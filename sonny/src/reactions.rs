@@ -132,13 +132,29 @@ pub fn declare(record: &Value) -> Option<Value> {
     }
     declared.retain(|other| other["name"] != TOOL);
     declared.push(tool);
-    Some(Value::Array(declared))
+    // Within what the daemon takes, or left as it is: the bot's own
+    // tools come first.
+    let bytes = serde_json::to_vec(&declared).map_or(usize::MAX, |json| json.len());
+    (declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES).then_some(Value::Array(declared))
 }
 
+/// The most tools a bot may have declared, and the most bytes they take,
+/// as the daemon counts them.
+const MAX_DECLARED: usize = 16;
+const DECLARED_BYTES: usize = 64 * 1024;
+
 /// What a `react` call asks: an emoji, and whether it comes off.
-pub fn call(arguments: &Value) -> Option<(&str, bool)> {
+pub fn call(arguments: &Value) -> Option<(String, bool)> {
     let emoji = arguments["emoji"].as_str().map(str::trim)?;
-    (!emoji.is_empty()).then_some((emoji, arguments["remove"] == true))
+    (!emoji.is_empty()).then(|| (emoji.to_owned(), arguments["remove"] == true))
+}
+
+/// Whether a call's kept result is the daemon refusing it.
+pub fn refused(output: &Value) -> bool {
+    output["output"]
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .is_some_and(|result| result.get("error").is_some())
 }
 
 /// `on` after a call: the emoji added, or taken off.
@@ -147,29 +163,6 @@ pub fn apply(on: &mut Vec<String>, emoji: &str, remove: bool) {
     if !remove {
         on.push(emoji.to_owned());
     }
-}
-
-/// The bot's reactions in `items`, by the node of the person's message
-/// each answers: its newest before the call.
-pub fn of_bot(items: &[(i64, Value)]) -> BTreeMap<i64, Vec<String>> {
-    let mut on: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-    let mut answering = None;
-    for (node, item) in items {
-        if item["role"] == "user" && !is_reaction(&crate::text(item)) {
-            answering = Some(*node);
-        } else if item["type"] == "function_call"
-            && item["name"] == TOOL
-            && let Some(message) = answering
-            && let Some(arguments) = item["arguments"]
-                .as_str()
-                .and_then(|a| serde_json::from_str::<Value>(a).ok())
-            && let Some((emoji, remove)) = call(&arguments)
-        {
-            apply(on.entry(message).or_default(), emoji, remove);
-        }
-    }
-    on.retain(|_, emoji| !emoji.is_empty());
-    on
 }
 
 #[cfg(test)]
@@ -207,30 +200,6 @@ mod tests {
     }
 
     #[test]
-    fn the_bots_reactions_add_up_under_the_message_each_answers() {
-        let user = |text: &str| {
-            json!({"type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": text}]})
-        };
-        let react = |arguments: Value| {
-            json!({"type": "function_call", "name": "react",
-            "call_id": "c", "arguments": arguments.to_string()})
-        };
-        let items = [
-            (1, user("merge it")),
-            (2, react(json!({"emoji": "👀"}))),
-            (3, react(json!({"emoji": "👍"}))),
-            (4, react(json!({"emoji": "👀", "remove": true}))),
-            (5, user("👍")),
-            (6, user("thanks")),
-            (7, react(json!({"emoji": 1}))),
-            (8, react(json!({"emoji": "🎉"}))),
-            (9, react(json!({"emoji": "🎉", "remove": true}))),
-        ];
-        assert_eq!(of_bot(&items), BTreeMap::from([(1, vec!["👍".to_owned()])]));
-    }
-
-    #[test]
     fn a_bot_is_given_react_beside_what_it_declares_once() {
         let other = json!({"name": "plan", "description": "d", "parameters": {"type": "object"},
             "result": "ok"});
@@ -240,5 +209,24 @@ mod tests {
         let old = json!({"name": "react", "description": "old", "parameters": {"type": "object"},
             "result": "ok"});
         assert_eq!(declare(&json!({"declared": [old]})), Some(json!([tool()])));
+        // A bot whose own tools leave no room keeps them, without react.
+        let full: Vec<Value> = (0..16)
+            .map(|n| {
+                json!({"name": format!("t{n}"), "description": "d",
+                "parameters": {"type": "object"}, "result": "ok"})
+            })
+            .collect();
+        assert_eq!(declare(&json!({"declared": full})), None);
+        let big = json!({"name": "big", "description": "d".repeat(64 * 1024),
+            "parameters": {"type": "object"}, "result": "ok"});
+        assert_eq!(declare(&json!({"declared": [big]})), None);
+    }
+
+    #[test]
+    fn a_refused_call_is_told_from_a_taken_one() {
+        assert!(!refused(&json!({"output": "Done."})));
+        assert!(refused(
+            &json!({"output": "{\"error\":\"invalid_arguments\"}"})
+        ));
     }
 }

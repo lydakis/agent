@@ -1189,6 +1189,8 @@ struct App {
     declare: Option<Value>,
     /// The bot's reactions in the running turn so far, drawn when it ends.
     bot_reactions: Vec<String>,
+    /// The bot's `react` calls not yet completed, by call id.
+    react_calls: HashMap<String, (String, bool)>,
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
@@ -1833,6 +1835,7 @@ impl App {
             reaction_turn: None,
             declare: None,
             bot_reactions: Vec::new(),
+            react_calls: HashMap::new(),
             answering: None,
             rows_drawn: 0,
             thought: String::new(),
@@ -2535,6 +2538,14 @@ impl App {
             asked["from"] = page["next_from"].clone();
         }
         nodes.reverse();
+        // Drawn from the start (attaching, or a repaint), the bot's
+        // reactions are read again with the rest; after a gap, those it
+        // made before the gap are still held.
+        if self.seen_node == 0 || after < self.seen_node {
+            self.bot_reactions.clear();
+            self.react_calls.clear();
+            self.answering = None;
+        }
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
@@ -2542,71 +2553,95 @@ impl App {
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
-        let mut items = Vec::with_capacity(nodes.len());
         for chunk in nodes.chunks(100) {
-            items.extend(self.items_at(chunk).await);
-        }
-        // The bot's reactions, each drawn under the message it answers.
-        let reacted = reactions::of_bot(&items);
-        for (node, item) in items {
-            // A reaction leaves the words before it as they were.
-            let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
-            if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
-                self.commit(match call {
-                    true => transcript::quiet(lines),
-                    false => lines,
-                });
-            }
-            match (item["type"].as_str(), item["role"].as_str()) {
-                // A reaction is drawn under the reply it answers.
-                (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
-                (_, Some("user")) => {
-                    // What the person ran is shown as it was when it ran.
-                    let lines = landed(&text(&item), &mut self.ran_here, self.width);
-                    self.commit(lines);
-                    if let Some(on) = reacted.get(&node) {
-                        self.commit_after(vec![transcript::reacted(&on.join(" "))], false);
+            for (node, item) in self.items_at(chunk).await {
+                // A reaction leaves the words before it as they were.
+                let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
+                if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
+                    self.commit(match call {
+                        true => transcript::quiet(lines),
+                        false => lines,
+                    });
+                }
+                match (item["type"].as_str(), item["role"].as_str()) {
+                    // A reaction is drawn under the reply it answers.
+                    (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
+                    (_, Some("user")) => {
+                        // The bot's reactions to the message before, as they
+                        // were drawn live.
+                        self.draw_bot_reactions();
+                        // What the person ran is shown as it was when it ran.
+                        let lines = landed(&text(&item), &mut self.ran_here, self.width);
+                        self.commit(lines);
+                        self.answering = Some((first_words(&text(&item)), self.rows_drawn));
                     }
-                }
-                (_, Some("assistant")) => {
-                    let reply = text(&item);
-                    if !reply.is_empty() {
-                        let mut lines = transcript::reply(&reply, self.width);
-                        lines.extend(self.reacted_row(node));
-                        said = Some(lines);
-                        self.saw_reply(node, &reply);
-                        self.last_reply = reply;
+                    (_, Some("assistant")) => {
+                        let reply = text(&item);
+                        if !reply.is_empty() {
+                            let mut lines = transcript::reply(&reply, self.width);
+                            lines.extend(self.reacted_row(node));
+                            said = Some(lines);
+                            self.saw_reply(node, &reply);
+                            self.last_reply = reply;
+                        }
                     }
-                }
-                // Drawn under the person's message instead.
-                (Some("function_call"), _) if item["name"] == reactions::TOOL => {}
-                (Some("function_call"), _) => {
-                    let arguments = item["arguments"]
-                        .as_str()
-                        .and_then(|a| serde_json::from_str(a).ok())
-                        .unwrap_or(Value::Null);
-                    let name = item["name"].as_str().unwrap_or("tool").to_owned();
-                    calls.insert(
-                        item["call_id"].as_str().unwrap_or("").to_owned(),
-                        (name, arguments),
-                    );
-                }
-                (Some("function_call_output"), _) => {
-                    let id = item["call_id"].as_str().unwrap_or("");
-                    // A call this window kept before it lost the daemon
-                    // may end in what it reads on reconnecting.
-                    if let Some((name, arguments)) =
-                        calls.remove(id).or_else(|| self.calls.remove(id))
+                    // Counted once it is known to have been taken.
+                    (Some("function_call"), _) if item["name"] == reactions::TOOL => {
+                        if let Some(reaction) = item["arguments"]
+                            .as_str()
+                            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                            .as_ref()
+                            .and_then(reactions::call)
+                        {
+                            let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                            self.react_calls.insert(id, reaction);
+                        }
+                    }
+                    (Some("function_call"), _) => {
+                        let arguments = item["arguments"]
+                            .as_str()
+                            .and_then(|a| serde_json::from_str(a).ok())
+                            .unwrap_or(Value::Null);
+                        let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                        calls.insert(
+                            item["call_id"].as_str().unwrap_or("").to_owned(),
+                            (name, arguments),
+                        );
+                    }
+                    (Some("function_call_output"), _)
+                        if self
+                            .react_calls
+                            .contains_key(item["call_id"].as_str().unwrap_or("")) =>
                     {
-                        let (output, failed) = output(&item);
-                        self.commit_call(&name, &arguments, &output, failed);
+                        let id = item["call_id"].as_str().unwrap_or("");
+                        if let Some((emoji, remove)) = self.react_calls.remove(id)
+                            && !output(&item).1
+                            && !reactions::refused(&item)
+                        {
+                            reactions::apply(&mut self.bot_reactions, &emoji, remove);
+                        }
                     }
+                    (Some("function_call_output"), _) => {
+                        let id = item["call_id"].as_str().unwrap_or("");
+                        // A call this window kept before it lost the daemon
+                        // may end in what it reads on reconnecting.
+                        if let Some((name, arguments)) =
+                            calls.remove(id).or_else(|| self.calls.remove(id))
+                        {
+                            let (output, failed) = output(&item);
+                            self.commit_call(&name, &arguments, &output, failed);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         if let Some(lines) = said {
             self.commit(lines);
+        }
+        // A running turn's reactions are drawn when it ends.
+        if self.running.is_none() {
+            self.draw_bot_reactions();
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
@@ -3043,14 +3078,31 @@ impl App {
                 }
             }
             "tool_started" if data["name"] == reactions::TOOL => {
-                // Drawn when the turn ends, so one taken off again is
-                // never drawn; its completion finds no call to draw.
-                if let Some(arguments) = data["arguments"]
+                // Counted once it completes, and drawn when the turn ends,
+                // so one taken off again is never drawn.
+                if let Some(reaction) = data["arguments"]
                     .as_str()
                     .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                    && let Some((emoji, remove)) = reactions::call(&arguments)
+                    .as_ref()
+                    .and_then(reactions::call)
                 {
-                    reactions::apply(&mut self.bot_reactions, emoji, remove);
+                    let id = data["call_id"].as_str().unwrap_or("").to_owned();
+                    self.react_calls.insert(id, reaction);
+                }
+            }
+            "tool_completed"
+                if self
+                    .react_calls
+                    .contains_key(data["call_id"].as_str().unwrap_or("")) =>
+            {
+                let id = data["call_id"].as_str().unwrap_or("");
+                // The daemon refuses a call that does not fit, or that the
+                // bot may not make.
+                if let Some((emoji, remove)) = self.react_calls.remove(id)
+                    && data["failed"] != true
+                    && data["denied"] != true
+                {
+                    reactions::apply(&mut self.bot_reactions, &emoji, remove);
                 }
             }
             "tool_started" => {
@@ -5590,6 +5642,17 @@ mod tests {
         app.daemon(turn_event("accepted", 2, json!({"node": 5})))
             .await;
         app.daemon(react(2, "c4", json!({"emoji": "🎉"}))).await;
+        app.daemon(turn_event("tool_completed", 2, json!({"call_id": "c4"})))
+            .await;
+        // One the daemon refused is not drawn.
+        app.daemon(react(2, "c5", json!({"emoji": "👀", "remove": "yes"})))
+            .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            2,
+            json!({"call_id": "c5", "failed": true}),
+        ))
+        .await;
         app.daemon(turn_event("message", 2, json!({"node": 7})))
             .await;
         app.daemon(turn_event(
@@ -5608,19 +5671,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replayed_bot_reactions_sit_under_the_message_they_answer() {
+    async fn replayed_bot_reactions_are_drawn_as_they_were_live() {
         let items = json!({
             "1": {"type": "message", "role": "user",
                   "content": [{"type": "input_text", "text": "merged, thanks"}]},
             "2": {"type": "function_call", "name": "react", "call_id": "c1",
                   "arguments": "{\"emoji\":\"👍\"}"},
             "3": {"type": "function_call_output", "call_id": "c1", "output": "Done."},
-            "4": {"type": "message", "role": "assistant",
-                  "content": [{"type": "output_text", "text": "Anything else?"}]},
+            "4": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "and the notes?"}]},
+            "5": {"type": "function_call", "name": "react", "call_id": "c2",
+                  "arguments": "{\"emoji\":\"👀\",\"remove\":\"yes\"}"},
+            "6": {"type": "function_call_output", "call_id": "c2",
+                  "output": "{\"error\":\"invalid_arguments\"}"},
+            "7": {"type": "function_call", "name": "react", "call_id": "c3",
+                  "arguments": "{\"emoji\":\"🎉\"}"},
+            "8": {"type": "function_call_output", "call_id": "c3", "output": "Done."},
+            "9": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Updated."}]},
         });
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
-            Some("history_nodes") => json!({"nodes": [{"node": 4}, {"node": 3}, {"node": 2},
-                {"node": 1}], "next_from": null}),
+            Some("history_nodes") => {
+                json!({"nodes": (1..=9).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
             _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
                 .map(|node| json!({"node": node, "item": items[node.to_string()]}))
                 .collect::<Vec<_>>()}),
@@ -5629,7 +5703,19 @@ mod tests {
         let mut app = app(client);
         app.history().await;
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert_eq!(rows, ["› merged, thanks", "   👍 ", "", "• Anything else?"]);
+        assert_eq!(
+            rows,
+            [
+                "› merged, thanks",
+                "   👍 ",
+                "",
+                "› and the notes?",
+                "",
+                "• Updated.",
+                "",
+                "  ↳ reacted 🎉 to “and the notes?”"
+            ]
+        );
     }
 
     #[tokio::test]
