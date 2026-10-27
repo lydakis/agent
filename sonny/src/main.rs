@@ -4161,12 +4161,8 @@ impl App {
                         None => "",
                     };
                     match settings.fullscreen {
-                        true => format!(
-                            "full screen{then}: drag to select and copy, scroll with the wheel"
-                        ),
-                        false => format!(
-                            "inline{then}: the conversation goes into your terminal's scrollback"
-                        ),
+                        true => format!("full screen{then}"),
+                        false => format!("inline{then}"),
                     }
                 }
                 Err(error) => error,

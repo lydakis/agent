@@ -51,6 +51,14 @@ struct Shown {
     first: bool,
 }
 
+/// A line of the conversation, its wrapped rows joined again, so it can
+/// be wrapped anew at any width.
+struct Row {
+    line: Line<'static>,
+    /// The lead the rows it goes on to start with, as it was written.
+    rest: Option<Line<'static>>,
+}
+
 /// A place in the rows shown: a row and a column.
 type Spot = (usize, usize);
 
@@ -71,18 +79,22 @@ struct Selection {
 
 #[derive(Default)]
 pub struct Screen {
-    /// The conversation's rows, as written.
-    rows: Vec<Line<'static>>,
+    /// The conversation's lines, as written.
+    rows: Vec<Row>,
     /// Those rows wrapped to `width`, as drawn.
     shown: Vec<Shown>,
     /// How many of `rows` are in `shown`.
     wrapped: usize,
+    /// How many rows of `shown` were taken off to be wrapped again.
+    relaid: usize,
     width: usize,
     /// How many rows the view is scrolled up from the newest.
     back: usize,
-    /// Where the rows were drawn last, and the first one drawn there.
+    /// Where the rows were drawn last, the first one drawn there, and
+    /// how many: the bottom one is a note while scrolled back.
     area: Rect,
     top: usize,
+    drawn: usize,
     selection: Option<Selection>,
     /// The last press: when, where, and how many presses in a row.
     clicks: Option<(Instant, u16, u16, u8)>,
@@ -99,7 +111,43 @@ impl Screen {
     }
 
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
-        self.rows.extend(lines);
+        for line in lines {
+            let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty())
+            else {
+                self.rows.push(Row { line, rest: None });
+                continue;
+            };
+            // A row the line above was wrapped onto joins it again.
+            if self.wrapped == self.rows.len() {
+                self.unlay();
+            }
+            let (rest, text) = split(line, lead);
+            let row = self.rows.last_mut().expect("a row to join");
+            // Spans alike join too, so a word cut over rows is one again.
+            for span in text {
+                match row.line.spans.last_mut() {
+                    Some(last) if last.style == span.style => {
+                        last.content.to_mut().push_str(&span.content)
+                    }
+                    _ => row.line.spans.push(span),
+                }
+            }
+            row.rest.get_or_insert(rest);
+        }
+    }
+
+    /// The last line's rows taken off the screen, to be wrapped again.
+    fn unlay(&mut self) {
+        let at = (self.shown.iter())
+            .rposition(|shown| shown.first)
+            .unwrap_or(0);
+        self.relaid += self.shown.len() - at;
+        self.shown.truncate(at);
+        self.wrapped -= 1;
+        if (self.selection.as_ref()).is_some_and(|s| s.anchor.0.max(s.head.0) >= at) {
+            self.selection = None;
+        }
+        self.linked = None;
     }
 
     /// Back to the newest rows.
@@ -109,7 +157,7 @@ impl Screen {
 
     /// Up (`rows` > 0) or down the conversation.
     pub fn scroll(&mut self, rows: isize) {
-        let most = self.shown.len().saturating_sub(self.area.height as usize);
+        let most = (self.shown.len() + 1).saturating_sub(self.area.height as usize);
         self.back = self.back.saturating_add_signed(rows).min(most);
     }
 
@@ -145,15 +193,19 @@ impl Screen {
             self.width = width;
             self.shown.clear();
             self.wrapped = 0;
+            self.relaid = 0;
             self.selection = None;
             self.linked = None;
         }
         let before = self.shown.len();
-        for line in &self.rows[self.wrapped..] {
-            let rows = if line.width() <= width {
-                vec![line.clone()]
-            } else {
-                crate::transcript::wrap(line.clone(), width, Span::raw(""), Span::raw("    "))
+        for row in &self.rows[self.wrapped..] {
+            let line = row.line.clone();
+            let rows = match line.width() <= width {
+                true => vec![line],
+                false => {
+                    let rest = row.rest.clone().unwrap_or(Line::from("    "));
+                    crate::transcript::wrap_lines(line, width, Line::default(), rest)
+                }
             };
             for (at, line) in rows.into_iter().enumerate() {
                 let joins = crate::transcript::lead(&line);
@@ -168,8 +220,9 @@ impl Screen {
             }
         }
         self.wrapped = self.rows.len();
+        let relaid = std::mem::take(&mut self.relaid);
         if self.back > 0 && before > 0 {
-            self.back += self.shown.len() - before;
+            self.back = (self.back + self.shown.len() - before).saturating_sub(relaid);
         }
         // The oldest rows go, a batch at a time.
         if self.rows.len() > KEEP + KEEP / 4 {
@@ -195,11 +248,14 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
-        self.back = self.back.min(self.shown.len().saturating_sub(height));
+        self.back = self.back.min((self.shown.len() + 1).saturating_sub(height));
+        // While scrolled back, the bottom row is the note, over no row.
+        let rows = height - usize::from(self.back > 0 && height > 1);
         let bottom = self.shown.len() - self.back;
-        let top = bottom.saturating_sub(height);
+        let top = bottom.saturating_sub(rows);
         self.area = area;
         self.top = top;
+        self.drawn = bottom - top;
         for (y, shown) in self.shown[top..bottom].iter().enumerate() {
             buf.set_line(area.x, area.y + y as u16, &shown.line, area.width);
         }
@@ -307,7 +363,7 @@ impl Screen {
         if self.shown.is_empty() {
             return None;
         }
-        let y = row.saturating_sub(self.area.y) as usize;
+        let y = (row.saturating_sub(self.area.y) as usize).min(self.drawn.saturating_sub(1));
         let at = (self.top + y).min(self.shown.len() - 1);
         let x = column.saturating_sub(self.area.x) as usize;
         Some((at, x.min(self.shown[at].line.width())))
@@ -367,13 +423,10 @@ impl Screen {
                 // Past the top or bottom edge, the view moves with it.
                 if event.row < self.area.y {
                     self.scroll(1);
-                } else if event.row >= self.area.bottom() {
+                } else if event.row >= self.area.y + self.drawn as u16 {
                     self.scroll(-1);
                 }
-                let row = event
-                    .row
-                    .clamp(self.area.y, self.area.bottom().saturating_sub(1));
-                let spot = self.spot(event.column, row)?;
+                let spot = self.spot(event.column, event.row)?;
                 let selection = self.selection.as_mut()?;
                 if spot != selection.head {
                     selection.head = spot;
@@ -411,6 +464,16 @@ impl Screen {
             Unit::Word => {
                 start.1 = self.word(start, true);
                 end.1 = self.word(end, false);
+                // A word cut at a row's end goes on in the row below.
+                while start.0 > 0 && self.cut(start.0) && self.leads(start) {
+                    let above = start.0 - 1;
+                    start = (above, self.word((above, self.width), true));
+                }
+                while self.cut(end.0 + 1) && self.ends(end.0) {
+                    let below = end.0 + 1;
+                    let lead = self.shown[below].joins.unwrap_or(0);
+                    end = (below, self.word((below, lead), false));
+                }
             }
             Unit::Line => {
                 while start.0 > 0 && self.shown[start.0].joins.is_some() {
@@ -424,6 +487,27 @@ impl Screen {
             }
         }
         (start, end)
+    }
+
+    /// The row goes on with a word cut at the end of the row above.
+    fn cut(&self, row: usize) -> bool {
+        (self.shown.get(row))
+            .is_some_and(|shown| shown.line.alignment == Some(crate::transcript::CUT))
+    }
+
+    /// Nothing but the row's lead is before `column`.
+    fn leads(&self, (row, column): Spot) -> bool {
+        let cells = cells(&self.shown[row].line);
+        cells[..column.min(cells.len())]
+            .iter()
+            .all(|g| g.trim().is_empty())
+    }
+
+    /// The row's last cell is part of a word.
+    fn ends(&self, row: usize) -> bool {
+        cells(&self.shown[row].line)
+            .last()
+            .is_some_and(|g| !g.trim().is_empty())
     }
 
     /// Where the word at `spot` starts, or ends: a run without spaces, so
@@ -510,6 +594,39 @@ impl Screen {
 
 /// A row's characters, one per column: a wide character, then empty
 /// strings for the columns it covers.
+/// A row a line was wrapped onto, as its lead of `columns` and the text
+/// after it.
+fn split(line: Line<'static>, columns: usize) -> (Line<'static>, Vec<Span<'static>>) {
+    let (mut lead, mut text) = (Vec::new(), Vec::new());
+    let mut left = columns;
+    for span in line.spans {
+        let style = line.style.patch(span.style);
+        if span.content.is_empty() {
+            continue;
+        }
+        if left == 0 {
+            text.push(Span::styled(span.content, style));
+            continue;
+        }
+        let mut cut = span.content.len();
+        let mut used = 0;
+        for (at, grapheme) in span.content.grapheme_indices(true) {
+            if used >= left {
+                cut = at;
+                break;
+            }
+            used += grapheme.width();
+        }
+        left -= used.min(left);
+        let (before, after) = span.content.split_at(cut);
+        lead.push(Span::styled(before.to_owned(), style));
+        if !after.is_empty() {
+            text.push(Span::styled(after.to_owned(), style));
+        }
+    }
+    (Line::from(lead), text)
+}
+
 fn cells(line: &Line) -> Vec<String> {
     let mut out = Vec::new();
     for span in &line.spans {
@@ -679,6 +796,41 @@ mod tests {
     }
 
     #[test]
+    fn a_wider_screen_joins_the_rows_a_line_was_wrapped_onto() {
+        let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
+        let reply = crate::transcript::reply(text, 30);
+        assert!(reply.len() > 2);
+        let (screen, buf) = screen(reply, 80, 5);
+        assert_eq!(screen.shown.len(), 1);
+        assert_eq!(row(&buf, 0).trim_end(), format!("• {text}"));
+    }
+
+    #[test]
+    fn a_double_click_takes_a_word_cut_over_rows() {
+        let url = "https://example.com/a/very/long/path/to/a/page";
+        let lines = crate::transcript::wrap(Line::from(url), 20, Span::raw(""), Span::raw(""));
+        let (mut screen, _) = screen(lines, 20, 5);
+        for _ in 0..2 {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 1));
+        }
+        assert_eq!(screen.selected().as_deref(), Some(url));
+    }
+
+    #[test]
+    fn the_note_over_the_bottom_row_is_not_selected() {
+        let lines: Vec<Line> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 20, 5);
+        screen.mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        let area = Rect::new(0, 0, 20, 5);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert_eq!(
+            drag(&mut screen, (0, 0), (19, 4)),
+            Some(Action::Copy("row 13\nrow 14\nrow 15\nrow 16".into()))
+        );
+    }
+
+    #[test]
     fn a_reply_wrapped_again_copies_without_its_bullet() {
         let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
         let reply = crate::transcript::reply(text, 80);
@@ -713,12 +865,12 @@ mod tests {
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
-        assert_eq!(row(&buf, 0).trim_end(), "row 12");
+        assert_eq!(row(&buf, 0).trim_end(), "row 13");
         assert!(row(&buf, 4).contains("3 newer rows"));
         screen.push(vec![Line::from("row 20")]);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
-        assert_eq!(row(&buf, 0).trim_end(), "row 12");
+        assert_eq!(row(&buf, 0).trim_end(), "row 13");
         // The note is a way back.
         screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 4));
         let mut buf = Buffer::empty(area);
