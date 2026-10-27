@@ -30,13 +30,13 @@ tasks made, and every bot named `PROJECT.*`. Each of these is one check:
 
 | Event | When | Questions |
 | --- | --- | --- |
-| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, sibling_needs, conflict, drifts (the person's words only), remember |
-| Ended | a task's turn ends, unless the lead is waiting on it | sibling_needs, conflict, drifts, stuck, lead_next, result |
-| Waiting | a task has waited on the person's approval for 2 minutes | stuck |
-| Quiet | a task's running turn has printed nothing for 30 minutes | stuck |
+| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, conflict, drifts (the person's words only) |
+| Ended | a task's turn ends, unless the lead is waiting on it | conflict, drifts, stuck, result (not on a turn the person asked for in the task) |
 
-A turn waiting on the person, on other turns or for a slot is not quiet,
-and a silence is checked once; printing again starts a new one. The judge
+`conflict` asks both whether the work collides with another task's and
+whether it holds something another task needs. An approval the person has
+not given and a turn that has printed nothing for 30 minutes need no
+judge: they are task updates. The judge
 reads the event's text, the lead's latest message to that task (its brief),
 the other tasks' briefs and latest lines, and the project's memory indexes.
 For `drifts` it also reads what passed in the task since the lead last
@@ -44,10 +44,12 @@ wrote to it: the person's messages and the first line of each reply, the
 last 6. A yes asks the lead to settle what the person means and steer the
 task with that reading.
 
-A high answer (0.70 or more; 0.85 for a result) wakes the lead: at once with `--delivery
-steer` when the question is urgent (redirects, conflict), else queued, at
-most every 2 minutes. A middle one (0.35 or more) waits for the next note,
-or goes alone after 30 minutes. The rest are only counted.
+A high answer (0.70 or more) to an urgent question (redirects, conflict)
+steers the lead at once with `--delivery steer`. Any other high answer
+goes in the next note, under "May need you", once the lead rests and at
+most every 10 minutes, as task updates do. A middle one (0.35 or more)
+sends no note by itself and rides along with the next. The rest are only
+counted.
 
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person
@@ -61,7 +63,7 @@ lead's file already holds one by that name, which it keeps as it is:
 
 ```
 {"name": "tasks", "tasks_of": ["shop.lead"], "bots": ["shop.*"],
- "on": ["said", "ended", "waiting", "quiet"], "updates": true}
+ "on": ["said", "ended"], "updates": true}
 ```
 
 Any bot can subscribe to more:
@@ -77,7 +79,7 @@ sonny lookout rm deploys
 - `--tasks-of BOT` watches every bot BOT or one of its tasks made, and
   `--bot GLOB` every bot its name matches, `*` matching any run of
   characters. A subscription needs one of them, and may have several.
-- `--on said,ended,waiting,quiet` picks the events; all four by default.
+- `--on said,ended` picks the events; both by default.
 - `--ask ID` asks only the built-in questions named; with no `--ask`, a
   subscription asks every one that fits the event, unless it looks for
   something of its own, when it asks only that.
@@ -113,15 +115,18 @@ with subscriptions of their own:
 
 - a turn the subscriber asked for and did not wait on, or another agent or a
   trigger asked for, once it ends;
-- an approval only the person can give;
+- an approval only the person can give, once it has waited 2 minutes;
+- a running turn that has printed nothing for 30 minutes, once per
+  silence; a turn waiting on the person, on other turns or for a slot is
+  not silent;
 - turns the person asked for in a task themselves, listed apart as theirs;
 - what was saved to or removed from the person's and the project's memory,
   by path, less what the subscriber saved itself: the folders its own
   memory indexes name.
 
-A turn the subscriber waits on is not news, nor its own forks. This goes
-with the next note, or on its own once it rests, at most every 10 minutes;
-memory alone never sends one.
+A turn the subscriber waits on is not news, nor its own forks. A note goes
+once the subscriber rests, at most every 10 minutes, or at once with an
+urgent answer; memory alone never sends one.
 
 ## The note
 
@@ -131,7 +136,7 @@ One message, queued (or steered, for an urgent answer), with no origin:
 Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.
 May need you:
 - calc.docs: turn:calc.docs/3, the person wrote in it (redirects 0.97; pass it to every task it applies to): "Use tabs."
-Ended or waiting for an approval:
+Ended, waiting for an approval, or gone quiet:
 - calc.fix: turn:calc.fix/5 failed, asked by you
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person

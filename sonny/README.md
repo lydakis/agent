@@ -143,9 +143,10 @@ Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
 subscribes each lead to its tasks. It tells a lead what its tasks
 did in one "Task updates" note, by the handles its wait tool reads them
-with, and wakes it early only when one needs it: a message that redirects
-other tasks, a conflict, a stuck or silent task, a result the person should
-hear. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
+with, and steers it at once only for a message that redirects other tasks
+or work that collides with another task's; what else the judge picks, such
+as a stuck task or a result the person should hear, is flagged in the next
+note. It judges with `AGENT_JUDGE`, the approver's setting, so Bedrock alone
 is enough, and with no judge sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see

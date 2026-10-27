@@ -1,13 +1,12 @@
 //! `sonny lookout`: a cheap decision model reading what happens in the bots
 //! each subscriber watches, which wakes the subscriber only when it should
 //! step in. It knows no leads: Sonny subscribes each lead to its tasks
-//! (`subs::Sub::lead`), and any bot can subscribe to more. Each
-//! message someone other than the subscriber writes in a task, each turn a task
-//! ends, each approval a task has waited on the person for a while, and each
-//! turn that has printed nothing for a long while is one check: a few yes/no
-//! questions to OpenAI's Decisions API, Jev, or a model the daemon runs
-//! (Haiku on Bedrock, say). A high answer wakes the lead now; a middle one
-//! waits for the next wake, or a digest after a quiet spell; a low one is
+//! (`subs::Sub::lead`), and any bot can subscribe to more. Each message
+//! someone other than the subscriber writes in a task, and each turn a task
+//! ends, is one check: a few yes/no questions to OpenAI's Decisions API,
+//! Jev, or a model the daemon runs (Haiku on Bedrock, say). A high answer to
+//! an urgent question steers the subscriber now; any other answer that is
+//! not low rides the next note, once the subscriber rests; a low one is
 //! only logged. One lookout watches a daemon, for every subscriber on it,
 //! started by the first Sonny to open; the daemon is unchanged: this follows
 //! every bot and submits to the subscribers like any client.
@@ -31,13 +30,11 @@ const LOW: f64 = agent_client::approver::LOW;
 const HIGH: f64 = agent_client::approver::HIGH;
 /// How long a check may take before it counts as failed.
 const DEADLINE: Duration = Duration::from_secs(10);
-/// The least time between two wakes; news meanwhile joins the next one.
+/// How long after a note is refused the next may go, even a steer.
 const WAKE_GAP: Duration = Duration::from_secs(120);
-/// How long middle answers wait for a wake before they are sent on their own.
-const DIGEST_AFTER: Duration = Duration::from_secs(30 * 60);
 /// How long a task waits on the person's approval before it is news.
 const APPROVAL_AFTER: Duration = Duration::from_secs(120);
-/// How long a running turn may print nothing before it is checked.
+/// How long a running turn may print nothing before it is news.
 const QUIET_AFTER: Duration = Duration::from_secs(30 * 60);
 /// How long the daemon may be unreachable before the lookout exits: a
 /// client starts another with the next daemon.
@@ -54,6 +51,8 @@ const QUOTE_CHARS: usize = 2000;
 const ROSTER: usize = 12;
 /// A wake names at most this many items; the rest wait for the next.
 const NOTE_ITEMS: usize = 16;
+/// How many middle answers wait for a note before the oldest is dropped.
+const HELD: usize = 4 * NOTE_ITEMS;
 
 /// What happened in a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,10 +61,6 @@ pub enum Kind {
     Said,
     /// A turn ended.
     Ended,
-    /// It has waited on the person's approval since `APPROVAL_AFTER`.
-    Waiting,
-    /// Its running turn has printed nothing since `QUIET_AFTER`.
-    Quiet,
 }
 
 pub struct Question {
@@ -82,19 +77,16 @@ pub struct Question {
 fn action(id: &str) -> &'static str {
     match id {
         "redirects" => "pass it to every task it applies to",
-        "sibling_needs" => "pass it to the task that needs it",
-        "conflict" => "reconcile the two tasks",
+        "conflict" => "pass it to the task it matters to, or reconcile the two tasks",
         "drifts" => "settle what the person means and steer the task with that reading",
-        "stuck" => "unblock it, or ask the person for what it needs, such as an approval",
-        "lead_next" => "start the next step",
+        "stuck" => "unblock it, or ask the person for what it needs",
         "result" => "tell the person",
-        "remember" => "save it with your memory skill",
         _ => "look",
     }
 }
 
 /// What each check may ask, as predicates over the input `input` builds.
-pub const QUESTIONS: [Question; 8] = [
+pub const QUESTIONS: [Question; 5] = [
     Question {
         id: "redirects",
         text: "Is `event` a message from the person that changes a goal, a constraint or a preference that also applies to the other tasks in `tasks` or to the project as a whole, not only to this task?",
@@ -103,15 +95,8 @@ pub const QUESTIONS: [Question; 8] = [
         wakes_at: HIGH,
     },
     Question {
-        id: "sibling_needs",
-        text: "Does the text in `event` hold a fact, a decision or a fix that one of the tasks in `tasks` needs for its own work and probably does not have?",
-        kinds: &[Kind::Said, Kind::Ended],
-        urgent: false,
-        wakes_at: HIGH,
-    },
-    Question {
         id: "conflict",
-        text: "Does the work in `event` contradict, duplicate or change the same thing as the work of one of the tasks in `tasks`?",
+        text: "Does the work in `event` contradict, duplicate or change the same thing as the work of one of the tasks in `tasks`, or hold a fact, a decision or a fix that one of them needs for its own work and probably does not have?",
         kinds: &[Kind::Said, Kind::Ended],
         urgent: true,
         wakes_at: HIGH,
@@ -125,14 +110,7 @@ pub const QUESTIONS: [Question; 8] = [
     },
     Question {
         id: "stuck",
-        text: "Is the task in `event` stuck: failing, going in circles, hung, waiting on an approval, blocked by calls the approver denied, or asking a question that nobody has answered?",
-        kinds: &[Kind::Ended, Kind::Waiting, Kind::Quiet],
-        urgent: false,
-        wakes_at: HIGH,
-    },
-    Question {
-        id: "lead_next",
-        text: "Does `event` show the task finished work that unblocks a next step named in `brief` or needed by one of the tasks in `tasks`?",
+        text: "Is the task in `event` stuck: failing, going in circles, blocked by calls the approver denied, or asking a question that nobody has answered?",
         kinds: &[Kind::Ended],
         urgent: false,
         wakes_at: HIGH,
@@ -145,20 +123,12 @@ pub const QUESTIONS: [Question; 8] = [
         // "Done" or "on it" read as results too often: it takes a clear one.
         wakes_at: 0.85,
     },
-    Question {
-        id: "remember",
-        text: "Is `event` a message from the person that states a lasting preference, rule or fact about the person or the project that `memory` does not already hold?",
-        kinds: &[Kind::Said],
-        urgent: false,
-        wakes_at: HIGH,
-    },
 ];
 
 /// How the judge reads the input, as a developer message.
 pub const READING: &str = "The user message is a JSON object about one event in a software project where a lead \
 agent coordinates task agents for a person. `event` is what just happened in one task: a message someone wrote \
-in it (`from` says who: `the person` is the person's own words), the reply it ended a turn with, an approval \
-it is waiting on, or the last thing a turn that has printed nothing for 30 minutes did. `brief` is what the lead \
+in it (`from` says who: `the person` is the person's own words), or the reply it ended a turn with. `brief` is what the lead \
 asked that task to do. `exchange`, when there is one, is what passed in that task since: the person's messages \
 and the first line of each reply, oldest first. `tasks` lists the project's other tasks, each with what the lead asked it and its latest \
 line. `memory` is the index of what the person and the project \
@@ -187,7 +157,9 @@ pub fn questions(seen: &Seen) -> Vec<Asked> {
                 .is_none_or(|ids| ids.contains(&q.id))
         })
         .filter(|q| match q.id {
-            "lead_next" => seen.brief.is_some(),
+            // A turn the person asked for in the task is news to them,
+            // which task updates list as theirs.
+            "result" => !seen.theirs,
             // Whether a task drifts from the person is read from what they
             // asked, and asked of their own words, not of others'.
             "drifts" => {
@@ -231,10 +203,9 @@ pub struct Seen {
     /// How the turn ended, for `Ended`.
     pub status: Option<String>,
     /// The history node holding the words, for `Said`: none while queued.
-    /// For `Quiet`, which silence in the turn, so each one is its own note.
     pub node: Option<i64>,
-    /// The call waiting on approval, for `Waiting`.
-    pub call: Option<String>,
+    /// The person asked for the turn in the task, for `Ended`.
+    pub theirs: bool,
     /// The node of the lead's latest message to the task, then.
     pub brief: Option<i64>,
     /// The other tasks, each with the node of the lead's latest message to it.
@@ -282,8 +253,6 @@ pub fn input(seen: &Seen, brief: &str, exchange: &[Value], peers: &[Peer], memor
     let kind = match seen.kind {
         Kind::Said => "message",
         Kind::Ended => "turn_end",
-        Kind::Waiting => "approval_wait",
-        Kind::Quiet => "quiet_turn",
     };
     let mut event = json!({"task": seen.task, "kind": kind, "text": cut(&seen.text, EVENT_CHARS)});
     if let Some(from) = &seen.from {
@@ -498,8 +467,6 @@ fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> St
         let what = match seen.kind {
             Kind::Said => format!("{} wrote in it", seen.from.as_deref().unwrap_or("someone")),
             Kind::Ended => format!("turn {}", seen.status.as_deref().unwrap_or("ended")),
-            Kind::Waiting => "waits on the person's approval".to_owned(),
-            Kind::Quiet => "has printed nothing for 30 minutes".to_owned(),
         };
         // The note reaches the approver as the person's words, so it quotes
         // only theirs: a task's own text there could ask for anything.
@@ -527,7 +494,7 @@ fn note(items: &[Item], more: usize, told: &updates::Told, dropped: usize) -> St
         .filter(|line| !picked.contains(&line.handle))
         .collect();
     if told_items.iter().any(|line| !line.theirs) {
-        lines.push("Ended or waiting for an approval:".to_owned());
+        lines.push("Ended, waiting for an approval, or gone quiet:".to_owned());
     }
     for (n, line) in told_items.iter().enumerate() {
         if line.theirs && (n == 0 || !told_items[n - 1].theirs) {
@@ -1271,23 +1238,6 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
             .iter()
             .filter(in_turn)
             .find(|(_, item)| item["role"] == "assistant"),
-        // The newest thing the turn did: an empty text beside a call is
-        // not it.
-        Kind::Quiet => items
-            .iter()
-            .filter(in_turn)
-            .find(|(_, item)| !evidence(item).trim().is_empty()),
-        Kind::Waiting => items
-            .iter()
-            // The call the approval names: a response's later calls wait
-            // behind it, so the newest call is not always the one.
-            .find(|(_, item)| {
-                item["type"] == "function_call"
-                    && seen
-                        .call
-                        .as_deref()
-                        .is_none_or(|call| item["call_id"] == call)
-            }),
     };
     found.map(|(_, item)| evidence(item)).unwrap_or_default()
 }
@@ -1828,9 +1778,9 @@ impl Service {
                     }
                     let now = Instant::now();
                     for lookout in self.lookouts.values_mut() {
-                        lookout.approvals_due();
-                        lookout.quiet_due(now);
-                        lookout.updates.expire(now);
+                        if lookout.updating {
+                            lookout.updates.expire(now);
+                        }
                     }
                 }
             }
@@ -2159,13 +2109,8 @@ struct Lookout {
     waiting_on: Vec<String>,
     /// The lead's wait returns the first of `waiting_on` to settle.
     waiting_any: bool,
-    /// Approvals the person has not answered, by task and turn, since when.
-    approvals: HashMap<(String, i64), (Instant, Option<String>)>,
-    /// Each task's running turn, when it last printed anything, and
-    /// whether that silence was checked already.
-    quiet: HashMap<String, (i64, Instant, bool)>,
-    /// Silences checked so far.
-    silences: i64,
+    /// Turns the person asked for in a task themselves.
+    theirs: HashSet<(String, i64)>,
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
     /// or `None` for the lead.
     steers: HashMap<(String, i64), Option<String>>,
@@ -2187,10 +2132,8 @@ struct Lookout {
     read: HashSet<String>,
     /// News for the lead, sent with the next wake.
     held: Vec<Item>,
-    held_since: Option<Instant>,
     /// A high answer is waiting to be sent: `Some(true)` steers.
     urgent: Option<bool>,
-    last_wake: Option<Instant>,
     /// When the last note was refused: even a steer waits the gap after.
     refused: Option<Instant>,
     log: Option<PathBuf>,
@@ -2214,9 +2157,7 @@ impl Lookout {
             updating: false,
             waiting_on: Vec::new(),
             waiting_any: false,
-            approvals: HashMap::new(),
-            quiet: HashMap::new(),
-            silences: 0,
+            theirs: HashSet::new(),
             steers: HashMap::new(),
             denied: HashMap::new(),
             checked: HashSet::new(),
@@ -2227,9 +2168,7 @@ impl Lookout {
             due: Vec::new(),
             read: HashSet::new(),
             held: Vec::new(),
-            held_since: None,
             urgent: None,
-            last_wake: None,
             refused: None,
             log: None,
         }
@@ -2260,6 +2199,7 @@ impl Lookout {
                 }
             }
             "deleted" if bot != self.lead => {
+                self.theirs.retain(|(task, _)| task != bot);
                 self.lineage.remove(bot);
                 self.globbed.remove(bot);
                 // A root keeps its place under its name, so what it makes
@@ -2271,7 +2211,6 @@ impl Lookout {
                 }
                 self.briefs.remove(bot);
                 self.exchanges.remove(bot);
-                self.quiet.remove(bot);
             }
             _ => {}
         }
@@ -2336,13 +2275,15 @@ impl Lookout {
         if !self.watches(bot) {
             return;
         }
-        self.printed(bot, kind, turn, data);
         let node = data["node"].as_i64();
         match kind {
             "accepted" => {
                 // Words checked when they were queued are not checked again,
                 // but still become the task's brief.
                 let checked = self.checked.remove(&(bot.to_owned(), turn));
+                if self.author(data).as_deref() == Some(PERSON) {
+                    self.theirs.insert((bot.to_owned(), turn));
+                }
                 match self.author(data) {
                     Some(from) => {
                         if !checked {
@@ -2372,20 +2313,12 @@ impl Lookout {
                     self.due(bot, turn, Kind::Said, Some(from), None, None);
                 }
             }
-            "turn_waiting" if !data["approval"].is_null() && data["approval"] != false => {
-                let call = data["call_id"].as_str().map(str::to_owned);
-                self.approvals
-                    .entry((bot.to_owned(), turn))
-                    .or_insert_with(|| (Instant::now(), call));
-            }
-            "tool_completed" | "turn_resumed" => {
-                self.approvals.remove(&(bot.to_owned(), turn));
+            "tool_completed" => {
                 if data["denied"] == true {
                     *self.denied.entry((bot.to_owned(), turn)).or_default() += 1;
                 }
             }
             "turn_finished" => {
-                self.approvals.remove(&(bot.to_owned(), turn));
                 let status = data["status"].as_str().unwrap_or("ended");
                 if status == "steered" {
                     match self.steers.remove(&(bot.to_owned(), turn)) {
@@ -2403,6 +2336,7 @@ impl Lookout {
                     return;
                 }
                 let denied = self.denied.remove(&(bot.to_owned(), turn)).unwrap_or(0);
+                let theirs = self.theirs.remove(&(bot.to_owned(), turn));
                 // A completed turn's reply is read from its checkpoint, not
                 // from wherever the task's history has moved on to.
                 let checkpoint = data["checkpoint"].as_i64();
@@ -2427,7 +2361,11 @@ impl Lookout {
                 if denied > 0 {
                     status.push_str(&format!(", after {denied} calls denied by the approver"));
                 }
-                self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint);
+                if self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint)
+                    && let Some(seen) = self.due.last_mut()
+                {
+                    seen.theirs = theirs;
+                }
                 self.passed(bot, reply);
             }
             _ => {}
@@ -2454,66 +2392,7 @@ impl Lookout {
         }
         self.read.extend(handles.iter().cloned());
         self.updates.read(handles);
-        if self.held.is_empty() {
-            self.held_since = None;
-        }
         self.urgent = self.pending();
-    }
-
-    /// Keeps each task's running turn and when it last printed anything:
-    /// a turn waiting on the person, on other turns or for a slot is not
-    /// silent, and neither is one that ended.
-    fn printed(&mut self, task: &str, kind: &str, turn: i64, data: &Value) {
-        let now = Instant::now();
-        match kind {
-            "accepted" | "turn_resumed" => {
-                self.quiet.insert(task.to_owned(), (turn, now, false));
-            }
-            "turn_waiting" | "turn_paced" => {
-                self.quiet.remove(task);
-            }
-            "turn_finished" if data["status"] != "steered" => {
-                if self
-                    .quiet
-                    .get(task)
-                    .is_some_and(|(running, ..)| *running == turn)
-                {
-                    self.quiet.remove(task);
-                }
-            }
-            // A turn that was running before its bot was watched is
-            // tracked from the first thing it does since.
-            "text_delta" | "tool_started" | "tool_completed" if !self.quiet.contains_key(task) => {
-                self.quiet.insert(task.to_owned(), (turn, now, false));
-            }
-            _ => {
-                if let Some((running, at, checked)) = self.quiet.get_mut(task)
-                    && *running == turn
-                {
-                    *at = now;
-                    *checked = false;
-                }
-            }
-        }
-    }
-
-    /// A check for each running turn silent since `QUIET_AFTER`, once per
-    /// silence.
-    fn quiet_due(&mut self, now: Instant) {
-        let due: Vec<(String, i64)> = self
-            .quiet
-            .iter_mut()
-            .filter(|(_, (_, at, checked))| !*checked && now.duration_since(*at) >= QUIET_AFTER)
-            .map(|(task, (turn, _, checked))| {
-                *checked = true;
-                (task.clone(), *turn)
-            })
-            .collect();
-        for (task, turn) in due {
-            self.silences += 1;
-            let spell = Some(self.silences);
-            self.due(&task, turn, Kind::Quiet, None, None, spell);
-        }
     }
 
     /// The person's words to a task are what it works to next, as the
@@ -2567,7 +2446,7 @@ impl Lookout {
             from,
             status,
             node,
-            call: None,
+            theirs: false,
             brief: self.briefs.get(task).copied(),
             peers,
             exchange: self.exchanges.get(task).cloned().unwrap_or_default(),
@@ -2686,35 +2565,6 @@ impl Lookout {
         !item.reasons.is_empty() || !item.looks.is_empty()
     }
 
-    fn approvals_due(&mut self) {
-        let now = Instant::now();
-        let due: Vec<(String, i64)> = self
-            .approvals
-            .iter()
-            .filter(|(_, (since, _))| now.duration_since(*since) >= APPROVAL_AFTER)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for (task, turn) in due {
-            let call = self
-                .approvals
-                .remove(&(task.clone(), turn))
-                .and_then(|(_, call)| call);
-            if self.due(&task, turn, Kind::Waiting, None, None, None)
-                && let Some(seen) = self.due.last_mut()
-            {
-                seen.call = call;
-            }
-        }
-    }
-
-    /// Checks every approval still waiting, however long it has waited.
-    fn still_waiting(&mut self) {
-        for (since, _) in self.approvals.values_mut() {
-            *since = Instant::now() - APPROVAL_AFTER;
-        }
-        self.approvals_due();
-    }
-
     fn peers_of(&self, task: &str) -> Vec<String> {
         let mut peers: Vec<String> = (self.lineage.iter())
             .chain(
@@ -2759,7 +2609,6 @@ impl Lookout {
                 if band == Band::Drop {
                     self.dropped += 1;
                 } else {
-                    self.held_since.get_or_insert_with(Instant::now);
                     let seen = Seen {
                         text: checked.text,
                         from: match checked.unattributed {
@@ -2776,7 +2625,7 @@ impl Lookout {
                     };
                     // Subscriptions may have changed while it was judged.
                     if self.still_asked(&mut item) {
-                        self.held.push(item);
+                        self.hold(item);
                     }
                 }
             }
@@ -2798,8 +2647,7 @@ impl Lookout {
                 {
                     self.due.push(seen);
                 } else {
-                    self.held_since.get_or_insert_with(Instant::now);
-                    self.held.push(Item {
+                    self.hold(Item {
                         seen,
                         reasons: Vec::new(),
                         looks: Vec::new(),
@@ -2811,6 +2659,19 @@ impl Lookout {
             Err(Failure::Unasked) => line["skipped"] = json!("nothing to ask"),
         }
         self.write(&line);
+    }
+
+    /// An item for the next note. What only might matter sends none by
+    /// itself, so the oldest of it goes once there is too much.
+    fn hold(&mut self, item: Item) {
+        self.held.push(item);
+        let middling = (self.held.iter()).filter(|item| item.band == Band::Hold);
+        if middling.count() > HELD
+            && let Some(at) = self.held.iter().position(|item| item.band == Band::Hold)
+        {
+            self.held.remove(at);
+            self.dropped += 1;
+        }
     }
 
     /// What the items still held after a note ask for: `Some(steer)` while
@@ -2825,16 +2686,14 @@ impl Lookout {
             .reduce(|a, b| a || b)
     }
 
-    /// Tell the lead what is held, when a high answer is waiting and the
-    /// last wake is far enough back, or when middle answers waited long;
-    /// or its task updates, once it rests. Either note carries everything.
+    /// Tell the lead at once what an urgent answer found, steering it; or,
+    /// once it rests, everything else the judge picked and its task
+    /// updates. Either note carries everything.
     async fn wake(&mut self, client: &Client) {
         let now = Instant::now();
-        let judged = self.wake_due(now);
-        if !judged && (self.refused(now) || !self.updating || !self.updates.due(now)) {
+        let Some(steer) = self.wake_due(now) else {
             return;
-        }
-        let steer = judged && self.urgent == Some(true);
+        };
         // A bounded note sends what woke it first: steers, then other wakes.
         self.held.sort_by_key(|item| match item.band {
             Band::Wake { steer: true } => 0,
@@ -2845,21 +2704,17 @@ impl Lookout {
         let sent: Vec<Item> = self.held.drain(..take).collect();
         let told = match self.updating {
             true => self.updates.take(now),
-            false => updates::Told::default(),
+            false => {
+                self.updates.noted(now);
+                updates::Told::default()
+            }
         };
         let prompt = note(&sent, self.held.len(), &told, self.dropped);
         let mut key: Vec<String> = sent
             .iter()
             .map(|item| {
                 let seen = &item.seen;
-                // Two approvals in one turn are two notes, and so are two
-                // silences.
-                let call = match (seen.kind, &seen.call, seen.node) {
-                    (_, Some(call), _) => format!("/{call}"),
-                    (Kind::Quiet, _, Some(spell)) => format!("/{spell}"),
-                    _ => String::new(),
-                };
-                format!("{}/{}/{:?}{call}", seen.task, seen.turn, seen.kind)
+                format!("{}/{}/{:?}", seen.task, seen.turn, seen.kind)
             })
             .collect();
         key.extend(told.items.iter().map(|line| line.key.clone()));
@@ -2874,18 +2729,15 @@ impl Lookout {
             .await;
         match submitted {
             Ok(_) => {
-                self.last_wake = Some(now);
                 self.refused = None;
                 self.dropped = 0;
                 self.urgent = self.pending();
-                self.held_since = (!self.held.is_empty()).then_some(now);
                 self.updates.sent(told);
                 self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
                     "delivery": delivery}));
             }
             // The same news twice is one note.
             Err(error) if error.code == "idempotency_conflict" => {
-                self.last_wake = Some(now);
                 self.urgent = self.pending();
                 self.updates.sent(told);
             }
@@ -2897,30 +2749,26 @@ impl Lookout {
                 self.write(
                     &json!({"at_ms": epoch_ms(), "lead": self.lead, "wake_failed": error.code}),
                 );
-                self.last_wake = Some(now);
                 self.refused = Some(now);
             }
         }
+    }
+
+    /// Whether a note is to go now, and whether it steers: at once for an
+    /// urgent answer, else for a high answer or task updates once the lead
+    /// rests and last heard long enough ago; middle answers go with it.
+    fn wake_due(&self, now: Instant) -> Option<bool> {
+        if self.refused(now) {
+            return None;
+        }
+        let steer = self.urgent == Some(true);
+        (steer || self.updates.due(now, self.urgent.is_some())).then_some(steer)
     }
 
     /// The last note was refused lately: even a steer waits the gap after.
     fn refused(&self, now: Instant) -> bool {
         self.refused
             .is_some_and(|at| now.duration_since(at) < WAKE_GAP)
-    }
-
-    /// A steer is worth cutting in at once; other high answers wait out
-    /// the gap since the last wake, and middle ones the digest's quiet spell.
-    fn wake_due(&self, now: Instant) -> bool {
-        let spaced = self
-            .last_wake
-            .is_none_or(|last| now.duration_since(last) >= WAKE_GAP);
-        let stale = self
-            .held_since
-            .is_some_and(|since| now.duration_since(since) >= DIGEST_AFTER);
-        !self.held.is_empty()
-            && !self.refused(now)
-            && (self.urgent == Some(true) || (spaced && (self.urgent.is_some() || stale)))
     }
 
     fn write(&self, line: &Value) {
@@ -3008,7 +2856,6 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
             events.extend(retained(&socket, &bot).await);
         }
         events.sort_by_key(|e| e["cursor"].as_i64().unwrap_or(0));
-        let mut waits: HashMap<(String, i64), (i64, At)> = HashMap::new();
         // The lead's history nodes as its events named them, oldest first,
         // and where its last finished turn left it: a round of many calls
         // may hold no node a fork can start from, but that one always is.
@@ -3034,15 +2881,6 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
             let before = lookout.due.len();
             lookout.event(event);
             let cursor = event["cursor"].as_i64().unwrap_or(0);
-            if let ("turn_waiting", Some(bot), Some(turn)) = (
-                event["event"].as_str().unwrap_or_default(),
-                event["bot"].as_str(),
-                event["turn"].as_i64(),
-            ) {
-                waits
-                    .entry((bot.to_owned(), turn))
-                    .or_insert_with(|| (cursor, at(&stood, closed)));
-            }
             for seen in lookout.due.drain(before..) {
                 due.push((
                     cursor,
@@ -3052,17 +2890,6 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
                     at(&stood, closed),
                 ));
             }
-        }
-        // Events carry no times, so only an approval still waiting when the
-        // history ends is known to be overdue; it is checked at its wait.
-        lookout.still_waiting();
-        for seen in lookout.due.drain(..) {
-            // Where the lead stood at the wait, not at the end.
-            let (cursor, stood_then) = waits
-                .get(&(seen.task.clone(), seen.turn))
-                .cloned()
-                .unwrap_or_else(|| (0, at(&[], None)));
-            due.push((cursor, lead.to_owned(), workspace.clone(), seen, stood_then));
         }
     }
     // The newest checks across every lead, oldest first, so a lead's story
@@ -3194,28 +3021,43 @@ mod tests {
     #[test]
     fn each_event_asks_its_own_questions() {
         let ids = |kind| asked(kind).iter().map(|q| q.id).collect::<Vec<_>>();
-        assert_eq!(
-            ids(Kind::Said),
-            [
-                "redirects",
-                "sibling_needs",
-                "conflict",
-                "drifts",
-                "remember"
-            ]
-        );
-        assert_eq!(
-            ids(Kind::Ended),
-            [
-                "sibling_needs",
-                "conflict",
-                "drifts",
-                "stuck",
-                "lead_next",
-                "result"
-            ]
-        );
-        assert_eq!(ids(Kind::Waiting), ["stuck"]);
+        assert_eq!(ids(Kind::Said), ["redirects", "conflict", "drifts"]);
+        assert_eq!(ids(Kind::Ended), ["conflict", "drifts", "stuck", "result"]);
+    }
+
+    #[test]
+    fn a_turn_the_person_asked_for_is_not_asked_for_a_result() {
+        let mut lookout = lookout();
+        lookout.event(&ev("calc.fix", 4, "accepted", json!({})));
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        lookout.event(&ev(
+            "calc.fix",
+            5,
+            "accepted",
+            json!({"from": {"bot": "calc.lead"}}),
+        ));
+        lookout.event(&ev(
+            "calc.fix",
+            5,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        let ids = |seen: &Seen| {
+            questions(seen)
+                .into_iter()
+                .map(|q| q.id)
+                .collect::<Vec<_>>()
+        };
+        let ended: Vec<&Seen> = (lookout.due.iter())
+            .filter(|seen| seen.kind == Kind::Ended)
+            .collect();
+        assert!(ended[0].theirs && !ids(ended[0]).contains(&"result".to_owned()));
+        assert!(!ended[1].theirs && ids(ended[1]).contains(&"result".to_owned()));
     }
 
     #[test]
@@ -3225,9 +3067,9 @@ mod tests {
         assert_eq!(reasons, [("drifts", 0.8)]);
         let (band_of, _) = band(&answers(&[("conflict", 0.7), ("drifts", 0.9)]));
         assert_eq!(band_of, Band::Wake { steer: true });
-        let (band_of, reasons) = band(&answers(&[("remember", 0.5), ("redirects", 0.1)]));
+        let (band_of, reasons) = band(&answers(&[("result", 0.5), ("redirects", 0.1)]));
         assert_eq!(band_of, Band::Hold);
-        assert_eq!(reasons, [("remember", 0.5)]);
+        assert_eq!(reasons, [("result", 0.5)]);
         assert_eq!(band(&answers(&[("stuck", 0.34)])).0, Band::Drop);
         assert_eq!(band(&Map::new()).0, Band::Drop);
     }
@@ -3241,7 +3083,7 @@ mod tests {
             from: Some("the person".into()),
             status: None,
             node: None,
-            call: None,
+            theirs: false,
             brief: None,
             peers: Vec::new(),
             exchange: Vec::new(),
@@ -3269,7 +3111,8 @@ mod tests {
     #[test]
     fn requests_take_each_api_s_shape() {
         let input = json!({"event": {}});
-        let questions: Vec<Asked> = (asked(Kind::Waiting).into_iter())
+        let questions: Vec<Asked> = (asked(Kind::Ended).into_iter())
+            .filter(|q| q.id == "stuck")
             .map(|q| Asked {
                 id: q.id.to_owned(),
                 text: q.text.to_owned(),
@@ -3281,7 +3124,7 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], input.to_string());
         assert_eq!(
             body["questions"],
-            json!([{"type": "predicate", "name": "stuck", "instructions": QUESTIONS[4].text}])
+            json!([{"type": "predicate", "name": "stuck", "instructions": QUESTIONS[3].text}])
         );
         let (path, body) = judge(Api::Jev).request(&input, &questions);
         assert_eq!(path, "/v1/systemone");
@@ -3299,7 +3142,7 @@ mod tests {
                 from: None,
                 status: Some("completed".into()),
                 node: None,
-                call: None,
+                theirs: false,
                 brief: None,
                 peers: Vec::new(),
                 exchange: Vec::new(),
@@ -3320,11 +3163,7 @@ mod tests {
                 text: "Use tabs everywhere.\nThanks.".into(),
                 ..item.seen.clone()
             },
-            reasons: vec![
-                ("redirects", 0.97),
-                ("remember", 0.91),
-                ("sibling_needs", 0.79),
-            ],
+            reasons: vec![("redirects", 0.97), ("conflict", 0.79)],
             looks: Vec::new(),
             band: Band::Wake { steer: true },
         };
@@ -3335,7 +3174,7 @@ mod tests {
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs: turn:calc.docs/3, the person wrote in it (redirects 0.97, remember 0.91, sibling needs 0.79; pass it to every task it applies to, and save it with your memory skill): \"Use tabs everywhere. Thanks.\""
+            "- calc.docs: turn:calc.docs/3, the person wrote in it (redirects 0.97, conflict 0.79; pass it to every task it applies to): \"Use tabs everywhere. Thanks.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
     }
@@ -3350,7 +3189,7 @@ mod tests {
                 from: None,
                 status: Some("completed".into()),
                 node: None,
-                call: None,
+                theirs: false,
                 brief: None,
                 peers: Vec::new(),
                 exchange: Vec::new(),
@@ -3380,7 +3219,7 @@ mod tests {
             "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
              May need you:\n\
              - calc.fix: turn:calc.fix/12, turn completed (result 0.90; tell the person)\n\
-             Ended or waiting for an approval:\n\
+             Ended, waiting for an approval, or gone quiet:\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              The person asked for these in the task themselves, so they are theirs:\n\
              - calc.ui: turn:calc.ui/2 completed\n\
@@ -3396,7 +3235,7 @@ mod tests {
         assert_eq!(
             note(&[], 0, &told, 0),
             "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
-             Ended or waiting for an approval:\n\
+             Ended, waiting for an approval, or gone quiet:\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              If nothing needs you, end with one line."
         );
@@ -3446,27 +3285,6 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert_eq!(lookout.due.len(), 1);
-        // A wait that timed out read no silence: the task is still news.
-        lookout.due.clear();
-        let quiet = Seen {
-            turn: 3,
-            kind: Kind::Quiet,
-            ..lookout.due_seen()
-        };
-        let wait = json!({"name": "wait", "arguments": json!({"handles": ["turn:calc.fix/3"], "timeout_ms": 0}).to_string()});
-        lookout.event(&ev("calc.lead", 8, "tool_started", wait));
-        lookout.answered(
-            quiet,
-            Ok(Checked {
-                answers: answers(&[("stuck", 0.9)]),
-                tokens: 0,
-                cached: 0,
-                ms: 0,
-                text: String::new(),
-                unattributed: false,
-            }),
-        );
-        assert_eq!(lookout.held.len(), 1);
     }
 
     #[test]
@@ -3509,7 +3327,7 @@ mod tests {
                 from: None,
                 status: Some("completed".into()),
                 node: None,
-                call: None,
+                theirs: false,
                 brief: None,
                 peers: Vec::new(),
                 exchange: Vec::new(),
@@ -3587,7 +3405,7 @@ mod tests {
                 from: None,
                 status: Some("completed".into()),
                 node: None,
-                call: None,
+                theirs: false,
                 brief: None,
                 peers: Vec::new(),
                 exchange: Vec::new(),
@@ -3725,7 +3543,7 @@ mod tests {
                 from: None,
                 status: Some("completed".into()),
                 node: None,
-                call: None,
+                theirs: false,
                 brief: None,
                 peers: Vec::new(),
                 exchange: Vec::new(),
@@ -3759,30 +3577,6 @@ mod tests {
             .collect();
         lookout.roots(&records);
         assert!(lookout.watches("r.a") && lookout.watches("r.b"));
-    }
-
-    #[test]
-    fn an_approval_nobody_asks_about_keeps_its_call_to_itself() {
-        let mut lookout = lookout();
-        let mut tasks = subs::Sub::lead("calc.lead", "calc");
-        tasks.on = vec![Kind::Ended];
-        let mut ops = sub("ops", &[], &["ops.*"]);
-        ops.on = vec![Kind::Waiting];
-        lookout.subs = vec![tasks, ops];
-        lookout.globbed.insert("ops.x".into());
-        let long_ago = Instant::now() - APPROVAL_AFTER;
-        lookout
-            .approvals
-            .insert(("ops.x".into(), 1), (long_ago, Some("a".into())));
-        lookout
-            .approvals
-            .insert(("calc.fix".into(), 2), (long_ago, Some("b".into())));
-        lookout.approvals_due();
-        assert_eq!(lookout.due.len(), 1);
-        assert_eq!(
-            (lookout.due[0].task.as_str(), lookout.due[0].call.as_deref()),
-            ("ops.x", Some("a"))
-        );
     }
 
     #[test]
@@ -3887,7 +3681,7 @@ mod tests {
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
         assert!(lookout.updating && lookout.watches("calc.fix"));
         turn(lookout, "calc.review");
-        assert!(!lookout.updates.due(later));
+        assert!(!lookout.updates.due(later, false));
         // Made before the lead was seated, its turn is still news.
         turn(lookout, "calc.fix");
         let told = lookout.updates.take(later);
@@ -3898,11 +3692,11 @@ mod tests {
         let after = later + Duration::from_secs(3600);
         // A task that subscribes after its news came: no one's task now.
         turn(lookout, "calc.ops");
-        assert!(lookout.updates.due(after));
+        assert!(lookout.updates.due(after, false));
         service.subscribers.insert("calc.ops".into(), Vec::new());
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
-        assert!(!lookout.updates.due(after));
+        assert!(!lookout.updates.due(after, false));
         service.subscribers.remove("calc.ops");
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
@@ -3915,9 +3709,9 @@ mod tests {
             .insert("calc.lead".into(), vec![sub("x", &["calc.lead"], &[])]);
         service.resubscribe();
         let lookout = service.lookouts.get_mut("calc.lead").unwrap();
-        assert!(!lookout.updating && !lookout.updates.due(after));
+        assert!(!lookout.updating && !lookout.updates.due(after, false));
         turn(lookout, "calc.fix");
-        assert!(!lookout.updates.due(after));
+        assert!(!lookout.updates.due(after, false));
         // Followed while off, so the lead's wait on a task still holds
         // that task's news back once they are asked for again.
         let mut waiting = ev("calc.lead", 1, "accepted", json!({}));
@@ -3942,9 +3736,9 @@ mod tests {
         ));
         lookout.event(&ev("calc.fix", 2, "turn_finished", finished.clone()));
         lookout.event(&ev("calc.lead", 1, "turn_finished", finished));
-        assert!(!lookout.updates.due(after));
+        assert!(!lookout.updates.due(after, false));
         turn(lookout, "calc.fix");
-        assert!(lookout.updates.due(after));
+        assert!(lookout.updates.due(after, false));
     }
 
     #[test]
@@ -3975,11 +3769,11 @@ mod tests {
         assert_eq!(lines[0], "Lookout · not running");
         assert_eq!(
             lines[1],
-            "tasks · tasks of calc.lead, bots calc.* · on said, ended, waiting, quiet · asks every built-in · task updates · 2 checks in the last day"
+            "tasks · tasks of calc.lead, bots calc.* · on said, ended · asks every built-in · task updates · 2 checks in the last day"
         );
         assert_eq!(
             lines[2],
-            "ops · bots ops.* · on said, ended, waiting, quiet · asks every built-in · 1 checks in the last day"
+            "ops · bots ops.* · on said, ended · asks every built-in · 1 checks in the last day"
         );
         assert_eq!(
             subscriptions(&store, "reviewer")[1],
@@ -4054,8 +3848,8 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert!(lookout.due.len() == 1 && lookout.judge.is_none());
-        assert!(!lookout.wake_due(now), "nothing judged");
-        assert!(lookout.updates.due(now));
+        assert_eq!(lookout.wake_due(now), Some(false), "no steer");
+        assert!(lookout.updates.due(now, false));
         let told = lookout.updates.take(now);
         assert_eq!(
             told.items[0].text,
@@ -4149,112 +3943,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_checks_an_approval_still_waiting_at_the_end() {
-        let mut lookout = lookout();
-        lookout.event(&ev(
-            "calc.fix",
-            4,
-            "turn_waiting",
-            json!({"approval": true, "call_id": "call_1"}),
-        ));
-        lookout.event(&ev(
-            "calc.fix",
-            5,
-            "turn_waiting",
-            json!({"approval": true, "call_id": "call_2"}),
-        ));
-        lookout.event(&ev("calc.fix", 5, "tool_completed", json!({})));
-        lookout.still_waiting();
-        assert_eq!(lookout.due.len(), 1);
-        assert_eq!(lookout.due[0].kind, Kind::Waiting);
-        assert_eq!(lookout.due[0].turn, 4);
-        assert_eq!(lookout.due[0].call.as_deref(), Some("call_1"));
-        assert!(lookout.approvals.is_empty());
-    }
-
-    #[test]
-    fn a_turn_silent_for_a_long_while_is_checked_once_per_silence() {
-        let mut lookout = lookout();
-        lookout.event(&ev(
-            "calc.fix",
-            3,
-            "accepted",
-            json!({"from": {"bot": "calc.lead"}}),
-        ));
-        let now = Instant::now();
-        lookout.quiet_due(now);
-        assert!(lookout.due.is_empty());
-        let later = now + QUIET_AFTER;
-        lookout.quiet_due(later);
-        assert_eq!((lookout.due[0].kind, lookout.due[0].turn), (Kind::Quiet, 3));
-        assert_eq!(
-            asked(Kind::Quiet).iter().map(|q| q.id).collect::<Vec<_>>(),
-            ["stuck"]
-        );
-        lookout.due.clear();
-        lookout.quiet_due(later);
-        assert!(lookout.due.is_empty());
-        // Printing again starts a new silence.
-        lookout.event(&ev("calc.fix", 3, "text_delta", json!({"text": "x"})));
-        lookout.quiet_due(Instant::now() + QUIET_AFTER);
-        assert_eq!(lookout.due.len(), 1);
-        // A turn waiting on the person or on other turns is not silent,
-        // and one that ended is gone.
-        lookout.due.clear();
-        lookout.event(&ev("calc.fix", 3, "turn_waiting", json!({"handles": []})));
-        lookout.quiet_due(Instant::now() + 2 * QUIET_AFTER);
-        assert!(lookout.due.is_empty());
-        lookout.event(&ev("calc.fix", 3, "turn_resumed", json!({})));
-        lookout.event(&ev(
-            "calc.fix",
-            3,
-            "turn_finished",
-            json!({"status": "completed"}),
-        ));
-        lookout.due.clear();
-        lookout.quiet_due(Instant::now() + 2 * QUIET_AFTER);
-        assert!(lookout.due.is_empty());
-        // A turn already running when its bot came to be watched is
-        // tracked from what it does next.
-        lookout.event(&ev("calc.fix", 8, "tool_started", json!({"name": "shell"})));
-        lookout.quiet_due(Instant::now() + 2 * QUIET_AFTER);
-        assert_eq!((lookout.due[0].kind, lookout.due[0].turn), (Kind::Quiet, 8));
-    }
-
-    #[test]
-    fn an_approval_is_news_only_after_a_while() {
-        let mut lookout = lookout();
-        lookout.event(&ev(
-            "calc.fix",
-            4,
-            "turn_waiting",
-            json!({"approval": true, "call_id": "call_1"}),
-        ));
-        lookout.approvals_due();
-        assert!(lookout.due.is_empty());
-        assert_eq!(
-            lookout.approvals[&("calc.fix".into(), 4)].1.as_deref(),
-            Some("call_1")
-        );
-        let since = Instant::now() - APPROVAL_AFTER;
-        lookout
-            .approvals
-            .insert(("calc.fix".into(), 4), (since, Some("call_1".into())));
-        lookout.approvals_due();
-        assert_eq!(lookout.due[0].kind, Kind::Waiting);
-        assert_eq!(lookout.due[0].call.as_deref(), Some("call_1"));
-        // An answered one is not.
-        lookout.event(&ev(
-            "calc.fix",
-            5,
-            "turn_waiting",
-            json!({"approval": "call_2"}),
-        ));
-        lookout.event(&ev("calc.fix", 5, "tool_completed", json!({})));
-        assert!(lookout.approvals.is_empty());
-    }
-
-    #[test]
     fn answers_are_held_until_a_wake_is_due() {
         let mut lookout = lookout();
         let seen = |turn| Seen {
@@ -4264,7 +3952,7 @@ mod tests {
             from: None,
             status: Some("completed".into()),
             node: None,
-            call: None,
+            theirs: false,
             brief: None,
             peers: Vec::new(),
             exchange: Vec::new(),
@@ -4456,11 +4144,36 @@ mod tests {
     }
 
     #[test]
-    fn a_steer_skips_the_gap_and_a_queue_waits() {
+    fn a_steer_goes_at_once_and_the_rest_waits_for_the_lead_to_rest() {
         let mut lookout = lookout();
+        let lead = json!({"bot_id": 1, "status": "idle"});
+        lookout.event(&json!({"bot": "calc.lead", "event": "created", "data": lead}));
+        lookout.event(&json!({"event": "follow_live"}));
         let now = Instant::now();
-        lookout.last_wake = Some(now);
+        assert_eq!(lookout.wake_due(now), None, "nothing to tell");
+        // A middle answer sends no note by itself, and the oldest of many
+        // is dropped.
         let seen = lookout.due_seen();
+        for turn in 0..=HELD as i64 {
+            lookout.hold(Item {
+                seen: Seen {
+                    turn,
+                    ..seen.clone()
+                },
+                reasons: vec![("stuck", 0.5)],
+                looks: Vec::new(),
+                band: Band::Hold,
+            });
+        }
+        assert_eq!(lookout.wake_due(now), None);
+        assert_eq!(
+            (
+                lookout.held.len(),
+                lookout.held[0].seen.turn,
+                lookout.dropped
+            ),
+            (HELD, 1, 1)
+        );
         lookout.held.push(Item {
             seen,
             reasons: vec![("drifts", 0.9)],
@@ -4468,19 +4181,20 @@ mod tests {
             band: Band::Wake { steer: false },
         });
         lookout.urgent = Some(false);
-        assert!(!lookout.wake_due(now));
-        assert!(lookout.wake_due(now + WAKE_GAP));
+        assert_eq!(lookout.wake_due(now), Some(false));
+        // It waits as long after the last note as task updates do.
+        lookout.updates.noted(now);
+        assert_eq!(lookout.wake_due(now), None);
+        assert_eq!(lookout.wake_due(now + updates::WAKE), Some(false));
+        // And for the lead to rest; a steer does not.
+        lookout.event(&ev("calc.lead", 2, "accepted", json!({})));
+        assert_eq!(lookout.wake_due(now + updates::WAKE), None);
         lookout.urgent = Some(true);
-        assert!(lookout.wake_due(now));
+        assert_eq!(lookout.wake_due(now), Some(true));
         // A refused note is not sent again on every event.
         lookout.refused = Some(now);
-        assert!(!lookout.wake_due(now));
-        assert!(lookout.wake_due(now + WAKE_GAP));
-        lookout.refused = None;
-        lookout.urgent = None;
-        lookout.held_since = Some(now);
-        assert!(!lookout.wake_due(now + WAKE_GAP));
-        assert!(lookout.wake_due(now + DIGEST_AFTER));
+        assert_eq!(lookout.wake_due(now), None);
+        assert_eq!(lookout.wake_due(now + WAKE_GAP), Some(true));
     }
 
     #[test]
@@ -4501,22 +4215,6 @@ mod tests {
         assert_eq!(lookout.pending(), None);
         lookout.held.push(item(Band::Wake { steer: false }));
         assert_eq!(lookout.pending(), Some(false));
-    }
-
-    #[test]
-    fn an_approval_is_cleared_only_by_its_own_turn() {
-        let mut lookout = lookout();
-        let waiting = json!({"approval": {"call_id": "c1"}});
-        lookout.event(&ev("calc.fix", 4, "turn_waiting", waiting));
-        lookout.event(&ev(
-            "calc.fix",
-            5,
-            "turn_finished",
-            json!({"status": "interrupted"}),
-        ));
-        assert!(lookout.approvals.contains_key(&("calc.fix".into(), 4)));
-        lookout.event(&ev("calc.fix", 4, "tool_completed", json!({})));
-        assert!(lookout.approvals.is_empty());
     }
 
     #[test]
