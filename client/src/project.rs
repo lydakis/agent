@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(create["model"], "alpha/role");
         assert!(
             create.get("settings").is_none(),
-            "only Anthropic's API takes an hour"
+            "only Claude takes an hour"
         );
         assert!(
             create.get("effort").is_none(),

@@ -67,13 +67,16 @@ Your final reply already reaches whoever waits on your turn, so contact your cre
 not to report results.";
 
 /// The prompt-cache lifetime human-facing clients make a bot with: an hour
-/// on Anthropic's own API, where a lead or monitor that rests past five
-/// minutes would otherwise send its whole context again uncached. An hour's
-/// writes cost twice the input rate instead of 1.25 times, and a read a
-/// tenth. Other providers keep their default: Bedrock is not known to take
-/// an hour, and Responses providers have no such setting.
+/// on Anthropic's API and on Bedrock, where a lead or monitor that rests past
+/// five minutes would otherwise send its whole context again uncached. An
+/// hour's writes cost twice the input rate instead of 1.25 times, and a read
+/// a tenth. Bedrock refuses the hour for Claude 3 models (its prompt-caching
+/// guide, read 2026-10-27), which keep five minutes; Responses providers have
+/// no such setting.
 pub fn cache_ttl(model: &str) -> Option<&'static str> {
-    model.starts_with("anthropic/").then_some("1h")
+    let claude = model.starts_with("anthropic/")
+        || (model.starts_with("bedrock/") && !model.contains("claude-3"));
+    claude.then_some("1h")
 }
 
 /// What human-facing clients tell a new bot's summarizer at compaction. The daemon has
@@ -872,10 +875,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_anthropics_api_caches_for_an_hour() {
-        assert_eq!(cache_ttl("anthropic/claude-opus-5-5"), Some("1h"));
+    fn claude_caches_for_an_hour_where_its_provider_takes_one() {
         for model in [
-            "bedrock/claude-opus-5-5",
+            "anthropic/claude-opus-5-5",
+            "bedrock/us.anthropic.claude-opus-5-5-v1:0",
+        ] {
+            assert_eq!(cache_ttl(model), Some("1h"), "{model}");
+        }
+        for model in [
+            "bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0",
             "openai/gpt-6",
             "chatgpt/gpt-6-sol",
         ] {
