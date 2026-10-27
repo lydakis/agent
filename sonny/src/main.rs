@@ -1917,24 +1917,33 @@ impl App {
     /// Drop the staged prompts that landed while Sonny was away, whose
     /// `accepted` or `steered` it missed: those whose turn no longer waits.
     async fn unstage_landed(&mut self) {
-        if self.staged.is_empty() {
+        let ids = self.staged.iter().map(|(turn, _)| *turn);
+        let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
             return;
+        };
+        // Every turn from the first staged to the last, a page at a time:
+        // other clients may have sent many between them.
+        let mut waiting: Vec<i64> = Vec::new();
+        let mut after = first - 1;
+        loop {
+            let asked = json!({"bot": self.bot, "after": after, "before": last + 1, "limit": 256});
+            let Ok(page) = self.client.request("turns", asked).await else {
+                // Unread, they stay as they are.
+                return;
+            };
+            waiting.extend(
+                page["turns"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+                    .filter_map(|row| row["turn"].as_i64()),
+            );
+            match page["next_after"].as_i64() {
+                Some(next) => after = next,
+                None => break,
+            }
         }
-        let page = self
-            .client
-            .request(
-                "turns",
-                json!({"bot": self.bot, "newest": true, "limit": 64}),
-            )
-            .await
-            .unwrap_or_default();
-        let waiting: Vec<i64> = page["turns"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
-            .filter_map(|row| row["turn"].as_i64())
-            .collect();
         self.staged.retain(|(turn, _)| waiting.contains(turn));
     }
 
@@ -3644,15 +3653,21 @@ mod tests {
 
     #[tokio::test]
     async fn on_reconnecting_only_prompts_still_waiting_stay_staged() {
-        let client = daemon_answering(|asked| match asked["op"].as_str() {
-            Some("turns") => json!({"turns": [
-                {"turn": 7, "status": "queued"},
-                {"turn": 6, "status": "running"},
+        // Two pages, from the first staged turn on.
+        let client =
+            daemon_answering(
+                |asked| match (asked["op"].as_str(), asked["after"].as_i64()) {
+                    (Some("turns"), Some(4)) => json!({"turns": [
                 {"turn": 5, "status": "steered"},
-            ]}),
-            _ => json!({}),
-        })
-        .await;
+                {"turn": 6, "status": "running"},
+            ], "next_after": 6}),
+                    (Some("turns"), Some(6)) => json!({"turns": [
+                {"turn": 7, "status": "queued"},
+            ], "next_after": null}),
+                    _ => json!({}),
+                },
+            )
+            .await;
         let mut app = app(client);
         app.staged = vec![
             (5, "a".into()),
