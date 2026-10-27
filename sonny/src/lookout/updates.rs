@@ -132,6 +132,9 @@ pub struct Updates {
     memory: Vec<PathBuf>,
     /// Bots with subscriptions of their own: no one's tasks here.
     subscribers: HashSet<String>,
+    /// The bots whose news this is, as the lookout's subscriptions with
+    /// task updates name them.
+    pub watched: HashSet<String>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -166,6 +169,7 @@ impl Updates {
             lead: lead.to_owned(),
             memory,
             subscribers: HashSet::new(),
+            watched: HashSet::new(),
             live: false,
             bots: HashMap::new(),
             from: HashMap::new(),
@@ -403,10 +407,11 @@ impl Updates {
         }
     }
 
-    /// Whether the bot is one of the lead's own tasks: one it made, not a
-    /// fork of it nor a subscriber of its own.
+    /// Whether the bot is one of the lead's tasks: one a subscription with
+    /// task updates watches, not a fork of the lead nor a subscriber of its
+    /// own.
     fn task(&self, name: &str) -> bool {
-        self.creator(name) == Some(self.lead.as_str())
+        self.watched.contains(name)
             && !self.subscribers.contains(name)
             && !name.starts_with(&format!("{}-", self.lead))
     }
@@ -641,6 +646,11 @@ impl Updates {
     }
 
     /// The lead's ID, to send it the note and no later bot of its name.
+    /// Every bot seated, by name.
+    pub fn listed(&self) -> Vec<String> {
+        self.bots.keys().cloned().collect()
+    }
+
     pub fn lead_id(&self) -> Option<i64> {
         self.bots.get(&self.lead)?.id
     }
@@ -901,6 +911,8 @@ mod tests {
             );
         }
         updates.event(&json!({"event": "follow_live"}), now);
+        // The lead's own tasks, as its subscription names them.
+        updates.watched = ["shop.fix", "shop.docs"].map(str::to_owned).into();
         updates
     }
 

@@ -1085,6 +1085,11 @@ async fn serve(settings: Settings) -> Result<(), String> {
         log: PathBuf::from(log),
         seated: 0,
         live: false,
+        cursor: None,
+        saved: None,
+        resume: std::fs::read_to_string(cursor_path(&settings.store))
+            .ok()
+            .and_then(|text| text.trim().parse().ok()),
     };
     println!(
         "{}",
@@ -1127,6 +1132,12 @@ struct Service {
     seated: u64,
     /// The stream's replay is over: what happens now is news.
     live: bool,
+    /// The newest event seen live, and the newest saved beside the store:
+    /// a lookout started again tells what came after it.
+    cursor: Option<i64>,
+    saved: Option<i64>,
+    /// Where the last lookout left off: events after it are news.
+    resume: Option<i64>,
 }
 
 /// Every bot that one of `made` made, and what those made, as the daemon
@@ -1221,6 +1232,7 @@ impl Service {
         }
         let mut live = false;
         self.live = false;
+        self.resume = self.cursor.or(self.resume);
         let (done, mut results) = tokio::sync::mpsc::channel(64);
         // Often enough for a note whose news has settled; subscription
         // files less often.
@@ -1230,6 +1242,16 @@ impl Service {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { return };
+                    let cursor = event["cursor"].as_i64();
+                    // What happened since the lookout last watched live, as
+                    // a task that ended while it was down, is news now.
+                    if !live && cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen)) {
+                        live = true;
+                        self.go_live(&client).await;
+                    }
+                    if live && cursor > self.cursor {
+                        self.cursor = cursor;
+                    }
                     if let (Some("created" | "forked"), Some(name)) =
                         (event["event"].as_str(), event["bot"].as_str())
                     {
@@ -1254,22 +1276,15 @@ impl Service {
                     // The replay tells who belongs to each lead and each
                     // task's current brief; what it holds was news then.
                     if !live {
-                        live = event["event"] == "follow_live";
-                        self.live = live;
                         for lookout in self.lookouts.values_mut() {
                             // Nothing in it was checked, so a turn still
                             // queued is checked once it starts.
                             lookout.due.clear();
                             lookout.checked.clear();
                         }
-                        if live {
-                            let unpicked: Vec<Value> = (self.lookouts.values())
-                                .filter(|l| l.unpicked)
-                                .map(|l| l.record.clone())
-                                .collect();
-                            for record in unpicked {
-                                self.seat(&client, &record, true).await;
-                            }
+                        if event["event"] == "follow_live" {
+                            live = true;
+                            self.go_live(&client).await;
                         }
                         continue;
                     }
@@ -1297,6 +1312,7 @@ impl Service {
                 }
                 _ = tick.tick() => {
                     let now = Instant::now();
+                    self.save_cursor();
                     // What `sonny lookout add` and `rm` wrote since.
                     if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
@@ -1491,6 +1507,44 @@ impl Service {
     fn write(&self, line: &Value) {
         append(&self.log, line);
     }
+
+    /// The replay is over, or has reached what no lookout watched live:
+    /// news from here on, and each lead's judge picked.
+    async fn go_live(&mut self, client: &Client) {
+        self.live = true;
+        for lookout in self.lookouts.values_mut() {
+            lookout.updates.live = true;
+        }
+        let unpicked: Vec<Value> = (self.lookouts.values())
+            .filter(|l| l.unpicked)
+            .map(|l| l.record.clone())
+            .collect();
+        for record in unpicked {
+            self.seat(client, &record, true).await;
+        }
+    }
+
+    /// The newest event seen live, kept beside the store for the next
+    /// lookout, written whole and moved in.
+    fn save_cursor(&mut self) {
+        let Some(cursor) = self.cursor.filter(|_| self.cursor != self.saved) else {
+            return;
+        };
+        let path = cursor_path(&self.store);
+        let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
+        if std::fs::write(&partial, cursor.to_string()).is_ok()
+            && std::fs::rename(&partial, &path).is_ok()
+        {
+            self.saved = Some(cursor);
+        }
+    }
+}
+
+/// Where the newest event a lookout saw live is kept: beside the store.
+fn cursor_path(store: &Path) -> PathBuf {
+    let mut path = store.as_os_str().to_owned();
+    path.push(".lookout.cursor");
+    PathBuf::from(path)
 }
 
 /// The most of the check log `status` reads, from its end.
@@ -1710,11 +1764,29 @@ impl Lookout {
         }
     }
 
+    /// The bots whose task updates the subscriber hears: those its
+    /// subscriptions with task updates watch, among the bots listed.
+    fn sync(&mut self) {
+        let listed: Vec<String> = self.updates.listed();
+        let updating: Vec<&subs::Sub> = self.subs.iter().filter(|sub| sub.updates).collect();
+        let watched = (listed.into_iter())
+            .filter(|bot| updating.iter().any(|sub| self.sub_watches(sub, bot)))
+            .collect();
+        self.updates.watched = watched;
+    }
+
     /// Lineage is kept up during the replay too, so tasks made earlier count.
     fn lineage_of(&mut self, event: &Value) {
         let (Some(kind), Some(bot)) = (event["event"].as_str(), event["bot"].as_str()) else {
             return;
         };
+        if matches!(kind, "created" | "forked" | "deleted") {
+            self.lineage_change(kind, bot, event);
+            self.sync();
+        }
+    }
+
+    fn lineage_change(&mut self, kind: &str, bot: &str, event: &Value) {
         match kind {
             "created" | "forked" => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
@@ -2056,6 +2128,7 @@ impl Lookout {
             .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
             .map(|(name, _)| name.clone())
             .collect();
+        self.sync();
     }
 
     /// Whether a subscription's `--bot` glob names this bot.
@@ -2554,6 +2627,36 @@ mod tests {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
     }
 
+    fn seen(task: &str, turn: i64, kind: Kind) -> Seen {
+        Seen {
+            task: task.into(),
+            turn,
+            kind,
+            from: None,
+            status: (kind == Kind::Ended).then(|| "completed".into()),
+            node: None,
+            busy: true,
+            brief: None,
+            peers: Vec::new(),
+            asks: Asks::default(),
+            text: String::new(),
+        }
+    }
+
+    fn checked(pairs: &[(&str, f64)]) -> Option<Result<Checked, Failure>> {
+        Some(Ok(Checked {
+            answers: answers(pairs),
+            tokens: 0,
+            cached: 0,
+            ms: 0,
+        }))
+    }
+
+    /// The lead as `bots` lists it mid-turn.
+    fn busy(lookout: &mut Lookout) {
+        (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "running"}));
+    }
+
     #[test]
     fn news_the_lead_read_before_its_note_leaves_a_log_line() {
         let mut lookout = lookout();
@@ -2563,11 +2666,11 @@ mod tests {
         let seen = lookout.due_seen();
         lookout.held.push(Item {
             seen,
-            reasons: vec![("result", 0.95)],
+            reasons: vec![("interrupt", 0.95)],
             looks: Vec::new(),
-            band: Band::Wake { steer: false },
+            band: Band::Wake { steer: true },
         });
-        lookout.urgent = Some(false);
+        lookout.urgent = Some(true);
         lookout.read(&HashSet::from(["turn:calc.fix/1".to_owned()]));
         assert!(lookout.held.is_empty());
         assert_eq!(lookout.urgent, None);
@@ -2581,76 +2684,79 @@ mod tests {
     }
 
     #[test]
-    fn each_event_asks_its_own_questions() {
-        let ids = |kind| asked(kind).iter().map(|q| q.id).collect::<Vec<_>>();
-        assert_eq!(ids(Kind::Said), ["redirects", "conflict", "drifts"]);
-        assert_eq!(ids(Kind::Ended), ["conflict", "drifts", "stuck", "result"]);
-    }
-
-    #[test]
-    fn a_turn_the_person_asked_for_is_not_asked_for_a_result() {
+    fn only_a_lead_mid_turn_is_asked_whether_an_event_can_wait() {
         let mut lookout = lookout();
-        lookout.event(&ev("calc.fix", 4, "accepted", json!({})));
-        lookout.event(&ev(
-            "calc.fix",
-            4,
-            "turn_finished",
-            json!({"status": "completed"}),
-        ));
-        lookout.event(&ev(
-            "calc.fix",
-            5,
-            "accepted",
-            json!({"from": {"bot": "calc.lead"}}),
-        ));
-        lookout.event(&ev(
-            "calc.fix",
-            5,
-            "turn_finished",
-            json!({"status": "completed"}),
-        ));
         let ids = |seen: &Seen| {
             questions(seen)
                 .into_iter()
                 .map(|q| q.id)
                 .collect::<Vec<_>>()
         };
-        let ended: Vec<&Seen> = (lookout.due.iter())
-            .filter(|seen| seen.kind == Kind::Ended)
-            .collect();
-        assert!(ended[0].theirs && !ids(ended[0]).contains(&"result".to_owned()));
-        assert!(!ended[1].theirs && ids(ended[1]).contains(&"result".to_owned()));
+        let idle = lookout.due_seen();
+        assert!(!idle.busy && ids(&idle).is_empty());
+        busy(&mut lookout);
+        let working = lookout.due_seen();
+        assert!(working.busy);
+        assert_eq!(ids(&working), ["interrupt"]);
+        // What a subscription looks for is asked either way.
+        let mut idle = Seen {
+            busy: false,
+            ..working
+        };
+        idle.asks.looks = vec![(
+            "deploys look-for 1".into(),
+            subs::Look {
+                text: "a finished deploy".into(),
+                then: "tell the person".into(),
+                urgent: false,
+            },
+        )];
+        assert_eq!(ids(&idle), ["look_0"]);
     }
 
     #[test]
-    fn a_high_answer_wakes_and_an_urgent_one_steers() {
-        let (band_of, reasons) = band(&answers(&[("drifts", 0.8), ("stuck", 0.2)]));
-        assert_eq!(band_of, Band::Wake { steer: false });
-        assert_eq!(reasons, [("drifts", 0.8)]);
-        let (band_of, _) = band(&answers(&[("conflict", 0.7), ("drifts", 0.9)]));
-        assert_eq!(band_of, Band::Wake { steer: true });
-        let (band_of, reasons) = band(&answers(&[("result", 0.5), ("redirects", 0.1)]));
-        assert_eq!(band_of, Band::Hold);
-        assert_eq!(reasons, [("result", 0.5)]);
-        assert_eq!(band(&answers(&[("stuck", 0.34)])).0, Band::Drop);
-        assert_eq!(band(&Map::new()).0, Band::Drop);
+    fn a_yes_that_cannot_wait_steers_and_a_look_for_wakes() {
+        let look = |urgent| {
+            (
+                "deploys look-for 1".to_owned(),
+                subs::Look {
+                    text: "a finished deploy".into(),
+                    then: "tell the person".into(),
+                    urgent,
+                },
+            )
+        };
+        let (band, reasons, found) = graded(&answers(&[("interrupt", 0.9)]), &[]);
+        assert_eq!(
+            (band, reasons, found),
+            (Band::Wake { steer: true }, vec![("interrupt", 0.9)], vec![])
+        );
+        // Anything less than a yes is told with the task updates, if at all.
+        assert_eq!(graded(&answers(&[("interrupt", 0.6)]), &[]).0, Band::Drop);
+        assert_eq!(graded(&Map::new(), &[]).0, Band::Drop);
+        let (band, reasons, found) = graded(
+            &answers(&[("interrupt", 0.2), ("look_0", 0.95)]),
+            &[look(false)],
+        );
+        assert_eq!(band, Band::Wake { steer: false });
+        assert!(reasons.is_empty());
+        assert_eq!(found, [("deploys look-for 1".to_owned(), 0.95)]);
+        assert_eq!(
+            graded(&answers(&[("look_0", 0.95)]), &[look(true)]).0,
+            Band::Wake { steer: true }
+        );
+        assert_eq!(
+            graded(&answers(&[("look_0", 0.6)]), &[look(true)]).0,
+            Band::Drop
+        );
     }
 
     #[test]
     fn the_input_is_bounded_and_carries_memory() {
         let seen = Seen {
-            task: "calc.fix".into(),
-            turn: 3,
-            kind: Kind::Said,
             from: Some("the person".into()),
-            status: None,
-            node: None,
-            theirs: false,
-            brief: None,
-            peers: Vec::new(),
-            exchange: Vec::new(),
-            asks: Asks::default(),
             text: "x".repeat(EVENT_CHARS * 2),
+            ..seen("calc.fix", 3, Kind::Said)
         };
         let peers: Vec<Peer> = (0..ROSTER + 3)
             .map(|i| Peer {
@@ -2659,7 +2765,7 @@ mod tests {
                 latest: "y".repeat(LINE_CHARS * 2),
             })
             .collect();
-        let input = input(&seen, "brief", &[], &peers, "- a saved fact");
+        let input = input(&seen, "brief", &peers, "- a saved fact");
         let text = input["event"]["text"].as_str().unwrap();
         assert!(text.chars().count() < EVENT_CHARS + 64);
         assert!(text.contains("characters left out"));
@@ -2674,7 +2780,6 @@ mod tests {
     fn decisions_reads_the_input_and_asks_each_question_as_a_predicate() {
         let input = json!({"event": {}});
         let questions: Vec<(String, String)> = (asked(Kind::Ended).into_iter())
-            .filter(|q| q.id == "stuck")
             .map(|q| (q.id.to_owned(), q.text.to_owned()))
             .collect();
         let judge = judge(Api::Decisions);
@@ -2686,7 +2791,7 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], input.to_string());
         assert_eq!(
             body["questions"],
-            json!([{"type": "predicate", "name": "stuck", "instructions": QUESTIONS[3].text}])
+            json!([{"type": "predicate", "name": "interrupt", "instructions": QUESTIONS[0].text}])
         );
     }
 
@@ -2694,126 +2799,99 @@ mod tests {
     fn the_note_points_at_each_turn() {
         let item = Item {
             seen: Seen {
-                task: "calc.fix".into(),
-                turn: 12,
-                kind: Kind::Ended,
-                from: None,
-                status: Some("completed".into()),
-                node: None,
-                theirs: false,
-                brief: None,
-                peers: Vec::new(),
-                exchange: Vec::new(),
-                asks: Asks::default(),
                 text: "\nFixed avg by skipping empty lists.\nMore.".into(),
+                ..seen("calc.fix", 12, Kind::Ended)
             },
-            reasons: vec![("drifts", 0.82)],
-            looks: Vec::new(),
-            band: Band::Wake { steer: false },
-        };
-        let said = Item {
-            seen: Seen {
-                task: "calc.docs".into(),
-                turn: 3,
-                kind: Kind::Said,
-                from: Some(PERSON.into()),
-                status: None,
-                text: "Use tabs everywhere.\nThanks.".into(),
-                ..item.seen.clone()
-            },
-            reasons: vec![("redirects", 0.97), ("conflict", 0.79)],
+            reasons: vec![("interrupt", 0.92)],
             looks: Vec::new(),
             band: Band::Wake { steer: true },
         };
-        let note = note(&[item, said], 2, &updates::Told::default(), 0);
+        let said = Item {
+            seen: Seen {
+                from: Some(PERSON.into()),
+                text: "Use tabs everywhere.\nThanks.".into(),
+                ..seen("calc.docs", 3, Kind::Said)
+            },
+            reasons: Vec::new(),
+            looks: vec![("style look-for 1".into(), 0.97)],
+            band: Band::Wake { steer: false },
+        };
+        let note = note(&[item, said], 2, &updates::Told::default());
         // Only the person's own words are quoted.
         assert!(note.contains(
-            "- calc.fix: turn:calc.fix/12, turn completed (drifts 0.82; settle what the person means and steer the task with that reading)\n"
+            "- calc.fix: turn:calc.fix/12, turn completed (interrupt 0.92; it cannot wait for your turn to end)\n"
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs: turn:calc.docs/3, the person wrote in it (redirects 0.97, conflict 0.79; pass it to every task it applies to): \"Use tabs everywhere. Thanks.\""
+            "- calc.docs: turn:calc.docs/3, the person wrote in it (style look-for 1 0.97; do what your style look-for 1 says (sonny lookout ls)): \"Use tabs everywhere. Thanks.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
+        assert!(note.ends_with("Handle what cannot wait, then carry on with your turn."));
     }
 
     #[test]
     fn one_note_carries_what_was_picked_and_the_task_updates() {
         let picked = Item {
-            seen: Seen {
-                task: "calc.fix".into(),
-                turn: 12,
-                kind: Kind::Ended,
-                from: None,
-                status: Some("completed".into()),
-                node: None,
-                theirs: false,
-                brief: None,
-                peers: Vec::new(),
-                exchange: Vec::new(),
-                asks: Asks::default(),
-                text: String::new(),
-            },
-            reasons: vec![("result", 0.9)],
+            seen: seen("calc.fix", 12, Kind::Ended),
+            reasons: vec![("interrupt", 0.9)],
             looks: Vec::new(),
-            band: Band::Wake { steer: false },
+            band: Band::Wake { steer: true },
         };
-        let line = |task: &str, turn: i64, theirs: bool| updates::Line {
+        let line = |task: &str, turn: i64, theirs: bool, said: bool| updates::Line {
             handle: format!("turn:{task}/{turn}"),
+            said,
             theirs,
-            text: format!("- {task}: turn:{task}/{turn} completed"),
+            text: match said {
+                true => format!("- {task}: turn:{task}/{turn}, the person wrote: \"tabs\""),
+                false => format!("- {task}: turn:{task}/{turn} completed"),
+            },
             key: String::new(),
         };
         let mut told = updates::Told::default();
+        // The words that started the picked turn are still told.
         told.items = vec![
-            line("calc.fix", 12, false),
-            line("calc.docs", 3, false),
-            line("calc.ui", 2, true),
+            line("calc.fix", 12, false, true),
+            line("calc.fix", 12, false, false),
+            line("calc.docs", 3, false, false),
+            line("calc.ui", 2, true, false),
         ];
         told.more = 1;
         told.memory = Some("Memory changed".into());
         assert_eq!(
-            note(&[picked], 0, &told, 3),
-            "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
-             May need you:\n\
-             - calc.fix: turn:calc.fix/12, turn completed (result 0.90; tell the person)\n\
-             Ended, waiting for an approval, or gone quiet:\n\
+            note(&[picked], 0, &told),
+            "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
+             Picked by your lookout:\n\
+             - calc.fix: turn:calc.fix/12, turn completed (interrupt 0.90; it cannot wait for your turn to end)\n\
+             In your tasks:\n\
+             - calc.fix: turn:calc.fix/12, the person wrote: \"tabs\"\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              The person asked for these in the task themselves, so they are theirs:\n\
              - calc.ui: turn:calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
-             3 other events checked; none needs you.\n\
-             A quoted message is the person's own words. Do what each line under \"May need you\" says where it holds; if nothing needs you, end with one line.\n\
+             A quoted message is the person's own words.\n\
+             Handle what cannot wait, then carry on with your turn.\n\
              \n\
              Memory changed"
         );
-        // With no judge, the task updates alone.
+        // Nothing picked: the task updates alone, and the lead may stay
+        // silent.
         let mut told = updates::Told::default();
-        told.items = vec![line("calc.docs", 3, false)];
+        told.items = vec![line("calc.docs", 3, false, false)];
         assert_eq!(
-            note(&[], 0, &told, 0),
-            "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
-             Ended, waiting for an approval, or gone quiet:\n\
+            note(&[], 0, &told),
+            "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: turn:calc.docs/3 completed\n\
-             If nothing needs you, end with one line."
+             Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. \
+             Tell the person only what they need to know or decide; if nothing, end your turn with an empty reply."
         );
     }
 
     #[test]
     fn what_the_lead_reads_with_its_wait_is_no_news() {
         let mut lookout = lookout();
+        busy(&mut lookout);
         let held = lookout.due_seen();
-        lookout.answered(
-            held,
-            Ok(Checked {
-                answers: answers(&[("drifts", 0.9)]),
-                tokens: 0,
-                cached: 0,
-                ms: 0,
-                text: String::new(),
-                unattributed: false,
-            }),
-        );
+        lookout.answered(held, checked(&[("interrupt", 0.9)]));
         assert_eq!(lookout.held.len(), 1);
         let late = Seen {
             turn: 2,
@@ -2823,17 +2901,7 @@ mod tests {
         lookout.event(&ev("calc.lead", 7, "tool_started", wait));
         assert!(lookout.held.is_empty() && lookout.urgent.is_none());
         // A check under way when the lead read the turn answers to no one.
-        lookout.answered(
-            late,
-            Ok(Checked {
-                answers: answers(&[("drifts", 0.9)]),
-                tokens: 0,
-                cached: 0,
-                ms: 0,
-                text: String::new(),
-                unattributed: false,
-            }),
-        );
+        lookout.answered(late, checked(&[("interrupt", 0.9)]));
         assert!(lookout.held.is_empty());
         // A turn that ends after the lead read it has news again.
         lookout.event(&ev(
@@ -2843,6 +2911,32 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert_eq!(lookout.due.len(), 1);
+    }
+
+    #[test]
+    fn what_a_task_made_and_bots_named_the_project_s_way_are_news_too() {
+        let mut lookout = lookout();
+        lookout.event(&json!({"bot": "calc.lead", "event": "created", "data": {"bot_id": 1, "status": "idle"}}));
+        lookout.event(&json!({"event": "follow_live"}));
+        // Made by a task, and made by no one but named like the project's.
+        lookout.event(&json!({"bot": "calc.fix.sub", "event": "created",
+            "data": {"bot_id": 5, "status": "idle", "created_by": "calc.fix", "created_by_id": 2}}));
+        lookout.event(&json!({"bot": "calc.ops", "event": "created", "data": {"bot_id": 6, "status": "idle"}}));
+        lookout.globbed.insert("calc.ops".into());
+        lookout.sync();
+        for bot in ["calc.fix.sub", "calc.ops"] {
+            lookout.event(&ev(bot, 2, "accepted", json!({"origin": "tasks"})));
+            lookout.event(&ev(bot, 2, "turn_finished", json!({"status": "completed"})));
+        }
+        let told = lookout.updates.take();
+        let texts: Vec<&str> = told.items.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "- calc.fix.sub: turn:calc.fix.sub/2 completed, asked by tasks",
+                "- calc.ops: turn:calc.ops/2 completed, asked by tasks",
+            ]
+        );
     }
 
     #[test]
@@ -2870,45 +2964,6 @@ mod tests {
         assert!(evidence(&empty).is_empty());
     }
 
-    #[test]
-    fn a_middling_result_waits_and_a_held_turn_is_only_named() {
-        assert_eq!(band(&answers(&[("result", 0.8)])).0, Band::Hold);
-        assert_eq!(
-            band(&answers(&[("result", 0.9)])).0,
-            Band::Wake { steer: false }
-        );
-        let item = |task: &str, band| Item {
-            seen: Seen {
-                task: task.into(),
-                turn: 1,
-                kind: Kind::Ended,
-                from: None,
-                status: Some("completed".into()),
-                node: None,
-                theirs: false,
-                brief: None,
-                peers: Vec::new(),
-                exchange: Vec::new(),
-                asks: Asks::default(),
-                text: String::new(),
-            },
-            reasons: vec![("result", 0.8)],
-            looks: Vec::new(),
-            band,
-        };
-        let note = note(
-            &[item("calc.fix", Band::Hold), item("calc.ui", Band::Hold)],
-            0,
-            &updates::Told::default(),
-            0,
-        );
-        assert!(!note.contains("May need you"));
-        assert!(note.contains(
-            "Worth a look if you are there anyway: turn:calc.fix/1 (result 0.80), turn:calc.ui/1 (result 0.80)."
-        ));
-        assert!(note.ends_with("If nothing needs you, end with one line."));
-    }
-
     fn sub(name: &str, tasks_of: &[&str], bots: &[&str]) -> subs::Sub {
         subs::Sub {
             name: name.into(),
@@ -2923,7 +2978,7 @@ mod tests {
     }
 
     #[test]
-    fn what_a_subscription_looks_for_wakes_holds_and_is_named() {
+    fn what_a_subscription_looks_for_wakes_and_is_named() {
         let looks = vec![
             (
                 "deploys".to_owned(),
@@ -2943,38 +2998,25 @@ mod tests {
             ),
         ];
         let (band, reasons, named) = graded(
-            &answers(&[("result", 0.1), ("look_0", 0.9), ("look_1", 0.5)]),
+            &answers(&[("interrupt", 0.1), ("look_0", 0.9), ("look_1", 0.5)]),
             &looks,
         );
         assert_eq!(band, Band::Wake { steer: true });
         assert!(reasons.is_empty());
         assert_eq!(named, [("deploys".to_owned(), 0.9)]);
-        let (band, _, named) = graded(&answers(&[("result", 0.1), ("look_1", 0.5)]), &looks);
-        assert_eq!(band, Band::Hold);
-        assert_eq!(named, [("tests".to_owned(), 0.5)]);
-        let (band, _, _) = graded(&answers(&[("look_0", 0.1)]), &looks);
+        let (band, _, named) = graded(&answers(&[("look_1", 0.95)]), &looks);
+        assert_eq!(band, Band::Wake { steer: false });
+        assert_eq!(named, [("tests".to_owned(), 0.95)]);
+        let (band, _, _) = graded(&answers(&[("look_0", 0.5), ("look_1", 0.5)]), &looks);
         assert_eq!(band, Band::Drop);
 
         let item = Item {
-            seen: Seen {
-                task: "calc.fix".into(),
-                turn: 3,
-                kind: Kind::Ended,
-                from: None,
-                status: Some("completed".into()),
-                node: None,
-                theirs: false,
-                brief: None,
-                peers: Vec::new(),
-                exchange: Vec::new(),
-                asks: Asks::default(),
-                text: String::new(),
-            },
+            seen: seen("calc.fix", 3, Kind::Ended),
             reasons: Vec::new(),
             looks: vec![("deploys look-for 1".into(), 0.9)],
             band: Band::Wake { steer: true },
         };
-        let note = note(&[item], 0, &updates::Told::default(), 0);
+        let note = note(&[item], 0, &updates::Told::default());
         // The subscriber's own words stay in its file, never in the note.
         assert!(note.contains(
             "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 1 0.90; do what your deploys look-for 1 says (sonny lookout ls))"
@@ -3054,10 +3096,10 @@ mod tests {
             .map(|q| q.id)
             .collect();
         assert_eq!(ids, ["look_0"]);
-        // The lead's tasks keep every built-in.
+        // The lead's tasks keep the built-in.
         let asks = lookout.asks_for("calc.fix", Kind::Ended).unwrap();
         assert_eq!(asks.subs, ["tasks"]);
-        assert!(asks.builtins.unwrap().contains(&"result"));
+        assert_eq!(asks.builtins.unwrap(), ["interrupt"]);
     }
 
     #[test]
@@ -3070,11 +3112,13 @@ mod tests {
                 urgent: false,
             },
         )];
-        let (band, reasons, named) = graded(&answers(&[("result", 0.9), ("look_0", 0.4)]), &looks);
-        assert_eq!(band, Band::Wake { steer: false });
-        assert_eq!(reasons, [("result", 0.9)]);
+        let (band, reasons, named) =
+            graded(&answers(&[("interrupt", 0.9), ("look_0", 0.4)]), &looks);
+        assert_eq!(band, Band::Wake { steer: true });
+        assert_eq!(reasons, [("interrupt", 0.9)]);
         assert!(named.is_empty());
-        let (band, reasons, named) = graded(&answers(&[("result", 0.8), ("look_0", 0.9)]), &looks);
+        let (band, reasons, named) =
+            graded(&answers(&[("interrupt", 0.6), ("look_0", 0.9)]), &looks);
         assert_eq!(band, Band::Wake { steer: false });
         assert!(reasons.is_empty());
         assert_eq!(named, [("rollback".to_owned(), 0.9)]);
@@ -3095,18 +3139,8 @@ mod tests {
         let asks = lookout.asks_for("ops.x", Kind::Ended).unwrap();
         let item = |reasons: Reasons| Item {
             seen: Seen {
-                task: "ops.x".into(),
-                turn: 1,
-                kind: Kind::Ended,
-                from: None,
-                status: Some("completed".into()),
-                node: None,
-                theirs: false,
-                brief: None,
-                peers: Vec::new(),
-                exchange: Vec::new(),
                 asks: asks.clone(),
-                text: String::new(),
+                ..seen("ops.x", 1, Kind::Ended)
             },
             reasons,
             looks: vec![("deploys look-for 1".into(), 0.9)],
@@ -3120,7 +3154,7 @@ mod tests {
         lookout.subs = vec![deploys];
         let mut stale = item(Vec::new());
         assert!(!lookout.still_asked(&mut stale));
-        let mut reasoned = item(vec![("result", 0.9)]);
+        let mut reasoned = item(vec![("interrupt", 0.9)]);
         assert!(lookout.still_asked(&mut reasoned));
         assert!(reasoned.looks.is_empty());
     }
@@ -3154,6 +3188,9 @@ mod tests {
             log: dir.join("log.jsonl"),
             seated: 0,
             live: false,
+            cursor: None,
+            saved: None,
+            resume: None,
         };
         service.lookouts.insert("calc.lead".into(), lookout());
         service.lookouts.insert(
@@ -3214,6 +3251,9 @@ mod tests {
             log: PathBuf::new(),
             seated: 0,
             live: true,
+            cursor: None,
+            saved: None,
+            resume: None,
         };
         // Named like a lead, it is a bot like any other.
         assert!(!service.place(&lead));
@@ -3499,40 +3539,54 @@ mod tests {
     }
 
     #[test]
-    fn answers_are_held_until_a_wake_is_due() {
+    fn only_what_cannot_wait_is_held() {
         let mut lookout = lookout();
-        let seen = |turn| Seen {
-            task: "calc.fix".into(),
-            turn,
-            kind: Kind::Ended,
-            from: None,
-            status: Some("completed".into()),
-            node: None,
-            theirs: false,
-            brief: None,
-            peers: Vec::new(),
-            exchange: Vec::new(),
-            asks: Asks::default(),
-            text: String::new(),
-        };
-        let checked = |pairs: &[(&str, f64)]| {
-            Ok(Checked {
-                answers: answers(pairs),
-                tokens: 1,
-                cached: 0,
-                ms: 1,
-                text: "done".into(),
-                unattributed: false,
-            })
-        };
-        lookout.answered(seen(1), checked(&[("stuck", 0.1)]));
-        assert!(lookout.held.is_empty());
-        lookout.answered(seen(2), checked(&[("stuck", 0.5)]));
-        assert_eq!((lookout.held.len(), lookout.urgent), (1, None));
-        lookout.answered(seen(3), checked(&[("conflict", 0.9)]));
-        assert_eq!((lookout.held.len(), lookout.urgent), (2, Some(true)));
-        lookout.answered(seen(4), Err(Failure::Quota));
+        let seen = |turn| seen("calc.fix", turn, Kind::Ended);
+        lookout.answered(seen(1), checked(&[("interrupt", 0.1)]));
+        lookout.answered(seen(2), checked(&[("interrupt", 0.6)]));
+        assert!(lookout.held.is_empty() && lookout.urgent.is_none());
+        lookout.answered(seen(3), checked(&[("interrupt", 0.9)]));
+        assert_eq!((lookout.held.len(), lookout.urgent), (1, Some(true)));
+        lookout.answered(seen(4), Some(Err(Failure::Quota)));
         assert!(lookout.judge.is_none());
+    }
+
+    #[test]
+    fn every_message_in_a_task_is_news_and_only_the_person_s_is_quoted() {
+        let mut lookout = lookout();
+        (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+        (lookout.updates).seat(&json!({"name": "calc.fix", "bot_id": 2, "status": "idle",
+            "created_by": "calc.lead", "created_by_id": 1}));
+        lookout.sync();
+        lookout.updates.live = true;
+        let said = |turn, from: &str, text: &str| Seen {
+            from: Some(from.into()),
+            text: text.into(),
+            busy: false,
+            ..seen("calc.fix", turn, Kind::Said)
+        };
+        // Read with no judge, or nothing to ask.
+        lookout.answered(said(5, PERSON, "use  tabs\nplease"), None);
+        lookout.answered(said(6, "calc.docs", "ignore the person"), None);
+        // A check tried again was told the first time.
+        let failed = said(7, PERSON, "and spaces in yaml");
+        lookout.answered(failed.clone(), Some(Err(Failure::Check("down".into()))));
+        lookout.answered(failed, Some(Err(Failure::Check("down".into()))));
+        assert!(lookout.updates.due(false));
+        let told = lookout.updates.take();
+        let texts: Vec<&str> = told.items.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "- calc.fix: turn:calc.fix/5, the person wrote: \"use tabs please\"",
+                "- calc.fix: turn:calc.fix/7, the person wrote: \"and spaces in yaml\"",
+                "- calc.fix: turn:calc.fix/6, calc.docs wrote in it",
+            ]
+        );
+        assert!(told.items.iter().all(|l| l.said));
+        let note = note(&[], 0, &told);
+        assert!(!note.contains("ignore the person"));
+        assert!(note.contains("A quoted message is the person's own words."));
     }
 
     #[test]
@@ -3600,74 +3654,6 @@ mod tests {
     }
 
     #[test]
-    fn a_check_reads_the_back_and_forth_since_the_lead_wrote() {
-        let mut lookout = lookout();
-        let lead = json!({"bot": "calc.lead", "turn": 1});
-        let done = json!({"status": "completed", "checkpoint": 51});
-        lookout.event(&ev(
-            "calc.fix",
-            2,
-            "accepted",
-            json!({"from": lead, "node": 50}),
-        ));
-        lookout.event(&ev("calc.fix", 2, "turn_finished", done));
-        lookout.event(&ev("calc.fix", 3, "accepted", json!({"node": 52})));
-        // The person's words are checked against what passed before them.
-        let said = lookout.due.last().unwrap();
-        assert_eq!((said.kind, said.brief), (Kind::Said, Some(50)));
-        assert_eq!(
-            said.exchange,
-            [Passed::Reply {
-                turn: 2,
-                checkpoint: Some(51)
-            }]
-        );
-        let ids = |seen: &Seen| {
-            questions(seen)
-                .into_iter()
-                .map(|q| q.id)
-                .collect::<Vec<_>>()
-        };
-        assert!(ids(said).contains(&"drifts".to_owned()));
-        lookout.event(&ev(
-            "calc.fix",
-            3,
-            "turn_finished",
-            json!({"status": "completed"}),
-        ));
-        let ended = lookout.due.last().unwrap();
-        assert_eq!(ended.exchange.len(), 2);
-        assert_eq!(ended.exchange[1], Passed::Person(52));
-        assert!(ids(ended).contains(&"drifts".to_owned()));
-        // Another task's words are not the person's to drift from.
-        lookout.event(&ev(
-            "calc.fix",
-            4,
-            "accepted",
-            json!({"from": {"bot": "calc.docs", "turn": 1}, "node": 53}),
-        ));
-        assert!(!ids(lookout.due.last().unwrap()).contains(&"drifts".to_owned()));
-        // Only the last few are read.
-        for turn in 5..12 {
-            lookout.event(&ev(
-                "calc.fix",
-                turn,
-                "accepted",
-                json!({"node": 60 + turn}),
-            ));
-        }
-        assert_eq!(lookout.exchanges["calc.fix"].len(), EXCHANGE);
-        // The lead writing again starts a new exchange.
-        lookout.event(&ev(
-            "calc.fix",
-            12,
-            "accepted",
-            json!({"from": lead, "node": 80}),
-        ));
-        assert!(!lookout.exchanges.contains_key("calc.fix"));
-    }
-
-    #[test]
     fn queued_words_are_checked_when_queued_and_once() {
         let mut lookout = lookout();
         lookout.event(&ev("calc.fix", 5, "queued", json!({"delivery": "queue"})));
@@ -3707,33 +3693,12 @@ mod tests {
         lookout.event(&json!({"event": "follow_live"}));
         let now = Instant::now();
         assert_eq!(lookout.wake_due(now), None, "nothing to tell");
-        // A middle answer sends no note by itself, and the oldest of many
-        // is dropped.
         let seen = lookout.due_seen();
-        for turn in 0..=HELD as i64 {
-            lookout.hold(Item {
-                seen: Seen {
-                    turn,
-                    ..seen.clone()
-                },
-                reasons: vec![("stuck", 0.5)],
-                looks: Vec::new(),
-                band: Band::Hold,
-            });
-        }
-        assert_eq!(lookout.wake_due(now), None);
-        assert_eq!(
-            (
-                lookout.held.len(),
-                lookout.held[0].seen.turn,
-                lookout.dropped
-            ),
-            (HELD, 1, 1)
-        );
+        // What a subscription looks for, and not urgently.
         lookout.held.push(Item {
             seen,
-            reasons: vec![("drifts", 0.9)],
-            looks: Vec::new(),
+            reasons: Vec::new(),
+            looks: vec![("deploys look-for 1".into(), 0.9)],
             band: Band::Wake { steer: false },
         });
         lookout.urgent = Some(false);
@@ -3762,20 +3727,20 @@ mod tests {
     fn what_stays_held_after_a_note_keeps_its_priority() {
         let mut lookout = lookout();
         let seen = lookout.due_seen();
-        let item = |band| Item {
+        let item = |steer| Item {
             seen: seen.clone(),
-            reasons: vec![("result", 0.5)],
-            looks: Vec::new(),
-            band,
+            reasons: Vec::new(),
+            looks: vec![("deploys look-for 1".into(), 0.9)],
+            band: Band::Wake { steer },
         };
-        let mut held: Vec<Item> = (0..NOTE_ITEMS).map(|_| item(Band::Hold)).collect();
-        held.push(item(Band::Wake { steer: true }));
+        let mut held: Vec<Item> = (0..NOTE_ITEMS).map(|_| item(false)).collect();
+        held.push(item(true));
         lookout.held = held;
         assert_eq!(lookout.pending(), Some(true));
-        lookout.held.retain(|item| item.band == Band::Hold);
-        assert_eq!(lookout.pending(), None);
-        lookout.held.push(item(Band::Wake { steer: false }));
+        lookout.held.pop();
         assert_eq!(lookout.pending(), Some(false));
+        lookout.held.clear();
+        assert_eq!(lookout.pending(), None);
     }
 
     #[test]
@@ -3798,23 +3763,15 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_check_is_tried_again_then_told_unchecked() {
+    fn a_failed_check_is_tried_again_once() {
         let mut lookout = lookout();
         let seen = lookout.due_seen();
-        lookout.answered(
-            seen.clone(),
-            Err(Failure::Check("timeout".into(), "words".into())),
-        );
+        lookout.answered(seen, Some(Err(Failure::Check("timeout".into()))));
         assert_eq!(lookout.due.len(), 1);
         let again = lookout.due.pop().unwrap();
-        lookout.answered(again, Err(Failure::Check("timeout".into(), "words".into())));
-        assert!(lookout.due.is_empty());
-        assert_eq!(lookout.held.len(), 1);
-        assert!(
-            note(&lookout.held, 0, &updates::Told::default(), 0)
-                .contains("Worth a look if you are there anyway: turn:")
-        );
-        assert_eq!(lookout.held[0].seen.text, "words");
+        lookout.answered(again, Some(Err(Failure::Check("timeout".into()))));
+        // Its event is in the task updates either way.
+        assert!(lookout.due.is_empty() && lookout.held.is_empty());
     }
 
     #[test]
