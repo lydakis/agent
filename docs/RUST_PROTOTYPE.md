@@ -2307,9 +2307,10 @@ tokens, past any model's window. Unset, it follows the turn's model the way
 they compute it: the context window less 20,000 tokens kept for the reply and
 a 13,000-token buffer, and at most 90% of the window (900,000 on a 1M window,
 167,000 on 200K). The window is the one the provider's model listing gives
-(`context_tokens`, as `provider_models` answers) when a client has asked for
-it and the provider kept it, as a model picker does (a turn never asks a
-provider for anything but its call). Otherwise, as for a provider that
+(`context_tokens`, as `provider_models` answers) once a client has asked
+for one, as a model picker does; the windows of the last listing that
+answered are kept apart from it, read without parsing it again (a turn never
+asks a provider for anything but its call). Otherwise, as for a provider that
 lists none, Claude models get the window Anthropic publishes, 1M from Claude 5
 on and 200K before, and any other model 200K, the smallest a current model
 has. A

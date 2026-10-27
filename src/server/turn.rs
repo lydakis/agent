@@ -951,9 +951,10 @@ impl Turn {
         };
         // One that parked on its pool is not tried again before the pool
         // reopens, while the view and the reply still fit; one that
-        // outgrows the limit summarizes first.
+        // outgrows the limit summarizes first, and so does one a client
+        // asked for, which parks on the pool rather than wait unasked.
         let fits = pressure.bytes + reserve < limit.bytes && pressure.items < limit.items;
-        if fits && now_ms() < accounting.summary_retry_at {
+        if fits && !requested && now_ms() < accounting.summary_retry_at {
             return Ok(Compaction::Skipped);
         }
         let _held = Held::from_now(&self.side.summary_ms);

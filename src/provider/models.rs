@@ -27,7 +27,12 @@ const KEPT: usize = 2 * crate::output::MAX_EVENT;
 /// the bytes it holds of the transport's shared `KEPT`. A listing is kept
 /// as its JSON text, so what it holds is what it counts.
 #[derive(Default)]
-pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed, usize)>>);
+pub struct Listing(
+    tokio::sync::Mutex<Option<(Instant, Listed, usize)>>,
+    /// Each listed model's context window, from the last listing that
+    /// answered: read per turn, so it is parsed once, as it arrives.
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+);
 
 /// A JSON array of `{id, name?, context_tokens?, output_tokens?}`.
 pub type Listed = Result<Arc<str>>;
@@ -53,6 +58,16 @@ impl Provider {
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
             .and_then(|models| {
+                let windows = models
+                    .iter()
+                    .filter_map(|entry| {
+                        Some((
+                            entry["id"].as_str()?.to_owned(),
+                            entry["context_tokens"].as_u64()?,
+                        ))
+                    })
+                    .collect();
+                *self.listing.1.lock().unwrap_or_else(|e| e.into_inner()) = windows;
                 // Answered only if one reply could carry it.
                 let text = serde_json::to_string(&models)?;
                 match text.len() <= crate::output::MAX_EVENT {
@@ -92,13 +107,8 @@ impl Provider {
     /// listing a client asked for and the provider kept, however old: a
     /// turn sends the provider nothing it did not ask for.
     pub fn listed_window(&self, model: &str) -> Option<u64> {
-        let kept = self.listing.0.try_lock().ok()?;
-        let (_, listed, _) = kept.as_ref()?;
-        let models: Vec<Value> = serde_json::from_str(listed.as_ref().ok()?).ok()?;
-        models
-            .iter()
-            .find(|entry| entry["id"] == model)
-            .and_then(|entry| entry["context_tokens"].as_u64())
+        let windows = self.listing.1.lock().unwrap_or_else(|e| e.into_inner());
+        windows.get(model).copied()
     }
 
     /// A ChatGPT login refused with 401 is refreshed and tried once more,
