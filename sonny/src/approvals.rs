@@ -67,18 +67,26 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
     }
 }
 
-/// The agents `lead` made, and those they made, from a `bots` listing.
+/// The agents `lead` made, and those they made, from a `bots` listing:
+/// by the maker's identity, so a reused name's children are strangers.
 pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
+    let Some(lead) = bots
+        .iter()
+        .find(|bot| bot["name"] == lead)
+        .and_then(|bot| bot["bot_id"].as_i64())
+    else {
+        return Vec::new();
+    };
     let mut makers = vec![lead];
-    let mut made = Vec::new();
+    let mut made: Vec<&Value> = Vec::new();
     while let Some(maker) = makers.pop() {
-        for bot in bots.iter().filter(|bot| bot["created_by"] == maker) {
-            if let Some(name) = bot["name"].as_str()
-                && name != lead
-                && !made.iter().any(|seen: &&Value| seen["name"] == name)
+        for bot in bots.iter().filter(|bot| bot["created_by_id"] == maker) {
+            if let Some(id) = bot["bot_id"].as_i64()
+                && id != lead
+                && !made.iter().any(|seen| seen["bot_id"] == id)
             {
                 made.push(bot);
-                makers.push(name);
+                makers.push(id);
             }
         }
     }
@@ -146,18 +154,23 @@ mod tests {
 
     #[test]
     fn a_picked_mode_reaches_every_agent_the_lead_made() {
-        let bot = |name: &str, by: Option<&str>, gates: Value| json!({"name": name, "created_by": by, "tools": ["shell", "read"], "gates": gates});
+        let bot = |name: &str, id: i64, by: Option<i64>, gates: Value| {
+            json!({"name": name, "bot_id": id, "created_by_id": by,
+                "tools": ["shell", "read"], "gates": gates})
+        };
         let auto = json!([{"tag": "auto", "tools": ["shell"]}]);
         let bots = [
-            bot("lead", None, auto.clone()),
-            bot("task", Some("lead"), auto.clone()),
+            bot("lead", 2, None, auto.clone()),
+            bot("task", 3, Some(2), auto.clone()),
             bot(
                 "helper",
-                Some("task"),
+                4,
+                Some(3),
                 json!([{"tag": "ci", "tools": ["shell"]}]),
             ),
-            bot("other", Some("someone"), auto.clone()),
-            bot("loop", Some("loop"), auto.clone()),
+            // Made by a lead of the same name, since deleted.
+            bot("old", 5, Some(1), auto.clone()),
+            bot("loop", 6, Some(6), auto.clone()),
         ];
         let names: Vec<_> = made_by(&bots, "lead").iter().map(|b| &b["name"]).collect();
         assert_eq!(names, [&json!("task"), &json!("helper")]);

@@ -891,9 +891,9 @@ struct App {
     choosing: Option<usize>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
-    /// The mode picked, still to give the agents the lead made: one busy
-    /// now takes it once idle.
-    spread: Option<&'static str>,
+    /// The mode picked, still to give the agents the lead made, and when
+    /// to try next: one busy now takes it once idle.
+    spread: Option<(&'static str, Instant)>,
     /// The newest reply's text, for `/copy`.
     last_reply: String,
 }
@@ -1519,6 +1519,9 @@ impl App {
             if self.retry.is_some_and(|at| at <= Instant::now()) {
                 self.reattach(events).await;
             }
+            if self.spread.is_some_and(|(_, at)| at <= Instant::now()) {
+                self.spread().await;
+            }
             self.listed();
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() {
@@ -1534,7 +1537,6 @@ impl App {
     /// for the turn to end, or when the daemon refused it (the notice says
     /// why).
     async fn configure(&mut self) -> bool {
-        self.spread().await;
         if self.instruct.is_none() && self.switch.is_none() && self.gating.is_none() {
             return true;
         }
@@ -1601,11 +1603,12 @@ impl App {
 
     /// Give the mode picked with `/approvals` to every agent the lead made,
     /// and those they made: the person's pick overrides the gate each was
-    /// made with. One that is busy is tried again at the next chance.
+    /// made with. One that is busy is tried again a little later.
     async fn spread(&mut self) {
-        let Some(mode) = self.spread else {
+        let Some((mode, _)) = self.spread else {
             return;
         };
+        self.spread = Some((mode, Instant::now() + Duration::from_secs(2)));
         let mut bots = Vec::new();
         let mut after = json!("");
         loop {
@@ -2653,7 +2656,7 @@ impl App {
                         self.choosing = None;
                         // The agents the lead made take it too, even when
                         // the lead has it already.
-                        self.spread = Some(mode);
+                        self.spread = Some((mode, Instant::now()));
                         if self.mode != Some(mode) {
                             self.gating = Some(mode);
                             self.configure().await;
