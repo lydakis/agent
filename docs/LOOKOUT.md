@@ -35,7 +35,7 @@ and a silence is checked once; printing again starts a new one. The judge
 reads the event's text, the lead's latest message to that task (its brief),
 the other tasks' briefs and latest lines, and the project's memory indexes.
 
-A high answer (0.70 or more) wakes the lead: at once with `--delivery
+A high answer (0.70 or more; 0.85 for a result) wakes the lead: at once with `--delivery
 steer` when the question is urgent (redirects, conflict), else queued, at
 most every 2 minutes. A middle one (0.35 or more) waits for the next note,
 or goes alone after 30 minutes. The rest are only counted.
@@ -43,6 +43,46 @@ or goes alone after 30 minutes. The rest are only counted.
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person
 schedules.
+
+## Subscriptions
+
+What a lead's lookout watches is its `tasks` subscription: the lead's tasks,
+every event, every question above. Any bot can subscribe to more, and a bot
+that is no lead gets a lookout of its own while it has a subscription:
+
+```
+sonny lookout add deploys --bot 'ops.*' --on ended \
+  --look-for "a deploy finished or failed" --then "tell the person which" --urgent
+sonny lookout add review --tasks-of review.lead --ask conflict --context "we own the parser"
+sonny lookout ls
+sonny lookout rm deploys
+```
+
+- `--tasks-of BOT` watches every bot BOT or one of its tasks made, and
+  `--bot GLOB` every bot its name matches, `*` matching any run of
+  characters. A subscription needs one of them, and may have several.
+- `--on said,ended,waiting,quiet` picks the events; all four by default.
+- `--ask ID` asks only the built-in questions named; with no `--ask`, a
+  subscription asks every one that fits the event, unless it looks for
+  something of its own, when it asks only that.
+- `--look-for TEXT --then ACTION` adds a question of the subscriber's own;
+  a high answer wakes it, steering with `--urgent`, and a middle one waits
+  for the next note.
+- `--context TEXT` is a line every check of it reads.
+
+A bot's shell sets `AGENT_BOT`, so a bot changes only its own
+subscriptions; the person names one with `--for BOT`. `add` under a name
+already taken does nothing when it says the same and is refused when it
+does not, so `rm` it first. Each subscriber's are one file,
+`STORE.lookout/BOT.json`, which a running lookout reads again every 15
+seconds. A lead's file that holds a `tasks` subscription replaces its own.
+
+The note names a subscription's answer as `deploys look-for 1 0.90` and
+says "do what your deploys look-for 1 says (sonny lookout ls)", where
+`ls` numbers each subscription's look-fors from 1: the
+subscriber's own words stay in its file, since the note reaches the
+approver as the person's. `/lookout` in Sonny lists the window's agent's
+subscriptions, and how many checks each asked for in the last day.
 
 ## Task updates
 
