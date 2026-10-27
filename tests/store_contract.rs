@@ -11104,7 +11104,7 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     converse(&mut db, "Bob", 1);
-    assert_eq!(db.next_expiry().unwrap(), None);
+    assert_eq!(db.next_expiry(0).unwrap(), (None, false));
     let before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -11136,7 +11136,8 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
             .get("expire_ms")
             .is_none()
     );
-    assert_eq!(db.next_expiry().unwrap(), Some(at));
+    assert_eq!(db.next_expiry(at - 1).unwrap(), (Some(at), false));
+    assert_eq!(db.next_expiry(at).unwrap(), (None, true));
     assert!(db.expired(at - 1, 16).unwrap().is_empty());
     assert_eq!(
         db.expired(at, 16).unwrap(),
@@ -11187,7 +11188,7 @@ fn an_expiring_fork_is_due_once_idle_that_long_and_never_while_a_turn_runs() {
     assert_eq!(error.facts.unwrap()["field"], "expire_ms");
     // Deleting it leaves its source as it was.
     db.delete_bot("Bob.side").unwrap();
-    assert_eq!(db.next_expiry().unwrap(), None);
+    assert_eq!(db.next_expiry(0).unwrap(), (None, false));
     assert!(db.expired(i64::MAX, 16).unwrap().is_empty());
     assert_eq!(db.inspect("Bob").unwrap().head, side.head);
 }
@@ -11209,7 +11210,7 @@ fn schema_50_bots_never_expire() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let bob = db.inspect("Bob").unwrap();
     assert_eq!((bob.expire_ms, bob.expires_at), (None, None));
-    assert_eq!(db.next_expiry().unwrap(), None);
+    assert_eq!(db.next_expiry(0).unwrap(), (None, false));
     converse(&mut db, "Bob", 1);
     let (side, _) = db
         .fork(
@@ -11221,7 +11222,7 @@ fn schema_50_bots_never_expire() {
             },
         )
         .unwrap();
-    assert_eq!(db.next_expiry().unwrap(), side.expires_at);
+    assert_eq!(db.next_expiry(0).unwrap(), (side.expires_at, false));
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
@@ -11258,8 +11259,20 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
     db.append(turn, vec![assistant("started")], &[], None)
         .unwrap();
     db.finish(turn, None).unwrap();
-    let (idle, _) = db.fork("Bob", "idle", expiring).unwrap();
+    let (idle, _) = db
+        .fork(
+            "Bob",
+            "idle",
+            Fork {
+                expire_ms: Some(60_000),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
     assert!(db.delete_bot("busy").is_err());
+    // While the busy one is due, the idle one's time is still the next.
+    let busy_at = db.inspect("busy").unwrap().expires_at.unwrap();
+    assert_eq!(db.next_expiry(busy_at).unwrap(), (idle.expires_at, true));
     assert_eq!(
         db.expired(i64::MAX, 1).unwrap(),
         vec![("idle".to_owned(), idle.bot_id)]

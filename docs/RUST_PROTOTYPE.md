@@ -1348,9 +1348,9 @@ the turn's id and handle at once, and `wait`, `turns`, and
   without interrupting, which starts at the running turn's newest finished
   round. `agent run` says the same as flags to copy
   (`--delivery steer --turn N`, `--delivery queue`, or
-  `run --fork=NAME --bot NEW --allow '' --expires 15m -- QUESTION`), built from the
-  refusal's `running_turn` and `fork_point`, taken in the refusing
-  transaction, so it asks nothing more and never names a turn that started
+  `run --detach --fork=NAME --bot NEW --allow '' --expires 15m -- QUESTION`),
+  built from the refusal's `running_turn` and `fork_point`, taken in the
+  refusing transaction, so it asks nothing more and never names a turn that started
   since. `fork_point` is where a fork without a checkpoint starts, the head
   of an idle bot or that newest finished round. A model calling `agent run`
   does not discover them otherwise, and in benchmark runs it ignored a prose
