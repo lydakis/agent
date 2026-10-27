@@ -1026,6 +1026,26 @@ class AutoApproverTests(ModelFixture):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
 
+    def test_an_approver_refused_the_tag_leaves_the_serving_judge_alone(self):
+        self.model.reply_for = lambda request, user: (
+            json.dumps({id: .05 for id in json.loads(user)['answer']})
+            if request['model'] in ('judge-model', 'other-model') else None)
+        self.model.models = ('synthetic-model', 'judge-model', 'other-model')
+        daemon = self.daemon()
+        self.approver(daemon, judge='openai/judge-model')
+        base = daemon.request('inspect', bot='approver.auto')['result']
+        refused = subprocess.run(
+            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), '--judge', 'openai/other-model'],
+            env=clean_env(), capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('approvals_served', refused.stderr)
+        kept = daemon.request('inspect', bot='approver.auto')['result']
+        self.assertEqual((kept['bot_id'], kept['model']), (base['bot_id'], 'judge-model'))
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'out').read_text(), 'safe')
+
     def test_secrets_are_redacted_before_the_judge_sees_them(self):
         daemon = self.daemon()
         self.approver(daemon)

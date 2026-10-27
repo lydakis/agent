@@ -50,16 +50,26 @@ pub fn spec(name: &str) -> Option<Spec<'_>> {
 /// (`--judge`, else `AGENT_JUDGE`), else the newest Haiku on Bedrock, else
 /// the newest Haiku the caller's provider lists, else the caller's own
 /// model. `None` only when nothing is named and there is no caller.
+/// Providers' listings wait at most `LISTING_DEADLINE`, past which the
+/// caller's own model judges.
 pub async fn pick(client: &Client, named: Option<&str>, caller: Option<&str>) -> Option<String> {
     if let Some(named) = named {
         return Some(named.to_owned());
     }
-    let listing = client
-        .request("provider_models", json!({}))
-        .await
-        .unwrap_or_default();
+    let listing = tokio::time::timeout(
+        LISTING_DEADLINE,
+        client.request("provider_models", json!({})),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
     picked(&listing, caller)
 }
+
+/// How long `pick` waits for the providers' listings: well inside the 10 s
+/// the CLI gives an approver it starts to say it serves.
+pub const LISTING_DEADLINE: Duration = Duration::from_secs(5);
 
 /// `pick` with nothing named, from a `provider_models` listing.
 pub fn picked(listing: &Value, caller: Option<&str>) -> Option<String> {

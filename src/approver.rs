@@ -99,6 +99,13 @@ enum Via {
     Model(judge::Base),
 }
 
+/// The judge picked, before the tag's lease is held: a model judge's base
+/// bot is made only after.
+enum Picked<'a> {
+    Decisions(judge::Decisions),
+    Model(&'a str),
+}
+
 impl Judge {
     async fn ask(
         &self,
@@ -171,7 +178,9 @@ async fn serve(settings: Settings) -> Result<i32> {
             ),
         )
     })?;
-    let (via, deadline_ms) = match judge::spec(&named) {
+    // An approver the daemon refuses the tag never replaces the base of
+    // the one serving it.
+    let picked = match judge::spec(&named) {
         None => {
             return Err(Error::with(
                 "invalid_judge",
@@ -185,28 +194,17 @@ async fn serve(settings: Settings) -> Result<i32> {
                     format!("set {} for the Decisions API", judge::DECISIONS_KEY),
                 )
             })?;
-            let decisions = judge::Decisions::new(model, settings.url.as_deref(), key)?;
-            (Via::Decisions(decisions), policy::DEADLINE_MS)
+            Picked::Decisions(judge::Decisions::new(model, settings.url.as_deref(), key)?)
         }
-        Some(judge::Spec::Model(model)) => {
-            if tag.len() > JUDGE_NAME_ROOM {
-                return Err(Error::with(
-                    "invalid_tag",
-                    format!(
-                        "a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"
-                    ),
-                ));
-            }
-            let base = judge::Base::make(
-                &client,
-                &format!("approver.{tag}"),
-                model,
-                settings.effort.as_deref(),
-                &policy::judge_instructions(),
-            )
-            .await?;
-            (Via::Model(base), policy::MODEL_DEADLINE_MS)
+        Some(judge::Spec::Model(_)) if tag.len() > JUDGE_NAME_ROOM => {
+            return Err(Error::with(
+                "invalid_tag",
+                format!(
+                    "a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"
+                ),
+            ));
         }
+        Some(judge::Spec::Model(model)) => Picked::Model(model),
     };
     let served = client
         .request(
@@ -218,6 +216,20 @@ async fn serve(settings: Settings) -> Result<i32> {
     let (Some(lease), Some(through)) = (served["lease"].as_u64(), served["through"].as_i64())
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
+    };
+    let (via, deadline_ms) = match picked {
+        Picked::Decisions(decisions) => (Via::Decisions(decisions), policy::DEADLINE_MS),
+        Picked::Model(model) => {
+            let base = judge::Base::make(
+                &client,
+                &format!("approver.{tag}"),
+                model,
+                settings.effort.as_deref(),
+                &policy::judge_instructions(),
+            )
+            .await?;
+            (Via::Model(base), policy::MODEL_DEADLINE_MS)
+        }
     };
     let shared = Arc::new(Shared {
         client,
