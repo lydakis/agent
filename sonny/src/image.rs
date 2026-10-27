@@ -33,7 +33,7 @@ const DIACRITICS: [char; 64] = [
     '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
 ];
 
-const PLACEHOLDER: char = '\u{10EEEE}';
+pub const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// System fonts, read once, for text inside an SVG.
 fn fonts() -> Arc<usvg::fontdb::Database> {
