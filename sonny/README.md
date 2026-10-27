@@ -143,7 +143,12 @@ off again never shows.
   folder. The lead starts each task with `sonny task NAME [--setup] [run
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
-  folder behind when that fails; `sonny task changes NAME [--apply]` lists,
+  folder behind when that fails. Every agent Sonny starts, leads and tasks
+  alike, is told after its role that the person it works for may be under
+  pressure, and to care whether they succeed: take work off their plate,
+  do or offer what they will need next, and say once when a better way of
+  working would help them; so `sonny task` gives what `--agents` or
+  `--profile` would compose as the task's instructions, with that after it; `sonny task changes NAME [--apply]` lists,
   or writes back, what a sandfs copy of a plain folder changed. A plain
   folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
   as an external volume, can't be copied, so its task gets a sandfs
