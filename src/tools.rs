@@ -695,6 +695,7 @@ impl Registry {
                     workspace.to_path_buf(),
                     timeout_ms,
                     environment.to_vec(),
+                    tokio::sync::oneshot::channel().0,
                 )
                 .await
             }
@@ -810,12 +811,15 @@ impl Registry {
 
     /// A foreground command, owning everything it uses so a running one
     /// can be moved to a task of its own. Dropping it kills the command.
+    /// `started` fires once it holds a process slot: only then is it
+    /// running, and only then may it move.
     pub fn foreground(
         &self,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
         environment: Vec<(String, String)>,
+        started: tokio::sync::oneshot::Sender<()>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
@@ -824,6 +828,7 @@ impl Registry {
                 .acquire()
                 .await
                 .map_err(|_| Error::new("tool_scheduler_closed"))?;
+            let _ = started.send(());
             let (stdout, stderr, exit) = shell(
                 &command,
                 &workspace,

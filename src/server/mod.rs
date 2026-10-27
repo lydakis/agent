@@ -752,6 +752,8 @@ struct Service {
     /// when they are tried again. Each holds no task and no slot; the run
     /// loop resumes them as they come due.
     wakes: Wakes,
+    /// The newest steer each parked turn has been woken for.
+    steer_wakes: HashMap<i64, i64>,
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
@@ -1108,6 +1110,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
     let mut wakes = Wakes::default();
+    let mut steer_wakes = HashMap::new();
     let parked = store
         .op("waiting_turns", |db| {
             // Every turn's lapse in one read, not one query per parked turn.
@@ -1118,7 +1121,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let own = !w.approval && w.paced_since_ms.is_none();
                     let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
                     // A steer sent while the daemon was down wakes the wait.
-                    let steered = own && db.joining_steer(&w.bot)?;
+                    let steered = match own {
+                        true => db.steered_park(&w.bot)?.filter(|(turn, _)| *turn == w.turn),
+                        false => None,
+                    };
                     Ok((w, lapse, steered))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1156,7 +1162,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                 },
             )
             .await;
-        if steered {
+        if let Some((turn, steer)) = steered {
+            steer_wakes.insert(turn, steer);
             handles.wake(waiting.bot, waiting.turn);
         }
     }
@@ -1181,6 +1188,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ready_hint: true,
         tokens: Arc::default(),
         wakes,
+        steer_wakes,
         draining: false,
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
@@ -1669,9 +1677,9 @@ impl Service {
         // A steer for a turn parked on `wait` wakes it; the handles it
         // waits on are reported pending and stay valid.
         if started.fresh
-            && let Some(parked) = started.parked
+            && let Some((parked, steer)) = started.parked
         {
-            self.handles.wake(bot.clone(), parked);
+            self.wake_for_steer(bot.clone(), parked, steer);
         }
         if started.status == "ready" {
             self.ready_hint = true;
@@ -1875,6 +1883,21 @@ impl Service {
         Ok(())
     }
 
+    /// Wake a turn parked on `wait` for steers up to `steer`, once: a steer
+    /// that stays queued (no room in the context) must not end every later
+    /// wait of the turn.
+    fn wake_for_steer(&mut self, bot: String, turn: i64, steer: i64) {
+        if self
+            .steer_wakes
+            .get(&turn)
+            .is_some_and(|&woken| woken >= steer)
+        {
+            return;
+        }
+        self.steer_wakes.insert(turn, steer);
+        self.handles.wake(bot, turn);
+    }
+
     /// Run a turn as a task: fresh after submission, or resuming a parked one.
     fn spawn(&mut self, bot: String, turn: i64, resumed: Option<Waiting>, steers: bool) {
         let (cancel, cancelled) = watch::channel(None);
@@ -1954,26 +1977,27 @@ impl Service {
                 // Interrupt may already have released the task's active slot.
                 // Finishing still promotes queued work in that case.
                 self.ready_hint = true;
+                self.steer_wakes.remove(&turn);
+                return Ok(());
             }
             // A wake-up may already have claimed the turn again.
             turn::Exit::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
-                self.wakes.set(at, bot, turn)
+                self.wakes.set(at, bot.clone(), turn)
             }
-            turn::Exit::Paced(_) => {}
-            // A steer committed while the turn was parking found it still
-            // running, so its wake-up comes from here. A failed read leaves
-            // the steer for the wait's end, as before.
-            turn::Exit::Parked => {
-                let name = bot.clone();
-                if let Ok(Some(parked)) = self
-                    .store
-                    .read("steered_park", move |db| db.steered_park(&name))
-                    .await
-                    && parked == turn
-                {
-                    self.handles.wake(bot, turn);
-                }
-            }
+            turn::Exit::Paced(_) | turn::Exit::Parked => {}
+        }
+        // A steer committed while the turn was parking on `wait` found it
+        // still running, so its wake-up comes from here; a wait with a
+        // gated call after it parks until that lapses. A failed read leaves
+        // the steer for the wait's end, as before.
+        let name = bot.clone();
+        if let Ok(Some((parked, steer))) = self
+            .store
+            .read("steered_park", move |db| db.steered_park(&name))
+            .await
+            && parked == turn
+        {
+            self.wake_for_steer(bot, turn, steer);
         }
         Ok(())
     }
@@ -2932,6 +2956,7 @@ impl Service {
                 // parked, and its wait or lapse must still wake it.
                 self.handles.forget(Waiter::Turn(turn));
                 self.wakes.cancel(turn);
+                self.steer_wakes.remove(&turn);
                 self.ready_hint = true;
                 view(&reader, bot, true).await
             }
@@ -3528,6 +3553,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
@@ -3735,6 +3761,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
@@ -3949,6 +3976,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),

@@ -373,6 +373,20 @@ class WaitTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'done')
         self.assertEqual(client.finished(steer)['data']['status'], 'completed')
 
+    def test_a_steer_leaves_a_command_waiting_for_a_slot_in_line(self):
+        client = self.client('echo,shell,wait', extra=('--max-processes', '1'))
+        for bot in ('Hold', 'Bob'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        held = client.request('submit', bot='Hold', request_id='h', prompt='bg:sleep .8')['result']['turn']
+        client.finished(held)
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:printf ran')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
+        # It ran once the slot freed, and too quickly to be moved.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'ran')
+        self.assertEqual(client.request('stats')['result']['queued_processes'], 0)
+
     def test_a_queued_message_leaves_a_parked_wait_alone(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))

@@ -2890,11 +2890,13 @@ impl Turn {
     /// each time it has sat unread for `after`. The outer error is the
     /// runtime's; the inner one is the tool's result.
     /// Run a tool while keeping the cache warm. With `lift`, a steer moves
-    /// the run to the background instead, handed back unfinished.
+    /// the run to the background instead, handed back unfinished, once the
+    /// paired signal says it is running: a command still waiting for a
+    /// process slot stays in line in the foreground.
     async fn run_tool<F: Future<Output = Result<Outcome>>>(
         &self,
         run: F,
-        lift: Option<&Lift>,
+        lift: Option<(&Lift, oneshot::Receiver<()>)>,
         warm: Option<&mut Warm<'_>>,
     ) -> Result<Ran<F>> {
         enum Next {
@@ -2904,9 +2906,13 @@ impl Turn {
         }
         let mut run = Box::pin(run);
         let lifted = async {
-            match lift {
-                Some(lift) => lift.lifted().await,
-                None => std::future::pending().await,
+            // A run that ends before it starts wins the race below.
+            if let Some((lift, running)) = lift
+                && running.await.is_ok()
+            {
+                lift.lifted().await
+            } else {
+                std::future::pending().await
             }
         };
         tokio::pin!(lifted);
@@ -3225,14 +3231,16 @@ impl Turn {
                     timeout_ms,
                     background: false,
                 }) => {
+                    let (started, running) = oneshot::channel();
                     let run = self.registry.foreground(
                         command,
                         workspace.to_path_buf(),
                         timeout_ms,
                         environment.to_vec(),
+                        started,
                     );
                     match self
-                        .run_tool(run, Some(&self.lift), warm.as_deref_mut())
+                        .run_tool(run, Some((&self.lift, running)), warm.as_deref_mut())
                         .await?
                     {
                         Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),

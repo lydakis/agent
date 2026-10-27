@@ -388,8 +388,9 @@ pub struct Started {
     pub entry: Option<Value>,
     /// A fresh steer the bot's running turn takes at its next boundary.
     pub joins: bool,
-    /// For such a steer, the bot's turn parked on a `wait`, which it wakes.
-    pub parked: Option<i64>,
+    /// For such a steer, the bot's turn parked on a `wait`, which it
+    /// wakes, and the newest queued steer.
+    pub parked: Option<(i64, i64)>,
 }
 /// Per-turn overrides of the bot's defaults, recorded with the turn.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -1674,10 +1675,11 @@ impl Database {
             .unwrap_or(false))
     }
 
-    /// The bot's turn parked on a `wait` while a steer waits for it: the
-    /// steer wakes it, and its handles are reported pending. A verdict or
-    /// a closed pool is not the bot's own wait, so neither is woken.
-    pub fn steered_park(&self, name: &str) -> Result<Option<i64>> {
+    /// The bot's turn parked on a `wait` while a steer waits for it, with
+    /// the newest queued steer: the steer wakes it, and its handles are
+    /// reported pending. A verdict or a closed pool is not the bot's own
+    /// wait, so neither is woken.
+    pub fn steered_park(&self, name: &str) -> Result<Option<(i64, i64)>> {
         let parked: Option<i64> = self
             .conn
             .prepare_cached(
@@ -1688,10 +1690,17 @@ impl Database {
             )?
             .query_row([name], |r| r.get(0))
             .optional()?;
-        match parked {
-            Some(turn) if self.joining_steer(name)? => Ok(Some(turn)),
-            _ => Ok(None),
-        }
+        let turn = match parked {
+            Some(turn) if self.joining_steer(name)? => turn,
+            _ => return Ok(None),
+        };
+        let newest: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT max(id) FROM turns WHERE bot=? AND status='queued' AND delivery='steer'",
+            )?
+            .query_row([name], |r| r.get(0))?;
+        Ok(Some((turn, newest)))
     }
 
     fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
@@ -4143,8 +4152,9 @@ impl Database {
             self.pending.0 += 1;
             self.pending.1 += prompt.len() as i64;
         }
-        let joins =
-            options.delivery == Delivery::Steer && status == "queued" && self.joining_steer(name)?;
+        let joins = options.delivery == Delivery::Steer
+            && status == "queued"
+            && self.joining_steer(name)?;
         let parked = match joins {
             true => self.steered_park(name)?,
             false => None,
