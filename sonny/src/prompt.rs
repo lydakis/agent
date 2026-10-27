@@ -21,8 +21,7 @@ pub struct Prompt {
     goal: Option<usize>,
 }
 
-/// One drawn row: the bytes of the text it shows. A row's trailing spaces
-/// may hang past the edge, as they do in the transcript.
+/// One drawn row: the bytes of the text it shows.
 #[derive(Debug, PartialEq)]
 pub struct Row {
     pub start: usize,
@@ -54,6 +53,7 @@ impl Prompt {
         self.goal = None;
         self.text.insert_str(self.at, text);
         self.at += text.len();
+        self.settle();
     }
 
     pub fn backspace(&mut self) {
@@ -61,12 +61,14 @@ impl Prompt {
         let start = self.before(self.at);
         self.text.drain(start..self.at);
         self.at = start;
+        self.settle();
     }
 
     pub fn delete(&mut self) {
         self.goal = None;
         let end = self.after(self.at);
         self.text.drain(self.at..end);
+        self.settle();
     }
 
     pub fn left(&mut self) {
@@ -83,6 +85,7 @@ impl Prompt {
     pub fn home(&mut self) {
         self.goal = None;
         self.at = self.line_start();
+        self.settle();
     }
 
     /// The end of the cursor's line.
@@ -94,6 +97,7 @@ impl Prompt {
     pub fn word_left(&mut self) {
         self.goal = None;
         self.at = self.word_start();
+        self.settle();
     }
 
     pub fn word_right(&mut self) {
@@ -104,6 +108,7 @@ impl Prompt {
             .find(char::is_whitespace)
             .unwrap_or(rest.len() - spaces);
         self.at += spaces + word;
+        self.settle();
     }
 
     /// Delete back to the start of the word before the cursor.
@@ -112,6 +117,7 @@ impl Prompt {
         let start = self.word_start();
         self.text.drain(start..self.at);
         self.at = start;
+        self.settle();
     }
 
     /// Delete back to the start of the line, or the line break before the
@@ -124,6 +130,7 @@ impl Prompt {
         };
         self.text.drain(start..self.at);
         self.at = start;
+        self.settle();
     }
 
     /// Delete to the end of the line, or the line break after the cursor
@@ -135,6 +142,19 @@ impl Prompt {
             end => end,
         };
         self.text.drain(self.at..end);
+        self.settle();
+    }
+
+    /// Put the cursor back on a grapheme boundary, the next one, after an
+    /// edit joined the graphemes around it (a flag's two halves) or a
+    /// move stopped inside one.
+    fn settle(&mut self) {
+        self.at = self
+            .text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .find(|&i| i >= self.at)
+            .unwrap_or(self.text.len());
     }
 
     /// Move a drawn row up; false when the cursor is on the first.
@@ -199,7 +219,7 @@ impl Prompt {
                 // A word wider than a row is cut where the row ends.
                 for (i, g) in word.grapheme_indices(true) {
                     let w = g.width();
-                    if used + w > room && used > 0 && !g.trim().is_empty() {
+                    if used + w > room && used > 0 {
                         let at = word_start + i;
                         rows.push(Row { start, end: at });
                         start = at;
@@ -383,6 +403,29 @@ mod tests {
         let shown: Vec<_> = rows.iter().map(|r| &prompt[r.start..r.end]).collect();
         assert_eq!(shown, ["abcdefghi", family]);
         assert_eq!(prompt.cursor(&rows), (1, LEAD + 2));
+    }
+
+    #[test]
+    fn an_edit_that_joins_graphemes_leaves_the_cursor_after_them() {
+        let (us, s) = ("\u{1F1FA}", "\u{1F1F8}");
+        let mut prompt = typed(s);
+        prompt.home();
+        prompt.insert(us);
+        assert_eq!(prompt.at, prompt.len());
+        let mut prompt = typed(&format!("{us}x{s}"));
+        prompt.left();
+        prompt.backspace();
+        assert_eq!(prompt.at, prompt.len());
+        prompt.backspace();
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn spaces_past_a_row_wrap_like_any_text() {
+        let prompt = typed(&" ".repeat(16));
+        let rows = prompt.layout(13);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(prompt.cursor(&rows), (1, LEAD + 6));
     }
 
     #[test]
