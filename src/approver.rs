@@ -74,8 +74,14 @@ const BACKOFF: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(4);
 /// The longest Retry-After honored, past any round's deadline anyway.
 const RETRY_MAX_SECS: f64 = 60.0;
-/// A judge fork is `approver.TAG.PID.N`, and every bot name fits 128 bytes.
-const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - ".4294967295.18446744073709551615".len();
+/// A judge fork is `approver.TAG.BASE.N`, BASE being the base bot's id,
+/// and every bot name fits 128 bytes.
+const JUDGE_NAME_ROOM: usize =
+    128 - "approver.".len() - ".9223372036854775807.18446744073709551615".len();
+/// How long a judge's fork may sit idle before the daemon deletes it. Each
+/// is deleted once its round is answered; this is for an approver that
+/// stopped mid-round.
+const JUDGE_EXPIRE_MS: u64 = 60_000;
 
 fn epoch_ms() -> i64 {
     SystemTime::now()
@@ -296,10 +302,11 @@ struct Model {
 }
 
 impl Model {
-    /// A fresh base, so a changed judge takes effect, and no forks left by
-    /// an approver that stopped mid-round. Only the tag's holder does this,
-    /// and it removes only judges: a bot of the same name that is not one
-    /// is refused, not deleted.
+    /// A fresh base, so a changed judge takes effect. Only the tag's holder
+    /// does this, and it removes only a judge: a bot of the same name that is
+    /// not one is refused, not deleted. Forks an approver left mid-round
+    /// expire on their own, and the new base's id keeps new forks' names
+    /// apart from theirs.
     async fn prepare(
         client: &Arc<Client>,
         base: String,
@@ -315,36 +322,6 @@ impl Model {
             }
             Err(error) if error.code != "bot_not_found" => return Err(error.into()),
             _ => {}
-        }
-        // Bots are listed in name order, so the judge's forks are the run
-        // of names right after its prefix: only those pages are read.
-        let prefix = format!("{base}.");
-        let mut after = json!(prefix);
-        'pages: loop {
-            let page = client
-                .request("bots", json!({"after":after,"limit":64}))
-                .await
-                .map_err(Error::from)?;
-            for bot in page["bots"].as_array().into_iter().flatten() {
-                let Some(name) = bot["name"]
-                    .as_str()
-                    .filter(|name| name.starts_with(&prefix))
-                else {
-                    break 'pages;
-                };
-                if bot["created_by"] == base.as_str()
-                    && bot["tools"].as_array().is_some_and(Vec::is_empty)
-                {
-                    // Aside, so a turn still ending does not hold up serving.
-                    let (client, name) = (client.clone(), name.to_owned());
-                    let running = bot["running_turn"].as_i64();
-                    tokio::spawn(async move { remove(&client, &name, running).await });
-                }
-            }
-            match &page["next_after"] {
-                Value::Null => break,
-                next => after = next.clone(),
-            }
         }
         match client.request("delete", json!({"bot":base})).await {
             Err(error) if error.code != "bot_not_found" => return Err(error.into()),
@@ -377,14 +354,14 @@ impl Model {
         let name = format!(
             "{}.{}.{}",
             self.base,
-            std::process::id(),
+            self.base_id,
             self.next.fetch_add(1, Ordering::Relaxed)
         );
         if let Err(error) = client
             .request(
                 "fork",
                 json!({"source":self.base,"bot":name,"workspace":"/","created_by":self.base,
-                    "created_by_id":self.base_id}),
+                    "created_by_id":self.base_id,"expire_ms":JUDGE_EXPIRE_MS}),
             )
             .await
         {
