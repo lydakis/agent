@@ -247,14 +247,21 @@ pub fn effective(lead: bool, subscriber: &str, mut subs: Vec<Sub>) -> Vec<Sub> {
     subs
 }
 
-/// The longest name a subscription or subscriber may have.
+/// The longest name a subscription may have.
 const NAME_MAX: usize = 64;
+
+/// The longest name the daemon gives a bot.
+const BOT_NAME_MAX: usize = 128;
 
 /// A name the note may say as it is: it reaches the approver as the
 /// person's words, so it holds nothing that reads as more.
 fn named_plainly(name: &str) -> bool {
+    plain(name, NAME_MAX)
+}
+
+fn plain(name: &str, max: usize) -> bool {
     !name.is_empty()
-        && name.len() <= NAME_MAX
+        && name.len() <= max
         && !name.starts_with('.')
         && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
@@ -392,7 +399,7 @@ fn edit(
         }
     }
     let subscriber = subscriber(named, caller)?;
-    if !named_plainly(&subscriber) {
+    if !plain(&subscriber, BOT_NAME_MAX) {
         return Err(format!("{subscriber:?} is not a bot's name"));
     }
     if let Some(name) = name.as_deref().filter(|name| !named_plainly(name)) {
@@ -557,6 +564,16 @@ mod tests {
                 .unwrap_err()
                 .contains("not a bot's name")
         );
+        // A lead of a project with a long name is a bot like any other.
+        let long = format!("{}.lead", "p".repeat(64));
+        edit(
+            &store,
+            None,
+            "add",
+            &args(&["x", "--for", &long, "--bot", "a"]),
+        )
+        .unwrap();
+        edit(&store, None, "rm", &args(&["x", "--for", &long])).unwrap();
         // Changes made at once all land.
         let threads: Vec<_> = (0..8)
             .map(|n| {

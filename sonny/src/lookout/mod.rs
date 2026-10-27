@@ -1894,6 +1894,9 @@ struct Lookout {
     /// For each other bot a subscription names the makers of: it, and every
     /// bot it or one of those made.
     others: HashMap<String, HashSet<String>>,
+    /// Bots a subscription's `--bot` glob names, as listed and made since:
+    /// peers to compare a check with, as tasks are.
+    globbed: HashSet<String>,
     /// A lead hears its task updates; another subscriber only what its
     /// subscriptions pick.
     updating: bool,
@@ -1951,6 +1954,7 @@ impl Lookout {
             lineage: [lead.to_owned()].into(),
             subs: subs::effective(lead_project(lead).is_some(), lead, Vec::new()),
             others: HashMap::new(),
+            globbed: HashSet::new(),
             updating: lead_project(lead).is_some(),
             waiting_on: Vec::new(),
             waiting_any: false,
@@ -1996,9 +2000,13 @@ impl Lookout {
                         made.insert(bot.to_owned());
                     }
                 }
+                if self.globs(bot) && event["data"]["expire_ms"].is_null() {
+                    self.globbed.insert(bot.to_owned());
+                }
             }
             "deleted" if bot != self.lead => {
                 self.lineage.remove(bot);
+                self.globbed.remove(bot);
                 // A root keeps its place under its name, so what it makes
                 // once made again is still watched.
                 for (root, made) in self.others.iter_mut() {
@@ -2363,6 +2371,17 @@ impl Lookout {
             grow(&mut made, records);
             self.others.insert(root, made);
         }
+        self.globbed = (records.iter())
+            .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
+            .map(|(name, _)| name.clone())
+            .collect();
+    }
+
+    /// Whether a subscription's `--bot` glob names this bot.
+    fn globs(&self, bot: &str) -> bool {
+        bot != self.lead
+            && !judge_bot(bot)
+            && (self.subs.iter()).any(|sub| sub.bots.iter().any(|glob| subs::matches(glob, bot)))
     }
 
     /// Keeps an item's look-fors only while its subscription still asks
@@ -2423,6 +2442,7 @@ impl Lookout {
                     .iter()
                     .flat_map(|(root, made)| made.iter().filter(move |b| *b != root)),
             )
+            .chain(self.globbed.iter())
             .filter(|bot| *bot != task && **bot != self.lead)
             .cloned()
             .collect();
@@ -3292,11 +3312,17 @@ mod tests {
             ("review.a", "review.lead"),
             ("review.b", "review.a"),
             ("shop.x", "shop.lead"),
+            ("ops.db", ""),
         ]
         .into_iter()
         .map(|(name, by)| (name.to_owned(), json!({"name": name, "created_by": by})))
         .collect();
         lookout.roots(&records);
+        // Bots a glob names are compared with as tasks are, those made
+        // later too.
+        lookout.lineage_of(&json!({"event": "created", "bot": "ops.web", "data": {}}));
+        let peers = lookout.peers_of("ops.deploy");
+        assert!(peers.contains(&"ops.db".to_owned()) && peers.contains(&"ops.web".to_owned()));
         // The lead's own tasks, a bot its glob names, and what another made.
         assert!(lookout.watches("calc.fix"));
         assert!(lookout.watches("ops.deploy"));
