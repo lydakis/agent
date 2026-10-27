@@ -517,7 +517,10 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    herdr::announce(&name, reopen());
+    // A side chat borrows its agent's pane, and Herdr keeps the agent.
+    if options.side.is_none() {
+        herdr::announce(&name, reopen());
+    }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
     // is read after that, so a turn that ended during the replay is seen
