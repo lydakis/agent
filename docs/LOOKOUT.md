@@ -25,8 +25,8 @@ named `PROJECT.*`. Each of these is one check:
 
 | Event | When | Questions |
 | --- | --- | --- |
-| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, sibling_needs, conflict, remember |
-| Ended | a task's turn ends, unless the lead is waiting on it | sibling_needs, conflict, off_brief, stuck, lead_next, result |
+| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, sibling_needs, conflict, drifts (the person's words only), remember |
+| Ended | a task's turn ends, unless the lead is waiting on it | sibling_needs, conflict, drifts, stuck, lead_next, result |
 | Waiting | a task has waited on the person's approval for 2 minutes | stuck |
 | Quiet | a task's running turn has printed nothing for 30 minutes | stuck |
 
@@ -34,6 +34,10 @@ A turn waiting on the person, on other turns or for a slot is not quiet,
 and a silence is checked once; printing again starts a new one. The judge
 reads the event's text, the lead's latest message to that task (its brief),
 the other tasks' briefs and latest lines, and the project's memory indexes.
+For `drifts` it also reads what passed in the task since the lead last
+wrote to it: the person's messages and the first line of each reply, the
+last 6. A yes asks the lead to settle what the person means and steer the
+task with that reading.
 
 A high answer (0.70 or more; 0.85 for a result) wakes the lead: at once with `--delivery
 steer` when the question is urgent (redirects, conflict), else queued, at
