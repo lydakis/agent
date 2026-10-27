@@ -796,7 +796,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     proposal's first step; the daemon is unchanged): a desktop window on a
     host from `~/.ssh/config`, through one ControlMaster per host that the
     app supervises, the host's own `agent start` over it, and its socket
-    forwarded into `~/.agent/hosts/` ([APP.md](APP.md#hosts-over-ssh)).
+    forwarded into `~/.agent/hosts/` (the app, since deleted).
     `agent start` now prints the socket it answered on and, for a daemon of
     another protocol, its ready line before failing; `agent shutdown` stops
     an older daemon by its pid. What reads files is refused by name on a
@@ -969,14 +969,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     refreshes its bundled catalog from the Codex backend's `/models`,
     OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
     catalogs. The daemon never reads the list. Done
-    (2026-09-27): the app shell ([APP.md](APP.md#projects-and-panes)):
+    (2026-09-27): the app shell (the app, since deleted):
     projects in the sidebar from coordinator bots and `.agents/project.toml`,
     a side pane with its own composer, the model chip, Send with queue or
     steer, one ⋯ menu, runs folded to one line. Done (2026-09-27): side
     chats, forks of a running or resting bot opened beside, with their
     source's tools in its folder: George (2026-09-27) wants them to edit,
     as the same agent asked something else at once, never read-only
-    ([APP.md](APP.md#projects-and-panes)). Follow-up: `delete` and `fork` take only a name, so a
+    (the app, since deleted). Follow-up: `delete` and `fork` take only a name, so a
     delete or fork the app started can land on a bot recreated under that
     name meanwhile; both should take the bot's id, as `submit` does. The
     same holds for a model menu left open across such a recreation. And a
@@ -996,7 +996,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `--workspace` runs where the bot is, one with it moves the bot there,
     and a fork starts where its source is (George, 2026-09-27); the app
     shows a worktree bot's branch
-    ([APP.md](APP.md#projects-and-panes)). Follow-up: deleting a bot leaves
+    (the app, since deleted). Follow-up: deleting a bot leaves
     its worktree and branch, which hold its work; the app should offer to
     remove them. Follow-up: the coordinator text continues a task by name,
     so a task deleted and recreated under the same name gets its messages;
@@ -1014,7 +1014,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `tools`, both indexed for every composed bot; `--profile ROLE` starts a
     bot in one; the app's coordinator text is its shipped `coordinator`
     profile ([CLIENT.md](CLIENT.md)). Done (2026-09-28): swarms, first
-    part ([APP.md](APP.md#projects-and-panes)): New swarm in a project's
+    part (the app, since deleted): New swarm in a project's
     menu, a swarm folder in `~/.agent/swarms` with its board, its agents as
     ordinary bots with a budget share in the app's mode-specific profile, and a
     `post` tool (the app's executable) that steers a post into the agents
@@ -1024,7 +1024,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     turn; a model could still post as another member, so the board should
     show a post as its author's only when the author's own tool call ran
     it. Deleting a swarm is not built. Done (2026-09-28): roles, the
-    council and streams ([APP.md](APP.md#projects-and-panes)): a swarm is
+    council and streams (the app, since deleted): a swarm is
     one board or a council of 3 (its first agents) that votes on proposed
     streams; you can decide any proposal; a stream's posts reach its own
     agents unless posted to everyone. Not built: curator digests, ✓ checks
@@ -1063,13 +1063,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     swarm every post reaches every working agent, so 16 posting once each
     is 240 deliveries, each re-read as context); Keep. Approvals in the app wait: George runs
     with full access. Done (2026-10-10, S1 of the shipping plan, first
-    part): swarms are a skill ([APP.md](APP.md#projects-and-panes)):
+    part): swarms are a skill (the app, since deleted):
     `app/skills/swarm` holds the rules (`member.md`) and a Python 3 script
     that starts, posts, stops and folds the board over the daemon's socket
     under a `flock` on the board; the app's Rust engine, its
     `--swarm-post`/`--swarm-start` modes and `~/.agent/swarms/start` are
     gone, and the app runs the script. Measured first: a post through the
-    script costs no more than one through the app binary (APP.md). Flat
+    script costs no more than one through the app binary (the app's notes, since deleted). Flat
     only for now: the council, its streams and its Settings role come back
     as a second skill. A swarm started before this has a `swarm.toml` the
     script does not read, so it is not listed.
@@ -1081,7 +1081,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     region and AWS profile or API key) and lists what each offers; there is
     no default model (George, 2026-09-28): a project or agent is given one
     when it is made, from any provider, listed under its provider's name.
-    Settings is the same screen ([APP.md](APP.md#setup-and-settings)). Follow-up: a change restarts the
+    Settings is the same screen (the app, since deleted). Follow-up: a change restarts the
     daemon and so stops running turns; a daemon that could take providers
     while running would not, but that is a daemon op for the app's sake and
     waits until restarts prove a cost. Follow-up: Settings shows the providers

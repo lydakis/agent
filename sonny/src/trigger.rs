@@ -15,7 +15,7 @@
 //! repeating trigger: that time is skipped. A deleted agent takes its
 //! triggers with it.
 //!
-//! `~/.agent/trigger`, a script the app writes, is how agents and people
+//! `~/.agent/trigger`, a script Sonny writes, is how agents and people
 //! add, list, fire and remove them.
 use agent_client::Client;
 use serde_json::{Value, json};
@@ -47,7 +47,7 @@ const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a fire waits for the turn whose answer goes to `--reply-to`:
 /// the longest wait the daemon takes.
 const REPLY_WAIT_MS: u64 = 86_400_000;
-pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME\n       trigger changed --except BOT";
+pub const USAGE: &str = "usage: trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only fire runs it\n       trigger ls [--after NAME]\n       trigger show NAME\n       trigger fire NAME\n       trigger rm NAME";
 
 /// Where triggers live: the LaunchAgents folder holds their plists, and
 /// `~/.agent/triggers` what each one's fires did.
@@ -902,7 +902,7 @@ pub fn commit(value: &str) -> Result<(When, PathBuf), String> {
 
 /// The LaunchAgent for a trigger. `environment` is what the fire starts
 /// with besides launchd's own: the shell whose login environment starts a
-/// daemon with your keys, as the app starts one. Without calendar entries
+/// daemon with your keys, as Sonny starts one. Without calendar entries
 /// or a watched path, launchd runs it only when asked (`fire`): an ask is a
 /// file in `asks`, which launchd watches as a queue.
 pub fn plist(
@@ -1005,7 +1005,7 @@ fn queues(asks: &Path) -> Result<(), String> {
     })
 }
 
-/// A plist's program arguments, as the app writes them.
+/// A plist's program arguments, as Sonny writes them.
 fn program(text: &str) -> Option<Vec<String>> {
     let rest = &text[text.find("<key>ProgramArguments</key>")?..];
     let array = &rest[rest.find("<array>")? + "<array>".len()..rest.find("</array>")?];
@@ -1020,14 +1020,14 @@ fn program(text: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// The path a plist has launchd watch, as the app writes it.
+/// The path a plist has launchd watch, as Sonny writes it.
 fn watched(text: &str) -> Option<PathBuf> {
     let rest = &text[text.find("<key>WatchPaths</key>")?..];
     let body = &rest[rest.find("<string>")? + "<string>".len()..];
     Some(PathBuf::from(unescape(&body[..body.find("</string>")?])))
 }
 
-/// The trigger a plist runs, and the app it runs it with.
+/// The trigger a plist runs, and the Sonny it runs it with.
 fn read_plist(text: &str) -> Option<(Trigger, PathBuf)> {
     let args = program(text)?;
     let (app, rest) = args.split_first()?;
@@ -1060,7 +1060,7 @@ fn read_trigger(path: &Path) -> Read {
     })
 }
 
-/// Walk one plist at a time when refreshing the app path.
+/// Walk one plist at a time when refreshing Sonny's path.
 fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
     std::fs::read_dir(&places.agents)
         .into_iter()
@@ -1295,7 +1295,7 @@ fn swap(
 }
 
 /// Held while a trigger's files or launchd's job change, so `add`, `rm`,
-/// a fire ending its trigger and the app's refresh never interleave. The
+/// a fire ending its trigger and Sonny's refresh never interleave. The
 /// lock goes with the process, also when a fire's own unload ends it.
 struct Lock {
     _held: std::fs::File,
@@ -1674,7 +1674,7 @@ fn tomb(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file}.retiring"))
 }
 
-/// At the app's start, under the lock, finish what was cut short: a retire
+/// At Sonny's start, under the lock, finish what was cut short: a retire
 /// a fire's own unload ended before it deleted what it set aside, and a
 /// write that died before its rename, whose temporary nothing else would
 /// remove. Every write here is under the lock, so no other is under way. A
@@ -1913,7 +1913,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
 }
 
 /// What a trigger's job starts with besides launchd's own: the shell whose
-/// login environment starts a daemon with your keys, as the app starts one.
+/// login environment starts a daemon with your keys, as Sonny starts one.
 fn environment() -> Vec<(&'static str, String)> {
     // PATH too: an `--if` command runs with the adder's, as typed there.
     ["HOME", "SHELL", "PATH"]
@@ -1970,7 +1970,7 @@ pub fn at_start() {
     });
 }
 
-/// `sonny trigger add|ls|show|fire|rm|changed`, as `~/.agent/trigger` runs it.
+/// `sonny trigger add|ls|show|fire|rm`, as `~/.agent/trigger` runs it.
 pub fn cli(args: &[String]) -> i32 {
     let done = match Places::home().and_then(|places| match args.split_first() {
         Some((verb, rest)) if verb == "ls" => match rest {
@@ -1984,98 +1984,16 @@ pub fn cli(args: &[String]) -> i32 {
         Some((verb, [name])) if verb == "show" => Ok(one(&places, name).unwrap_or(Value::Null)),
         Some((verb, [name])) if verb == "fire" => fire_now(&places, name),
         Some((verb, rest)) if verb == "add" => add(&places, rest),
-        Some((verb, [flag, bot])) if verb == "changed" && flag == "--except" => {
-            changed(&places, bot).map(|yes| json!({"changed": yes}))
-        }
         _ => Err(format!("usage: {USAGE}")),
     }) {
         Ok(value) => {
             println!("{value}");
-            // A check's answer is its exit status too: 1 says nothing changed.
-            return i32::from(value["changed"] == false);
+            return 0;
         }
         Err(error) => error,
     };
     eprintln!("{}", error_json(&done));
     1
-}
-
-/// Whether an agent other than `except` has a new message or another status
-/// since the last check for `except`: a heartbeat's `--if`, so a quiet tick
-/// costs this process and one `bots` page per 256 agents, and no model call.
-/// The first check, and one with no daemon running, only take note.
-fn changed(places: &Places, except: &str) -> Result<bool, String> {
-    changed_at(places, except, &Daemon::current()?.socket()?)
-}
-
-fn changed_at(places: &Places, except: &str, socket: &Path) -> Result<bool, String> {
-    valid_name(except)?;
-    let now = runtime()?.block_on(async {
-        // No daemon: nothing moved, and none is started to ask.
-        let Ok((client, _events)) = Client::connect(socket).await else {
-            return Ok(None);
-        };
-        let store = client.store().unwrap_or_default().to_owned();
-        let mut hash = Fnv::new(&store);
-        let mut busy = false;
-        let mut after = Value::Null;
-        let read = loop {
-            let page = match client
-                .request("bots", json!({"after": after, "limit": 256}))
-                .await
-            {
-                Ok(page) => page,
-                Err(e) => break Err(coded(e)),
-            };
-            for bot in page["bots"].as_array().into_iter().flatten() {
-                if bot["name"] == except {
-                    busy = bot["status"] != "idle";
-                } else {
-                    hash.add(&format!(
-                        "{}|{}|{}|{}",
-                        bot["name"], bot["bot_id"], bot["head"], bot["status"]
-                    ));
-                }
-            }
-            after = page["next_after"].clone();
-            if after.is_null() {
-                break Ok(Some((format!("{:016x}", hash.0), busy, store)));
-            }
-        };
-        client.close().await;
-        read
-    })?;
-    let Some((now, busy, store)) = now else {
-        return Ok(false);
-    };
-    // One note per store: two daemons' fleets never read as each other's.
-    let seen = places
-        .state
-        .join(format!(".changed.{except}.{:016x}", Fnv::new(&store).0));
-    let before = std::fs::read_to_string(&seen).ok();
-    // A busy agent would skip this wake, so the change stays unseen until
-    // a tick can deliver it.
-    if busy || before.as_deref() == Some(now.as_str()) {
-        return Ok(false);
-    }
-    std::fs::create_dir_all(&places.state).map_err(|e| e.to_string())?;
-    replace(&seen, &now)?;
-    Ok(before.is_some())
-}
-
-/// FNV-1a, 64-bit: the same digest from one app version to the next.
-struct Fnv(u64);
-impl Fnv {
-    fn new(seed: &str) -> Self {
-        let mut hash = Self(0xcbf2_9ce4_8422_2325);
-        hash.add(seed);
-        hash
-    }
-    fn add(&mut self, text: &str) {
-        for byte in text.bytes().chain([0]) {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-        }
-    }
 }
 
 /// A trigger that watched the triggers' own folder would fire itself: each
@@ -2332,7 +2250,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     }
 }
 
-/// What a fire did, kept for the app to show and the next fire to read.
+/// What a fire did, kept for `ls` to show and the next fire to read.
 /// It is the trigger's whole row, which Settings still shows once the
 /// trigger has ended on its own.
 fn record_last(
@@ -2441,7 +2359,7 @@ fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(),
     said
 }
 
-/// The first fire of a `--start` trigger: the agent is made as the app
+/// The first fire of a `--start` trigger: the agent is made as Sonny
 /// makes one, with its folder's composed policy and the default tools, and
 /// shown under the agent that added the trigger. Its request id is the
 /// trigger's: a fire cut short after the daemon made it asks again and gets
@@ -2560,7 +2478,7 @@ async fn deliver(
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire
 /// cut short is run again for its ask, which sends the same request: the
 /// daemon takes it once. With `--reply-to` it ends `.to.ID`, the agent its
-/// answer goes to: the app tells a coordinator of its task's turn only
+/// answer goes to: the lookout tells a lead of its task's turn only
 /// when the answer does not reach it already.
 fn request_id(trigger: &Trigger, id: i64, ask: Option<&Asked>) -> String {
     let base = match ask {
@@ -3346,7 +3264,7 @@ mod tests {
                 .unwrap_err()
                 .starts_with("trigger_not_found")
         );
-        // A move of the app is written into every trigger and reloaded.
+        // A move of Sonny is written into every trigger and reloaded.
         let unloads = w.fake.unloads.get();
         refresh(&w.places, Path::new("/B/agent-app"), &|x| w.fake.call(x));
         assert_eq!(triggers(&w.places)[0].1, Path::new("/B/agent-app"));
@@ -3472,62 +3390,6 @@ mod tests {
         assert_eq!(one(&w.places, "task-065").unwrap(), second["triggers"][2]);
         assert!(one(&w.places, "task-999").is_none());
         assert!(one(&w.places, "../x").is_none());
-    }
-
-    #[test]
-    fn changed_says_when_another_agent_moved() {
-        use std::io::{BufRead, Write};
-        let w = World::new("changed");
-        std::fs::create_dir_all(&w.root).unwrap();
-        let socket = w.root.join("f.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        // The fleet each connection sees: home, and one task on two pages.
-        let fleet = std::sync::Arc::new(std::sync::Mutex::new((1, 1, "idle", "idle")));
-        let kept = fleet.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let reader = std::io::BufReader::new(stream.try_clone().unwrap());
-                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL, "store": {"identity": "s1"}});
-                writeln!(stream, "{ready}").unwrap();
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    let request: Value = serde_json::from_str(&line).unwrap();
-                    let (home, task, status, at_home) = *kept.lock().unwrap();
-                    let result = if request["after"].is_null() {
-                        json!({"bots": [{"name": "home", "bot_id": 1, "head": home, "status": at_home}], "next_after": "home"})
-                    } else {
-                        json!({"bots": [{"name": "p.task", "bot_id": 2, "head": task, "status": status}], "next_after": null})
-                    };
-                    if writeln!(stream, "{}", json!({"id": request["id"], "result": result}))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        });
-        let changed = || changed_at(&w.places, "home", &socket).unwrap();
-        assert!(!changed(), "the first check takes note");
-        assert!(!changed());
-        // Home's own turn is not news for Home.
-        fleet.lock().unwrap().0 = 5;
-        assert!(!changed());
-        fleet.lock().unwrap().1 = 2;
-        assert!(changed(), "another agent's message is");
-        assert!(!changed(), "once");
-        fleet.lock().unwrap().2 = "waiting";
-        assert!(changed(), "so is another status");
-        // Home busy at a tick would skip the wake: the news waits for it.
-        fleet.lock().unwrap().1 = 3;
-        fleet.lock().unwrap().3 = "running";
-        assert!(!changed());
-        fleet.lock().unwrap().3 = "idle";
-        assert!(changed(), "once Home can take it");
-        // No daemon: nothing to tell, and the last digest stays.
-        assert!(!changed_at(&w.places, "home", &w.root.join("none.sock")).unwrap());
-        assert!(!changed());
-        assert!(changed_at(&w.places, "../x", &socket).is_err());
     }
 
     #[test]

@@ -34,8 +34,10 @@ cd agent
 cargo install --locked --path .
 ```
 
-That puts `agent` in `~/.cargo/bin`. The desktop app has its own build; see
-[Desktop app](#desktop-app).
+That puts `agent` in `~/.cargo/bin`. With [Homebrew](https://brew.sh),
+`brew install lydakis/agent/agent` builds the same from a release's source;
+`brew install lydakis/agent/sonny` adds [Sonny](#sonny), the terminal
+client, and pulls in `agent` with it.
 
 ## Quickstart
 
@@ -166,21 +168,16 @@ Programs that want a persistent connection can speak the daemon's JSONL socket
 protocol directly; [`client/`](client) is a Rust client for it. See the
 [software protocol](docs/RUST_PROTOTYPE.md#software-protocol).
 
-## Desktop app
+## Sonny
 
-[`app/`](app) is a Tauri desktop client over the same socket: projects and
-their tasks, a thread with another beside it, and background commands in one
-window. On macOS, install it with [Homebrew](https://brew.sh):
+[Sonny](sonny/README.md) is a terminal client over the same socket. Opened
+in a folder, it is that project's lead: it starts tasks, each in its own copy
+of the folder, lays them out in Rex or Herdr, and hears what they did. It
+also gives every agent [triggers, memory and skills](docs/SONNY.md).
 
 ```sh
-brew install --cask lydakis/agent/agent
+brew install lydakis/agent/sonny
 ```
-
-The app carries its own copy of the runtime, which the cask also puts on
-`PATH` as `agent`, and starts the daemon when none is running. A window can
-also run its agents on a machine you reach over SSH, which needs its own Linux
-`agent` ([hosts over SSH](docs/APP.md#hosts-over-ssh)). See [desktop client](docs/APP.md) to build and run it from
-source.
 
 ## How fast is it?
 
