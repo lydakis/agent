@@ -89,6 +89,49 @@ class LookoutTests(ModelFixture):
             {'from': 'the task', 'text': 'reply:fix the parser'},
         ])
 
+    def test_a_fork_of_the_lead_judges_from_where_the_lead_stood(self):
+        self.make('calc.lead', 'calc.fix')
+        forked = queue.Queue()
+
+        def reply(request, user):
+            if user.startswith('This message is from your lookout'):
+                body = json.loads(user[user.index('{'):])
+                forked.put((request, body))
+                return json.dumps({q: (0.9 if q == 'result' else 0.1) for q in body['questions']})
+            if request['model'] == 'judge-model':
+                body = json.loads(user)
+                self.asked.put((request, body))
+                return json.dumps({q: 0.1 for q in body['questions']})
+            return None
+        self.model.reply_for = reply
+        for n, (bot, prompt) in enumerate([('calc.lead', 'plan the parser work'), ('calc.fix', 'fix the parser'),
+                                           ('calc.lead', 'words after the task ended')]):
+            turn = self.daemon.request('submit', bot=bot, request_id=f'r{n}', prompt=prompt)['result']['turn']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        out = self.lookout('--replay', '--judge', 'lead,openai/judge-model+lead')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        checks = {(line['judge'], line['kind']): line for line in map(json.loads, out.stdout.splitlines())}
+        self.assertEqual(checks[('lead', 'Ended')]['band'], 'Wake { steer: false }')
+        # The fork read the lead's conversation up to the task's end, not
+        # what the lead was told after it.
+        asked = [forked.get(timeout=5) for _ in range(2)]
+        self.assertEqual([body['input']['event']['text'] for _, body in asked],
+                         ['fix the parser', 'reply:fix the parser'])
+        for request, _ in asked:
+            history = json.dumps(request['input'])
+            self.assertIn('plan the parser work', history)
+            self.assertNotIn('words after the task ended', history)
+        # A judge reading the lead's words gets them from the same point.
+        said = [b for _, b in iter(lambda: None if self.asked.empty() else self.asked.get(), None)]
+        self.assertEqual(said[-1]['input']['lead'], [
+            {'from': 'to the lead', 'text': 'plan the parser work'},
+            {'from': 'the lead', 'text': 'reply:plan the parser work'},
+        ])
+        # Each fork of the lead is deleted once it answers.
+        bots = [b['name'] for b in self.daemon.request('bots')['result']['bots']]
+        self.assertEqual(sorted(b for b in bots if b.startswith('lookout.')),
+                         [b for b in bots if b.startswith('lookout.') and b.count('.') == 1], bots)
+
     def test_one_lookout_wakes_each_lead_whose_task_has_news(self):
         self.make('calc.lead', 'calc.fix', 'shop.lead')
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'openai/judge-model',
