@@ -1406,7 +1406,7 @@ and the message. A fire whose daemon announces another store (a reused
 socket) sends nothing and records `store_mismatch`. When it fires, Sonny
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
-on that socket as Sonny does (the `agent` beside it, or `AGENT_BIN`), with the login shell's environment and
+on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
 `~/.agent/env`. A repeating trigger submits with `delivery: reject`: a bot
 that is working, or has work waiting, skips that fire rather than having it
 cut in or pile up. A one-off, and a fire `fire` asked for, submits with
