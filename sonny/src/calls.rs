@@ -87,6 +87,9 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
             output: None,
         }),
         "plan" if program.contains("skills/plan") => plan(args),
+        "sonny" if args.first().is_some_and(|a| a == "agent") => {
+            agent(&args[1..], stdin, printed, failed)
+        }
         "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "split") => sonny_split(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "ask") => sonny_ask(&args[1..], failed),

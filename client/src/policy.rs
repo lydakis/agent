@@ -17,6 +17,32 @@ use std::path::{Path, PathBuf};
 /// for the prompt cache to matter.
 pub const MAX_INSTRUCTIONS: usize = 60 * 1024;
 
+/// The command a bot's shell reaches the daemon's CLI by, as the client
+/// that made the bot says: `AGENT_CLI` when a client that wraps the CLI
+/// sets it (Sonny sets its own `"PATH/sonny" agent`), else `"$AGENT_BIN"`,
+/// the binary the daemon gives every shell.
+pub fn cli() -> String {
+    std::env::var("AGENT_CLI")
+        .ok()
+        .filter(|cli| !cli.trim().is_empty())
+        .unwrap_or_else(|| "\"$AGENT_BIN\"".into())
+}
+
+/// `text` with each `"$AGENT_BIN"` naming the CLI the way `cli` says, as
+/// the preamble and a role are written.
+pub fn with_cli(text: &str) -> String {
+    naming(text, &cli())
+}
+
+fn naming(text: &str, cli: &str) -> String {
+    text.replace("\"$AGENT_BIN\"", cli)
+}
+
+/// `PREAMBLE`, naming the CLI the way `cli` says.
+pub fn preamble() -> String {
+    with_cli(PREAMBLE)
+}
+
 pub const PREAMBLE: &str = "To delegate a subtask to another agent with its own conversation, run \
 \"$AGENT_BIN\" run --detach --new --agents --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
 --agents gives it this folder's AGENTS.md, skills and memory, so its task need not say where they are. \
@@ -355,14 +381,16 @@ impl Kind {
             Kind::Profiles => "agents",
         }
     }
-    fn header(self) -> &'static str {
+    fn header(self) -> String {
         match self {
             Kind::Skills => {
                 "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n"
+                    .into()
             }
-            Kind::Profiles => {
-                "\n\n# Profiles\n\nStart an agent in one of these roles with \"$AGENT_BIN\" run --detach --new --profile ROLE --bot NAME -- TASK.\n"
-            }
+            Kind::Profiles => format!(
+                "\n\n# Profiles\n\nStart an agent in one of these roles with {} run --detach --new --profile ROLE --bot NAME -- TASK.\n",
+                cli()
+            ),
         }
     }
     /// The name an entry of this directory would index under. Only a name
@@ -764,7 +792,7 @@ pub fn instructions(
     role: Option<&Profile>,
     memory: &[PathBuf],
 ) -> Result<Instructions, Failure> {
-    let mut text = String::from(PREAMBLE);
+    let mut text = preamble();
     let mut sources = Vec::new();
     for path in agents_files(workspace)? {
         let header = format!("\n\n# Instructions from {}\n\n", path.display());
@@ -778,7 +806,7 @@ pub fn instructions(
             MAX_INSTRUCTIONS.saturating_sub(text.len() + kind.header().len()),
         )?;
         if !entries.is_empty() {
-            let mut block = String::from(kind.header());
+            let mut block = kind.header();
             for entry in &entries {
                 block.push_str(&entry_row(entry));
             }
@@ -804,7 +832,7 @@ pub fn instructions(
     }
     // The role comes last: the most specific text a bot is given.
     if let Some(role) = role.filter(|r| !r.body.is_empty()) {
-        let block = format!("\n\n# Role: {}\n\n{}", role.name, role.body);
+        let block = format!("\n\n# Role: {}\n\n{}", role.name, with_cli(&role.body));
         if text.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
                 path: role
@@ -830,6 +858,19 @@ pub fn instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_that_wraps_the_cli_names_its_own_way_in() {
+        let sonny = "\"/opt/homebrew/opt/sonny/bin/sonny\" agent";
+        let text = naming(PREAMBLE, sonny);
+        assert!(!text.contains("AGENT_BIN"), "{text}");
+        assert!(text.contains(&format!(
+            "{sonny} run --detach --new --agents --bot NAME -- TASK"
+        )));
+        assert!(text.contains(&format!("{sonny} run --detach --bot \"$AGENT_PARENT\"")));
+        // Without one, the binary the daemon gives every shell.
+        assert_eq!(naming(PREAMBLE, "\"$AGENT_BIN\""), PREAMBLE);
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("agent-policy-{name}-{}", std::process::id()));
