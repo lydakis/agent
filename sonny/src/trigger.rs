@@ -1,11 +1,9 @@
 //! Triggers: an agent woken with a message it wrote for itself, or one
 //! written for it, when something happens: a time comes, a file is written,
-//! a repository's HEAD moves, an agent ends a turn, or someone fires it by
-//! name. launchd watches, so a trigger fires with the app closed, and once
-//! on waking for times the Mac slept through. The daemon has no clock or
-//! watcher of its own. No process of a trigger runs between its fires but
-//! one watcher, while any trigger waits on turn ends: it follows those
-//! agents' events and starts their triggers' fires (`watch`).
+//! a repository's HEAD moves, or someone fires it by name. launchd
+//! watches, so a trigger fires with Sonny closed, and once on waking for
+//! times the Mac slept through. The daemon has no clock or watcher of its
+//! own, and no process of a trigger runs between its fires.
 //!
 //! A trigger is one LaunchAgent, `~/Library/LaunchAgents/LABEL.plist`,
 //! which runs this executable with `--trigger-fire` and everything the fire
@@ -1958,7 +1956,7 @@ pub(crate) fn error_json(message: &str) -> Value {
 }
 
 /// At Sonny's start, off its way: finish what a fire cut short, and point
-/// every trigger (and the watcher) at this Sonny when it moved.
+/// every trigger at this Sonny when it moved.
 pub fn at_start() {
     if !cfg!(target_os = "macos") {
         return;
@@ -2496,8 +2494,8 @@ fn unmade(error: String) -> Value {
 
 /// How a turn a trigger sent says so in its `request_id`, by the trigger's
 /// generation, which has no `_` (a request id is a name's characters, so
-/// the trigger's own name could not be told apart): the watcher counts no
-/// turn end of a turn its own trigger sent, so a trigger never wakes itself.
+/// the trigger's own name could not be told apart), so a turn shows which
+/// trigger sent it.
 fn sent_by(trigger: &Trigger) -> String {
     format!("trigger_{}_", trigger.generation)
 }
