@@ -758,13 +758,13 @@ fn unique(prefix: &str) -> String {
 /// (Ghostty, Rex) can mark this pane working, blocked or done; and the
 /// same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
-    herdr::report(state);
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
     // agent itself is doing.
     if SIDE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    herdr::report(state);
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
@@ -1073,7 +1073,8 @@ impl Fleet {
             return;
         };
         for bot in page["bots"].as_array().into_iter().flatten() {
-            let Some(name) = bot["name"].as_str() else {
+            // Side chats are never tasks, as when they are made.
+            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
             self.lineage.insert(name.to_owned());
@@ -1478,11 +1479,7 @@ impl App {
         term::laid_out().await;
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
-        // A side chat shows only itself, not the history it was copied with.
-        match self.options.side {
-            Some(node) => self.history_after(node).await,
-            None => self.history().await,
-        }
+        self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             status_report("working", &self.bot);
@@ -1795,7 +1792,8 @@ impl App {
             self.down = false;
             self.notice = None;
             self.context = context.or(self.context);
-            self.history_after(self.seen_node).await;
+            self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
+                .await;
             self.unstage_landed().await;
             let now = record["running_turn"].as_i64();
             // A turn that ended while away ends here as its event would have.
@@ -1908,9 +1906,11 @@ impl App {
         ))
     }
 
-    /// The bot's latest items, written as the transcript would have shown them.
+    /// The bot's latest items, written as the transcript would have shown
+    /// them. A side chat shows only itself, not the history it was copied
+    /// with.
     async fn history(&mut self) {
-        self.history_after(0).await;
+        self.history_after(self.options.side.unwrap_or(0)).await;
     }
 
     /// The bot's items after `after`, drawn as they would have been live:
@@ -2939,7 +2939,12 @@ impl App {
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
             self.input.clear();
-            self.status().await;
+            // The side chat already holds the screen /status would take.
+            if self.options.side.is_some() {
+                self.notice = Some("/status is for the agent itself, not a side chat".into());
+            } else {
+                self.status().await;
+            }
             return;
         }
         if prompt == "/open" {
@@ -3180,6 +3185,8 @@ impl App {
         };
         let mut command = std::process::Command::new(me);
         command
+            .arg("--store")
+            .arg(&self.options.store)
             .arg("--socket")
             .arg(&self.options.socket)
             .args([
