@@ -1,6 +1,6 @@
 ---
 name: automation
-description: Set up or run a recurring job (a daily brief, a watcher, a digest) so each run reads only what is new, says what it could not read, and never double-posts
+description: Set up or run a recurring job (a daily brief, a digest, a monitor that watches a channel, inbox or queue for a lead) so each run reads only what is new, says what it could not read, and never double-posts
 ---
 
 # Recurring jobs
@@ -86,6 +86,69 @@ Its `--budget-tokens` is a lifetime cap, so size it for many runs. When the
 cap is reached its turns fail with `budget_exhausted`. A trigger's
 `--turn-budget-tokens N` caps each run on its own, and a run past it fails
 with `turn_budget_exhausted`.
+
+## Monitors
+
+A monitor is a job that watches something for a lead, such as a team
+channel, an inbox or an on-call queue, and tells the lead only what needs
+it. It is its own agent so its checks stay out of the lead's conversation:
+the lead sets it up and handles what it reports. Its `preferences.md` names
+the lead as the destination and, when the person wants one, a destination
+for urgent items, such as a direct message to the person.
+
+Run it often and gate each fire, adding the trigger from the job folder,
+where the gate runs:
+
+```
+cd FOLDER && "$HOME/.agent/trigger" add --bot NAME --every 10m --if '! ./quiet' -- MESSAGE
+```
+
+Any exit but 0 from `--if` skips the fire with no model call, and one that
+runs past a minute is a failed fire that `trigger ls` shows. Write `quiet`
+at setup: a short script that only reads, and exits 0 only when it found
+that no source has anything past its bookmark and the newest run record is
+under an hour old. The `!` makes that a skip, and makes anything else a
+fire, so a check that cannot tell, from a missing tool, an expired token or
+a source that errors, wakes the job to fail and say so instead of passing
+for a quiet day. A gate that runs past its minute is a failed fire with no
+turn, which nothing below hears of, so give every request in `quiet` a time
+limit well inside it, such as `curl --max-time 20`: a source that hangs then
+makes `quiet` fail, and the job runs. The hour lets a run re-check the
+ledger's open items. The gate gets `HOME`, `SHELL`, the `PATH` it was added
+with and the daemon's socket, not the daemon's environment or anything it
+loaded, so keep the source's read-only token in a file both `quiet` and the
+job read, such as `token` in the job folder with mode 600.
+
+The job posts to the lead (step 8) from its shell. A request id takes only
+letters, digits, `.`, `_` and `-`, so KEY is the post's key with every other
+character turned into `_`, for example `brief_2026-01-05_07_30_-0500`:
+
+```
+"$AGENT_BIN" run --bot LEAD --detach --delivery queue --request-id KEY -- TEXT
+```
+
+The turn handle it prints is the confirmation. The daemon keeps the key,
+and a post records the job's turn that sent it, so sending the same key and
+text again starts nothing new: within that turn it answers `duplicate:
+true`, and from a later run `idempotency_conflict` with `field` `from`. That
+is step 2's lookup for this destination: a run that may have posted sends
+its planned text again under its key, and either answer means the first
+post went out. A conflict on any other field means the text differs from
+the plan, so leave the run open and tell the person. An urgent item
+also goes to the urgent destination, as a second post keyed with the run's
+key and `_urgent`, recorded and confirmed the same way.
+
+What a source said goes into a post quoted and named as the source's, never
+as a request of the job's own. The lead reads the post as the monitor's
+words, not the person's, but a line that reads like an instruction is still
+one the job chose to pass on.
+
+So the lead hears when the monitor itself goes wrong, it subscribes to it
+in the lookout, which needs a judge (`AGENT_JUDGE`) to answer a look-for:
+
+```
+sonny lookout add NAME --bot NAME --on ended --look-for "the turn failed or said a source could not be read" --then "tell the person which monitor and what it could not read"
+```
 
 ## Each run
 
