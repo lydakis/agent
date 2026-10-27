@@ -1681,9 +1681,9 @@ impl Service {
             .store
             .read("next_expiry", |db| db.next_expiry())
             .await?;
-        let now = tokio::time::Instant::now();
+        let (now, wall) = (tokio::time::Instant::now(), now_ms());
         self.expiry = next.map(|at| match u64::try_from(at).ok() {
-            Some(at) if at > now_ms() => now + Duration::from_millis(at - now_ms()),
+            Some(at) if at > wall => now + Duration::from_millis(at - wall),
             _ => now + overdue,
         });
         Ok(())
