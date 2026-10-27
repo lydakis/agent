@@ -115,7 +115,7 @@ fn usage() -> String {
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies (experimental, built in), which take\n\
      uncommitted changes along and work outside git too.\n\
-     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell, makes a task's\n\
+     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
      (or writes here) what a sandfs copy of a plain folder changed.\n\
      The lookout wakes the lead when its tasks need it, judged by --lookout, else AGENT_JUDGE\n\
