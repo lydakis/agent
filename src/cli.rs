@@ -42,9 +42,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "interrupt",
-        about: "Stop a bot's running turn; prints its turn view",
-        usage: "interrupt --bot NAME",
-        flags: "--bot --pretty",
+        about: "Stop a bot's running turn, or with --turn end one still queued; prints its turn view",
+        usage: "interrupt --bot NAME [--turn TURN]",
+        flags: "--bot --turn --pretty",
         settings: "",
         startup: false,
     },
@@ -229,7 +229,7 @@ fn print_flags(flags: &str) {
             "--after" => ("ID", "Start after this event cursor or turn ID"),
             "--turn" => (
                 "ID",
-                "Select a turn; with run --delivery steer, the turn to steer",
+                "Select a turn; with run --delivery steer, the turn to steer; with interrupt, the turn to end, also one still queued",
             ),
             "--new" => ("", "Create a new bot instead of continuing a named bot"),
             "--fork" => (

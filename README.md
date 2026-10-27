@@ -126,7 +126,8 @@ agent run --bot scout --delivery steer -- "Skip the integration tests"
 ```
 
 Or stop it: `agent interrupt --bot scout`. A busy bot rejects new work unless
-you choose `--delivery queue` or `steer`.
+you choose `--delivery queue` or `steer`. A queued message it has not started
+can be taken back with `agent interrupt --bot scout --turn N`.
 
 ## Let bots delegate
 

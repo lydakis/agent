@@ -1576,9 +1576,16 @@ fn interrupt(options: &Options) -> Result<i32> {
         .clone()
         .ok_or(Error::with("usage", "interrupt needs --bot"))?;
     let mut connection = Connection::connect(&options.socket)?;
-    let state = connection.request("inspect", json!({"bot":bot}))?;
-    let Some(turn) = state["running_turn"].as_i64() else {
-        return fail_with("no_active_turn", format!("{bot} has no running turn"));
+    // A named turn may be one still queued, which then never runs.
+    let turn = match options.turn {
+        Some(turn) => turn,
+        None => {
+            let state = connection.request("inspect", json!({"bot":bot}))?;
+            let Some(turn) = state["running_turn"].as_i64() else {
+                return fail_with("no_active_turn", format!("{bot} has no running turn"));
+            };
+            turn
+        }
     };
     let view = connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
     print_json(&view, options.pretty)?;
