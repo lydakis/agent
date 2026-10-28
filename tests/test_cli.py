@@ -1441,7 +1441,7 @@ class ModelListTests(ModelFixture):
 
     def test_a_fresh_install_names_the_missing_provider_and_stats_starts_its_daemon(self):
         refused = self.agent('stats', *self.store, check=False)
-        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(refused.returncode, 2)
         self.assertEqual(json.loads(refused.stderr)['error'], 'provider_required')
         self.assertFalse((self.path / 'state.sqlite').exists())
         stats = json.loads(self.agent('stats', *self.store, '--provider', f'openai=responses,{self.url}').stdout)
