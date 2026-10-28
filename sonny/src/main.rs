@@ -1285,6 +1285,36 @@ const COMMANDS: [(&str, &str); 16] = [
 ];
 
 /// What an agent's last few items say, for `/status`.
+/// What an idle agent's history says, read once per turn it ended: the
+/// question it has open, and whether its last turn resolved it.
+#[derive(Clone, Default)]
+struct Seen {
+    ask: Option<String>,
+    itself: bool,
+}
+
+/// Whether `items`, one turn of `bot`'s, hold a `resolve_task` call of its
+/// own that resolved itself and was not refused.
+fn resolved_itself(items: &[Value], bot: &str) -> bool {
+    items.iter().any(|call| {
+        call["type"] == "function_call"
+            && call["name"] == resolved::TOOL
+            && resolved::itself(
+                &call["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or(Value::Null),
+                bot,
+            )
+            && items.iter().any(|done| {
+                done["type"] == "function_call_output"
+                    && done["call_id"] == call["call_id"]
+                    && !output(done).1
+                    && !reactions::refused(done)
+            })
+    })
+}
+
 #[derive(Default)]
 struct Latest {
     /// Its latest step, as a line.
@@ -1384,7 +1414,7 @@ struct App {
     watch: Option<Watch>,
     /// What `/status` read of each idle agent's history: its last turn
     /// then, and the question left open.
-    asks_seen: HashMap<String, (i64, Option<String>)>,
+    asks_seen: HashMap<String, (i64, Seen)>,
     /// The live area is drawn afresh: the main screen is back from `/status`.
     redraw: bool,
     sounds: sound::Sounds,
@@ -1565,6 +1595,9 @@ struct Fleet {
     /// Finished calls that may have waited, to read for the turns they
     /// returned: the bot, the output's node, and the call.
     returned: Vec<(String, i64, String)>,
+    /// Tasks' turns that resolved them: their window closes once the turn
+    /// completes.
+    resolving: resolved::Own,
 }
 
 /// The projects inside `project` whose leads are among `names`:
@@ -1659,6 +1692,7 @@ impl Fleet {
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
+            resolving: Default::default(),
         };
         fleet.layout.adopt_own(lead);
         fleet.doing(lead, "idle");
@@ -1826,8 +1860,8 @@ impl Fleet {
         }
     }
 
-    /// A task the lead resolved: its window closes, unless new work has
-    /// it at work again.
+    /// A task resolved, by the lead or itself: its window closes, unless
+    /// new work has it at work again.
     fn resolved(&mut self, task: &str) {
         if self.lineage.contains(task)
             && !matches!(self.doing.get(task), Some(&"working" | &"needs you"))
@@ -2002,6 +2036,7 @@ impl Fleet {
         if self.lineage.contains(bot) {
             self.errand(bot, kind, data);
             self.taken(bot, kind, event);
+            self.resolving.event(event, &self.lead);
             match kind {
                 "accepted" if bot == self.lead => self.doing(bot, "working"),
                 "approval_requested" => {
@@ -2019,14 +2054,23 @@ impl Fleet {
                 "tool_completed" | "turn_resumed" if self.doing.get(bot) == Some(&"needs you") => {
                     self.doing(bot, "working")
                 }
-                "turn_finished" => self.doing(
-                    bot,
-                    match data["status"].as_str() {
-                        Some("completed" | "steered") => "done",
-                        Some("interrupted") => "stopped",
-                        _ => "failed",
-                    },
-                ),
+                "turn_finished" => {
+                    self.doing(
+                        bot,
+                        match data["status"].as_str() {
+                            Some("completed" | "steered") => "done",
+                            Some("interrupted") => "stopped",
+                            _ => "failed",
+                        },
+                    );
+                    // A task that resolved itself in the turn it finished.
+                    if let Some(turn) = event["turn"].as_i64()
+                        && self.resolving.ended(bot, turn)
+                        && data["status"] == "completed"
+                    {
+                        self.resolved(bot);
+                    }
+                }
                 _ => {}
             }
         }
@@ -4104,25 +4148,28 @@ impl App {
                         .map(|(began, ended)| ended.saturating_sub(began) / 1000),
                 ),
             };
-            let resolved =
-                resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
             let Latest { mut step, pr, ask } = self.latest(name).await;
             // A question stays open until its answer lands, past work that
             // does not wait on it and messages that answer something else:
             // an idle agent's recent history is read once per turn it
-            // ended. A running turn shows its work, as its last items say;
-            // a question still open shows again once it ends.
-            let ask = match turn["turn"].as_i64() {
+            // ended, as is whether that turn resolved the task. A running
+            // turn shows its work, as its last items say; a question still
+            // open shows again once it ends.
+            let seen = match turn["turn"].as_i64() {
                 Some(last) if !running => match self.asks_seen.get(name) {
-                    Some((seen, ask)) if *seen == last => ask.clone(),
+                    Some((at, seen)) if *at == last => seen.clone(),
                     _ => {
-                        let ask = self.open_ask(name).await;
-                        self.asks_seen.insert(name.to_owned(), (last, ask.clone()));
-                        ask
+                        let seen = self.scan(name, ran["turn"].as_i64()).await;
+                        self.asks_seen.insert(name.to_owned(), (last, seen.clone()));
+                        seen
                     }
                 },
-                _ => ask,
+                _ => Seen { ask, itself: false },
             };
+            let ask = seen.ask;
+            let itself = seen.itself && name != lead && ran["status"] == "completed";
+            let resolved = itself
+                || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
             if let Some(question) = &ask {
                 step = format!("asks: {}", first_line(question));
             }
@@ -4207,20 +4254,25 @@ impl App {
         }
     }
 
-    /// The oldest question `bot` asked and has no answer to, read from its
-    /// newest 400 nodes.
-    async fn open_ask(&self, bot: &str) -> Option<String> {
-        let page = self
+    /// What `bot`'s newest 400 nodes say: the oldest question it asked and
+    /// has no answer to, and whether its turn `last` resolved it.
+    async fn scan(&self, bot: &str, last: Option<i64>) -> Seen {
+        let Ok(page) = self
             .client
             .request("history_nodes", json!({"bot": bot, "limit": 400}))
             .await
-            .ok()?;
-        let nodes: Vec<i64> = page["nodes"]
-            .as_array()?
+        else {
+            return Seen::default();
+        };
+        let listed = page["nodes"].as_array().cloned().unwrap_or_default();
+        let nodes: Vec<i64> = listed.iter().filter_map(|n| n["node"].as_i64()).collect();
+        let in_last: std::collections::HashSet<i64> = listed
             .iter()
+            .filter(|n| last.is_some() && n["turn"].as_i64() == last)
             .filter_map(|n| n["node"].as_i64())
             .collect();
         let mut items = Vec::new();
+        let mut turn = Vec::new();
         for chunk in nodes.chunks(100) {
             // Newest first, as the nodes were asked for; each node's items
             // newest first too.
@@ -4230,10 +4282,16 @@ impl App {
                 while let Some((_, item)) = read.next_if(|(next, _)| *next == node) {
                     kept.push(item);
                 }
+                if in_last.contains(&node) {
+                    turn.extend(kept.iter().cloned());
+                }
                 items.extend(kept.into_iter().rev());
             }
         }
-        asks::open(&items)
+        Seen {
+            ask: asks::open(&items),
+            itself: resolved_itself(&turn, bot),
+        }
     }
 
     /// An agent's latest step, as a line; the pull request its latest

@@ -892,7 +892,10 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
         }
         crate::resolved::TOOL => Some(Said {
             verb: "Resolved".into(),
-            what: arguments["task"].as_str()?.trim().to_owned(),
+            what: match arguments["task"].as_str().map(str::trim) {
+                Some(task) if !task.is_empty() => task.to_owned(),
+                _ => "this task".into(),
+            },
             under: Vec::new(),
             failed,
             output: None,

@@ -1,37 +1,93 @@
-//! Tasks marked resolved: the lead calls the `resolve_task` tool Sonny
-//! declares on it once nothing is left to do in a task, such as when its
-//! pull request merged or the work was dropped, and `/status` files the
-//! task out of the way. The lead's Sonny keeps each mark beside the store,
-//! read from the lead's history as the calls land: the task's newest turn
-//! finished by then, so one still running is not resolved. Turns are numbered across the store, so a task turn
-//! numbered after it, new work for the task or another bot under its name,
-//! reopens the task without anyone taking the mark off.
+//! Tasks marked resolved, as threads are: a task resolves itself once
+//! nothing is left to do in it, and its lead can resolve any of its tasks,
+//! both with the `resolve_task` tool Sonny declares, and `/status` files
+//! the task out of the way. A task's own call is read from its history: its
+//! newest turn resolved it. The lead's Sonny keeps a mark for each of the
+//! lead's calls beside the store, read from the lead's history as the
+//! calls land: the task's newest turn finished by then, so one still
+//! running is not resolved. Turns are numbered across the store, so a task
+//! turn numbered after it, new work for the task or another bot under its
+//! name, reopens the task without anyone taking the mark off.
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// The name of the tool the lead resolves a task with.
+/// The name of the tool a task or its lead resolves the task with.
 pub const TOOL: &str = "resolve_task";
 
-/// The `resolve_task` tool as Sonny declares it on a lead.
+/// The `resolve_task` tool as Sonny declares it on a lead, which the
+/// tasks it starts take too, and on a task.
 pub fn tool() -> Value {
     json!({
         "name": TOOL,
-        "description": "Mark one of your tasks resolved once nothing is left to do in it: its pull request \
-            merged, its answer passed on, or the person dropped the work. The person's status view files \
-            it under Resolved, out of their way, and its window closes. Sending the task new work reopens \
-            it. A task that is still working, or waits on the person, is not resolved.",
+        "description": "Mark a task resolved once nothing is left to do in it: its pull request merged, \
+            its answer passed on, or the person dropped the work. As a task, resolve yourself, naming no \
+            task, in the turn that finishes the work; as a lead, name one of your tasks. The person's status \
+            view files it under Resolved, out of their way, and its window closes once its turn ends. New \
+            work sent to the task reopens it. A task that waits on the person, or on work still to come, is \
+            not resolved.",
         "parameters": {
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "The task's name, as you started it."}
+                "task": {"type": "string", "description": "The task's name, as it was started; none to resolve yourself."}
             },
-            "required": ["task"],
             "additionalProperties": false
         },
-        "result": "Resolved.",
-        // The lead's alone: a task it starts does not take it.
-        "inherit": false
+        "result": "Resolved."
     })
+}
+
+/// Whether a `resolve_task` call with `arguments`, made by `bot`, resolves
+/// `bot` itself: it names no task, or its own name.
+pub fn itself(arguments: &Value, bot: &str) -> bool {
+    match arguments["task"].as_str().map(str::trim) {
+        None | Some("") => true,
+        Some(task) => task == bot || bot.split_once('.').is_some_and(|(_, short)| task == short),
+    }
+}
+
+/// Tasks' turns that resolved the task, followed in the daemon's events:
+/// a call that names no task or its own and did not fail.
+#[derive(Default)]
+pub struct Own {
+    /// Calls under way, by bot and call.
+    calls: HashSet<(String, String)>,
+    /// Turns that resolved their bot, by bot and turn.
+    turns: HashSet<(String, i64)>,
+}
+
+impl Own {
+    /// Follow `event`, of any bot but `lead`.
+    pub fn event(&mut self, event: &Value, lead: &str) {
+        let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
+            return;
+        };
+        let data = &event["data"];
+        let call = (
+            bot.to_owned(),
+            data["call_id"].as_str().unwrap_or("").to_owned(),
+        );
+        match event["event"].as_str() {
+            Some("tool_started") if data["name"] == TOOL && bot != lead => {
+                let arguments = data["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or(Value::Null);
+                if itself(&arguments, bot) {
+                    self.calls.insert(call);
+                }
+            }
+            Some("tool_completed") if self.calls.remove(&call) && data["failed"] != true => {
+                self.turns.insert((bot.to_owned(), turn));
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `bot`'s turn `turn` resolved it, asked once it ended.
+    pub fn ended(&mut self, bot: &str, turn: i64) -> bool {
+        self.turns.remove(&(bot.to_owned(), turn))
+    }
 }
 
 /// The task a `resolve_task` call with `arguments` names, in full, for
@@ -119,6 +175,49 @@ mod tests {
         assert_eq!(named(""), None);
         assert_eq!(named("../x"), None);
         assert_eq!(call(&json!({}), "calc"), None);
+    }
+
+    #[test]
+    fn a_task_resolves_itself_by_naming_no_task_or_its_own() {
+        let by = |arguments: Value| itself(&arguments, "calc.fix");
+        assert!(by(json!({})));
+        assert!(by(json!({"task": " "})));
+        assert!(by(json!({"task": "fix"})));
+        assert!(by(json!({"task": "calc.fix"})));
+        assert!(!by(json!({"task": "docs"})));
+    }
+
+    #[test]
+    fn a_task_turn_that_resolved_itself_is_followed_in_events() {
+        let mut own = Own::default();
+        let ev = |bot: &str, turn: i64, kind: &str, data: Value| json!({"bot": bot, "turn": turn, "event": kind, "data": data});
+        let started = |call: &str, arguments: &str| json!({"name": TOOL, "call_id": call, "arguments": arguments});
+        for (bot, turn, call, arguments, failed) in [
+            ("calc.fix", 5, "c1", "{}", false),
+            ("calc.docs", 6, "c1", "{\"task\":\"fix\"}", false),
+            ("calc.bench", 7, "c1", "{}", true),
+            ("calc.lead", 8, "c1", "{}", false),
+        ] {
+            own.event(
+                &ev(bot, turn, "tool_started", started(call, arguments)),
+                "calc.lead",
+            );
+            own.event(
+                &ev(
+                    bot,
+                    turn,
+                    "tool_completed",
+                    json!({"call_id": call, "failed": failed}),
+                ),
+                "calc.lead",
+            );
+        }
+        assert!(own.ended("calc.fix", 5));
+        assert!(!own.ended("calc.fix", 5));
+        // Another task named, a failed call, the lead itself: none.
+        assert!(!own.ended("calc.docs", 6));
+        assert!(!own.ended("calc.bench", 7));
+        assert!(!own.ended("calc.lead", 8));
     }
 
     #[test]
