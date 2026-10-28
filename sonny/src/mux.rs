@@ -16,7 +16,10 @@ pub struct Block {
     pub window: String,
 }
 
-/// Where `sonny show` puts a task.
+/// The sides a split may be on.
+pub const SIDES: [&str; 4] = ["right", "left", "above", "below"];
+
+/// Where `show_agent` puts a task.
 pub enum Placement {
     Window,
     /// Beside a block (a bot's, by its label), on one side.
@@ -75,9 +78,9 @@ pub trait Backend {
 }
 
 /// A project's home, as its lead's Sonny last found it in the person's
-/// terminal: kept so that an agent's `sonny run` and `sonny show` go
-/// there, to that multiplexer, instead of one guessed from the agent's
-/// shell, which is in neither.
+/// terminal: kept so that an agent's `run_in_pane` and `show_agent` calls
+/// go there, to that multiplexer, instead of one guessed from where the
+/// lookout answering them runs, which is in neither.
 #[derive(Debug, PartialEq)]
 pub enum Place {
     Herdr {
@@ -359,25 +362,16 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
     Some(Layout::new(backend))
 }
 
-/// The project's home, from an agent's shell, whose multiplexer variables
-/// would name the daemon's terminal: where the lead's Sonny last laid the
-/// project out, in that multiplexer; without one (or with `host`, a Rex
-/// server), in Herdr when the project's lead is in a Herdr pane, else in
-/// the multiplexer project `like`'s home is in, else in Rex (or Herdr,
-/// without Rex), made when needed.
-pub fn for_agent(
-    socket: &Path,
-    project: &str,
-    host: Option<&str>,
-    like: Option<&str>,
-) -> Result<Layout, String> {
-    let herdr = crate::herdr::find().filter(|_| host.is_none());
+/// The project's home, for an agent's call, from the lookout answering it,
+/// whose multiplexer variables would name the terminal Sonny started it
+/// in: where the lead's Sonny last laid the project out, in that
+/// multiplexer; without one, in Herdr when the project's lead is in a
+/// Herdr pane, else in the multiplexer project `like`'s home is in, else
+/// in Rex (or Herdr, without Rex), made when needed.
+pub fn for_agent(socket: &Path, project: &str, like: Option<&str>) -> Result<Layout, String> {
+    let herdr = crate::herdr::find();
     let rex = crate::rex::find();
-    let recall = |project| {
-        Place::file(socket, project)
-            .filter(|_| host.is_none())
-            .and_then(|file| Place::recall(&file))
-    };
+    let recall = |project| Place::file(socket, project).and_then(|file| Place::recall(&file));
     let kept = recall(project);
     let like = like.and_then(recall);
     let backend: Box<dyn Backend> = match (kept, herdr, rex) {
@@ -403,7 +397,7 @@ pub fn for_agent(
         (_, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
             crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
         ),
-        (_, _, Some(rex)) => Box::new(crate::rex::Rex::open(rex, host, project, false, None)?),
+        (_, _, Some(rex)) => Box::new(crate::rex::Rex::open(rex, None, project, false, None)?),
         (_, Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?),
         (_, None, None) => return Err("neither rex nor herdr was found".into()),
     };
@@ -413,13 +407,9 @@ pub fn for_agent(
 /// The skills that let any agent run long work where the person can see
 /// it, for the multiplexer this terminal is in (the other's taken out, so
 /// agents read one), and show the person pictures. Each names this
-/// machine's multiplexer CLI and Sonny.
+/// machine's multiplexer CLI.
 pub fn install_skill(host: Option<&str>) {
     crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
-    // By the path that outlives an upgrade, as the other scripts name it.
-    let Some(sonny) = crate::skills::sonny_path() else {
-        return;
-    };
     let quoted = |path: &Path| format!("\"{}\"", path.to_string_lossy());
     let rex = |bin: PathBuf| {
         let text = include_str!("../skills/rex-windows/SKILL.md");
@@ -445,7 +435,7 @@ pub fn install_skill(host: Option<&str>) {
             None => return,
         },
     };
-    crate::skills::install(name, &text.replace("SONNY_BIN", &quoted(&sonny)));
+    crate::skills::install(name, &text);
     crate::skills::remove(other);
 }
 

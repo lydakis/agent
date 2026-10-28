@@ -342,7 +342,7 @@ impl View {
             ));
             out.push(
                 Line::from(
-                    "An agent adds a trigger with ~/.agent/trigger add, and a lookout subscription with sonny lookout add.",
+                    "An agent adds a trigger with ~/.agent/trigger add, and a lookout subscription with its subscriptions tool.",
                 )
                 .dim(),
             );
