@@ -275,7 +275,17 @@ fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
     assert!(!copy.join(".git").exists());
     let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
     assert!(!ok && err.contains("on HEAD"), "{err}");
+    // A tag keeps it too, as does a stash.
+    lab.git(&copy, &["tag", "-a", "-m", "kept", "kept"]);
     lab.git(&copy, &["switch", "-q", "agent/demo.fix"]);
+    let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
+    assert!(!ok && err.contains("on kept"), "{err}");
+    lab.git(&copy, &["tag", "-d", "kept"]);
+    std::fs::write(copy.join("src/lib.rs"), "three\n").unwrap();
+    lab.git(&copy, &["stash", "-q"]);
+    let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
+    assert!(!ok && err.contains("on stash@{0}"), "{err}");
+    lab.git(&copy, &["stash", "drop", "-q"]);
     // Unmounted, so the folder can go with the test.
     let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
     assert!(ok, "{err}");

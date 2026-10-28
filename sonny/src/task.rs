@@ -1038,22 +1038,40 @@ fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
         if !git(folder, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
             return Ok("uncommitted changes in its copy".into());
         }
-        // Every branch's tip, not only the one checked out: the copy goes
-        // with the commits that are only in it.
+        // Every commit a name in the copy keeps, not only the one checked
+        // out: the copy goes with the commits that are only in it.
         let origin = git(folder, &["remote", "get-url", "origin"]).unwrap_or_default();
-        let mut tips = git(
+        // Branches and tags, a tag by the commit it names.
+        let refs = git(
             folder,
             &[
                 "for-each-ref",
-                "--format=%(objectname) %(refname:short)",
+                "--format=%(objectname) %(*objectname) %(refname:short)",
                 "refs/heads",
+                "refs/tags",
             ],
         )?;
-        // A detached HEAD's commits are on no branch.
-        tips.push_str(&format!("\n{} HEAD", git(folder, &["rev-parse", "HEAD"])?));
-        let unpushed: Vec<&str> = tips
+        let mut tips: Vec<(String, String)> = refs
             .lines()
-            .filter_map(|line| line.split_once(' '))
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, ' ');
+                let (tip, peeled, name) = (parts.next()?, parts.next()?, parts.next()?);
+                let tip = if peeled.is_empty() { tip } else { peeled };
+                Some((tip.to_owned(), name.to_owned()))
+            })
+            .collect();
+        // Every stash, and a detached HEAD's commits, which are on no branch.
+        let stashes = git(folder, &["stash", "list", "--format=%H %gd"])?;
+        tips.extend(
+            stashes
+                .lines()
+                .filter_map(|line| line.split_once(' '))
+                .map(|(tip, name)| (tip.to_owned(), name.to_owned())),
+        );
+        tips.push((git(folder, &["rev-parse", "HEAD"])?, "HEAD".into()));
+        let unpushed: Vec<&str> = tips
+            .iter()
+            .map(|(tip, name)| (tip.as_str(), name.as_str()))
             .filter(|(tip, _)| match Path::new(&origin).is_dir() {
                 true => git(
                     Path::new(&origin),
