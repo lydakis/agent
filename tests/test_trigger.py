@@ -509,7 +509,7 @@ class TriggerFireTests(ModelFixture):
 
         def trigger(*args, ok=True):
             result = subprocess.run([str(SONNY), 'trigger', *args], env=env, capture_output=True, text=True,
-                                    timeout=60, cwd=self.path)
+                                    timeout=120, cwd=self.path)
             if ok:
                 self.assertEqual(result.returncode, 0, result.stderr)
             return result
@@ -539,9 +539,11 @@ class TriggerFireTests(ModelFixture):
         watched.write_text('synthetic\n')
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 3, 60), 'launchd did not fire on the write')
         self.settle('p.task')
-        # Fire by name: launchd runs it now.
-        self.assertEqual(json.loads(trigger('fire', name).stdout), {'name': name, 'fired': True})
+        # Fire by name: launchd runs it now, and `fire` says the turn it sent.
+        fired = json.loads(trigger('fire', name).stdout)
+        self.assertEqual((fired['name'], fired['fired'], fired['outcome']), (name, True, 'sent'), fired)
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
+        self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
         self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[trigger {name} · '))
         # A plist launchd no longer has, as after a failed reload: rm still removes it.
         subprocess.run(['/bin/launchctl', 'bootout', target], check=True, capture_output=True)

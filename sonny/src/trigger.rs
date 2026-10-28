@@ -1271,14 +1271,14 @@ pub fn install(
                     let asks = places.asks(&trigger.name);
                     queues(&asks)?;
                     let want = plist(app, trigger, when, &asks, environment);
-                    swap(
-                        &path,
-                        &format!("{LABEL}{}", trigger.name),
-                        Some(&text),
-                        &want,
-                        launchd,
-                    )?;
-                    write_row(places, trigger, &durable["last"], &kept)?;
+                    let label = format!("{LABEL}{}", trigger.name);
+                    swap(&path, &label, Some(&text), &want, launchd)?;
+                    // Without what it keeps the new one would start over:
+                    // the old one goes back in.
+                    if let Err(error) = write_row(places, trigger, &durable["last"], &kept) {
+                        let _ = swap(&path, &label, Some(&want), &text, launchd);
+                        return Err(error);
+                    }
                     Ok(None)
                 }
                 Some(field) => Err(format!(
@@ -4159,6 +4159,35 @@ mod tests {
         add(&again, true).unwrap();
         assert_eq!(Kept::of(&state(&w.places, &again)).started_id, Some(11));
         assert_eq!(w.rows()[0]["last"]["outcome"], "sent");
+    }
+
+    #[test]
+    fn a_replace_whose_row_cannot_be_written_puts_the_old_trigger_back() {
+        let w = World::new("replace-unwritten");
+        let s = trigger();
+        w.install(&s).unwrap();
+        // A row nothing can be written over.
+        let row = w.places.last(&s.name);
+        let _ = std::fs::remove_file(&row);
+        std::fs::create_dir_all(row.join("x")).unwrap();
+        let other = Trigger {
+            generation: "test-2".into(),
+            message: "something else".into(),
+            ..s.clone()
+        };
+        let when = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
+        let replaced = install(
+            &w.places,
+            Path::new("/A/agent-app"),
+            &other,
+            &when,
+            &[],
+            true,
+            &|x| w.fake.call(x),
+        );
+        assert!(replaced.is_err());
+        let back = read_plist(&w.plist(&s.name)).unwrap().0;
+        assert_eq!(back, s);
     }
 
     #[test]
