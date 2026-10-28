@@ -593,9 +593,12 @@ class PromptReadTests(ModelFixture):
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         read = client.request('prompts', bot='Bob', turn=second, bytes=1024)['result']
         # With what the bot said last before it: what a short answer answers.
+        reply = read['prompts'][0].pop('reply')['text']
         self.assertEqual(read['prompts'], [{'turn': second, 'text': 'done',
-                                            'from': {'bot': 'Bob', 'turn': first},
-                                            'reply': {'text': 'echo:{"exit_code":3,"stderr":"","stdout":"","success":false}'}}])
+                                            'from': {'bot': 'Bob', 'turn': first}}])
+        self.assertTrue(reply.startswith('echo:'), reply)
+        self.assertEqual({**json.loads(reply[len('echo:'):]), 'wall_time_ms': 0},
+                         {'exit_code': 3, 'stderr': '', 'stdout': '', 'success': False, 'wall_time_ms': 0})
         self.assertEqual(read['earlier'], [{'turn': first, 'text': 'shell:exit 3'}])
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')

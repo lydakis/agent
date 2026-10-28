@@ -260,16 +260,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'script' and getattr(self.server, 'call_script', None):
-                # One call a round from `call_script`, then an answer; a cut
-                # inside the turn keeps at least its newest call in view.
-                done = max((int(i['call_id'][7:]) + 1 for i in request['input']
+                # One round a step of `call_script`, then an answer; a cut
+                # inside the turn keeps at least its newest call in view. A
+                # step is a call, or a list of calls made in one round.
+                done = max((int(i['call_id'][7:].split('.')[0]) + 1 for i in request['input']
                             if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
                            default=0)
                 text = ''
                 if done < len(self.server.call_script):
-                    name, arguments = self.server.call_script[done]
-                    output = [{'type': 'function_call', 'name': name, 'call_id': f'script-{done}',
-                               'arguments': json.dumps(arguments)}]
+                    step = self.server.call_script[done]
+                    calls = step if isinstance(step, list) else [step]
+                    output = [{'type': 'function_call', 'name': name,
+                               'call_id': f'script-{done}' + (f'.{n}' if n else ''),
+                               'arguments': json.dumps(arguments)}
+                              for n, (name, arguments) in enumerate(calls)]
                 else:
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
