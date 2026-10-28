@@ -392,12 +392,26 @@ impl Base {
         }
     }
 
-    /// One check: a fork reads `prompt` and answers every id by `deadline`.
+    /// One check: a fork reads `prompt` and answers every id with a
+    /// probability by `deadline`.
     pub async fn ask(
         &self,
         client: &Client,
         prompt: &str,
         ids: &[&str],
+        deadline: Instant,
+    ) -> Result<(Answers, Usage), Failed> {
+        self.ask_with(client, prompt, ids, probabilities, deadline)
+            .await
+    }
+
+    /// One check whose reply `parse` reads as answers to every id.
+    pub async fn ask_with(
+        &self,
+        client: &Client,
+        prompt: &str,
+        ids: &[&str],
+        parse: Parse,
         deadline: Instant,
     ) -> Result<(Answers, Usage), Failed> {
         let name = format!(
@@ -416,10 +430,19 @@ impl Base {
             )
             .await
             .map_err(|error| failed(format!("the judge could not start: {}", error.code)))?;
-        let (answered, running) = turn(client, &name, prompt, ids, deadline).await;
+        let (answered, running) = turn_with(client, &name, prompt, ids, parse, deadline).await;
         remove(client, &name, running).await;
         answered
     }
+}
+
+/// How a judge's reply is read as answers to the ids asked: `None` when it
+/// does not answer them all, a failed check.
+pub type Parse = fn(&str, &[&str]) -> Option<Answers>;
+
+/// A reply read as a probability for every id.
+pub fn probabilities(reply: &str, ids: &[&str]) -> Option<Answers> {
+    model_answers(reply, ids.iter().copied())
 }
 
 /// Whether a bot record is a judge given `instructions`: no tools, and
@@ -428,13 +451,25 @@ pub fn is_judge(bot: &Value, instructions: &str) -> bool {
     bot["tools"].as_array().is_some_and(Vec::is_empty) && bot["instructions"] == instructions
 }
 
-/// One turn of a judge's fork `name`: its answers to every id by
+/// One turn of a judge's fork `name`: its probabilities for every id by
 /// `deadline`, and the turn if it is still running.
 pub async fn turn(
     client: &Client,
     name: &str,
     prompt: &str,
     ids: &[&str],
+    deadline: Instant,
+) -> (Result<(Answers, Usage), Failed>, Option<i64>) {
+    turn_with(client, name, prompt, ids, probabilities, deadline).await
+}
+
+/// One turn of a judge's fork, its reply read by `parse`.
+pub async fn turn_with(
+    client: &Client,
+    name: &str,
+    prompt: &str,
+    ids: &[&str],
+    parse: Parse,
     deadline: Instant,
 ) -> (Result<(Answers, Usage), Failed>, Option<i64>) {
     // Queued when every slot is taken: it starts when one frees, within
@@ -483,12 +518,7 @@ pub async fn turn(
         return (Err(failed(why)), None);
     }
     let Some(answers) = (outcome["text_truncated"] != true)
-        .then(|| {
-            model_answers(
-                outcome["text"].as_str().unwrap_or_default(),
-                ids.iter().copied(),
-            )
-        })
+        .then(|| parse(outcome["text"].as_str().unwrap_or_default(), ids))
         .flatten()
     else {
         return (Err(failed("the judge's answer did not parse")), None);

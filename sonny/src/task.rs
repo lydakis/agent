@@ -25,6 +25,9 @@ struct Place {
     dir: PathBuf,
     note: Option<String>,
     undo: Undo,
+    /// The lead's folder the task's is a copy of, and the copy's top: a
+    /// brief that names a path in the one names it in the other.
+    copy: Option<(PathBuf, PathBuf)>,
 }
 
 /// What a start that failed takes away: only what it made.
@@ -104,12 +107,18 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
+    // A path in the lead's folder would have the task write there instead
+    // of in its copy, where nothing keeps it apart from the lead's work.
+    let (brief, moved) = match &place.copy {
+        Some((from, to)) => in_copy(brief, from, to),
+        None => (brief.to_vec(), 0),
+    };
     let status = command
         .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
         .arg("--")
-        .args(brief)
+        .args(&brief)
         .stdin(Stdio::null())
         .status();
     match status {
@@ -122,12 +131,20 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     if let Some(note) = &place.note {
         eprintln!("{note}");
     }
+    if let (Some((from, to)), 1..) = (&place.copy, moved) {
+        eprintln!(
+            "{name}: the brief named {} {moved} time{}; it names the task's copy {} instead",
+            shell_quote(from),
+            if moved == 1 { "" } else { "s" },
+            shell_quote(to)
+        );
+    }
     Ok(())
 }
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
-/// for a task in `dir` given as `--instructions`, with who it works for
-/// after it, and the role's model and tools unless the flags name their
+/// for a task in `dir` given as `--instructions`, with what every task is
+/// told (`task.md`) after it, and the role's model and tools unless the flags name their
 /// own. Other flags pass as they are.
 fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     let mut kept = Vec::new();
@@ -153,7 +170,8 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     if named("--instructions") || named("--instructions-file") {
         return Err("--agents and --profile compose instructions; --instructions sets them".into());
     }
-    let role = match profile {
+    // What every task is told comes after any role, so it is never the role too.
+    let role = match profile.filter(|name| !name.eq_ignore_ascii_case("task")) {
         Some(name) => Some(
             agent_client::policy::profile(dir, name)
                 .map_err(|e| format!("{}: {e}", e.code()))?
@@ -177,10 +195,174 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     }
     added.extend([
         "--instructions".to_owned(),
-        crate::project::with_person(&composed.text),
+        crate::project::as_task(dir, &composed.text)?,
     ]);
     kept.extend(added);
     Ok(kept)
+}
+
+/// `brief` with each path in the folder `from` turned into the same path
+/// in its copy `to`, and how many were. A folder has more names than its
+/// own: the one the lead's shell was given (`$PWD`, through a link), a
+/// link in the home to it or a folder holding it (`~/workplace` for
+/// `/Volumes/workplace`), each also from `~`, and macOS's `/tmp` for
+/// `/private/tmp`.
+fn in_copy(brief: &[String], from: &Path, to: &Path) -> (Vec<String>, usize) {
+    let names = names(from);
+    let to = to.to_string_lossy();
+    let mut moved = 0;
+    let brief = brief
+        .iter()
+        .map(|arg| {
+            let (arg, count) = replace_paths(arg, &names, &to);
+            moved += count;
+            arg
+        })
+        .collect();
+    (brief, moved)
+}
+
+/// Every name of the folder `from` a brief might use, longest first.
+fn names(from: &Path) -> Vec<String> {
+    let mut names = vec![from.to_path_buf()];
+    let canonical = std::fs::canonicalize(from).unwrap_or_else(|_| from.to_owned());
+    names.push(canonical.clone());
+    // The shell's own name for where it is, which may go through a link.
+    if let (Some(pwd), Ok(here)) = (std::env::var_os("PWD"), std::env::current_dir()) {
+        let pwd = PathBuf::from(pwd);
+        let here = std::fs::canonicalize(here).unwrap_or_default();
+        if std::fs::canonicalize(&pwd).is_ok_and(|real| real == here)
+            && let Ok(below) = here.strip_prefix(&canonical)
+        {
+            let mut top = pwd;
+            for _ in below.components() {
+                top.pop();
+            }
+            // Entered through a link to a folder inside it, what is left names
+            // something else.
+            if std::fs::canonicalize(&top).is_ok_and(|real| real == canonical) {
+                names.push(top);
+            }
+        }
+    }
+    let home = home_dir().ok();
+    // Links in the home to the folder, or to a folder holding it.
+    if let Some(entries) = home.as_ref().and_then(|home| std::fs::read_dir(home).ok()) {
+        for entry in entries.flatten() {
+            let link = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
+            if let Ok(target) = std::fs::canonicalize(&link)
+                && let Ok(below) = canonical.strip_prefix(&target)
+            {
+                names.push(within(&link, below));
+            }
+        }
+    }
+    let mut names: Vec<String> = names
+        .iter()
+        .flat_map(|name| {
+            let name = name.to_string_lossy().into_owned();
+            // macOS's `/tmp` and `/var` are `/private/tmp` and `/private/var`;
+            // other folders under `/private` have no such second name.
+            let short = name
+                .strip_prefix("/private")
+                .filter(|rest| rest.starts_with('/'))
+                .filter(|rest| {
+                    std::fs::canonicalize(rest)
+                        .is_ok_and(|real| Some(real) == std::fs::canonicalize(&name).ok())
+                });
+            [Some(name.clone()), short.map(str::to_owned)]
+        })
+        .flatten()
+        .collect();
+    if let Some(home) = home
+        .as_ref()
+        .map(|home| home.to_string_lossy().into_owned())
+    {
+        let tilde: Vec<String> = names
+            .iter()
+            .filter_map(|name| name.strip_prefix(&home))
+            .filter(|rest| rest.starts_with('/'))
+            .map(|rest| format!("~{rest}"))
+            .collect();
+        names.extend(tilde);
+    }
+    names.retain(|name| name.len() > 1);
+    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    names.dedup();
+    names
+}
+
+/// `text` with each of `names` that stands as a whole path, or as the
+/// start of one, turned into `to`; and how many were.
+fn replace_paths(text: &str, names: &[String], to: &str) -> (String, usize) {
+    // A name inside a longer one (`/work` in `/workplace`, `/work+old` or
+    // `/x/work`) is another path. Names end at spaces and at what sets a path
+    // apart in prose and commands: quotes, brackets, `=`, `:` and the like.
+    let part_of_name = |c: char| {
+        !c.is_whitespace()
+            && !matches!(
+                c,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+            && !matches!(c, ',' | ';' | ':' | '=' | '|' | '&' | '!' | '?' | '*')
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0;
+    let mut rest = text;
+    'scan: while !rest.is_empty() {
+        let at_start = out.chars().next_back().is_none_or(|c| !part_of_name(c));
+        if at_start {
+            for name in names {
+                if let Some(after) = rest.strip_prefix(name.as_str())
+                    && ends_name(after, part_of_name)
+                    && stays_inside(after, part_of_name)
+                {
+                    out.push_str(to);
+                    count += 1;
+                    rest = after;
+                    continue 'scan;
+                }
+            }
+        }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    (out, count)
+}
+
+/// Whether the rest of a path, `after` the folder's name, stays inside the
+/// folder: `/work/repo/../notes.md` names a file beside it, not in it.
+fn stays_inside(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
+    let end = after
+        .find(|c: char| !part_of_name(c))
+        .unwrap_or(after.len());
+    let mut depth = 0usize;
+    for part in after[..end].split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return false,
+            },
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
+/// Whether a name ends where `after` starts: at a `/` going on below it,
+/// or at anything not part of a path, a sentence's last `.` or `,` too.
+fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
+    let mut chars = after.chars();
+    match chars.next() {
+        None | Some('/') => true,
+        Some('.' | ',') => chars.next().is_none_or(char::is_whitespace),
+        Some(c) => !part_of_name(c),
+    }
 }
 
 /// Whether the daemon has a task `name`: one whose start failed after it
@@ -221,6 +403,7 @@ fn in_place(here: &Path) -> Place {
         dir: here.to_owned(),
         note: None,
         undo: Undo::Nothing,
+        copy: None,
     }
 }
 
@@ -236,6 +419,7 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     if git(here, &["rev-parse", "--show-toplevel"]).is_err() {
         return Ok(in_place(here));
     }
+    let top = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"])?);
     let prefix = git(here, &["rev-parse", "--show-prefix"])?;
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let branch = format!("agent/{name}");
@@ -269,6 +453,7 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
             shell_quote(&path)
         )),
         undo,
+        copy: Some((top, path)),
     })
 }
 
@@ -443,8 +628,9 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         let what = match over {
             true => {
                 "a sandfs workspace over this folder, which is on another disk than sandfs's \
-                     home and so is not copied: the task's changes stay in the workspace, and it \
-                     sees what changes here meanwhile"
+                     home and so is not copied: the task's changes stay in the workspace, a file \
+                     it has looked at stays as it first saw it, and `--apply` writes over what \
+                     changed here meanwhile without asking"
             }
             false => "a sandfs copy of this folder as it is now",
         };
@@ -458,6 +644,7 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         dir: within(&dir, prefix),
         note: Some(note),
         undo,
+        copy: Some((root, dir)),
     })
 }
 
@@ -553,6 +740,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_brief_names_the_copy_where_it_named_the_folder() {
+        let names = ["/Volumes/workplace".to_owned(), "~/workplace".to_owned()];
+        let to = "/Users/g/.agent/tasks/t";
+        let said = "Write /Volumes/workplace/notes.md and ~/workplace/a, not /Volumes/workplace2, \
+                    /x/Volumes/workplace or ~/workplaces. Look in /Volumes/workplace.";
+        let (brief, count) = replace_paths(said, &names, to);
+        assert_eq!(
+            brief,
+            "Write /Users/g/.agent/tasks/t/notes.md and /Users/g/.agent/tasks/t/a, not /Volumes/workplace2, \
+             /x/Volumes/workplace or ~/workplaces. Look in /Users/g/.agent/tasks/t."
+        );
+        assert_eq!(count, 3);
+        assert_eq!(replace_paths("`/Volumes/workplace`", &names, to).1, 1);
+        // Paths that climb out of the folder name what is beside it.
+        for beside in [
+            "/Volumes/workplace/../notes.md",
+            "/Volumes/workplace/a/../../b",
+        ] {
+            assert_eq!(replace_paths(beside, &names, to), (beside.to_owned(), 0));
+        }
+        assert_eq!(
+            replace_paths("/Volumes/workplace/a/../b", &names, to).0,
+            "/Users/g/.agent/tasks/t/a/../b"
+        );
+        // Sibling folders whose names only start the same stay as they are.
+        for sibling in [
+            "/Volumes/workplace+backup",
+            "/Volumes/workplace@old",
+            "/Volumes/workplace#2",
+        ] {
+            assert_eq!(replace_paths(sibling, &names, to), (sibling.to_owned(), 0));
+        }
+        assert_eq!(
+            replace_paths(
+                "--dir=/Volumes/workplace:/Volumes/workplace/b (see ~/workplace)",
+                &names,
+                to
+            )
+            .0,
+            "--dir=/Users/g/.agent/tasks/t:/Users/g/.agent/tasks/t/b (see /Users/g/.agent/tasks/t)"
+        );
+    }
+
+    #[test]
     fn a_folder_on_another_disk_is_told_apart() {
         let tmp = std::env::temp_dir();
         assert!(same_disk(&tmp, &tmp.join("not/made/yet")));
@@ -575,7 +806,7 @@ mod tests {
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();
-            assert!(flags[at + 1].ends_with(crate::project::PERSON));
+            assert!(flags[at + 1].ends_with("helping them well is the care."));
             flags[at + 1].clone()
         };
 
@@ -595,6 +826,14 @@ mod tests {
             flags[..3],
             ["--model=x/y", "--tools=read", "--instructions"]
         );
+
+        // The person's task.md replaces Sonny's, after any role, and once.
+        std::fs::write(dir.join(".agents/agents/task.md"), "Be kind.\n").unwrap();
+        let flags = told(&["--profile", "reviewer"]).unwrap();
+        assert!(flags.last().unwrap().ends_with("Review it.\n\nBe kind."));
+        let flags = told(&["--profile", "task"]).unwrap();
+        assert_eq!(flags.last().unwrap().matches("Be kind.").count(), 1);
+        std::fs::remove_file(dir.join(".agents/agents/task.md")).unwrap();
 
         assert_eq!(told(&["--model", "x/y"]).unwrap(), ["--model", "x/y"]);
         assert!(told(&["--profile", "nobody"]).is_err());

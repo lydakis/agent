@@ -32,6 +32,7 @@ mod project;
 mod prompt;
 mod reactions;
 mod rex;
+mod screen;
 mod settings;
 mod shell;
 mod skills;
@@ -50,8 +51,8 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
-            self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-            KeyModifiers,
+            self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+            EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         },
         execute,
         terminal::{
@@ -86,12 +87,39 @@ const REACTABLE: usize = 9;
 /// How much of a reply's first line a reaction quotes.
 const QUOTED: usize = 72;
 
+/// Draws in a row that may fail before the client gives up on its
+/// terminal: each failed cursor query waits up to 2 s, so about a minute.
+const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How long a side chat's copy stays once idle.
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Sonny owns the whole screen (`/fullscreen`): the alternate screen and
+/// the mouse, the conversation kept in [`screen::Screen`].
+static FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn full() -> bool {
+    FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Into the full screen, or out of it.
+fn own_screen(own: bool) {
+    FULL.store(own, std::sync::atomic::Ordering::Relaxed);
+    let _ = match own {
+        true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
+        false => execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen),
+    };
+}
+
+/// A terminal drawn inline, under the scrollback, or over the full screen.
+fn viewport() -> Viewport {
+    match full() {
+        true => Viewport::Fullscreen,
+        false => Viewport::Inline(VIEWPORT),
+    }
+}
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -711,13 +739,20 @@ async fn run() -> Result<(), String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    if settings::Settings::load().fullscreen {
+        own_screen(true);
+    }
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(std::io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT),
+            viewport: viewport(),
         },
     )
     .map_err(|e| e.to_string())?;
+    // A side chat opens on its window's alternate screen, still drawn on.
+    if full() {
+        let _ = terminal.clear();
+    }
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
     if options.side.is_some() {
@@ -808,6 +843,9 @@ async fn run() -> Result<(), String> {
     }
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
+    if full() {
+        own_screen(false);
+    }
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     status_report("clear", &name);
@@ -826,9 +864,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
-    let instructions = agent_client::policy::instructions(&workspace, None, &memory)
-        .map(|composed| project::with_person(&composed.text))
-        .map_err(|e| e.to_string())?;
+    let composed =
+        agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
+    let instructions = project::as_task(&workspace, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
@@ -842,6 +880,23 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// A link, file or page, opened as the system opens it.
+fn open(target: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("{opener}: {error}"))
 }
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
@@ -871,6 +926,10 @@ fn window(mut rows: Vec<Line<'static>>, row: usize, keep: usize) -> (Vec<Line<'s
 }
 
 fn fit(terminal: &mut Tui, height: u16) -> std::io::Result<()> {
+    // The full screen keeps its size; history goes above whatever height.
+    if full() {
+        return Ok(());
+    }
     let area = terminal.get_frame().area();
     let height = height.min(terminal.size()?.height);
     if area.height == height {
@@ -1060,7 +1119,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 15] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1078,6 +1137,10 @@ const COMMANDS: [(&str, &str); 14] = [
     (
         "/verbose",
         "every tool call, or only what moves the work on",
+    ),
+    (
+        "/fullscreen",
+        "Sonny owns the screen (select, copy, scroll), or writes into the scrollback",
     ),
     (
         "/copies",
@@ -1255,6 +1318,10 @@ struct App {
     /// Those whose output this window showed, from when their record is
     /// sent until it lands.
     ran_here: Vec<user_shell::Ran>,
+    /// The conversation's rows, kept when Sonny owns the whole screen.
+    screen: screen::Screen,
+    /// Into the full screen, or out of it, at the next repaint.
+    switch_screen: bool,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1613,6 +1680,15 @@ impl Fleet {
             .unwrap_or(bot)
     }
 
+    /// The bot as the person tells it apart from every other project's:
+    /// the lead by its project, as `shop lead`, a task by its own name.
+    fn named(&self, bot: &str) -> String {
+        match bot == self.lead {
+            true => format!("{} lead", self.project),
+            false => self.short(bot).to_owned(),
+        }
+    }
+
     /// Note what the bot is doing, and name the windows after it.
     fn doing(&mut self, bot: &str, doing: &'static str) {
         if self.doing.get(bot) != Some(&doing) {
@@ -1634,7 +1710,7 @@ impl Fleet {
 
     /// Each window holding the project's bots is named after the lead, or
     /// its first bot, and what that bot is doing, with a count of the others
-    /// that are working or need the person: `lead · done · 2 working`. A
+    /// that are working or need the person: `shop lead · done · 2 working`. A
     /// window that also holds the person's own blocks, as when Sonny was
     /// opened beside them, keeps the name they gave it.
     fn name_windows(&mut self) {
@@ -1654,7 +1730,7 @@ impl Fleet {
             else {
                 continue;
             };
-            let mut name = format!("{} · {}", self.short(first), self.doing[first]);
+            let mut name = format!("{} · {}", self.named(first), self.doing[first]);
             for state in ["needs you", "working"] {
                 let others = bots
                     .iter()
@@ -1870,6 +1946,8 @@ impl App {
             shown: Vec::new(),
             unsent: Vec::new(),
             ran_here: Vec::new(),
+            screen: screen::Screen::default(),
+            switch_screen: false,
         }
     }
 
@@ -1916,6 +1994,8 @@ impl App {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                // A read that fails, as one can while the Mac wakes, is
+                // tried again rather than leaving the client deaf to keys.
                 match event::poll(Duration::from_millis(50)) {
                     Ok(false) => {}
                     Ok(true) => match event::read() {
@@ -1924,15 +2004,23 @@ impl App {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
                     },
-                    Err(_) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
         });
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        // A terminal waking with the Mac can be slow to answer the cursor
+        // query a resize makes, and a draw then fails; the next tick draws
+        // again, and only a terminal that keeps failing ends the client.
+        let mut failed_draws = 0;
         loop {
-            self.draw(terminal).map_err(|e| e.to_string())?;
+            match self.draw(terminal) {
+                Ok(()) => failed_draws = 0,
+                Err(_) if failed_draws < DRAW_ATTEMPTS => failed_draws += 1,
+                Err(error) => return Err(error.to_string()),
+            }
             if self.quit {
                 return Ok(());
             }
@@ -2249,20 +2337,28 @@ impl App {
     /// in the view just picked, once no turn is running: the screen and scrollback cleared, and the
     /// bot's items read again as on attach.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
-        execute!(
-            std::io::stdout(),
-            Clear(ClearType::Purge),
-            Clear(ClearType::All),
-            ratatui::crossterm::cursor::MoveTo(0, 0)
-        )
-        .map_err(|e| e.to_string())?;
+        if std::mem::take(&mut self.switch_screen) {
+            own_screen(!full());
+        }
+        // The full screen's rows are Sonny's own; inline, the scrollback's.
+        self.screen.clear();
+        if !full() {
+            execute!(
+                std::io::stdout(),
+                Clear(ClearType::Purge),
+                Clear(ClearType::All),
+                ratatui::crossterm::cursor::MoveTo(0, 0)
+            )
+            .map_err(|e| e.to_string())?;
+        }
         *terminal = Terminal::with_options(
             CrosstermBackend::new(std::io::stdout()),
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT),
+                viewport: viewport(),
             },
         )
         .map_err(|e| e.to_string())?;
+        terminal.clear().map_err(|e| e.to_string())?;
         self.pending.clear();
         self.held.clear();
         self.live = None;
@@ -3302,9 +3398,16 @@ impl App {
             }
         };
         let jobs = errand::jobs(self.folder_name()).await;
-        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        // The full screen is the alternate screen already.
+        if !full() {
+            let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        }
         match Terminal::new(CrosstermBackend::new(std::io::stdout())) {
-            Ok(screen) => {
+            Ok(mut screen) => {
+                // A new terminal draws only what differs from blank.
+                if full() {
+                    let _ = screen.clear();
+                }
                 self.watch = Some(Watch {
                     screen,
                     project,
@@ -3315,7 +3418,9 @@ impl App {
                 })
             }
             Err(error) => {
-                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                if !full() {
+                    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                }
                 self.notice = Some(error.to_string());
             }
         }
@@ -3615,6 +3720,56 @@ impl App {
             .collect()
     }
 
+    /// What the full screen takes before the rest: the mouse, a copy of
+    /// the selection, and the keys that scroll. Whether it took `event`.
+    fn full_screen(&mut self, event: &Event) -> bool {
+        let key = match event {
+            Event::Mouse(mouse) => {
+                match self.screen.mouse(*mouse) {
+                    Some(screen::Action::Copy(text)) => self.copied(&text),
+                    Some(screen::Action::Open(link)) => {
+                        if let Err(error) = open(&link) {
+                            self.notice = Some(error);
+                        }
+                    }
+                    None => {}
+                }
+                return true;
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            _ => return false,
+        };
+        let copy = key.code == KeyCode::Char('c')
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER));
+        match key.code {
+            _ if copy && let Some(text) = self.screen.selected() => {
+                self.copied(&text);
+                self.screen.unselect();
+            }
+            KeyCode::Esc if self.screen.unselect() => {}
+            KeyCode::PageUp => self.screen.page(true),
+            KeyCode::PageDown => self.screen.page(false),
+            // Sending goes back to the newest rows, where its answer comes.
+            KeyCode::Enter => {
+                self.screen.latest();
+                return false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `text` put on the clipboard, and said so.
+    fn copied(&mut self, text: &str) {
+        term::copy(text);
+        let count = text.chars().count();
+        self.notice = Some(match count {
+            1 => "copied 1 character".into(),
+            _ => format!("copied {count} characters"),
+        });
+    }
+
     async fn key(&mut self, mut event: Event) {
         // Ctrl-H is the backspace a terminal sends as 0x08, which reads as
         // Ctrl and `h`: it deletes, as in a shell.
@@ -3625,6 +3780,9 @@ impl App {
             key.code = KeyCode::Backspace;
             key.modifiers = KeyModifiers::NONE;
         }
+        if full() && self.watch.is_none() && self.full_screen(&event) {
+            return;
+        }
         if self.watch.is_some() {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
@@ -3633,7 +3791,9 @@ impl App {
                         && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 self.watch = None;
-                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                if !full() {
+                    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                }
                 self.redraw = true;
             }
             return;
@@ -3893,23 +4053,10 @@ impl App {
             self.input.clear();
             let page = transcript::PAGE.lock().ok().and_then(|page| page.clone());
             self.notice = Some(match page {
-                Some(page) => {
-                    let opener = if cfg!(target_os = "macos") {
-                        "open"
-                    } else {
-                        "xdg-open"
-                    };
-                    match std::process::Command::new(opener)
-                        .arg(&page)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        Ok(_) => "opened in your browser".to_owned(),
-                        Err(error) => format!("{opener}: {error}"),
-                    }
-                }
+                Some(page) => match open(&page.to_string_lossy()) {
+                    Ok(()) => "opened in your browser".to_owned(),
+                    Err(error) => error,
+                },
                 None => "no HTML page in this conversation yet".into(),
             });
             return;
@@ -4003,6 +4150,27 @@ impl App {
                         "chime off"
                     }
                     .to_owned()
+                }
+                Err(error) => error,
+            });
+            return;
+        }
+        if prompt == "/fullscreen" {
+            self.input.clear();
+            let mut settings = settings::Settings::load();
+            settings.fullscreen = !full();
+            self.notice = Some(match settings.save() {
+                Ok(()) => {
+                    self.switch_screen = true;
+                    self.repaint = true;
+                    let then = match self.running {
+                        Some(_) => " once this turn ends",
+                        None => "",
+                    };
+                    match settings.fullscreen {
+                        true => format!("full screen{then}"),
+                        false => format!("inline{then}"),
+                    }
                 }
                 Err(error) => error,
             });
@@ -4382,6 +4550,10 @@ impl App {
             DisableBracketedPaste,
             EnterAlternateScreen
         );
+        // The side chat's Sonny takes the mouse if it wants it.
+        if full() {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
         let _ = disable_raw_mode();
         match command.spawn() {
             Ok(child) => self.side = Some(child),
@@ -4404,11 +4576,12 @@ impl App {
 
     fn side_back(&mut self) {
         let _ = enable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            LeaveAlternateScreen,
-            EnableBracketedPaste
-        );
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        // A full-screen side chat left the alternate screen on its way out.
+        let _ = match full() {
+            true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
+            false => execute!(std::io::stdout(), LeaveAlternateScreen),
+        };
         self.keys_paused
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.redraw = true;
@@ -4500,6 +4673,9 @@ impl App {
             terminal,
             VIEWPORT - 2 + live_rows + composer_rows.len() as u16,
         )?;
+        if full() {
+            self.screen.push(std::mem::take(&mut self.pending));
+        }
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -4537,8 +4713,29 @@ impl App {
                 }
             }
         }
+        let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
+        let workspace = std::path::PathBuf::from(&self.workspace);
         terminal.draw(|frame| {
-            let [live, status, _, composer, footer] = areas(frame.area(), live_rows);
+            // The full screen: the conversation above the rows that move,
+            // which sit right under it until it fills the screen, as inline.
+            let view = match full() {
+                true => {
+                    let area = frame.area();
+                    let room = area.height.saturating_sub(below);
+                    let rows = self.screen.height(area.width as usize).min(room as usize);
+                    let [history, view, _] = Layout::vertical([
+                        Constraint::Length(rows as u16),
+                        Constraint::Length(below),
+                        Constraint::Min(0),
+                    ])
+                    .areas(area);
+                    let file = |word: &str| links::file(&workspace, word);
+                    self.screen.render(history, frame.buffer_mut(), file);
+                    view
+                }
+                false => frame.area(),
+            };
+            let [live, status, _, composer, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
@@ -4568,7 +4765,7 @@ impl App {
                         }
                     })
                     .collect();
-                let [_, _, _, composer_row, _] = areas(frame.area(), live_rows);
+                let [_, _, _, composer_row, _] = areas(view, live_rows);
                 let area = ratatui::layout::Rect {
                     y: composer_row.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
@@ -4732,14 +4929,19 @@ impl App {
         // What is sent answers the lead's first open question.
         let answering = (!self.chatting).then(|| self.asks.first()).flatten();
         if self.input.is_empty() {
+            // Named, so a message typed in the wrong pane is caught first.
+            let name = match &self.project {
+                Some(project) => format!("{project} lead"),
+                None => self.bot.clone(),
+            };
             let hint = match self.running {
                 _ if let Some(ask) = answering => {
                     asks::hint(ask, self.asks.len() - 1, width.saturating_sub(prompt::LEAD))
                 }
                 _ if self.react_to.is_some() => "An emoji for that reply, or Esc".into(),
                 _ if !self.asks.is_empty() => "A message of your own, or Esc to answer".into(),
-                Some(_) => "Steer the running turn".into(),
-                None => "Ask anything".into(),
+                Some(_) => format!("Steer {name}"),
+                None => format!("Message {name}"),
             };
             let lead = match answering {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),

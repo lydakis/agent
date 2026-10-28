@@ -2098,10 +2098,13 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `{"calls":[{"call_id","request","announced_ms","gates","name","node"}]}`.
   A round whose calls take more than 256 KiB is announced in several such
   events, in order, so each one pages.
-- **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"lease"?}`
+- **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"unreviewed"?,"by"?,"lease"?}`
   records one gate's verdict on the call's current request; `tag` may be
   left out when the call has one gate, and `reason` goes only with a deny
-  (`invalid_reason` otherwise). `lease` is for a session serving `tag`
+  (`invalid_reason` otherwise). `unreviewed: true` marks a deny nobody
+  assessed (the approver's review failed or timed out): it counts toward
+  no breaker, as in Codex, and goes with a deny only
+  (`invalid_unreviewed` otherwise). `lease` is for a session serving `tag`
   (below): the answer renews the lease, and one under a lease that ended
   gets `approvals_lost` and changes nothing; a lease without a `tag` is
   `invalid_lease`. An answer without one is an override, whoever serves
@@ -2175,16 +2178,21 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   carries `denials`, the bot's counts under each of its open gates (next).
 - **Denial counts.** The daemon counts, per bot and gate tag, the denials
   that tag gave in the turn that gave the last one: `in_row`, ended when a
-  call every gate allowed starts, and `in_turn`, all of them. A denial in a
+  call every gate allowed starts, and which of the turn's last 50 decided
+  calls were denied, Codex's breaker window. A denial in a
   new turn starts both from none, so the breaker that ends one turn does
   not refuse the next. They are
-  written in the commit that records the denial, and the start that ends
-  a run writes only when a run was counted, so a bot never denied writes
-  nothing. A lapsed gate's denial is not counted: nobody judged the call.
-  `inspect` reports `denials: {tag: {in_row, in_turn, turn}}` once one is
-  counted; a listed or served call carries `{tag: {in_row, in_turn}}` as
-  seen from its own turn, so an approver that restarts or takes over
-  counts on where the last one left off.
+  written in the commit that records the denial; an allowed start writes
+  only while a denial is still in the window, and the count is dropped
+  once none is, so a bot never denied writes nothing. A lapsed gate's
+  denial, and an `unreviewed` one, are not counted: nobody judged the call.
+  `inspect` reports `denials: {tag: {in_row, window, turn}}` while one is
+  counted, `window` the last 50 decided calls as bits, newest lowest, set
+  for a denial; a listed or served call carries `{tag: {in_row, recent}}`,
+  `recent` the denials in that window, as seen from its own turn, so an
+  approver that restarts or takes over counts on where the last one left
+  off. Schema 54 turned a stored count of N a turn into N denials as the
+  window's newest calls, since their order was never kept.
 - **Serving a tag.** `{"op":"serve_approvals","tag","lease_ms","limit"?}`
   hands the session the tag. The reply is the first page of the calls
   waiting on it, as `approvals {tag}` lists them, with the `lease` number,
@@ -2235,10 +2243,10 @@ The CLI turns a mode into a gate. `run --new --approval manual`, or
 `AGENT_APPROVAL=manual`, gates every tool of the new bot but `history`,
 `wait`, `note`, and `echo`, tagged `manual`; `--approve LIST` picks the
 tools instead, and `fork` takes both. `full`, the default, gates nothing.
-`auto` gates the same tools, tagged `auto`, with a 45 s expiry, and
+`auto` gates the same tools but `read`, tagged `auto`, with a 105 s
+expiry (the approver's 90 s review budget plus margin), and
 starts `agent approver` detached if no session serves `auto`, logging to
-`STORE.approver.log`; its judge is `AGENT_JUDGE`, else Jev when
-`TYPESAFE_API_KEY` is set, else the bot's own model, and a judge that
+`STORE.approver.log`; its judge is `AGENT_JUDGE`, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
 PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves
