@@ -34,6 +34,7 @@ mod reactions;
 mod rex;
 mod screen;
 mod settings;
+mod setup;
 mod shell;
 mod skills;
 mod sound;
@@ -485,14 +486,62 @@ fn start_lookout(options: &Options) -> Result<(), String> {
 }
 
 /// The daemon, started the way the CLI starts it when it is not running.
+/// With no provider set anywhere, the person is asked for one first, and a
+/// first model list is written once it runs.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
-    start_daemon(&options.store, &options.socket, false)?;
-    Client::connect(&options.socket)
+    match start_daemon(&options.store, &options.socket, false) {
+        Err(failed) if failed.code.as_deref() == Some("provider_required") => {
+            if !setup::interactive() {
+                return Err(format!("{failed}; run sonny in a terminal to choose one"));
+            }
+            let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+            setup::provider(&bin)?;
+            start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
+        }
+        started => started.map_err(|e| e.to_string())?,
+    }
+    let connected = Client::connect(&options.socket)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
+        tokio::spawn(first_models(connected.0.clone(), path));
+    }
+    Ok(connected)
+}
+
+/// `~/.agent/models`, the list agents read with `agent models`, written
+/// from the providers' listings when there is none yet, as `agent models
+/// --discover` writes it. A provider that will not list leaves it for the
+/// next start.
+async fn first_models(client: Arc<Client>, path: PathBuf) {
+    let Ok(listing) = client.request("provider_models", json!({})).await else {
+        return;
+    };
+    if let Ok(text) = agent_client::models::render(&listing, &[]) {
+        let _ = agent_client::models::install(&path, &text);
+    }
+}
+
+/// Why the daemon did not start: the CLI's error code when it named one,
+/// and what it said.
+pub struct NotStarted {
+    pub code: Option<String>,
+    reason: String,
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not start the daemon: {}", self.reason)
+    }
+}
+
+impl From<String> for NotStarted {
+    fn from(reason: String) -> Self {
+        NotStarted { code: None, reason }
+    }
 }
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
@@ -502,9 +551,9 @@ fn start_daemon(
     store: &std::path::Path,
     socket: &std::path::Path,
     login: bool,
-) -> Result<(), String> {
+) -> Result<(), NotStarted> {
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
     let mut command = std::process::Command::new(&bin);
     if let Some(environment) = login.then(login::environment).flatten() {
@@ -522,13 +571,15 @@ fn start_daemon(
         .map_err(|e| format!("{}: {e}", bin.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let reason = stderr
+        let failure = stderr
             .lines()
             .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|failure| Some(failure["detail"].as_str()?.to_owned()))
-            .unwrap_or_else(|| stderr.trim().to_owned());
-        return Err(format!("could not start the daemon: {reason}"));
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        let field = |name: &str| Some(failure.as_ref()?[name].as_str()?.to_owned());
+        return Err(NotStarted {
+            code: field("error"),
+            reason: field("detail").unwrap_or_else(|| stderr.trim().to_owned()),
+        });
     }
     Ok(())
 }
@@ -857,8 +908,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let model = options
         .model
         .clone()
-        .or_else(|| std::env::var("AGENT_MODEL").ok())
-        .ok_or("--new needs --model PROVIDER/MODEL")?;
+        .or_else(|| agent_client::env_file::var("AGENT_MODEL"))
+        .ok_or("--new needs --model PROVIDER/MODEL, or AGENT_MODEL in ~/.agent/env")?;
     let workspace = match &options.workspace {
         Some(dir) => std::path::absolute(dir).map_err(|e| e.to_string())?,
         None => std::env::current_dir().map_err(|e| e.to_string())?,

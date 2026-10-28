@@ -684,7 +684,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
     if options.providers.is_empty() {
         return fail_with(
-            "usage",
+            "provider_required",
             "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
@@ -1083,8 +1083,9 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&ready, options.pretty)?;
             refused.map_or(Ok(0), Err)
         }
+        // About the daemon, not its bots: a fresh install's first one starts.
         "stats" => {
-            let mut connection = ensure_existing_daemon(&options)?;
+            let mut connection = ensure_daemon(&options)?;
             let stats = connection.request("stats", json!({}))?;
             print_json(&stats, options.pretty)?;
             Ok(0)
@@ -1211,33 +1212,7 @@ fn models(options: &Options) -> Result<i32> {
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
         let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Written whole beside it, then linked into place: a failed write
-        // leaves no partial list, and a list made meanwhile is not replaced.
-        let staged = path.with_file_name(format!(".models.{}", std::process::id()));
-        let installed = (|| {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staged)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            std::fs::hard_link(&staged, &path)
-        })();
-        let _ = std::fs::remove_file(&staged);
-        installed.map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => {
-                Error::with("models_file_exists", path.display().to_string())
-            }
-            _ => error.into(),
-        })?;
-        // The new name is durable only once its directory is.
-        if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
+        agent_client::models::install(&path, &text).map_err(Error::from)?;
         eprintln!("wrote {}", path.display());
     }
     let models = agent_client::models::read(&path).map_err(Error::from)?;

@@ -591,21 +591,6 @@ where a lead agent coordinates task agents for a person. The user message is a J
 how to read `input`, and `questions` maps each question's id to the question. Answer with one JSON object \
 mapping every question id to the probability, from 0 to 1, that the answer is yes, and nothing else.";
 
-/// A key from this shell, else from `~/.agent/env`.
-fn key(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .or_else(|| {
-            let file = agent_client::env_file::path()?;
-            agent_client::env_file::read(&file)
-                .ok()?
-                .into_iter()
-                .find(|(key, value)| key == name && !value.is_empty())
-                .map(|(_, value)| value)
-        })
-}
-
 impl Judge {
     /// `openai-decisions/MODEL` with `OPENAI_API_KEY` (`LOOKOUT_URL`
     /// points it elsewhere), any other `provider/model`, which the daemon
@@ -634,7 +619,7 @@ impl Judge {
             )),
             Some(judge::Spec::Model(model)) => Ok(judge(Api::Model, model, None)),
             Some(judge::Spec::Decisions(model)) => {
-                let key = key(judge::DECISIONS_KEY)
+                let key = agent_client::env_file::var(judge::DECISIONS_KEY)
                     .ok_or_else(|| format!("lookout: set {} for {spec}", judge::DECISIONS_KEY))?;
                 let url = std::env::var("LOOKOUT_URL")
                     .ok()
@@ -818,7 +803,9 @@ fn judge_bot(name: &str) -> bool {
 /// `AGENT_JUDGE`, else the lead's own model. `None` when it is `off`,
 /// which judges nothing.
 fn pick(spec: Option<&str>, lead_model: &str) -> Option<String> {
-    let named = spec.map(str::to_owned).or_else(|| key(judge::VAR));
+    let named = spec
+        .map(str::to_owned)
+        .or_else(|| agent_client::env_file::var(judge::VAR));
     judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off")
 }
 

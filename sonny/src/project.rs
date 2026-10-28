@@ -416,19 +416,20 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     let role = role(dir)?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
-    // the role's, AGENT_MODEL's, then the newest agent's, so a bare
-    // `sonny` needs no flag.
+    // the role's, AGENT_MODEL's (from ~/.agent/env or the shell), then the
+    // newest agent's, so a bare `sonny` needs no flag. With none, the
+    // person picks one, kept as AGENT_MODEL for later projects.
     let model = match model
         .map(str::to_owned)
         .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
+        .or_else(|| agent_client::env_file::var("AGENT_MODEL"))
     {
         Some(model) => model,
-        None => match std::env::var("AGENT_MODEL").ok() {
+        None => match newest(client).await? {
             Some(model) => model,
-            None => newest(client)
-                .await?
-                .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
+            None if crate::setup::interactive() => crate::setup::model(client).await?,
+            None => return Err("model_required: no default model yet; set AGENT_MODEL in ~/.agent/env or pass --model PROVIDER/MODEL once".into()),
         },
     };
     let picks = agent_client::project::Picks {

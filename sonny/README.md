@@ -13,7 +13,12 @@ Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
 `opt` path. On Linux, each release also has
 `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and aarch64): static builds of
 Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
-`bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
+`bin/sonny`, or let [install.sh](../install.sh) fetch, check and link the
+latest one into `~/.local`:
+
+    curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
+
+With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
 the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
@@ -30,6 +35,20 @@ skills it writes name `"…/sonny" agent` wherever they would say
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
 Sonny in its `lead` role, with the folder's
 `.agents/project.toml` written when it had none.
+
+`~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
+keys and defaults Sonny applies over your shell's to the daemon, the
+approver, the lookout and its own settings, `AGENT_MODEL` included. When
+neither it nor the shell names a provider (`AGENT_PROVIDER` or a provider's
+key), the first `sonny` in a terminal asks for one, as Codex and Claude Code
+ask for a sign-in: a ChatGPT plan (signed in with `agent login chatgpt`), an
+Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS profile. A new
+project's model is `--model`, else the project file's or the role's, else
+`AGENT_MODEL`, else the newest agent's; with none, Sonny lists what the
+providers offer and keeps the pick as `AGENT_MODEL`. Outside a terminal
+both fail, naming what to set. The first start also writes
+`~/.agent/models`, the list agents read with `agent models`, when there is
+none, as `agent models --discover` does.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`

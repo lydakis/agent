@@ -260,9 +260,9 @@ forwards that path. A socket path that is not UTF-8, which the ready line
 cannot carry, is refused before anything starts (`socket_path_unsupported`). When the daemon holding the socket speaks another
 protocol, `start` still prints its ready line and then fails with
 `daemon_protocol_mismatch`, so a caller can tell an older daemon from a newer
-one. `stats`,
+one. `stats` starts it as `start` does, so it answers on a fresh install;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
-existing store. These commands accept the startup
+existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match
@@ -271,7 +271,8 @@ Comparison uses effective limits: `--idle-exit 0` means disabled, and positive
 context limits are clamped to at least 1,024 bytes and two items.
 With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
 separated by whitespace), else the providers whose key variable is set; a
-running daemon is not checked against either.
+running daemon is not checked against either. With none of them, starting
+fails with `provider_required`.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
 `AGENT_MODEL` is only a creation default. An existing bot uses its stored
