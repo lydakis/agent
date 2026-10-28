@@ -14,8 +14,8 @@ pub fn install_errand() {
 
 /// What every agent of Sonny's leans on: the lead's and tasks' roles, the
 /// memory, plan and automation skills, the nightly cleanup's, and
-/// `~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, which run
-/// this Sonny. Written at each start, so they lead to this copy.
+/// `~/.agent/memory` and `~/.agent/trigger`, which run this Sonny. Written
+/// at each start, so they lead to this copy.
 pub fn install_own() {
     install_role("lead", crate::project::LEAD);
     install_role("task", crate::project::TASK);
@@ -34,12 +34,19 @@ pub fn install_own() {
     let state = PathBuf::from(home).join(".agent");
     for (name, usage) in [
         ("memory", agent_client::memory::usage()),
-        ("project", crate::project::usage()),
         (crate::trigger::VERB, crate::trigger::USAGE),
     ] {
         if let Err(error) = write_runner(&state.join(name), usage, &sonny, name) {
             eprintln!("sonny: {error}");
         }
+    }
+    // An older Sonny's `~/.agent/project`, for what the new_project tool
+    // does now.
+    let project = state.join("project");
+    if std::fs::read_to_string(&project).is_ok_and(|text| {
+        text.starts_with("#!/bin/sh\n# usage: project add") && text.ends_with(" project \"$@\"\n")
+    }) {
+        let _ = std::fs::remove_file(&project);
     }
 }
 

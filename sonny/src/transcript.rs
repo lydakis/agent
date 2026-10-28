@@ -593,6 +593,14 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     if let Some(from) = from {
         out.push(Line::from(format!("  from {from}")).dim());
     }
+    // An answer to the lead's question says which, and shows the answer.
+    let text = match crate::asks::split(text) {
+        Some((question, answer)) => {
+            out.push(crate::asks::answering(question, width));
+            answer
+        }
+        None => text,
+    };
     // A long paste shows its start; the rest is in the conversation.
     let lines: Vec<&str> = text.lines().collect();
     let shown = if lines.len() > PROMPT_LINES + 2 {
@@ -803,6 +811,58 @@ pub fn quiet(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// What a call would have done, in a few words: a command's first line,
+/// a file's path, else the tool's name.
+pub fn action(name: &str, arguments: &Value, workspace: &str) -> String {
+    match (arguments["command"].as_str(), arguments["path"].as_str()) {
+        (Some(command), _) => command.lines().next().unwrap_or("").trim().to_owned(),
+        (None, Some(path)) => format!("{name} {}", shown(path, workspace)),
+        _ => name.to_owned(),
+    }
+}
+
+/// The most of a denial's reason drawn under it.
+const DENIAL_ROWS: usize = 4;
+
+/// A call that was denied, as Codex draws one: what it would have done,
+/// then why, when a reason was given. Kept in the clean view too.
+pub fn denied(
+    name: &str,
+    arguments: &Value,
+    reason: &str,
+    workspace: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let what = action(name, arguments, workspace);
+    let mut lines = vec![Line::from(vec![
+        Span::raw("✗ ").fg(Color::Red),
+        Span::raw("Request "),
+        Span::raw("denied").bold(),
+        Span::raw(" for "),
+        Span::raw(cut(&what, width.saturating_sub(22).max(8))).dim(),
+    ])];
+    let mut rows = Vec::new();
+    for paragraph in reason.lines().filter(|line| !line.trim().is_empty()) {
+        rows.extend(wrap(
+            Line::from(paragraph.trim().to_owned()),
+            width,
+            Span::raw(if rows.is_empty() { "  └ " } else { "    " }),
+            Span::raw("    "),
+        ));
+    }
+    if rows.len() > DENIAL_ROWS {
+        rows.truncate(DENIAL_ROWS);
+        if let Some(last) = rows.last_mut() {
+            if let Some(span) = last.spans.last_mut() {
+                span.content = span.content.trim_end().to_owned().into();
+            }
+            last.spans.push(Span::raw(" …"));
+        }
+    }
+    lines.extend(rows.into_iter().map(|line| line.dim()));
+    lines
+}
+
 /// What a tool call did: one header line, then a short look at its result.
 pub fn tool(
     name: &str,
@@ -832,7 +892,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 25] = [
+const KEPT: [&str; 29] = [
     "Started",
     "Messaged",
     "Steered",
@@ -853,6 +913,10 @@ const KEPT: [&str; 25] = [
     "Fired the trigger",
     "Added the project",
     "Moved",
+    "Opened",
+    "Discarded",
+    "Subscribed to",
+    "Unsubscribed from",
     "Opened a tab",
     "Opened a split",
     "Stopped Errand job",
@@ -882,9 +946,14 @@ fn drawn(
     let elbow = || Span::raw("  └ ").dim();
     let gap = || Span::raw("    ");
     // A tool Sonny declares, said as what it does.
-    if let Some(said) = crate::calls::declared(name, arguments, failed) {
+    if let Some(mut said) = crate::calls::declared(name, arguments, failed) {
         if clean && !kept(&said) {
             return Vec::new();
+        }
+        // One Sonny answered with an error says why, so the call is not
+        // read as done.
+        if let Some(why) = failed.then(|| refusal(output)).flatten() {
+            said.under.insert(0, Line::from(why).red());
         }
         return said_lines(said, width);
     }
@@ -1126,6 +1195,14 @@ fn assignment(part: &str) -> bool {
 }
 
 /// A call said as an action, with up to two rows of each line under it.
+/// The first line of a failed call's `{"error","detail"}` output: its
+/// detail, else its code.
+fn refusal(output: Option<&str>) -> Option<String> {
+    let error: Value = serde_json::from_str(output?).ok()?;
+    let why = error["detail"].as_str().or(error["error"].as_str())?;
+    Some(why.lines().next().unwrap_or("").to_owned())
+}
+
 fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
@@ -1385,6 +1462,15 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_shows_itself_under_the_question_it_answers() {
+        let shown: Vec<String> = prompt("You asked: Ship it?\n\nNot yet", None, 80)
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(shown, ["  answering “Ship it?”", "› Not yet"]);
+    }
+
+    #[test]
     fn task_updates_and_lookout_notes_read_as_one_quiet_row() {
         let told = "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
                     - shop.fix: turn:shop.fix/5 failed, asked by you\n\
@@ -1627,7 +1713,8 @@ mod tests {
         );
         let asked = clean(
             "ask",
-            serde_json::json!({"question": "Ship it?", "choices": ["yes", "no"]}),
+            serde_json::json!({"question": "Ship it?", "options": [
+                {"label": "yes", "explanation": "e"}, {"label": "no", "explanation": "e"}]}),
             "Asked.",
         );
         assert_eq!(asked, ["• Asked you Ship it?", "  └ 1 yes · 2 no"]);
@@ -1636,12 +1723,57 @@ mod tests {
             r#"{"bot":"calc.fix","handle":"turn:calc.fix/2","turn":2}"#,
         );
         assert_eq!(started[0], "• Started calc.fix · turn 2");
-        // How a lead in Sonny starts a task, and the note it prints after.
-        let task = shell(
-            r#""/Applications/Sonny/sonny" task calc.fix --agents --setup --model "$AGENT_MODEL" -- 'Fix the tests.'"#,
-            "{\"bot\":\"calc.fix\",\"handle\":\"turn:calc.fix/3\",\"turn\":3}\nIts work comes back on branch agent/calc.fix.",
+        // How a lead in Sonny starts a task.
+        let task = clean(
+            "start_task",
+            serde_json::json!({"name": "fix", "brief": "Fix the tests.", "setup": true}),
+            "Started calc.fix: {\"handle\":\"turn:calc.fix/3\"}",
         );
-        assert_eq!(task, ["• Started calc.fix · turn 3", "  └ Fix the tests."]);
+        assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
+        // One that failed says why first.
+        let shown = text(&super::clean(
+            "show_agent",
+            &serde_json::json!({"agent": "calc.fix", "split": "right"}),
+            Some(r#"{"error":"not_shown","detail":"neither rex nor herdr was found"}"#),
+            true,
+            "/w",
+            80,
+        ));
+        assert_eq!(
+            shown,
+            [
+                "• Moved calc.fix to a split right of you",
+                "  └ neither rex nor herdr was found"
+            ]
+        );
+        // Memory and triggers through their tools read as their scripts do.
+        let saved = clean(
+            "memory",
+            serde_json::json!({"save": {"name": "deploys", "type": "feedback",
+                "description": "Deploys wait for review.", "source": "s", "text": "t"}}),
+            "{}",
+        );
+        assert_eq!(
+            saved,
+            ["• Saved to memory deploys", "  └ Deploys wait for review."]
+        );
+        assert!(clean("memory", serde_json::json!({}), "{}").is_empty());
+        let scheduled = text(&super::clean(
+            "triggers",
+            &serde_json::json!({"add": {"every": "30m", "message": "Check the queue."}}),
+            Some(r#"{"error":"trigger_refused","detail":"triggers_unsupported: only macOS"}"#),
+            true,
+            "/w",
+            80,
+        ));
+        assert_eq!(
+            scheduled,
+            [
+                "• Scheduled every 30m",
+                "  └ triggers_unsupported: only macOS",
+                "    Check the queue."
+            ]
+        );
         assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
         assert_eq!(
             shell(r#"sonny task changes calc.fix --apply"#, ""),
@@ -1698,10 +1830,7 @@ mod real_calls {
         );
         for row in rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(
-                !text.contains("AGENT_BIN") && !text.contains("sonny show"),
-                "{command}\n  drew: {text}"
-            );
+            assert!(!text.contains("AGENT_BIN"), "{command}\n  drew: {text}");
         }
     }
 
@@ -1741,15 +1870,15 @@ mod real_calls {
             false,
         );
         show(
-            r#""$AGENT_BIN" --help; "$HOME/.agent/project" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
+            r#""$AGENT_BIN" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
             "Usage: agent COMMAND [OPTIONS]\n",
             false,
         );
         show(
             &format!(
-                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'; "/Users/x/sonny" show calc.single-negative --split right"#
+                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'"#
             ),
-            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}\n{\"bot\":\"calc.single-negative\",\"session\":\"calc\"}",
+            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}",
             false,
         );
     }

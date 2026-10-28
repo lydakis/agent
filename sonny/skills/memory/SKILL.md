@@ -27,8 +27,9 @@ itself is `NAME.md` in the same folder.
 An agent made with its folder's instructions starts with both indexes in
 them, each under `# Memory in DIR`, as they were when it was made. When there is
 no such section, or yours may be out of date because the agent has been
-running a while, run `"$HOME/.agent/memory" show`. It prints both indexes
-as JSON: `user` and `project`, each with its folder's absolute
+running a while, call the memory tool with nothing, or run
+`"$HOME/.agent/memory" show` where you have no memory tool. Either gives both
+indexes as JSON: `user` and `project`, each with its folder's absolute
 `dir` and its `index` text, and the project's `name`. `project` is null
 outside a project. Open a fact's file, `DIR/NAME.md`, with the `read` tool
 when its description bears on the task. An empty index means nothing is
@@ -42,9 +43,13 @@ the person's latest word win over memory.
 
 ## Saving
 
-Save with `"$HOME/.agent/memory"`, the script Sonny writes. Every reply is
-one JSON object on stdout; a failure is one `{"error", "detail"}` object on
-stderr with exit 1.
+Save with the memory tool when you have it, which Sonny's agents do: `save`
+with `name`, `type`, `description`, `source` and `text`, `remove` NAME,
+`index` or `check`, and `user` or `project` NAME for the scope. It writes
+memory for you even where your shell cannot. Without the tool, use
+`"$HOME/.agent/memory"`, the script Sonny writes, with the same fields as
+below. Every reply is one JSON object on stdout; a failure is one
+`{"error", "detail"}` object on stderr with exit 1.
 
 ```sh
 "$HOME/.agent/memory" show [SCOPE]

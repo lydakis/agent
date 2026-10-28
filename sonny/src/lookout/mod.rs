@@ -4,12 +4,15 @@
 //! hears every message someone else writes in its tasks and how each turn
 //! ends, unjudged, as soon as it rests (see `updates`): it decides itself
 //! what matters. A judge `agent_client::judge` picks, the lead's own model
-//! by default, decides only what cannot wait: while the subscriber is in
-//! the middle of a turn, each event is a check of whether to steer it now,
-//! and of whatever its subscriptions look for. One lookout watches a
+//! by default, decides what cannot wait: while the subscriber is in the
+//! middle of a turn, each event is a check of whether to steer it now. It
+//! also picks a task drifting from what the person means, busy or not,
+//! which a lead reading everything lets pass too often, and whatever the
+//! subscriptions look for. One lookout watches a
 //! daemon, for every subscriber on it, started by the first Sonny to open;
 //! the daemon is unchanged: this follows every bot and submits to the
-//! subscribers like any client.
+//! subscribers like any client. It also answers its agents' calls of the
+//! tools Sonny answers (`served`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod subs;
@@ -79,23 +82,40 @@ pub struct Question {
     pub id: &'static str,
     pub text: &'static str,
     kinds: &'static [Kind],
+    /// Asked only while the subscriber is mid-turn, and a yes cuts into it.
+    mid_turn: bool,
+    /// What the note asks the lead to do about a yes.
+    todo: &'static str,
 }
 
-/// What a check may ask, as predicates over the input `input` builds: only
+/// What a check may ask, as predicates over the input `input` builds:
 /// whether the event cannot wait for the subscriber's turn to end, asked
-/// only while one runs. Everything else it hears when it rests, and judges
-/// itself.
-pub const QUESTIONS: [Question; 1] = [Question {
-    id: "interrupt",
-    text: "The agent being told is in the middle of a turn. Can `event` not wait until that turn ends: does it change what that agent or one of the tasks in `tasks` is doing right now, or is the task blocked on something only that agent or the person can give?",
-    kinds: &[Kind::Said, Kind::Ended],
-}];
+/// only while one runs, and whether a task drifts from what the person
+/// means, which a lead reading every message lets pass too often.
+/// Everything else it hears when it rests, and judges itself.
+pub const QUESTIONS: [Question; 2] = [
+    Question {
+        id: "interrupt",
+        text: "The agent being told is in the middle of a turn. Can `event` not wait until that turn ends: does it change what that agent or one of the tasks in `tasks` is doing right now, or is the task blocked on something only that agent or the person can give?",
+        kinds: &[Kind::Said, Kind::Ended],
+        mid_turn: true,
+        todo: "it cannot wait for your turn to end",
+    },
+    Question {
+        id: "drifts",
+        text: "Does `event` show the task drifting from what the person means, judged from `brief` and the person's messages in `exchange`: misreading them, swinging between readings as they correct it, going in circles, arguing past what they asked, or doing only part of it while presenting it as done? A task that follows the person's latest message is not drifting.",
+        kinds: &[Kind::Said, Kind::Ended],
+        mid_turn: false,
+        todo: "settle what the person means and steer the task with that reading",
+    },
+];
 
 /// How the judge reads the input, as a developer message.
 pub const READING: &str = "The user message is a JSON object about one event in a software project where a lead \
 agent coordinates task agents for a person. `event` is what just happened in one task: a message someone wrote \
 in it (`from` says who: `the person` is the person's own words), or the reply it ended a turn with. `brief` is what the lead \
-asked that task to do, or the person's latest words to it. `tasks` lists the project's other tasks, each with what the lead asked it and its latest \
+asked that task to do, or the person's latest words to it. `exchange`, when there is one, is what passed in that \
+task since the lead last wrote to it: the person's messages and the first line of each reply, oldest first. `tasks` lists the project's other tasks, each with what the lead asked it and its latest \
 line. `memory` is the index of what the person and the project \
 saved to memory, one fact a line. `lead`, when there is one, is the lead's own latest conversation, \
 oldest first: what it was told, what it said and the commands it ran. `context`, when there is one, is what the agent being told says it cares \
@@ -110,12 +130,20 @@ pub struct Asked {
 }
 
 /// What a check asks of what it saw: the built-ins its subscriptions name
-/// that fit the event, while the subscriber is mid-turn, and what they
-/// look for.
+/// that fit the event, those for a turn only while the subscriber is
+/// mid-turn, and what they look for.
 pub fn questions(seen: &Seen) -> Vec<Asked> {
     let mut asked: Vec<Asked> = asked(seen.kind)
         .into_iter()
-        .filter(|_| seen.busy)
+        .filter(|q| seen.busy || !q.mid_turn)
+        // Whether a task drifts from the person is read from what they or
+        // the lead asked, and asked of their own words, not of others'.
+        .filter(|q| {
+            let asked = seen.brief.is_some()
+                || seen.exchange.iter().any(|p| matches!(p, Passed::Person(_)));
+            q.id != "drifts"
+                || (asked && (seen.kind != Kind::Said || seen.from.as_deref() == Some(PERSON)))
+        })
         .filter(|q| {
             seen.asks
                 .builtins
@@ -160,14 +188,30 @@ pub struct Seen {
     pub node: Option<i64>,
     /// The subscriber was in the middle of a turn.
     pub busy: bool,
-    /// The node of the lead's latest message to the task, then.
+    /// The node of the lead's latest message to the task, or of the
+    /// person's words to it since, then.
     pub brief: Option<i64>,
+    /// The lead wrote that brief, not the person.
+    pub led: bool,
     /// The other tasks, each with the node of the lead's latest message to it.
     pub peers: Vec<(String, Option<i64>)>,
+    /// What passed in the task since the lead last wrote to it, then.
+    pub exchange: Vec<Passed>,
     pub text: String,
     /// What the subscriptions that matched ask of it.
     pub asks: Asks,
 }
+
+/// One thing that passed in a task: the person's words at a node, or the
+/// reply a turn ended with, read from its checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Passed {
+    Person(i64),
+    Reply { turn: i64, checkpoint: Option<i64> },
+}
+
+/// How much of an exchange a check reads: the last few back and forths.
+const EXCHANGE: usize = 6;
 
 /// What a check asks, from the subscriptions an event matched.
 #[derive(Clone, Debug, Default)]
@@ -188,9 +232,9 @@ pub struct Peer {
     pub latest: String,
 }
 
-/// The judge's input: the event, the task's brief, the other tasks, and
-/// what memory holds.
-pub fn input(seen: &Seen, brief: &str, peers: &[Peer], memory: &str) -> Value {
+/// The judge's input: the event, the task's brief and what passed in it
+/// since, the other tasks, and what memory holds.
+pub fn input(seen: &Seen, brief: &str, exchange: &[Value], peers: &[Peer], memory: &str) -> Value {
     let kind = match seen.kind {
         Kind::Said => "message",
         Kind::Ended => "turn_end",
@@ -212,6 +256,9 @@ pub fn input(seen: &Seen, brief: &str, peers: &[Peer], memory: &str) -> Value {
         .collect();
     let mut input = json!({"event": event, "brief": cut(brief, BRIEF_CHARS), "tasks": tasks,
         "memory": cut(memory, MEMORY_CHARS)});
+    if !exchange.is_empty() {
+        input["exchange"] = json!(exchange);
+    }
     if !seen.asks.context.is_empty() {
         input["context"] = json!(cut(&seen.asks.context.join("\n"), BRIEF_CHARS));
     }
@@ -256,9 +303,9 @@ pub enum Band {
 /// The built-in questions whose answers put an item in the note.
 type Reasons = Vec<(&'static str, f64)>;
 
-/// A check's band, from a yes: one to the built-in steers the subscriber,
-/// and one to what a subscription looks for wakes it, steering when it
-/// said `--urgent`. Anything less is a no: the subscriber hears of the
+/// A check's band, from a yes: one to `interrupt` steers the subscriber,
+/// one to `drifts` wakes it once it rests, and one to what a subscription
+/// looks for wakes it, steering when it said `--urgent`. Anything less is a no: the subscriber hears of the
 /// event with its task updates, if it asked for them. What said yes comes
 /// back, the look-fors by name.
 pub fn graded(
@@ -269,7 +316,8 @@ pub fn graded(
     let reasons: Reasons = (QUESTIONS.iter())
         .filter_map(|q| Some((q.id, yes(q.id)?)))
         .collect();
-    let mut steer = !reasons.is_empty();
+    let mut steer =
+        (reasons.iter()).any(|(id, _)| QUESTIONS.iter().any(|q| q.id == *id && q.mid_turn));
     let mut found = Vec::new();
     for (n, (sub, look)) in looks.iter().enumerate() {
         if let Some(p) = yes(&format!("look_{n}")) {
@@ -321,14 +369,14 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     let mut quoted = false;
     for item in items {
         let seen = &item.seen;
-        let mut todo: Vec<String> = Vec::new();
-        if !item.reasons.is_empty() {
-            todo.push("it cannot wait for your turn to end".to_owned());
-        }
+        let mut todo: Vec<String> = (item.reasons.iter())
+            .filter_map(|(id, _)| QUESTIONS.iter().find(|q| q.id == *id))
+            .map(|q| q.todo.to_owned())
+            .collect();
         // A subscription's own action is the subscriber's words, so the
         // note names it and the lead reads it there.
         for (look, _) in &item.looks {
-            let sub = format!("do what your {look} says (sonny lookout ls)");
+            let sub = format!("do what your {look} says (your subscriptions tool lists it)");
             if !todo.contains(&sub) {
                 todo.push(sub);
             }
@@ -559,7 +607,7 @@ impl Judge {
             })[..12]
         );
         let effort = self.effort.as_deref();
-        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS)
+        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS, &[])
             .await
             .map(Arc::new)
             .map_err(|e| failed(format!("the judge could not be made: {e}")))?;
@@ -874,6 +922,33 @@ async fn brief(client: &Client, task: &str, node: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
+/// What passed in a task, as the judge reads it: the person's words, and
+/// the first line of each reply.
+async fn exchange(client: &Client, task: &str, passed: &[Passed]) -> Vec<Value> {
+    let mut read = Vec::new();
+    for passed in passed {
+        let (from, text) = match *passed {
+            Passed::Person(node) => (
+                PERSON,
+                cut(&node_text(client, task, node).await, LINE_CHARS * 4),
+            ),
+            Passed::Reply { turn, checkpoint } => {
+                let reply = recent(client, task, 30, false, checkpoint)
+                    .await
+                    .into_iter()
+                    .find(|(t, item)| *t == Some(turn) && item["role"] == "assistant")
+                    .map(|(_, item)| first_line(&crate::text(&item)))
+                    .unwrap_or_default();
+                ("the task", cut(&reply, LINE_CHARS))
+            }
+        };
+        if !text.trim().is_empty() {
+            read.push(json!({"from": from, "text": text}));
+        }
+    }
+    read
+}
+
 /// How much of the lead's conversation a `+lead` judge reads: its last
 /// few items, each cut to its ends.
 const LEAD_ITEMS: usize = 12;
@@ -923,8 +998,10 @@ async fn latest(client: &Client, task: &str) -> String {
 /// the lead's own brief, which a client sent without saying so.
 async fn unattributed(client: &Client, seen: &Seen, text: &str) -> bool {
     // Only a brief the lead is known to have sent: with none, `brief`
-    // falls back to the task's first message, which may be this one.
+    // falls back to the task's first message, which may be this one, and
+    // the person's own brief is theirs to say again.
     seen.kind == Kind::Said
+        && seen.led
         && seen.brief.is_some()
         && seen.from.as_deref() == Some(PERSON)
         && !text.trim().is_empty()
@@ -955,9 +1032,17 @@ async fn check(
         return Err(Failure::Unasked);
     }
     let text = &seen.text;
-    let same: Vec<&str> = (questions.iter().map(|q| q.text.as_str()))
-        .chain(seen.asks.context.iter().map(String::as_str))
+    let mut same: Vec<String> = (questions.iter().map(|q| q.text.clone()))
+        .chain(seen.asks.context.iter().cloned())
         .collect();
+    // Whether words drift depends on what passed before them in that task:
+    // the same correction again, after another reply, is a check of its own.
+    if questions.iter().any(|q| q.id == "drifts") {
+        same.push(format!(
+            "{} {:?} {:?}",
+            seen.task, seen.brief, seen.exchange
+        ));
+    }
     let same = same.join("\n");
     if seen.kind == Kind::Said && repeated(recent, text, &same, Instant::now()) {
         return Err(Failure::Duplicate);
@@ -971,7 +1056,11 @@ async fn check(
             latest: latest(client, task).await,
         });
     }
-    let mut input = input(seen, &brief, &roster, memory);
+    let exchange = match questions.iter().any(|q| q.id == "drifts") {
+        true => exchange(client, &seen.task, &seen.exchange).await,
+        false => Vec::new(),
+    };
+    let mut input = input(seen, &brief, &exchange, &roster, memory);
     if judge.context {
         input["lead"] = json!(lead_words(client, at).await);
     }
@@ -991,27 +1080,11 @@ async fn check(
 }
 
 const USAGE: &str = "usage: sonny lookout [--store PATH] [--socket PATH] [--judge PROVIDER/MODEL|off]\n\
-       sonny lookout --replay --judge SPEC[,SPEC]... [--store PATH] [--socket PATH] [--limit N]\n\
-       sonny lookout ls|add|rm ... (sonny lookout ls --help)";
+       sonny lookout --replay --judge SPEC[,SPEC]... [--store PATH] [--socket PATH] [--limit N]";
 
-/// `sonny lookout`: one lookout for the store's daemon, a replay of its
-/// checks over what the store kept, or the subscriptions it watches for.
+/// `sonny lookout`: one lookout for the store's daemon, or a replay of its
+/// checks over what the store kept.
 pub fn run(args: &[String]) -> Result<(), String> {
-    if let Some((command, rest)) = args.split_first()
-        && matches!(command.as_str(), "ls" | "add" | "rm")
-    {
-        let mut store = None;
-        let mut kept = Vec::new();
-        let mut rest = rest.iter();
-        while let Some(arg) = rest.next() {
-            match arg.as_str() {
-                "--store" => store = Some(PathBuf::from(rest.next().ok_or(USAGE)?)),
-                _ => kept.push(arg.clone()),
-            }
-        }
-        let (store, _) = crate::daemon_paths(store, None)?;
-        return subs::run(&store, command, &kept);
-    }
     let (mut store, mut socket, mut judge, mut replaying, mut limit) =
         (None, None, None, false, 150);
     let mut args = args.iter();
@@ -1050,15 +1123,68 @@ pub struct Settings {
 /// says so and exits. Every check is logged beside the store, in
 /// `STORE.lookout.jsonl`.
 pub fn main(settings: Settings) -> Result<(), String> {
-    let Some(_held) = lock(&settings.store)? else {
+    let held = match lock(&settings.store)? {
+        Some(held) => Some(held),
+        None => replace(&settings.store)?,
+    };
+    let Some(_held) = held else {
         println!("{}", json!({"event": "already_watching"}));
         return Ok(());
     };
+    // Which Sonny this is, for the next one to start to tell.
+    let _ = std::fs::write(beside(&settings.store, ".lookout.sonny"), identity());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
         .block_on(serve(settings))
+}
+
+/// `store`'s path with `suffix` after it, for the files beside it.
+fn beside(store: &Path, suffix: &str) -> PathBuf {
+    let mut path = store.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// This Sonny, told apart from another build of it: its version and when
+/// its binary was written.
+fn identity() -> String {
+    let written = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |at| at.as_nanos());
+    format!("{} {written}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The lock, taken from a lookout another Sonny started, as one an upgrade
+/// left running, so the tools this Sonny gives its agents are answered:
+/// that lookout is stopped, and the lock awaited for a few seconds. `None`
+/// when the lookout holding it is this Sonny's own.
+fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
+    let theirs = std::fs::read_to_string(beside(store, ".lookout.sonny")).unwrap_or_default();
+    if theirs == identity() {
+        return Ok(None);
+    }
+    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok());
+    let Some(pid) = pid.filter(|pid| *pid > 0 && *pid != std::process::id() as i32) else {
+        return Ok(None);
+    };
+    // SAFETY: a signal to the process the lock file names, which asks it
+    // to exit.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until {
+        if let Some(held) = lock(store)? {
+            return Ok(Some(held));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(None)
 }
 
 /// The store's lookout lock, held while this process lives: `None` when
@@ -1116,11 +1242,22 @@ async fn serve(settings: Settings) -> Result<(), String> {
         "{}",
         json!({"event": "watching", "pid": std::process::id()})
     );
+    let served = crate::served::Server::start(service.store.clone(), service.socket.clone());
+    // Asked to give way, as by another build's lookout: what it still
+    // serves stops first, since that one serves it again.
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::spawn(async move {
+            term.recv().await;
+            crate::served::stop();
+            std::process::exit(0);
+        });
+    }
     let mut gone: Option<Instant> = None;
     loop {
         if let Ok((client, events)) = Client::connect(&service.socket).await {
             gone = None;
-            service.watch(client, events).await;
+            service.watch(client, events, &served).await;
         }
         // A daemon restarting is back within moments; one shut down is not,
         // and the client that starts the next daemon starts its lookout.
@@ -1220,7 +1357,12 @@ fn others(subscriber: &str, subscribers: &HashMap<String, Vec<subs::Sub>>) -> Ha
 }
 
 impl Service {
-    async fn watch(&mut self, client: Arc<Client>, mut events: agent_client::Events) {
+    async fn watch(
+        &mut self,
+        client: Arc<Client>,
+        mut events: agent_client::Events,
+        served: &crate::served::Server,
+    ) {
         // Judges are picked before the replay starts: a model listing can
         // take seconds, and a replay nobody reads fills the connection.
         let bots = all_bots(&client).await;
@@ -1245,6 +1387,8 @@ impl Service {
         for lookout in self.lookouts.values_mut() {
             // The replay's turns were news then; the live ones are now.
             lookout.updates.live = false;
+            // What passed in each task is read again from the replay.
+            lookout.exchanges.clear();
             for bot in &bots {
                 lookout.updates.seat(bot);
             }
@@ -1272,6 +1416,7 @@ impl Service {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { return };
+                    served.event(&event);
                     let cursor = event["cursor"].as_i64();
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
@@ -1362,8 +1507,9 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
-                    // What `sonny lookout add` and `rm` wrote since.
-                    if reread.is_none_or(|at| now >= at + REREAD) {
+                    // What `subscriptions` calls wrote since: at once for
+                    // one this lookout answered, else now and then.
+                    if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
                         if read != self.subscribers {
@@ -1806,6 +1952,10 @@ struct Lookout {
     told: VecDeque<(String, i64)>,
     /// The node of the lead's latest message to each task.
     briefs: HashMap<String, i64>,
+    /// The tasks whose brief the lead wrote, not the person.
+    led: HashSet<String>,
+    /// What passed in each task since the lead last wrote to it.
+    exchanges: HashMap<String, Vec<Passed>>,
     recent: Recent,
     /// Checks to start.
     due: Vec<Seen>,
@@ -1852,6 +2002,8 @@ impl Lookout {
             retried: HashSet::new(),
             told: VecDeque::new(),
             briefs: HashMap::new(),
+            led: HashSet::new(),
+            exchanges: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
             read: HashSet::new(),
@@ -1919,6 +2071,8 @@ impl Lookout {
                     }
                 }
                 self.briefs.remove(bot);
+                self.led.remove(bot);
+                self.exchanges.remove(bot);
             }
             _ => {}
         }
@@ -2044,6 +2198,7 @@ impl Lookout {
                 // A completed turn's reply is read from its checkpoint, not
                 // from wherever the task's history has moved on to.
                 let checkpoint = data["checkpoint"].as_i64();
+                let reply = Passed::Reply { turn, checkpoint };
                 // Ending after the lead read it, it has a reply the lead has
                 // not seen.
                 self.read.remove(&format!("turn:{bot}/{turn}"));
@@ -2054,6 +2209,7 @@ impl Lookout {
                     if self.waiting_any {
                         self.waiting_on.clear();
                     }
+                    self.passed(bot, reply);
                     return;
                 }
                 let mut status = match data["error"].as_str() {
@@ -2064,6 +2220,7 @@ impl Lookout {
                     status.push_str(&format!(", after {denied} calls denied by the approver"));
                 }
                 self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint);
+                self.passed(bot, reply);
             }
             _ => {}
         }
@@ -2106,12 +2263,24 @@ impl Lookout {
     fn briefed_by(&mut self, task: &str, from: &str, node: Option<i64>) {
         if let (PERSON, Some(node)) = (from, node) {
             self.briefs.insert(task.to_owned(), node);
+            self.led.remove(task);
+            self.passed(task, Passed::Person(node));
         }
     }
 
-    /// The lead wrote to the task.
+    /// The lead wrote to the task: what passes from now is a new exchange.
     fn briefed(&mut self, task: &str, node: i64) {
         self.briefs.insert(task.to_owned(), node);
+        self.led.insert(task.to_owned());
+        self.exchanges.remove(task);
+    }
+
+    fn passed(&mut self, task: &str, passed: Passed) {
+        let exchange = self.exchanges.entry(task.to_owned()).or_default();
+        exchange.push(passed);
+        if exchange.len() > EXCHANGE {
+            exchange.remove(0);
+        }
     }
 
     /// A check to start, with the briefs as they stand now.
@@ -2144,7 +2313,9 @@ impl Lookout {
             node,
             busy: self.updates.busy(),
             brief: self.briefs.get(task).copied(),
+            led: self.led.contains(task),
             peers,
+            exchange: self.exchanges.get(task).cloned().unwrap_or_default(),
             asks,
             text: String::new(),
         });
@@ -2772,7 +2943,9 @@ mod tests {
             node: None,
             busy: true,
             brief: None,
+            led: false,
             peers: Vec::new(),
+            exchange: Vec::new(),
             asks: Asks::default(),
             text: String::new(),
         }
@@ -2884,6 +3057,114 @@ mod tests {
             graded(&answers(&[("look_0", 0.6)]), &[look(true)]).0,
             Band::Drop
         );
+        // A drift waits for the lead to rest, unless it cannot wait too.
+        let (band, reasons, _) = graded(&answers(&[("interrupt", 0.2), ("drifts", 0.8)]), &[]);
+        assert_eq!(
+            (band, reasons),
+            (Band::Wake { steer: false }, vec![("drifts", 0.8)])
+        );
+        assert_eq!(
+            graded(&answers(&[("interrupt", 0.9), ("drifts", 0.8)]), &[]).0,
+            Band::Wake { steer: true }
+        );
+    }
+
+    #[test]
+    fn a_check_reads_the_back_and_forth_since_the_lead_wrote() {
+        let mut lookout = lookout();
+        let lead = json!({"bot": "calc.lead", "turn": 1});
+        let done = json!({"status": "completed", "checkpoint": 51});
+        lookout.event(&ev(
+            "calc.fix",
+            2,
+            "accepted",
+            json!({"from": lead, "node": 50}),
+        ));
+        lookout.event(&ev("calc.fix", 2, "turn_finished", done));
+        lookout.event(&ev("calc.fix", 3, "accepted", json!({"node": 52})));
+        // The person's words are checked against what passed before them,
+        // whether the lead rests or not.
+        let said = lookout.due.last().unwrap();
+        assert!(!said.busy);
+        assert_eq!(
+            (said.kind, said.brief, said.led),
+            (Kind::Said, Some(50), true)
+        );
+        assert_eq!(
+            said.exchange,
+            [Passed::Reply {
+                turn: 2,
+                checkpoint: Some(51)
+            }]
+        );
+        let ids = |seen: &Seen| {
+            questions(seen)
+                .into_iter()
+                .map(|q| q.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(said), ["drifts"]);
+        lookout.event(&ev(
+            "calc.fix",
+            3,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        let ended = lookout.due.last().unwrap();
+        // The person's words are the brief now, and theirs to say again.
+        assert_eq!((ended.brief, ended.led), (Some(52), false));
+        assert_eq!(ended.exchange.len(), 2);
+        assert_eq!(ended.exchange[1], Passed::Person(52));
+        assert_eq!(ids(ended), ["drifts"]);
+        // Another task's words are not the person's to drift from.
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "accepted",
+            json!({"from": {"bot": "calc.docs", "turn": 1}, "node": 53}),
+        ));
+        assert!(ids(lookout.due.last().unwrap()).is_empty());
+        // Only the last few are read.
+        for turn in 5..12 {
+            lookout.event(&ev(
+                "calc.fix",
+                turn,
+                "accepted",
+                json!({"node": 60 + turn}),
+            ));
+        }
+        assert_eq!(lookout.exchanges["calc.fix"].len(), EXCHANGE);
+        // The lead writing again starts a new exchange.
+        lookout.event(&ev(
+            "calc.fix",
+            12,
+            "accepted",
+            json!({"from": lead, "node": 80}),
+        ));
+        assert!(!lookout.exchanges.contains_key("calc.fix"));
+        // A task only programs wrote in has nothing of the person's to
+        // drift from.
+        lookout.lineage.insert("calc.docs".to_owned());
+        let program = json!({"origin": "tasks", "node": 90});
+        lookout.event(&ev("calc.docs", 1, "accepted", program));
+        lookout.event(&ev(
+            "calc.docs",
+            1,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        lookout.event(&ev(
+            "calc.docs",
+            2,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        let ended = lookout.due.last().unwrap();
+        assert_eq!(
+            (ended.task.as_str(), ended.exchange.len()),
+            ("calc.docs", 1)
+        );
+        assert!(ids(ended).is_empty());
     }
 
     #[test]
@@ -2900,7 +3181,8 @@ mod tests {
                 latest: "y".repeat(LINE_CHARS * 2),
             })
             .collect();
-        let input = input(&seen, "brief", &peers, "- a saved fact");
+        let exchange = [json!({"from": "the person", "text": "no, the other one"})];
+        let input = input(&seen, "brief", &exchange, &peers, "- a saved fact");
         let text = input["event"]["text"].as_str().unwrap();
         assert!(text.chars().count() < EVENT_CHARS + 64);
         assert!(text.contains("characters left out"));
@@ -2909,6 +3191,12 @@ mod tests {
         assert_eq!(input["tasks"].as_array().unwrap().len(), ROSTER);
         assert_eq!(input["tasks"][0]["brief"], "Brief 0");
         assert_eq!(input["memory"], "- a saved fact");
+        assert_eq!(input["exchange"][0]["text"], "no, the other one");
+        assert!(
+            super::input(&seen, "brief", &[], &peers, "")
+                .get("exchange")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2926,7 +3214,10 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], input.to_string());
         assert_eq!(
             body["questions"],
-            json!([{"type": "predicate", "name": "interrupt", "instructions": QUESTIONS[0].text}])
+            json!([
+                {"type": "predicate", "name": "interrupt", "instructions": QUESTIONS[0].text},
+                {"type": "predicate", "name": "drifts", "instructions": QUESTIONS[1].text},
+            ])
         );
     }
 
@@ -2958,7 +3249,7 @@ mod tests {
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs: turn:calc.docs/3, the person wrote in it (style look-for 1 0.97; do what your style look-for 1 says (sonny lookout ls)): \"Use tabs everywhere. Thanks.\""
+            "- calc.docs: turn:calc.docs/3, the person wrote in it (style look-for 1 0.97; do what your style look-for 1 says (your subscriptions tool lists it)): \"Use tabs everywhere. Thanks.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
         assert!(note.ends_with("Handle what cannot wait, then carry on with your turn."));
@@ -3041,6 +3332,28 @@ mod tests {
              Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. \
              Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
         );
+        // A drift is picked with what to do about it, for a lead at rest,
+        // and the line that told the same words goes.
+        let drifting = Item {
+            seen: Seen {
+                from: Some(PERSON.into()),
+                text: "no, tabs".into(),
+                busy: false,
+                ..seen("calc.fix", 13, Kind::Said)
+            },
+            reasons: vec![("drifts", 0.8)],
+            looks: Vec::new(),
+            band: Band::Wake { steer: false },
+        };
+        let mut told = updates::Told::default();
+        told.items = vec![line("calc.fix", 13, false, true)];
+        let text = note(&[drifting], 0, &told);
+        assert!(text.contains(
+            "Picked by your lookout:\n\
+             - calc.fix: turn:calc.fix/13, the person wrote in it (drifts 0.80; settle what the person means and steer the task with that reading): \"no, tabs\"\n\
+             A quoted message is the person's own words.\n\
+             Read the turns you need"
+        ), "{text}");
     }
 
     #[test]
@@ -3176,7 +3489,7 @@ mod tests {
         let note = note(&[item], 0, &updates::Told::default());
         // The subscriber's own words stay in its file, never in the note.
         assert!(note.contains(
-            "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 1 0.90; do what your deploys look-for 1 says (sonny lookout ls))"
+            "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 1 0.90; do what your deploys look-for 1 says (your subscriptions tool lists it))"
         ), "{note}");
         assert!(!note.contains("tell me") && !note.contains("a deploy"));
     }
@@ -3253,10 +3566,10 @@ mod tests {
             .map(|q| q.id)
             .collect();
         assert_eq!(ids, ["look_0"]);
-        // The lead's tasks keep the built-in.
+        // The lead's tasks keep the built-ins.
         let asks = lookout.asks_for("calc.fix", Kind::Ended).unwrap();
         assert_eq!(asks.subs, ["tasks"]);
-        assert_eq!(asks.builtins.unwrap(), ["interrupt"]);
+        assert_eq!(asks.builtins.unwrap(), ["interrupt", "drifts"]);
     }
 
     #[test]

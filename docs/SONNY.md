@@ -19,8 +19,16 @@ happens a trigger costs its plist and launchd's watch, and no model call.
 A lead hears of its tasks' turns from Sonny's task updates and lookout, not
 from triggers.
 
-Sonny writes `~/.agent/trigger` each time it starts, a script that runs it
-as `sonny trigger`:
+Sonny's agents add and change triggers with the `triggers` tool, which
+Sonny's lookout answers outside the agent's sandbox, since a trigger is a
+LaunchAgent: `add` (the fields below, as `every`, `cron`, `start {name,
+model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
+and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
+It waits for a verdict wherever the agent's other calls do (`/approvals`),
+since a trigger runs as the person and its `if` command outside any
+sandbox. For people, scripts and other harnesses, Sonny writes
+`~/.agent/trigger` each time it starts, a script that runs it as
+`sonny trigger`:
 
 ```sh
 ~/.agent/trigger add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] -- MESSAGE
@@ -247,7 +255,13 @@ it). Each folder's `MEMORY.md` is an index generated from the front matter,
 one line per fact, and is held to 4 KiB so reading it at the start of
 every task stays cheap. The daemon knows nothing of memory.
 
-Sonny writes `~/.agent/memory` each time it starts, a script that runs it as
+Sonny's agents read and save memory with the `memory` tool, which Sonny's
+lookout answers outside the agent's sandbox, so a sandboxed agent still
+saves to `~/.agents/memory`: `save {name, type, description, source,
+text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
+or `project`, or nothing to show both indexes. It waits for no verdict.
+For people, scripts and other harnesses, Sonny writes `~/.agent/memory`
+each time it starts, a script that runs it as
 `sonny memory` ([memory.rs](../client/src/memory.rs), in agent-client):
 
 ```sh
