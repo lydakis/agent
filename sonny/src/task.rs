@@ -102,7 +102,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
         flags.extend(["--effort".to_owned(), effort]);
     }
-    let place = if info["threads_in"] == "project" {
+    let mut place = if info["threads_in"] == "project" {
         in_place(here)
     } else {
         match crate::settings::Settings::load().copies.as_str() {
@@ -148,6 +148,20 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
                 return failed(&place, false, error);
             }
             Err(e) => return failed(&place, false, format!("{}: {e}", script.display())),
+        }
+    }
+    // A new worktree takes clones of the lead's build folders only once
+    // setup has run: setup runs outside any sandbox and must not run what
+    // the lead's folders hold.
+    if let (Undo::Worktree { path, .. }, Some((top, _))) = (&place.undo, &place.copy) {
+        let seeded = crate::seed::seed(top, path);
+        // Named so the person knows why the first build is quicker.
+        if let (false, Some(note)) = (seeded.is_empty(), place.note.as_mut()) {
+            let folders: Vec<_> = seeded.iter().map(|f| f.to_string_lossy()).collect();
+            note.push_str(&format!(
+                "; it starts with copy-on-write clones of {}",
+                folders.join(", ")
+            ));
         }
     }
     let lead = (
@@ -550,7 +564,6 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     let prefix = git(here, &["rev-parse", "--show-prefix"])?;
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let branch = format!("agent/{name}");
-    let mut seeded = Vec::new();
     let undo = if path.exists() {
         // Left by a task of this name before: its own only if it is a
         // worktree of this repository on the task's branch.
@@ -567,31 +580,18 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
             here,
             &["worktree", "add", "-q", "-b", &branch, &target, "HEAD"],
         )?;
-        seeded = crate::seed::seed(&top, &path);
         Undo::Worktree {
             here: here.to_owned(),
             path: path.clone(),
             branch: branch.clone(),
         }
     };
-    // Named so the person knows why the first build is quicker.
-    let cloned = match seeded.is_empty() {
-        true => String::new(),
-        false => format!(
-            "; it starts with copy-on-write clones of {}",
-            seeded
-                .iter()
-                .map(|folder| folder.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
     Ok(Place {
         dir: within(&path, Path::new(prefix.trim_end_matches('/'))),
         note: Some(format!(
             "{name}: a worktree at {} on branch {branch}, from the last commit (uncommitted \
              changes here are not in it); its commits are on {branch} here as it makes \
-             them{cloned}",
+             them",
             shell_quote(&path)
         )),
         undo,
