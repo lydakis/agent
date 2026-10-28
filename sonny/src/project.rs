@@ -131,6 +131,9 @@ fn start_rule(sonny: &str) -> String {
          or brought here with the git push it names for a sandfs copy of a git repository; \
          for a sandfs copy of any other folder, {sonny} task changes NAME lists what the task changed, \
          and once you have checked that, {sonny} task changes NAME --apply writes it here. \
+         A task works in its own folder only, and each file has one writer: Sonny turns paths in this folder named in the brief into the task's, \
+         and never copy a task's files into this folder yourself (cp, a redirect, tee), which can write zeros over the files there; \
+         take its work back only as above. \
          A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
     ))
 }
@@ -652,6 +655,7 @@ mod tests {
             "leave out --setup for a task that only reads",
             "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
             "\"/opt/sonny\" task changes NAME --apply writes it here",
+            "never copy a task's files into this folder yourself",
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }
