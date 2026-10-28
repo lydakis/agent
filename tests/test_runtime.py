@@ -159,7 +159,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if ((user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1)
+            if ((user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:', 'busy:')) and attempt == 1)
                     or (user.startswith('outage:') and attempt <= int(user.split(':')[1]))
                     or user.startswith('limited-forever:') or (user == 'tool:limited' and attempt == 2)):
                 # Transport-level refusals: a 503 or a CDN's 520 the next
@@ -167,10 +167,13 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # the call after the tool), or a 429 that never lifts.
                 body = json.dumps({'error': {'message': 'try later'}}).encode()
                 self.send_response(520 if user.startswith('origin:') else
-                                   503 if user.startswith(('flaky:', 'waitretry:', 'outage:')) else 429)
+                                   503 if user.startswith(('flaky:', 'waitretry:', 'outage:', 'busy:')) else 429)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
-                if not user.startswith(('flaky:', 'origin:', 'waitretry:', 'outage:')):
+                if user.startswith('busy:'):
+                    # A 503 that says when to come back.
+                    self.send_header('Retry-After', '0.7')
+                elif not user.startswith(('flaky:', 'origin:', 'waitretry:', 'outage:')):
                     delays = getattr(self.server, 'retry_delays', ['0.05'])
                     self.send_header('Retry-After', delays[min(attempt - 1, len(delays) - 1)])
                 self.end_headers()
@@ -2175,6 +2178,15 @@ class RuntimeTests(ModelFixture):
         client.finished(fresh['turn'])
         self.assertEqual(client.request('submit', bot='Gone', request_id='r7', bot_id=bob['bot_id'], prompt='hello')['error'],
                          'bot_not_found')
+
+    def test_a_server_error_retries_after_the_wait_its_response_names(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='r1', prompt='busy:1')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
+        # Its Retry-After, not the 250 ms backoff, as the providers' SDKs take it.
+        self.assertEqual([(r['error'], r['delay_ms']) for r in retried], [('provider_http_503', 700)])
 
     def test_transient_failures_are_retried_and_rate_limits_pace_the_pool(self):
         client = self.client()

@@ -890,15 +890,18 @@ impl Provider {
                 refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
-            return Err(Error {
-                code: if quota {
-                    "provider_quota_exhausted".to_owned()
-                } else {
-                    format!("provider_http_{status}")
+            return Err(waits(
+                Error {
+                    code: if quota {
+                        "provider_quota_exhausted".to_owned()
+                    } else {
+                        format!("provider_http_{status}")
+                    },
+                    detail: body.detail,
+                    facts: None,
                 },
-                detail: body.detail,
-                facts: None,
-            });
+                &headers,
+            ));
         }
         reservation.learn(response.headers(), self.family);
         // The answer is a message with no content; only its usage matters.
@@ -1144,11 +1147,14 @@ impl Provider {
             } else {
                 format!("provider_http_{status}")
             };
-            return Err(Error {
-                code,
-                detail: body.detail,
-                facts: None,
-            });
+            return Err(waits(
+                Error {
+                    code,
+                    detail: body.detail,
+                    facts: None,
+                },
+                &headers,
+            ));
         }
         reservation.learn(response.headers(), self.family);
         if self.family == Family::Responses
@@ -1529,6 +1535,16 @@ pub fn paced(code: &str) -> bool {
         code,
         "provider_rate_limited" | "provider_overloaded" | "provider_http_429" | "provider_http_529"
     )
+}
+
+/// A refusal with the wait its response asks for, as the fact
+/// `retry_after_ms`, so a retry of a server error can honour it as the
+/// providers' SDKs do.
+pub(crate) fn waits(error: Error, headers: &reqwest::header::HeaderMap) -> Error {
+    match retry_after(headers) {
+        Some(after) => error.facts(json!({"retry_after_ms": after.as_millis() as u64})),
+        None => error,
+    }
 }
 
 /// Whether a paced refusal is an overload rather than a rate limit.

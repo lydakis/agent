@@ -2982,7 +2982,7 @@ impl Turn {
                 None if error.code == "provider_stream_stalled" => {
                     backoff(attempt + STALL_START, turn as u64)
                 }
-                None => backoff(attempt, turn as u64),
+                None => asked(&error).unwrap_or_else(|| backoff(attempt, turn as u64)),
             };
             // A backoff of a second or more parks too: an outage's retries
             // are not this turn's to sleep through with a live task and an
@@ -4160,6 +4160,13 @@ fn retryable(code: &str) -> bool {
 /// A stream that stalled on this request stalls again when resent at once
 /// with the same context: its retries start at 2 s.
 const STALL_START: u32 = 3;
+
+/// The wait a server error's response asked for, when it is one a retry
+/// takes: up to a minute, as the OpenAI and Anthropic SDKs take it.
+fn asked(error: &Error) -> Option<std::time::Duration> {
+    let ms = error.facts.as_ref()?.get("retry_after_ms")?.as_u64()?;
+    (ms <= 60_000).then(|| std::time::Duration::from_millis(ms))
+}
 
 /// Retry backoffs at least this long park the turn instead of sleeping in it.
 const BACKOFF_PARK: std::time::Duration = std::time::Duration::from_secs(1);
