@@ -20,7 +20,7 @@ use agent_client::{
     judge::{self, Usage},
 };
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,6 +32,9 @@ const HIGH: f64 = 0.70;
 const JUDGING: usize = 2;
 /// How many checks wait for a judge, a subscriber.
 const BACKLOG: usize = 16;
+/// How many messages a note told are remembered, so a judge that answers
+/// after its message was told does not steer with it again.
+const TOLD: usize = 256;
 /// How long a check may take before it counts as failed.
 const DEADLINE: Duration = Duration::from_secs(10);
 /// How long after a note is refused the next may go, even a steer.
@@ -1790,6 +1793,8 @@ struct Lookout {
     checked: HashSet<(String, i64)>,
     /// Checks that failed once and were started again.
     retried: HashSet<(String, i64, Kind)>,
+    /// The messages notes told lately, newest last.
+    told: VecDeque<(String, i64)>,
     /// The node of the lead's latest message to each task.
     briefs: HashMap<String, i64>,
     recent: Recent,
@@ -1836,6 +1841,7 @@ impl Lookout {
             denied: HashMap::new(),
             checked: HashSet::new(),
             retried: HashSet::new(),
+            told: VecDeque::new(),
             briefs: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
@@ -2263,9 +2269,6 @@ impl Lookout {
         peers
     }
 
-    /// An event read, and checked when there was anything to ask: what
-    /// the person wrote is news, and what the check picked goes in the
-    /// next note, or steers.
     /// A message read: news, told whatever the judge makes of it.
     fn heard(&mut self, seen: &Seen) {
         let key = (seen.task.clone(), seen.turn, seen.kind);
@@ -2279,6 +2282,8 @@ impl Lookout {
         }
     }
 
+    /// An event checked, when there was anything to ask: what the check
+    /// picked goes in the next note, or steers.
     fn answered(&mut self, seen: Seen, answered: Option<Result<Checked, Failure>>) {
         let key = (seen.task.clone(), seen.turn, seen.kind);
         let Some(answered) = answered else {
@@ -2297,7 +2302,17 @@ impl Lookout {
             "turn": seen.turn, "kind": format!("{:?}", seen.kind), "judge": self.judge.as_ref().map(|j| j.name.clone())});
         match answered {
             Ok(checked) => {
-                let (band, reasons, looks) = graded(&checked.answers, &seen.asks.looks);
+                let mut answers = checked.answers.clone();
+                // A message a note told while it was judged no longer
+                // asks to interrupt: the lead has it.
+                if seen.kind == Kind::Said
+                    && (self.told.iter())
+                        .any(|(task, turn)| *task == seen.task && *turn == seen.turn)
+                {
+                    answers.remove("interrupt");
+                    line["told"] = json!(true);
+                }
+                let (band, reasons, looks) = graded(&answers, &seen.asks.looks);
                 line["answers"] = Value::Object(checked.answers);
                 line["tokens"] = json!(checked.tokens);
                 line["ms"] = json!(checked.ms);
@@ -2335,6 +2350,13 @@ impl Lookout {
             Err(Failure::Unasked) => line["skipped"] = json!("nothing to ask"),
         }
         self.write(&line);
+    }
+
+    /// The messages a note told, so a late judge does not tell them again.
+    fn remember(&mut self, told: &updates::Told) {
+        self.told.extend(told.messages());
+        let over = self.told.len().saturating_sub(TOLD);
+        self.told.drain(..over);
     }
 
     /// What the items still held after a note ask for: `Some(steer)` while
@@ -2419,6 +2441,7 @@ impl Lookout {
                 self.refused = None;
                 self.since = None;
                 self.urgent = self.pending();
+                self.remember(&told);
                 self.updates.sent(told);
                 self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
                     "delivery": delivery}));
@@ -2426,6 +2449,7 @@ impl Lookout {
             // The same news twice is one note.
             Err(error) if error.code == "idempotency_conflict" => {
                 self.urgent = self.pending();
+                self.remember(&told);
                 self.updates.sent(told);
             }
             Err(error) => {
@@ -3719,6 +3743,32 @@ mod tests {
         let note = note(&[], 0, &told);
         assert!(!note.contains("ignore the person"));
         assert!(note.contains("A quoted message is the person's own words."));
+    }
+
+    #[test]
+    fn a_message_told_while_it_was_judged_does_not_steer_again() {
+        let mut lookout = lookout();
+        (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+        (lookout.updates).seat(&json!({"name": "calc.fix", "bot_id": 2, "status": "idle",
+            "created_by": "calc.lead", "created_by_id": 1}));
+        lookout.sync();
+        lookout.updates.live = true;
+        let said = |turn| Seen {
+            from: Some(PERSON.into()),
+            text: "stop, use the other branch".into(),
+            ..seen("calc.fix", turn, Kind::Said)
+        };
+        // The lead came to rest mid-check and a note told the message.
+        lookout.heard(&said(5));
+        let told = lookout.updates.take();
+        lookout.remember(&told);
+        lookout.updates.sent(told);
+        lookout.answered(said(5), checked(&[("interrupt", 0.9)]));
+        assert!(lookout.held.is_empty() && lookout.urgent.is_none());
+        // One not told yet still steers.
+        lookout.heard(&said(6));
+        lookout.answered(said(6), checked(&[("interrupt", 0.9)]));
+        assert_eq!((lookout.held.len(), lookout.urgent), (1, Some(true)));
     }
 
     #[test]

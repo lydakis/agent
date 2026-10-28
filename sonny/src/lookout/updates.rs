@@ -127,6 +127,14 @@ pub struct Told {
     seen: Option<HashMap<String, u64>>,
 }
 
+impl Told {
+    /// Each message it tells of: its task and turn.
+    pub fn messages(&self) -> impl Iterator<Item = (String, i64)> + '_ {
+        (self.sent.iter())
+            .flat_map(|(task, news)| news.said.iter().map(|said| (task.clone(), said.turn)))
+    }
+}
+
 pub struct Line {
     pub handle: String,
     /// Words written in the task, not how a turn ended.
