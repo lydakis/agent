@@ -25,8 +25,12 @@ use files::read_bounded;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
-/// Retained full output per stream; more than this fails the tool.
+/// Retained output per stream. Past this a stream keeps its first and last
+/// `KEPT_END` bytes and the command runs on.
 pub const ARTIFACT_BYTES: usize = 1024 * 1024;
+/// Each end kept of a stream past `ARTIFACT_BYTES`, leaving room for the
+/// marker that counts the dropped middle.
+const KEPT_END: usize = (ARTIFACT_BYTES - 256) / 2;
 /// The carry-forward note a bot may keep ahead of its window.
 pub const NOTE_BYTES: usize = 8192;
 const FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -84,14 +88,14 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"}},
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers (an image or other binary file is refused, naming its kind): a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -118,7 +122,7 @@ impl Tool {
                 "required":["text"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
@@ -277,6 +281,28 @@ pub struct Registry {
     encodings: Encodings,
 }
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
+/// What a file that is not text holds, named by its first bytes, as `file`
+/// would: a NUL in its first 8 KiB marks one as binary, as git decides.
+fn binary(bytes: &[u8]) -> Option<&'static str> {
+    const KINDS: [(&[u8], &str); 6] = [
+        (b"\x89PNG", "a PNG image"),
+        (b"\xff\xd8\xff", "a JPEG image"),
+        (b"GIF8", "a GIF image"),
+        (b"%PDF", "a PDF"),
+        (b"PK\x03\x04", "a zip archive"),
+        (b"\x7fELF", "an executable"),
+    ];
+    if let Some((_, kind)) = KINDS.iter().find(|(magic, _)| bytes.starts_with(magic)) {
+        return Some(kind);
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("a WebP image");
+    }
+    bytes[..bytes.len().min(8192)]
+        .contains(&0)
+        .then_some("a binary file")
+}
+
 /// A background command's admission: a slot taken at once when one was
 /// free, otherwise a counted place in line released when it gets a slot
 /// or is dropped before starting.
@@ -1019,6 +1045,12 @@ impl Registry {
                 limit,
             } => {
                 let bytes = read_bounded(&resolve(workspace, &path)).await?;
+                if let Some(kind) = binary(&bytes) {
+                    return fail_with(
+                        "file_not_text",
+                        format!("{kind} of {} bytes; read returns text", bytes.len()),
+                    );
+                }
                 let text = String::from_utf8_lossy(&bytes);
                 Ok(Outcome::text(
                     self.redact(page_lines(&text, offset, limit)?),
@@ -1079,9 +1111,10 @@ impl Registry {
 }
 
 impl Registry {
-    fn shell_outcome(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit: Exit) -> Outcome {
+    fn shell_outcome(&self, stdout: Captured, stderr: Captured, exit: Exit) -> Outcome {
         let mut artifacts = Vec::new();
-        let mut preview = |name: &'static str, bytes: Vec<u8>| {
+        let mut preview = |name: &'static str, captured: Captured| {
+            let (bytes, dropped) = captured.finish();
             // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
             // bytes still get the same lossy decoding as before.
             let text = String::from_utf8(bytes)
@@ -1090,7 +1123,7 @@ impl Registry {
             if text.len() <= PREVIEW_BYTES {
                 return text;
             }
-            let shown = truncate(&text);
+            let shown = truncate(&text, dropped);
             // read_to_end may have reserved beyond the output length.
             // Do not retain that spare capacity while storage catches up.
             text.shrink_to_fit();
@@ -1312,26 +1345,93 @@ fn boundary(text: &str, mut index: usize) -> usize {
 }
 
 /// Head and tail of an oversized output, with the omission stated.
-fn truncate(text: &str) -> String {
+/// `dropped` counts the bytes the retained text itself left out.
+fn truncate(text: &str, dropped: u64) -> String {
     let half = PREVIEW_BYTES / 2;
     let head = &text[..boundary(text, half)];
     let tail_start = boundary(text, text.len() - half);
     let omitted = text.len() - head.len() - (text.len() - tail_start);
+    let retained = if dropped == 0 {
+        "the full output is retained".to_owned()
+    } else {
+        format!(
+            "{dropped} more past 1 MiB were not kept, and its first and last {KEPT_END} bytes are retained"
+        )
+    };
     format!(
-        "{head}\n[... {omitted} bytes omitted; the full output is retained: see this result's artifacts and read them with the read tool ...]\n{}",
+        "{head}\n[... {omitted} bytes omitted; {retained}: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
     )
 }
 
-/// Append a pipe's output to `bytes`, which keeps what arrived if the read
-/// is cancelled, as it is at a shell timeout.
-async fn bounded_read(pipe: &mut (impl AsyncRead + Unpin), bytes: &mut Vec<u8>) -> Result<()> {
-    let room = (ARTIFACT_BYTES + 1).saturating_sub(bytes.len());
-    pipe.take(room as u64).read_to_end(bytes).await?;
-    if bytes.len() > ARTIFACT_BYTES {
-        return fail("shell_output_limit");
+/// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
+/// that its first and last `KEPT_END` bytes and a count of the rest.
+#[derive(Default)]
+struct Captured {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+}
+impl Captured {
+    /// Output past the head. Once the whole would pass the bound, the tail
+    /// keeps only its last `KEPT_END` bytes.
+    fn keep(&mut self, bytes: &[u8]) {
+        self.tail.extend(bytes);
+        if self.head.len() + self.tail.len() > ARTIFACT_BYTES {
+            let cut = self.tail.len() - KEPT_END;
+            self.tail.drain(..cut);
+            self.dropped += cut as u64;
+        }
     }
-    Ok(())
+    /// The kept bytes, with a marker where the middle was dropped, and how
+    /// many bytes that was.
+    fn finish(self) -> (Vec<u8>, u64) {
+        let Captured {
+            mut head,
+            mut tail,
+            mut dropped,
+        } = self;
+        // Output after the last trim can leave a dropped tail long, short of
+        // the room the marker needs.
+        if dropped > 0 && tail.len() > KEPT_END {
+            let cut = tail.len() - KEPT_END;
+            tail.drain(..cut);
+            dropped += cut as u64;
+        }
+        if dropped > 0 {
+            head.extend_from_slice(
+                format!(
+                    "\n[... {dropped} bytes dropped: past 1 MiB only the first and last {KEPT_END} bytes of this stream are kept ...]\n"
+                )
+                .as_bytes(),
+            );
+        }
+        head.extend(tail);
+        (head, dropped)
+    }
+}
+
+/// Append a pipe's output to `captured` until it closes. What arrived stays
+/// there if the read is cancelled, as it is at a shell timeout.
+async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -> Result<()> {
+    let room = KEPT_END.saturating_sub(captured.head.len());
+    if room > 0 {
+        (&mut *pipe)
+            .take(room as u64)
+            .read_to_end(&mut captured.head)
+            .await?;
+        if captured.head.len() < KEPT_END {
+            return Ok(());
+        }
+    }
+    let mut chunk = vec![0; 64 * 1024];
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        captured.keep(&chunk[..read]);
+    }
 }
 
 /// How a shell command ended: on its own, or killed at its timeout.
@@ -1463,7 +1563,7 @@ async fn shell(
     timeout: Duration,
     registry: &Registry,
     environment: &[(String, String)],
-) -> Result<(Vec<u8>, Vec<u8>, Exit)> {
+) -> Result<(Captured, Captured, Exit)> {
     use std::process::Stdio;
     use tokio::process::Child;
     struct ProcessGroup {
@@ -1501,16 +1601,16 @@ async fn shell(
         .stderr
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
-    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (mut out, mut err) = (Captured::default(), Captured::default());
     let result = tokio::time::timeout(timeout, async {
         tokio::try_join!(
-            bounded_read(&mut stdout, &mut out),
-            bounded_read(&mut stderr, &mut err),
+            capture(&mut stdout, &mut out),
+            capture(&mut stderr, &mut err),
             async { owned.child.wait().await.map_err(Error::from) }
         )
     })
     .await;
-    // Finish cleanup before returning a timeout/overflow. Drop also covers
+    // Finish cleanup before returning a timeout. Drop also covers
     // cancellation, with Tokio responsible for reaping its killed child.
     // SAFETY: kill takes no pointers; the group is this command's own.
     unsafe {
@@ -1523,11 +1623,11 @@ async fn shell(
         Err(_) => {
             // What the group wrote before it was killed is still in the pipes.
             // A process that left the group may hold them open, so the drain
-            // is bounded too. Overflowing the output limit still fails the tool.
+            // is bounded too.
             if let Ok(Err(error)) = tokio::time::timeout(Duration::from_millis(100), async {
                 tokio::try_join!(
-                    bounded_read(&mut stdout, &mut out),
-                    bounded_read(&mut stderr, &mut err)
+                    capture(&mut stdout, &mut out),
+                    capture(&mut stderr, &mut err)
                 )
             })
             .await
@@ -1546,7 +1646,7 @@ async fn shell(
     _: Duration,
     _: &Registry,
     _: &[(String, String)],
-) -> Result<(Vec<u8>, Vec<u8>, Exit)> {
+) -> Result<(Captured, Captured, Exit)> {
     fail("shell_platform_unsupported")
 }
 
@@ -1554,17 +1654,63 @@ async fn shell(
 mod tests {
     use super::*;
     #[test]
+    fn binary_files_are_named_and_text_passes() {
+        assert_eq!(binary(b"\x89PNG\r\n\x1a\n\0\0"), Some("a PNG image"));
+        assert_eq!(binary(b"RIFF\0\0\0\0WEBPVP8 "), Some("a WebP image"));
+        assert_eq!(binary(b"data\0more"), Some("a binary file"));
+        assert_eq!(binary("caf\u{e9}\n".as_bytes()), None);
+        assert_eq!(binary(b""), None);
+    }
+    #[tokio::test]
+    async fn read_refuses_an_image_by_its_kind() {
+        let dir = std::env::temp_dir().join(format!("agent-read-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\nIHDR").unwrap();
+        let registry = Registry::new("read").unwrap();
+        let prepared = registry.prepare("read", r#"{"path":"shot.png"}"#).unwrap();
+        let error = registry.execute(prepared, &dir, &[]).await.unwrap_err();
+        assert_eq!(error.code, "file_not_text");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("a PNG image of 12 bytes; read returns text")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn oversized_output_keeps_head_and_tail_on_char_boundaries() {
         let text = format!(
             "{}é{}",
             "a".repeat(PREVIEW_BYTES),
             "z".repeat(PREVIEW_BYTES)
         );
-        let shown = truncate(&text);
+        let shown = truncate(&text, 0);
         assert!(shown.starts_with("aaaa"));
         assert!(shown.ends_with("zzzz"));
-        assert!(shown.contains("bytes omitted"));
+        assert!(shown.contains("bytes omitted; the full output is retained"));
         assert!(shown.len() < text.len());
+        assert!(truncate(&text, 9).contains("9 more past 1 MiB were not kept"));
+    }
+    #[test]
+    fn captured_output_keeps_both_ends_past_the_bound() {
+        let mut whole = Captured::default();
+        whole.head.extend(vec![b'h'; KEPT_END]);
+        whole.keep(&vec![b't'; ARTIFACT_BYTES - KEPT_END]);
+        let (bytes, dropped) = whole.finish();
+        assert_eq!((bytes.len(), dropped), (ARTIFACT_BYTES, 0));
+
+        let mut over = Captured::default();
+        over.head.extend(vec![b'h'; KEPT_END]);
+        for _ in 0..40 {
+            over.keep(&vec![b'm'; 64 * 1024]);
+        }
+        over.keep(b"end");
+        let (bytes, dropped) = over.finish();
+        assert_eq!(dropped, (40 * 64 * 1024 + 3 - KEPT_END) as u64);
+        assert!(bytes.len() <= ARTIFACT_BYTES);
+        assert!(bytes.starts_with(b"hhhh"));
+        assert!(bytes.ends_with(b"mmmend"));
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(&format!("[... {dropped} bytes dropped")));
     }
     #[test]
     fn registries_reject_unknown_and_duplicate_tools() {

@@ -416,7 +416,8 @@ pub fn for_agent(
 /// machine's multiplexer CLI and Sonny.
 pub fn install_skill(host: Option<&str>) {
     crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
-    let Some(sonny) = std::env::current_exe().ok() else {
+    // By the path that outlives an upgrade, as the other scripts name it.
+    let Some(sonny) = crate::skills::sonny_path() else {
         return;
     };
     let quoted = |path: &Path| format!("\"{}\"", path.to_string_lossy());

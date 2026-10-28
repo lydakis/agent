@@ -88,11 +88,15 @@ class SocketClient:
             start_new_session=True, env=clean_env())
         try:
             deadline = time.monotonic() + 5
-            while not self.socket_path.exists():
-                if self.process.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError('daemon startup failed')
-                time.sleep(.01)
-            self.control = Connection(self.socket_path)
+            while True:
+                # The path appears at bind, a moment before the daemon listens.
+                try:
+                    self.control = Connection(self.socket_path)
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    if self.process.poll() is not None or time.monotonic() > deadline:
+                        raise RuntimeError('daemon startup failed')
+                    time.sleep(.01)
             self.control.tools = tools.split(',')
             self.control.settings = settings
         except Exception:
