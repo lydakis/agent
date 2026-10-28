@@ -1739,6 +1739,34 @@ mod tests {
                 "  └ neither rex nor herdr was found"
             ]
         );
+        // Memory and triggers through their tools read as their scripts do.
+        let saved = clean(
+            "memory",
+            serde_json::json!({"save": {"name": "deploys", "type": "feedback",
+                "description": "Deploys wait for review.", "source": "s", "text": "t"}}),
+            "{}",
+        );
+        assert_eq!(
+            saved,
+            ["• Saved to memory deploys", "  └ Deploys wait for review."]
+        );
+        assert!(clean("memory", serde_json::json!({}), "{}").is_empty());
+        let scheduled = text(&super::clean(
+            "triggers",
+            &serde_json::json!({"add": {"every": "30m", "message": "Check the queue."}}),
+            Some(r#"{"error":"trigger_refused","detail":"triggers_unsupported: only macOS"}"#),
+            true,
+            "/w",
+            80,
+        ));
+        assert_eq!(
+            scheduled,
+            [
+                "• Scheduled every 30m",
+                "  └ triggers_unsupported: only macOS",
+                "    Check the queue."
+            ]
+        );
         assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
         assert_eq!(
             shell(r#"sonny task changes calc.fix --apply"#, ""),

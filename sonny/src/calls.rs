@@ -820,6 +820,56 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 (None, None) => said("Listed subscriptions", ""),
             })
         }
+        crate::served::MEMORY => Some(
+            match (arguments["save"]["name"].as_str(), field("remove")) {
+                (Some(saved), _) => {
+                    let mut said = said("Saved to memory", saved.trim());
+                    if let Some(description) = arguments["save"]["description"].as_str() {
+                        said.under
+                            .push(Line::from(first_line(description)).italic().dim());
+                    }
+                    said
+                }
+                (None, Some(removed)) => said("Removed from memory", removed),
+                _ if arguments["index"] == true => said("Indexed memory", ""),
+                _ if arguments["check"] == true => said("Checked memory", ""),
+                _ if arguments.get("cleanup").is_some() || arguments["changed"] == true => {
+                    said("Cleaned up memory", "")
+                }
+                _ => said("Read memory", ""),
+            },
+        ),
+        crate::served::TRIGGERS => Some(
+            match (
+                arguments["add"].is_object(),
+                field("remove"),
+                field("fire"),
+                field("show"),
+            ) {
+                (true, ..) => {
+                    // As the trigger script's add says it.
+                    let add = &arguments["add"];
+                    let name = (add["name"].as_str())
+                        .or(add["start"]["name"].as_str())
+                        .or(add["bot"].as_str())
+                        .map(|name| name.trim().to_owned());
+                    let when = ["every", "cron", "at", "in"]
+                        .into_iter()
+                        .find_map(|key| Some(format!("{key} {}", add[key].as_str()?.trim())));
+                    let what = [name, when].into_iter().flatten().collect::<Vec<_>>();
+                    let mut said = said("Scheduled", &what.join(" · "));
+                    if let Some(message) = add["message"].as_str() {
+                        said.under
+                            .push(Line::from(first_line(message)).italic().dim());
+                    }
+                    said
+                }
+                (_, Some(removed), ..) => said("Removed the trigger", removed),
+                (_, _, Some(fired), _) => said("Fired the trigger", fired),
+                (_, _, _, Some(shown)) => said("Read the trigger", shown),
+                _ => said("Listed triggers", ""),
+            },
+        ),
         crate::asks::TOOL => {
             let ask = crate::asks::call("", arguments)?;
             let mut said = Said {

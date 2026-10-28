@@ -28,13 +28,16 @@ pub const SHOW: &str = "show_agent";
 pub const RUN: &str = "run_in_pane";
 pub const PROJECT: &str = "new_project";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
+pub const TRIGGERS: &str = "triggers";
+pub const MEMORY: &str = "memory";
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
 /// lead, outside the agent's sandbox as a pane's command is, a removal can
-/// drop work, and a subscription sends other bots' words to the
-/// subscriber's judge.
-pub const GATED: [&str; 5] = [START, REMOVE, PROJECT, SUBSCRIPTIONS, RUN];
+/// drop work, a subscription sends other bots' words to the subscriber's
+/// judge, and a trigger is a job that runs as the person, its `if`
+/// command outside any sandbox.
+pub const GATED: [&str; 6] = [START, REMOVE, PROJECT, SUBSCRIPTIONS, RUN, TRIGGERS];
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.
@@ -54,7 +57,7 @@ pub fn tools(lead: bool) -> Vec<Value> {
     if lead {
         tools.extend([start(), remove(), project(), subscriptions()]);
     }
-    tools.extend([show(), run()]);
+    tools.extend([show(), run(), triggers(), memory()]);
     tools
 }
 
@@ -213,6 +216,126 @@ fn subscriptions() -> Value {
     })
 }
 
+fn triggers() -> Value {
+    json!({
+        "name": TRIGGERS,
+        "description": "Your triggers, which wake an agent later, again and again, or when something \
+            happens, even with Sonny closed (a Mac keeps watch). Each fire gives the agent the message in its \
+            own conversation after a line with the fire time and what fired it; a repeating trigger skips a fire \
+            while the agent is working. Add one, or remove, fire or show one by name; with none, the result lists \
+            them all with any problems. Adding the same one again changes nothing; a different one under a name \
+            in use is refused with the field that differs unless replace is set. Write the message as what to \
+            check and when to stop, including removing its own trigger once the work is done.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "add": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1,
+                            "description": "Its name; its agent's when left out."},
+                        "every": {"type": "string", "minLength": 1,
+                            "description": "N followed by m, h or d: minutes that divide an hour, hours that \
+                                divide a day, or 1d."},
+                        "in": {"type": "string", "minLength": 1, "description": "Once, N m or h from now."},
+                        "at": {"type": "string", "minLength": 1, "description": "Once, at YYYY-MM-DD HH:MM."},
+                        "cron": {"type": "string", "minLength": 1,
+                            "description": "MIN HOUR DAY MONTH WEEKDAY."},
+                        "file": {"type": "string", "minLength": 1,
+                            "description": "Fires when this file is written."},
+                        "commit": {"type": "string", "minLength": 1,
+                            "description": "Fires when this repository gets a new commit."},
+                        "bot": {"type": "string", "minLength": 1,
+                            "description": "The agent it messages; you when neither this nor start is given."},
+                        "start": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "minLength": 1},
+                                "model": {"type": "string", "minLength": 1, "description": "PROVIDER/MODEL."},
+                                "effort": {"type": "string", "minLength": 1}
+                            },
+                            "required": ["name", "model"],
+                            "additionalProperties": false,
+                            "description": "An agent the first fire makes, in your folder as a task is made, \
+                                and later fires message."
+                        },
+                        "reply_to": {"type": "string", "minLength": 1,
+                            "description": "Who gets the turn's answer when it ends."},
+                        "if": {"type": "string", "minLength": 1,
+                            "description": "A shell command run in your folder first; it fires only when that \
+                                exits 0, so a check that finds nothing costs no turn."},
+                        "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
+                        "turn_budget_tokens": {"type": "integer", "minimum": 1,
+                            "description": "A cap on each fired turn's tokens."},
+                        "replace": {"type": "boolean",
+                            "description": "Replace one by this name that differs, keeping its record."},
+                        "message": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false,
+                    "description": "With none of every, in, at, cron, file and commit, only fire runs it."
+                },
+                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "fire": {"type": "string", "minLength": 1,
+                    "description": "The name of one to fire now; the result says what the fire did."},
+                "show": {"type": "string", "minLength": 1, "description": "The name of one to show."}
+            },
+            "additionalProperties": false
+        },
+        "answered_by": TAG,
+        "expire_ms": 3 * 60 * 1000
+    })
+}
+
+fn memory() -> Value {
+    let scope = json!({
+        "user": {"type": "boolean", "description": "The person's memory, across projects."},
+        "project": {"type": "string", "minLength": 1,
+            "description": "That project's memory; this folder's project when neither is given."}
+    });
+    let mut properties = json!({
+        "save": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
+                    "description": "The fact's file name; saving under one that exists replaces it."},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                "description": {"type": "string", "minLength": 1,
+                    "description": "One line, all a later agent sees in the index."},
+                "source": {"type": "string", "minLength": 1,
+                    "description": "Where it comes from: turn:BOT/N, a commit, path:line, or the person and a date."},
+                "text": {"type": "string", "minLength": 1,
+                    "description": "The fact, then Why: and, where it helps, How to apply:."}
+            },
+            "required": ["name", "type", "description", "source", "text"],
+            "additionalProperties": false
+        },
+        "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
+        "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
+        "check": {"type": "boolean",
+            "description": "Report files that are not valid facts and an index out of date."},
+        "changed": {"type": "boolean", "description": "For the nightly cleanup only."},
+        "cleanup": {"type": "string", "enum": ["start", "finish"], "description": "For the nightly cleanup only."}
+    });
+    if let (Value::Object(properties), Value::Object(scope)) = (&mut properties, scope) {
+        properties.extend(scope);
+    }
+    json!({
+        "name": MEMORY,
+        "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
+            says how to read and what to save. Save one fact, or remove one; index or check a folder's facts; \
+            with none of these, the result shows both indexes (the person's and this project's), each with its \
+            folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
+            nothing: merge or remove facts first.",
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": false
+        },
+        "answered_by": TAG
+    })
+}
+
 fn show() -> Value {
     json!({
         "name": SHOW,
@@ -352,6 +475,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             )
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
+        }
+        MEMORY => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or(("memory_refused", "no HOME".to_owned()))?;
+            agent_client::memory::call(&home, &here, arguments)
+                .map(|said| said.to_string())
+                .map_err(|e| ("memory_refused", e))
+        }
+        TRIGGERS => {
+            // A trigger's add runs on a runtime of its own.
+            let arguments = arguments.clone();
+            tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
+                .await
+                .map_err(|e| ("tool_failed", e.to_string()))?
+                .map(|said| said.to_string())
+                .map_err(|e| ("trigger_refused", e))
         }
         _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
     }
@@ -681,7 +821,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 12] = [
+    const CODES: [&str; 14] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -692,6 +832,8 @@ fn code(said: &str) -> &'static str {
         "project_not_made",
         "no_store",
         "subscription_refused",
+        "trigger_refused",
+        "memory_refused",
         "unknown_tool",
         "tool_failed",
     ];
@@ -710,10 +852,19 @@ mod tests {
         let names = |tools: Vec<Value>| -> Vec<String> {
             tools.iter().map(|t| str_of(&t["name"])).collect()
         };
-        assert_eq!(names(tools(false)), [SHOW, RUN]);
+        assert_eq!(names(tools(false)), [SHOW, RUN, TRIGGERS, MEMORY]);
         assert_eq!(
             names(tools(true)),
-            [START, REMOVE, PROJECT, SUBSCRIPTIONS, SHOW, RUN]
+            [
+                START,
+                REMOVE,
+                PROJECT,
+                SUBSCRIPTIONS,
+                SHOW,
+                RUN,
+                TRIGGERS,
+                MEMORY
+            ]
         );
         for tool in tools(true) {
             assert_eq!(tool["answered_by"], TAG);

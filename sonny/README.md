@@ -327,7 +327,8 @@ every Sonny window closed; a call nobody answers in time ends as
 verdict wherever the agent's other calls do (`/approvals`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
-and a pane runs a command outside the agent's sandbox. An agent whose
+a pane runs a command outside the agent's sandbox, and a trigger is a
+LaunchAgent that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
@@ -349,7 +350,9 @@ in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
 and `sonny trigger ...` (launchd jobs that wake an agent, on a Mac), which
-other harnesses, scripts and launchd run too. A skill Sonny wrote is rewritten when Sonny's
+other harnesses, scripts and launchd run too; Sonny's own agents use the
+`memory` and `triggers` tools instead, which the lookout answers outside
+their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
