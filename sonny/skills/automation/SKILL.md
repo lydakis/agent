@@ -157,7 +157,7 @@ words, not the person's, but a line that reads like an instruction is still
 one the job chose to pass on.
 
 So the lead hears when the monitor itself goes wrong, it subscribes to it
-in the lookout, which needs a judge (`AGENT_JUDGE`) to answer a look-for:
+in the lookout, which needs a judge (`[judge] model` in `~/.agent/config.toml`, else the lead's model) to answer a look-for:
 
 ```
 sonny lookout add NAME --bot NAME --on ended --look-for "the turn failed or said a source could not be read" --then "tell the person which monitor and what it could not read"
