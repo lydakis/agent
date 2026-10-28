@@ -319,8 +319,8 @@ Nothing is scheduled until the person runs `schedule`, since Sonny has no
 default model to run it on. To move the time, `~/.agent/trigger rm
 memory-cleanup` and `schedule` again without `--model`: that keeps the
 agent it started, with its model and history. With `--model`, while that
-agent exists, `schedule` is `bot_exists`, since an agent keeps its model
-for life. The `memory-cleanup` skill
+agent exists, `schedule` is `bot_exists`: it only starts that agent, and
+never changes the model of one it already started. The `memory-cleanup` skill
 ([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
 and never removes a fact for its age alone.

@@ -160,6 +160,10 @@ pub struct Declared {
     /// before it ends `tool_unserved`; `ANSWER_EXPIRE_MS` when left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expire_ms: Option<u64>,
+    /// Whether a bot this one creates takes the tool too; `false` keeps it
+    /// the declaring bot's own.
+    #[serde(default = "inherited", skip_serializing_if = "is_inherited")]
+    pub inherit: bool,
 }
 fn declared_result() -> String {
     "ok".into()
@@ -171,6 +175,12 @@ impl Declared {
         self.answered_by.as_ref()?;
         Some(started_ms + self.expire_ms.unwrap_or(ANSWER_EXPIRE_MS))
     }
+}
+fn inherited() -> bool {
+    true
+}
+fn is_inherited(inherit: &bool) -> bool {
+    *inherit
 }
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 16;

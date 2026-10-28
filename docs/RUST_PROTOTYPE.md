@@ -18,9 +18,14 @@ CARGO_HOME=.local/cargo cargo build --release --locked
 CARGO_HOME=.local/cargo cargo test --locked
 CARGO_HOME=.local/cargo cargo clippy --locked --all-targets -- -D warnings
 AGENT_TEST_RUNTIME=1 AGENT_BENCH_TEST_ENGINES=1 .local/venv/bin/python -m unittest discover -s tests -v
+AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m tests.run --jobs 4   # the same modules side by side
 .local/venv/bin/python -m bench run --engine rust --out .local/bench/rust
 .local/venv/bin/python -m bench.matrix --out .local/bench/three-engines
 ```
+
+Every pull request and push to main runs the format, Clippy and Rust test
+checks and, after a release build of the daemon and Sonny, the runtime suite
+with `tests.run` on Linux ([test.yml](../.github/workflows/test.yml)).
 
 The same checks run on Linux amd64 through Errand, with the build tree and
 the Python venv kept as named runner caches so a job pays for a build once
@@ -2076,7 +2081,13 @@ narrows them as it does the daemon's. Changing them changes the request's
 tool definitions, so a fork keys its own prompt cache from then on, as for
 instructions.
 
-Protocol version 20 lets a client answer its own declared tools. A tool
+Protocol version 20 adds `inherit` to a declared tool, default `true` and
+reported only when `false`: a tool declared with `"inherit": false` stays
+the declaring bot's own, so a bot it creates does not take it with the
+rest. A fork still keeps it. A lead's client uses it for a tool only the
+lead should call.
+
+Protocol version 21 lets a client answer its own declared tools. A tool
 declared with `answered_by`, a tag of 1 to 64 letters, digits, `_`, `-` or
 `.` that the daemon never reads, takes no `result`: a call that fits its
 `parameters` starts, and waits for the answer of whichever client acts for
@@ -2094,8 +2105,8 @@ the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
 lowercase letters, digits or `_`; output and detail each up to 64 KiB,
 redacted as command output is; anything else is `invalid_tool_result` or
 `tool_output_limit`). The first answer counts: another is
-`call_already_answered`, one for a call that ended is `no_pending_call` or,
-once its turn ended, `stale_turn`. There is no lease: a tag is the client's
+`call_already_answered`, one for a call that ended or ran out of time is
+`no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.
 
 The call waits as a gated call waits for its verdict. Its turn holds live
@@ -2108,8 +2119,10 @@ answer to a parked call is committed on arrival and resumes the turn. A
 call still unanswered at `expires_ms` ends with
 `{"error":"tool_unserved","detail":...}` and the turn goes on, since the
 model can act on it; the service wakes a parked one then from its own
-schedule, so a waiting call costs a row and no timer. An interrupt ends the
-call as cancelled, like any running call. A call that does not fit its
+schedule, so a waiting call costs a row and no timer. A later call's gate that
+lapses first ends the wait as `tool_unserved` and the turn as it ends one
+waiting on a verdict. An interrupt ends the call as cancelled, like any
+running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
 
 ### Tool approval

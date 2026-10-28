@@ -3054,25 +3054,39 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
+        inherit: true,
+        answered_by: None,
+        expire_ms: None,
+    };
+    // The lead's own tool, which a bot it creates does not take.
+    let resolve = Declared {
+        name: "resolve".into(),
+        description: "Resolve a task.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        inherit: false,
         answered_by: None,
         expire_ms: None,
     };
     let declared = [react.clone()];
+    let leads = [react.clone(), resolve];
     let (lead, _) = db
         .create(
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(&declared),
+                declared: Some(&leads),
                 ..binding()
             },
         )
         .unwrap();
-    assert_eq!(lead.declared, declared);
+    assert_eq!(lead.declared, leads);
     assert_eq!(
         serde_json::to_value(&lead).unwrap()["declared"],
         json!([{"name":"react","description":"React to a message.",
-            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"}])
+            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"},
+            {"name":"resolve","description":"Resolve a task.","parameters":{"type":"object"},
+            "result":"ok","inherit":false}])
     );
     // A bot the lead creates takes its tools unless its client declares others.
     let child = |db: &mut Database, name: &str, declared: Option<&[Declared]>| {
@@ -3082,21 +3096,22 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         b.declared = declared;
         db.create(name, Some("/synthetic"), b).unwrap().0
     };
+    // All but the lead's own.
     assert_eq!(child(&mut db, "Task", None).declared, declared);
     assert!(child(&mut db, "Own", Some(&[])).declared.is_empty());
     // A bot nobody created declares nothing it was not given.
     let plain = db.create("Plain", Some("/synthetic"), binding()).unwrap().0;
     assert!(plain.declared.is_empty() && !plain.may_call("react"));
     // Declaring again says whether anything changed.
-    assert!(!db.set_declared("Lead", None, &declared).unwrap());
+    assert!(!db.set_declared("Lead", None, &leads).unwrap());
     assert!(db.set_declared("Plain", None, &declared).unwrap());
     assert!(db.inspect("Plain").unwrap().may_call("react"));
     assert!(db.set_declared("Plain", None, &[]).unwrap());
     assert!(db.inspect("Plain").unwrap().declared.is_empty());
-    // A fork keeps them, and its allowed list narrows them like the rest.
+    // A fork keeps them all, and its allowed list narrows them like the rest.
     converse(&mut db, "Lead", 1);
     let fork = db.fork("Lead", "Copy", Fork::default()).unwrap().0;
-    assert_eq!(fork.declared, declared);
+    assert_eq!(fork.declared, leads);
     assert!(fork.declared("react").is_some());
     let only_read = ["read".to_owned()];
     let narrowed = db
@@ -3148,6 +3163,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         result: "ok".into(),
         answered_by: Some("sonny".into()),
         expire_ms: None,
+        inherit: true,
     };
     db.create(
         "Lead",

@@ -1793,7 +1793,9 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='cancel',
                               prompt='shell:sleep 30 & echo $! > child.pid; wait')['result']['turn']
         deadline = time.monotonic() + 3
-        while not (self.path / 'child.pid').exists() and time.monotonic() < deadline:
+        # The shell makes the file before it writes the PID.
+        while not (self.path / 'child.pid').exists() or not (self.path / 'child.pid').read_text().endswith('\n'):
+            self.assertLess(time.monotonic(), deadline)
             time.sleep(.01)
         pid = int((self.path / 'child.pid').read_text())
         child = psutil.Process(pid)
