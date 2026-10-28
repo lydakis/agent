@@ -491,7 +491,10 @@ impl Updates {
         which: Option<String>,
         origin: Option<String>,
     ) {
-        let resolved = self.resolving.ended(name, turn) && status == "completed";
+        // A note while the turn still runs leaves its resolve for the last.
+        let resolved = ![APPROVAL, QUIET].contains(&status)
+            && self.resolving.ended(name, turn)
+            && status == "completed";
         if !self.task(name) {
             return;
         }
@@ -1046,6 +1049,8 @@ mod tests {
                 now,
             );
         }
+        // A silence noted while the turn still runs keeps its resolve.
+        updates.expire(now + QUIET_AFTER);
         updates.event(
             &ev(
                 "shop.fix",
@@ -1058,7 +1063,8 @@ mod tests {
         turn(&mut updates, "shop.docs", 6, lead, "completed");
         assert_eq!(
             text(&updates.take()),
-            "- shop.fix: turn:shop.fix/5 completed, asked by you, and resolved itself\n\
+            "- shop.fix: turn:shop.fix/5 completed, asked by you, and resolved itself, \
+             and 1 earlier since turn:shop.fix/5\n\
              - shop.docs: turn:shop.docs/6 completed, asked by you"
         );
     }
