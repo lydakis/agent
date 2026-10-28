@@ -24,6 +24,10 @@ use std::{
 /// daemon is asked whether it is.
 pub const DOUBT: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
+/// About what one note may take, well under the daemon's prompt limit; a
+/// line other than the person's words counts as `LINE_BYTES`.
+const NOTE_BYTES: usize = 64 * 1024;
+const LINE_BYTES: usize = 160;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
@@ -602,22 +606,56 @@ impl Updates {
     pub fn take(&mut self) -> Told {
         let mut tasks = std::mem::take(&mut self.tasks);
         tasks.sort_by_key(|(_, news)| news.said.is_empty() && news.act.is_none());
-        self.tasks = tasks.split_off(tasks.len().min(WAKE_TASKS));
+        let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
-        for (name, news) in &tasks {
+        let mut sent = Vec::new();
+        // What does not fit in this note's bytes waits for the next.
+        let mut later = Vec::new();
+        let mut bytes = 0;
+        for (name, mut news) in tasks {
+            if bytes >= NOTE_BYTES {
+                later.push((name, news));
+                continue;
+            }
+            let (mut kept, mut wait) = (Vec::new(), Vec::new());
+            for message in std::mem::take(&mut news.said) {
+                let size = (message.words.as_deref())
+                    .map_or(0, |words| super::cut(words, super::QUOTE_CHARS).len())
+                    + LINE_BYTES;
+                let first = items.is_empty() && kept.is_empty();
+                if wait.is_empty() && (first || bytes + size <= NOTE_BYTES) {
+                    bytes += size;
+                    kept.push(message);
+                } else {
+                    wait.push(message);
+                }
+            }
+            news.said = kept;
+            if !wait.is_empty() {
+                let waiting = News {
+                    said: wait,
+                    ..News::default()
+                };
+                later.push((name.clone(), waiting));
+            }
             // A message that started a turn told below as asked by its
             // writer says nothing more; the person's words are still quoted.
             let ended = |s: &&Said| {
                 s.words.is_none() && news.act.as_ref().is_some_and(|t| t.turn == s.turn)
             };
             let left: Vec<Said> = news.said.iter().filter(|s| !ended(s)).cloned().collect();
-            items.extend(said(name, &left, &mut quoted));
+            items.extend(said(&name, &left, &mut quoted));
             let turns = [(false, &news.act), (true, &news.theirs)];
             items.extend(
-                (turns.into_iter()).filter_map(|(theirs, t)| Some(line(name, theirs, t.as_ref()?))),
+                (turns.into_iter())
+                    .filter_map(|(theirs, t)| Some(line(&name, theirs, t.as_ref()?))),
             );
+            bytes += 2 * LINE_BYTES;
+            sent.push((name, news));
         }
+        later.extend(rest);
+        self.tasks = later;
         // The person's own turns come last, under a line of their own.
         items.sort_by_key(|item| item.theirs);
         let (memory, seen) = match self.memory_news() {
@@ -628,7 +666,7 @@ impl Updates {
             items,
             more: self.tasks.len(),
             memory,
-            sent: tasks,
+            sent,
             seen,
         }
     }
@@ -1027,6 +1065,30 @@ mod tests {
              - shop.fix: turn:shop.fix/7, shop.docs wrote in it\n\
              - shop.fix: turn:shop.fix/6 completed, asked by shop.docs"
         );
+    }
+
+    #[test]
+    fn messages_past_one_note_s_bytes_wait_for_the_next() {
+        let mut updates = fleet();
+        let words = "x".repeat(super::super::QUOTE_CHARS);
+        for turn in 1..=50 {
+            updates.said(
+                "shop.fix",
+                turn,
+                "the person",
+                Some(&format!("{turn} {words}")),
+            );
+        }
+        let first = updates.take();
+        let told = first.items.len();
+        assert!((20..50).contains(&told), "{told}");
+        assert!(first.items.iter().map(|i| i.text.len()).sum::<usize>() <= NOTE_BYTES);
+        assert_eq!(first.more, 1);
+        updates.sent(first);
+        let second = updates.take();
+        let handles: Vec<&str> = second.items.iter().map(|i| i.handle.as_str()).collect();
+        assert_eq!(handles.len(), 50 - told);
+        assert_eq!(handles[0], format!("turn:shop.fix/{}", told + 1));
     }
 
     #[test]

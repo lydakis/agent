@@ -180,8 +180,17 @@ would reply to the person, or nothing if you would reply nothing.
 
 def turn_items(daemon, bot, turn):
     """The fork's calls and its reply in its turn."""
-    page = daemon.request('history_nodes', bot=bot, limit=200, oldest_first=True)
-    nodes = [n['node'] for n in page['nodes'] if n.get('turn') == turn]
+    # Newest first, back to the rehearsal's first node: the history it
+    # inherits from the lead comes before it.
+    nodes, start = [], None
+    while True:
+        page = daemon.request('history_nodes', bot=bot, limit=400, **({'from': start} if start else {}))
+        nodes += [n['node'] for n in page['nodes'] if n.get('turn') == turn]
+        older = page['nodes'] and page['nodes'][-1].get('turn') == turn
+        start = page.get('next_from')
+        if not older or start is None:
+            break
+    nodes.sort()
     if not nodes:
         return []
     read = daemon.request('history_items', bot=bot, nodes=nodes)

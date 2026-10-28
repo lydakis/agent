@@ -3258,7 +3258,9 @@ impl App {
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
-                let words = self.live.as_ref().is_some_and(|live| !live.rows.is_empty());
+                // Rows already drawn above, as a long reply spills, count.
+                let words =
+                    (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
                 let ended = matches!(status, "completed" | "steered");
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
@@ -5804,6 +5806,26 @@ mod tests {
         let rows = lines(&app);
         assert!(rows.iter().any(|row| row.starts_with("─ Worked")));
         assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
+        // A reply long enough to spill above as it streams still speaks.
+        app.pending.clear();
+        app.height = 8;
+        app.daemon(turn_event(
+            "accepted",
+            4,
+            json!({"request_id": "lookout-cd34"}),
+        ))
+        .await;
+        let long: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 4, "text": long}))
+            .await;
+        assert!(app.live.as_ref().is_some_and(|live| live.spilled));
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
         // The person's own turn, with nothing said, still ends with its line.
         app.pending.clear();
         app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
