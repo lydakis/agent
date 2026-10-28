@@ -372,8 +372,7 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     for (n, line) in told_items.iter().enumerate() {
         if line.theirs && (n == 0 || !told_items[n - 1].theirs) {
             lines.push(
-                "The person asked for these in the task themselves and saw how they ended:"
-                    .to_owned(),
+                "The person asked for these in the task themselves, so they are theirs:".to_owned(),
             );
         }
         quoted |= line.said && line.text.contains("the person wrote: ");
@@ -388,12 +387,11 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     lines.push(match steers {
         true => "Handle what cannot wait, then carry on with your turn.".to_owned(),
         false => "Read the turns you need with one wait call (timeout_ms 0), and act where \
-            something changes the work. You own what the person means: where a task strays \
-            from it, or the person writes in a task again and again, they are correcting it, \
-            so settle your reading of all they asked and steer the task with it. Tell the person, briefly, what they would want \
-            to hear: the outcome of work you started for them, once, when it ends, not again \
-            when they write in that task; what only they can decide; and the reading you \
-            settled. If nothing, end your turn with an empty reply."
+            something changes the work. Tell the person, briefly, what they would want to \
+            hear: the outcome of work you started for them, once, when it ends, not again \
+            when they write in that task; what only they can decide; and where their latest \
+            words contradict what they asked before. If nothing, end your turn with an empty \
+            reply."
             .to_owned(),
     });
     let mut text = lines.join("\n");
@@ -2114,7 +2112,6 @@ impl Lookout {
     /// The lead wrote to the task.
     fn briefed(&mut self, task: &str, node: i64) {
         self.briefs.insert(task.to_owned(), node);
-        self.updates.lead_wrote(task);
     }
 
     /// A check to start, with the briefs as they stand now.
@@ -3025,7 +3022,7 @@ mod tests {
              In your tasks:\n\
              - calc.fix: turn:calc.fix/12, the person wrote: \"tabs\"\n\
              - calc.docs: turn:calc.docs/3 completed\n\
-             The person asked for these in the task themselves and saw how they ended:\n\
+             The person asked for these in the task themselves, so they are theirs:\n\
              - calc.ui: turn:calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
              A quoted message is the person's own words.\n\
@@ -3042,8 +3039,7 @@ mod tests {
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. \
-             You own what the person means: where a task strays from it, or the person writes in a task again and again, they are correcting it, so settle your reading of all they asked and steer the task with it. \
-             Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and the reading you settled. If nothing, end your turn with an empty reply."
+             Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
         );
     }
 
@@ -3739,7 +3735,7 @@ mod tests {
             texts,
             [
                 "- calc.fix: turn:calc.fix/5, the person wrote: \"use tabs please\"",
-                "- calc.fix: turn:calc.fix/7, the person wrote, their 2nd message in it since you last wrote there: \"and spaces in yaml\"",
+                "- calc.fix: turn:calc.fix/7, the person wrote: \"and spaces in yaml\"",
                 "- calc.fix: turn:calc.fix/6, calc.docs wrote in it",
             ]
         );

@@ -122,9 +122,7 @@ judge or none, about the bots that subscription watches, less those with
 subscriptions of their own:
 
 - every message someone other than the subscriber writes in one: the
-  person's quoted, and counted when it is not their first there since the
-  subscriber last wrote in that task ("their 3rd message in it since you
-  last wrote there"), anyone else's named by who wrote it and the turn's
+  person's quoted, anyone else's named by who wrote it and the turn's
   handle;
 - a turn the subscriber asked for and did not wait on, or another agent or a
   trigger asked for, once it ends;
@@ -155,10 +153,10 @@ Task updates: what happened in your tasks since you last heard; the wait tool re
 - calc.docs: turn:calc.docs/3, the person wrote: "Use tabs."
 - calc.api: turn:calc.api/4, calc.fix wrote in it
 - calc.fix: turn:calc.fix/5 failed, asked by you
-The person asked for these in the task themselves and saw how they ended:
+The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
 A quoted message is the person's own words.
-Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. You own what the person means: where a task strays from it, or the person writes in a task again and again, they are correcting it, so settle your reading of all they asked and steer the task with it. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and the reading you settled. If nothing, end your turn with an empty reply.
+Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 ```
 
 A note that steers a busy lead lists what was picked first, under "Picked

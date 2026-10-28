@@ -19,7 +19,9 @@ picked it, by the bands of the replay `--bands` holds (keyed by task, turn
 and kind; one judge's, `--band-judge`, when it holds several). An event that
 note would not have told the lead of is written as unsent: the lead did
 nothing. `every` is the note that tells the lead every message, the
-person's quoted. Nothing a fork does reaches a task or the person.
+person's quoted; a person-asked turn is grouped as theirs only when it
+completed, as one that failed is news to them too. Nothing a fork does
+reaches a task or the person.
 A fork's wait tool reads a turn as it stands in the store now, not as it
 stood at the event, so a turn still running then can show its final answer;
 `every` sends a note for each message where `today` sent few, so it meets
@@ -159,30 +161,6 @@ def today(row, band):
     return '\n'.join(lines)
 
 
-def ordinal(n):
-    suffix = 'th' if n % 100 in (11, 12, 13) else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
-    return f'{n}{suffix}'
-
-
-def counted(rows):
-    """Number each of the person's messages in a task since the lead last
-    wrote there, as the live note does. A turn the lead asked for is where
-    it last wrote; the replay holds no other trace of its messages."""
-    by_task = {}
-    for row in rows:
-        by_task.setdefault((row.get('lead'), row['task']), []).append(row)
-    for task_rows in by_task.values():
-        task_rows.sort(key=lambda r: (r['turn'], r['kind'] != 'Said'))
-        run = []
-        for row in task_rows:
-            if row['kind'] == 'Ended' and row.get('asked_by') == 'you':
-                run = [t for t in run if t > row['turn']]
-            elif row['kind'] == 'Said' and row.get('from') == PERSON:
-                if row['turn'] not in run:
-                    run.append(row['turn'])
-                row['nth'] = run.index(row['turn']) + 1
-
-
 def drifting(band):
     """The judge's drift answer in an old replay's band, when it is a yes."""
     for id, p in (band or {}).get('reasons') or []:
@@ -211,26 +189,22 @@ def every(row, band=None):
                      f'the task with that reading){quote}')
     elif row['kind'] == 'Said':
         if row.get('from') == PERSON:
-            nth = row.get('nth') or 1
-            run = f', their {ordinal(nth)} message in it since you last wrote there' if nth > 1 else ''
-            lines.append(f'- {task}: {handle}, the person wrote{run}: "{cut(words(row.get("words") or ""), QUOTE_CHARS)}"')
+            lines.append(f'- {task}: {handle}, the person wrote: "{cut(words(row.get("words") or ""), QUOTE_CHARS)}"')
             quoted = True
         else:
             lines.append(f'- {task}: {handle}, {row.get("from") or "someone"} wrote in it')
     else:
         line, theirs = ended_line(row, saw=True)
         if theirs:
-            lines.append('The person asked for these in the task themselves and saw how they ended:')
+            lines.append('The person asked for these in the task themselves, so they are theirs:')
         lines.append(line)
     if quoted:
         lines.append("A quoted message is the person's own words.")
     lines.append('Read the turns you need with one wait call (timeout_ms 0), and act where something changes the '
-                 'work. You own what the person means: where a task strays from it, or the person writes in a task '
-                 'again and again, they are correcting it, so settle your reading of all they asked and steer the '
-                 'task with it. Tell the '
-                 'person, briefly, what they would want to hear: the outcome of work you started for them, once, '
-                 'when it ends, not again when they write in that task; what only they can decide; and the '
-                 'reading you settled. If nothing, end your turn with an empty reply.')
+                 'work. Tell the person, briefly, what they would want to hear: the outcome of work you started '
+                 'for them, once, when it ends, not again when they write in that task; what only they can '
+                 'decide; and where their latest words contradict what they asked before. If nothing, end your '
+                 'turn with an empty reply.')
     return '\n'.join(lines)
 
 
@@ -370,7 +344,6 @@ def run(args):
     rows = {}
     for row in load(args.replay):
         rows.setdefault(key(row), row)
-    counted(rows.values())
     bands = {}
     if args.bands:
         for row in load(args.bands):
