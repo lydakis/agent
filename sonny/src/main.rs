@@ -1137,7 +1137,7 @@ const COMMANDS: [(&str, &str); 15] = [
     ),
     (
         "/fullscreen",
-        "Sonny owns the screen (select, copy, scroll), or writes into the scrollback",
+        "full screen (the default), or inline in the terminal's scrollback",
     ),
     (
         "/copies",
