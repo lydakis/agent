@@ -159,7 +159,10 @@ class ApprovalTests(ModelFixture):
                  # moving HEAD leaves the next still kept from the hooks.
                  ['shell', {'command': f'mv {repo}/.git/HEAD {repo}/.git/HEAD.x'}],
                  ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/post-checkout; '
-                                       f'mv {repo}/.git/HEAD.x {repo}/.git/HEAD'}]]
+                                       f'mv {repo}/.git/HEAD.x {repo}/.git/HEAD'}],
+                 # Nor may it point git at another folder's hooks and config.
+                 ['shell', {'command': f'echo /tmp > {repo}/.git/commondir'}],
+                 ['shell', {'command': f'echo /tmp > {repo}/.git/worktrees/tree/commondir'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
                               prompt='calls:' + json.dumps(calls))['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -172,6 +175,13 @@ class ApprovalTests(ModelFixture):
         self.assertFalse((repo / '.git/hooks/pre-commit').exists())
         self.assertFalse((repo / '.git/hooks/post-checkout').exists())
         self.assertEqual((repo / '.git/config').read_text(), config)
+        self.assertNotEqual(self.tool_output(client, 'shell-7')[1]['exit_code'], 0)
+        self.assertEqual((repo / '.git/worktrees/tree/commondir').read_text(), '../..\n')
+        # Linux can't keep it from being made, only removes it after.
+        deadline = time.monotonic() + 5
+        while (repo / '.git/commondir').exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse((repo / '.git/commondir').exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_without_a_gate_cannot_leave_its_sandbox(self):

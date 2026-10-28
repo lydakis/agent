@@ -2107,8 +2107,13 @@ is there. The daemon's store and the files beside it stay read-only too. A
 protected folder that is a symlink refuses the call with
 `sandbox_unavailable`, since the link could be swapped from inside. A git
 folder given as a `writable` folder, so a bot may commit, keeps what git
-runs read-only as `.git` does: its `hooks`, `config`, `config.worktree` and
-submodules' `modules`, and missing `hooks` or `modules` may not be made. It is
+runs read-only as `.git` does: its `hooks`, `config`, `config.worktree`,
+submodules' `modules`, and the `commondir` that would point git at another
+folder's hooks and config, its own and each linked worktree's under
+`worktrees`. Missing `hooks` or `modules` may not be made, nor a missing
+`commondir` on macOS; on Linux, where a folder held in its place would stop
+git, one the command makes is removed when it ends. So a sandboxed `git
+worktree remove` of an existing worktree is refused. It is
 known by its name, `.git` or `NAME.git`, which the bot can't change, not by
 what is inside it. One whose config is missing, turns on per-worktree config
 or includes other files stays read-only as a whole, since git reads those

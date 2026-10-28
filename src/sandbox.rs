@@ -37,10 +37,13 @@ const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
 /// In a git folder given as a root, so a bot may commit, what git runs
 /// stays read-only as it does under `.git`: its hooks, the config that can
-/// name other hooks or programs, and its submodules' git folders, which
-/// hold their own. Missing hooks and submodules are kept from being made. A git folder is known by its name, `.git` or `NAME.git`, which the
-/// bot can't change, never by what is inside it, which it can.
-const GIT_PROTECTED: [&str; 4] = ["hooks", "config", "config.worktree", "modules"];
+/// name other hooks or programs, its submodules' git folders, which hold
+/// their own, and `commondir`, which would have git take another folder's
+/// hooks and config in its place. Missing hooks, submodules and `commondir`
+/// are kept from being made. A git folder is known by its name, `.git` or
+/// `NAME.git`, which the bot can't change, never by what is inside it,
+/// which it can.
+const GIT_PROTECTED: [&str; 5] = ["hooks", "config", "config.worktree", "modules", "commondir"];
 
 /// A folder the bot may write, and what inside it stays read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,11 @@ pub struct Root {
     pub read_only: Vec<PathBuf>,
     /// Paths inside the root that don't exist and may not be made.
     pub missing: Vec<PathBuf>,
+    /// Paths inside the root that don't exist and may not be left made:
+    /// files git reads whenever they are there, so an empty folder held in
+    /// their place would stop git. On Linux, removed when the command ends;
+    /// elsewhere they are `missing`.
+    pub left: Vec<PathBuf>,
 }
 
 /// What a sandboxed command may do: write its roots, and reach the network
@@ -131,6 +139,7 @@ impl Policy {
                     .read_only
                     .iter()
                     .chain(&root.missing)
+                    .chain(&root.left)
                     .any(|kept| path.starts_with(kept))
             })
     }
@@ -360,6 +369,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     }
     let mut read_only = Vec::new();
     let mut missing = Vec::new();
+    let mut left = Vec::new();
     for name in PROTECTED {
         let kept = path.join(name);
         if held(&kept) {
@@ -401,7 +411,29 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
                 Ok(found) if found.file_type().is_symlink() => return linked(&kept),
                 Ok(_) => read_only.push(kept),
                 Err(_) if matches!(name, "hooks" | "modules") => missing.push(kept),
+                Err(_) if name == "commondir" && cfg!(target_os = "linux") => left.push(kept),
+                Err(_) if name == "commondir" => missing.push(kept),
                 Err(_) => {}
+            }
+        }
+        // Each linked worktree's folder names the repository's folder for
+        // it the same way.
+        for entry in std::fs::read_dir(path.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            match entry.file_type() {
+                Ok(found) if found.is_symlink() => return linked(&entry.path()),
+                Ok(found) if found.is_dir() => {}
+                _ => continue,
+            }
+            let kept = entry.path().join("commondir");
+            match std::fs::symlink_metadata(&kept) {
+                Ok(found) if found.file_type().is_symlink() => return linked(&kept),
+                Ok(_) => read_only.push(kept),
+                Err(_) if cfg!(target_os = "linux") => left.push(kept),
+                Err(_) => missing.push(kept),
             }
         }
     }
@@ -426,6 +458,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         path: path.to_owned(),
         read_only,
         missing,
+        left,
     })
 }
 
@@ -744,8 +777,9 @@ fn held(path: &Path) -> bool {
 }
 
 /// What a running sandbox holds in place; dropping it lets the
-/// placeholders go once no other sandbox holds them.
-pub struct Hold(Vec<PathBuf>);
+/// placeholders go once no other sandbox holds them, and removes what the
+/// command may not leave made.
+pub struct Hold(Vec<PathBuf>, Vec<PathBuf>);
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
 /// being removed is gone.
@@ -778,7 +812,12 @@ pub async fn hold(policy: &Policy) -> Hold {
                         }),
                     }
                 }
-                return Hold(paths);
+                let left = policy
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.left.iter().cloned())
+                    .collect();
+                return Hold(paths, left);
             }
         }
         removed.await;
@@ -808,12 +847,18 @@ impl Drop for Hold {
                 }
             }
         }
-        if released.is_empty() {
+        let left = std::mem::take(&mut self.1);
+        if released.is_empty() && left.is_empty() {
             return;
         }
         // Off the runtime thread, and with no lock held: no sandbox takes
         // one up while it is marked as being removed.
         let remove = move || {
+            // Git never makes these in a repository's own folder: one there
+            // now is the command's.
+            for path in &left {
+                let _ = std::fs::remove_file(path);
+            }
             for path in &released {
                 // Only an empty one: a placeholder, never what a command
                 // outside the sandbox made there since.
@@ -1043,6 +1088,8 @@ mod tests {
         std::fs::create_dir_all(git.join("objects")).unwrap();
         std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(git.join("config"), "").unwrap();
+        std::fs::create_dir_all(git.join("worktrees/wt")).unwrap();
+        std::fs::write(git.join("worktrees/wt/commondir"), "../..\n").unwrap();
         let base = std::fs::canonicalize(&base).unwrap();
         let git = base.join(".git");
         let policy = Policy::new(
@@ -1060,6 +1107,11 @@ mod tests {
         // Missing hooks may not be made, nor a submodule's git folder.
         assert!(!policy.can_write(&git.join("hooks/pre-commit")));
         assert!(!policy.can_write(&git.join("modules/sub/hooks/pre-commit")));
+        // Nor a `commondir`, which would have git take another folder's hooks
+        // and config, here or in a linked worktree's folder.
+        assert!(!policy.can_write(&git.join("commondir")));
+        assert!(!policy.can_write(&git.join("worktrees/wt/commondir")));
+        assert!(policy.can_write(&git.join("worktrees/wt/index.lock")));
         // With per-worktree config on, whose files git reads wherever they
         // are made, none of it is written.
         std::fs::write(
@@ -1261,6 +1313,7 @@ mod tests {
                 Root {
                     read_only: PROTECTED.iter().map(|name| path.join(name)).collect(),
                     missing: Vec::new(),
+                    left: Vec::new(),
                     path: path.clone(),
                 }
             })
