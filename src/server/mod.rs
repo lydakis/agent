@@ -1704,9 +1704,24 @@ impl Service {
                 settings,
                 created_by,
                 created_by_id,
+                declare,
                 ..
             } => {
                 claim(created_by, created_by_id)?;
+                // A tool a client answers is one the caller may pass on: one
+                // it has and gives the bots it makes, answered by the same
+                // client. Another could get a client to act for it.
+                let passes = |tool: &agent_runtime::tools::Declared| {
+                    tool.answered_by.is_none()
+                        || me.declared.iter().any(|own| {
+                            own.inherit
+                                && own.name == tool.name
+                                && own.answered_by == tool.answered_by
+                        })
+                };
+                if declare.iter().flatten().any(|tool| !passes(tool)) {
+                    return refuse("declare a tool a client answers that it can't pass on");
+                }
                 folders.extend(workspace.clone());
                 folders.extend(settings.writable.iter().cloned());
             }

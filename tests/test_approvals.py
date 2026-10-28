@@ -160,6 +160,11 @@ class ApprovalTests(ModelFixture):
         self.addCleanup(daemon.close)
         daemon.request('create', bot='Bob', workspace=str(self.path))
         daemon.request('create', bot='Alice', workspace=str(outside), settings={})
+        # Another sandboxed bot, whose own socket is open once it has run a
+        # command.
+        carl = daemon.request('create', bot='Carl', workspace=str(self.path))['result']['bot_id']
+        turn = daemon.request('submit', bot='Carl', request_id='c', prompt='shell:true')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         (self.path / 'kid').mkdir()
         child = dict(op='create', model='openai/synthetic-model', instructions='Kid.', tools=['echo'])
         requests = [
@@ -174,6 +179,9 @@ class ApprovalTests(ModelFixture):
             dict(op='delete', bot='Kid'),
             dict(op='fork', source='Alice', bot='Copy'),
             dict(op='fork', source='Alice', bot='Ask', allow=[], expire_ms=60000),
+            dict(child, bot='Hand', workspace=str(self.path / 'kid'),
+                 declare=[{'name': 'act', 'description': 'Act.', 'parameters': {'type': 'object'},
+                           'answered_by': 'client'}]),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
@@ -189,22 +197,29 @@ class ApprovalTests(ModelFixture):
             '    return out\n'
             'requests = json.load(open("requests.json"))\n'
             'try:\n'
-            '    open(os.path.join(os.path.dirname(os.environ["AGENT_SOCKET"]), "planted"), "w"); planted = True\n'
+            '    ask(sys.argv[1] + ".d/" + sys.argv[2], requests[:1]); borrowed = True\n'
+            'except OSError:\n'
+            '    borrowed = False\n'
+            'try:\n'
+            '    open(sys.argv[1] + ".d/planted", "w"); planted = True\n'
             'except OSError:\n'
             '    planted = False\n'
-            'print(json.dumps({"own": os.environ["AGENT_SOCKET"], "planted": planted, "answers": ask(os.environ["AGENT_SOCKET"], requests),\n'
-            '                  "daemon": ask(sys.argv[1], requests[:1]) if sys.platform == "linux" else None}))\n')
+            'print(json.dumps({"own": os.environ["AGENT_SOCKET"], "planted": planted, "borrowed": borrowed, "answers": ask(os.environ["AGENT_SOCKET"], requests)}))\n')
         turn = daemon.request('submit', bot='Bob', request_id='t',
-                              prompt=f'shell:python3 probe.py {daemon.socket_path}')['result']['turn']
+                              prompt=f'shell:python3 probe.py {daemon.socket_path} {carl}')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
-        self.assertNotEqual(probed['own'], str(daemon.socket_path))
+        # On Linux its own socket is in the daemon's socket's place.
+        if sys.platform == 'linux':
+            self.assertEqual(probed['own'], str(daemon.socket_path))
         # No bot can put its own listener in place of another's.
         self.assertFalse(probed['planted'])
+        # Nor reach another bot's, which would answer as that bot.
+        self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask) = probed['answers']
+         ask, hand) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy):
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),
@@ -212,9 +227,6 @@ class ApprovalTests(ModelFixture):
         self.assertIn('result', delete_kid)
         # A fork that may call nothing only answers.
         self.assertEqual(ask['result']['created_by'], 'Bob')
-        if probed['daemon'] is not None:
-            # In the daemon's socket's place, its own.
-            self.assertIn('result', probed['daemon'][0])
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(daemon.request('inspect', bot='Bob')['result']['instructions'], 'Test agent.')
 

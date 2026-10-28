@@ -1730,7 +1730,7 @@ fn sh(
         process.env(name, value);
     }
     // A sandboxed command reaches the daemon through its bot's own socket.
-    if let Some(own) = sandbox.and_then(|policy| policy.capability.as_ref()) {
+    if let Some(own) = sandbox.and_then(Policy::reach) {
         process.env("AGENT_SOCKET", own);
     }
     process.current_dir(workspace);

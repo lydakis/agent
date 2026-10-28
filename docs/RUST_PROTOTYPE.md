@@ -2110,9 +2110,11 @@ never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
 socket, `SOCKET.d/BOT_ID` beside its own, the first time one of the bot's
 commands runs, and keeps it while it runs. On Linux it is bound over the
-daemon's socket in the sandbox; on macOS Seatbelt denies the daemon's socket
-and allows the bot's, network on or off. Either way the command's
-`AGENT_SOCKET` names it. A request on it:
+daemon's socket in the sandbox, and the folder of the bots' sockets is
+hidden; on macOS Seatbelt denies the daemon's socket and that folder and
+allows the bot's own, network on or off. Either way the command's
+`AGENT_SOCKET` names it, and no command reaches another bot's. A request on
+it:
 
 | Request | On a bot's own socket |
 |---|---|
@@ -2123,7 +2125,9 @@ and allows the bot's, network on or off. Either way the command's
 | Everything else | As on the daemon's socket |
 
 The folder of these sockets stays read-only in every root, so no bot can
-put its own listener in another's place. A socket inside a writable folder
+put its own listener in another's place. A tool a client answers, declared
+for a bot the caller makes, must be one the caller has and passes on,
+answered by the same client; another is `not_permitted`. A socket inside a writable folder
 stays read-only too. On macOS the folders between a writable folder and
 anything kept inside it (a socket, the store, a worktree's git folder) can't
 be renamed, so nothing kept can be moved to a name its rule doesn't cover. A

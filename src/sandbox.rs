@@ -65,6 +65,18 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// The socket a command in this sandbox reaches the daemon by: its
+    /// bot's own, which bubblewrap puts in the daemon's socket's place, as
+    /// Seatbelt can't.
+    pub fn reach(&self) -> Option<&Path> {
+        self.capability.as_ref()?;
+        if cfg!(target_os = "linux") {
+            self.socket.as_deref()
+        } else {
+            self.capability.as_deref()
+        }
+    }
+
     /// The policy for a bot in `mode`, whose folder is `workspace` and
     /// whose client named `writable`; `None` when its commands run
     /// unconfined. `daemon` holds what the daemon itself keeps: its store,
@@ -609,7 +621,21 @@ mod linux {
         // nothing.
         if let Some(socket) = &policy.socket {
             match &policy.capability {
-                Some(own) => args.extend(["--bind".into(), path(own), path(socket)]),
+                Some(own) => {
+                    args.extend(["--bind".into(), path(own), path(socket)]);
+                    // The other bots' sockets are out of sight: each would
+                    // answer as its own bot.
+                    if let Some(folder) = own.parent() {
+                        args.extend([
+                            "--perms".into(),
+                            "555".into(),
+                            "--tmpfs".into(),
+                            path(folder),
+                            "--remount-ro".into(),
+                            path(folder),
+                        ]);
+                    }
+                }
                 None => args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]),
             }
         }
@@ -879,6 +905,13 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         ));
     }
     if let Some(own) = &policy.capability {
+        // Not another bot's, which would answer as its own bot.
+        if let Some(folder) = own.parent() {
+            let key = param(folder);
+            sections.push(format!(
+                "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+            ));
+        }
         let key = param(own);
         sections.push(format!(
             "(allow system-socket (socket-domain AF_UNIX))\n\
@@ -1070,6 +1103,33 @@ mod tests {
             assert!(linux::args(&own, false).windows(3).any(|w| w[0] == "--bind"
                 && w[1] == base.join("own.sock").to_string_lossy()
                 && w[2] == socket.to_string_lossy()));
+            // Never another bot's, from the same folder.
+            let folder_key = params
+                .iter()
+                .find(|(_, path)| path == &base)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            let denied = format!(
+                "(deny network-outbound (remote unix-socket (subpath (param \"{folder_key}\"))))"
+            );
+            let allowed = format!(
+                "(allow network-outbound (remote unix-socket (subpath (param \"{own_key}\"))))"
+            );
+            assert!(profile.find(&denied).unwrap() < profile.find(&allowed).unwrap());
+            #[cfg(target_os = "linux")]
+            assert!(
+                linux::args(&own, false)
+                    .windows(2)
+                    .any(|w| w[0] == "--tmpfs" && w[1] == base.to_string_lossy())
+            );
+            assert_eq!(
+                own.reach(),
+                Some(if cfg!(target_os = "linux") {
+                    socket.as_path()
+                } else {
+                    own.capability.as_deref().unwrap()
+                })
+            );
         }
         std::fs::remove_dir_all(base).unwrap();
     }
