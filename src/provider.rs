@@ -890,15 +890,18 @@ impl Provider {
                 refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
-            return Err(Error {
-                code: if quota {
-                    "provider_quota_exhausted".to_owned()
-                } else {
-                    format!("provider_http_{status}")
+            return Err(waits(
+                Error {
+                    code: if quota {
+                        "provider_quota_exhausted".to_owned()
+                    } else {
+                        format!("provider_http_{status}")
+                    },
+                    detail: body.detail,
+                    facts: None,
                 },
-                detail: body.detail,
-                facts: None,
-            });
+                &headers,
+            ));
         }
         reservation.learn(response.headers(), self.family);
         // The answer is a message with no content; only its usage matters.
@@ -1144,11 +1147,14 @@ impl Provider {
             } else {
                 format!("provider_http_{status}")
             };
-            return Err(Error {
-                code,
-                detail: body.detail,
-                facts: None,
-            });
+            return Err(waits(
+                Error {
+                    code,
+                    detail: body.detail,
+                    facts: None,
+                },
+                &headers,
+            ));
         }
         reservation.learn(response.headers(), self.family);
         if self.family == Family::Responses
@@ -1531,6 +1537,20 @@ pub fn paced(code: &str) -> bool {
     )
 }
 
+/// A refusal with the wait its response asks for, as the fact
+/// `retry_after_ms`, so a retry of a server error can honour it as the
+/// providers' SDKs do.
+/// Facts the error already carries are kept.
+pub(crate) fn waits(mut error: Error, headers: &reqwest::header::HeaderMap) -> Error {
+    if let Some(after) = retry_after(headers) {
+        error
+            .facts
+            .get_or_insert_default()
+            .insert("retry_after_ms".into(), json!(after.as_millis() as u64));
+    }
+    error
+}
+
 /// Whether a paced refusal is an overload rather than a rate limit.
 pub fn overload(code: &str) -> bool {
     matches!(code, "provider_overloaded" | "provider_http_529")
@@ -1788,12 +1808,15 @@ fn looks_like_sse_prefix(body: &[u8]) -> bool {
 }
 
 /// An error code that means the account's allowance is spent, not that the
-/// pace is too fast: an API key's quota, or a ChatGPT plan's usage limit,
-/// which OpenAI says not to retry or guess a reset for.
+/// pace is too fast: an API key's quota, a ChatGPT plan's usage limit, which
+/// OpenAI says not to retry or guess a reset for, or Anthropic's spend cap,
+/// which refuses every retry until the next month.
 pub(crate) fn quota(code: &str) -> bool {
     matches!(
         code,
-        "insufficient_quota" | "subscription_sharing_usage_limit_exceeded"
+        "insufficient_quota"
+            | "subscription_sharing_usage_limit_exceeded"
+            | "enforced_spend_limit_reached"
     )
 }
 
@@ -1817,9 +1840,15 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
     }
     match serde_json::from_str::<Value>(text) {
         Ok(value) => Some(ErrorBody {
-            quota: ["code", "type"]
-                .iter()
-                .any(|field| value["error"][field].as_str().is_some_and(quota)),
+            // Anthropic's spend cap is a `rate_limit_error` told apart only
+            // by `details.error_code`.
+            quota: [
+                &value["error"]["code"],
+                &value["error"]["type"],
+                &value["error"]["details"]["error_code"],
+            ]
+            .iter()
+            .any(|field| field.as_str().is_some_and(quota)),
             detail: value
                 .as_str()
                 .or_else(|| value["error"]["message"].as_str())

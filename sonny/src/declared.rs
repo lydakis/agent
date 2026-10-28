@@ -65,6 +65,9 @@ mod tests {
     fn a_bot_is_given_sonnys_tools_beside_its_own_once() {
         let other = json!({"name": "notes", "description": "d", "parameters": {"type": "object"},
             "result": "ok"});
+        // A lead's fit beside a few of its own, by count and by size.
+        let lead = declare(&json!({"declared": [other.clone(), other.clone()]}), true).unwrap();
+        assert!(serde_json::to_vec(&lead).unwrap().len() <= DECLARED_BYTES / 2);
         let wanted = declare(&json!({"declared": [other]}), false).unwrap();
         let mut all = vec![other];
         all.extend(tools(false));

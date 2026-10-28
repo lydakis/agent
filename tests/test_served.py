@@ -4,6 +4,7 @@ call's output."""
 import json
 import os
 import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -210,6 +211,32 @@ class ServedToolTests(ModelFixture):
         self.lookout()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': []})
+
+    def test_an_agent_saves_memory_through_the_lookout(self):
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('memory')])
+        self.lookout()
+        fact = {'name': 'prefers-short', 'type': 'feedback', 'description': 'Short replies.',
+                'source': 'the person, 2026-10-28', 'text': '-'}
+        saved = json.loads(self.call('calc.lead', 'memory', {'save': fact, 'user': True}))
+        self.assertTrue(saved, saved)
+        memory = self.path / '.agents/memory'
+        self.assertIn('\n-\n', (memory / 'prefers-short.md').read_text())
+        self.assertIn('prefers-short (feedback', (memory / 'MEMORY.md').read_text())
+        shown = json.loads(self.call('calc.lead', 'memory', {'user': True}))
+        self.assertIn('Short replies.', shown['user']['index'])
+        refused = json.loads(self.call('calc.lead', 'memory', {'save': dict(fact, name='x', type='mood')}))
+        self.assertEqual(refused['error'], 'memory_refused')
+
+    @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
+    def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('triggers')])
+        self.lookout()
+        refused = json.loads(self.call('calc.lead', 'triggers', {'add': {'every': '30m', 'message': 'Check.'}}))
+        self.assertEqual(refused['error'], 'trigger_refused')
+        self.assertIn('triggers_unsupported', refused['detail'])
+        self.assertFalse((self.path / 'Library/LaunchAgents').exists())
 
     def test_a_lookout_another_build_started_gives_way(self):
         old = self.lookout()

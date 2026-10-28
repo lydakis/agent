@@ -297,16 +297,18 @@ off again never shows.
   the background, which outlives Sonny; Sonny mounts task copies a restart
   unmounted again when it opens the lead, but not those whose task is gone,
   which it names instead.
-- **Needs you:** when the lead needs the person to decide something, it
-  calls its `ask` tool with the question and up to nine choices. Sonny
-  pins the open questions above the composer, oldest first, until each is
-  answered: what you type next answers the first (a choice's number picks
-  it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
-  sets the questions aside for a message of your own, and Esc again goes
-  back to them. The open questions are read from the lead's history (its
-  `ask` calls not yet answered), so one asked while Sonny was closed is
-  pinned when it opens; Sonny keeps them in `~/.agent/sonny/asks` too, so
-  one asked before the history it replays still comes back.
+- **Decisions:** when the lead reaches a fork in the road, an
+  architectural choice or a step that cannot be undone, it calls its `ask`
+  tool with the question, why it asks, two to four options each with what
+  picking it means, and the one it recommends and why. Sonny draws the
+  decision in the conversation where it was asked, and the composer's hint
+  names it: what you type next answers it (an option's number picks it),
+  and goes to the lead as `You asked: QUESTION` and your answer. Esc sets
+  it aside for a message of your own, and Esc again goes back to it. The
+  lead does not wait: it goes on with the option it recommends when that
+  can be undone, or ends its turn. Open questions are read from the
+  history Sonny replays (its `ask` calls not yet answered), so one asked
+  while Sonny was closed is answered the same way when it opens.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
@@ -325,7 +327,8 @@ every Sonny window closed; a call nobody answers in time ends as
 verdict wherever the agent's other calls do (`/approvals`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
-and a pane runs a command outside the agent's sandbox. An agent whose
+a pane runs a command outside the agent's sandbox, and a trigger is a
+LaunchAgent that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
@@ -336,7 +339,7 @@ that one reopens it.
 
 ![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 
-![A plan and a question set with the plan and ask tools](../docs/sonny/ask-and-plan.png)
+![A decision the lead asked with the ask tool, drawn where it asked it](../docs/sonny/ask-asked.png)
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
@@ -347,7 +350,9 @@ in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
 and `sonny trigger ...` (launchd jobs that wake an agent, on a Mac), which
-other harnesses, scripts and launchd run too. A skill Sonny wrote is rewritten when Sonny's
+other harnesses, scripts and launchd run too; Sonny's own agents use the
+`memory` and `triggers` tools instead, which the lookout answers outside
+their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an

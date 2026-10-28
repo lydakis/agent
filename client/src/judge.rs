@@ -307,9 +307,13 @@ async fn read_reply(mut response: reqwest::Response) -> Result<Vec<u8>, &'static
 /// is deleted once it answers; this is for a judge that stopped mid-check.
 const FORK_EXPIRE_MS: u64 = 60_000;
 
-/// A model the daemon runs, as an idle base bot holding the judge's model
-/// and instructions and no tools. Each check forks it, takes one turn, and
-/// deletes the fork once it answers.
+/// The tools of a judge that may look before it answers: read-only, as
+/// Codex's guardian runs, in a read-only sandbox with no network.
+pub const LOOKING: [&str; 2] = ["shell", "read"];
+
+/// A model the daemon runs, as an idle base bot holding the judge's model,
+/// instructions, and tools: none, or `LOOKING`. Each check forks it, takes
+/// one turn, and deletes the fork once it answers.
 pub struct Base {
     pub name: String,
     /// The base's identity, which each fork names as its creator.
@@ -322,16 +326,18 @@ pub struct Base {
 pub const FORK_SUFFIX: usize = ".9223372036854775807.4294967295.18446744073709551615".len();
 
 impl Base {
-    /// The base `name` running `model` at `effort` with `instructions`:
-    /// kept when it already is that judge, made anew when it is another,
-    /// so a changed judge takes effect. A bot of that name that is not a
-    /// judge at all is refused, never deleted.
+    /// The base `name` running `model` at `effort` with `instructions`
+    /// and `tools`, `LOOKING` ones run in a read-only sandbox: kept when it
+    /// already is that judge, made anew when it is another or an older
+    /// version of it, so a changed judge takes effect. A bot of that name
+    /// that is not a judge at all is refused, never deleted.
     pub async fn make(
         client: &Client,
         name: &str,
         model: &str,
         effort: Option<&str>,
         instructions: &str,
+        tools: &[&str],
     ) -> crate::Result<Self> {
         let judge = |bot: &Value| is_judge(bot, instructions);
         let same = |bot: &Value| {
@@ -341,7 +347,14 @@ impl Base {
                 bot["model"].as_str().unwrap_or_default()
             ) == model
                 && bot["effort"].as_str() == effort
+                && bot["instructions"] == instructions
+                && bot["tools"] == json!(tools)
         };
+        let mut made = json!({"bot": name, "workspace": "/", "model": model, "effort": effort,
+            "instructions": instructions, "tools": tools});
+        if !tools.is_empty() {
+            made["settings"] = json!({"sandbox": "read-only"});
+        }
         let base = |bot: &Value| {
             Ok(Self {
                 name: name.to_owned(),
@@ -366,13 +379,7 @@ impl Base {
             Err(error) if error.code == "bot_not_found" => {}
             Err(error) => return Err(error),
         }
-        let made = client
-            .request(
-                "create",
-                json!({"bot": name, "workspace": "/", "model": model, "effort": effort,
-                    "instructions": instructions, "tools": []}),
-            )
-            .await;
+        let made = client.request("create", made).await;
         match made {
             Ok(made) => base(&made),
             // Another judge made it first.
@@ -399,17 +406,20 @@ impl Base {
         ids: &[&str],
         deadline: Instant,
     ) -> Result<(Answers, Usage), Failed> {
-        self.ask_with(client, prompt, ids, probabilities, deadline)
+        self.ask_with(client, prompt, ids, probabilities, None, deadline)
             .await
     }
 
-    /// One check whose reply `parse` reads as answers to every id.
+    /// One check whose reply `parse` reads as answers to every id, its
+    /// fork started in `workspace` (else `/`), where a judge with tools
+    /// looks. A workspace since removed starts it in `/`.
     pub async fn ask_with(
         &self,
         client: &Client,
         prompt: &str,
         ids: &[&str],
         parse: Parse,
+        workspace: Option<&str>,
         deadline: Instant,
     ) -> Result<(Answers, Usage), Failed> {
         let name = format!(
@@ -419,15 +429,23 @@ impl Base {
             std::process::id(),
             self.next.fetch_add(1, Ordering::Relaxed)
         );
-        client
-            .request(
+        let fork = |workspace: &str| {
+            client.request(
                 "fork",
-                json!({"source": self.name, "bot": name, "workspace": "/",
+                json!({"source": self.name, "bot": name, "workspace": workspace,
                     "created_by": self.name, "created_by_id": self.id,
                     "expire_ms": FORK_EXPIRE_MS}),
             )
-            .await
-            .map_err(|error| failed(format!("the judge could not start: {}", error.code)))?;
+        };
+        let forked = match fork(workspace.unwrap_or("/")).await {
+            Err(error)
+                if workspace.is_some() && error.code == "workspace_must_exist_and_be_absolute" =>
+            {
+                fork("/").await
+            }
+            forked => forked,
+        };
+        forked.map_err(|error| failed(format!("the judge could not start: {}", error.code)))?;
         let (answered, running) = turn_with(client, &name, prompt, ids, parse, deadline).await;
         remove(client, &name, running).await;
         answered
@@ -443,10 +461,25 @@ pub fn probabilities(reply: &str, ids: &[&str]) -> Option<Answers> {
     model_answers(reply, ids.iter().copied())
 }
 
-/// Whether a bot record is a judge given `instructions`: no tools, and
-/// those instructions exactly.
+/// Whether a bot record is a judge given `instructions`, or an older
+/// version of them: their first sentence, which names what the judge
+/// does, and no tools but `LOOKING` ones, those in a read-only sandbox.
 pub fn is_judge(bot: &Value, instructions: &str) -> bool {
-    bot["tools"].as_array().is_some_and(Vec::is_empty) && bot["instructions"] == instructions
+    let first = |text: &str| {
+        text.split_once(". ")
+            .map_or(text, |(first, _)| first)
+            .to_owned()
+    };
+    let Some(tools) = bot["tools"].as_array() else {
+        return false;
+    };
+    bot["instructions"]
+        .as_str()
+        .is_some_and(|said| first(said) == first(instructions))
+        && tools
+            .iter()
+            .all(|tool| LOOKING.iter().any(|looking| tool == looking))
+        && (tools.is_empty() || bot["settings"]["sandbox"] == "read-only")
 }
 
 /// One turn of a judge's fork `name`: its probabilities for every id by
@@ -627,11 +660,29 @@ mod tests {
     }
 
     #[test]
-    fn only_a_tool_less_bot_with_the_judges_instructions_is_a_judge() {
-        let said = "Answer yes or no.";
+    fn a_judge_has_its_first_sentence_and_only_read_only_tools() {
+        let said = "Answer yes or no. Reply in JSON.";
         assert!(is_judge(&json!({"tools": [], "instructions": said}), said));
+        // An older version of the same judge is still one, to be remade.
+        let older = json!({"tools": [], "instructions": "Answer yes or no. Reply in YAML."});
+        assert!(is_judge(&older, said));
+        let looking = json!({"tools": ["shell", "read"], "instructions": said,
+            "settings": {"sandbox": "read-only"}});
+        assert!(is_judge(&looking, said));
+        // Tools outside a read-only sandbox, or ones that write, are not a
+        // judge's.
         assert!(!is_judge(
             &json!({"tools": ["shell"], "instructions": said}),
+            said
+        ));
+        assert!(!is_judge(
+            &json!({"tools": ["shell"], "instructions": said,
+                "settings": {"sandbox": "workspace-write"}}),
+            said
+        ));
+        assert!(!is_judge(
+            &json!({"tools": ["write"], "instructions": said,
+                "settings": {"sandbox": "read-only"}}),
             said
         ));
         assert!(!is_judge(

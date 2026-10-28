@@ -237,7 +237,8 @@ mod tests {
                 "remove_task",
                 "new_project",
                 "subscriptions",
-                "run_in_pane"
+                "run_in_pane",
+                "triggers"
             ])
         );
     }

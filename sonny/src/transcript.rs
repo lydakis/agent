@@ -586,6 +586,14 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     if let Some(from) = from {
         out.push(Line::from(format!("  from {from}")).dim());
     }
+    // An answer to the lead's question says which, and shows the answer.
+    let text = match crate::asks::split(text) {
+        Some((question, answer)) => {
+            out.push(crate::asks::answering(question, width));
+            answer
+        }
+        None => text,
+    };
     // A long paste shows its start; the rest is in the conversation.
     let lines: Vec<&str> = text.lines().collect();
     let shown = if lines.len() > PROMPT_LINES + 2 {
@@ -1447,6 +1455,15 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_shows_itself_under_the_question_it_answers() {
+        let shown: Vec<String> = prompt("You asked: Ship it?\n\nNot yet", None, 80)
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        assert_eq!(shown, ["  answering “Ship it?”", "› Not yet"]);
+    }
+
+    #[test]
     fn task_updates_and_lookout_notes_read_as_one_quiet_row() {
         let told = "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
                     - shop.fix: turn:shop.fix/5 failed, asked by you\n\
@@ -1689,7 +1706,8 @@ mod tests {
         );
         let asked = clean(
             "ask",
-            serde_json::json!({"question": "Ship it?", "choices": ["yes", "no"]}),
+            serde_json::json!({"question": "Ship it?", "options": [
+                {"label": "yes", "explanation": "e"}, {"label": "no", "explanation": "e"}]}),
             "Asked.",
         );
         assert_eq!(asked, ["• Asked you Ship it?", "  └ 1 yes · 2 no"]);
@@ -1719,6 +1737,34 @@ mod tests {
             [
                 "• Moved calc.fix to a split right of you",
                 "  └ neither rex nor herdr was found"
+            ]
+        );
+        // Memory and triggers through their tools read as their scripts do.
+        let saved = clean(
+            "memory",
+            serde_json::json!({"save": {"name": "deploys", "type": "feedback",
+                "description": "Deploys wait for review.", "source": "s", "text": "t"}}),
+            "{}",
+        );
+        assert_eq!(
+            saved,
+            ["• Saved to memory deploys", "  └ Deploys wait for review."]
+        );
+        assert!(clean("memory", serde_json::json!({}), "{}").is_empty());
+        let scheduled = text(&super::clean(
+            "triggers",
+            &serde_json::json!({"add": {"every": "30m", "message": "Check the queue."}}),
+            Some(r#"{"error":"trigger_refused","detail":"triggers_unsupported: only macOS"}"#),
+            true,
+            "/w",
+            80,
+        ));
+        assert_eq!(
+            scheduled,
+            [
+                "• Scheduled every 30m",
+                "  └ triggers_unsupported: only macOS",
+                "    Check the queue."
             ]
         );
         assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());

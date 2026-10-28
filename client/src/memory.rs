@@ -55,6 +55,55 @@ pub fn cli(args: &[String]) -> i32 {
     }
 }
 
+/// A `memory` call of an agent working in `cwd`, as a client's tool takes
+/// it: the script's commands but `schedule`, which is the person's, with
+/// the fact's text in the call. `save {name, type, description, source,
+/// text}`, `remove` NAME, `index`, `check`, `changed` or `cleanup` (`start`
+/// or `finish`); with none, `show`. `user` or `project` picks the scope.
+pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+    let mut scope = Vec::new();
+    if arguments["user"] == true {
+        scope.push("--user".to_owned());
+    } else if let Some(project) = arguments["project"].as_str() {
+        scope.extend(["--project".to_owned(), project.to_owned()]);
+    }
+    let save = &arguments["save"];
+    let mut args: Vec<String> = if save.is_object() {
+        let mut args = vec!["save".to_owned(), text(&save["name"])];
+        for (key, flag) in [
+            ("type", "--type"),
+            ("description", "--description"),
+            ("source", "--source"),
+        ] {
+            args.extend([flag.to_owned(), text(&save[key])]);
+        }
+        args
+    } else if let Some(name) = arguments["remove"].as_str() {
+        vec!["rm".to_owned(), name.to_owned()]
+    } else if let Some(step) = arguments["cleanup"].as_str() {
+        vec!["cleanup".to_owned(), step.to_owned()]
+    } else if arguments["changed"] == true {
+        vec!["changed".to_owned()]
+    } else if arguments["index"] == true {
+        vec!["index".to_owned()]
+    } else if arguments["check"] == true {
+        vec!["check".to_owned()]
+    } else {
+        vec!["show".to_owned()]
+    };
+    if !matches!(args[0].as_str(), "cleanup" | "changed") {
+        args.extend(scope);
+    }
+    if save.is_object() {
+        args.extend(["--".to_owned(), text(&save["text"])]);
+    }
+    // The text is the call's own: a lone "-" is that text, not stdin.
+    run(&home.join(".agents/memory"), cwd, &args, &|| {
+        Ok("-".to_owned())
+    })
+}
+
 fn stdin() -> Result<String, String> {
     let mut text = String::new();
     std::io::stdin()
