@@ -3,7 +3,7 @@
 //! `~/.agents/memory/projects/NAME`, outside its checkout, so its lead and
 //! every task's worktree share one copy whatever is committed. Each folder's
 //! `MEMORY.md` is an index generated from the facts' front matter and kept
-//! within 4 KiB, so reading it at the start of every task stays cheap; a
+//! within 16 KiB, so reading it at the start of every task stays cheap; a
 //! save that would pass that is refused until facts are merged or removed.
 //! The daemon knows nothing of memory.
 //!
@@ -21,8 +21,9 @@ use std::{
 };
 
 /// A fact file, front matter included, and a folder's index: each at most
-/// this. Small on purpose, like Hermes' and Claude Code's memory indexes.
-const LIMIT: usize = 4096;
+/// this. Bounded, so every task can read the index whole, and roomy enough
+/// that a busy project's leads and tasks do not spend turns trimming it.
+const LIMIT: usize = 16 * 1024;
 /// Entries a folder may hold, facts or not, before it is refused as not a
 /// memory folder.
 const MAX_ENTRIES: usize = 1024;

@@ -78,7 +78,7 @@ EOF
   helps, **How to apply:**. Write dates as dates, not "today" or "last
   week".
 
-A fact file is at most 4 KiB, and so is each index. A save that would push
+A fact file is at most 16 KiB, and so is each index. A save that would push
 the index past that is refused with `memory_full`, and nothing changes.
 Merge related facts into one, or remove one that no longer holds, then
 save again. `check` reports any file that is not a valid fact and an index
