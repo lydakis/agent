@@ -59,12 +59,13 @@ impl Image {
 }
 
 /// What `images` add to the item they go in beyond their weight: their
-/// encoded bytes less what they weigh. Context accounting leaves this out,
-/// so a picture counts at its token cost rather than its size.
-pub fn pictured(images: &[Image]) -> usize {
+/// encoded bytes less what they weigh, which is negative for a picture that
+/// compresses to less than it costs. Context accounting leaves this out, so
+/// a picture counts at its token cost rather than its size.
+pub fn pictured(images: &[Image]) -> i64 {
     images
         .iter()
-        .map(|image| image.data.len().saturating_sub(image.weight()))
+        .map(|image| image.data.len() as i64 - image.weight() as i64)
         .sum()
 }
 
@@ -393,10 +394,13 @@ mod tests {
         };
         assert_eq!(unreadable.weight(), 6400);
         // What a picture adds beyond its weight is left out of accounting;
-        // one smaller than its weight adds nothing.
+        // one smaller than its weight still counts at its weight.
         let shot = png(40, 30);
-        assert_eq!(pictured(std::slice::from_ref(&shot)), shot.data.len() - 8);
-        assert_eq!(pictured(&[unreadable]), 0);
+        assert_eq!(
+            pictured(std::slice::from_ref(&shot)),
+            shot.data.len() as i64 - 8
+        );
+        assert_eq!(pictured(&[unreadable]), 12 - 6400);
     }
     #[test]
     fn pictures_follow_the_words_in_each_familys_shape() {

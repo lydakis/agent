@@ -2650,7 +2650,9 @@ and bytes, in each family's result shape: a list of an `input_text` and an
 Anthropic. One longer than 1568 pixels on a side is scaled down to it, and one
 over 1 MiB as sent is re-encoded as a JPEG, so a screenshot fits what every
 provider takes. Any other binary file is `file_not_text`, naming its kind, and
-an image that cannot be decoded is `invalid_image`. `write` creates parent
+an image that cannot be decoded is `invalid_image`. One that must be scaled
+but has more than 64 megapixels is `image_limit`, refused before it is
+decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
 directories and writes up to
 1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
 is set. Paths are relative to the workspace unless absolute; nothing confines a

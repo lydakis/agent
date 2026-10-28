@@ -71,7 +71,7 @@ struct Span<'a> {
     ids: &'a [i64],
     sizes: &'a [u32],
     thinking: &'a [u32],
-    pictured: &'a [u32],
+    pictured: &'a [i32],
     elided: i64,
 }
 impl Span<'_> {
@@ -107,13 +107,14 @@ fn fingerprint(prefix: &[u8], first: i64, url: &str, model: &str) -> i64 {
 }
 
 /// Split window items into read-ahead batches by count and by bytes.
-fn batches(ids: &[i64], sizes: &[u32], pictured: &[u32]) -> Vec<Vec<i64>> {
+fn batches(ids: &[i64], sizes: &[u32], pictured: &[i32]) -> Vec<Vec<i64>> {
     let mut out: Vec<Vec<i64>> = Vec::with_capacity(ids.len().div_ceil(WINDOW_BATCH));
     let mut bytes = 0u64;
     for (index, id) in ids.iter().enumerate() {
         // Read as stored: with its pictures' bytes.
-        let size = u64::from(sizes.get(index).copied().unwrap_or(0))
-            + u64::from(pictured.get(index).copied().unwrap_or(0));
+        let size = (i64::from(sizes.get(index).copied().unwrap_or(0))
+            + i64::from(pictured.get(index).copied().unwrap_or(0)))
+        .max(0) as u64;
         let full = out
             .last()
             .is_some_and(|b| b.len() >= WINDOW_BATCH || bytes + size > WINDOW_BATCH_BYTES);
@@ -822,10 +823,10 @@ impl Turn {
             + ids.len().saturating_sub(1)
             + tail.len())
         .saturating_sub(stripped);
-        let pictures: usize = pictured.iter().map(|&bytes| bytes as usize).sum();
+        let pictures: i64 = pictured.iter().map(|&bytes| i64::from(bytes)).sum();
         let (store, chunks): (_, Arc<[_]>) =
             (self.store.clone(), batches(ids, sizes, pictured).into());
-        Items::weighing(weight + pictures, weight, move || {
+        Items::weighing((weight as i64 + pictures) as usize, weight, move || {
             let items = stream::iter([Ok(prefix.clone())]).chain(item_chunks(
                 store.clone(),
                 chunks.clone(),
@@ -1882,20 +1883,24 @@ impl Turn {
             self.store.clone(),
             batches(&plan.ids, &plan.sizes, &plan.pictured).into(),
         );
-        let pictures: usize = plan.pictured.iter().map(|&bytes| bytes as usize).sum();
+        let pictures: i64 = plan.pictured.iter().map(|&bytes| i64::from(bytes)).sum();
         // Elided results go as the stubs the model last saw.
         let elided = plan.elided;
-        Ok(Items::weighing(total + pictures, total, move || {
-            stream::iter([Ok(head.clone())])
-                .chain(item_chunks(
-                    store.clone(),
-                    chunks.clone(),
-                    Strip::from(i64::MAX),
-                    elided,
-                ))
-                .chain(stream::iter([Ok(tail.clone())]))
-                .boxed()
-        }))
+        Ok(Items::weighing(
+            (total as i64 + pictures) as usize,
+            total,
+            move || {
+                stream::iter([Ok(head.clone())])
+                    .chain(item_chunks(
+                        store.clone(),
+                        chunks.clone(),
+                        Strip::from(i64::MAX),
+                        elided,
+                    ))
+                    .chain(stream::iter([Ok(tail.clone())]))
+                    .boxed()
+            },
+        ))
     }
 
     async fn rounds(

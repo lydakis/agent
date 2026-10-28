@@ -892,9 +892,10 @@ pub struct Window {
     pub sizes: Vec<u32>,
     /// Bytes each item loses when sent without its thinking blocks.
     pub thinking: Vec<u32>,
-    /// What each item's pictures add to its length beyond their weight:
-    /// an item is sent with `sizes` plus these bytes.
-    pub pictured: Vec<u32>,
+    /// What each item's pictures add to its length beyond their weight
+    /// (less, for one that compresses to less than it costs): an item is
+    /// sent with `sizes` plus these bytes.
+    pub pictured: Vec<i32>,
     /// Sum of item weights, without separators.
     pub item_bytes: i64,
     /// Full unsummarized span, even when the bounded window omits a backlog.
@@ -996,7 +997,7 @@ pub struct CompactionPlan {
     pub ids: Vec<i64>,
     pub sizes: Vec<u32>,
     /// What each node's pictures add to its length beyond their weight.
-    pub pictured: Vec<u32>,
+    pub pictured: Vec<i32>,
     /// The covered turns' user prompts, bounded, oldest first.
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
@@ -2592,17 +2593,18 @@ impl Database {
             None => None,
         };
         let clamp = |bytes: i64| bytes.clamp(0, u32::MAX as i64) as u32;
+        let signed = |bytes: i64| bytes.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let (mut ids, mut sizes, mut thinking, mut pictured) = match pinned {
             // A prompt carries no thinking.
             Some((id, size, .., pictures)) => {
-                (vec![id], vec![clamp(size)], vec![0], vec![clamp(pictures)])
+                (vec![id], vec![clamp(size)], vec![0], vec![signed(pictures)])
             }
             None => Default::default(),
         };
         ids.extend(window.iter().rev().map(|r| r.id));
         sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
         thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
-        pictured.extend(window.iter().rev().map(|r| clamp(r.pictured)));
+        pictured.extend(window.iter().rev().map(|r| signed(r.pictured)));
         // The view since the summary includes the prompt it keeps in full.
         let mut unsummarized = state.unsummarized;
         if let Some((_, size, ..)) = state.pinned {
@@ -3334,7 +3336,7 @@ impl Database {
         for (id, size, seq, prompt, pictures) in span {
             ids.push(id);
             sizes.push(size.clamp(0, u32::MAX as i64) as u32);
-            pictured.push(pictures.clamp(0, u32::MAX as i64) as u32);
+            pictured.push(pictures.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
             if let (Some(seq), Some(prompt)) = (seq, prompt) {
                 from = from.min(seq);
                 to = to.max(seq);
@@ -4607,7 +4609,7 @@ impl Database {
         // Each steer's id, item, prompt size, whether it was attached (which
         // no pending count holds), its pictures' JSON, and what they add
         // beyond their weight.
-        type Steer = (i64, Vec<u8>, usize, bool, Option<String>, usize);
+        type Steer = (i64, Vec<u8>, usize, bool, Option<String>, i64);
         let mut steers: Vec<Steer> = Vec::new();
         let mut more = false;
         let mut capped = false;
@@ -4653,7 +4655,7 @@ impl Database {
                 let item = family.user_item_with(&row.get::<_, String>(1)?, &pictures)?;
                 // Its pictures count at their weight, as the node will.
                 let pictured = crate::codec::pictured(&pictures);
-                let weight = item.len() - pictured;
+                let weight = (item.len() as i64 - pictured) as usize;
                 if weight + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
@@ -5016,7 +5018,7 @@ impl Database {
         // result weighs over it.
         let next = next_node(&tx)?;
         let pictured = crate::codec::pictured(&outcome.images);
-        let weight = item.len() - pictured;
+        let weight = (item.len() as i64 - pictured) as usize;
         let stub = if !outcome.images.is_empty() {
             super::context::picture_stub(family, call_id, &outcome.output, weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
@@ -9426,7 +9428,7 @@ fn node_with_turn(
     parent: Option<i64>,
     item: &[u8],
     turn: Option<i64>,
-    pictured: usize,
+    pictured: i64,
 ) -> Result<i64> {
     insert_node(conn, parent, item, turn, 0, pictured)
 }
@@ -9470,7 +9472,7 @@ fn insert_node(
     item: &[u8],
     turn: Option<i64>,
     elided: i64,
-    pictured: usize,
+    pictured: i64,
 ) -> Result<i64> {
     let (bytes, depth, saved, thought): (i64, i64, i64, i64) = match parent {
         Some(id) => conn
@@ -9501,7 +9503,7 @@ fn insert_node(
     .execute(params![
         parent,
         item,
-        bytes + (item.len() - pictured) as i64,
+        bytes + item.len() as i64 - pictured,
         depth + 1,
         turn,
         turn_seq,
@@ -9509,7 +9511,7 @@ fn insert_node(
         elided,
         saved + elided,
         thought + thinking,
-        pictured as i64
+        pictured
     ])?;
     Ok(conn.last_insert_rowid())
 }

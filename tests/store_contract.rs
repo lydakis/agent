@@ -9380,7 +9380,11 @@ fn sent(db: &Database, window: &agent_runtime::store::Window) -> Vec<Value> {
     let mut items = Vec::new();
     for ((id, size), pictured) in window.ids.iter().zip(&window.sizes).zip(&window.pictured) {
         let bytes = db.items_by_ids(&[*id], 0, window.elided).unwrap();
-        assert_eq!(bytes.len(), (size + pictured) as usize, "node {id}");
+        assert_eq!(
+            bytes.len() as i64,
+            i64::from(*size) + i64::from(*pictured),
+            "node {id}"
+        );
         items.push(serde_json::from_slice(&bytes).unwrap());
     }
     let joined = db.items_by_ids(&window.ids, 0, window.elided).unwrap();
@@ -9411,6 +9415,43 @@ fn noise(side: u32) -> agent_runtime::codec::Image {
         media_type: "image/png".into(),
         data: base64::engine::general_purpose::STANDARD.encode(png),
     }
+}
+
+#[test]
+fn a_picture_that_compresses_below_its_cost_counts_at_its_cost() {
+    use base64::Engine;
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // A blank 1568 × 1568 PNG is a few KB, and still 1600 tokens.
+    let mut png = Vec::new();
+    image::GrayImage::new(1568, 1568)
+        .write_with_encoder(image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Best,
+            image::codecs::png::FilterType::NoFilter,
+        ))
+        .unwrap();
+    let blank = agent_runtime::codec::Image {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png),
+    };
+    assert!(blank.data.len() < blank.weight());
+    db.begin(
+        "Bob",
+        "r1",
+        "look",
+        true,
+        &TurnOptions {
+            images: vec![blank.clone()],
+            ..TurnOptions::default()
+        },
+        allow_provider,
+    )
+    .unwrap();
+    let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert!(window.item_bytes > 6400, "{}", window.item_bytes);
+    assert!(window.pictured[0] < 0, "{:?}", window.pictured);
+    sent(&db, &window);
 }
 
 #[test]
@@ -9479,8 +9520,9 @@ fn pictures_count_at_their_weight_and_go_whole() {
         .unwrap()
         .unwrap();
     let raw = db.items_by_ids(&plan.ids, 0, plan.elided).unwrap();
-    let span: u32 = plan.sizes.iter().chain(&plan.pictured).sum();
-    assert_eq!(raw.len(), span as usize + plan.ids.len() - 1);
+    let span: i64 = plan.sizes.iter().map(|&s| i64::from(s)).sum::<i64>()
+        + plan.pictured.iter().map(|&p| i64::from(p)).sum::<i64>();
+    assert_eq!(raw.len() as i64, span + plan.ids.len() as i64 - 1);
     // Elided, the result goes as its text, and its picture no longer adds
     // to what it sends.
     let elision = db.elision_plan("Bob", 1, 1).unwrap().unwrap();

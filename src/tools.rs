@@ -1051,7 +1051,7 @@ impl Registry {
                 let bytes = read_bounded(&resolve(workspace, &path)).await?;
                 // A picture goes to the model as one, after a line on it.
                 if binary(&bytes).is_some()
-                    && let Some((image, line)) = picture::read(&bytes)?
+                    && let Some((image, line)) = picture::read_apart(bytes.clone()).await?
                 {
                     return Ok(Outcome {
                         images: vec![image],

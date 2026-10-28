@@ -14,9 +14,27 @@ const LONGEST: u32 = crate::codec::LONGEST_SIDE;
 /// under the 5 MB Anthropic takes for one.
 const MOST_BYTES: usize = 1024 * 1024;
 
+/// The most pixels a picture may have to be scaled: decoding one takes
+/// four bytes a pixel, and a small file can hold a large picture.
+const MOST_PIXELS: u64 = 64 << 20;
+
+/// `read`, in a blocking worker and one picture at a time: decoding and
+/// scaling are CPU work that would hold up every bot on the daemon's thread,
+/// and each one can take hundreds of megabytes while it runs.
+pub async fn read_apart(bytes: Vec<u8>) -> Result<Option<(Image, String)>> {
+    static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let _turn = ONE
+        .acquire()
+        .await
+        .map_err(|_| Error::new("invalid_image"))?;
+    tokio::task::spawn_blocking(move || read(&bytes))
+        .await
+        .map_err(|_| Error::new("invalid_image"))?
+}
+
 /// The picture an image file holds, with a line for the model on what it
 /// is; `None` for a file that is not one of the four kinds providers take.
-pub fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
+fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
     let (format, media_type, kind) = match bytes {
         [0x89, b'P', b'N', b'G', ..] => (ImageFormat::Png, "image/png", "PNG"),
         [0xff, 0xd8, 0xff, ..] => (ImageFormat::Jpeg, "image/jpeg", "JPEG"),
@@ -55,7 +73,20 @@ pub fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
             format!("a {kind} image, {width}×{height}, {size} bytes; it follows"),
         )
     } else {
-        let picture = image::load_from_memory_with_format(bytes, format).map_err(unreadable)?;
+        if u64::from(width) * u64::from(height) > MOST_PIXELS {
+            return Err(Error::with(
+                "image_limit",
+                format!(
+                    "a {kind} image of {width}×{height} pixels is too large to scale; the most is 64 megapixels"
+                ),
+            ));
+        }
+        // A wide pixel format can still take more than four bytes a pixel.
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(4 * MOST_PIXELS);
+        let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+        reader.limits(limits);
+        let picture = reader.decode().map_err(unreadable)?;
         let scaled = match width.max(height) > LONGEST {
             true => picture.resize(LONGEST, LONGEST, FilterType::CatmullRom),
             false => picture,
@@ -158,6 +189,23 @@ mod tests {
         assert_eq!(image.media_type, "image/jpeg");
         assert_eq!(decoded(&image).dimensions(), (1200, 900));
         assert!(line.contains("it follows as a JPEG of"), "{line}");
+    }
+
+    #[test]
+    fn a_picture_too_large_to_scale_is_refused_before_it_is_decoded() {
+        // A small PNG that says it is 12000 × 12000: decoded, 432 MB.
+        let mut bomb = png(10, 10);
+        bomb[16..20].copy_from_slice(&12000u32.to_be_bytes());
+        bomb[20..24].copy_from_slice(&12000u32.to_be_bytes());
+        let crc = bomb[12..29].iter().fold(!0u32, |crc, &byte| {
+            (0..8).fold(crc ^ u32::from(byte), |crc, _| {
+                (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg())
+            })
+        });
+        bomb[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        let error = read(&bomb).unwrap_err();
+        assert_eq!(error.code, "image_limit");
+        assert!(error.to_string().contains("12000×12000"), "{error}");
     }
 
     #[test]
