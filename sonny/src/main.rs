@@ -4607,7 +4607,18 @@ impl App {
     /// A picture for the message being written, behind a placeholder put
     /// where the cursor is; or why there is none.
     fn attach(&mut self, picture: Result<attach::Picture, String>) {
+        // The daemon takes a message's pictures up to a size together.
+        let placed: usize = (self.placed(&self.input).iter())
+            .map(|placed| placed.data.len())
+            .sum();
         match picture {
+            Ok(picture) if placed + picture.data.len() > attach::MOST_BYTES => {
+                self.notice = Some(format!(
+                    "a message's pictures may be {} MB together; this one makes {} MB",
+                    attach::MOST_BYTES / 1024 / 1024,
+                    (placed + picture.data.len()).div_ceil(1024 * 1024)
+                ));
+            }
             Ok(picture) => {
                 self.pictures.push(picture);
                 self.input
@@ -6630,6 +6641,16 @@ mod tests {
             Some(json!([{"media_type": "image/png", "data": "Ag=="}]))
         );
         assert_eq!(attach::submitted(&[]), None);
+        // Pictures past what a message takes together are not attached.
+        app.input.clear();
+        let large = || attach::Picture {
+            media_type: "image/jpeg",
+            data: vec![0; 3 << 20],
+        };
+        app.attach(Ok(large()));
+        app.attach(Ok(large()));
+        assert_eq!(app.placed(&app.input).len(), 1);
+        assert!(app.notice.as_deref().unwrap().contains("5 MB together"));
     }
 
     #[tokio::test]

@@ -22,6 +22,9 @@ const PROMPT_SHARE_BYTES: usize = 4096;
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
+/// The most bytes of pictures one absorption takes in, past its first
+/// steer's: a message's pictures may be 5 MiB once decoded.
+const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
@@ -4621,7 +4624,7 @@ impl Database {
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
-                    s.status='attached',s.images
+                    s.status='attached',length(s.images)
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -4637,7 +4640,7 @@ impl Database {
                 through,
                 attached
             ])?;
-            let mut bytes = 0;
+            let (mut bytes, mut picture_bytes) = (0, 0);
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
                 if !row.get::<_, bool>(3)? {
@@ -4649,8 +4652,21 @@ impl Database {
                     more = !steers.is_empty();
                     break;
                 }
+                // Pictures are read only once they fit their own budget,
+                // which the first steer's always do; the rest wait for the
+                // next batch.
+                let pictured_size = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as usize;
+                if !steers.is_empty() && pictured_size > STEER_BATCH_PICTURE_BYTES - picture_bytes {
+                    more = true;
+                    break;
+                }
                 bytes += size;
-                let images: Option<String> = row.get(5)?;
+                picture_bytes += pictured_size;
+                let id: i64 = row.get(0)?;
+                let images: Option<String> = self
+                    .conn
+                    .prepare_cached("SELECT images FROM turns WHERE id=?")?
+                    .query_row([id], |r| r.get(0))?;
                 let pictures = images_from(images.as_deref())?;
                 let item = family.user_item_with(&row.get::<_, String>(1)?, &pictures)?;
                 // Its pictures count at their weight, as the node will.
@@ -4662,7 +4678,7 @@ impl Database {
                 }
                 room_bytes -= weight + 1;
                 room_items -= 1;
-                steers.push((row.get(0)?, item, size, row.get(4)?, images, pictured));
+                steers.push((id, item, size, row.get(4)?, images, pictured));
             }
         }
         let mut absorbed = Absorbed {

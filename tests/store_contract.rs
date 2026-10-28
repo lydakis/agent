@@ -12104,3 +12104,62 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
     db.process_finish(process, &json!({}), &[]).unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
 }
+
+#[test]
+fn steer_batches_bound_the_bytes_of_their_pictures() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin(
+            "Bob",
+            "first",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Each picture is 3.2 MB of base64, so two fit a batch and the third
+    // waits for the next.
+    let shot = noise(900);
+    assert!(shot.data.len() > 3 << 20);
+    let mut submitted = Vec::new();
+    for n in 0..3 {
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            images: vec![shot.clone()],
+            ..TurnOptions::default()
+        };
+        submitted.push(
+            db.begin(
+                "Bob",
+                &n.to_string(),
+                "look",
+                true,
+                &options,
+                allow_provider,
+            )
+            .unwrap()
+            .turn,
+        );
+    }
+    let absorb = |db: &mut agent_runtime::store::Database, through| {
+        db.absorb(
+            first,
+            through,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let absorbed = absorb(&mut db, None);
+    let seen: Vec<_> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
+    assert_eq!(seen, submitted[..2]);
+    let absorbed = absorb(&mut db, absorbed.next_through);
+    assert_eq!(absorbed.outcomes[0].0, submitted[2]);
+    assert!(absorbed.next_through.is_none());
+}

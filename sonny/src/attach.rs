@@ -16,9 +16,10 @@ pub struct Picture {
 /// detail keeps of a screenshot's shorter side.
 const LONGEST: u32 = 1568;
 
-/// The most bytes a picture that is not a PNG, and so is sent as it is,
-/// may have: Anthropic's limit for one image.
-const MOST_BYTES: usize = 5 * 1024 * 1024;
+/// The most bytes a picture may have, and the pictures of one message
+/// together: Anthropic's limit for one image, and the daemon's for a
+/// message.
+pub const MOST_BYTES: usize = 5 * 1024 * 1024;
 
 /// What a picture is called in the composer and the message, numbered
 /// from 1.
@@ -130,16 +131,15 @@ pub fn load(path: &Path) -> Result<Picture, String> {
 }
 
 fn picture(media_type: &'static str, data: Vec<u8>) -> Result<Picture, String> {
-    if media_type == "image/png" {
-        return Ok(Picture {
-            media_type,
-            data: fit(data)?,
-        });
-    }
+    // A PNG is scaled down first, which most often brings it under.
+    let data = match media_type {
+        "image/png" => fit(data)?,
+        _ => data,
+    };
     if data.len() > MOST_BYTES {
         return Err(format!(
-            "{} MB is past the {} MB an image may be; a PNG is scaled down",
-            data.len() / 1024 / 1024,
+            "{} MB is past the {} MB an image may be",
+            data.len().div_ceil(1024 * 1024),
             MOST_BYTES / 1024 / 1024
         ));
     }
@@ -265,6 +265,18 @@ mod tests {
         assert_eq!((fitted.width(), fitted.height()), (1568, 980));
         assert!(fit(b"not a png".to_vec()).is_err());
         assert!(picture("image/jpeg", vec![0; MOST_BYTES + 1]).is_err());
+        // A PNG of noise can be too large even at 1568 pixels.
+        let mut noise = tiny_skia::Pixmap::new(1568, 1200).unwrap();
+        let mut state = 0x2545_f491_u32;
+        for byte in noise.data_mut() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        let noise = noise.encode_png().unwrap();
+        assert!(noise.len() > MOST_BYTES);
+        assert!(picture("image/png", noise).is_err());
     }
 
     #[test]
