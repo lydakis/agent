@@ -5317,3 +5317,48 @@ pool closed on every refusal costs: at 5 % refused, both builds fall from
 about 285 to about 20 turns/s with p50 latency near 3 s. That is the pacer
 behaving as designed today; whether one refusal should close the pool is
 left to a pacer change.
+
+## Lone overloads back off their own call
+
+An overload naming no delay closed the model's pool for a second, doubling
+while refusals continued, so every bot on the model waited for one refused
+call. Now a lone overload backs off its own call from half a second, as
+Codex and the providers' SDKs retry one; the pool closes only when overloads
+cluster (three within two seconds and at least a quarter of the answers) or
+name a delay.
+
+Screen, 2026-10-28, Linux x86_64 container: 64 bots resubmitting as each
+turn ends, a local fixture answering after 200 ms and refusing a random
+fraction of calls with 529 and no `Retry-After`; 3 s warmup, 15 s measured,
+one run each. The #257 head (`f63a8f8`) against this change.
+
+| Refused | Before: turns/s | p50 ms | p95 ms | After: turns/s | p50 ms | p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 % | 290.7 | 217 | 234 | 291.7 | 216 | 231 |
+| 5 % | 20.4 | 3096 | 5140 | 256.2 | 217 | 631 |
+| 50 % | 1.3 | 9324 | 16351 | 3.9 | 9179 | 17302 |
+
+No turn failed in any run. At 50 % the clusters still close the pool: the
+fixture saw 97 requests in 18 s, not a storm of retries.
+
+Hot-path screen, 2026-10-28, same container: `main` (`9a5e785`) against this
+change rebased onto it, alternating builds; `bench.footprint` three runs,
+`bench.lifecycle` (socket, 32 echo bots) two runs of three,
+`bench.completion_burst` and `bench.admission_burst` (32 bots) two runs of
+five. Medians, ranges in brackets.
+
+| Measure | main | This change |
+| --- | ---: | ---: |
+| Idle RSS, MiB | 18.62 (18.49–18.76) | 18.65 (18.61–18.77) |
+| Per idle bot, KiB | 0.97 (0.97–1.06) | 1.14 (1.02–1.15) |
+| After one turn each, MiB | 27.21 (26.58–27.32) | 27.73 (27.57–27.89) |
+| CPU per turn, one each, ms | 1.54 (1.52–1.54) | 1.55 (1.48–1.67) |
+| Lifecycle CPU, s | 1.35 (1.29–1.45) | 1.375 (1.35–1.43) |
+| Lifecycle p95 turn, ms | 598 (594–602) | 595 (589–603) |
+| Lifecycle peak RSS, MiB | 24.45 (24.30–24.53) | 24.49 (24.37–24.67) |
+| Completion burst p99, ms | 17.5 (15.1–22.8) | 15.2 (13.5–18.8) |
+| Admission burst, last submit reply, ms | 8.3 (6.7–12.3) | 9.5 (6.8–13.2) |
+| Lone submit CPU, ms per 32 | 55.8 (44.6–66.2) | 49.6 (44.0–60.8) |
+
+Every difference is inside the run-to-run range: three integers more in a
+pool's state, updated under its existing lock, cost nothing measurable.
