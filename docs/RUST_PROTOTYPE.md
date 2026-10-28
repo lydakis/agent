@@ -2108,7 +2108,10 @@ protected folder that is a symlink refuses the call with
 `sandbox_unavailable`, since the link could be swapped from inside. A git
 folder given as a `writable` folder, so a bot may commit, keeps what git
 runs read-only as `.git` does: its `hooks`, `config` and `config.worktree`,
-and a repository's missing `hooks` may not be made. Network is
+and its missing `hooks` may not be made. It is known by its name, `.git` or
+`NAME.git`, which the bot can't change, not by what is inside it. One whose
+config is missing or turns on per-worktree config stays read-only as a
+whole, since git reads those files wherever they are made. Network is
 off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 

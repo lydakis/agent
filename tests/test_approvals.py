@@ -154,7 +154,12 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(client.request('configure', bot='Bob', network=True)['error'], 'invalid_setting')
         calls = [['shell', {'command': ' '.join(git) + ' commit -q --allow-empty -m two'}],
                  ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/pre-commit'}],
-                 ['shell', {'command': f'echo "[core] hooksPath = /tmp" >> {repo}/.git/config'}]]
+                 ['shell', {'command': f'echo "[core] hooksPath = /tmp" >> {repo}/.git/config'}],
+                 # What is inside the folder doesn't make it git's: one call
+                 # moving HEAD leaves the next still kept from the hooks.
+                 ['shell', {'command': f'mv {repo}/.git/HEAD {repo}/.git/HEAD.x'}],
+                 ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/post-checkout; '
+                                       f'mv {repo}/.git/HEAD.x {repo}/.git/HEAD'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
                               prompt='calls:' + json.dumps(calls))['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -163,7 +168,9 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(log.stdout.split(), ['two', 'one'])
         self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
         self.assertNotEqual(self.tool_output(client, 'shell-3')[1]['exit_code'], 0)
+        self.assertEqual(self.tool_output(client, 'shell-4')[1]['exit_code'], 0)
         self.assertFalse((repo / '.git/hooks/pre-commit').exists())
+        self.assertFalse((repo / '.git/hooks/post-checkout').exists())
         self.assertEqual((repo / '.git/config').read_text(), config)
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')

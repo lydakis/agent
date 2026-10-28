@@ -38,7 +38,8 @@ const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
 /// In a git folder given as a root, so a bot may commit, what git runs
 /// stays read-only as it does under `.git`: its hooks, and the config that
 /// can name other hooks or programs. Missing hooks are kept from being
-/// made.
+/// made. A git folder is known by its name, `.git` or `NAME.git`, which the
+/// bot can't change, never by what is inside it, which it can.
 const GIT_PROTECTED: [&str; 3] = ["hooks", "config", "config.worktree"];
 
 /// A folder the bot may write, and what inside it stays read-only.
@@ -383,9 +384,13 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             Err(_) => {}
         }
     }
-    if path.join("HEAD").is_file() && !git_folder_writable(path) {
+    let git = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".git"));
+    if git && !git_folder_writable(path) {
         read_only.push(path.to_owned());
-    } else if path.join("HEAD").is_file() {
+    } else if git {
         for name in GIT_PROTECTED {
             let kept = path.join(name);
             if held(&kept) {
@@ -395,9 +400,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             match std::fs::symlink_metadata(&kept) {
                 Ok(found) if found.file_type().is_symlink() => return linked(&kept),
                 Ok(_) => read_only.push(kept),
-                // Only a repository's own folder runs hooks; a linked
-                // worktree's has none.
-                Err(_) if name == "hooks" && path.join("objects").is_dir() => missing.push(kept),
+                Err(_) if name == "hooks" => missing.push(kept),
                 Err(_) => {}
             }
         }
@@ -431,11 +434,8 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
 /// turns on per-worktree config, whose files git reads wherever a worktree
 /// keeps one, made or not. Any mention of that setting counts.
 fn git_folder_writable(path: &Path) -> bool {
-    let repository = path.join("objects").is_dir();
-    match std::fs::read_to_string(path.join("config")) {
-        Ok(config) => !config.to_ascii_lowercase().contains("worktreeconfig"),
-        Err(_) => !repository,
-    }
+    std::fs::read_to_string(path.join("config"))
+        .is_ok_and(|config| !config.to_ascii_lowercase().contains("worktreeconfig"))
 }
 
 /// A symlink the sandbox may replace can't be held read-only: whatever is
