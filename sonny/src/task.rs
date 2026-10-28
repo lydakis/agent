@@ -671,8 +671,8 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         }
         if !looked_all {
             note.push_str(
-                ". This folder is too big to look for every linked worktree in, so git in one \
-                 it missed still changes the repository it belongs to",
+                ". This folder is too big or deep to look for every linked worktree in, so git \
+                 in one it missed still changes the repository it belongs to",
             );
         }
         note
@@ -745,6 +745,7 @@ fn linked_worktrees(root: &Path) -> (Vec<PathBuf>, bool) {
     };
     let mut found = Vec::new();
     let mut looked = 0;
+    let mut looked_all = true;
     let mut next = vec![(root.to_owned(), 0)];
     while let Some((dir, depth)) = next.pop() {
         looked += 1;
@@ -772,9 +773,6 @@ fn linked_worktrees(root: &Path) -> (Vec<PathBuf>, bool) {
                 }
             }
         }
-        if depth == DEEP {
-            continue;
-        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -786,11 +784,14 @@ fn linked_worktrees(root: &Path) -> (Vec<PathBuf>, bool) {
                 Some(".git" | "node_modules" | "target" | "__pycache__")
             );
             if !skip && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                next.push((entry.path(), depth + 1));
+                match depth == DEEP {
+                    true => looked_all = false,
+                    false => next.push((entry.path(), depth + 1)),
+                }
             }
         }
     }
-    (tidy(root, found), true)
+    (tidy(root, found), looked_all)
 }
 
 /// `found`, relative to `root`, sorted and once each.
@@ -1019,17 +1020,23 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
         }
         false => None,
     };
-    if !discard {
-        if let Some(ws) = &copy {
-            // Left unmounted by a restart: its folder is empty until it is
-            // mounted again, and an empty folder would pass for no work.
-            if ws.mounted.is_none() {
-                sandfs()?
-                    .mount(name, &folder, &MountOptions::default())
-                    .map_err(|e| {
-                        format!("{name}'s copy could not be mounted to check it: {e:#}")
-                    })?;
-            }
+    // Left unmounted by a restart: its folder is empty until it is mounted
+    // again, and an empty folder would pass for no work.
+    if !discard
+        && let Some(ws) = &copy
+        && ws.mounted.is_none()
+    {
+        sandfs()?
+            .mount(name, &folder, &MountOptions::default())
+            .map_err(|e| format!("{name}'s copy could not be mounted to check it: {e:#}"))?;
+    }
+    // What would be lost, checked while the task can still be kept, and again
+    // once it is gone and can write no more.
+    let kept = || -> Result<(), String> {
+        if discard {
+            return Ok(());
+        }
+        if copy.is_some() {
             let left = not_here(name, &folder, here)?;
             if !left.is_empty() {
                 return Err(format!(
@@ -1045,7 +1052,9 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
                  remove it anyway"
             ));
         }
-    }
+        Ok(())
+    };
+    kept()?;
     if listed(&agent, name) {
         let output = crate::agent_command(&agent)?
             .args(["rm", "--bot", name])
@@ -1056,6 +1065,7 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
             let said = String::from_utf8_lossy(&output.stderr);
             return Err(format!("{name} was not removed: {}", said.trim()));
         }
+        kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
     }
     if copy.is_some() {
         sandfs()?.remove(name, true).map_err(|e| format!("{e:#}"))?;
@@ -1097,7 +1107,19 @@ fn unkept(repo: &Path) -> Result<(String, Vec<String>), String> {
             "refs/tags",
         ],
     )?;
-    let stashes = git(repo, &["stash", "list", "--format=%H commit   %gd"])?;
+    // As `git stash list` says them, which needs a work tree that a
+    // deinitialized submodule's repository has not.
+    let stashes = git(
+        repo,
+        &[
+            "log",
+            "--walk-reflogs",
+            "--ignore-missing",
+            "--format=%H commit   %gd",
+            "refs/stash",
+            "--",
+        ],
+    )?;
     let head = format!("{} commit   HEAD", git(repo, &["rev-parse", "HEAD"])?);
     let local = Path::new(&origin).is_dir();
     let unkept = refs
@@ -1130,14 +1152,46 @@ fn unkept(repo: &Path) -> Result<(String, Vec<String>), String> {
     Ok((origin, unkept))
 }
 
+/// The submodule repositories git keeps in `modules`, a repository's
+/// `modules` folder, and theirs in turn, each with its name.
+fn repositories(modules: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    let mut next = vec![modules.to_owned()];
+    while let Some(dir) = next.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            if path.join("HEAD").is_file() && path.join("objects").is_dir() {
+                let name = path.strip_prefix(modules).unwrap_or(&path);
+                found.push((
+                    name.to_string_lossy().replace("/modules/", "/"),
+                    path.clone(),
+                ));
+                next.push(path.join("modules"));
+            } else {
+                // A submodule named with a slash.
+                next.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// What of the task's work in its copy at `folder` is not in `here`, said
 /// in a few words, or nothing: a git copy's uncommitted changes and
 /// commits its origin lacks; any other copy's changes not applied here,
 /// but for git's own files and those git ignores.
 fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
     if folder.join(".git").exists() {
-        // The copy's own repository, then each submodule checked out in it,
-        // which a push of the copy's branch does not push.
+        // Each submodule checked out in it first, whose changes its own
+        // status names, then the copy's own: a push of the copy's branch
+        // pushes neither a submodule's changes nor its commits.
         let subs = git(
             folder,
             &[
@@ -1148,21 +1202,41 @@ fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
                 "echo \"$displaypath\"",
             ],
         )?;
-        for sub in std::iter::once("").chain(subs.lines()) {
-            let repo = folder.join(sub);
-            let at = |what: &str| match sub {
-                "" => what.to_owned(),
-                sub => format!("{what} in its submodule {sub}"),
-            };
-            if !git(&repo, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
-                return Ok(at("uncommitted changes in its copy"));
+        for sub in subs.lines() {
+            if !git(
+                &folder.join(sub),
+                &["status", "--porcelain", "--untracked-files=all"],
+            )?
+            .is_empty()
+            {
+                return Ok(format!(
+                    "uncommitted changes in its copy, in its submodule {sub}"
+                ));
             }
+        }
+        if !git(folder, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+            return Ok("uncommitted changes in its copy".into());
+        }
+        // Every submodule's repository, checked out or not: one deinitialized
+        // keeps its commits, and its repository, all the same.
+        let common = git(
+            folder,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let modules = Path::new(common.trim()).join("modules");
+        for (sub, repo) in
+            std::iter::once((String::new(), folder.to_owned())).chain(repositories(&modules))
+        {
             let (origin, unkept) = unkept(&repo)?;
             if !unkept.is_empty() {
-                return Ok(at(&format!(
-                    "commits not pushed to {origin}, on {}",
+                let at = match sub.is_empty() {
+                    true => String::new(),
+                    false => format!(" in its submodule {sub}"),
+                };
+                return Ok(format!(
+                    "commits not pushed to {origin}, on {}{at}",
                     unkept.join(", ")
-                )));
+                ));
             }
         }
         return Ok(String::new());
@@ -1434,6 +1508,18 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_deeper_than_worktrees_are_looked_for_says_so() {
+        let root = std::env::temp_dir().join(format!("sonny-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("1/2/3/4/5/6")).unwrap();
+        assert_eq!(linked_worktrees(&root), (Vec::new(), true));
+        std::fs::create_dir_all(root.join("1/2/3/4/5/6/7")).unwrap();
+        let found = linked_worktrees(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, (Vec::new(), false));
+    }
+
+    #[test]
     fn a_git_copy_keeps_what_its_origin_lacks_in_its_submodules_too() {
         let base = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -1492,6 +1578,20 @@ mod tests {
             left(&copy)
         );
         run(&sub, &["push", "-q", "origin", "HEAD:refs/heads/task"]);
+        assert_eq!(left(&copy), "");
+        // And once the submodule is deinitialized, whose repository keeps
+        // its commits.
+        run(&sub, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        run(&copy, &["commit", "-qam", "lib three"]);
+        run(&copy, &["push", "-q", "origin", "main:task"]);
+        run(&copy, &["submodule", "deinit", "-q", "-f", "lib"]);
+        assert!(
+            left(&copy).ends_with(" in its submodule lib"),
+            "{}",
+            left(&copy)
+        );
+        let kept = copy.join(".git/modules/lib");
+        run(&kept, &["push", "-q", "origin", "HEAD:refs/heads/task"]);
         assert_eq!(left(&copy), "");
         // With an origin by URL, a commit only an annotated tag keeps.
         let url = format!("file://{}", top.display());
