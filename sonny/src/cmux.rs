@@ -132,8 +132,12 @@ static RESUME: OnceLock<Resume> = OnceLock::new();
 /// `resume` (`sonny` first) as the tab's resume command, which it runs
 /// when it restores the tab after a relaunch, as it does for the agents
 /// it supports, once the person allows commands that start with `sonny`.
-/// In the background, so cmux never slows Sonny down.
+/// In the background, so cmux never slows Sonny down. A Sonny in a Herdr
+/// pane inside a cmux tab is Herdr's to restore, not the tab's.
 pub fn announce(bot: &str, resume: Vec<String>) {
+    if crate::herdr::pane().is_some() {
+        return;
+    }
     let (Some(surface), Some(bin)) = (surface(), find()) else {
         return;
     };
