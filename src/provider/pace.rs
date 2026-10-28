@@ -100,10 +100,13 @@ struct State {
     overloads: Overloads,
     /// Output tokens the pool's latest calls reported, oldest first.
     outputs: std::collections::VecDeque<u32>,
-    /// Per mille of each latest call's input that counted against the
+    /// Parts per million of each latest call's input that counted against the
     /// limit, oldest first, for a provider that leaves cache reads out.
     counted: std::collections::VecDeque<u32>,
 }
+
+/// The scale of a counted-input share: parts per million.
+const SHARE: u64 = 1_000_000;
 
 /// The output and counted-input estimates follow this many of the latest
 /// calls, once they have `OUTPUT_KNOWN` of them.
@@ -204,7 +207,12 @@ impl Reservation<'_> {
         let mut state = self.pace.state.lock().unwrap();
         sample(&mut state.outputs, usage.output_tokens);
         if !family.counts_cache_reads() && usage.input_tokens > 0 {
-            sample(&mut state.counted, input * 1000 / usage.input_tokens);
+            // Rounded up, so a few uncached tokens beside a long cached
+            // prompt still reserve something.
+            sample(
+                &mut state.counted,
+                (input * SHARE).div_ceil(usage.input_tokens),
+            );
         }
         drop(state);
         self.settle_cost(Cost {
@@ -468,7 +476,7 @@ impl Pace {
     pub fn input_estimate(&self, input: u64, output: u64) -> u64 {
         let state = self.state.lock().unwrap();
         let mut estimate =
-            p90(&state.counted).map_or(input, |share| (input * share).div_ceil(1000).min(input));
+            p90(&state.counted).map_or(input, |share| (input * share).div_ceil(SHARE).min(input));
         if let Some(limit) = state.tokens[INPUT].bucket.per_minute {
             estimate = estimate.min(limit as u64);
         }
@@ -847,6 +855,11 @@ mod tests {
         // A prompt larger than the limit waits for a full allowance: it may
         // be read from the cache.
         assert_eq!(pace.input_estimate(50_000, 0), 10_000);
+        // A few uncached tokens beside a long cached prompt still reserve
+        // their share.
+        let pace = Pace::default();
+        read(&pace, 8, 200_050, 200_000, crate::codec::Family::Anthropic).await;
+        assert_eq!(pace.input_estimate(200_050, 0), 51);
         // A provider that counts cache reads learns nothing to leave out.
         let pace = Pace::default();
         read(&pace, 8, 10_000, 9_500, crate::codec::Family::Responses).await;
