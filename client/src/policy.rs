@@ -538,6 +538,27 @@ fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<(String, PathB
     Ok(None)
 }
 
+/// The top of the git checkout `dir` is in, as the main checkout's when it
+/// is a linked worktree, looking no higher than the home folder (the home
+/// folder's own only for the home folder itself), as [`project`] looks.
+pub fn checkout(dir: &Path) -> Option<PathBuf> {
+    checkout_from(dir, home().as_deref())
+}
+
+fn checkout_from(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let home = home.map(|h| h.canonicalize().unwrap_or_else(|_| h.to_path_buf()));
+    for at in dir.ancestors() {
+        if home.as_deref() == Some(at) && at != dir.as_path() {
+            return None;
+        }
+        if std::fs::symlink_metadata(at.join(".git")).is_ok() {
+            return Some(main_checkout(at).unwrap_or_else(|| at.to_path_buf()));
+        }
+    }
+    None
+}
+
 fn project_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
@@ -1171,10 +1192,21 @@ mod tests {
             memory_indexes_from(&repo, None).unwrap(),
             Vec::<PathBuf>::new()
         );
+        // A worktree's checkout is the main one.
+        let top = repo.canonicalize().unwrap();
+        assert_eq!(
+            checkout_from(&worktree.join("web"), Some(&home)),
+            Some(top.clone())
+        );
+        assert_eq!(checkout_from(&repo.join("web"), Some(&home)), Some(top));
         // A project above a repository, or the home folder's, is not its.
         let nested = repo.join("web/inner");
         std::fs::create_dir_all(nested.join(".git")).unwrap();
         assert_eq!(project(&nested).unwrap(), None);
+        assert_eq!(
+            checkout_from(&nested, Some(&home)),
+            Some(nested.canonicalize().unwrap())
+        );
         std::fs::create_dir_all(home.join(".agents")).unwrap();
         std::fs::create_dir_all(home.join("Developer/plain")).unwrap();
         std::fs::write(home.join(".agents/project.toml"), "name = \"me\"\n").unwrap();
@@ -1186,6 +1218,17 @@ mod tests {
             project_from(&home, Some(&home)).unwrap(),
             Some(("me".into(), home.canonicalize().unwrap()))
         );
+        // Nor is a home folder that is a repository a folder's checkout.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        assert_eq!(
+            checkout_from(&home.join("Developer/plain"), Some(&home)),
+            None
+        );
+        assert_eq!(
+            checkout_from(&home, Some(&home)),
+            Some(home.canonicalize().unwrap())
+        );
+        std::fs::remove_dir_all(home.join(".git")).unwrap();
         std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
         let error = project(&repo.join("web")).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");

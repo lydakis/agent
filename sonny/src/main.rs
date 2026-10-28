@@ -695,6 +695,8 @@ async fn run() -> Result<(), String> {
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
     let mut moving = None;
+    // A lead made below another project's folder, and that project's lead.
+    let mut above = None;
     let (name, project) = match &options.bot {
         Some(bot) => {
             if options.new {
@@ -716,6 +718,7 @@ async fn run() -> Result<(), String> {
             let lead = project::open(&client, &dir, options.model.as_deref()).await?;
             fresh = lead.new;
             moving = lead.moving;
+            above = lead.above;
             (lead.bot, Some(lead.project))
         }
     };
@@ -785,6 +788,13 @@ async fn run() -> Result<(), String> {
         if let Some(fleet) = &app.fleet {
             app.notice = fleet.note.clone();
         }
+    }
+    if let Some(above) = above
+        && app.notice.is_none()
+    {
+        app.notice = Some(format!(
+            "a new lead for this folder; {above} leads the folder above: sonny --bot {above}"
+        ));
     }
     app.lead = project::lead(&app.options.socket, &bot);
     // Task copies a restart unmounted are mounted again before any task
