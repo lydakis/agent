@@ -6,7 +6,9 @@
 #
 # It downloads sonny-VERSION-linux-ARCH.tar.gz, which holds static builds of
 # Sonny (bin/sonny) and the daemon (libexec/agent), checks it against the
-# release's .sha256, unpacks it to PREFIX/opt/sonny-VERSION-linux-ARCH, points
+# release's .sha256 and, when the GitHub CLI is signed in, against the
+# release workflow's build attestation (the checksum alone only guards the
+# download), unpacks it to PREFIX/opt/sonny-VERSION-linux-ARCH, points
 # PREFIX/opt/sonny at it and links PREFIX/bin/sonny to its Sonny. Earlier
 # versions stay where they are, since a running daemon may still use one.
 #
@@ -65,6 +67,12 @@ main() {
     curl -fsSL -o "$work/$name.tar.gz.sha256" "$url.sha256" || fail "could not download $url.sha256"
     (cd "$work" && $sha256 -c "$name.tar.gz.sha256" >/dev/null) ||
         fail "$name.tar.gz does not match its published sha256"
+    if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+        gh attestation verify "$work/$name.tar.gz" --repo lydakis/agent \
+            --signer-workflow lydakis/agent/.github/workflows/release.yml \
+            --deny-self-hosted-runners >/dev/null ||
+            fail "$name.tar.gz has no build attestation from the release workflow"
+    fi
 
     mkdir -p "$prefix/opt" "$prefix/bin"
     tar -xzf "$work/$name.tar.gz" -C "$work"
