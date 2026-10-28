@@ -5258,7 +5258,13 @@ impl App {
         // while the pane has all of a narrow one, as it gets back after.
         let size = terminal.size()?;
         self.full_width = size.width;
-        let (chat, _) = self.split(Rect::new(0, 0, size.width, size.height));
+        let (chat, shown) = self.split(Rect::new(0, 0, size.width, size.height));
+        // A pane a narrow window hides takes no clicks.
+        if shown.is_none()
+            && let Some(pane) = &mut self.pane
+        {
+            pane.area = Rect::default();
+        }
         let width = match chat.width {
             0 => size.width,
             chat => chat,
