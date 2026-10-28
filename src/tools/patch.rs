@@ -63,7 +63,7 @@ pub enum Change {
 
 /// A run of lines to find and replace, after an optional `@@` line that
 /// places it.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Chunk {
     context: Option<String>,
     old: Vec<String>,
@@ -79,6 +79,38 @@ pub struct Patch {
 
 fn invalid(line: usize, detail: impl std::fmt::Display) -> Error {
     Error::with("invalid_patch", format!("line {line}: {detail}"))
+}
+
+/// The most a patch's changed files may hold together while it is staged.
+const STAGED_BYTES: usize = 16 * FILE_BYTES;
+
+/// A path as the file it names: `./f` and `d/../f` are `f`.
+fn file_key(path: &str) -> PathBuf {
+    let mut key = PathBuf::new();
+    for part in Path::new(path).components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if key.file_name().is_some() => {
+                key.pop();
+            }
+            part => key.push(part),
+        }
+    }
+    key
+}
+
+/// Note that the patch changes `path`. Each file is changed once: a
+/// second change would be computed from the file as it was.
+fn claim(seen: &mut Vec<PathBuf>, path: &str, line: usize) -> Result<()> {
+    let key = file_key(path);
+    if seen.contains(&key) {
+        return Err(invalid(
+            line,
+            format!("{path} is changed twice; a patch changes each file once"),
+        ));
+    }
+    seen.push(key);
+    Ok(())
 }
 
 impl Patch {
@@ -101,6 +133,7 @@ impl Patch {
         }
         let body = &lines[1..lines.len() - 1];
         let mut changes = Vec::new();
+        let mut seen = Vec::new();
         let mut at = 0;
         while at < body.len() {
             let number = at + 2;
@@ -116,19 +149,24 @@ impl Patch {
                     contents.push('\n');
                     at += 1;
                 }
-                changes.push(Change::Add {
-                    path: path_of(path, number)?,
-                    contents,
-                });
+                let path = path_of(path, number)?;
+                claim(&mut seen, &path, number)?;
+                changes.push(Change::Add { path, contents });
             } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-                changes.push(Change::Delete {
-                    path: path_of(path, number)?,
-                });
+                let path = path_of(path, number)?;
+                claim(&mut seen, &path, number)?;
+                changes.push(Change::Delete { path });
             } else if let Some(path) = line.strip_prefix("*** Update File: ") {
                 let path = path_of(path, number)?;
+                claim(&mut seen, &path, number)?;
                 let mut move_to = None;
                 if let Some(to) = body.get(at).and_then(|l| l.strip_prefix("*** Move to: ")) {
-                    move_to = Some(path_of(to, at + 2)?);
+                    let to = path_of(to, at + 2)?;
+                    // A move to the file itself is no move.
+                    if file_key(&to) != file_key(&path) {
+                        claim(&mut seen, &to, at + 2)?;
+                        move_to = Some(to);
+                    }
                     at += 1;
                 }
                 let chunks = chunks(body, &mut at)?;
@@ -184,10 +222,12 @@ impl Patch {
             Remove(PathBuf),
         }
         let mut writes = Vec::new();
+        let mut staged = 0;
         let mut summary = String::from("Success. Updated the following files:\n");
         for change in &self.changes {
             match change {
                 Change::Add { path, contents } => {
+                    staged += contents.len();
                     writes.push(Write::Put(workspace.join(path), contents.clone(), None));
                     summary.push_str(&format!("A {path}\n"));
                 }
@@ -211,9 +251,27 @@ impl Patch {
                     let bytes = files::read_bounded(&source).await?;
                     let text = String::from_utf8(bytes)
                         .map_err(|_| Error::with("file_not_utf8", path.clone()))?;
-                    let updated = update(&text, chunks, path)?;
+                    // Matching can take a while on a long file: off the
+                    // runtime's thread.
+                    let (chunks, name) = (chunks.clone(), path.clone());
+                    let updated =
+                        tokio::task::spawn_blocking(move || update(&text, &chunks, &name))
+                            .await
+                            .map_err(|_| {
+                                Error::with(
+                                    "invalid_patch",
+                                    format!("{path}: could not be matched"),
+                                )
+                            })??;
                     if updated.len() > FILE_BYTES {
                         return Err(Error::with("tool_output_limit", path.clone()));
+                    }
+                    staged += updated.len();
+                    if staged > STAGED_BYTES {
+                        return Err(Error::with(
+                            "tool_output_limit",
+                            "the files a patch changes hold at most 64 MiB together",
+                        ));
                     }
                     match move_to {
                         Some(to) => {
@@ -418,12 +476,16 @@ fn seek(lines: &[&str], pattern: &[String], start: usize, end_of_file: bool) -> 
     ];
     for norm in passes {
         let wanted: Vec<String> = pattern.iter().map(|line| norm(line)).collect();
+        let normed: Vec<String> = lines[start.min(from)..]
+            .iter()
+            .map(|line| norm(line))
+            .collect();
+        let base = start.min(from);
         for at in (from..=last).chain(start..from.min(last + 1)) {
-            if lines[at..at + pattern.len()]
-                .iter()
-                .zip(&wanted)
-                .all(|(line, wanted)| norm(line) == *wanted)
-            {
+            let lines = &normed[at - base..at - base + pattern.len()];
+            // The ends first: most places differ there, and a long run of
+            // like lines is then not compared whole at every place.
+            if lines.last() == wanted.last() && lines == &wanted[..] {
                 return Some(at);
             }
         }
@@ -495,6 +557,14 @@ mod tests {
                 "changes nothing",
             ),
             ("*** Begin Patch\n*** End Patch", "at least one file"),
+            (
+                "*** Begin Patch\n*** Update File: f\n-a\n+b\n*** Update File: ./f\n-c\n+d\n*** End Patch",
+                "line 5: ./f is changed twice",
+            ),
+            (
+                "*** Begin Patch\n*** Update File: f\n*** Move to: g\n-a\n+b\n*** Delete File: d/../g\n*** End Patch",
+                "changed twice",
+            ),
         ] {
             let error = Patch::parse(text).unwrap_err();
             assert_eq!(error.code, "invalid_patch", "{text}");
@@ -503,6 +573,15 @@ mod tests {
                 "{error:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_move_to_the_file_itself_is_an_update() {
+        let parsed = patch("*** Update File: f\n*** Move to: ./f\n-a\n+b\n");
+        let Change::Update { move_to, .. } = &parsed.changes[0] else {
+            panic!()
+        };
+        assert_eq!(move_to, &None);
     }
 
     #[test]
@@ -530,6 +609,18 @@ mod tests {
         let error = update("other\n", chunks, "f").unwrap_err();
         assert_eq!(error.code, "patch_context_not_found");
         assert!(error.detail.unwrap().contains("say(\"hi\")"));
+        // A long run of like lines whose last line is not there fails fast.
+        let text = "x\n".repeat(20_000);
+        let mut long = "*** Update File: f\n".to_owned();
+        long.push_str(&"-x\n".repeat(9_999));
+        long.push_str("-y\n+z\n");
+        let parsed = patch(&long);
+        let Change::Update { chunks, .. } = &parsed.changes[0] else {
+            panic!()
+        };
+        let started = std::time::Instant::now();
+        assert!(update(&text, chunks, "f").is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         // An insertion with no context lands at the end even when a later
         // chunk changes an earlier line.
         let parsed = patch("*** Update File: f\n@@\n+tail\n@@\n-first\n+changed\n");
