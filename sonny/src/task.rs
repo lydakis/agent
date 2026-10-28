@@ -264,9 +264,15 @@ fn names(from: &Path) -> Vec<String> {
         .iter()
         .flat_map(|name| {
             let name = name.to_string_lossy().into_owned();
+            // macOS's `/tmp` and `/var` are `/private/tmp` and `/private/var`;
+            // other folders under `/private` have no such second name.
             let short = name
                 .strip_prefix("/private")
-                .filter(|rest| rest.starts_with('/'));
+                .filter(|rest| rest.starts_with('/'))
+                .filter(|rest| {
+                    std::fs::canonicalize(rest)
+                        .is_ok_and(|real| Some(real) == std::fs::canonicalize(&name).ok())
+                });
             [Some(name.clone()), short.map(str::to_owned)]
         })
         .flatten()
@@ -312,6 +318,7 @@ fn replace_paths(text: &str, names: &[String], to: &str) -> (String, usize) {
             for name in names {
                 if let Some(after) = rest.strip_prefix(name.as_str())
                     && ends_name(after, part_of_name)
+                    && stays_inside(after, part_of_name)
                 {
                     out.push_str(to);
                     count += 1;
@@ -325,6 +332,26 @@ fn replace_paths(text: &str, names: &[String], to: &str) -> (String, usize) {
         rest = &rest[c.len_utf8()..];
     }
     (out, count)
+}
+
+/// Whether the rest of a path, `after` the folder's name, stays inside the
+/// folder: `/work/repo/../notes.md` names a file beside it, not in it.
+fn stays_inside(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
+    let end = after
+        .find(|c: char| !part_of_name(c))
+        .unwrap_or(after.len());
+    let mut depth = 0usize;
+    for part in after[..end].split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return false,
+            },
+            _ => depth += 1,
+        }
+    }
+    true
 }
 
 /// Whether a name ends where `after` starts: at a `/` going on below it,
@@ -726,6 +753,17 @@ mod tests {
         );
         assert_eq!(count, 3);
         assert_eq!(replace_paths("`/Volumes/workplace`", &names, to).1, 1);
+        // Paths that climb out of the folder name what is beside it.
+        for beside in [
+            "/Volumes/workplace/../notes.md",
+            "/Volumes/workplace/a/../../b",
+        ] {
+            assert_eq!(replace_paths(beside, &names, to), (beside.to_owned(), 0));
+        }
+        assert_eq!(
+            replace_paths("/Volumes/workplace/a/../b", &names, to).0,
+            "/Users/g/.agent/tasks/t/a/../b"
+        );
         // Sibling folders whose names only start the same stay as they are.
         for sibling in [
             "/Volumes/workplace+backup",
