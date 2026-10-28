@@ -238,7 +238,11 @@ fn names(from: &Path) -> Vec<String> {
             for _ in below.components() {
                 top.pop();
             }
-            names.push(top);
+            // Entered through a link to a folder inside it, what is left names
+            // something else.
+            if std::fs::canonicalize(&top).is_ok_and(|real| real == canonical) {
+                names.push(top);
+            }
         }
     }
     let home = home_dir().ok();
@@ -288,9 +292,17 @@ fn names(from: &Path) -> Vec<String> {
 /// `text` with each of `names` that stands as a whole path, or as the
 /// start of one, turned into `to`; and how many were.
 fn replace_paths(text: &str, names: &[String], to: &str) -> (String, usize) {
-    // A name inside a longer one (`/work` in `/workplace` or `/x/work`) is
-    // another path.
-    let part_of_name = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~');
+    // A name inside a longer one (`/work` in `/workplace`, `/work+old` or
+    // `/x/work`) is another path. Names end at spaces and at what sets a path
+    // apart in prose and commands: quotes, brackets, `=`, `:` and the like.
+    let part_of_name = |c: char| {
+        !c.is_whitespace()
+            && !matches!(
+                c,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+            && !matches!(c, ',' | ';' | ':' | '=' | '|' | '&' | '!' | '?' | '*')
+    };
     let mut out = String::with_capacity(text.len());
     let mut count = 0;
     let mut rest = text;
@@ -714,6 +726,23 @@ mod tests {
         );
         assert_eq!(count, 3);
         assert_eq!(replace_paths("`/Volumes/workplace`", &names, to).1, 1);
+        // Sibling folders whose names only start the same stay as they are.
+        for sibling in [
+            "/Volumes/workplace+backup",
+            "/Volumes/workplace@old",
+            "/Volumes/workplace#2",
+        ] {
+            assert_eq!(replace_paths(sibling, &names, to), (sibling.to_owned(), 0));
+        }
+        assert_eq!(
+            replace_paths(
+                "--dir=/Volumes/workplace:/Volumes/workplace/b (see ~/workplace)",
+                &names,
+                to
+            )
+            .0,
+            "--dir=/Users/g/.agent/tasks/t:/Users/g/.agent/tasks/t/b (see /Users/g/.agent/tasks/t)"
+        );
     }
 
     #[test]
