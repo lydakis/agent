@@ -3706,7 +3706,8 @@ impl Turn {
             // queued without waiting on the one before, so results done
             // together share a commit. Waiting for room on the store's
             // queue happens beside the calls still running, which go on
-            // being polled.
+            // being polled; meanwhile the channel holds at most one result
+            // per call in the batch.
             let (done, mut recorded) = tokio::sync::mpsc::unbounded_channel();
             let run = async move {
                 let mut results = stream::iter(runs).buffered(self.registry.wide(PARALLEL_CALLS));
@@ -3715,18 +3716,25 @@ impl Turn {
                 }
                 Ok::<_, Error>(())
             };
+            // Each write's acknowledgement carries its result: dropped as
+            // it comes, so committed results aren't held for the batch.
             let write = async {
-                let mut written = Vec::new();
-                while let Some((id, outcome)) = recorded.recv().await {
-                    written.push(
-                        self.store
-                            .slot()
-                            .await?
-                            .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome)),
-                    );
+                let mut written = stream::FuturesOrdered::new();
+                loop {
+                    tokio::select! {
+                        Some(answer) = written.next(), if !written.is_empty() => drop(answer?),
+                        next = recorded.recv() => match next {
+                            Some((id, outcome)) => written.push_back(
+                                self.store.slot().await?.op("tool_finish", move |db| {
+                                    db.tool_finish(turn, &id, &outcome)
+                                }),
+                            ),
+                            None => break,
+                        },
+                    }
                 }
-                for answer in written {
-                    answer.await?;
+                while let Some(answer) = written.next().await {
+                    answer?;
                 }
                 Ok::<_, Error>(())
             };
