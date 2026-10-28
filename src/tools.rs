@@ -21,6 +21,7 @@ use tokio::{
 };
 
 mod files;
+mod picture;
 use files::read_bounded;
 
 /// Model-facing text per tool result stream.
@@ -91,7 +92,7 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers (an image or other binary file is refused, naming its kind): a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers, or see a picture: a PNG, JPEG, GIF or WebP file comes back as the image itself, scaled down when large (any other binary file is refused, naming its kind). A file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -613,6 +614,8 @@ impl ReadSource {
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
+    /// Pictures that go to the model after the text: an image file read.
+    pub images: Vec<crate::codec::Image>,
     /// A carry-forward note to record with this result; empty text clears.
     pub note: Option<String>,
     /// The call failed: an error, or a command that did not succeed. Set by
@@ -624,6 +627,7 @@ impl Outcome {
         Self {
             output,
             artifacts: Vec::new(),
+            images: Vec::new(),
             note: None,
             failed: false,
         }
@@ -1031,6 +1035,15 @@ impl Registry {
                 limit,
             } => {
                 let bytes = read_bounded(&resolve(workspace, &path)).await?;
+                // A picture goes to the model as one, after a line on it.
+                if binary(&bytes).is_some()
+                    && let Some((image, line)) = picture::read(&bytes)?
+                {
+                    return Ok(Outcome {
+                        images: vec![image],
+                        ..Outcome::text(format!("{path}: {line}"))
+                    });
+                }
                 if let Some(kind) = binary(&bytes) {
                     return fail_with(
                         "file_not_text",
@@ -1132,6 +1145,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
+            images: Vec::new(),
             note: None,
             failed: !success,
         }
@@ -1580,17 +1594,37 @@ mod tests {
         assert_eq!(binary(b""), None);
     }
     #[tokio::test]
-    async fn read_refuses_an_image_by_its_kind() {
+    async fn read_shows_a_picture_and_refuses_other_binaries_by_kind() {
         let dir = std::env::temp_dir().join(format!("agent-read-image-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\nIHDR").unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(4, 3)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.join("shot.png"), &png).unwrap();
+        std::fs::write(dir.join("doc.pdf"), b"%PDF-1.7 and more").unwrap();
         let registry = Registry::new("read").unwrap();
-        let prepared = registry.prepare("read", r#"{"path":"shot.png"}"#).unwrap();
-        let error = registry.execute(prepared, &dir, &[]).await.unwrap_err();
+        let read = |path: &str| {
+            let prepared = registry
+                .prepare("read", &json!({"path": path}).to_string())
+                .unwrap();
+            registry.execute(prepared, &dir, &[])
+        };
+        let outcome = read("shot.png").await.unwrap();
+        assert_eq!(
+            outcome.output,
+            format!(
+                "shot.png: a PNG image, 4×3, {} bytes; it follows",
+                png.len()
+            )
+        );
+        assert_eq!(outcome.images.len(), 1);
+        assert_eq!(outcome.images[0].media_type, "image/png");
+        let error = read("doc.pdf").await.unwrap_err();
         assert_eq!(error.code, "file_not_text");
         assert_eq!(
             error.detail.as_deref(),
-            Some("a PNG image of 12 bytes; read returns text")
+            Some("a PDF of 17 bytes; read returns text")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

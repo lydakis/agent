@@ -1,4 +1,4 @@
-"""Pictures sent with a prompt: validated on submit, after the words in the user item."""
+"""Pictures sent with a prompt, validated on submit and put after its words, and image files read."""
 import base64
 import os
 import sqlite3
@@ -67,6 +67,30 @@ class ImageTests(ModelFixture):
         retried = client.request('submit', bot='Bob', request_id='a', prompt='slow', images=[])
         self.assertEqual(retried['error'], 'idempotency_conflict')
         self.assertEqual(retried['field'], 'images')
+
+    def test_read_sends_an_image_file_as_a_picture_scaled_to_fit(self):
+        (self.path / 'shot.png').write_bytes(png(3000, 2000))
+        client = self.client('read')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='a', prompt='readpic:shot.png')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while True:
+            request = self.model.requests.get(timeout=3)
+            if request['input'][-1].get('type') == 'function_call_output':
+                break
+        text, picture = request['input'][-1]['output']
+        self.assertEqual(text['type'], 'input_text')
+        self.assertTrue(text['text'].startswith('shot.png: a PNG image, 3000×2000,'), text)
+        self.assertTrue(text['text'].endswith('scaled to 1568×1045'), text)
+        self.assertEqual(picture['type'], 'input_image')
+        data = base64.b64decode(picture['image_url'].removeprefix('data:image/png;base64,'))
+        self.assertEqual(struct.unpack('>II', data[16:24]), (1568, 1045))
+        # History reads leave the picture's bytes out.
+        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+        node = next(e for e in events if e['event'] == 'tool_completed')['data']['node']
+        read = node_item(client, 'Bob', node)['result']
+        self.assertEqual(read['output'][1], {'type': 'input_image', 'image_url': 'data:image/png;base64,',
+                                             'omitted_bytes': len(picture['image_url']) - len('data:image/png;base64,')})
 
     def test_pictures_a_provider_would_refuse_are_refused_on_submit(self):
         client = self.client()

@@ -5103,7 +5103,12 @@ fn first_line(text: &str) -> String {
 
 /// A message item's text.
 fn text(item: &Value) -> String {
-    match &item["content"] {
+    joined(&item["content"])
+}
+
+/// Text, or the text of a list of parts, leaving out the pictures.
+fn joined(content: &Value) -> String {
+    match content {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
@@ -5117,10 +5122,11 @@ fn text(item: &Value) -> String {
 /// A tool result's text, and whether it failed. A shell result is JSON
 /// with its streams and exit status.
 fn output(item: &Value) -> (String, bool) {
-    let raw = item["output"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| text(item));
+    // A result with a picture (an image file read) is a list of parts.
+    let raw = match &item["output"] {
+        Value::Null => text(item),
+        output => joined(output),
+    };
     let failed = item["failed"] == true;
     match serde_json::from_str::<Value>(&raw) {
         Ok(shell) if shell.get("exit_code").is_some() => {

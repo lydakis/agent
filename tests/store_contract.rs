@@ -84,6 +84,7 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
+        images: Vec::new(),
         note: None,
         failed: false,
     }
@@ -3183,6 +3184,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
+        images: Vec::new(),
         note: None,
         failed: false,
     };
@@ -8225,6 +8227,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
+            images: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
         };

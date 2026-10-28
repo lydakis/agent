@@ -100,17 +100,33 @@ impl Family {
             Family::Responses => json!({"type":"input_text","text":text}),
             Family::Anthropic => json!({"type":"text","text":text}),
         }];
-        content.extend(images.iter().map(|image| match self {
-            Family::Responses => json!({"type":"input_image",
-                "image_url":format!("data:{};base64,{}", image.media_type, image.data)}),
-            Family::Anthropic => json!({"type":"image","source":{"type":"base64",
-                "media_type":image.media_type,"data":image.data}}),
-        }));
+        content.extend(images.iter().map(|image| self.image(image)));
         Ok(serde_json::to_vec(
             &json!({"role":"user","content":content}),
         )?)
     }
     pub fn tool_result_item(self, call_id: &str, output: &str) -> Result<Vec<u8>> {
+        self.tool_result_item_with(call_id, output, &[])
+    }
+    /// A tool's result with pictures after its text, as both families take
+    /// them in a result: a list of parts in place of the text alone.
+    pub fn tool_result_item_with(
+        self,
+        call_id: &str,
+        output: &str,
+        images: &[Image],
+    ) -> Result<Vec<u8>> {
+        let output = match images {
+            [] => json!(output),
+            _ => {
+                let mut parts = vec![match self {
+                    Family::Responses => json!({"type":"input_text","text":output}),
+                    Family::Anthropic => json!({"type":"text","text":output}),
+                }];
+                parts.extend(images.iter().map(|image| self.image(image)));
+                Value::Array(parts)
+            }
+        };
         let item = match self {
             Family::Responses => {
                 json!({"type":"function_call_output","call_id":call_id,"output":output})
@@ -119,6 +135,14 @@ impl Family {
                 {"type":"tool_result","tool_use_id":call_id,"content":output}]}),
         };
         Ok(serde_json::to_vec(&item)?)
+    }
+    fn image(self, image: &Image) -> Value {
+        match self {
+            Family::Responses => json!({"type":"input_image",
+                "image_url":format!("data:{};base64,{}", image.media_type, image.data)}),
+            Family::Anthropic => json!({"type":"image","source":{"type":"base64",
+                "media_type":image.media_type,"data":image.data}}),
+        }
     }
     pub fn tools(self, tools: &[ToolSchema]) -> Value {
         let encoded: Vec<Value> = tools
@@ -318,6 +342,24 @@ mod tests {
         assert_eq!(
             Family::Anthropic.user_item("look").unwrap(),
             Family::Anthropic.user_item_with("look", &[]).unwrap()
+        );
+        // A result's pictures follow its text the same way.
+        let result = |family: Family| -> Value {
+            serde_json::from_slice(
+                &family
+                    .tool_result_item_with("c1", "a.png", &images)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            result(Family::Responses)["output"],
+            json!([{"type":"input_text","text":"a.png"},
+                {"type":"input_image","image_url":"data:image/png;base64,iVBO"}])
+        );
+        assert_eq!(
+            result(Family::Anthropic)["content"][0]["content"][1]["source"]["data"],
+            "iVBO"
         );
     }
     #[test]

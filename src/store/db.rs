@@ -4929,7 +4929,7 @@ impl Database {
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
         let family = bot.family()?;
-        let item = family.tool_result_item(call_id, &outcome.output)?;
+        let item = family.tool_result_item_with(call_id, &outcome.output, &outcome.images)?;
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -4954,7 +4954,9 @@ impl Database {
         // read tool never elides, since the model could not follow a stub,
         // so it gets none.
         let next = next_node(&tx)?;
-        let stub = if bot.tools.iter().any(|tool| tool == "read") {
+        let stub = if !outcome.images.is_empty() {
+            super::context::picture_stub(family, call_id, &outcome.output, item.len())?
+        } else if bot.tools.iter().any(|tool| tool == "read") {
             super::context::stub(family, call_id, &outcome.output, next, item.len())?
         } else {
             None
@@ -8266,26 +8268,43 @@ fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-/// SQL for `item`, a node's item, as history reads return it: a user
-/// item's pictures without their bytes, each counted in `omitted_bytes`
-/// (a data URL keeps its media type). The model is sent them whole.
+/// SQL for `item`, a node's item, as history reads return it: the pictures
+/// of a user item or a tool's result without their bytes, each counted in
+/// `omitted_bytes` (a data URL keeps its media type). The model is sent
+/// them whole.
 const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
-    THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user'
-        AND json_type(CAST(item AS TEXT),'$.content')='array'
-    THEN CAST(json_set(CAST(item AS TEXT),'$.content',(
-        SELECT json_group_array(CASE
-            WHEN json_extract(value,'$.type')='input_image'
-                AND json_extract(value,'$.image_url') LIKE 'data:%'
-            THEN json_set(value,'$.image_url',
-                substr(json_extract(value,'$.image_url'),1,instr(json_extract(value,'$.image_url'),',')),
-                '$.omitted_bytes',length(json_extract(value,'$.image_url'))
-                    -instr(json_extract(value,'$.image_url'),','))
-            WHEN json_extract(value,'$.type')='image'
-                AND json_extract(value,'$.source.type')='base64'
-            THEN json_set(value,'$.source.data','',
-                '$.omitted_bytes',length(json_extract(value,'$.source.data')))
-            ELSE json(value) END)
-        FROM json_each(CAST(item AS TEXT),'$.content'))) AS BLOB)
+THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CAST(item AS TEXT),'$.content')='array'
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',(SELECT json_group_array(
+        CASE WHEN json_extract(b.value,'$.type')='tool_result'
+            AND json_type(b.value,'$.content')='array'
+        THEN json_set(b.value,'$.content',(SELECT json_group_array(CASE
+            WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
+            THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
+                '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
+            WHEN json_extract(p.value,'$.type')='image' AND json_extract(p.value,'$.source.type')='base64'
+            THEN json_set(p.value,'$.source.data','',
+                '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
+            ELSE json(p.value) END)
+            FROM json_each(b.value,'$.content') AS p))
+        ELSE CASE
+            WHEN json_extract(b.value,'$.type')='input_image' AND json_extract(b.value,'$.image_url') LIKE 'data:%'
+            THEN json_set(b.value,'$.image_url',substr(json_extract(b.value,'$.image_url'),1,instr(json_extract(b.value,'$.image_url'),',')),
+                '$.omitted_bytes',length(json_extract(b.value,'$.image_url'))-instr(json_extract(b.value,'$.image_url'),','))
+            WHEN json_extract(b.value,'$.type')='image' AND json_extract(b.value,'$.source.type')='base64'
+            THEN json_set(b.value,'$.source.data','',
+                '$.omitted_bytes',length(json_extract(b.value,'$.source.data')))
+            ELSE json(b.value) END END)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b)) AS BLOB)
+    WHEN json_extract(CAST(item AS TEXT),'$.type')='function_call_output' AND json_type(CAST(item AS TEXT),'$.output')='array'
+    THEN CAST(json_set(CAST(item AS TEXT),'$.output',(SELECT json_group_array(CASE
+        WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
+        THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
+            '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
+        WHEN json_extract(p.value,'$.type')='image' AND json_extract(p.value,'$.source.type')='base64'
+        THEN json_set(p.value,'$.source.data','',
+            '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
+        ELSE json(p.value) END)
+        FROM json_each(CAST(item AS TEXT),'$.output') AS p)) AS BLOB)
     ELSE item END
 ELSE item END";
 /// The bot's oldest queued turn now waits only for a slot. True when that

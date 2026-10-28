@@ -2288,7 +2288,9 @@ single long turn outgrows the window, and it comes first because it costs
 no call and keeps the model's own reasoning in view. Compaction then runs as
 before if the view is still over its threshold.
 
-A result is elidable when its stub saves at least 1 KiB. For a bot with
+A result is elidable when its stub saves at least 1 KiB. A result that
+carried a picture is stubbed as its text alone, with a line that the file
+holds the picture if the model needs it again. For a bot with
 `read`, the stub is made when the result is recorded, with the node id its insert takes, and stored
 beside it. Each node records what its stub saves and, like its byte total,
 the cumulative savings along its lineage; each floor version records the
@@ -2296,7 +2298,8 @@ cumulative savings through its floor. A node's bytes as sent are then its
 byte total less the smaller of the two, so the window, turn admission, and
 compaction accounting stay constant-time lookups and read no item. A
 request reads the stub in place of the result's row. The stored transcript
-is never rewritten: `history_items`, `history`, and forks see every result whole,
+is never rewritten: `history_items`, `history`, and forks see every result whole
+(history reads leave out a picture's bytes, counting them in `omitted_bytes`),
 and `read` with `result/NODE` returns one on the bot's own lineage. A
 shell result is one JSON line, often longer than a `read` page, so that
 read splits lines longer than 4 KiB into numbered pieces and pages them.
@@ -2614,7 +2617,14 @@ the tool is offered is the client's choice at creation, like any tool.
 bound including paging notices (files up to 4 MiB). If the first requested line
 cannot fit the page, it returns `read_line_too_long` with the line number; use a
 byte-oriented tool to inspect that line. A page ending before an oversized line
-still returns its preceding lines and the next offset. `write` creates parent
+still returns its preceding lines and the next offset. A PNG, JPEG, GIF or
+WebP file comes back as the picture itself, after a line naming its kind, size
+and bytes, in each family's result shape: a list of an `input_text` and an
+`input_image` data URL for Responses, a `text` and a base64 `image` block for
+Anthropic. One longer than 1568 pixels on a side is scaled down to it, and one
+over 1 MiB as sent is re-encoded as a JPEG, so a screenshot fits what every
+provider takes. Any other binary file is `file_not_text`, naming its kind, and
+an image that cannot be decoded is `invalid_image`. `write` creates parent
 directories and writes up to
 1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
 is set. Paths are relative to the workspace unless absolute; nothing confines a
