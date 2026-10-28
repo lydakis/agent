@@ -319,12 +319,13 @@ impl Requests for crate::Client {
 /// the coordinator. A project that already exists in this folder is
 /// returned with `created: false`, its coordinator's row as the record, and
 /// nothing changed; a name another
-/// folder's coordinator holds is refused.
+/// folder's coordinator holds is refused. A role that names no tools gets
+/// the default set for its model, from `providers` (`ready.providers`).
 pub async fn create(
     daemon: &impl Requests,
     dir: &Path,
     policy: &Value,
-    tools: &Value,
+    providers: &Value,
     picks: &Picks,
     copies: &str,
     after: Option<&str>,
@@ -391,7 +392,10 @@ pub async fn create(
         "bot": coordinator, "workspace": at, "model": model,
         "instructions": instructions,
         "compaction_instructions": policy["compaction_instructions"],
-        "tools": if policy["tools"].is_null() { tools } else { &policy["tools"] },
+        "tools": match &policy["tools"] {
+            Value::Null => json!(crate::default_tools(providers, model)),
+            tools => tools.clone(),
+        },
     });
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
@@ -502,7 +506,7 @@ mod tests {
                 daemon,
                 dir,
                 policy,
-                &json!(["shell", "read"]),
+                &json!({"alpha": {"family": "responses"}}),
                 picks,
                 "worktree",
                 None,
@@ -558,7 +562,10 @@ mod tests {
         );
         assert_eq!(
             (&create["tools"], &create["compaction_instructions"]),
-            (&json!(["shell", "read"]), &json!("keep"))
+            (
+                &json!(["shell", "read", "write", "apply_patch", "wait", "history"]),
+                &json!("keep")
+            )
         );
         let file = read(&dir).unwrap();
         assert_eq!(

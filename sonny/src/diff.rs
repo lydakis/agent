@@ -209,11 +209,22 @@ pub fn unified(text: &str, width: usize, most: usize) -> Option<Vec<Line<'static
     }
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut files: Vec<(String, Vec<Hunk>)> = Vec::new();
+    // Files a diff deletes: named by their old path, with no lines shown.
+    let mut deleted: Vec<usize> = Vec::new();
+    let mut old_path = "";
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
-        if let Some(path) = line.strip_prefix("+++ ") {
-            let path = path.strip_prefix("b/").unwrap_or(path).to_owned();
-            files.push((path, Vec::new()));
+        if let Some(path) = line.strip_prefix("--- ") {
+            old_path = path.strip_prefix("a/").unwrap_or(path);
+        } else if let Some(path) = line.strip_prefix("+++ ") {
+            let path = match path {
+                "/dev/null" => {
+                    deleted.push(files.len());
+                    old_path
+                }
+                path => path.strip_prefix("b/").unwrap_or(path),
+            };
+            files.push((path.to_owned(), Vec::new()));
         } else if let Some(header) = line.strip_prefix("@@ ")
             && let Some((_, hunks)) = files.last_mut()
         {
@@ -251,6 +262,11 @@ pub fn unified(text: &str, width: usize, most: usize) -> Option<Vec<Line<'static
             Span::raw(path.clone()).bold(),
             Span::raw("  "),
         ];
+        if deleted.contains(&i) {
+            head.push(Span::raw("deleted").fg(palette().removed));
+            out.push(Line::from(head));
+            continue;
+        }
         head.extend(counts(removed, added));
         out.push(Line::from(head));
         let digits = hunks

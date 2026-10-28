@@ -297,7 +297,13 @@ pub struct Completion {
 pub struct ToolCall {
     pub name: String,
     pub call_id: String,
+    /// A JSON object. A custom tool's call carries its free-form input as
+    /// `{"input": ...}`, so every tool reads its arguments one way.
     pub arguments: String,
+    /// A Responses custom tool's call (`custom_tool_call`), answered with a
+    /// `custom_tool_call_output`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
 }
 pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
 /// The conversation items of a request: pre-encoded, comma-separated items

@@ -658,6 +658,85 @@ fn prompt_bytes(prompts: &[Value]) -> usize {
         .sum()
 }
 
+/// Whether a tool changes files: its calls are judged by the files they
+/// change, not their contents.
+fn changes_files(tool: &str) -> bool {
+    matches!(tool, "write" | "edit" | "apply_patch")
+}
+
+/// The files a call changes: a write's or edit's `path`, or every file a
+/// patch adds, deletes, updates or moves to, or the `paths` read from a
+/// cut patch.
+fn changed_paths(tool: &str, arguments: &Value) -> Vec<String> {
+    match tool {
+        "write" | "edit" => arguments["path"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        "apply_patch" => match arguments["paths"].as_array() {
+            Some(paths) => paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            None => patch_paths(arguments["input"].as_str().unwrap_or_default()),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The files a patch names on its file lines. Also read from a cut
+/// arguments preview, where the patch is still JSON-escaped, so a literal
+/// `\n` ends a line too.
+fn patch_paths(text: &str) -> Vec<String> {
+    const MARKERS: [&str; 4] = [
+        "*** Add File: ",
+        "*** Delete File: ",
+        "*** Update File: ",
+        "*** Move to: ",
+    ];
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in text.split('\n').flat_map(|line| line.split("\\n")) {
+        let line = line.trim();
+        if let Some(path) = MARKERS.iter().find_map(|marker| line.strip_prefix(marker))
+            && !path.is_empty()
+            && seen.insert(path)
+        {
+            paths.push(path.to_owned());
+        }
+    }
+    paths
+}
+
+/// The files a file-changing call too large to read back changes: a
+/// patch's as the daemon named them whole, else as its preview names them.
+fn cut_files(tool: &str, call: &Value, preview: &str) -> std::result::Result<Value, Unjudged> {
+    match call["paths"].as_array() {
+        Some(paths) if tool == "apply_patch" => Ok(json!({"paths":paths})),
+        _ => cut_change(tool, preview),
+    }
+}
+
+/// What is shown of a file-changing call too large to read back: the
+/// files it changes, when its preview names them.
+fn cut_change(tool: &str, preview: &str) -> std::result::Result<Value, Unjudged> {
+    match tool {
+        "apply_patch" => {
+            // The line the cut falls in may hold part of a path: only
+            // lines it ended are read.
+            let ended = preview.rfind("\\n").map_or("", |end| &preview[..end]);
+            let paths = patch_paths(ended);
+            if paths.is_empty() {
+                return Err(Unjudged::TooLong);
+            }
+            Ok(json!({"paths":paths}))
+        }
+        _ => Ok(json!({"path":preview_path(preview).ok_or(Unjudged::TooLong)?})),
+    }
+}
+
 /// The `path` of a call whose arguments preview was cut, when the preview
 /// holds it whole: the fields before the cut parse, the one it falls in
 /// does not.
@@ -792,6 +871,9 @@ async fn intent(
         }
     }
     let mut planned = Vec::with_capacity(calls.len());
+    // The files each call changes, read before its contents are clipped
+    // for showing, which can leave out a patch's file lines.
+    let mut changes = Vec::with_capacity(calls.len());
     // Past this the state is too long to judge anyway: stop reading.
     let mut size = 0;
     for (index, call) in calls.iter().enumerate() {
@@ -808,7 +890,8 @@ async fn intent(
         };
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
         let mut unseen = false;
-        if matches!(tool.as_str(), "write" | "edit") {
+        changes.push(changed_paths(&tool, &arguments));
+        if changes_files(&tool) {
             (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
         }
         size += arguments.to_string().len();
@@ -826,13 +909,16 @@ async fn intent(
     let mut allowed = Vec::new();
     let mut allowed_cut = read["calls_more"] == true;
     let mut written = Vec::new();
+    // Whether an earlier call changed files not all of which are named: a
+    // later call may run one unseen.
+    let mut written_cut = false;
     // Arguments read whole for calls whose preview was cut; past the text
     // limit only a write's or edit's path is still read, and kept small.
     let mut expanded = 0;
     for call in read["calls"].as_array().into_iter().flatten() {
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
         let preview = call["arguments"].as_str().unwrap_or_default();
-        let writes = matches!(tool.as_str(), "write" | "edit");
+        let writes = changes_files(&tool);
         let cut = call["arguments_truncated"] == true;
         // Whether a write's size is known: an ungated call has no planning
         // node to read its whole arguments from.
@@ -852,7 +938,7 @@ async fn intent(
                     // Too large to read back: as a call with no node.
                     Err(Unjudged::TooLong) if writes => {
                         sized = false;
-                        json!({"path":preview_path(preview).ok_or(Unjudged::TooLong)?})
+                        cut_files(&tool, call, preview)?
                     }
                     Err(Unjudged::TooLong) => {
                         allowed_cut = true;
@@ -864,7 +950,7 @@ async fn intent(
                 // no file this turn wrote could be matched.
                 None if writes => {
                     sized = false;
-                    json!({"path":preview_path(preview).ok_or(Unjudged::TooLong)?})
+                    cut_files(&tool, call, preview)?
                 }
                 None => {
                     allowed_cut = true;
@@ -874,18 +960,23 @@ async fn intent(
         };
         // A file's content is not what consent is about: its path and size.
         if writes && let Value::Object(fields) = &arguments {
+            let paths = changed_paths(&tool, &arguments);
             // A failed write changed nothing this turn: its file is not shown.
-            if let Some(path) = fields.get("path").and_then(Value::as_str)
-                && call["failed"] != true
-            {
-                written.push(path.to_owned());
+            if call["failed"] != true {
+                written.extend(paths.iter().cloned());
+                // A patch read from its cut preview alone may name more.
+                written_cut |= call["paths_cut"] == true
+                    || (tool == "apply_patch" && !sized && !call["paths"].is_array());
             }
             let bytes: usize = fields
                 .iter()
-                .filter(|(name, _)| name.as_str() != "path")
+                .filter(|(name, _)| !matches!(name.as_str(), "path" | "paths"))
                 .map(|(_, value)| value.as_str().map_or(0, str::len))
                 .sum();
-            arguments = json!({"path":fields.get("path"),"bytes":sized.then_some(bytes)});
+            arguments = match tool.as_str() {
+                "apply_patch" => json!({"paths":paths,"bytes":sized.then_some(bytes)}),
+                _ => json!({"path":fields.get("path"),"bytes":sized.then_some(bytes)}),
+            };
         }
         if cut {
             expanded += arguments.to_string().len();
@@ -906,7 +997,8 @@ async fn intent(
     // call will find it, so it points to that call instead.
     let workspace = read["workspace"].as_str().map(PathBuf::from);
     let mut changing: Vec<(String, String)> = Vec::new();
-    for call in &mut planned {
+    for (call, changed) in planned.iter_mut().zip(changes) {
+        call.unseen |= written_cut;
         let mut text = String::new();
         strings(&call.arguments, &mut text);
         let names = |path: &str| {
@@ -943,10 +1035,8 @@ async fn intent(
                 None => {}
             }
         }
-        if matches!(call.tool.as_str(), "write" | "edit")
-            && let Some(path) = call.arguments["path"].as_str()
-        {
-            changing.push((path.to_owned(), call.id.clone()));
+        for path in changed {
+            changing.push((path, call.id.clone()));
         }
     }
     let earlier = read["earlier"]
@@ -1311,6 +1401,45 @@ mod tests {
         assert_eq!(cut(r#"{"content":"echo one\necho tw"#), None);
         assert_eq!(cut(r#"{"path":7,"content":"x"#), None);
         assert_eq!(cut("echo"), None);
+    }
+
+    #[test]
+    fn a_patch_is_judged_by_every_file_it_names() {
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n*** Move to: b.rs\n@@\n-x\n+y\n*** Add File: c.rs\n+z\n*** Delete File: a.rs\n*** End Patch";
+        assert_eq!(
+            changed_paths("apply_patch", &json!({"input": patch})),
+            ["a.rs", "b.rs", "c.rs"]
+        );
+        // Cut short, still JSON-escaped: the files named before the cut.
+        let preview = &json!({"input": patch}).to_string()[..72];
+        assert_eq!(
+            cut_change("apply_patch", preview).ok(),
+            Some(json!({"paths":["a.rs", "b.rs"]}))
+        );
+        // A path the cut falls in is not read as a shorter one.
+        let preview = &json!({"input": patch}).to_string()[..65];
+        assert_eq!(
+            cut_change("apply_patch", preview).ok(),
+            Some(json!({"paths":["a.rs"]}))
+        );
+        assert!(cut_change("apply_patch", r#"{"input":"*** Begin Pa"#).is_err());
+        // The files the daemon named whole win over a cut preview's.
+        let call = json!({"paths":["a.rs", "b.rs", "c.rs", "run.sh"]});
+        assert_eq!(
+            cut_files("apply_patch", &call, preview).ok(),
+            Some(json!({"paths":["a.rs", "b.rs", "c.rs", "run.sh"]}))
+        );
+        assert_eq!(
+            cut_files("apply_patch", &json!({}), preview).ok(),
+            Some(json!({"paths":["a.rs"]}))
+        );
+        // What a cut preview yields still names its files.
+        assert_eq!(
+            changed_paths("apply_patch", &json!({"paths":["a.rs", "b.rs"]})),
+            ["a.rs", "b.rs"]
+        );
+        assert_eq!(changed_paths("edit", &json!({"path": "x"})), ["x"]);
+        assert!(changed_paths("shell", &json!({"command": "*** Add File: x"})).is_empty());
     }
 
     #[test]

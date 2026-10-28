@@ -22,8 +22,10 @@ use tokio::{
 };
 
 mod files;
+mod patch;
 mod picture;
 use files::read_bounded;
+pub use patch::Patch;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
@@ -52,6 +54,7 @@ enum Tool {
     Read,
     Write,
     Edit,
+    ApplyPatch,
     Wait,
     History,
     Note,
@@ -64,6 +67,7 @@ impl Tool {
             "read" => Tool::Read,
             "write" => Tool::Write,
             "edit" => Tool::Edit,
+            "apply_patch" => Tool::ApplyPatch,
             "wait" => Tool::Wait,
             "history" => Tool::History,
             "note" => Tool::Note,
@@ -77,6 +81,7 @@ impl Tool {
             Tool::Read => "read",
             Tool::Write => "write",
             Tool::Edit => "edit",
+            Tool::ApplyPatch => "apply_patch",
             Tool::Wait => "wait",
             Tool::History => "history",
             Tool::Note => "note",
@@ -113,6 +118,11 @@ impl Tool {
                 "new":{"type":"string"},"replace_all":{"type":"boolean"}},
                 "required":["path","old","new"],"additionalProperties":false}),
             ),
+            Tool::ApplyPatch => (
+                "Edit files with a patch: add, update, move and delete any number of files in one call. The patch is checked against every file first, so one that does not apply changes nothing. Format: `*** Begin Patch`, then for each file `*** Add File: PATH` followed by its lines each starting with +, or `*** Delete File: PATH`, or `*** Update File: PATH` with an optional `*** Move to: NEW_PATH` and chunks of lines starting with a space (kept), - (removed) or + (added); an `@@ LINE` before a chunk names a line above it, such as a function's, to place it, and `*** End of File` after a chunk anchors it at the end. Show about three kept lines around each change. Finish with `*** End Patch`. Paths are relative to the workspace unless absolute.",
+                json!({"type":"object","properties":{"input":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch."}},
+                "required":["input"],"additionalProperties":false}),
+            ),
             Tool::History => (
                 "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
@@ -135,6 +145,7 @@ impl Tool {
             name: self.name().into(),
             description: description.into(),
             parameters,
+            grammar: (self == Tool::ApplyPatch).then_some(patch::GRAMMAR),
         }
     }
 }
@@ -639,6 +650,7 @@ pub enum Prepared {
         path: String,
         content: String,
     },
+    ApplyPatch(Patch),
     Edit {
         path: String,
         old: String,
@@ -731,9 +743,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,wait,history,note"
+            "echo,shell,read,write,edit,apply_patch,wait,history,note"
         } else {
-            "echo,read,write,edit,wait,history,note"
+            "echo,read,write,edit,apply_patch,wait,history,note"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -809,6 +821,7 @@ impl Registry {
                 name: tool.name.clone().into(),
                 description: tool.description.clone().into(),
                 parameters: tool.parameters.clone(),
+                grammar: None,
             }))
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
@@ -959,6 +972,11 @@ impl Registry {
         struct Write {
             path: String,
             content: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ApplyPatch {
+            input: String,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1117,6 +1135,17 @@ impl Registry {
                     content: args.content,
                 }
             }
+            Tool::ApplyPatch => {
+                let args: ApplyPatch = serde_json::from_str(args).map_err(invalid)?;
+                if args.input.len() > WRITE_BYTES {
+                    return fail("tool_input_limit");
+                }
+                let patch = Patch::parse(&args.input)?;
+                for target in patch.paths() {
+                    path(target)?;
+                }
+                Prepared::ApplyPatch(patch)
+            }
             Tool::Edit => {
                 let args: Edit = serde_json::from_str(args).map_err(invalid)?;
                 path(&args.path)?;
@@ -1213,6 +1242,19 @@ impl Registry {
                     content.len(),
                     path
                 )))
+            }
+            Prepared::ApplyPatch(patch) => {
+                for path in patch.paths() {
+                    writable(sandbox.clone(), &resolve(workspace, path), path).await?;
+                }
+                let staged = patch.stage(workspace).await?;
+                // A process slot only while the sandbox's helper writes.
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = match staged.writes() {
+                    true => self.helper_slot(&sandbox).await?,
+                    false => None,
+                };
+                Ok(Outcome::text(staged.commit(sandbox).await?))
             }
             Prepared::Edit {
                 path,

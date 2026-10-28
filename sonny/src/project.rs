@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 /// `~/.agents/agents/lead.md` to edit; used when neither the folder nor
 /// the person has a `lead.md`.
 pub const LEAD: &str = include_str!("../agents/lead.md");
-pub const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 
 /// What Sonny ships for every agent it starts other than a lead (tasks,
 /// a trigger's agents and the ones opened with `--new`), written to the
@@ -504,7 +503,16 @@ async fn make(
         "declare": crate::declared::tools(true),
     });
     let copies = crate::settings::Settings::load().copies;
-    agent_client::project::create(client, dir, &policy, &json!(TOOLS), picks, &copies, None).await
+    agent_client::project::create(
+        client,
+        dir,
+        &policy,
+        client.providers(),
+        picks,
+        &copies,
+        None,
+    )
+    .await
 }
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
