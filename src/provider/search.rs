@@ -6,7 +6,7 @@
 //! Bedrock's Responses endpoint hosts `web_search` for the GPT models it
 //! serves; Anthropic hosts its own server tool, which Bedrock does not.
 //! Any other gateway offers none, and a bot there is refused the tool.
-use super::{Provider, connection_error, error_body, sanitize_error};
+use super::{Provider, connection_error, error_body, pace, refused, retry_after, sanitize_error};
 use crate::{Error, Result, codec::Family, fail_with};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -27,8 +27,22 @@ const RUN_PARAMETERS: &str = include_str!("../tools/web_run.json");
 const MAX_OUTPUT_TOKENS: u64 = 10_000;
 const MAX_RESPONSE: usize = 1024 * 1024;
 /// A search that opens pages takes seconds; one that has not answered in
-/// two minutes is failed to the model, which may try again.
+/// two minutes, retries and waits included, is failed to the model, which
+/// may try again.
 const DEADLINE: Duration = Duration::from_secs(120);
+/// The pace pool searches share.
+const POOL: &str = "web.run";
+/// A transient failure's retries wait 250 ms, doubling to 8 s.
+const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+/// Why one search request failed: wait this long and try again, back off
+/// (as long as the provider asked, if it did) and try again, or stop.
+enum Attempt {
+    Paced(Error, Duration),
+    Transient(Error, Option<Duration>),
+    Final(Error),
+}
 
 /// The `web.run` function, as a Responses namespace and as a plain tool
 /// named `web_search` for another family.
@@ -144,37 +158,110 @@ impl Provider {
             .ok()
             .filter(Value::is_object)
             .ok_or_else(|| Error::new("invalid_tool_arguments"))?;
-        let body = json!({"id":session,"model":model,"commands":commands,
+        let body = serde_json::to_vec(&json!({"id":session,"model":model,"commands":commands,
             "settings":{"allowed_callers":["direct"],"external_web_access":true},
-            "max_output_tokens":MAX_OUTPUT_TOKENS});
-        let admission = self.admit().await?;
+            "max_output_tokens":MAX_OUTPUT_TOKENS}))?;
+        // Searches have their own pool: a refusal of one says nothing of
+        // the model's calls, and the next search waits it out.
+        let pace = self.pools.get(POOL);
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let mut backoff = FIRST_BACKOFF;
+        loop {
+            let (error, wait) = match self.search_once(&pace, &url, &body, deadline).await {
+                Ok(output) => {
+                    pace.accepted();
+                    return Ok(output);
+                }
+                Err(Attempt::Final(error)) => return Err(error),
+                Err(Attempt::Paced(error, wait)) => (error, wait),
+                Err(Attempt::Transient(error, asked)) => {
+                    let wait = asked.unwrap_or(backoff);
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    (error, wait)
+                }
+            };
+            // A wait past the deadline is the model's to hear about; the
+            // pool stays closed for its next search.
+            if tokio::time::Instant::now() + wait >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// One `alpha/search` request, classed as the model's calls are: a rate
+    /// limit closes the pool, an overload closes it when it names a delay
+    /// or overloads cluster, a server or connection failure backs off, and
+    /// the rest are final.
+    async fn search_once(
+        &self,
+        pace: &pace::Pace,
+        url: &reqwest::Url,
+        body: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<String, Attempt> {
+        let mut park_for = None;
+        let mut reservation = match pace.acquire(0, &mut park_for).await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return Err(match park_for {
+                    Some(wait) => Attempt::Paced(error, wait),
+                    None => Attempt::Final(error),
+                });
+            }
+        };
+        let transient = |error: Error| Attempt::Transient(error, None);
+        let admission = self.admit().await.map_err(transient)?;
         let (client, _lease) = self.transport.lease();
         let mut http = client
-            .post(url)
-            .timeout(DEADLINE)
+            .post(url.clone())
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .header("content-type", "application/json")
-            .body(serde_json::to_vec(&body)?);
+            .body(body.to_vec());
         if let Some(key) = &self.key {
             http = http.bearer_auth(key);
         }
-        let response = http.send().await.map_err(connection_error)?;
+        reservation.dispatch();
+        let response = http
+            .send()
+            .await
+            .map_err(|error| transient(connection_error(error)))?;
         drop(admission);
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            // A refusal is the search's failure: the model reads why.
-            let detail = error_body(response).await.and_then(|body| body.detail);
-            return Err(Error {
-                code: format!("provider_http_{status}"),
-                detail,
+            let headers = response.headers().clone();
+            let after = retry_after(&headers);
+            let body = error_body(response).await.unwrap_or_default();
+            // The model reads why a search failed.
+            let error = |code: String| Error {
+                code,
+                detail: body.detail.clone(),
                 facts: None,
+            };
+            return Err(match status {
+                429 if body.quota => Attempt::Final(error("provider_quota_exhausted".into())),
+                429 | 529 => {
+                    refused(pace, status == 529, after);
+                    let error = error(format!("provider_http_{status}"));
+                    // A refusal that closed the pool waits until it opens.
+                    match pace.blocked_for() {
+                        Some(left) => Attempt::Paced(error, left),
+                        None => Attempt::Transient(error, after),
+                    }
+                }
+                500..=599 => Attempt::Transient(error(format!("provider_http_{status}")), after),
+                _ => Attempt::Final(error(format!("provider_http_{status}"))),
             });
         }
         let mut stream = response.bytes_stream();
         let mut read = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(connection_error)?;
+            let chunk = chunk.map_err(|error| transient(connection_error(error)))?;
             if read.len() + chunk.len() > MAX_RESPONSE {
-                return fail_with("output_limit", "the search answered more than 1 MiB");
+                return Err(Attempt::Final(Error::with(
+                    "output_limit",
+                    "the search answered more than 1 MiB",
+                )));
             }
             read.extend_from_slice(&chunk);
         }
@@ -184,7 +271,12 @@ impl Provider {
         }
         serde_json::from_slice::<Answer>(&read)
             .map(|answer| answer.output)
-            .map_err(|_| Error::with("invalid_search_response", "no output in the answer"))
+            .map_err(|_| {
+                Attempt::Final(Error::with(
+                    "invalid_search_response",
+                    "no output in the answer",
+                ))
+            })
     }
 }
 
@@ -330,45 +422,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// One fake `alpha/search` answer: the request it read, as text, and
-    /// the provider's result.
-    async fn answered(status: &str, body: &str, commands: &str) -> (String, Result<String>) {
+    /// A fake `alpha/search` answering each request in turn with a status,
+    /// extra headers and a body: the requests it read, as text, and the
+    /// provider's result.
+    async fn served(
+        replies: &[(&str, &str, &str)],
+        commands: &str,
+    ) -> (Vec<String>, Result<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1/alpha/search", listener.local_addr().unwrap());
-        let reply = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
+        let replies: Vec<String> = replies
+            .iter()
+            .map(|(status, headers, body)| format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+            .collect();
         let server = tokio::spawn(async move {
-            let Ok(Ok((mut socket, _))) =
-                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
-            else {
-                return String::new();
-            };
-            let mut request = Vec::new();
-            let mut buffer = [0; 4096];
-            loop {
-                let n = socket.read(&mut buffer).await.unwrap();
-                request.extend_from_slice(&buffer[..n]);
-                let text = String::from_utf8_lossy(&request);
-                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                    let length = head
-                        .lines()
-                        .find_map(|line| {
-                            line.to_lowercase()
-                                .strip_prefix("content-length: ")
-                                .map(str::to_owned)
-                        })
-                        .and_then(|n| n.parse::<usize>().ok())
-                        .unwrap_or(0);
-                    if rest.len() >= length || n == 0 {
-                        break;
+            let mut requests = Vec::new();
+            for reply in replies {
+                let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if rest.len() >= length || n == 0 {
+                            break;
+                        }
                     }
                 }
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request).into_owned());
             }
-            socket.write_all(reply.as_bytes()).await.unwrap();
-            String::from_utf8_lossy(&request).into_owned()
+            requests
         });
         let openai = provider(
             Family::Responses,
@@ -379,7 +482,44 @@ mod tests {
             .search_at(url.parse().unwrap(), "gpt-6-sol", "bot-session", commands)
             .await
             .map_err(|error| sanitize_error(error, Some("synthetic-key")));
+        drop(openai);
         (server.await.unwrap(), result)
+    }
+
+    async fn answered(status: &str, body: &str, commands: &str) -> (String, Result<String>) {
+        let (mut requests, result) = served(&[(status, "", body)], commands).await;
+        (requests.pop().unwrap_or_default(), result)
+    }
+
+    /// A rate limit and a server error are retried after the wait they
+    /// name; an exhausted quota is not.
+    #[tokio::test]
+    async fn refusals_for_pace_and_server_errors_are_retried() {
+        let (requests, result) = served(
+            &[
+                ("429 Too Many Requests", "retry-after-ms: 20\r\n", "{}"),
+                ("503 Service Unavailable", "retry-after-ms: 10\r\n", "{}"),
+                ("200 OK", "", r#"{"output":"found"}"#),
+            ],
+            r#"{"search_query":[{"q":"rust"}]}"#,
+        )
+        .await;
+        assert_eq!(result.unwrap(), "found");
+        assert_eq!(requests.len(), 3);
+        let (requests, result) = served(
+            &[
+                (
+                    "429 Too Many Requests",
+                    "",
+                    r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"quota"}}"#,
+                ),
+                ("200 OK", "", r#"{"output":"found"}"#),
+            ],
+            r#"{}"#,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, "provider_quota_exhausted");
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]

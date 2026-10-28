@@ -2828,7 +2828,9 @@ worker or daemon shutdown. Use the shell tool for special-file operations.
 does. On OpenAI's API with a key it is Codex's `web.run` function in the `web`
 namespace, which the daemon answers by posting the call's commands to the
 provider's `alpha/search` (bounded at 1 MiB and two minutes) and returning its
-`output`. Bedrock's GPT models get the hosted `web_search` tool over indexed
+`output`. Searches are paced in a pool of their own and their failures classed
+as a model call's: a rate limit closes the pool, a server or connection failure
+backs off, and both retry within the two minutes before the model hears of them. Bedrock's GPT models get the hosted `web_search` tool over indexed
 results, and Anthropic's API gets its hosted server tool, `web_search_20260209`
 for Claude 4.6 and later but Haiku, `web_search_20250305` otherwise; the
 provider runs both, its blocks and citations are kept in the history as sent,
