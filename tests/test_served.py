@@ -128,6 +128,32 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'setup.done').exists())
         self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
+    def test_a_start_the_person_denies_runs_no_setup(self):
+        repo = self.path / 'calc'
+        (repo / '.agents').mkdir(parents=True)
+        setup = repo / '.agents/setup'
+        setup.write_text(f'#!/bin/sh\ntouch {self.path}/setup.ran\n')
+        setup.chmod(0o755)
+        self.git(repo, 'init', '-q', '-b', 'main')
+        self.git(repo, 'add', '.')
+        self.git(repo, 'commit', '-qm', 'one')
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        self.lookout()
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='deny', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 10
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        self.assertEqual(asked[0]['name'], 'start_task')
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id='script-0',
+                            request=asked[0]['request'], decision='deny', by='test')
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        self.assertFalse((self.path / 'setup.ran').exists())
+        self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
+
     def test_a_call_that_fails_is_answered_with_its_error(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('show_agent')])

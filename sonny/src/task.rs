@@ -132,7 +132,13 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     if start.setup && place.dir != here && script.exists() {
         // Its output is not kept, however long a build runs: only the last
         // lines of its errors, which a failure shows.
-        let ran = Command::new(&script)
+        let mut setup = Command::new(&script);
+        // The folder's own code, run outside any sandbox: none of the
+        // keys Agent keeps, as a bot's shell has none.
+        for key in kept_keys() {
+            setup.env_remove(key);
+        }
+        let ran = setup
             .current_dir(&place.dir)
             .env("AGENT_SOURCE", here)
             .stdin(Stdio::null())
@@ -784,6 +790,20 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
         true => copy.to_owned(),
         false => copy.join(prefix),
     }
+}
+
+/// The provider keys this process may hold: the well-known ones and what
+/// `~/.agent/env` sets.
+fn kept_keys() -> Vec<String> {
+    let mut keys: Vec<String> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+        .map(String::from)
+        .into();
+    if let Some(file) = agent_client::env_file::path()
+        && let Ok(set) = agent_client::env_file::read(&file)
+    {
+        keys.extend(set.into_iter().map(|(key, _)| key));
+    }
+    keys
 }
 
 /// The last 20 lines with words `stream` writes, each cut to 1000 bytes,

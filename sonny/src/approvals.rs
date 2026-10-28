@@ -225,12 +225,18 @@ mod tests {
             "gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
         assert!(regate(&lapsing, "auto").is_some());
         // Of the tools its client declared, those that can drop work or
-        // run outside the sandbox wait for the verdict too.
+        // run something outside the sandbox wait for the verdict too.
         let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(true),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
         assert_eq!(
             regate(&panes, "auto").unwrap()["approve"],
-            json!(["shell", "remove_task", "run_in_pane"])
+            json!([
+                "shell",
+                "start_task",
+                "remove_task",
+                "new_project",
+                "run_in_pane"
+            ])
         );
     }
 }

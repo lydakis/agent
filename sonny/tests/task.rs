@@ -89,7 +89,10 @@ impl Lab {
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com");
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            // Keys the lookout that runs these calls may hold.
+            .env("OPENAI_API_KEY", "sk-lab")
+            .env("LAB_TOKEN", "t-lab");
         if fail {
             command.env("AGENT_FAIL", "1");
         }
@@ -292,9 +295,14 @@ fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
     std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
     std::fs::write(
         &setup,
-        "#!/bin/sh\necho \"$AGENT_SOURCE\" > from\nexit \"${SETUP_EXIT:-0}\"\n",
+        "#!/bin/sh\necho \"$AGENT_SOURCE\" > from\n\
+         echo \"${OPENAI_API_KEY:-none} ${LAB_TOKEN:-none}\" > keys\nexit \"${SETUP_EXIT:-0}\"\n",
     )
     .unwrap();
+    std::fs::create_dir_all(lab.home.join(".agent")).unwrap();
+    let env = lab.home.join(".agent/env");
+    std::fs::write(&env, "LAB_TOKEN=t-lab\n").unwrap();
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
     lab.git(&lab.repo, &["add", "."]);
     lab.git(&lab.repo, &["commit", "-qm", "setup"]);
@@ -303,6 +311,9 @@ fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
     let folder = lab.home.join(".agent/worktrees/demo.fix/src");
     let from = std::fs::read_to_string(folder.join("from")).unwrap();
     assert_eq!(from.trim(), lab.repo.join("src").to_string_lossy());
+    // The folder's own code sees none of the keys Agent keeps.
+    let keys = std::fs::read_to_string(folder.join("keys")).unwrap();
+    assert_eq!(keys.trim(), "none none");
     // Setup is Sonny's, never the run's.
     assert!(!lab.ran().contains(&"--setup".to_owned()));
 }
