@@ -905,6 +905,9 @@ async fn intent(
     let mut allowed = Vec::new();
     let mut allowed_cut = read["calls_more"] == true;
     let mut written = Vec::new();
+    // Whether an earlier call changed files not all of which are named: a
+    // later call may run one unseen.
+    let mut written_cut = false;
     // Arguments read whole for calls whose preview was cut; past the text
     // limit only a write's or edit's path is still read, and kept small.
     let mut expanded = 0;
@@ -957,6 +960,9 @@ async fn intent(
             // A failed write changed nothing this turn: its file is not shown.
             if call["failed"] != true {
                 written.extend(paths.iter().cloned());
+                // A patch read from its cut preview alone may name more.
+                written_cut |= call["paths_cut"] == true
+                    || (tool == "apply_patch" && !sized && !call["paths"].is_array());
             }
             let bytes: usize = fields
                 .iter()
@@ -988,6 +994,7 @@ async fn intent(
     let workspace = read["workspace"].as_str().map(PathBuf::from);
     let mut changing: Vec<(String, String)> = Vec::new();
     for call in &mut planned {
+        call.unseen |= written_cut;
         let mut text = String::new();
         strings(&call.arguments, &mut text);
         let names = |path: &str| {

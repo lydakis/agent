@@ -6399,9 +6399,13 @@ impl Database {
             // The files a cut patch changes, when they fit what is left.
             if let Some(paths) = data.get("paths") {
                 let size = paths.to_string().len();
-                if size <= calls_left {
+                let fits = size <= calls_left;
+                if fits {
                     calls_left -= size;
                     call["paths"] = paths.clone();
+                }
+                if !fits || data["paths_cut"] == true {
+                    call["paths_cut"] = json!(true);
                 }
             }
             if failed.contains(&call_id) {
@@ -8498,10 +8502,23 @@ fn started(call: &ToolCall) -> Value {
         && let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments)
         && let Some(Ok(patch)) = arguments["input"].as_str().map(crate::tools::Patch::parse)
     {
-        data["paths"] = json!(patch.paths().collect::<Vec<_>>());
+        // Within what an event page carries: past it, the rest is marked
+        // as left out.
+        let (mut paths, mut size) = (Vec::new(), 0);
+        for path in patch.paths() {
+            size += path.len() + 3;
+            if size > STARTED_PATHS_BYTES {
+                data["paths_cut"] = json!(true);
+                break;
+            }
+            paths.push(path);
+        }
+        data["paths"] = json!(paths);
     }
     data
 }
+/// The most of a cut patch's paths a `tool_started` event names.
+const STARTED_PATHS_BYTES: usize = 64 * 1024;
 /// In an answered call's start, note it as waiting for its client, and
 /// name that client and the call's deadline in `tool_started`. A call
 /// whose arguments do not fit is refused at once, so it waits for none.
@@ -10296,6 +10313,19 @@ mod tests {
             ..call
         };
         assert!(started(&short).get("paths").is_none());
+        // Past what an event carries, the paths named stop and say so.
+        let mut input = "*** Begin Patch\n".to_owned();
+        for n in 0..3000 {
+            input.push_str(&format!("*** Delete File: {}{n}\n", "d/".repeat(100)));
+        }
+        input.push_str("*** End Patch");
+        let many = ToolCall {
+            arguments: json!({"input":input}).to_string(),
+            ..short
+        };
+        let data = started(&many);
+        assert_eq!(data["paths_cut"], true);
+        assert!(data.to_string().len() < 80 * 1024);
     }
 
     #[test]
