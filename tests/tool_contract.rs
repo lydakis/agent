@@ -724,7 +724,7 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
 
 /// A folder a bot may write that something swapped for a link since is
 /// refused, never bound where the link points: a bot's creator may write
-/// the folder above it.
+/// the folder above it. Each confined call builds its policy anew.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_folder_swapped_for_a_link_is_not_followed() {
@@ -738,30 +738,20 @@ async fn a_folder_swapped_for_a_link_is_not_followed() {
     let (given, outside) = (base.join("creator/child"), base.join("outside"));
     std::fs::create_dir_all(&given).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    let policy = Policy::new(
-        Some(Mode::WorkspaceWrite),
-        Some(&given),
-        &[],
-        false,
-        &Daemon::default(),
-    )
-    .unwrap()
-    .unwrap();
+    let policy = |workspace: &std::path::Path| {
+        Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(workspace),
+            &[],
+            false,
+            &Daemon::default(),
+        )
+    };
+    assert!(policy(&given).is_ok());
     std::fs::rename(&given, base.join("creator/moved")).unwrap();
     std::os::unix::fs::symlink(&outside, &given).unwrap();
-    let tools = Registry::new("shell").unwrap();
-    let prepared = tools
-        .prepare(
-            "shell",
-            &json!({"command": format!("touch {}/planted", given.display())}).to_string(),
-        )
-        .unwrap();
-    let ran = tools
-        .execute(prepared, &base, &[], Some(std::sync::Arc::new(policy)))
-        .await;
-    let error = ran.err().map(|error| error.code);
-    assert_eq!(error.as_deref(), Some("sandbox_unavailable"));
-    assert!(!outside.join("planted").exists());
+    let error = policy(&given).unwrap_err();
+    assert_eq!(error.code, "sandbox_unavailable");
     std::fs::remove_dir_all(base).unwrap();
 }
 

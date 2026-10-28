@@ -3655,7 +3655,8 @@ async fn delete_pieces(
     for provider in providers.values() {
         provider.forget(&bot);
     }
-    daemon.release(bot_id);
+    // Closing it takes a lock and unlinks a file: off the runtime thread.
+    let _ = tokio::task::spawn_blocking(move || daemon.release(bot_id)).await;
     // Followers learn the bot is gone; nothing durable remains to replay.
     let mut gone = json!({"event":"deleted","bot":bot,"durable":false});
     if expired {
