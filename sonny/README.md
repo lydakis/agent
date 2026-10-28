@@ -266,13 +266,15 @@ PEER`, and in Rex opens a window following each detached job.
 
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. It tells a lead what its tasks
-did in one "Task updates" note, by the handles its wait tool reads them
-with, and steers it at once only for a message that redirects other tasks
-or work that collides with another task's; what else the judge picks, such
-as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
-own model, and with the judge `off` sends the task updates alone. Any agent can
+subscribes each lead to its tasks. As soon as the lead rests, it tells it
+every message someone else wrote in its tasks and how each turn ended, in
+one "Task updates" note, by the handles its wait tool reads them with; the
+lead decides what matters. While the lead is mid-turn, a judge asks of each
+event only whether it cannot wait, and steers the lead at once if so. A
+turn a note started that ends with nothing to say stays folded under the
+note, with no sound. It judges with `AGENT_JUDGE`, the approver's setting,
+else the lead's own model, and with the judge `off` sends the task updates
+alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
