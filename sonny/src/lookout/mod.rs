@@ -2789,16 +2789,23 @@ impl Lookout {
         if self.refused(now) || !(steer || (now >= since + SETTLE && self.updates.due(true))) {
             return;
         }
-        // A bounded note sends what is urgent first.
+        // A bounded note sends what is urgent first, and always at least one.
         self.heard.sort_by_key(|heard| !heard.event.urgent);
-        let take = self.heard.len().min(NOTE_ITEMS);
+        let mut bytes = 0;
+        let take = (self.heard.iter().take(NOTE_ITEMS))
+            .take_while(|heard| {
+                bytes += sources::line(heard).len() + 1;
+                bytes <= sources::NOTE_BYTES
+            })
+            .count()
+            .max(1);
         let sent: Vec<sources::Heard> = self.heard.drain(..take).collect();
         let prompt = sources::note(&sent, self.heard.len());
         let key: Vec<String> = (sent.iter())
             .map(|heard| {
                 let event = &heard.event;
                 let id = event.id.as_deref().unwrap_or_default();
-                format!("{}/{id}/{}", event.source, event.at_ms)
+                format!("{}/{id}/{}/{}", event.source, event.at_ms, event.seq)
             })
             .collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
@@ -4869,6 +4876,7 @@ mod tests {
             url: None,
             urgent,
             at_ms: 1,
+            seq: 0,
         }
     }
 
@@ -4981,5 +4989,16 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("Handle what cannot wait"), "{prompt}");
+        // A note stays under its bytes however the text escapes; the rest
+        // waits for the next.
+        let escaped = "\u{1}".repeat(sources::TEXT_CHARS);
+        for _ in 0..NOTE_ITEMS {
+            lookout.heard_from(&slack(&escaped, true));
+        }
+        lookout.wake_sources(&client).await;
+        let prompt = got.recv().await.unwrap()["prompt"].as_str().unwrap().to_owned();
+        assert!(prompt.len() <= sources::NOTE_BYTES + 1024, "{}", prompt.len());
+        let told = prompt.matches("- slack").count();
+        assert!(told > 0 && lookout.heard.len() == NOTE_ITEMS - told, "{told}");
     }
 }
