@@ -193,8 +193,18 @@ def turn_items(daemon, bot, turn):
     nodes.sort()
     if not nodes:
         return []
-    read = daemon.request('history_items', bot=bot, nodes=nodes)
-    return [entry['item'] for entry in read['items']]
+    # At most 400 a read, and a read cut short by size goes on from the
+    # first node it did not return.
+    items = []
+    while nodes:
+        read = daemon.request('history_items', bot=bot, nodes=nodes[:400])
+        got = read['items']
+        if not got:
+            break
+        items += [entry['item'] for entry in got]
+        seen = {entry['node'] for entry in got}
+        nodes = [node for node in nodes if node not in seen]
+    return items
 
 
 def calls(items):

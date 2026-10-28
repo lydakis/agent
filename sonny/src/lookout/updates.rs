@@ -28,6 +28,8 @@ const WAKE_TASKS: usize = 32;
 /// line other than the person's words counts as `LINE_BYTES`.
 const NOTE_BYTES: usize = 64 * 1024;
 const LINE_BYTES: usize = 160;
+/// How many messages a task's news keeps the person's words for.
+const PENDING: usize = 128;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
@@ -84,6 +86,15 @@ impl News {
         self.said.extend(news.said);
         self.said.sort_by_key(|said| said.turn);
         self.said.dedup_by_key(|said| said.turn);
+        // A long backlog keeps its count and who wrote, but past PENDING
+        // the oldest lose their words, then go: the wait tool reads them.
+        let over = self.said.len().saturating_sub(PENDING);
+        for said in self.said.iter_mut().take(over) {
+            said.words = None;
+        }
+        if self.said.len() > 2 * PENDING {
+            self.said.drain(..self.said.len() - 2 * PENDING);
+        }
         self.act = one(self.act.take(), news.act);
         self.theirs = one(self.theirs.take(), news.theirs);
     }
@@ -438,10 +449,13 @@ impl Updates {
         if !self.live || !self.task(name) {
             return;
         }
+        // Only what a note quotes is kept.
+        let line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
         let said = Said {
             turn,
             from: from.to_owned(),
-            words: words.map(str::to_owned),
+            words,
         };
         self.news_of(name).merge(News {
             said: vec![said],
@@ -620,9 +634,7 @@ impl Updates {
             }
             let (mut kept, mut wait) = (Vec::new(), Vec::new());
             for message in std::mem::take(&mut news.said) {
-                let size = (message.words.as_deref())
-                    .map_or(0, |words| super::cut(words, super::QUOTE_CHARS).len())
-                    + LINE_BYTES;
+                let size = message.words.as_ref().map_or(0, String::len) + LINE_BYTES;
                 let first = items.is_empty() && kept.is_empty();
                 if wait.is_empty() && (first || bytes + size <= NOTE_BYTES) {
                     bytes += size;
@@ -847,16 +859,13 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
         let Some(words) = &message.words else {
             continue;
         };
-        let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Kept as told: one line, cut at the quote's length.
         let handle = format!("turn:{name}/{}", message.turn);
-        let text = match quoted.get(&words) {
+        let text = match quoted.get(words) {
             Some(first) => format!("- {name}: {handle}, the person wrote the same as in {first}"),
-            None => format!(
-                "- {name}: {handle}, the person wrote: \"{}\"",
-                super::cut(&words, super::QUOTE_CHARS)
-            ),
+            None => format!("- {name}: {handle}, the person wrote: \"{words}\""),
         };
-        quoted.entry(words).or_insert(handle);
+        quoted.entry(words.clone()).or_insert(handle);
         lines.push(line(message.turn, text));
     }
     let others: Vec<&Said> = said.iter().filter(|s| s.words.is_none()).collect();
@@ -1089,6 +1098,22 @@ mod tests {
         let handles: Vec<&str> = second.items.iter().map(|i| i.handle.as_str()).collect();
         assert_eq!(handles.len(), 50 - told);
         assert_eq!(handles[0], format!("turn:shop.fix/{}", told + 1));
+    }
+
+    #[test]
+    fn a_long_backlog_keeps_only_the_newest_words() {
+        let mut updates = fleet();
+        let long = "y".repeat(10 * super::super::QUOTE_CHARS);
+        for turn in 1..=300 {
+            updates.said("shop.fix", turn, "the person", Some(&long));
+        }
+        let said = &updates.tasks[0].1.said;
+        assert_eq!(said.len(), 2 * PENDING);
+        assert_eq!(said[0].turn, 300 - 2 * PENDING as i64 + 1);
+        let quoted = said.iter().filter(|s| s.words.is_some()).count();
+        assert_eq!(quoted, PENDING);
+        let kept = said.last().and_then(|s| s.words.as_ref()).unwrap();
+        assert!(kept.len() < 2 * super::super::QUOTE_CHARS);
     }
 
     #[test]
