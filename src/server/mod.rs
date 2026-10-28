@@ -947,8 +947,17 @@ struct Active {
     compact: Arc<std::sync::atomic::AtomicBool>,
     /// Armed by a `steer` alone, never by other deliveries.
     lift: Arc<turn::Lift>,
+    /// Set by the task before it submits its finish: from then on the store,
+    /// whose finishing commit also publishes `turn_finished`, says whether
+    /// the bot is still busy, though the task is not reaped yet.
+    ending: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Active {
+    /// The running turn, unless it has committed or is committing its end;
+    /// then a busy check asks the store.
+    fn running(&self) -> Option<i64> {
+        (!self.ending.load(std::sync::atomic::Ordering::Acquire)).then_some(self.turn)
+    }
     /// Cancel the turn with `code` unless a cause is already set: the first
     /// cause wins, so shutdown never relabels a client's pending interrupt.
     /// False when the task has already dropped its receiver.
@@ -1983,6 +1992,7 @@ impl Service {
         if lifted {
             lift.arm();
         }
+        let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         self.active.insert(
             bot.clone(),
             Active {
@@ -1992,6 +2002,7 @@ impl Service {
                 steers: steers.clone(),
                 compact: compact.clone(),
                 lift: lift.clone(),
+                ending: ending.clone(),
             },
         );
         let task = Turn {
@@ -2022,6 +2033,7 @@ impl Service {
             let exit = task.execute(cancelled.clone()).await;
             let result = match &exit {
                 turn::Exit::Finished(error) => {
+                    ending.store(true, std::sync::atomic::Ordering::Release);
                     commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled)
                         .await
                         .map(|()| exit)
@@ -2243,12 +2255,12 @@ impl Service {
                             "turns":0,"events":0,"nodes":0}));
                     }
                 }
-                if let Some(active) = self.active.get(&bot) {
+                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
-                        format!("turn {} of {bot} is running", active.turn),
+                        format!("turn {turn} of {bot} is running"),
                     )
-                    .facts(json!({"running_turn":active.turn})));
+                    .facts(json!({"running_turn":turn})));
                 }
                 // One bounded piece per job, on a task of its own, so other
                 // bots' requests and commits interleave with a large deletion
@@ -2347,12 +2359,12 @@ impl Service {
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
                 }
-                if let Some(active) = self.active.get(&bot) {
+                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
-                        format!("turn {} of {bot} is running", active.turn),
+                        format!("turn {turn} of {bot} is running"),
                     )
-                    .facts(json!({"running_turn":active.turn})));
+                    .facts(json!({"running_turn":turn})));
                 }
                 // Another model of the bot's family: its history is kept in
                 // that family's encoding.
@@ -3452,6 +3464,7 @@ mod tests {
             steers: Arc::default(),
             compact: Arc::default(),
             lift: Arc::default(),
+            ending: Arc::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -3670,6 +3683,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_that_committed_its_end_does_not_hold_its_bot_busy_until_reaped() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-ending-busy-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = store
+            .op("create", |db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic-model",
+                        instructions: "test",
+                        effort: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                        gate: None,
+                        settings: Default::default(),
+                        declared: None,
+                        request_id: None,
+                    },
+                )?;
+                let turn = db
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                Ok(turn)
+            })
+            .await
+            .unwrap();
+        let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let mut service = Service {
+            store: store.clone(),
+            identity: 0,
+            transport: Transport::new(64, 1).unwrap(),
+            providers: Arc::new(HashMap::new()),
+            registry: Registry::new("wait").unwrap(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
+                processes: 16,
+                detached: 16,
+                active: 1024,
+                connecting: 64,
+                connections: 11,
+            },
+            sessions: 0,
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1,
+            active: HashMap::from([(
+                "Bob".into(),
+                Active {
+                    turn,
+                    task: 1,
+                    cancel: watch::channel(None).0,
+                    steers: Arc::default(),
+                    compact: Arc::default(),
+                    lift: Arc::default(),
+                    ending: ending.clone(),
+                },
+            )]),
+            next_task: 1,
+            jobs: JoinSet::new(),
+            replays: JoinSet::new(),
+            retention: JoinSet::new(),
+            ready_hint: false,
+            tokens: Arc::default(),
+            wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
+            draining: false,
+            admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
+            expiry: None,
+            reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
+        };
+        let output = Output::writer(tokio::io::sink());
+        let delete = || Command::Delete {
+            bot: "Bob".into(),
+            bot_id: None,
+        };
+        // Running: refused at once, without asking the store.
+        let busy = service
+            .dispatch(delete(), 0, &output, Value::Null, Bound::default())
+            .await
+            .unwrap_err();
+        assert_eq!(busy.code, "bot_busy");
+        // The task is submitting its end: the store decides, and the turn is
+        // still running there.
+        ending.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            service
+                .dispatch(delete(), 0, &output, Value::Null, Bound::default())
+                .await
+                .unwrap_err()
+                .code,
+            "deferred"
+        );
+        let refused = service.retention.join_next().await;
+        assert!(refused.is_some());
+        assert!(store.op("inspect", |db| db.inspect("Bob")).await.is_ok());
+        // Its end committed, which published `turn_finished`; the task is not
+        // reaped, and a client that saw the event may delete the bot.
+        store
+            .op("finish", move |db| db.finish(turn, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .dispatch(delete(), 0, &output, Value::Null, Bound::default())
+                .await
+                .unwrap_err()
+                .code,
+            "deferred"
+        );
+        service.retention.join_next().await;
+        assert_eq!(
+            store
+                .op("inspect", |db| db.inspect("Bob"))
+                .await
+                .unwrap_err()
+                .code,
+            "bot_not_found"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[tokio::test]
     async fn interrupt_reconciles_a_parked_task_before_it_is_reaped() {
         let dir = std::env::temp_dir().join(format!(
             "agent-parked-interrupt-test-{}",
@@ -3764,6 +3919,7 @@ mod tests {
                     steers: Arc::default(),
                     compact: Arc::default(),
                     lift: Arc::default(),
+                    ending: Arc::default(),
                 },
             )]),
             next_task: 1,
@@ -3972,6 +4128,7 @@ mod tests {
                             steers: Arc::default(),
                             compact: Arc::default(),
                             lift: Arc::default(),
+                            ending: Arc::default(),
                         },
                     )
                 })
@@ -4706,7 +4863,10 @@ mod tests {
         assert_eq!(service.storage_backoff, Duration::ZERO);
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
         service.complete(bot, turn, task, exit).await.unwrap();
-        assert_eq!(status().await, "failed", "the provider was missing");
+        // Nothing listens there: its retries back off, and a backoff of a
+        // second or more parks the turn again rather than sleeping in it.
+        assert_eq!(status().await, "paced", "the provider refused, backing off");
+        assert!(service.active.is_empty(), "the backoff holds no slot");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
