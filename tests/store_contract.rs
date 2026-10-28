@@ -3365,6 +3365,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
             name: "start".into(),
             call_id: format!("c{n}"),
             arguments: "{}".into(),
+            custom: false,
         })
         .collect();
     db.append(turn, vec![], &calls, None).unwrap();
