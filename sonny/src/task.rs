@@ -1521,7 +1521,14 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_dir_all(&base);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("git is off here"));
+        // Older git says the reason; newer git names the .git file that
+        // holds it.
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            said.contains("git is off here")
+                || said.contains("gitfile does not point to a valid repository"),
+            "{said}"
+        );
     }
 
     #[test]
