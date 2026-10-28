@@ -755,6 +755,7 @@ async fn run() -> Result<(), String> {
     }
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
         app.notice = Some(format!(
@@ -2560,6 +2561,7 @@ impl App {
                     phase: "Working".into(),
                     note: false,
                 });
+                self.turn_began().await;
                 status_report("working", &self.bot);
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
@@ -3693,15 +3695,25 @@ impl App {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            let turn = self
+            let turns = self
                 .client
-                .request("turns", json!({"bot": name, "newest": true, "limit": 1}))
+                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
                 .await
                 .ok()
-                .and_then(|page| page["turns"].get(0).cloned())
-                .unwrap_or(Value::Null);
+                .and_then(|page| page["turns"].as_array().cloned())
+                .unwrap_or_default();
+            let turn = turns.first().cloned().unwrap_or(Value::Null);
+            // A message steered into a running turn is recorded as a turn
+            // of its own that never ran: the time is the one it joined.
+            let ran = turns
+                .iter()
+                .find(|turn| turn["status"] != "steered")
+                .unwrap_or(&Value::Null);
             let running = !bot["running_turn"].is_null();
-            let state = match (running, turn["status"].as_str()) {
+            let state = match (
+                running,
+                if running { &turn } else { ran }["status"].as_str(),
+            ) {
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
                 }
@@ -3724,10 +3736,18 @@ impl App {
                 (false, Some(other)) => other.to_owned(),
                 (false, None) => "idle".into(),
             };
-            let at = if running {
-                turn["started_ms"].as_u64()
-            } else {
-                turn["finished_ms"].as_u64()
+            // A running turn counts on from its start; one that ended
+            // shows how long it took.
+            let started = ran["started_ms"].as_u64();
+            let finished = ran["finished_ms"].as_u64();
+            let (at, seconds) = match running {
+                true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
+                false => (
+                    finished,
+                    started
+                        .zip(finished)
+                        .map(|(began, ended)| ended.saturating_sub(began) / 1000),
+                ),
             };
             let resolved =
                 resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
@@ -3775,7 +3795,9 @@ impl App {
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 state,
-                seconds: at.map(|at| now.saturating_sub(at) / 1000),
+                running,
+                seconds,
+                at,
                 model,
                 latest: step,
                 place,
@@ -3788,10 +3810,45 @@ impl App {
             (
                 row.name != "lead",
                 row.group,
-                row.seconds.unwrap_or(u64::MAX),
+                std::cmp::Reverse(row.at.unwrap_or(0)),
             )
         });
         Ok((project, rows))
+    }
+
+    /// Count the running turn's time from when the daemon started it, not
+    /// from when this window first saw it run.
+    async fn turn_began(&mut self) {
+        let Some(turn) = self.running.as_ref().map(|r| r.turn) else {
+            return;
+        };
+        let Ok(page) = self
+            .client
+            .request(
+                "turns",
+                json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
+            )
+            .await
+        else {
+            return;
+        };
+        let Some(started) = page["turns"]
+            .get(0)
+            .filter(|row| row["turn"] == turn)
+            .and_then(|row| row["started_ms"].as_u64())
+        else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ago = Duration::from_millis(now.saturating_sub(started));
+        if let Some(running) = &mut self.running
+            && let Some(began) = Instant::now().checked_sub(ago)
+        {
+            running.started = began;
+        }
     }
 
     /// The oldest question `bot` asked and has no answer to, read from its
@@ -5446,8 +5503,8 @@ impl App {
     }
 }
 
-/// `/status` on its own screen: the card, its times counted on since it was
-/// read, and how to leave.
+/// `/status` on its own screen: the card, running turns' times counted on
+/// since it was read, and how to leave.
 fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
@@ -5455,7 +5512,9 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         .iter()
         .cloned()
         .map(|mut row| {
-            row.seconds = row.seconds.map(|s| s + since);
+            if row.running {
+                row.seconds = row.seconds.map(|s| s + since);
+            }
             row
         })
         .collect();
