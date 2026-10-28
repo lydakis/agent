@@ -156,6 +156,30 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
 }
 
 #[test]
+fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
+    let lab = Lab::new("brief");
+    // A link in the home to the repository, as `~/workplace` is to
+    // `/Volumes/workplace`.
+    std::os::unix::fs::symlink(&lab.repo, lab.home.join("link")).unwrap();
+    let repo = lab.repo.to_string_lossy();
+    let brief = format!("edit {repo}/src/lib.rs and ~/link/src, keep {repo}2/x");
+    let (ok, _, said) = lab.run(
+        &lab.repo.join("src"),
+        env!("CARGO_BIN_EXE_sonny"),
+        &["task", "demo.fix", "--", &brief],
+        false,
+    );
+    assert!(ok, "{said}");
+    let copy = lab.home.join(".agent/worktrees/demo.fix");
+    let copy = copy.to_string_lossy();
+    assert_eq!(
+        lab.ran().last().unwrap(),
+        &format!("edit {copy}/src/lib.rs and {copy}/src, keep {repo}2/x")
+    );
+    assert!(said.contains("2 times"), "{said}");
+}
+
+#[test]
 fn a_task_that_does_not_start_leaves_no_worktree_or_branch() {
     let lab = Lab::new("worktree-fails");
     let (ok, said) = lab.task(true, &[]);
@@ -364,26 +388,6 @@ fn a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it() {
 }
 
 #[test]
-fn a_brief_names_the_tasks_worktree_where_it_named_the_repository() {
-    let lab = Lab::new("brief");
-    let file = lab.repo.join("src/lib.rs");
-    let brief = format!("fix {}", file.display());
-    let (ok, _, err) = lab.run(
-        &lab.repo,
-        env!("CARGO_BIN_EXE_sonny"),
-        &["task", "demo.fix", "--", &brief],
-        false,
-    );
-    assert!(ok, "{err}");
-    let worktree = lab.home.join(".agent/worktrees/demo.fix");
-    assert_eq!(
-        lab.ran().last().unwrap(),
-        &format!("fix {}", worktree.join("src/lib.rs").display())
-    );
-    assert!(err.contains("now name its copy"), "{err}");
-}
-
-#[test]
 fn a_done_worktree_task_is_removed_with_its_merged_branch() {
     let lab = Lab::new("rm-worktree");
     let (ok, said) = lab.task(false, &[]);
@@ -450,7 +454,7 @@ fn a_plain_folder_copy_turns_git_off_in_linked_worktrees_and_applies_what_it_lis
             err.contains("Git is off in its copy of 1 linked worktrees"),
             "{err}"
         );
-        assert!(err.contains("unchecked"), "{err}");
+        assert!(err.contains("without asking"), "{err}");
         // Git stops in the copy's worktree, and works in the real one.
         let (ok, _, said) = lab.run(&copy.join("shop/.worktrees/wt"), "git", &["status"], false);
         assert!(!ok && said.contains("git is off here"), "{said}");

@@ -394,6 +394,10 @@ enum Command {
         /// the reason.
         decision: String,
         reason: Option<String>,
+        /// On a deny: nobody assessed the call (the review failed), so it
+        /// counts toward no breaker.
+        #[serde(default)]
+        unreviewed: bool,
         /// A label for audit, the client's choice; not verified.
         by: Option<String>,
         /// The lease of the session serving `tag`: an answer under a lease
@@ -2523,6 +2527,7 @@ impl Service {
                 tag,
                 decision,
                 reason,
+                unreviewed,
                 by,
                 lease,
             } => {
@@ -2534,6 +2539,9 @@ impl Service {
                 };
                 if call_id.is_empty() {
                     return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                if unreviewed && decision != "deny" {
+                    return fail_with("invalid_unreviewed", "only a deny is unreviewed");
                 }
                 if let Some(tag) = &tag {
                     name("tag", tag).map_err(|e| Error {
@@ -2569,6 +2577,7 @@ impl Service {
                             request,
                             tag: tag.as_deref(),
                             allow,
+                            unreviewed,
                             reason: reason.as_deref(),
                             by: by.as_deref(),
                         };
@@ -5556,6 +5565,7 @@ mod tests {
                     request: 1,
                     tag: None,
                     allow: true,
+                    unreviewed: false,
                     reason: None,
                     by: Some("test"),
                 })?;

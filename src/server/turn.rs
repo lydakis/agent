@@ -341,6 +341,11 @@ struct Accounting {
     /// Until when a summary that parked on its pool is not tried again
     /// while the view fits, kept in the park record.
     summary_retry_at: u64,
+    /// The model has replied in this turn, also before a park it resumed
+    /// from, so a reply with nothing in it, as after a reaction with nothing
+    /// to add, ends the turn rather than failing it. An empty reply to a
+    /// prompt fails; an empty summary is the summary's own failure.
+    answered: bool,
 }
 impl Accounting {
     fn totals(&self) -> (u64, u64) {
@@ -1939,6 +1944,13 @@ impl Turn {
                 let _ = accounting.route.set(route.clone());
             }
             accounting.summary_retry_at = waiting.summary_retry_ms.unwrap_or(0);
+            // A turn parked on a call the model made had replied; one parked
+            // on its pool may have, before the call it parked at.
+            accounting.answered = waiting.paced_since_ms.is_none() || {
+                self.store
+                    .read("turn_called", move |db| db.turn_called(turn))
+                    .await?
+            };
             // Only a pool park continues the same model call's retry budget.
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
@@ -2337,6 +2349,7 @@ impl Turn {
                 }
             };
             sent_here = true;
+            accounting.answered = true;
             model_rounds += 1;
             if let Some(usage) = &response.usage {
                 record.tokens_used = record
@@ -2763,6 +2776,17 @@ impl Turn {
                 _ => call.await,
             };
             let sent_ms = sent.get().map_or(0, epoch_ms);
+            let result = match result {
+                Ok(completion)
+                    if completion.items.is_empty()
+                        && completion.calls.is_empty()
+                        && !summary
+                        && !accounting.answered =>
+                {
+                    Err(Error::new("empty_completion"))
+                }
+                result => result,
+            };
             let error = match result {
                 Ok(mut completion) => {
                     if let Some(usage) = &mut completion.usage {
@@ -2861,7 +2885,7 @@ impl Turn {
                 .exhausted()
                 .or_else(|| (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit")));
             attempt += 1;
-            let paced = error.code == "provider_rate_limited" || error.code == "provider_http_429";
+            let paced = agent_runtime::provider::paced(&error.code);
             let cap = if paced {
                 MAX_PACED_ATTEMPTS
             } else {
@@ -2896,12 +2920,15 @@ impl Turn {
                 .then(|| provider.blocked_for(model))
                 .flatten()
                 .filter(|block| *block >= MIN_PARK);
-            // Rate limits already hold the pool; other transient failures
+            // Rate limits and overloads already hold the pool; other transient failures
             // back off exponentially with a little spread.
             let delay = match park {
                 Some(block) => block,
                 None if paced => std::time::Duration::ZERO,
                 None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
+                None if error.code == "provider_stream_stalled" => {
+                    backoff(attempt + STALL_START, turn as u64)
+                }
                 None => backoff(attempt, turn as u64),
             };
             self.retried(
@@ -3909,6 +3936,11 @@ fn retryable(code: &str) -> bool {
         || code.starts_with("provider_http_5")
 }
 
+/// A stream that stalled on this request stalls again when resent at once
+/// with the same context: its retries start at 2 s. An overload is the
+/// pool's to wait out, as a rate limit is.
+const STALL_START: u32 = 3;
+
 /// 250 ms doubling to 30 s, spread by up to a fifth either way so several
 /// daemons on one key do not retry in step. Deterministic per turn and
 /// attempt, so it costs a few integer operations.
@@ -4425,6 +4457,20 @@ fn summarizer_usage(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stall_waits_seconds_before_its_retry_and_an_overload_holds_the_pool() {
+        for code in [
+            "provider_http_529",
+            "provider_http_429",
+            "provider_rate_limited",
+        ] {
+            assert!(agent_runtime::provider::paced(code), "{code}");
+        }
+        assert!(!agent_runtime::provider::paced("provider_stream_stalled"));
+        let first = super::backoff(1 + super::STALL_START, 7).as_millis();
+        assert!((1600..=2400).contains(&first), "{first}");
+        assert!(super::backoff(1, 7).as_millis() < 400);
+    }
     #[test]
     fn pinned_blocks_cache_only_with_their_provider_format() {
         use agent_runtime::codec::Family;
