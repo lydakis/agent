@@ -13,7 +13,12 @@ Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
 `opt` path. On Linux, each release also has
 `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and aarch64): static builds of
 Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
-`bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
+`bin/sonny`, or let [install.sh](../install.sh) fetch, check and link the
+latest one into `~/.local`:
+
+    curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
+
+With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
 the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
@@ -42,6 +47,30 @@ that project's lead (the nearest project above decides; the home folder's
 file never does). A lead made below another project's folder says which
 lead holds the folder above. Sonny refuses to make a lead in a task's own
 folder under `~/.agent`.
+
+`~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
+keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
+the daemon, the approver and the lookout. Settings go in
+`~/.agent/config.toml`, as Codex keeps them: `provider` (the daemon's
+`--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
+agent's when none is named) and the efforts below. When no provider is named
+and no key is set, the first `sonny` in a terminal asks for one, as Codex and
+Claude Code ask for a sign-in: a ChatGPT plan (signed in with `agent login
+chatgpt`), an Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS
+profile. A new project's model is `--model`, else the project file's or the
+role's, else `AGENT_MODEL`, else the config's `model`, else the newest
+agent's; with none, Sonny lists what the providers offer and keeps the pick
+as `model`. Either step also suggests efforts, `[sonny] lead_effort =
+"medium"` and `task_effort = "high"`, unless the config already sets them.
+Outside a terminal both fail, naming what to set. The first start also writes
+`~/.agent/models`, the list agents read with `agent models`, when there is
+none, as `agent models --discover` does.
+
+A new project's empty transcript opens with a welcome: Sonny, the robot
+the client is named for, drawn in half blocks, as a portrait the first
+time Sonny ever runs (noted in `~/.agent/sonny/welcomed`) and as a small
+icon for each project after that. A folder that already has a lead opens
+on its history, with no welcome over it.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -252,12 +281,11 @@ off again never shows.
   inside a plain folder stay in its copy, and in the copy of a linked
   worktree, whose `.git` names its repository outside the copy, git is
   turned off, so it can't change that repository while the files stay
-  behind. A plain folder on another disk than sandfs's home
-  (`~/.local/share/sandfs`), such as an external volume, can't be copied,
-  so its task gets a sandfs workspace over the folder itself: the task's
-  changes still stay in the workspace, but a file it has looked at stays
-  as it first saw it, and `--apply` writes over what changed in the folder
-  meanwhile without asking. `sonny task rm NAME [--discard]` removes a
+  behind. A plain folder on another disk than sandfs's home, such as an
+  external volume, is copied on its own disk, in a `.sandfs` folder at
+  that disk's top; on a disk that can't clone files (ext4) its files are
+  copied in full. A task that is done, fails or needs the person has its
+  copy give back the memory it can do without. `sonny task rm NAME [--discard]` removes a
   task that is done and the folder Sonny made it, refusing while its work
   isn't back yet: changes not applied, uncommitted or not pushed. A
   worktree's branch is kept unless it is merged. `sonny task` also works

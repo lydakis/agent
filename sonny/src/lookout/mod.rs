@@ -454,21 +454,6 @@ where a lead agent coordinates task agents for a person. The user message is a J
 how to read `input`, and `questions` maps each question's id to the question. Answer with one JSON object \
 mapping every question id to the probability, from 0 to 1, that the answer is yes, and nothing else.";
 
-/// A key from this shell, else from `~/.agent/env`.
-fn key(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .or_else(|| {
-            let file = agent_client::env_file::path()?;
-            agent_client::env_file::read(&file)
-                .ok()?
-                .into_iter()
-                .find(|(key, value)| key == name && !value.is_empty())
-                .map(|(_, value)| value)
-        })
-}
-
 impl Judge {
     /// `openai-decisions/MODEL` with `OPENAI_API_KEY` (`LOOKOUT_URL`
     /// points it elsewhere), any other `provider/model`, which the daemon
@@ -501,7 +486,7 @@ impl Judge {
                 Ok(judge(Api::Model, model, config.judge.effort, None))
             }
             Some(judge::Spec::Decisions(model)) => {
-                let key = key(judge::DECISIONS_KEY)
+                let key = agent_client::env_file::var(judge::DECISIONS_KEY)
                     .ok_or_else(|| format!("lookout: set {} for {spec}", judge::DECISIONS_KEY))?;
                 let url = std::env::var("LOOKOUT_URL")
                     .ok()

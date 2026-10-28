@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod output;
 pub mod provider;
+pub mod sandbox;
 pub mod sse;
 pub mod store;
 pub mod tools;
