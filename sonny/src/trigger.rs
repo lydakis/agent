@@ -2586,9 +2586,29 @@ async fn deliver(
     if let Some(ask) = ask {
         let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
             "reply_to": trigger.reply_to, "submit": asking});
-        let _ = std::fs::write(&ask.path, sent.to_string());
+        // On disk before it goes, or it does not go: an ask that lost it
+        // would send another request.
+        if let Err(error) = keep_sent(places, trigger, ask, &sent) {
+            return json!({"outcome": "failed", "detail": error});
+        }
     }
     submit(client, trigger, bot, asking, started, ask).await
+}
+
+/// Write what an ask sends into it, durably: beside the queue first, where
+/// a fire taking asks does not look, then renamed into its place.
+fn keep_sent(places: &Places, trigger: &Trigger, ask: &Asked, sent: &Value) -> Result<(), String> {
+    let beside = places
+        .state
+        .join(format!(".sent.{}.{}", trigger.name, ask.name()));
+    replace(&beside, &sent.to_string())?;
+    let taking = ask.path.parent().unwrap_or(Path::new("."));
+    std::fs::rename(&beside, &ask.path)
+        .and_then(|()| std::fs::File::open(taking)?.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&beside);
+            format!("{}: {e}", ask.path.display())
+        })
 }
 
 /// The request an ask sent before, to send again, and the trigger that sent
