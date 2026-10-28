@@ -4417,7 +4417,7 @@ impl App {
                         if at < self.denials.len() {
                             let denied = self.denials.remove(at);
                             self.notice =
-                                Some(match self.send(approval(&denied), None, false).await {
+                                Some(match self.send(approval(&denied), None, false, &[]).await {
                                     Ok(()) => {
                                         "approved one retry; the retry is still reviewed".into()
                                     }
