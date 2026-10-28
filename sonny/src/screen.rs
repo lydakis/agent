@@ -39,6 +39,32 @@ pub enum Action {
     Open(String),
 }
 
+/// How a row's link names something Sonny does when it is clicked (a
+/// button), rather than a page or a file: never underlined, and never
+/// written out for the terminal to open.
+pub const BUTTON: &str = "sonny:";
+
+/// What a row is, so the client finds it again to change what is drawn
+/// around it: where a message ends, the reactions under it, the rows of a
+/// group of calls drawn as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tag {
+    /// The last row of the message at this node, the bot's or the person's.
+    End(i64),
+    /// The reactions under the message at this node.
+    Reactions(i64),
+    /// A group of calls, by the client's number for it.
+    Group(u64),
+}
+
+/// What a line pushed is besides its text: a [`Tag`], or a link its row
+/// opens across its text, a [`BUTTON`] or a page.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mark {
+    Tag(Tag),
+    Link(String),
+}
+
 /// A row on the screen: one of the conversation's rows, or the part of
 /// one that did not fit the width.
 struct Shown {
@@ -61,6 +87,25 @@ struct Row {
     rest: Option<Line<'static>>,
     /// Where its text opens, whatever its words are.
     link: Option<String>,
+    tag: Option<Tag>,
+}
+
+impl Row {
+    fn new(line: Line<'static>) -> Self {
+        Row {
+            line,
+            rest: None,
+            link: None,
+            tag: None,
+        }
+    }
+
+    fn mark(&mut self, mark: Mark) {
+        match mark {
+            Mark::Tag(tag) => self.tag = Some(tag),
+            Mark::Link(url) => self.link = Some(url),
+        }
+    }
 }
 
 /// A place in the rows shown: a row and a column.
@@ -152,53 +197,186 @@ impl Screen {
     }
 
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
-        for line in lines {
-            let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty())
-            else {
-                self.rows.push(Row {
-                    line,
-                    rest: None,
-                    link: None,
-                });
-                continue;
-            };
-            // A row the line above was wrapped onto joins it again.
-            if self.wrapped == self.rows.len() {
-                self.unlay();
-            }
-            let (rest, text) = split(line, lead);
-            let row = self.rows.last_mut().expect("a row to join");
-            // Spans alike join too, so a word cut over rows is one again.
-            for span in text {
-                match row.line.spans.last_mut() {
-                    Some(last) if last.style == span.style => {
-                        last.content.to_mut().push_str(&span.content)
-                    }
-                    _ => row.line.spans.push(span),
+        self.push_marked(lines, Vec::new());
+    }
+
+    /// [`Screen::push`], each of `marks` on the row the line at its place
+    /// in `lines` was pushed into.
+    pub fn push_marked(&mut self, lines: Vec<Line<'static>>, mut marks: Vec<(usize, Mark)>) {
+        marks.sort_by_key(|(at, _)| *at);
+        let mut marks = marks.into_iter().peekable();
+        for (at, line) in lines.into_iter().enumerate() {
+            self.push_line(line);
+            while let Some((_, mark)) = marks.next_if(|(on, _)| *on == at) {
+                if let Some(row) = self.rows.last_mut() {
+                    row.mark(mark);
                 }
             }
-            row.rest.get_or_insert(rest);
         }
     }
 
+    /// `mark` on the last row pushed; whether there was one.
+    pub fn mark_last(&mut self, mark: Mark) -> bool {
+        let laid = self.wrapped == self.rows.len();
+        let Some(row) = self.rows.last_mut() else {
+            return false;
+        };
+        row.mark(mark);
+        // Its rows drawn already link where it does now.
+        if laid {
+            let link = row.link.clone();
+            let from = (self.shown.iter()).rposition(|shown| shown.first);
+            for shown in &mut self.shown[from.unwrap_or(0)..] {
+                shown.link = link.clone();
+            }
+            self.linked = None;
+        }
+        true
+    }
+
+    fn push_line(&mut self, line: Line<'static>) {
+        let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty()) else {
+            self.rows.push(Row::new(line));
+            return;
+        };
+        // A row the line above was wrapped onto joins it again.
+        if self.wrapped == self.rows.len() {
+            self.unlay();
+        }
+        let (rest, text) = split(line, lead);
+        let row = self.rows.last_mut().expect("a row to join");
+        // Spans alike join too, so a word cut over rows is one again.
+        for span in text {
+            match row.line.spans.last_mut() {
+                Some(last) if last.style == span.style => {
+                    last.content.to_mut().push_str(&span.content)
+                }
+                _ => row.line.spans.push(span),
+            }
+        }
+        row.rest.get_or_insert(rest);
+    }
+
+    /// The row tagged `tag`, the newest if more are.
+    fn tagged(&self, tag: Tag) -> Option<usize> {
+        self.rows.iter().rposition(|row| row.tag == Some(tag))
+    }
+
+    /// Whether a row is tagged `tag`.
+    pub fn has(&self, tag: Tag) -> bool {
+        self.tagged(tag).is_some()
+    }
+
+    /// The row tagged `tag` (`line`, or none) put right under the row
+    /// tagged `under`, in place of the one there: reactions under their
+    /// message. Whether `under` was found.
+    pub fn put_under(&mut self, under: Tag, tag: Tag, line: Option<Line<'static>>) -> bool {
+        let Some(at) = self.tagged(under).map(|at| at + 1) else {
+            return false;
+        };
+        let shown = self.shown_at(at);
+        let there = (self.rows.get(at)).is_some_and(|row| row.tag == Some(tag));
+        match (line, there) {
+            (Some(line), true) => self.rows[at].line = line,
+            (Some(line), false) => {
+                let mut row = Row::new(line);
+                row.tag = Some(tag);
+                self.rows.insert(at, row);
+            }
+            (None, true) => {
+                self.rows.remove(at);
+            }
+            (None, false) => return true,
+        }
+        self.relay(at, shown);
+        true
+    }
+
+    /// The rows tagged `tag` replaced by `lines`, each line's `marks` on
+    /// its row and every row tagged `tag`: a group of calls drawn again.
+    /// Whether there were any.
+    pub fn replace_tagged(
+        &mut self,
+        tag: Tag,
+        lines: Vec<Line<'static>>,
+        marks: Vec<(usize, Mark)>,
+    ) -> bool {
+        let Some(first) = self.rows.iter().position(|row| row.tag == Some(tag)) else {
+            return false;
+        };
+        let end = (self.rows[first..].iter())
+            .position(|row| row.tag != Some(tag))
+            .map_or(self.rows.len(), |n| first + n);
+        let shown = self.shown_at(first);
+        let mut fresh = Screen::default();
+        fresh.push_marked(lines, marks);
+        for row in &mut fresh.rows {
+            row.tag = Some(tag);
+        }
+        self.rows.splice(first..end, fresh.rows);
+        self.relay(first, shown);
+        true
+    }
+
+    /// Each row's text, as written: what a test reads of the conversation.
+    #[cfg(test)]
+    pub fn texts(&self) -> Vec<String> {
+        self.rows.iter().map(|row| row.line.to_string()).collect()
+    }
+
+    /// Where the row `row` starts among the rows drawn, if it was laid out.
+    fn shown_at(&self, row: usize) -> Option<usize> {
+        if row >= self.wrapped {
+            return None;
+        }
+        let mut firsts = 0;
+        (self.shown.iter()).position(|shown| {
+            firsts += usize::from(shown.first);
+            firsts > row
+        })
+    }
+
+    /// The rows from `row` on laid out again, as they changed: those
+    /// drawn from `shown` on taken off first. The view stays on the rows
+    /// above a change in it or under it, and on the newest rows when it
+    /// was there.
+    fn relay(&mut self, row: usize, shown: Option<usize>) {
+        self.selection = None;
+        self.linked = None;
+        self.laid += 1;
+        let Some(at) = shown else {
+            // Not laid out yet: the next layout takes them as they are.
+            self.wrapped = self.wrapped.min(row);
+            return;
+        };
+        let before = self.shown.len();
+        let hold = self.back > 0 && at >= self.top;
+        self.shown.truncate(at);
+        self.wrapped = row;
+        if self.width == 0 {
+            return;
+        }
+        let back = std::mem::take(&mut self.back);
+        self.layout(self.width);
+        self.back = match hold {
+            true => (back + self.shown.len()).saturating_sub(before),
+            false => back,
+        };
+    }
     /// A line whose rows after its first start with `rest` when wrapped,
     /// as a numbered line of code goes on under its code.
     pub fn push_hanging(&mut self, line: Line<'static>, rest: Line<'static>) {
-        self.rows.push(Row {
-            line,
-            rest: Some(rest),
-            link: None,
-        });
+        let mut row = Row::new(line);
+        row.rest = Some(rest);
+        self.rows.push(row);
     }
 
     /// A line whose text opens `url`, a name that may hold spaces or
     /// anything else a link read from words would stop at.
     pub fn push_linked(&mut self, line: Line<'static>, url: String) {
-        self.rows.push(Row {
-            line,
-            rest: None,
-            link: Some(url),
-        });
+        let mut row = Row::new(line);
+        row.link = Some(url);
+        self.rows.push(row);
     }
 
     /// Its lines replaced by `lines`, the view kept as far down from the
@@ -530,7 +708,11 @@ impl Screen {
             self.linked = Some((top, bottom, self.width, area));
             self.links = self.find_links(drawn, &file);
         }
-        for (y, from, to, _) in &self.links {
+        for (y, from, to, _) in self
+            .links
+            .iter()
+            .filter(|(.., url)| !url.starts_with(BUTTON))
+        {
             for x in *from..*to {
                 let cell = &mut buf[(x, *y)];
                 cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
@@ -601,7 +783,11 @@ impl Screen {
     /// link click (Cmd+click) open the file or page outside Sonny.
     pub fn link_cells(&self, buf: &Buffer) -> Vec<(u16, u16, Cell)> {
         let mut cells = Vec::new();
-        for (y, from, to, url) in &self.links {
+        for (y, from, to, url) in self
+            .links
+            .iter()
+            .filter(|(.., url)| !url.starts_with(BUTTON))
+        {
             // The line a preview opens at is no part of the file's address.
             let url = match url.starts_with("file://") {
                 true => url.split('#').next().unwrap_or(url),

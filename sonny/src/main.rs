@@ -1078,6 +1078,8 @@ struct Live {
     spilled: bool,
     /// Every row has ended: the words wait only for what follows them.
     closed: bool,
+    /// The node the words were kept at, once their message came.
+    node: Option<i64>,
 }
 
 impl Live {
@@ -1090,6 +1092,7 @@ impl Live {
             gap,
             spilled: false,
             closed: false,
+            node: None,
         }
     }
 }
@@ -1322,8 +1325,10 @@ struct App {
     /// next round reads it, once known.
     context: Option<u64>,
     input: prompt::Prompt,
-    /// Lines waiting to be written into the conversation.
+    /// Lines waiting to be written into the conversation, and what marks
+    /// the rows of some, by their place among them.
     pending: Vec<Line<'static>>,
+    marks: Vec<(usize, screen::Mark)>,
     any_history: bool,
     /// The welcome over a new project's empty transcript: asked for at
     /// start, drawn once the width is known, and kept for a repaint.
@@ -1407,7 +1412,7 @@ struct App {
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
-    answering: Option<(String, usize)>,
+    answering: Option<(String, usize, i64)>,
     /// Rows written into the history so far.
     rows_drawn: usize,
     /// The reasoning streamed since the bot last spoke or called a tool,
@@ -2076,6 +2081,7 @@ impl App {
             context: None,
             input: prompt::Prompt::default(),
             pending: Vec::new(),
+            marks: Vec::new(),
             any_history: false,
             welcome: None,
             width: 80,
@@ -2609,6 +2615,7 @@ impl App {
         }
         terminal.clear().map_err(|e| e.to_string())?;
         self.pending.clear();
+        self.marks.clear();
         self.held.clear();
         self.live = None;
         self.any_history = false;
@@ -2795,6 +2802,28 @@ impl App {
         self.commit(lines);
     }
 
+    /// The person's message at `node` landed: drawn as it reads, what
+    /// they ran as it was when it ran, its last row tagged, and the
+    /// message the bot now answers.
+    fn land(&mut self, node: i64, said: &str) {
+        let prose = self.prose();
+        let lines = landed(said, &mut self.ran_here, prose);
+        self.commit(lines);
+        self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+        self.answering = Some((first_words(said), self.rows_drawn, node));
+    }
+
+    /// The bot's words at `node`, as replayed: their last row tagged,
+    /// and the person's reactions to them right under it.
+    fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
+        self.commit(lines);
+        self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+        if let Some(row) = self.reacted_row(node) {
+            self.commit_after(vec![row], false);
+            self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
+        }
+    }
+
     /// Commit a finished cell, a blank line apart from the one before.
     /// The welcome, first in the transcript, when this window has one.
     fn draw_welcome(&mut self) {
@@ -2819,6 +2848,35 @@ impl App {
         self.any_history = true;
         self.rows_drawn += lines.len();
         self.pending.extend(lines);
+    }
+
+    /// The lines waiting written into the conversation, with their marks.
+    fn flush(&mut self) {
+        let marks = std::mem::take(&mut self.marks);
+        self.screen
+            .push_marked(std::mem::take(&mut self.pending), marks);
+    }
+
+    /// `mark` on the last row written so far, waiting or drawn.
+    fn mark_last(&mut self, mark: screen::Mark) {
+        match self.pending.len() {
+            0 => {
+                self.screen.mark_last(mark);
+            }
+            n => self.marks.push((n - 1, mark)),
+        }
+    }
+
+    /// The row tagged `tag` (`line`, or none) right under the row tagged
+    /// `under`; whether that row is in the conversation.
+    fn put_under(
+        &mut self,
+        under: screen::Tag,
+        tag: screen::Tag,
+        line: Option<Line<'static>>,
+    ) -> bool {
+        self.flush();
+        self.screen.put_under(under, tag, line)
     }
 
     /// The items of `nodes`, in order and in the Responses family's shape.
@@ -2951,16 +3009,17 @@ impl App {
         }
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         // The bot's words, quiet if a call follows them, as they were live.
-        let mut said: Option<Vec<Line<'static>>> = None;
+        let mut said: Option<(i64, Vec<Line<'static>>)> = None;
         for chunk in nodes.chunks(100) {
             for (node, item) in self.items_at(chunk).await {
                 // A reaction leaves the words before it as they were.
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
-                if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
-                    self.commit(match call {
+                if let Some((at, lines)) = said.take_if(|_| call || item["role"].is_string()) {
+                    let lines = match call {
                         true => transcript::quiet(lines),
                         false => lines,
-                    });
+                    };
+                    self.commit_said(at, lines);
                 }
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
@@ -2970,18 +3029,12 @@ impl App {
                         // were drawn live.
                         self.draw_bot_reactions();
                         asks::close(&mut self.asks, &text(&item));
-                        // What the person ran is shown as it was when it ran.
-                        let prose = self.prose();
-                        let lines = landed(&text(&item), &mut self.ran_here, prose);
-                        self.commit(lines);
-                        self.answering = Some((first_words(&text(&item)), self.rows_drawn));
+                        self.land(node, &text(&item));
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let mut lines = transcript::reply(&reply, self.prose());
-                            lines.extend(self.reacted_row(node));
-                            said = Some(lines);
+                            said = Some((node, transcript::reply(&reply, self.prose())));
                             self.saw_reply(node, &reply);
                             self.last_reply = reply;
                         }
@@ -3056,8 +3109,8 @@ impl App {
                 }
             }
         }
-        if let Some(lines) = said {
-            self.commit(lines);
+        if let Some((at, lines)) = said {
+            self.commit_said(at, lines);
         }
         // A running turn's reactions are drawn when it ends.
         if self.running.is_none() {
@@ -3257,6 +3310,9 @@ impl App {
             Words::Reply => live.rows,
         });
         self.any_history = true;
+        if let Some(node) = live.node {
+            self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+        }
     }
 
     fn live_line(&mut self, live: &mut Live, line: &str) {
@@ -3376,10 +3432,7 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                     && !reactions::is_reaction(&text(item))
                 {
-                    let prose = self.prose();
-                    let lines = landed(&text(item), &mut self.ran_here, prose);
-                    self.commit(lines);
-                    self.answering = Some((first_words(&text(item)), self.rows_drawn));
+                    self.land(node, &text(item));
                     self.answered(&text(item));
                 }
             }
@@ -3395,10 +3448,7 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    let prose = self.prose();
-                    let lines = landed(&text(item), &mut self.ran_here, prose);
-                    self.commit(lines);
-                    self.answering = Some((first_words(&text(item)), self.rows_drawn));
+                    self.land(node, &text(item));
                     self.answered(&text(item));
                 }
             }
@@ -3500,6 +3550,16 @@ impl App {
                     live.closed = true;
                     self.live = Some(live);
                 }
+                // Found again by their node, for the reactions under them:
+                // now when written already, else once they are.
+                if let Some(node) = data["node"].as_i64()
+                    && let Some(live) = &mut self.live
+                {
+                    match live.spilled {
+                        true => self.mark_last(screen::Mark::Tag(screen::Tag::End(node))),
+                        false => live.node = Some(node),
+                    }
+                }
             }
             "compaction_text_delta" | "compaction_thinking_delta" => {
                 if let Some(running) = &mut self.running {
@@ -3553,6 +3613,8 @@ impl App {
                     && data["denied"] != true
                 {
                     reactions::apply(&mut self.bot_reactions, &emoji, remove);
+                    // Under the message as it is made, once it can be.
+                    self.place_bot_reactions();
                 }
             }
             "tool_started" => {
@@ -3711,7 +3773,7 @@ impl App {
                 let ended = matches!(status, "completed" | "steered");
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
-                    && self.answering.as_ref().map(|(_, at)| *at) == Some(self.rows_drawn);
+                    && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
                 if only_reacted {
                     self.draw_bot_reactions();
                 }
@@ -5420,22 +5482,26 @@ impl App {
         }
     }
 
-    /// The bot's reactions so far to the person's message: right under it
-    /// when nothing was drawn since, else a row of their own that says
-    /// which message.
+    /// The bot's reactions so far to the person's message, right under
+    /// it; or, when that message is no longer in the conversation, under
+    /// what was drawn last, with a row of their own that says which.
     fn draw_bot_reactions(&mut self) {
+        if self.place_bot_reactions() {
+            self.bot_reactions.clear();
+            return;
+        }
         let on = std::mem::take(&mut self.bot_reactions);
         if on.is_empty() {
             return;
         }
         let emoji = on.join(" ");
         match &self.answering {
-            Some((_, at)) if *at == self.rows_drawn => {
+            Some((_, at, _)) if *at == self.rows_drawn => {
                 self.commit_after(vec![transcript::reacted(&emoji)], false);
             }
             answering => {
                 let what = match answering {
-                    Some((first, _)) => format!("↳ reacted {emoji} to “{first}”"),
+                    Some((first, ..)) => format!("↳ reacted {emoji} to “{first}”"),
                     None => format!("↳ reacted {emoji}"),
                 };
                 let rows = transcript::wrap(
@@ -5448,9 +5514,29 @@ impl App {
             }
         }
         // Another reaction now goes under this one's row.
-        if let Some((_, at)) = &mut self.answering {
+        if let Some((_, at, _)) = &mut self.answering {
             *at = self.rows_drawn;
         }
+    }
+
+    /// The bot's reactions so far, none included, as the row under the
+    /// person's message they answer; whether that message is in the
+    /// conversation to put them under.
+    fn place_bot_reactions(&mut self) -> bool {
+        let Some((.., node)) = self.answering else {
+            return false;
+        };
+        let tag = screen::Tag::Reactions(node);
+        // None now and none drawn: nothing to put or take off.
+        if self.bot_reactions.is_empty()
+            && !self.screen.has(tag)
+            && !(self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+        {
+            return true;
+        }
+        let row = (!self.bot_reactions.is_empty())
+            .then(|| transcript::reacted(&self.bot_reactions.join(" ")));
+        self.put_under(screen::Tag::End(node), tag, row)
     }
 
     /// The person's reactions to the reply at `node`, as its row.
@@ -5500,10 +5586,16 @@ impl App {
         }
         self.input.clear();
         self.notice = None;
-        // Under the last reply when nothing came after it; else a row of
-        // its own that says which reply.
-        if added && last && self.running.is_none() {
+        // Under the reply, wherever it is in the conversation; else, as
+        // when it is no longer there, a row of its own that says which.
+        if last && self.running.is_none() {
             self.end_live(Words::Reply);
+        }
+        let row = self.reacted_row(node);
+        if self.put_under(screen::Tag::End(node), screen::Tag::Reactions(node), row) {
+            return;
+        }
+        if added && last && self.running.is_none() {
             self.commit_after(vec![transcript::reacted(&emoji)], false);
             return;
         }
@@ -5688,7 +5780,7 @@ impl App {
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
         let live_rows = open_rows.len().max(1) as u16;
-        self.screen.push(std::mem::take(&mut self.pending));
+        self.flush();
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
         if let (Some(watch), Some(pane)) = (&mut self.watch, &mut self.pane)
