@@ -967,7 +967,16 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
         false => None,
     };
     if !discard {
-        if copy.is_some() {
+        if let Some(ws) = &copy {
+            // Left unmounted by a restart: its folder is empty until it is
+            // mounted again, and an empty folder would pass for no work.
+            if ws.mounted.is_none() {
+                sandfs()?
+                    .mount(name, &folder, &MountOptions::default())
+                    .map_err(|e| {
+                        format!("{name}'s copy could not be mounted to check it: {e:#}")
+                    })?;
+            }
             let left = not_here(name, &folder, here)?;
             if !left.is_empty() {
                 return Err(format!(

@@ -269,11 +269,16 @@ fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
     lab.git(&copy, &["commit", "-q", "--allow-empty", "-m", "loose"]);
     let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
     assert!(!ok && err.contains("on HEAD"), "{err}");
+    // Left unmounted, as by a restart, it is mounted again to be checked.
+    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
+    sandfs.unmount("demo.fix").unwrap();
+    assert!(!copy.join(".git").exists());
+    let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
+    assert!(!ok && err.contains("on HEAD"), "{err}");
     lab.git(&copy, &["switch", "-q", "agent/demo.fix"]);
     // Unmounted, so the folder can go with the test.
     let (ok, _, err) = lab.run(&lab.repo, sonny, &["task", "rm", "demo.fix"], false);
     assert!(ok, "{err}");
-    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
     assert!(sandfs.workspaces().unwrap().is_empty());
 }
 
