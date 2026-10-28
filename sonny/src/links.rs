@@ -229,6 +229,26 @@ pub fn file(workspace: &Path, word: &str) -> Option<String> {
     Some(url)
 }
 
+/// [`file`], with the line `word` names after the path, if any, as
+/// `#L…`: where the full screen's preview of it opens.
+pub fn file_line(workspace: &Path, word: &str) -> Option<String> {
+    let url = file(workspace, word)?;
+    let line = match word.split_once("#L") {
+        Some((_, line)) => line.split(|c: char| !c.is_ascii_digit()).next(),
+        None => {
+            let numbers: Vec<&str> = (word.rsplit(':'))
+                .take(2)
+                .take_while(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .collect();
+            numbers.last().copied()
+        }
+    };
+    Some(match line.filter(|line| !line.is_empty()) {
+        Some(line) => format!("{url}#L{line}"),
+        None => url,
+    })
+}
+
 /// Whether an address that [`run`] stopped at `end` of `row` ends there,
 /// rather than at a character it holds that `run` does not follow.
 fn ends(row: &[&str], end: usize) -> bool {
@@ -438,6 +458,18 @@ mod tests {
             file(&dir, "a b.md"),
             Some(format!("file://{}/a%20b.md", dir.display()))
         );
+        // For the preview, the line goes with it.
+        let main = format!("file://{}/src/main.rs", dir.display());
+        assert_eq!(
+            file_line(&dir, "src/main.rs:12:3"),
+            Some(format!("{main}#L12"))
+        );
+        assert_eq!(file_line(&dir, "src/main.rs:7"), Some(format!("{main}#L7")));
+        assert_eq!(
+            file_line(&dir, "src/main.rs#L40-L44"),
+            Some(format!("{main}#L40"))
+        );
+        assert_eq!(file_line(&dir, "src/main.rs"), Some(main));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

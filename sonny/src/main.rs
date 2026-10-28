@@ -16,6 +16,7 @@ mod declared;
 mod diff;
 mod errand;
 mod herdr;
+mod highlight;
 mod html;
 mod image;
 mod js;
@@ -26,6 +27,7 @@ mod math;
 mod mermaid;
 mod models;
 mod mux;
+mod pane;
 mod place;
 mod plan;
 mod project;
@@ -63,7 +65,7 @@ use ratatui::{
             enable_raw_mode,
         },
     },
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
@@ -692,6 +694,8 @@ async fn run() -> Result<(), String> {
     trigger::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
+    // So are the syntaxes, before the first code is colored.
+    std::thread::spawn(highlight::preload);
     let (client, mut events) = connect(&options).await?;
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
@@ -1317,6 +1321,14 @@ struct App {
     /// read, and the view held where it was while all is drawn again.
     want_older: bool,
     hold_view: bool,
+    /// The window's width, the pane's included.
+    full_width: u16,
+    /// The pane beside the conversation on the full screen, with what the
+    /// person opened to look at; whether keys go to it; and whether the
+    /// mouse button went down in it, so a drag stays in it.
+    pane: Option<pane::Pane>,
+    pane_keys: bool,
+    pane_mouse: bool,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -1982,6 +1994,10 @@ impl App {
             older: None,
             want_older: false,
             hold_view: false,
+            full_width: 0,
+            pane: None,
+            pane_keys: false,
+            pane_mouse: false,
             verbose: false,
             instruct: None,
             move_to: None,
@@ -3999,17 +4015,45 @@ impl App {
                 return true;
             }
             Event::Mouse(mouse) => {
-                let up = mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp;
-                if up && self.screen.at_top() && self.older.is_some() {
-                    self.want_older = true;
+                use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+                let at = (mouse.column, mouse.row).into();
+                let over_pane = self.pane.as_ref().is_some_and(|p| p.area.contains(at));
+                let down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                if down {
+                    self.pane_mouse = over_pane;
+                    self.pane_keys = over_pane;
                 }
-                match self.screen.mouse(*mouse) {
-                    Some(screen::Action::Copy(text)) => self.copied(&text),
-                    Some(screen::Action::Open(link)) => {
-                        if let Err(error) = open(&link) {
-                            self.notice = Some(error);
+                let held = matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                );
+                let in_pane = if held { self.pane_mouse } else { over_pane };
+                let action = match &mut self.pane {
+                    Some(pane) if in_pane => {
+                        // A click on its name opens the file outside Sonny.
+                        if down && pane.on_title(mouse.column, mouse.row) {
+                            if let Err(error) = open(&pane.url()) {
+                                self.notice = Some(error);
+                            }
+                            return true;
                         }
+                        pane.screen.mouse(*mouse)
                     }
+                    _ => {
+                        let up = mouse.kind == MouseEventKind::ScrollUp;
+                        if up && self.screen.at_top() && self.older.is_some() {
+                            self.want_older = true;
+                        }
+                        // A press here lets go of what was selected there.
+                        if down && let Some(pane) = &mut self.pane {
+                            pane.screen.unselect();
+                        }
+                        self.screen.mouse(*mouse)
+                    }
+                };
+                match action {
+                    Some(screen::Action::Copy(text)) => self.copied(&text),
+                    Some(screen::Action::Open(link)) => self.follow(&link),
                     None => {}
                 }
                 return true;
@@ -4020,6 +4064,46 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        if self.finding.is_none()
+            && let Some(pane) = &mut self.pane
+        {
+            if self.pane_keys {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.pane = None;
+                        self.pane_keys = false;
+                    }
+                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Up => pane.screen.scroll(1),
+                    KeyCode::Down => pane.screen.scroll(-1),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    // Anything else is for the composer, as it was typed.
+                    _ => {
+                        self.pane_keys = false;
+                        return false;
+                    }
+                }
+                return true;
+            }
+            // Tab, with nothing typed, puts the keys in the pane.
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+                && self.input.is_empty()
+                && self.picker.is_none()
+                && self.choosing.is_none()
+                && self.reacting.is_none()
+            {
+                pane.screen.unselect();
+                self.pane_keys = true;
+                return true;
+            }
+        }
         if let Some(query) = &mut self.finding {
             match key.code {
                 KeyCode::Esc => self.finding = None,
@@ -4072,6 +4156,53 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A link clicked on the full screen: a file is shown in the pane, as
+    /// a preview, and anything else opened as the system opens it.
+    fn follow(&mut self, link: &str) {
+        if link.starts_with("file://") {
+            let workspace = std::path::Path::new(&self.workspace);
+            let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+            match pane::Pane::preview(link, workspace, width) {
+                Ok(pane) => {
+                    self.pane = Some(pane);
+                    self.pane_keys = true;
+                    self.screen.unselect();
+                }
+                Err(error) => self.notice = Some(error),
+            }
+            return;
+        }
+        if let Err(error) = open(link) {
+            self.notice = Some(error);
+        }
+    }
+
+    /// Where the conversation and the pane go in `area`, the conversation
+    /// none when the pane takes the whole of a narrow window, and the
+    /// pane none when it is closed or the conversation is shown instead.
+    fn split(&self, area: Rect) -> (Rect, Option<Rect>) {
+        if self.pane.is_none() || !full() {
+            return (area, None);
+        }
+        let pane = pane::width(area.width, PROSE as u16);
+        if pane == area.width {
+            return match self.pane_keys {
+                true => (Rect { width: 0, ..area }, Some(area)),
+                false => (area, None),
+            };
+        }
+        let chat = Rect {
+            width: area.width - pane - 1,
+            ..area
+        };
+        let pane = Rect {
+            x: area.right() - pane,
+            width: pane,
+            ..area
+        };
+        (chat, Some(pane))
     }
 
     /// A page up the full screen, or the page before its first row.
@@ -4998,7 +5129,15 @@ impl App {
             terminal.clear()?;
         }
         terminal.autoresize()?;
-        let width = terminal.size()?.width as usize;
+        // The conversation's width, the pane's taken off: the window's
+        // while the pane has all of a narrow one, as it gets back after.
+        let size = terminal.size()?;
+        self.full_width = size.width;
+        let (chat, _) = self.split(Rect::new(0, 0, size.width, size.height));
+        let width = match chat.width {
+            0 => size.width,
+            chat => chat,
+        } as usize;
         self.width = width;
         self.height = terminal.size()?.height as usize;
         let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(PROSE));
@@ -5068,7 +5207,24 @@ impl App {
             // which sit right under it until it fills the screen, as inline.
             let view = match full() {
                 true => {
-                    let area = frame.area();
+                    let (area, pane) = self.split(frame.area());
+                    if let (Some(at), Some(open)) = (pane, &mut self.pane) {
+                        let file = |word: &str| links::file_line(&workspace, word);
+                        open.render(at, frame.buffer_mut(), self.pane_keys, file);
+                        // The line between them, as a split's.
+                        if area.width > 0 {
+                            let line = Rect {
+                                x: area.right(),
+                                width: 1,
+                                ..at
+                            };
+                            let rule = vec![Line::from("│").dim(); line.height as usize];
+                            frame.render_widget(Paragraph::new(rule), line);
+                        }
+                    }
+                    if area.width == 0 {
+                        return;
+                    }
                     let room = area.height.saturating_sub(below);
                     let column = area.width.min(PROSE as u16);
                     let rows = self.screen.height(column as usize).min(room as usize);
@@ -5078,7 +5234,7 @@ impl App {
                         Constraint::Min(0),
                     ])
                     .areas(area);
-                    let file = |word: &str| links::file(&workspace, word);
+                    let file = |word: &str| links::file_line(&workspace, word);
                     let history = ratatui::layout::Rect {
                         width: column,
                         ..history
@@ -5280,10 +5436,13 @@ impl App {
                 return;
             }
             frame.render_widget(Paragraph::new(composer_rows), composer);
-            frame.set_cursor_position((
-                composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
-                composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
-            ));
+            // Keys in the pane: no cursor where they do not go.
+            if !self.pane_keys {
+                frame.set_cursor_position((
+                    composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
+                    composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
+                ));
+            }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
         Ok(())

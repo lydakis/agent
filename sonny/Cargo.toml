@@ -20,6 +20,10 @@ libc = "0.2"
 # The lookout asks its decision model over HTTPS (lookout.rs).
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
 ratatui = { version = "0.29", features = ["scrolling-regions"] }
+# Syntax colors for code, as bat draws them: syntect with bat's own
+# syntaxes and themes, read with the pure-Rust regex engine.
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 # Task copies (`sonny copy`), built in so nothing needs installing; its
 # mounts are served by Sonny itself, run again as `sonny sandfs daemon`.
 sandfs = "0.8"

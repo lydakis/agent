@@ -299,12 +299,24 @@ a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
-Sonny drew around it. A click on a link opens it. Ctrl+F finds text in
+Sonny drew around it. A click on a web link opens it in the browser, and
+a click on a file opens it in a pane beside the conversation: code in
+syntax colors with its line numbers, at the line the link names
+(`src/main.rs:120`), and Markdown as replies read. The pane scrolls,
+selects and copies as the conversation does; a click on its name opens
+the file in the app the system opens it with, and Esc closes it. Keys go
+to the pane after a click in it; Tab takes them back to the composer, and
+Tab with nothing typed puts them in the pane again. A window too narrow for
+both shows the one the keys are in. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are. `/fullscreen` switches
 to inline, where Sonny writes into the terminal's own scrollback, and back;
 the choice is kept with the other settings.
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
+
+![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)
+
+![README.md beside the chat, read as a reply: headings, a list, a table and a Python block in color](../docs/sonny/pane-markdown.png)
 
 `demo/` has the scripted model and folder the recordings use.

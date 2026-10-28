@@ -107,6 +107,8 @@ pub struct Screen {
     /// Counts each change to the rows shown, so what was found in them is
     /// looked for again.
     laid: usize,
+    /// A row to show at the top once the rows are laid out.
+    go_to: Option<usize>,
 }
 
 /// The place found is to be picked again, the rows having been drawn anew.
@@ -165,6 +167,20 @@ impl Screen {
             }
             row.rest.get_or_insert(rest);
         }
+    }
+
+    /// A line whose rows after its first start with `rest` when wrapped,
+    /// as a numbered line of code goes on under its code.
+    pub fn push_hanging(&mut self, line: Line<'static>, rest: Line<'static>) {
+        self.rows.push(Row {
+            line,
+            rest: Some(rest),
+        });
+    }
+
+    /// The view put with the line `row` of those pushed at its top.
+    pub fn show_row(&mut self, row: usize) {
+        self.go_to = Some(row);
     }
 
     /// The last line's rows taken off the screen, to be wrapped again.
@@ -422,6 +438,13 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
+        if let Some(row) = self.go_to.take() {
+            let at = (self.shown.iter().enumerate())
+                .filter(|(_, shown)| shown.first)
+                .nth(row)
+                .map_or(0, |(at, _)| at);
+            self.back = self.shown.len().saturating_sub(at + height);
+        }
         self.back = self.back.min(self.most(height));
         let bottom = self.shown.len() - self.back;
         let top = bottom.saturating_sub(height);

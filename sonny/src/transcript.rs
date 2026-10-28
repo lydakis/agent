@@ -26,6 +26,8 @@ pub struct Markdown {
     table: Vec<String>,
     /// Inside `$$` display math, gathered in `picture`.
     math: bool,
+    /// The open fence's code, in its language's colors when known.
+    code: Option<crate::highlight::Code>,
 }
 
 impl Markdown {
@@ -173,8 +175,11 @@ impl Markdown {
             let drawn = matches!(lang, "svg" | "mermaid") && crate::term::graphics();
             if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math" | "html")) {
                 self.picture = Some((lang.to_owned(), String::new()));
-            } else if !self.fence {
+            } else if self.fence {
+                self.code = crate::highlight::Code::language(lang);
+            } else {
                 self.ready = self.picture.take();
+                self.code = None;
             }
             return None;
         }
@@ -185,10 +190,12 @@ impl Markdown {
         }
         if self.fence {
             self.hang = 2;
-            return Some(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(text.to_owned(), Style::new().fg(Color::Cyan)),
-            ]));
+            let mut spans = vec![Span::raw("  ")];
+            match &mut self.code {
+                Some(code) => spans.extend(code.line(text)),
+                None => spans.push(Span::styled(text.to_owned(), Style::new().fg(Color::Cyan))),
+            }
+            return Some(Line::from(spans));
         }
         let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
