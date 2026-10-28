@@ -257,10 +257,14 @@ impl State {
                 Ok(Frame::Quiet)
             }
             // An internal error after the stream began is told apart: the
-            // runtime may resend without what the request replayed.
+            // runtime may resend without what the request replayed. An
+            // overload or a rate limit mid-stream is the 529 or 429 it would
+            // have been before the stream began, and is retried as one.
             Some("error") => {
                 let code = match event["error"]["type"].as_str() {
                     Some("api_error") => "provider_server_error",
+                    Some("overloaded_error") => "provider_http_529",
+                    Some("rate_limit_error") => "provider_rate_limited",
                     _ => "provider_error",
                 };
                 match detail_of(&event) {
@@ -408,14 +412,19 @@ impl State {
                 }
             });
         }
-        if content.is_empty() {
-            return fail("empty_completion");
-        }
-        let item = serde_json::to_vec(&json!({"role":"assistant","content":content}))?;
+        // An empty reply is kept as no item at all, since Messages refuses an
+        // assistant turn without content; the runtime decides whether it
+        // ends the turn or fails it.
+        let items = match content.is_empty() {
+            true => Vec::new(),
+            false => vec![Bytes::from(serde_json::to_vec(
+                &json!({"role":"assistant","content":content}),
+            )?)],
+        };
         Ok(Completion {
             thinking_dropped: self.thinking_dropped,
             fallbacks: self.fallbacks,
-            items: vec![Bytes::from(item)],
+            items,
             calls,
             usage: self.saw_usage.then_some(self.usage),
         })
@@ -752,6 +761,15 @@ mod tests {
         let error = State::default()
             .frame(br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#)
             .unwrap_err();
+        assert_eq!(error.code, "provider_http_529");
         assert_eq!(error.detail.as_deref(), Some("busy"));
+        let error = State::default()
+            .frame(br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "provider_rate_limited");
+        let error = State::default()
+            .frame(br#"{"type":"error","error":{"type":"invalid_request_error"}}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "provider_error");
     }
 }

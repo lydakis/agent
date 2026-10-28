@@ -16,6 +16,26 @@ use std::{
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
 use agent_client::approver::{AUTO_EXPIRE_MS, AUTO_UNGATED, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
+
+/// A command's answer on standard output. A reader that stopped reading,
+/// as `| head` does, ends the command quietly, as SIGPIPE ends a C tool:
+/// it has the part it wanted.
+macro_rules! say {
+    () => { emit(format_args!("\n")) };
+    ($($arg:tt)*) => { emit(format_args!("{}\n", format_args!($($arg)*))) };
+}
+macro_rules! say_raw {
+    ($($arg:tt)*) => { emit(format_args!($($arg)*)) };
+}
+fn emit(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().write_fmt(args) {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        panic!("writing to stdout: {error}");
+    }
+}
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shutdown drains each client and the event publisher under 5 s bounds,
 /// after any grace period the caller gave running turns.
@@ -1224,8 +1244,8 @@ fn models(options: &Options) -> Result<i32> {
     if options.pretty {
         for model in &models {
             match &model.note {
-                Some(note) => println!("{}  # {}", visible(&model.id), visible(note)),
-                None => println!("{}", visible(&model.id)),
+                Some(note) => say!("{}  # {}", visible(&model.id), visible(note)),
+                None => say!("{}", visible(&model.id)),
             }
         }
         if models.is_empty() {
@@ -1245,9 +1265,9 @@ fn models(options: &Options) -> Result<i32> {
 
 fn print_json(value: &Value, pretty: bool) -> Result<()> {
     if pretty {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        say!("{}", serde_json::to_string_pretty(value)?);
     } else {
-        println!("{value}");
+        say!("{value}");
     }
     Ok(())
 }
@@ -1655,7 +1675,7 @@ fn approvals(options: &Options) -> Result<i32> {
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
-        print!("[");
+        say_raw!("[");
     }
     loop {
         let page = connection.request(
@@ -1672,20 +1692,20 @@ fn approvals(options: &Options) -> Result<i32> {
         }
         for call in &calls {
             if options.pretty {
-                println!(
+                say!(
                     "{} turn {} {}",
                     call["bot"].as_str().unwrap_or(""),
                     call["turn"],
                     call_line(call)
                 );
                 for line in answer_lines(call, &options.target) {
-                    println!("{line}");
+                    say!("{line}");
                 }
             } else {
                 if !first {
-                    print!(",");
+                    say_raw!(",");
                 }
-                print!("{call}");
+                say_raw!("{call}");
                 first = false;
             }
         }
@@ -1695,7 +1715,7 @@ fn approvals(options: &Options) -> Result<i32> {
         }
     }
     if !options.pretty {
-        println!("]");
+        say!("]");
     }
     Ok(0)
 }
@@ -1895,7 +1915,7 @@ fn turns(options: &Options) -> Result<i32> {
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
-        print!("[");
+        say_raw!("[");
     }
     loop {
         let page = connection.request(
@@ -1908,7 +1928,7 @@ fn turns(options: &Options) -> Result<i32> {
         left -= turns.len();
         for turn in turns {
             if options.pretty {
-                println!(
+                say!(
                     "{:>6} {:<11} in {:>7} out {:>6} rounds {:>3}  {}  {}",
                     turn["turn"],
                     turn["status"].as_str().unwrap_or(""),
@@ -1928,9 +1948,9 @@ fn turns(options: &Options) -> Result<i32> {
                 );
             } else {
                 if !first {
-                    print!(",");
+                    say_raw!(",");
                 }
-                print!("{turn}");
+                say_raw!("{turn}");
                 first = false;
             }
         }
@@ -1950,7 +1970,7 @@ fn turns(options: &Options) -> Result<i32> {
         }
     }
     if !options.pretty {
-        println!("]");
+        say!("]");
     }
     Ok(0)
 }
@@ -1963,7 +1983,7 @@ fn list(options: &Options) -> Result<i32> {
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
     if !options.pretty {
-        print!("[");
+        say_raw!("[");
     }
     loop {
         let page = connection.request(
@@ -1976,7 +1996,7 @@ fn list(options: &Options) -> Result<i32> {
         left -= bots.len();
         for bot in bots {
             if options.pretty {
-                println!(
+                say!(
                     "{:<24} {:<11} {}/{}  {}",
                     bot["name"].as_str().unwrap_or(""),
                     bot["status"].as_str().unwrap_or(""),
@@ -1986,9 +2006,9 @@ fn list(options: &Options) -> Result<i32> {
                 );
             } else {
                 if !first {
-                    print!(",");
+                    say_raw!(",");
                 }
-                print!("{bot}");
+                say_raw!("{bot}");
                 first = false;
             }
         }
@@ -1998,7 +2018,7 @@ fn list(options: &Options) -> Result<i32> {
         }
     }
     if !options.pretty {
-        println!("]");
+        say!("]");
     }
     Ok(0)
 }
@@ -2049,14 +2069,14 @@ impl Renderer {
     }
     fn flush(&mut self) {
         if self.mode != Mode::Idle {
-            println!();
+            say!();
             self.mode = Mode::Idle;
         }
         let _ = std::io::stdout().flush();
     }
     fn print(&mut self, mode: Mode, text: &str) {
         if self.mode != mode && self.mode != Mode::Idle {
-            println!();
+            say!();
         }
         self.mode = mode;
         let text = streamed(text);
@@ -2085,7 +2105,7 @@ impl Renderer {
         let finished =
             event["event"] == "turn_finished" && self.turn.is_some_and(|t| event["turn"] == t);
         if !self.pretty {
-            println!("{event}");
+            say!("{event}");
             let _ = std::io::stdout().flush();
             return Ok(finished.then(|| exit_code(&event["data"])));
         }
@@ -2114,7 +2134,7 @@ impl Renderer {
                     data["name"].as_str().unwrap_or("tool"),
                     data["arguments"].as_str().unwrap_or(""),
                 );
-                println!("{}", self.dim(&line));
+                say!("{}", self.dim(&line));
             }
             // A person answering from another terminal needs to see what
             // each call would do, then the command. The event names the
@@ -2130,9 +2150,9 @@ impl Renderer {
                     .filter_map(|call| call["call_id"].as_str())
                     .collect();
                 for call in pending(connection, bot, event["turn"].as_i64(), &wanted)? {
-                    println!("{}", self.dim(&format!("⏸ {}", call_line(&call))));
+                    say!("{}", self.dim(&format!("⏸ {}", call_line(&call))));
                     for line in answer_lines(&call, &self.target) {
-                        println!("{}", self.dim(&line));
+                        say!("{}", self.dim(&line));
                     }
                 }
             }
@@ -2148,7 +2168,7 @@ impl Renderer {
                         .or_else(|| item["content"][0]["content"].as_str())
                         .unwrap_or("");
                     for line in preview(output).lines() {
-                        println!("{}", self.dim(&format!("  {}", streamed(line))));
+                        say!("{}", self.dim(&format!("  {}", streamed(line))));
                     }
                 }
             }

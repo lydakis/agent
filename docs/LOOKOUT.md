@@ -50,7 +50,10 @@ reads the event's text, the lead's latest message to that task (its
 brief), the other tasks' briefs and latest lines, and the project's memory
 indexes. A yes (0.70 or more) steers the lead at once with
 `--delivery steer`; anything else waits for the lead to rest, as all news
-does. A resting lead is never judged for: it hears everything anyway.
+does. A resting lead is never judged for: it hears everything anyway. A
+judge answers at most two checks at once for one subscriber, so many busy
+tasks never crowd the model pool they work in; the rest wait their turn,
+and one still waiting when the lead comes to rest is not asked.
 
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person

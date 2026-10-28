@@ -103,7 +103,8 @@ identity is `bot_not_found`.
   judge model decide each call. For `auto`, and whenever `run` continues or
   `fork` copies a bot an `auto` gate answers, the CLI starts `agent
   approver` detached when no session serves the `auto` tag, and gives a
-  call 45 s before its gate lapses.
+  call 105 s before its gate lapses (the approver's 90 s review budget,
+  plus margin).
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`, and in `auto` `read` too. A fork keeps its source's gates and a created bot its

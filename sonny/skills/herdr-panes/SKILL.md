@@ -22,6 +22,7 @@ Sessions are for leads: each project's lead has a Herdr workspace of its own, an
   It starts in your current folder, in the person's shell, which stays open after the command exits so the output can be read. It prints JSON with the pane's ID as `block`; keep it. The pane is labelled `YOUR-NAME/NAME`, so the person can see whose it is. Running the same NAME again replaces the old pane. Pass what the command needs from your environment as arguments or with `env VAR=value COMMAND`. To wait for the command to end, end it with a line you can wait for: `SONNY_BIN run tests -- sh -c 'cargo test; echo "exited $?"'`.
 
 - Never make a Herdr workspace, tab or pane yourself (`herdr workspace create`, `herdr tab create`, `herdr pane split`), and never use `--current` or `$HERDR_PANE_ID`: they may name a pane that is not yours.
+- Never close a tab or pane the person has typed in or asked you to open; ask them first. Close only what you opened for your own work.
 
 - When the person asks for an agent somewhere else ("put it next to the lead", "open that in a split", "give it its own tab"), or they should watch one beside you now, move it, before or after starting it:
 

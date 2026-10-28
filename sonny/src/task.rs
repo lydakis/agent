@@ -126,8 +126,8 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
 }
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
-/// for a task in `dir` given as `--instructions`, with who it works for
-/// after it, and the role's model and tools unless the flags name their
+/// for a task in `dir` given as `--instructions`, with what every task is
+/// told (`task.md`) after it, and the role's model and tools unless the flags name their
 /// own. Other flags pass as they are.
 fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     let mut kept = Vec::new();
@@ -153,7 +153,8 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     if named("--instructions") || named("--instructions-file") {
         return Err("--agents and --profile compose instructions; --instructions sets them".into());
     }
-    let role = match profile {
+    // What every task is told comes after any role, so it is never the role too.
+    let role = match profile.filter(|name| !name.eq_ignore_ascii_case("task")) {
         Some(name) => Some(
             agent_client::policy::profile(dir, name)
                 .map_err(|e| format!("{}: {e}", e.code()))?
@@ -177,7 +178,7 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     }
     added.extend([
         "--instructions".to_owned(),
-        crate::project::with_person(&composed.text),
+        crate::project::as_task(dir, &composed.text)?,
     ]);
     kept.extend(added);
     Ok(kept)
@@ -575,7 +576,7 @@ mod tests {
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();
-            assert!(flags[at + 1].ends_with(crate::project::PERSON));
+            assert!(flags[at + 1].ends_with("helping them well is the care."));
             flags[at + 1].clone()
         };
 
@@ -595,6 +596,14 @@ mod tests {
             flags[..3],
             ["--model=x/y", "--tools=read", "--instructions"]
         );
+
+        // The person's task.md replaces Sonny's, after any role, and once.
+        std::fs::write(dir.join(".agents/agents/task.md"), "Be kind.\n").unwrap();
+        let flags = told(&["--profile", "reviewer"]).unwrap();
+        assert!(flags.last().unwrap().ends_with("Review it.\n\nBe kind."));
+        let flags = told(&["--profile", "task"]).unwrap();
+        assert_eq!(flags.last().unwrap().matches("Be kind.").count(), 1);
+        std::fs::remove_file(dir.join(".agents/agents/task.md")).unwrap();
 
         assert_eq!(told(&["--model", "x/y"]).unwrap(), ["--model", "x/y"]);
         assert!(told(&["--profile", "nobody"]).is_err());

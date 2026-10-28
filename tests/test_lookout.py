@@ -263,6 +263,45 @@ class LookoutTests(ModelFixture):
         # The lead rested throughout: nothing was judged.
         self.assertTrue(self.asked.empty())
 
+    def test_a_busy_lead_s_checks_run_two_at_a_time(self):
+        self.make('calc.lead')
+        self.subscribe('calc.lead', 'calc')
+        lead = self.daemon.request('inspect', bot='calc.lead')['result']['bot_id']
+        tasks = [f'calc.t{n}' for n in range(4)]
+        for task in tasks:
+            self.daemon.request('create', bot=task, workspace=str(self.path), model='openai/synthetic-model',
+                                instructions='Test agent.', tools=['echo'], created_by='calc.lead',
+                                created_by_id=lead)
+        lock, running, peak, asked = threading.Lock(), [0], [0], queue.Queue()
+
+        def reply(request, user):
+            if user == 'hold on':
+                self.gate.wait(30)
+                return None
+            if request['model'] != 'judge-model':
+                return None
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            time.sleep(.5)
+            with lock:
+                running[0] -= 1
+            body = json.loads(user)
+            asked.put(body)
+            return json.dumps({q: 0.1 for q in body['questions']})
+        self.model.reply_for = reply
+        self.start()
+        time.sleep(1)
+        held = self.hold('calc.lead')
+        for n, task in enumerate(tasks):
+            self.daemon.request('submit', bot=task, request_id=f'r{n}', prompt=f'part {n}', origin='tasks')
+        # A message and a turn's end for each task, all while the lead works.
+        for _ in range(2 * len(tasks)):
+            asked.get(timeout=30)
+        self.assertEqual(peak[0], 2)
+        self.gate.set()
+        self.assertEqual(self.daemon.finished(held)['data']['status'], 'completed')
+
     def test_what_happened_while_the_lookout_was_down_reaches_the_lead(self):
         self.make('calc.lead', 'calc.fix')
         self.subscribe('calc.lead', 'calc')

@@ -25,9 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// An answer at or above this is a yes. The approver's band, so one
-/// reading of a judge's probabilities holds everywhere.
-const HIGH: f64 = agent_client::approver::HIGH;
+/// An answer at or above this is a yes.
+const HIGH: f64 = 0.70;
+/// How many checks a judge answers at once for one subscriber; the rest
+/// wait their turn.
+const JUDGING: usize = 2;
 /// How long a check may take before it counts as failed.
 const DEADLINE: Duration = Duration::from_secs(10);
 /// How long after a note is refused the next may go, even a steer.
@@ -1310,6 +1312,9 @@ impl Service {
                     }
                     if let Some(lookout) = self.lookouts.get_mut(&lead) {
                         lookout.checking = lookout.checking.saturating_sub(1);
+                        if answered.is_some() {
+                            lookout.judging = lookout.judging.saturating_sub(1);
+                        }
                         lookout.answered(seen, answered);
                     }
                 }
@@ -1342,7 +1347,12 @@ impl Service {
                 // Events are read and checked beside the stream, so a slow
                 // judge never stalls it.
                 let due = std::mem::take(&mut lookout.due);
-                for seen in due {
+                let mut later = Vec::new();
+                for mut seen in due {
+                    // One that waited for a judge while the subscriber
+                    // has since come to rest no longer asks whether it
+                    // can wait: the note tells it.
+                    seen.busy &= lookout.updates.busy();
                     // With no judge, or nothing to ask, only the task
                     // updates go out, which quote what the person wrote.
                     let judge = (lookout.judge.clone()).filter(|_| !questions(&seen).is_empty());
@@ -1350,6 +1360,13 @@ impl Service {
                     if judge.is_none() && !quotes {
                         continue;
                     }
+                    // A few model calls at once a subscriber, so many busy
+                    // tasks never crowd the pool they work in.
+                    if judge.is_some() && lookout.judging >= JUDGING {
+                        later.push(seen);
+                        continue;
+                    }
+                    lookout.judging += usize::from(judge.is_some());
                     let (client, done) = (client.clone(), done.clone());
                     let (memory, recent) = (memory(&lookout.workspace), lookout.recent.clone());
                     let (lead, id) = (lookout.lead.clone(), lookout.id);
@@ -1369,6 +1386,7 @@ impl Service {
                         let _ = done.send((lead, id, seen, answered)).await;
                     });
                 }
+                lookout.due.extend(later);
                 lookout.wake(&client).await;
             }
         }
@@ -1730,6 +1748,8 @@ struct Lookout {
     since: Option<Instant>,
     /// Checks under way.
     checking: usize,
+    /// Of those, the ones a judge answers.
+    judging: usize,
     log: Option<PathBuf>,
 }
 
@@ -1763,6 +1783,7 @@ impl Lookout {
             refused: None,
             since: None,
             checking: 0,
+            judging: 0,
             log: None,
         }
     }

@@ -453,7 +453,16 @@ pub fn wrap_lines(
     // a wider one.
     let mut room = width.saturating_sub(first.width()).max(8);
     let rest_room = width.saturating_sub(rest.width()).max(8);
-    let rest = rest.spans;
+    // A row this line itself was wrapped onto stays one.
+    let first = match lead(&line) {
+        Some(columns) => Line::from([vec![goes_on(columns, true)], first.spans].concat()),
+        // A row wrapped again keeps the lead it opened with.
+        None => {
+            let opens = opens(&line).unwrap_or(0) + first.width();
+            Line::from([vec![goes_on(opens, false)], first.spans].concat())
+        }
+    };
+    let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
     // Each row, and whether it goes on with a word cut in the row above.
     let mut rows: Vec<(Vec<Span<'static>>, bool)> =
         vec![(first.spans, line.alignment == Some(CUT))];
@@ -507,6 +516,45 @@ pub fn wrap_lines(
             ..Line::from(spans)
         })
         .collect()
+}
+
+/// How a wrapped row tells a copy what to leave out and join: an empty
+/// first span, which draws nothing, whose underline colour is how many
+/// columns the row's lead takes (a bullet or an indent, not the text), and
+/// whose blink, never drawn, says the row goes on with the line above.
+fn goes_on(lead: usize, joins: bool) -> Span<'static> {
+    let mut style = Style::new()
+        .underline_color(Color::Indexed(lead.min(255) as u8))
+        .add_modifier(Modifier::HIDDEN);
+    if joins {
+        style = style.add_modifier(Modifier::SLOW_BLINK);
+    }
+    Span::styled("", style)
+}
+
+/// A wrapped row's lead, in columns, and whether the row goes on with
+/// the line above.
+fn mark(line: &Line) -> Option<(usize, bool)> {
+    let marks = line.spans.iter().take_while(|span| span.content.is_empty());
+    marks
+        .filter(|span| span.style.add_modifier.contains(Modifier::HIDDEN))
+        .find_map(|span| match span.style.underline_color {
+            Some(Color::Indexed(lead)) => Some((
+                lead as usize,
+                span.style.add_modifier.contains(Modifier::SLOW_BLINK),
+            )),
+            _ => None,
+        })
+}
+
+/// The columns of a row's lead, when a line was wrapped onto the row.
+pub fn lead(line: &Line) -> Option<usize> {
+    mark(line).filter(|(_, joins)| *joins).map(|(lead, _)| lead)
+}
+
+/// The columns of the lead a wrapped line starts with, if any.
+pub fn opens(line: &Line) -> Option<usize> {
+    mark(line).filter(|(_, joins)| !joins).map(|(lead, _)| lead)
 }
 
 /// Words with the spaces after each kept, so wrapping loses nothing.
@@ -1310,12 +1358,18 @@ mod tests {
             80,
         ));
         let header = &ran[0];
-        let bullet = header.spans[0].style;
+        // What draws: a wrapped row opens with an empty mark for copies.
+        let spans: Vec<_> = header
+            .spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .collect();
+        let bullet = spans[0].style;
         assert_eq!(
             (bullet.fg, bullet.add_modifier),
             (Some(Color::Red), Modifier::empty())
         );
-        for span in &header.spans[1..] {
+        for span in &spans[1..] {
             let style = header.style.patch(span.style);
             assert!(style.add_modifier.contains(Modifier::DIM), "{span:?}");
             assert!(!style.add_modifier.contains(Modifier::BOLD), "{span:?}");

@@ -22,6 +22,7 @@ Sessions are for leads: each project's lead has a Rex session of its own, and it
   It starts in your current folder, through the person's login shell, and stays open after the command exits so it can be read. It prints JSON with the `block` ID; keep it. The block is labelled `YOUR-NAME/NAME`, so the person can see whose it is. Running the same NAME again replaces the old block. Pass what the command needs from your environment as arguments or with `env VAR=value COMMAND`.
 
 - Never make a Rex session or window yourself (`rex new`, `rex window new`, `rex run`, `rex split`), and never use `$REX_SESSION` or `$REX_BLOCK`: they may name a terminal that is not yours.
+- Never close a window or block the person has typed in or asked you to open; ask them first. Close only what you opened for your own work.
 
 - When the person asks for an agent somewhere else ("put it next to the lead", "open that in a split", "give it its own tab"), or they should watch one beside you now, move it, before or after starting it:
 
