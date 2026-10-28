@@ -168,15 +168,16 @@ def every(row):
     else:
         line, theirs = ended_line(row)
         if theirs:
-            lines.append('The person asked for these in the task themselves, so they are theirs:')
+            lines.append('The person asked for these in the task themselves:')
         lines.append(line)
     if quoted:
         lines.append("A quoted message is the person's own words.")
     lines.append('Read the turns you need with one wait call (timeout_ms 0), and act where something changes the '
-                 'work. Tell the person, briefly, what they would want to hear: the outcome of work you started '
-                 'for them, once, when it ends, not again when they write in that task; what only they can '
-                 'decide; and where their latest words contradict what they asked before. If nothing, end your '
-                 'turn with an empty reply.')
+                 'work. You own what the person means: where a task strays from it, or the person keeps '
+                 'correcting a task, settle your reading of all they asked and steer the task with it. Tell the '
+                 'person, briefly, what they would want to hear: the outcome of work you started for them, once, '
+                 'when it ends, not again when they write in that task; what only they can decide; and the '
+                 'reading you settled. If nothing, end your turn with an empty reply.')
     return '\n'.join(lines)
 
 

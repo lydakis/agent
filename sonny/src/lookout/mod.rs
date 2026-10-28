@@ -372,7 +372,7 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     for (n, line) in told_items.iter().enumerate() {
         if line.theirs && (n == 0 || !told_items[n - 1].theirs) {
             lines.push(
-                "The person asked for these in the task themselves, so they are theirs:".to_owned(),
+                "The person asked for these in the task themselves:".to_owned(),
             );
         }
         quoted |= line.said && line.text.contains("the person wrote: ");
@@ -387,11 +387,12 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     lines.push(match steers {
         true => "Handle what cannot wait, then carry on with your turn.".to_owned(),
         false => "Read the turns you need with one wait call (timeout_ms 0), and act where \
-            something changes the work. Tell the person, briefly, what they would want to \
-            hear: the outcome of work you started for them, once, when it ends, not again \
-            when they write in that task; what only they can decide; and where their latest \
-            words contradict what they asked before. If nothing, end your turn with an empty \
-            reply."
+            something changes the work. You own what the person means: where a task strays \
+            from it, or the person keeps correcting a task, settle your reading of all they \
+            asked and steer the task with it. Tell the person, briefly, what they would want \
+            to hear: the outcome of work you started for them, once, when it ends, not again \
+            when they write in that task; what only they can decide; and the reading you \
+            settled. If nothing, end your turn with an empty reply."
             .to_owned(),
     });
     let mut text = lines.join("\n");
@@ -3019,7 +3020,7 @@ mod tests {
              In your tasks:\n\
              - calc.fix: turn:calc.fix/12, the person wrote: \"tabs\"\n\
              - calc.docs: turn:calc.docs/3 completed\n\
-             The person asked for these in the task themselves, so they are theirs:\n\
+             The person asked for these in the task themselves:\n\
              - calc.ui: turn:calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
              A quoted message is the person's own words.\n\
@@ -3036,7 +3037,8 @@ mod tests {
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. \
-             Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
+             You own what the person means: where a task strays from it, or the person keeps correcting a task, settle your reading of all they asked and steer the task with it. \
+             Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and the reading you settled. If nothing, end your turn with an empty reply."
         );
     }
 
