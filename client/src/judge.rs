@@ -14,10 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The judge for everything that judges, as one setting.
-pub const VAR: &str = "AGENT_JUDGE";
-/// A model judge's effort, for everything that judges; unset, the model's own.
-pub const EFFORT_VAR: &str = "AGENT_JUDGE_EFFORT";
 /// The key OpenAI's Decisions API takes.
 pub const DECISIONS_KEY: &str = "OPENAI_API_KEY";
 /// Where OpenAI's Decisions API is, unless the caller points elsewhere.
@@ -47,7 +43,7 @@ pub fn spec(name: &str) -> Option<Spec<'_>> {
 }
 
 /// Who judges for a bot running `caller`: the judge `named` by the caller
-/// (`--judge`, else `AGENT_JUDGE`), else the bot's own model. No model is
+/// (`--judge`, else the config's `[judge] model`), else the bot's own model. No model is
 /// guessed for a provider.
 pub fn pick(named: Option<&str>, caller: Option<&str>) -> Option<String> {
     named.or(caller).map(str::to_owned)

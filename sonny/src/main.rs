@@ -410,25 +410,6 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
     Ok(())
 }
 
-/// The effort a new lead starts at when nothing else names one.
-pub const LEAD_EFFORT: &str = "SONNY_LEAD_EFFORT";
-/// The effort a new task starts at when its project's file names none.
-pub const TASK_EFFORT: &str = "SONNY_TASK_EFFORT";
-
-/// A setting `name` as Sonny's agents would see it: `~/.agent/env`'s value
-/// over this shell's own, an empty one unsetting it. An unreadable file
-/// counts for nothing here; starting the daemon says why.
-pub fn setting(name: &str) -> Option<String> {
-    let file = agent_client::env_file::path()
-        .and_then(|path| agent_client::env_file::read(&path).ok())
-        .and_then(|keys| keys.into_iter().find(|(key, _)| key == name));
-    match file {
-        Some((_, value)) => Some(value),
-        None => std::env::var(name).ok(),
-    }
-    .filter(|value| !value.is_empty())
-}
-
 /// An `auto` gate needs an approver serving it: when none does, one is
 /// started the way the CLI starts it, detached, logging beside the store,
 /// judged by `model` unless a judge is set.

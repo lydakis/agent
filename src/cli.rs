@@ -267,7 +267,7 @@ fn print_flags(flags: &str) {
             ),
             "--effort" => (
                 "LEVEL",
-                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn; the approver's judge's (default AGENT_JUDGE_EFFORT)",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn; the approver's judge's (default [judge] effort in ~/.agent/config.toml)",
             ),
             "--request-id" => (
                 "ID",
@@ -399,7 +399,7 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: openai-decisions/MODEL or any model the daemon serves; default AGENT_JUDGE, else AGENT_MODEL",
+                "Who judges: openai-decisions/MODEL or any model the daemon serves; default [judge] model in ~/.agent/config.toml, else AGENT_MODEL",
             ),
             "--judge-url" => (
                 "URL",

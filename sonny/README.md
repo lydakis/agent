@@ -52,15 +52,15 @@ Each agent's effort is the daemon's to keep; Sonny only picks what a new
 one starts with, and imposes nothing. With nothing set, a new lead starts
 at its model's own effort (`AGENT_EFFORT` when its model is
 `AGENT_MODEL`'s), and each task at its lead's. Defaults go in
-`~/.agent/env` (or the shell, which the file overrides), and a project's
+`~/.agent/config.toml` (`agent_client::config`), and a project's
 `.agents/project.toml` overrides them for that project:
 
-| What | `~/.agent/env` | `.agents/project.toml` |
+| What | `~/.agent/config.toml` | `.agents/project.toml` |
 | --- | --- | --- |
-| A new lead's effort | `SONNY_LEAD_EFFORT` | `effort` |
+| A new lead's effort | `[sonny] lead_effort` | `effort` |
 | Each new task's model | (the lead's) | `threads_model` |
-| Each new task's effort | `SONNY_TASK_EFFORT` | `threads_effort` |
-| The approver's and lookout's judge | `AGENT_JUDGE_EFFORT` | |
+| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
+| The approver's and lookout's judge | `[judge] model`, `effort` | |
 
 `sonny task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names `--model` or `--effort` only for one the person asks
@@ -281,8 +281,8 @@ did in one "Task updates" note, by the handles its wait tool reads them
 with, and steers it at once only for a message that redirects other tasks
 or work that collides with another task's; what else the judge picks, such
 as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
-own model, at `AGENT_JUDGE_EFFORT` when set, and with the judge `off` sends the task updates alone. Any agent can
+note. It judges with the config's `[judge] model`, the approver's setting,
+else the lead's own model, at `[judge] effort` when set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).

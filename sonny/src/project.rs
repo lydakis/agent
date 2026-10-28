@@ -419,8 +419,9 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, then the newest agent's, so a bare
-    // `sonny` needs no flag. Its effort: SONNY_LEAD_EFFORT, else
-    // AGENT_EFFORT with AGENT_MODEL's model, as the CLI takes them.
+    // `sonny` needs no flag. Its effort: the config's `[sonny]
+    // lead_effort`, else AGENT_EFFORT with AGENT_MODEL's model, as the CLI
+    // takes them.
     let (mut effort, model) = (None, model.map(str::to_owned));
     let model = match model
         .or_else(|| info["model"].as_str().map(str::to_owned))
@@ -439,7 +440,8 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     };
     let picks = agent_client::project::Picks {
         model: Some(model),
-        effort: crate::setting(crate::LEAD_EFFORT).or(effort.filter(|e| !e.is_empty())),
+        effort: (agent_client::config::load()?.sonny.lead_effort)
+            .or(effort.filter(|e| !e.is_empty())),
         ..Default::default()
     };
     make(client, dir, &role, &picks).await.map(|_| ())
@@ -497,7 +499,9 @@ pub fn cli(args: &[String]) -> i32 {
                     .await
                     .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
                 let mut picks = picks;
-                picks.effort = picks.effort.or_else(|| crate::setting(crate::LEAD_EFFORT));
+                if picks.effort.is_none() {
+                    picks.effort = agent_client::config::load()?.sonny.lead_effort;
+                }
                 let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
                 if let Ok(made) = &mut made {
                     open_new_lead(&client, &socket, made).await;

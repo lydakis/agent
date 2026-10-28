@@ -72,6 +72,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     // With the provider keys the app keeps, should this start the daemon;
     // read before the folder is made, so a bad env file leaves nothing.
     let mut command = crate::agent_command(&agent)?;
+    let config = agent_client::config::load()?;
 
     let info = agent_client::project::read(here)?;
     let place = if info["threads_in"] == "project" {
@@ -107,7 +108,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         std::env::var("AGENT_MODEL").ok(),
         std::env::var("AGENT_EFFORT").ok(),
     );
-    let flags = with_defaults(&info, &flags, lead, crate::setting(crate::TASK_EFFORT));
+    let flags = with_defaults(&info, &flags, lead, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
     let flags = match told(&place.dir, &flags) {
         Ok(flags) => flags,
@@ -152,7 +153,8 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
 /// own: the project's `threads_model`, else the lead's (`lead`, its
 /// AGENT_MODEL and AGENT_EFFORT), so a role (--profile) never swaps it;
 /// and the project's `threads_effort`, else `task_effort`
-/// (SONNY_TASK_EFFORT), else the lead's own when the task runs its model.
+/// (the config's `[sonny] task_effort`), else the lead's own when the task
+/// runs its model.
 fn with_defaults(
     info: &Value,
     flags: &[&String],
@@ -1507,7 +1509,7 @@ mod tests {
             run(none.clone(), &["--agents"], None),
             ["--agents", "--model", "a/lead", "--effort", "high"]
         );
-        // SONNY_TASK_EFFORT over the lead's effort.
+        // The config's task effort over the lead's effort.
         assert_eq!(
             run(none.clone(), &[], Some("xhigh")),
             ["--model", "a/lead", "--effort", "xhigh"]
