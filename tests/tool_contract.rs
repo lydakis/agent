@@ -19,6 +19,19 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
     assert_eq!(output["stdout"], "out");
     assert_eq!(output["stderr"], "err");
     assert_eq!(output["exit_code"], 7);
+    assert!(output["wall_time_ms"].is_u64());
+    // No command has a terminal, and what the caller sets still wins.
+    let prepared = tools
+        .prepare(
+            "shell",
+            &json!({"command":"printf '%s %s %s %s %s' \"$TERM\" \"$NO_COLOR\" \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\""})
+                .to_string(),
+        )
+        .unwrap();
+    let env = [("PAGER".to_owned(), "less".to_owned())];
+    let output: Value =
+        serde_json::from_str(&tools.execute(prepared, &cwd, &env).await.unwrap().output).unwrap();
+    assert_eq!(output["stdout"], "dumb 1 less cat cat");
     assert!(
         Registry::new("echo")
             .unwrap()

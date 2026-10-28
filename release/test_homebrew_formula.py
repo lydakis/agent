@@ -36,7 +36,7 @@ class FormulaTest(unittest.TestCase):
 
     def test_sonny_pulls_in_agent(self):
         formula = self.render("sonny")
-        self.assertIn('  depends_on "lydakis/agent/agent"\n', formula)
+        self.assertIn('  depends_on "lydakis/agent/agent"\n  depends_on "ripgrep"\n', formula)
         self.assertIn('*std_cargo_args(path: "sonny")', formula)
         self.assertIn('shell_output("#{bin}/sonny --version")', formula)
         # Sonny finds the daemon by the agent formula's opt path itself, so
