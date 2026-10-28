@@ -915,7 +915,7 @@ impl Provider {
         let message: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
         let usage = anthropic::message_usage(&message, self.cache_hour);
-        reservation.settle_usage(Some(&usage), estimate);
+        reservation.settle_refresh(&usage);
         pace.accepted();
         Ok((usage, sent_at))
     }
@@ -1002,9 +1002,20 @@ impl Provider {
         }
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
+        let input = ((prefix.len() + request.items.weight) / 4) as u64;
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.weight) / 4) as u64,
-            output: u64::from(self.max_output_tokens.unwrap_or(512)),
+            input,
+            // Anthropic counts output as it is written, not the cap a
+            // request asks for: reserve what this model's calls have been
+            // writing. OpenAI counts the cap, so it is reserved whole.
+            output: match self.family {
+                Family::Anthropic => pace.output_estimate(
+                    u64::from(self.max_output_tokens.unwrap_or(512)),
+                    u64::from(self.anthropic_max_tokens(request.model)),
+                    input,
+                ),
+                Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
+            },
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
@@ -2104,7 +2115,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[])
+                .encoded(family, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {

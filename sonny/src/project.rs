@@ -2,8 +2,8 @@
 //! project's lead, `<project>.lead`, the same bot whichever Sonny opens
 //! that folder. A folder that is not
 //! a project yet becomes one: its lead, then its `.agents/project.toml`.
-//! `sonny project add`, which `~/.agent/project` runs, makes one from an
-//! agent's shell the same way.
+//! The `new_project` tool Sonny answers makes one for an agent the same
+//! way.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -78,7 +78,7 @@ fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
     let info = agent_client::project::read(dir)?;
     let copies = crate::settings::Settings::load().copies;
     let rule = agent_client::project::rule(&info, &copies);
-    Ok((format!("{composed}\n\n{rule}\n\n{}", start()?), skills))
+    Ok((format!("{composed}\n\n{rule}"), skills))
 }
 
 /// The role with the folder's rules, skills and memory and who it works
@@ -106,40 +106,6 @@ pub fn plain(dir: &Path) -> Result<String, String> {
     let composed = agent_client::policy::instructions(dir, None, &memory)
         .map_err(|e| format!("{}: {e}", e.code()))?;
     as_task(dir, &composed.text)
-}
-
-/// This Sonny's rule for starting a task, which names this binary, so it
-/// is composed rather than kept in the lead's file. How to ask the person
-/// is the `ask` tool's to say.
-fn start() -> Result<String, String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    Ok(start_rule(&me.to_string_lossy()))
-}
-
-/// How the lead starts a task in Sonny: `sonny task`, at `sonny`, makes
-/// its folder the way the person set Sonny up and starts it there.
-fn start_rule(sonny: &str) -> String {
-    let sonny = format!("\"{sonny}\"");
-    agent_client::policy::with_cli(&format!(
-        "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead, which makes its folder first; \
-         messages to tasks that exist still go through \"$AGENT_BIN\" run, as above. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
-         that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
-         {sonny} task NAME --agents --setup -- TASK\n\
-         which picks the task's model and effort as the person set them up (add --model or --effort only for one the person asks for): \
-         it makes the task's folder the way the person set Sonny up, starts the task there and prints the turn's handle, as run --detach does. \
-         Pass --profile ROLE in place of --agents when a listed role fits, and leave out --setup for a task that only reads, \
-         so the folder's .agents/setup runs only for a task that will change files. \
-         It also says how the task's work comes back, which goes in the brief: on its branch agent/NAME, here already for a worktree, \
-         or brought here with the git push it names for a sandfs copy of a git repository; \
-         for a sandfs copy of any other folder, {sonny} task changes NAME lists what the task changed, \
-         and once you have checked that, {sonny} task changes NAME --apply writes it here. \
-         A task works in its own folder only, and each file has one writer: Sonny turns paths in this folder named in the brief into the task's, \
-         and never copy a task's files into this folder yourself (cp, a redirect, tee), which can write zeros over the files there; \
-         take its work back only as above. \
-         Commits a task makes in a repository inside a copy of a plain folder do not come back, so work that commits starts in that repository's own folder. \
-         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it. \
-         Once the person says a task is done, {sonny} task rm NAME, from this folder, removes it and its folder; it refuses while its work is not here yet."
-    ))
 }
 
 /// What attaching does with a lead's instructions.
@@ -522,7 +488,7 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
 }
 
 /// Make the project in `dir` with its lead in `role`, told the task rule
-/// with the copies Sonny is set to and how Sonny starts tasks.
+/// with the copies Sonny is set to.
 async fn make(
     client: &Client,
     dir: &Path,
@@ -538,117 +504,74 @@ async fn make(
         "declare": crate::declared::tools(true),
     });
     let copies = crate::settings::Settings::load().copies;
-    agent_client::project::create(
-        client,
-        dir,
-        &policy,
-        &json!(TOOLS),
-        picks,
-        &copies,
-        Some(&start()?),
-    )
-    .await
+    agent_client::project::create(client, dir, &policy, &json!(TOOLS), picks, &copies, None).await
 }
 
-const USAGE: &str = "usage: project add DIR [--model PROVIDER/MODEL] [--effort LEVEL] [--threads-model PROVIDER/MODEL] [--threads-effort LEVEL] [--threads-in worktree|project]";
-
-/// What `~/.agent/project` says it takes.
-pub fn usage() -> &'static str {
-    USAGE
-}
-
-/// `sonny project add`, as `~/.agent/project` runs it from an agent's
-/// shell: the project Sonny makes for a folder, on that shell's daemon,
-/// printed as one JSON line (`created: false` when it was there already),
-/// or an `{"error": CODE, "detail": ...}` line on stderr and exit 1.
-pub fn cli(args: &[String]) -> i32 {
-    let made = add_args(args).and_then(|(dir, picks)| {
-        let socket = daemon_socket()?;
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(async {
-                let (client, _events) = Client::connect(&socket)
-                    .await
-                    .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
-                let mut picks = picks;
-                if picks.effort.is_none() {
-                    picks.effort = agent_client::config::load()?.sonny.lead_effort;
-                }
-                let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
-                if let Ok(made) = &mut made {
-                    open_new_lead(&client, &socket, made).await;
-                }
-                client.close().await;
-                made
-            })
-    });
-    match made {
-        Ok(mut made) => {
-            made.as_object_mut().map(|m| m.remove("record"));
-            println!("{made}");
-            0
-        }
-        Err(error) => {
-            eprintln!("{}", error_json(&error));
-            1
-        }
+/// A `new_project` call of `caller`'s: the project Sonny makes for a
+/// folder, on the caller's daemon (`created: false` when it was there
+/// already), its lead opened in a home of its own.
+pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
+    let (dir, mut picks) = picks(arguments)?;
+    if picks.effort.is_none() {
+        picks.effort = agent_client::config::load()?.sonny.lead_effort;
     }
+    let socket = std::env::var_os("AGENT_SOCKET")
+        .map(PathBuf::from)
+        .ok_or("AGENT_SOCKET is not set")?;
+    let (client, _events) = Client::connect(&socket)
+        .await
+        .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
+    let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
+    if let Ok(made) = &mut made {
+        open_new_lead(&client, &socket, caller, made).await;
+        made.as_object_mut().map(|m| m.remove("record"));
+    }
+    client.close().await;
+    made
 }
 
-/// A lead made from another agent's shell opens in a home of its own, a
-/// Herdr workspace or a Rex session beside the caller's, as the person
-/// would otherwise ask; `opened_in` says where, or `not_opened` why not.
-async fn open_new_lead(client: &Client, socket: &Path, made: &mut Value) {
-    let (Ok(caller), Some(project)) = (std::env::var("AGENT_BOT"), made["project"].as_str()) else {
+/// A lead made for another agent opens in a home of its own, a Herdr
+/// workspace or a Rex session beside the caller's, as the person would
+/// otherwise ask; `opened_in` says where, or `not_opened` why not.
+async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut Value) {
+    let Some(project) = made["project"].as_str() else {
         return;
     };
     if made["created"] != true {
         return;
     }
-    let like = crate::project_of(client, &caller).await;
+    let like = crate::project_of(client, caller).await;
     let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
     let opened = std::env::current_exe()
         .map_err(|e| e.to_string())
-        .and_then(|me| crate::open_lead(socket, store.as_deref(), project, &like, None, &me));
+        .and_then(|me| crate::open_lead(socket, store.as_deref(), project, &like, &me));
     match opened {
         Ok((home, _)) => made["opened_in"] = json!(home),
         Err(error) => made["not_opened"] = json!(error),
     }
 }
 
-/// The folder and picks `project add` was given.
-fn add_args(args: &[String]) -> Result<(PathBuf, agent_client::project::Picks), String> {
-    let usage = || USAGE.to_owned();
-    let (Some("add"), Some(dir)) = (args.first().map(String::as_str), args.get(1)) else {
-        return Err(usage());
-    };
-    let mut picks = agent_client::project::Picks::default();
-    let (mut threads_model, mut threads_effort, mut threads_in) = (None, None, None);
-    let mut rest = args[2..].iter();
-    while let Some(flag) = rest.next() {
-        let value = rest
-            .next()
+/// The folder and picks a `new_project` call names: the caller's model
+/// when it names none.
+fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), String> {
+    let text = |key: &str| {
+        arguments[key]
+            .as_str()
             .filter(|v| !v.is_empty())
-            .ok_or_else(usage)?
-            .clone();
-        let slot = match flag.as_str() {
-            "--model" => &mut picks.model,
-            "--effort" => &mut picks.effort,
-            "--threads-model" => &mut threads_model,
-            "--threads-effort" => &mut threads_effort,
-            "--threads-in" => &mut threads_in,
-            _ => return Err(usage()),
-        };
-        if slot.replace(value).is_some() {
-            return Err(usage());
-        }
-    }
+            .map(str::to_owned)
+    };
+    let folder = text("folder").ok_or("project_invalid: a folder")?;
+    let mut picks = agent_client::project::Picks {
+        model: text("model").or_else(|| std::env::var("AGENT_MODEL").ok()),
+        effort: text("effort"),
+        ..Default::default()
+    };
+    let (threads_model, threads_effort) = (text("threads_model"), text("threads_effort"));
+    let threads_in = text("threads_in");
     let in_project = match threads_in.as_deref() {
         None | Some("worktree") => false,
         Some("project") => true,
-        Some(_) => return Err(usage()),
+        Some(other) => return Err(format!("project_invalid: threads_in {other:?}")),
     };
     if threads_model.is_some() || threads_effort.is_some() || threads_in.is_some() {
         picks.threads = Some(agent_client::project::ThreadPicks {
@@ -657,9 +580,9 @@ fn add_args(args: &[String]) -> Result<(PathBuf, agent_client::project::Picks), 
             in_project,
         });
     }
-    let dir = Path::new(dir)
+    let dir = Path::new(&folder)
         .canonicalize()
-        .map_err(|e| format!("project_invalid: {dir}: {e}"))?;
+        .map_err(|e| format!("project_invalid: {folder}: {e}"))?;
     if !dir.is_dir() {
         return Err(format!(
             "project_invalid: {} is not a folder",
@@ -669,57 +592,28 @@ fn add_args(args: &[String]) -> Result<(PathBuf, agent_client::project::Picks), 
     Ok((dir, picks))
 }
 
-/// The daemon of the shell this runs in, found as the CLI finds it.
-fn daemon_socket() -> Result<PathBuf, String> {
-    if let Some(socket) = std::env::var_os("AGENT_SOCKET").filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(socket));
-    }
-    let store = match std::env::var_os("AGENT_STORE").filter(|s| !s.is_empty()) {
-        Some(store) => PathBuf::from(store),
-        None => PathBuf::from(
-            std::env::var_os("HOME")
-                .ok_or("no AGENT_SOCKET, AGENT_STORE or HOME to find the daemon")?,
-        )
-        .join(".agent/state.sqlite"),
-    };
-    agent_client::socket::default_socket(&store).map_err(|e| e.to_string())
-}
-
-/// One error shape, `{"error": CODE, "detail": ...}`, from `CODE: detail`.
-fn error_json(message: &str) -> Value {
-    match message.split_once(": ") {
-        Some((code, detail))
-            if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
-        {
-            json!({"error": code, "detail": detail})
-        }
-        _ => json!({"error": "project_failed", "detail": message}),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn project_add_reads_its_flags_and_refuses_others() {
-        let run = |args: &[&str]| add_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
-        for bad in [
-            &["add"][..],
-            &["rm", "/x"],
-            &["add", "/x", "--model"],
-            &["add", "/x", "--color", "red"],
-            &["add", "/x", "--threads-in", "elsewhere"],
-            &["add", "/x", "--model", "a", "--model", "b"],
-        ] {
-            assert!(run(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
+    fn a_new_project_reads_its_picks_and_refuses_others() {
+        let picked = |arguments: Value| picks(&arguments);
+        for bad in [json!({}), json!({"folder": "/", "threads_in": "elsewhere"})] {
+            assert!(
+                picked(bad.clone())
+                    .unwrap_err()
+                    .starts_with("project_invalid: "),
+                "{bad}"
+            );
         }
         assert!(
-            run(&["add", "/no/such/folder/here"])
+            picked(json!({"folder": "/no/such/folder/here"}))
                 .unwrap_err()
                 .starts_with("project_invalid: ")
         );
-        let (_, picks) = run(&["add", "/", "--model", "a/b", "--threads-in", "project"]).unwrap();
+        let (_, picks) =
+            picked(json!({"folder": "/", "model": "a/b", "threads_in": "project"})).unwrap();
         assert_eq!(picks.model.as_deref(), Some("a/b"));
         assert!(
             picks
@@ -727,28 +621,10 @@ mod tests {
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
         // Tasks may take an effort of their own on the lead's model.
-        let (_, picks) = run(&["add", "/", "--threads-effort", "xhigh"]).unwrap();
+        let (_, picks) = picked(json!({"folder": "/", "threads_effort": "xhigh"})).unwrap();
         assert!(picks.threads.is_some_and(|t| t.model.is_none()
             && t.effort.as_deref() == Some("xhigh")
             && !t.in_project));
-        assert_eq!(error_json("project_exists: x")["error"], "project_exists");
-    }
-
-    #[test]
-    fn a_lead_starts_its_tasks_with_sonny() {
-        let text = start_rule("/opt/sonny");
-        for said in [
-            "\"/opt/sonny\" task NAME --agents --setup -- TASK\n",
-            "which picks the task's model and effort as the person set them up",
-            "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead",
-            "leave out --setup for a task that only reads",
-            "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
-            "\"/opt/sonny\" task changes NAME --apply writes it here",
-            "never copy a task's files into this folder yourself",
-            "\"/opt/sonny\" task rm NAME, from this folder, removes it",
-        ] {
-            assert!(text.contains(said), "{said} in {text}");
-        }
     }
 
     #[test]

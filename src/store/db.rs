@@ -168,7 +168,7 @@ impl Denials {
 /// its approvals. `None` takes the runtime's default; a fork keeps its
 /// source's. Stored as given, so a bot that chose nothing follows the
 /// defaults.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     /// Model context per request: the newest turns within these bounds, in
@@ -212,6 +212,17 @@ pub struct Settings {
     /// Anthropic prompt-cache lifetime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
+    /// How its shell, write and edit calls are confined, by Codex's
+    /// sandbox modes; none runs them unconfined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::Mode>,
+    /// Folders a workspace-write sandbox may write besides the bot's own
+    /// and the temporary directories, each by its real path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<String>,
+    /// Whether a workspace-write sandbox reaches the network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -221,6 +232,9 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
+/// The most a bot's `writable` folders take as JSON, by their real paths,
+/// so a reply that repeats them has a bound.
+pub const FOLDERS_JSON: usize = 32 << 10;
 const MIN_COMPACT_TOKENS: u64 = 1024;
 /// Where a model with a `window`-token context compacts unless the bot
 /// sets `compact_tokens`, as Codex and Claude Code compute it: the window
@@ -269,6 +283,34 @@ impl Settings {
             None => Some(crate::provider::KEEP_WARM),
         }
     }
+    /// These settings for a bot that a bot with `creator`'s settings
+    /// makes: no weaker a sandbox than its creator's, as Codex's subagents
+    /// inherit their parent's. A sandboxed creator's child takes the
+    /// creator's sandbox and writable folders unless it names a stricter
+    /// sandbox, and reaches the network only if both do.
+    pub fn under(mut self, creator: &Settings) -> Settings {
+        use crate::sandbox::Mode;
+        let sandboxed = |settings: &Settings| {
+            matches!(
+                settings.sandbox,
+                Some(Mode::ReadOnly | Mode::WorkspaceWrite)
+            )
+        };
+        if !sandboxed(creator) {
+            return self;
+        }
+        if !sandboxed(&self) {
+            self.writable = creator.writable.clone();
+            self.network = creator.network;
+        }
+        self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
+        if self.sandbox != Some(Mode::WorkspaceWrite) {
+            self.writable.clear();
+            self.network = false;
+        }
+        self.network &= creator.network;
+        self
+    }
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
     }
@@ -312,6 +354,22 @@ impl Settings {
         {
             return refuse("keep_warm is below 300 seconds; 0 never refreshes");
         }
+        let confined = self.sandbox == Some(crate::sandbox::Mode::WorkspaceWrite);
+        if !confined && (!self.writable.is_empty() || self.network) {
+            return refuse("writable and network go with sandbox workspace-write");
+        }
+        if self.writable.len() > 64
+            || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
+        {
+            return refuse("writable names at most 64 folders, 32 KiB in all");
+        }
+        if self
+            .writable
+            .iter()
+            .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("writable folders are absolute paths");
+        }
         Ok(())
     }
     /// Every setting as it applies, defaults included, for clients.
@@ -322,7 +380,8 @@ impl Settings {
             "keep_turns":self.keep_turns,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
-            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes)})
+            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
+            "sandbox":self.sandbox,"writable":self.writable,"network":self.network})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -373,11 +432,45 @@ impl Bot {
             .facts(json!({"turn_budget_tokens":cap.tokens,"turn_tokens_used":spent})),
         )
     }
-    /// Whether a call of this tool, the daemon's or a declared one, waits
-    /// for a verdict. A call the bot may not make is refused, never
-    /// announced.
-    pub fn gated(&self, tool: &str) -> bool {
-        gated(&self.gates, tool) && self.may_call(tool)
+    /// Whether this call, of the daemon's tool or a declared one, waits
+    /// for a verdict, run in the turn's `workspace`. A call the bot may not
+    /// make is refused, never announced, and one its sandbox confines runs
+    /// without a verdict: only an escape is gated, as in Codex.
+    pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path) -> bool {
+        gated(&self.gates, &call.name)
+            && self.may_call(&call.name)
+            && !self.confines(call, workspace)
+    }
+    /// Whether the bot's commands run in a sandbox.
+    pub fn sandboxed(&self) -> bool {
+        use crate::sandbox::Mode;
+        matches!(
+            self.settings.sandbox,
+            Some(Mode::ReadOnly | Mode::WorkspaceWrite)
+        )
+    }
+    /// Whether this call runs inside the bot's sandbox: the bot has one, the
+    /// tool is one a sandbox holds, and the call doesn't ask to leave it.
+    pub fn confines(&self, call: &ToolCall, workspace: &std::path::Path) -> bool {
+        use crate::sandbox::{Mode, confinable, escapes};
+        match self.settings.sandbox {
+            None | Some(Mode::DangerFullAccess) => false,
+            Some(mode) => {
+                confinable(&call.name)
+                    && !escapes(
+                        mode,
+                        Some(
+                            self.workspace
+                                .as_deref()
+                                .map_or(workspace, std::path::Path::new),
+                        ),
+                        &self.settings.writable,
+                        &call.name,
+                        &call.arguments,
+                        workspace,
+                    )
+            }
+        }
     }
     /// The tools this bot may call: its allowed list, else its tools.
     pub fn callable(&self) -> &[String] {
@@ -2010,6 +2103,19 @@ impl Database {
             None => Vec::new(),
         })
     }
+    /// The settings of the bot a client creates for, whose sandbox the new
+    /// bot may not weaken.
+    fn creator_settings(conn: &Connection, creator: Option<i64>) -> Result<Option<Settings>> {
+        let Some(id) = creator else {
+            return Ok(None);
+        };
+        let settings: Option<String> =
+            conn.query_row("SELECT settings FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        Ok(Some(match settings {
+            Some(text) => serde_json::from_str(&text)?,
+            None => Settings::default(),
+        }))
+    }
     /// The tools the creating bot's client declared, which a bot it
     /// creates takes unless its own client declares others: all but those
     /// declared as the creator's own.
@@ -2323,6 +2429,10 @@ impl Database {
         }
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(inherited.iter().chain(binding.gate), &tools))?;
+        let settings = match Self::creator_settings(&tx, created_by_id)? {
+            Some(creator) => binding.settings.clone().under(&creator),
+            None => binding.settings.clone(),
+        };
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
             params![
@@ -2342,7 +2452,7 @@ impl Database {
                 binding.compaction_model,
                 binding.fallbacks,
                 gates,
-                binding.settings.stored()?,
+                settings.stored()?,
                 creation(binding.request_id, request),
                 declared,
             ],
@@ -4867,11 +4977,23 @@ impl Database {
         usage: Option<&Usage>,
     ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
+        // A gated round notes which item plans each call. Whether a
+        // sandboxed bot's call is gated can turn on the folder it runs in.
+        let workspace: Option<String> = match calls.is_empty() || !bot.sandboxed() {
+            true => None,
+            false => self
+                .conn
+                .prepare_cached(
+                    "SELECT COALESCE(t.workspace,b.workspace) FROM turns t
+                     JOIN bots b ON b.name=t.bot WHERE t.id=?",
+                )?
+                .query_row([turn], |r| r.get(0))?,
+        };
+        let workspace = std::path::Path::new(workspace.as_deref().unwrap_or("/"));
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        // A gated round notes which item plans each call.
-        let gated = calls.iter().any(|call| bot.gated(&call.name));
+        let gated = calls.iter().any(|call| bot.gated(call, workspace));
         let mut planned = HashMap::new();
         let last_reasoning = items.last().is_some_and(|item| {
             serde_json::from_slice::<Kind>(item).is_ok_and(|k| k.kind == "reasoning")
@@ -4910,7 +5032,7 @@ impl Database {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
             let mut judged = Vec::new();
-            for call in calls.iter().filter(|call| bot.gated(&call.name)) {
+            for call in calls.iter().filter(|call| bot.gated(call, workspace)) {
                 let gates: Vec<CallGate> = bot
                     .gates
                     .iter()
@@ -7197,6 +7319,11 @@ impl Database {
             parent.gates.iter().chain(&inherited).chain(gate),
             &tools,
         ))?;
+        // And the stricter of its source's sandbox and its creator's.
+        let settings = match Self::creator_settings(&tx, created_by_id)? {
+            Some(creator) => parent.settings.clone().under(&creator),
+            None => parent.settings.clone(),
+        };
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
@@ -7229,7 +7356,7 @@ impl Database {
                 thinking.2,
                 gates,
                 allowed.as_ref().map(|allowed| allowed.join(",")),
-                parent.settings.stored()?,
+                settings.stored()?,
                 creation(request_id, request),
                 expire_ms.map(|ms| ms as i64),
                 expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),

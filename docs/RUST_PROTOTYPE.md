@@ -404,6 +404,9 @@ keep-warm when it sets any of them.
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. | `5m` |
+| `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
+| `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
+| `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -2083,6 +2086,73 @@ foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
+
+### Sandbox
+
+A bot created with `sandbox` runs its `shell` commands, `write`s and `edit`s
+confined, as Codex confines its agent: the mode names, the writable folders,
+the folders kept read-only inside them, the bubblewrap arguments on Linux and
+the Seatbelt profile on macOS are Codex's, ported (see NOTICE). Reading stays
+open. `read-only` writes nothing; `workspace-write` writes the bot's folder
+(its stored workspace, else the turn's), each `writable` folder, `$TMPDIR`
+and `/tmp`. Inside each writable folder, `.git` (and a linked worktree's own
+git folder when the folder holds it), `.agents`, `.codex` and `.aws` stay
+read-only, and a missing `.git`, `.agents` or `.codex` may not be made: git
+runs hooks and config from there outside the sandbox, and agents trust what
+is there. The daemon's store and the files beside it stay read-only too. A
+protected folder that is a symlink refuses the call with
+`sandbox_unavailable`, since the link could be swapped from inside. Network is
+off unless `network` is set. The daemon's socket is out of reach either way,
+as Codex keeps its own from a sandboxed command: nothing confined may drive
+the daemon, so a sandboxed bot delegates through tools its client declares,
+not through `agent` in its shell. A socket inside a writable folder stays
+read-only. On macOS the folders between a writable folder and anything kept
+inside it (the socket, the store, a worktree's git folder) can't be renamed,
+so nothing kept can be moved to a name its rule doesn't cover. `danger-full-access`, or no `sandbox`, runs
+unconfined.
+
+Creating a sandboxed bot checks that sandboxes run here and refuses with
+`sandbox_unavailable` otherwise: on Linux, a system bubblewrap
+(`/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` or
+`/run/current-system/sw/bin/bwrap`, never one found on `PATH`, which could
+lie in a folder a bot may write) must make the user, pid and network
+namespaces; on
+macOS, `/usr/bin/sandbox-exec` must exist. A sandboxed bot never runs
+unconfined for want of one. A `writable` folder that doesn't exist is
+`path_not_found`.
+
+A confined command that touches what it may not fails as it would on a
+read-only filesystem, and the model sees that result. A confined `write` or
+`edit` is checked against the same folders by the target's real path and
+refused with `write_denied`; the write itself then runs inside the sandbox,
+as Codex runs `apply_patch`, in the agent binary started as
+`agent --agent-run-as-write PATH` with the content on stdin, so a link
+swapped in after the check can't carry it out. Being a process, it takes a
+slot of the daemon's process budget as a command does.
+
+To leave the sandbox, a shell call sets
+`sandbox_permissions: "require_escalated"` with a `justification`, which a
+sandboxed bot's `shell` schema shows with Codex's descriptions; a `write` or
+`edit` leaves it by naming a path outside its writable folders. Only such an
+escape is gated: a confined call runs without a verdict even under a gate,
+and an escape waits on the bot's gate as any gated call does
+(see [tool approval](#tool-approval)) and, allowed, runs unconfined. With no
+gate on the tool there is no one to ask, so, as Codex refuses an escape under
+a policy that never asks, a command asking to escalate is refused with
+`escalation_refused` and a write or edit stays held to the sandbox
+(`write_denied`). Whether a call escapes is read
+from its arguments and the folders' names alone, so the round that announces
+it and the run that starts it agree.
+
+A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
+creator's sandbox and `writable` folders unless it names a stricter sandbox,
+and reaches the network only if both do, as Codex's subagents inherit their
+parent's sandbox.
+
+On Linux, bubblewrap makes an empty folder on the host to mount a missing
+`.git` read-only over; the daemon removes it once no running sandbox holds
+it, and a detached command holds it until it exits. A sandbox that needs
+one being removed waits until it is gone.
 
 ### Declared tools
 
