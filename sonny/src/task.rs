@@ -130,17 +130,22 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     // worktree; a task in the lead's folder has nothing to set up.
     let script = here.join(".agents/setup");
     if start.setup && place.dir != here && script.exists() {
+        // Its output is not kept, however long a build runs: only the last
+        // lines of its errors, which a failure shows.
         let ran = Command::new(&script)
             .current_dir(&place.dir)
             .env("AGENT_SOURCE", here)
             .stdin(Stdio::null())
-            .output();
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                let tail = child.stderr.take().map(tail).unwrap_or_default();
+                Ok((child.wait()?, tail))
+            });
         match ran {
-            Ok(ran) if ran.status.success() => {}
-            Ok(ran) => {
-                let said = String::from_utf8_lossy(&ran.stderr);
-                let tail: Vec<&str> = said.trim().lines().rev().take(20).collect();
-                let tail: Vec<&str> = tail.into_iter().rev().collect();
+            Ok((status, _)) if status.success() => {}
+            Ok((_, tail)) => {
                 let error = format!("{} failed:\n{}", script.display(), tail.join("\n"));
                 return failed(&place, false, error);
             }
@@ -779,6 +784,32 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
         true => copy.to_owned(),
         false => copy.join(prefix),
     }
+}
+
+/// The last 20 lines with words `stream` writes, each cut to 1000 bytes,
+/// read to its end without keeping the rest.
+fn tail(stream: impl std::io::Read) -> Vec<String> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut lines = std::collections::VecDeque::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // A longer line is read as several.
+        match std::io::Read::take(&mut reader, 1000).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+        if text.is_empty() {
+            continue;
+        }
+        if lines.len() == 20 {
+            lines.pop_front();
+        }
+        lines.push_back(text);
+    }
+    lines.into()
 }
 
 /// This program, by the path that outlives an upgrade.
@@ -1443,6 +1474,22 @@ pub fn remount(socket: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_setup_s_errors_keep_only_their_last_lines() {
+        let mut said: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        said.push_str(&"x".repeat(2500));
+        said.push_str("\n\n");
+        let kept = tail(said.as_bytes());
+        assert_eq!(kept.len(), 20);
+        assert_eq!(kept[0], "line 14");
+        assert_eq!(kept[16], "line 30");
+        // A long line is kept in pieces of 1000 bytes.
+        assert_eq!(
+            kept[17..].iter().map(String::len).collect::<Vec<_>>(),
+            [1000, 1000, 500]
+        );
+    }
 
     #[test]
     fn a_brief_names_the_copy_where_it_named_the_folder() {

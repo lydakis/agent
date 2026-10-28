@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 import unittest
+from pathlib import Path
 
 from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
@@ -94,6 +95,38 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': 'Again.'}))
         self.assertEqual(refused['error'], 'task_not_started')
         self.assertTrue(worktree.is_dir())
+
+    def test_a_turn_interrupted_mid_setup_stops_it_and_starts_no_task(self):
+        repo = self.path / 'calc'
+        (repo / '.agents').mkdir(parents=True)
+        setup = repo / '.agents/setup'
+        setup.write_text(f'#!/bin/sh\necho $$ > {self.path}/setup.pid\nsleep 30\ntouch {self.path}/setup.done\n')
+        setup.chmod(0o755)
+        self.git(repo, 'init', '-q', '-b', 'main')
+        self.git(repo, 'add', '.')
+        self.git(repo, 'commit', '-qm', 'one')
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[dict(declared('start_task', inherit=False),
+                                                                expire_ms=120_000)])
+        self.lookout()
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['turn']
+        pid = self.path / 'setup.pid'
+        deadline = time.monotonic() + 30
+        while not pid.exists() or not pid.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, 'the setup never ran')
+            time.sleep(.05)
+        setup_pid = int(pid.read_text())
+        self.daemon.request('interrupt', bot='calc.lead', turn=turn)
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'interrupted')
+        deadline = time.monotonic() + 10
+        stat = Path(f'/proc/{setup_pid}/stat')
+        while stat.exists() and stat.read_text().split()[2] != 'Z':
+            self.assertLess(time.monotonic(), deadline, 'the setup still runs')
+            time.sleep(.05)
+        time.sleep(1)
+        self.assertFalse((self.path / 'setup.done').exists())
+        self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
     def test_a_call_that_fails_is_answered_with_its_error(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',

@@ -420,8 +420,9 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
 }
 
 /// The lookout, `sonny lookout`, which wakes leads when their tasks need
-/// them: started detached, logging beside the store. One already watching
-/// this daemon keeps it, and the new one exits.
+/// them and answers Sonny's tools: started detached, logging beside the
+/// store. One already watching this daemon keeps it, and the new one
+/// exits.
 fn start_lookout(options: &Options) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut log = options.store.clone().into_os_string();
@@ -771,9 +772,8 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(format!("the lookout: {error}"));
     }
-    if project.is_some()
-        && let Err(error) = start_lookout(&app.options)
-    {
+    // It answers the tools Sonny gives every agent, a lead or not.
+    if let Err(error) = start_lookout(&app.options) {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -2215,6 +2215,12 @@ impl App {
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let declare = self.declare.take();
+        // New tools are gated as the bot's mode gates the rest, so a tool
+        // Sonny gates never runs unjudged where the mode judges.
+        let gating = gating.or(declare
+            .as_ref()
+            .and(self.mode)
+            .filter(|mode| *mode != "full"));
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
@@ -2552,9 +2558,7 @@ impl App {
                 .await;
             // A daemon that restarted took the approver and the lookout
             // Sonny started with it.
-            if self.project.is_some()
-                && let Err(error) = start_lookout(&self.options)
-            {
+            if let Err(error) = start_lookout(&self.options) {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")

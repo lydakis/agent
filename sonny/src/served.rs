@@ -12,7 +12,7 @@
 //! that call. What it prints is the call's result.
 use agent_client::Client;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -371,15 +371,27 @@ fn project_of(bot: &str) -> String {
 pub struct Server {
     nudge: Arc<Notify>,
     subscribed: Arc<AtomicBool>,
+    serving: Serving,
 }
 
 impl Server {
     /// Serve the daemon of `store` on `socket`, from a connection of its
     /// own.
     pub fn start(store: PathBuf, socket: PathBuf) -> Server {
-        let (nudge, subscribed) = (Arc::new(Notify::new()), Arc::default());
-        tokio::spawn(serve(store, socket, nudge.clone(), Arc::clone(&subscribed)));
-        Server { nudge, subscribed }
+        let (nudge, subscribed, serving) =
+            (Arc::new(Notify::new()), Arc::default(), Serving::default());
+        tokio::spawn(serve(
+            store,
+            socket,
+            nudge.clone(),
+            Arc::clone(&subscribed),
+            Arc::clone(&serving),
+        ));
+        Server {
+            nudge,
+            subscribed,
+            serving,
+        }
     }
 
     /// Whether a `subscriptions` call changed a file since last asked, so
@@ -390,22 +402,39 @@ impl Server {
 
     /// An event the lookout read: a call of Sonny's that started, or a
     /// stream live again, which may follow calls started while it was not.
+    /// A turn that ended, as one the person interrupted, stops what its
+    /// calls still run, so a slow setup starts no task after all.
     pub fn event(&self, event: &Value) {
         let started = event["event"] == "tool_started" && event["data"]["answered_by"] == TAG;
         if started || event["event"] == "follow_live" {
             self.nudge.notify_one();
         }
+        if event["event"] == "turn_finished"
+            && let Some(turn) = event["turn"].as_i64()
+        {
+            self.serving.lock().unwrap().retain(|key, job| {
+                if key.0 == turn {
+                    job.abort();
+                }
+                key.0 != turn
+            });
+        }
     }
 }
 
-/// A call being answered, by its turn and ID.
-type Serving = Arc<Mutex<HashSet<(i64, String)>>>;
+/// The calls being answered, by their turn and ID.
+type Serving = Arc<Mutex<HashMap<(i64, String), tokio::task::AbortHandle>>>;
 
-async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, subscribed: Arc<AtomicBool>) {
+async fn serve(
+    store: PathBuf,
+    socket: PathBuf,
+    nudge: Arc<Notify>,
+    subscribed: Arc<AtomicBool>,
+    serving: Serving,
+) {
     let Ok(me) = std::env::current_exe() else {
         return;
     };
-    let serving: Serving = Arc::default();
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
             loop {
@@ -414,7 +443,8 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, subscribed: 
                 };
                 for call in calls {
                     let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
-                    if serving.lock().unwrap().insert(key.clone()) {
+                    let mut jobs = serving.lock().unwrap();
+                    if !jobs.contains_key(&key) {
                         let (client, me, store, socket, serving, subscribed) = (
                             client.clone(),
                             me.clone(),
@@ -423,7 +453,8 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, subscribed: 
                             serving.clone(),
                             subscribed.clone(),
                         );
-                        tokio::spawn(async move {
+                        let held = key.clone();
+                        let job = tokio::spawn(async move {
                             let answer = answer(&client, &call, &me, &store, &socket).await;
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                                 "call_id": call["call_id"]});
@@ -443,6 +474,7 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, subscribed: 
                             let _ = client.request("tool_result", asked).await;
                             serving.lock().unwrap().remove(&key);
                         });
+                        jobs.insert(held, job.abort_handle());
                     }
                 }
                 tokio::select! {
@@ -503,7 +535,34 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .get(0)
         .filter(|record| record["name"] == bot)
         .ok_or(("caller_unknown", format!("{bot} is gone")))?;
-    let workspace = record["workspace"].as_str().unwrap_or("/");
+    // As the calling turn runs, which keeps its folder and model when the
+    // bot's own change for a turn after it.
+    let turn = call["turn"].as_i64().unwrap_or(0);
+    let page = client
+        .request(
+            "turns",
+            json!({"bot": bot, "after": turn - 1, "before": turn + 1, "limit": 1}),
+        )
+        .await
+        .map_err(|e| ("caller_unknown", e.to_string()))?;
+    let running = page["turns"].get(0).filter(|t| t["turn"] == turn);
+    let of = |key: &str| running.map_or(&Value::Null, |t| &t[key]);
+    let workspace = of("workspace")
+        .as_str()
+        .or(record["workspace"].as_str())
+        .unwrap_or("/");
+    let model = match of("model").as_str() {
+        Some(model) => model.to_owned(),
+        None => format!(
+            "{}/{}",
+            str_of(&record["provider"]),
+            str_of(&record["model"])
+        ),
+    };
+    let effort = match running {
+        Some(_) => of("effort").as_str(),
+        None => record["effort"].as_str(),
+    };
     let mut command = tokio::process::Command::new(me);
     command
         .arg("tool")
@@ -515,19 +574,14 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .env("AGENT_TURN", call["turn"].to_string())
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
-        .env(
-            "AGENT_MODEL",
-            format!(
-                "{}/{}",
-                str_of(&record["provider"]),
-                str_of(&record["model"])
-            ),
-        )
+        .env("AGENT_MODEL", model)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // A group of its own, so what it started stops with it.
+        .process_group(0)
         .kill_on_drop(true);
-    match record["effort"].as_str() {
+    match effort {
         Some(effort) => command.env("AGENT_EFFORT", effort),
         None => command.env_remove("AGENT_EFFORT"),
     };
@@ -537,6 +591,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
+    let group = child.id().map(Group);
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         let _ = stdin
@@ -552,8 +607,11 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .saturating_sub(now);
     let output = tokio::time::timeout(Duration::from_millis(left), child.wait_with_output())
         .await
-        .map_err(|_| ("tool_unserved", "ran out of time".to_owned()))?
-        .map_err(|e| ("tool_failed", e.to_string()))?;
+        .map_err(|_| ("tool_unserved", "ran out of time".to_owned()))?;
+    // Answered: what it left running on purpose, as a pane's program or a
+    // lookout it started, runs on.
+    std::mem::forget(group);
+    let output = output.map_err(|e| ("tool_failed", e.to_string()))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let said: Option<Value> = stdout
         .lines()
@@ -569,6 +627,17 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
             "tool_failed",
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         )),
+    }
+}
+
+/// A call's process group, stopped when its answer is given up: out of
+/// time, or its turn over, as the person interrupting a slow setup.
+struct Group(u32);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        // SAFETY: a signal to the group this call's process leads.
+        unsafe { libc::kill(-(self.0 as libc::pid_t), libc::SIGKILL) };
     }
 }
 
