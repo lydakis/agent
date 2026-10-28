@@ -257,8 +257,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `announced_ms` is when this request was written. The stored event holds
   no arguments, since the node already does; a few dozen bytes per call.
   What is sent to approvers also carries, per gate, the bot's
-  `denials: {"in_row","in_turn"}` for that tag, counted in the call's own
-  turn. The daemon keeps these two counts on the bot's row, updated in
+  `denials: {"in_row","recent"}` for that tag, counted in the call's own
+  turn (`recent` replaced `in_turn` on 2026-10-27, below). The daemon keeps these two counts on the bot's row, updated in
   the commits that already record a denial or start an allowed call, so an approver that restarts or
   takes over sees the same counts its predecessor did and the circuit
   breaker does not reset. `approvals` and
@@ -445,6 +445,51 @@ own clock.
   allow a fixed set of commands and deny the rest with no model at all.
 
 ### Automatic mode
+
+**Since 2026-10-27 the judge follows Codex's guardian reviewer** (George:
+"if we're doing something weird, we should stop and do what Codex is
+doing"; he agreed to every pick the comparison made. Codex read at
+openai/codex `cf2c04b`). Steps 3 to 5 below, and the probability
+questions in [Which model judges](#which-model-judges), are the history
+this replaced:
+
+- **One written policy and one assessment a call.** The eleven
+  probability questions were built for Jev, dropped the same day. The
+  judge now gets Codex's policy (evidence handling, authorization scoring,
+  a risk taxonomy, data exfiltration, credential probing, persistent
+  security weakening, destructive actions, and its outcome table), with
+  this agent's own rules folded in: only the person's words and the
+  environment note are trusted; a go-ahead binds to the question and the
+  refused calls right before it; a one-time effect is used up; a refused
+  call redone another way is judged as it was; ordinary work (the old
+  "person trusts the agent" list) is low risk; and reaching the approval
+  channel is `critical` whatever anyone asked. Per call it answers
+  `{"outcome":"allow"}`, or `risk_level` (low, medium, high, critical),
+  `user_authorization` (unknown, low, medium, high), `outcome`, and a
+  one-sentence `rationale`. Low and medium risk are allowed; high only
+  with at least medium authorization on a narrow action; critical never.
+  The Decisions API gets the same policy and one predicate a call (is the
+  outcome deny?), read at even odds. When the person's latest words or
+  the calls already run do not fit the state, it carries
+  `authorization_unreadable` and the judge scores authorization unknown.
+- **A denial goes back to the model at once.** Its reason is Codex's:
+  "This action was rejected due to unacceptable risk (risk, authorization).
+  Reason: RATIONALE", then that the agent must not work around it and
+  should take a materially safer route or ask its caller. Nobody waits:
+  until now a judged-risky call waited for the person under Sonny's
+  gate, which never lapses. The person's go-ahead in a message still
+  authorizes the retry, as before and as in Codex.
+- **A review that fails is closed and labeled.** A round is sent up to 3
+  times within a 90 s budget (Codex's attempts and timeout), then denied
+  as "Automatic approval review failed: WHY", saying it is a review
+  failure, not a judgment that the call is unsafe; one that ran out of
+  time says the model may retry once. Both answer with `unreviewed`, so
+  they count toward no breaker. A call too long to show the judge is
+  still handed to the person, where one can answer, as Codex asks the
+  person when a review's input is over its budget. The CLI's `auto` gate
+  lapses at 105 s to fit the longer budget.
+- **The breaker is Codex's:** 3 denials in a row, or 10 among the turn's
+  last 50 decided calls, where it was 20 a turn.
 
 The approver is a client program with its policy as data, like the CLI's
 default compaction text: `agent approver`, a long-running command, and the
