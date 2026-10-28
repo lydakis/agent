@@ -87,7 +87,7 @@ fn folder(
     dir: &Path,
     role: &agent_client::policy::Profile,
 ) -> Result<(String, Vec<String>), String> {
-    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
+    let memory = memory(dir)?;
     let composed =
         agent_client::policy::instructions(dir, Some(role), &memory).map_err(|e| e.to_string())?;
     let skills = composed
@@ -96,6 +96,16 @@ fn folder(
         .map(|skill| skill.name)
         .collect();
     Ok((composed.text, skills))
+}
+
+/// The memory a lead of `dir` reads: its own project's, by the name its
+/// lead takes, even before the folder has a project file. Looked up from
+/// the folder, one made below another project, outside git, would take
+/// that project's.
+fn memory(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(agent_client::policy::project_memory_indexes(&default_name(
+        dir,
+    )?))
 }
 
 /// What an agent a trigger starts in `dir` is told: the folder's rules,
@@ -552,6 +562,13 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
     let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
     if let Ok(made) = &mut made {
+        // Composed from its folder, so the lead follows the folder's
+        // changes as one Sonny opened there does, when it opens.
+        if made["created"] == true
+            && let Some(text) = made["record"]["instructions"].as_str()
+        {
+            wrote(&lead(&socket, &made["record"]), text);
+        }
         open_new_lead(&client, &socket, caller, made).await;
         made.as_object_mut().map(|m| m.remove("record"));
     }
@@ -707,6 +724,20 @@ mod tests {
         assert_eq!(at(&new), real(&new));
         assert_eq!(at(&ws), real(&ws));
         assert_eq!(above(&real(&new)).as_deref(), Some("ws.lead"));
+        // Its lead reads its own memory, not the workspace's, though the
+        // folder has no project file of its own until the lead is made.
+        assert_eq!(
+            agent_client::policy::project(&real(&new))
+                .unwrap()
+                .as_deref(),
+            Some("ws")
+        );
+        let read = memory(&real(&new)).unwrap();
+        assert!(
+            read.last()
+                .is_some_and(|index| index.ends_with("projects/new/MEMORY.md")),
+            "{read:?}"
+        );
         // In a repository, its project or its top, never a subfolder.
         assert_eq!(at(&repo.join("src/deep")), real(&repo));
         assert_eq!(at(&bare.join("src")), real(&bare));

@@ -485,12 +485,31 @@ fn memory_indexes_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<Path
     let Some(home) = home else {
         return Ok(Vec::new());
     };
+    let project = project_from(workspace, Some(home))?;
+    Ok(indexes_of(
+        project.map(|(name, _)| name).as_deref(),
+        Some(home),
+    ))
+}
+
+/// The memory indexes a new bot of the project named `project` starts
+/// with, as [`memory_indexes`] finds them for a folder in it: for a
+/// project's lead, whose folder has no project file until it is made, and
+/// would otherwise take the memory of a project above it.
+pub fn project_memory_indexes(project: &str) -> Vec<PathBuf> {
+    indexes_of(Some(project), home().as_deref())
+}
+
+fn indexes_of(project: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
     let root = home.join(".agents/memory");
     let mut found = vec![root.join("MEMORY.md")];
-    if let Some((name, _)) = project_from(workspace, Some(home))? {
+    if let Some(name) = project {
         found.push(root.join("projects").join(name).join("MEMORY.md"));
     }
-    Ok(found)
+    found
 }
 
 /// The project `dir` belongs to: the name in the nearest
@@ -1331,6 +1350,15 @@ mod tests {
             memory_indexes_from(&repo, None).unwrap(),
             Vec::<PathBuf>::new()
         );
+        // Named, a project's own, whatever folder is above it.
+        assert_eq!(
+            indexes_of(Some("web"), Some(&home)),
+            [
+                memory.join("MEMORY.md"),
+                memory.join("projects/web/MEMORY.md")
+            ]
+        );
+        assert_eq!(indexes_of(Some("web"), None), Vec::<PathBuf>::new());
         // A worktree's checkout is the main one.
         let top = repo.canonicalize().unwrap();
         assert_eq!(

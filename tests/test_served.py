@@ -233,6 +233,30 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'memory', {'save': dict(fact, name='x', type='mood')}))
         self.assertEqual(refused['error'], 'memory_refused')
 
+    def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
+        ws = self.path / 'ws'
+        (ws / '.agents').mkdir(parents=True)
+        (ws / '.agents/project.toml').write_text('name = "ws"\n')
+        (ws / 'api').mkdir()
+        memory = self.path / '.agents/memory/projects'
+        for name in ['ws', 'api']:
+            (memory / name).mkdir(parents=True)
+            (memory / name / 'MEMORY.md').write_text(f'# Memory of {name}\n')
+        self.daemon.request('create', bot='ws.lead', workspace=str(ws), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('new_project')])
+        self.lookout()
+        made = json.loads(self.call('ws.lead', 'new_project', {'folder': str(ws / 'api')}))
+        self.assertEqual((made['coordinator'], made['created']), ('api.lead', True), made)
+        # Its own project's memory, though the folder above is a project
+        # and the new one had no file when its lead was made.
+        lead = self.daemon.request('inspect', bot='api.lead')['result']
+        self.assertIn('# Memory of api', lead['instructions'])
+        self.assertNotIn('# Memory of ws', lead['instructions'])
+        # Sonny composed them, so the lead takes its folder's changes when
+        # it opens, as one made by opening Sonny there does.
+        [kept] = (self.path / '.agent/sonny/instructions').iterdir()
+        self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
+
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
