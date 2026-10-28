@@ -1449,9 +1449,14 @@ fn as_unified(patch: &str, workspace: &str) -> String {
                 if line.starts_with("@@") || line == "*** End of File" {
                     continue;
                 }
-                let line = if line.is_empty() { " " } else { line };
+                // A line with no change mark, as in a patch the daemon
+                // refused, is drawn as context.
+                let line = match line.chars().next() {
+                    Some('+' | '-' | ' ') => line.to_owned(),
+                    _ => format!(" {line}"),
+                };
                 if let Some(chunk) = chunks.last_mut() {
-                    chunk.push(line.to_owned());
+                    chunk.push(line);
                 }
             }
             let (mut grown, mut from) = (0isize, 0);
@@ -1775,6 +1780,15 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_patch_with_an_unmarked_line_still_draws() {
+        let unified = as_unified(
+            "*** Begin Patch\n*** Update File: f\n@@\nα\n-a\n+b\n*** End Patch",
+            "/nonexistent",
+        );
+        assert!(unified.contains("\n α\n-a\n+b\n"), "{unified}");
     }
 
     #[test]
