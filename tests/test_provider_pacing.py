@@ -30,8 +30,12 @@ class AllowanceModel(http.server.BaseHTTPRequestHandler):
             self.server.held.set()
             self.server.release.wait(5)
         if mode == 'quota' and n == 1:
-            payload = json.dumps({'error': {self.server.quota_field: 'insufficient_quota',
-                                 'message': 'Check billing.'}}).encode()
+            error = {self.server.quota_field: 'insufficient_quota', 'message': 'Check billing.'}
+            if self.server.quota_field == 'details':
+                # Anthropic's spend cap: a rate limit error but for its code.
+                error = {'type': 'rate_limit_error', 'message': 'Usage paused.',
+                         'details': {'error_code': 'enforced_spend_limit_reached'}}
+            payload = json.dumps({'error': error}).encode()
             self.send_response(429)
             self.send_header('Content-Type', 'application/json')
             # This must not block the next bot in the same pool.
@@ -150,7 +154,7 @@ class ProviderPacingTests(unittest.TestCase):
 
     def test_permanent_quota_fails_once_without_pausing_the_pool(self):
         self.server.mode = 'quota'
-        for field in ('type', 'code'):
+        for field in ('type', 'code', 'details'):
             with self.subTest(field=field):
                 self.server.calls = 0
                 self.server.quota_field = field

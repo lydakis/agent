@@ -495,6 +495,9 @@ impl Failure {
         {
             failure.error.code = format!("provider_http_{status}");
         }
+        if let Some(headers) = failure.headers.as_deref() {
+            failure.error = super::waits(failure.error, headers);
+        }
         failure
     }
 }
