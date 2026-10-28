@@ -5441,3 +5441,34 @@ that change (`main` with it) against this one.
 
 Every difference is inside the run-to-run range; the estimate is one
 selection over 32 samples a call.
+
+## Server errors wait as asked, and a spent cap ends the turn
+
+Two refusals the daemon paced wrongly. A 503 or other server error that
+named its wait in `retry-after-ms` or `retry-after` was retried on the
+250 ms backoff regardless; a retry now takes the wait when it is a minute
+or less, as the OpenAI and Anthropic SDKs do, and a wait of a second or
+more parks the turn. Anthropic answers a spent monthly cap with a 429
+`rate_limit_error` with no `retry-after`, marked only by
+`error.details.error_code` `enforced_spend_limit_reached`; the daemon took
+it for a rate limit, closed the pool and retried every bot on it until the
+month ended. It now ends the turn as `provider_quota_exhausted` and leaves
+the pool open. Neither runs on a call that succeeds.
+
+Hot-path screen, in the same alternating run as the earlier pacer changes':
+the output-reservation change against this one.
+
+| Measure | Before | This change |
+| --- | ---: | ---: |
+| Idle RSS, MiB | 18.50 (18.44–18.76) | 18.73 (18.54–18.80) |
+| Per idle bot, KiB | 1.18 (1.03–1.21) | 1.03 (1.02–1.29) |
+| After one turn each, MiB | 27.13 (26.62–27.89) | 27.38 (27.17–27.49) |
+| CPU per turn, one each, ms | 1.44 (1.35–1.65) | 1.46 (1.40–1.63) |
+| Lifecycle CPU, s | 1.29 (1.26–1.38) | 1.29 (1.25–1.53) |
+| Lifecycle p95 turn, ms | 593 (586–605) | 593 (587–602) |
+| Lifecycle peak RSS, MiB | 24.45 (24.02–24.58) | 24.39 (23.88–24.50) |
+| Completion burst p99, ms | 17.2 (15.1–20.3) | 16.9 (14.8–25.0) |
+| Admission burst, last submit reply, ms | 7.9 (6.9–10.9) | 7.7 (6.6–11.7) |
+| Lone submit CPU, ms per 32 | 51.9 (44.4–58.9) | 52.8 (40.0–61.0) |
+
+Every difference is inside the run-to-run range.
