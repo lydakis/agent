@@ -376,6 +376,8 @@ fn a_task_done_goes_with_its_worktree_once_its_work_is_committed() {
     assert!(ok, "{said}");
     lab.has_task(true);
     let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    // A new file counts though git is set to show none.
+    lab.git(&lab.repo, &["config", "status.showUntrackedFiles", "no"]);
     std::fs::write(worktree.join("src/new.rs"), "new\n").unwrap();
     let (ok, said) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
     assert!(!ok && said.contains("uncommitted changes"), "{said}");
@@ -466,6 +468,24 @@ fn a_task_done_counts_a_staged_edit_and_a_file_made_to_run_as_work() {
     let (ok, said_runs) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
     let refused_runs = !ok && said_runs.contains("src/lib.rs");
     std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // A stash holds an edit no commit has.
+    std::fs::write(&lib, "four\n").unwrap();
+    lab.git(&copy, &["stash", "-q"]);
+    let (ok, said_stash) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let refused_stash = !ok && said_stash.contains("a stash");
+    lab.git(&copy, &["stash", "pop", "-q"]);
+    std::fs::write(&lib, "two\n").unwrap();
+    // A repository inside both, which git names only as a whole.
+    for (dir, said) in [(&lab.repo, "a\n"), (&copy, "b\n")] {
+        std::fs::create_dir_all(dir.join("dep")).unwrap();
+        lab.git(&dir.join("dep"), &["init", "-q"]);
+        std::fs::write(dir.join("dep/notes.md"), said).unwrap();
+    }
+    let (ok, said_inner) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let refused_inner = !ok && said_inner.contains("dep/");
+    for dir in [&lab.repo, &copy] {
+        std::fs::remove_dir_all(dir.join("dep")).unwrap();
+    }
     let (ok, said_done) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
     let gone = sandfs.workspaces().unwrap().is_empty();
     if !gone {
@@ -473,6 +493,8 @@ fn a_task_done_counts_a_staged_edit_and_a_file_made_to_run_as_work() {
     }
     assert!(refused_staged, "{said_staged}");
     assert!(refused_runs, "{said_runs}");
+    assert!(refused_stash, "{said_stash}");
+    assert!(refused_inner, "{said_inner}");
     assert!(ok && gone, "{said_done}");
 }
 

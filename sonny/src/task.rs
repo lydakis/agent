@@ -764,7 +764,7 @@ fn finish(here: &Path, name: &str, flags: &[String]) -> Result<(), String> {
             }
         }
         if let Some(path) = &worktree
-            && !git(path, &["status", "--porcelain"])?.is_empty()
+            && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
         {
             return Err(format!(
                 "{name}: its worktree {} has uncommitted changes; commit them on agent/{name}, \
@@ -848,6 +848,14 @@ fn unsaved(top: &Path, name: &str, dir: &Path) -> Result<Vec<String>, String> {
             left.push(format!(
                 "{commits} commit{} no remote has (`git -C {} push origin agent/{name}` sends them)",
                 if commits == "1" { "" } else { "s" },
+                shell_quote(dir)
+            ));
+        }
+        // A stash the copy made: what it holds isn't in any commit.
+        let stash = |dir: &Path| git(dir, &["stash", "list", "--format=%H"]).unwrap_or_default();
+        if stash(dir) != stash(top) {
+            left.push(format!(
+                "a stash (`git -C {} stash list` shows it)",
                 shell_quote(dir)
             ));
         }
@@ -936,12 +944,28 @@ fn same_staged(dir: &Path, path: &str, lead: &Path) -> Result<bool, String> {
     })
 }
 
-/// Whether `a` and `b` hold the same: both missing, folders, links to one
-/// target, or files with the same bytes that both run or both don't.
+/// Whether `a` and `b` hold the same: both missing, folders holding the
+/// same, links to one target, or files with the same bytes that both run or
+/// both don't.
 fn same(a: &Path, b: &Path) -> bool {
     match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
         (Err(_), Err(_)) => true,
-        (Ok(x), Ok(y)) if x.is_dir() && y.is_dir() => true,
+        // Git names a folder it doesn't look into, such as a repository
+        // inside the copy, as a whole.
+        (Ok(x), Ok(y)) if x.is_dir() && y.is_dir() => {
+            let names = |dir: &Path| -> Option<std::collections::BTreeSet<_>> {
+                std::fs::read_dir(dir)
+                    .ok()?
+                    .map(|entry| entry.ok().map(|entry| entry.file_name()))
+                    .collect()
+            };
+            match (names(a), names(b)) {
+                (Some(x), Some(y)) if x == y => {
+                    x.iter().all(|name| same(&a.join(name), &b.join(name)))
+                }
+                _ => false,
+            }
+        }
         (Ok(x), Ok(y)) if x.is_symlink() && y.is_symlink() => {
             std::fs::read_link(a).ok() == std::fs::read_link(b).ok()
         }
