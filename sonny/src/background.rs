@@ -263,6 +263,12 @@ impl View {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Key::Close;
             }
+            // A letter with Ctrl or Alt is another shortcut, such as Ctrl+F's
+            // find: never a fire or a removal.
+            KeyCode::Char(_)
+                if key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) => {}
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
@@ -579,6 +585,9 @@ mod tests {
         assert_eq!(lines[8], "Lookout subscriptions · 1");
         assert_eq!(lines[9], " ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
+        // Ctrl+D is not d.
+        view.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(view.confirm, None);
         assert_eq!(press(&mut view, KeyCode::Char('d')), Key::Stay);
         assert_eq!(
             view.confirm,
