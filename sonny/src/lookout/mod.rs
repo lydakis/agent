@@ -560,7 +560,7 @@ impl Judge {
             })[..12]
         );
         let effort = self.effort.as_deref();
-        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS)
+        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS, &[])
             .await
             .map(Arc::new)
             .map_err(|e| failed(format!("the judge could not be made: {e}")))?;
