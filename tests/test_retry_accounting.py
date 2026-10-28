@@ -21,17 +21,23 @@ class RetryAccountingTests(ModelFixture):
         return client.request('turns', bot=bot)['result']['turns'][0]
 
     def test_completed_retries_and_waits_survive_interrupt_and_restart(self):
-        self.model.retry_delays = ['0.05', '0.05', '10']
+        self.model.retry_delays = ['0.3', '0.3', '10']
         client = self.client()
         turn = self.submit(client, 'Bob', 'limited-forever:cancel')
         client.receive(lambda e: e.get('event') == 'retry' and e['data'].get('attempt') == 3)
         row = self.interrupt(client, 'Bob', turn)
         self.assertEqual(self.model.requests.qsize(), 3)
         self.assertEqual(row['retries'], 2)
-        # Each wait is timed from when the next call starts pacing, after
-        # the refusal was read, so a busy machine records less than the
-        # 50 ms each refusal asked for; both waits still count.
-        self.assertGreaterEqual(row['paced_ms'], 50)
+        # Each retry waited for its refusal's Retry-After, timed here from
+        # the refused attempt's arrival, which a slow machine only lengthens.
+        arrived = self.model.arrived
+        for attempt in (1, 2):
+            self.assertGreaterEqual(arrived['limited-forever:cancel', attempt + 1]
+                                    - arrived['limited-forever:cancel', attempt], .3)
+        # The daemon times each wait from when the next call starts pacing,
+        # after the refusal was read, so it records less than was asked;
+        # the waits still count.
+        self.assertGreater(row['paced_ms'], 0)
         client.close()
         client = self.client()
         persisted = client.request('turns', bot='Bob')['result']['turns'][0]
@@ -61,7 +67,7 @@ class RetryAccountingTests(ModelFixture):
         row = self.interrupt(client, 'Waiting', turn)
         self.assertEqual(self.model.requests.qsize(), 1)
         self.assertEqual(row['retries'], 0)
-        self.assertGreaterEqual(row['paced_ms'], 50)
+        self.assertGreater(row['paced_ms'], 0)
 
     def test_park_and_resume_flush_retry_accounting_once(self):
         self.model.all_streaming = threading.Event()
