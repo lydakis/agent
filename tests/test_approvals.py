@@ -166,6 +166,9 @@ class ApprovalTests(ModelFixture):
         turn = daemon.request('submit', bot='Carl', request_id='c', prompt='shell:true')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         (self.path / 'kid').mkdir()
+        act = {'name': 'act', 'description': 'Act.', 'parameters': {'type': 'object'}, 'answered_by': 'client'}
+        # A bot in its folder with a tool a client answers, which isn't Bob's.
+        daemon.request('create', bot='Dave', workspace=str(self.path), declare=[act])
         child = dict(op='create', model='openai/synthetic-model', instructions='Kid.', tools=['echo'])
         requests = [
             dict(op='bots'),
@@ -179,9 +182,10 @@ class ApprovalTests(ModelFixture):
             dict(op='delete', bot='Kid'),
             dict(op='fork', source='Alice', bot='Copy'),
             dict(op='fork', source='Alice', bot='Ask', allow=[], expire_ms=60000),
-            dict(child, bot='Hand', workspace=str(self.path / 'kid'),
-                 declare=[{'name': 'act', 'description': 'Act.', 'parameters': {'type': 'object'},
-                           'answered_by': 'client'}]),
+            dict(child, bot='Hand', workspace=str(self.path / 'kid'), declare=[act]),
+            dict(op='fork', source='Dave', bot='Tooled'),
+            dict(op='submit', bot='Bob', request_id='away', prompt='echo:hi', workspace=str(outside),
+                 delivery='queue'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
@@ -217,9 +221,9 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand) = probed['answers']
+         ask, hand, tooled, away) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand):
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),
@@ -229,6 +233,11 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(ask['result']['created_by'], 'Bob')
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(daemon.request('inspect', bot='Bob')['result']['instructions'], 'Test agent.')
+        # A bot's own socket goes with it.
+        own = Path(f'{daemon.socket_path}.d') / str(carl)
+        self.assertTrue(own.is_socket())
+        self.assertIn('result', daemon.request('delete', bot='Carl'))
+        self.assertFalse(own.exists())
 
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()

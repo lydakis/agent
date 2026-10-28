@@ -13,7 +13,8 @@ use tokio::net::{UnixListener, UnixStream};
 const SOCKET_PATH: usize = 103;
 
 /// Each sandboxed bot's own socket, in a folder beside the daemon's: opened
-/// the first time one of its commands runs, and kept while the daemon runs.
+/// the first time one of its commands runs, and closed when the bot is
+/// deleted.
 /// A connection on it is a session answered as that bot. `None` when the
 /// folder's sockets wouldn't fit a socket path.
 pub fn capabilities(
@@ -30,17 +31,27 @@ pub fn capabilities(
     let runtime = tokio::runtime::Handle::current();
     // The folder is made ready by the first bot to need it, once the
     // daemon owns its socket.
-    let opened = std::sync::Mutex::new(None::<std::collections::HashMap<i64, PathBuf>>);
+    type Opened = std::collections::HashMap<i64, (PathBuf, tokio::task::AbortHandle)>;
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(None::<Opened>));
     let (place, own) = (folder.clone(), socket.to_owned());
+    let closing = opened.clone();
     Some(agent_runtime::sandbox::Capabilities {
         folder,
+        close: std::sync::Arc::new(move |bot| {
+            let mut opened = closing.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((path, accepting)) = opened.as_mut().and_then(|opened| opened.remove(&bot))
+            {
+                accepting.abort();
+                let _ = std::fs::remove_file(path);
+            }
+        }),
         open: std::sync::Arc::new(move |bot| {
             let mut opened = opened.lock().unwrap_or_else(|e| e.into_inner());
             if opened.is_none() {
                 prepare(&place, &own)?;
             }
             let opened = opened.get_or_insert_default();
-            if let Some(path) = opened.get(&bot) {
+            if let Some((path, _)) = opened.get(&bot) {
                 return Ok(path.clone());
             }
             let path = place.join(bot.to_string());
@@ -51,13 +62,13 @@ pub fn capabilities(
                 let _entered = runtime.enter();
                 UnixListener::from_std(listener)?
             };
-            runtime.spawn(super::session::accept(
+            let accepting = runtime.spawn(super::session::accept(
                 listener,
                 sender.clone(),
                 next.clone(),
                 Some(bot),
             ));
-            opened.insert(bot, path.clone());
+            opened.insert(bot, (path.clone(), accepting.abort_handle()));
             Ok(path)
         }),
     })

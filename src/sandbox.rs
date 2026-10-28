@@ -309,6 +309,13 @@ impl Daemon {
             .map(|capabilities| (capabilities.open)(bot))
             .transpose()
     }
+
+    /// Close bot `bot`'s own socket, once the bot is gone.
+    pub fn release(&self, bot: i64) {
+        if let Some(capabilities) = &self.capabilities {
+            (capabilities.close)(bot);
+        }
+    }
 }
 
 /// The folder of the bots' own sockets, which stays read-only in every
@@ -318,6 +325,7 @@ pub struct Capabilities {
     pub folder: PathBuf,
     #[allow(clippy::type_complexity)]
     pub open: std::sync::Arc<dyn Fn(i64) -> Result<PathBuf> + Send + Sync>,
+    pub close: std::sync::Arc<dyn Fn(i64) + Send + Sync>,
 }
 
 impl std::fmt::Debug for Capabilities {

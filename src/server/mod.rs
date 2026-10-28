@@ -1695,6 +1695,15 @@ impl Service {
             *created_by_id = Some(me.bot_id);
             Ok(())
         };
+        // A tool a client answers is one the caller may pass on: one it has
+        // and gives the bots it makes, answered by the same client. Another
+        // could get a client to act for it.
+        let passes = |tool: &agent_runtime::tools::Declared| {
+            tool.answered_by.is_none()
+                || me.declared.iter().any(|own| {
+                    own.inherit && own.name == tool.name && own.answered_by == tool.answered_by
+                })
+        };
         // The folders a request would give a bot, each of which the caller
         // must be able to write itself.
         let mut folders: Vec<String> = Vec::new();
@@ -1708,17 +1717,6 @@ impl Service {
                 ..
             } => {
                 claim(created_by, created_by_id)?;
-                // A tool a client answers is one the caller may pass on: one
-                // it has and gives the bots it makes, answered by the same
-                // client. Another could get a client to act for it.
-                let passes = |tool: &agent_runtime::tools::Declared| {
-                    tool.answered_by.is_none()
-                        || me.declared.iter().any(|own| {
-                            own.inherit
-                                && own.name == tool.name
-                                && own.answered_by == tool.answered_by
-                        })
-                };
                 if declare.iter().flatten().any(|tool| !passes(tool)) {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
@@ -1741,6 +1739,20 @@ impl Service {
                         .store
                         .op("inspect", move |db| db.inspect(&source))
                         .await?;
+                    // A fork keeps its source's declared tools; those it may
+                    // call are the caller's to pass on.
+                    let callable = |tool: &&agent_runtime::tools::Declared| match allow {
+                        Some(Some(names)) => names.contains(&tool.name),
+                        _ => true,
+                    };
+                    if source
+                        .declared
+                        .iter()
+                        .filter(callable)
+                        .any(|tool| !passes(tool))
+                    {
+                        return refuse("fork a bot whose tools a client answers for it");
+                    }
                     folders.extend(workspace.clone().or(source.workspace));
                     folders.extend(source.settings.writable);
                 }
@@ -1768,12 +1780,12 @@ impl Service {
                     }
                     (false, None) => *origin = Some(me.name.clone()),
                 }
-                // A sandboxed bot with no folder of its own works in each
-                // turn's: one the caller gives it must be the caller's.
+                // A turn's folder is the sandboxed bot's to write, and stays
+                // its folder: one the caller gives it must be the caller's.
                 if let Some(workspace) = workspace {
                     let bot = bot.clone();
                     let target = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
-                    if target.sandboxed() && target.workspace.is_none() {
+                    if target.sandboxed() {
                         folders.push(workspace.clone());
                     }
                 }
@@ -2078,10 +2090,11 @@ impl Service {
             }
             let (store, hub, providers) =
                 (self.store.clone(), self.hub.clone(), self.providers.clone());
+            let daemon = self.registry.daemon().clone();
             self.retention.spawn(async move {
                 // A refusal (new work, a command still running) or a
                 // deletion that raced it leaves the bot to a later look.
-                let _ = delete_pieces(store, hub, providers, bot, bot_id, true).await;
+                let _ = delete_pieces(store, hub, providers, daemon, bot, bot_id, true).await;
             });
         }
         self.plan_expiry(overdue).await
@@ -2561,8 +2574,10 @@ impl Service {
                 };
                 let (store, hub, output) = (store.clone(), self.hub.clone(), output.clone());
                 let providers = self.providers.clone();
+                let daemon = self.registry.daemon().clone();
                 self.retention.spawn(async move {
-                    let result = delete_pieces(store, hub, providers, bot, bot_id, false).await;
+                    let result =
+                        delete_pieces(store, hub, providers, daemon, bot, bot_id, false).await;
                     retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
@@ -3594,6 +3609,7 @@ async fn delete_pieces(
     store: Store,
     hub: Hub,
     providers: Arc<HashMap<String, Provider>>,
+    daemon: agent_runtime::sandbox::Daemon,
     bot: String,
     bot_id: i64,
     expired: bool,
@@ -3635,10 +3651,11 @@ async fn delete_pieces(
         }
     }
     // Its connections go with it, and a later bot of the
-    // same name starts on a fresh one.
+    // same name starts on a fresh one; so does its own socket.
     for provider in providers.values() {
         provider.forget(&bot);
     }
+    daemon.release(bot_id);
     // Followers learn the bot is gone; nothing durable remains to replay.
     let mut gone = json!({"event":"deleted","bot":bot,"durable":false});
     if expired {
