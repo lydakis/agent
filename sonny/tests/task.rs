@@ -92,7 +92,8 @@ impl Lab {
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             // Keys the lookout that runs these calls may hold.
             .env("OPENAI_API_KEY", "sk-lab")
-            .env("LAB_TOKEN", "t-lab");
+            .env("LAB_TOKEN", "t-lab")
+            .env("AWS_SECRET_ACCESS_KEY", "aws-lab");
         if fail {
             command.env("AGENT_FAIL", "1");
         }
@@ -296,7 +297,7 @@ fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
     std::fs::write(
         &setup,
         "#!/bin/sh\necho \"$AGENT_SOURCE\" > from\n\
-         echo \"${OPENAI_API_KEY:-none} ${LAB_TOKEN:-none}\" > keys\nexit \"${SETUP_EXIT:-0}\"\n",
+         echo \"${OPENAI_API_KEY:-none} ${LAB_TOKEN:-none} ${AWS_SECRET_ACCESS_KEY:-none}\" > keys\nexit \"${SETUP_EXIT:-0}\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(lab.home.join(".agent")).unwrap();
@@ -313,7 +314,7 @@ fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
     assert_eq!(from.trim(), lab.repo.join("src").to_string_lossy());
     // The folder's own code sees none of the keys Agent keeps.
     let keys = std::fs::read_to_string(folder.join("keys")).unwrap();
-    assert_eq!(keys.trim(), "none none");
+    assert_eq!(keys.trim(), "none none none");
     // Setup is Sonny's, never the run's.
     assert!(!lab.ran().contains(&"--setup".to_owned()));
 }

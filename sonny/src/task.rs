@@ -792,18 +792,45 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
     }
 }
 
-/// The provider keys this process may hold: the well-known ones and what
-/// `~/.agent/env` sets.
+/// The provider credentials this process may hold, as the daemon keeps
+/// them from a bot's shell: the well-known keys, Bedrock's, the key a
+/// provider in `AGENT_PROVIDER` names, and what `~/.agent/env` sets.
 fn kept_keys() -> Vec<String> {
-    let mut keys: Vec<String> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
-        .map(String::from)
-        .into();
+    let mut keys: Vec<String> = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ]
+    .map(String::from)
+    .into();
+    keys.extend(provider_keys(
+        &std::env::var("AGENT_PROVIDER").unwrap_or_default(),
+    ));
     if let Some(file) = agent_client::env_file::path()
         && let Ok(set) = agent_client::env_file::read(&file)
     {
-        keys.extend(set.into_iter().map(|(key, _)| key));
+        keys.extend(set.iter().map(|(key, _)| key.clone()));
+        let named = set.iter().find(|(key, _)| key == "AGENT_PROVIDER");
+        keys.extend(
+            named
+                .map(|(_, specs)| provider_keys(specs))
+                .unwrap_or_default(),
+        );
     }
     keys
+}
+
+/// The key variables `NAME=FAMILY,URL,KEY_ENV` specs name.
+fn provider_keys(specs: &str) -> Vec<String> {
+    (specs.split_whitespace())
+        .filter_map(|spec| spec.split(',').nth(2))
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The last 20 lines with words `stream` writes, each cut to 1000 bytes,
@@ -1494,6 +1521,14 @@ pub fn remount(socket: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_spec_s_key_is_kept_from_setup() {
+        assert_eq!(
+            provider_keys("openai=responses,http://x/v1,WORK_KEY local=chat,http://y"),
+            ["WORK_KEY"]
+        );
+    }
 
     #[test]
     fn a_setup_s_errors_keep_only_their_last_lines() {
