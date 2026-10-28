@@ -173,7 +173,9 @@ off again never shows.
   **Resolved**, only counted until `r` shows them. The lead marks a task
   resolved with its `resolve_task` tool once nothing is left to do in it,
   such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it.
+  task's window closes. New work sent to the task reopens it. Each agent's
+  time is how long its running turn has been at it, or how long its last
+  turn took.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
