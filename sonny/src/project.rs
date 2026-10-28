@@ -18,16 +18,55 @@ pub const LEAD: &str = include_str!("../agents/lead.md");
 /// person's `~/.agents/agents/task.md` to edit, as [`LEAD`] is.
 pub const TASK: &str = include_str!("../agents/task.md");
 
-/// `text`, an agent's composed instructions, with what every agent but a
-/// lead is told after it: the body of the folder's or the person's
-/// `task.md`, else Sonny's.
-pub fn as_task(dir: &Path, text: &str) -> Result<String, String> {
-    let task = match agent_client::policy::profile(dir, "task")
+/// The roles Sonny ships, which the person's files of the same names
+/// replace, or build on with `extends`.
+pub const BUILTINS: [(&str, &str); 2] = [("lead", LEAD), ("task", TASK)];
+
+/// The profile `name` for an agent in `dir`, which must exist: the folder's
+/// or the person's file, else the one Sonny ships.
+pub fn profile(dir: &Path, name: &str) -> Result<agent_client::policy::Profile, String> {
+    agent_client::policy::profile_with(dir, name, &BUILTINS)
         .map_err(|e| format!("{}: {e}", e.code()))?
-    {
-        Some(task) => task,
-        None => agent_client::policy::Profile::parse("task", None, TASK),
-    };
+        .ok_or_else(|| {
+            let missing = agent_client::policy::Failure::Missing {
+                name: name.to_owned(),
+                kind: "profile",
+            };
+            format!("{}: {missing}", missing.code())
+        })
+}
+
+/// The name of the profile a project's lead runs as: its file's `profile`,
+/// else the config's `[sonny] lead_profile`, else `lead`.
+pub fn lead_profile(info: &Value) -> Result<String, String> {
+    named(info, "profile", |sonny| sonny.lead_profile, "lead")
+}
+
+/// The name of the profile every agent but a lead is told after the rest:
+/// the project file's `threads_profile`, else the config's
+/// `[sonny] task_profile`, else `task`.
+pub fn task_profile(info: &Value) -> Result<String, String> {
+    named(info, "threads_profile", |sonny| sonny.task_profile, "task")
+}
+
+fn named(
+    info: &Value,
+    key: &str,
+    config: fn(agent_client::config::Sonny) -> Option<String>,
+    default: &str,
+) -> Result<String, String> {
+    if let Some(name) = info[key].as_str() {
+        return Ok(name.to_owned());
+    }
+    Ok(config(agent_client::config::load()?.sonny).unwrap_or_else(|| default.to_owned()))
+}
+
+/// `text`, an agent's composed instructions, with what every agent but a
+/// lead is told after it: the body of the task profile `info`, a project's
+/// fields, names (`task.md`, the folder's or the person's, else Sonny's,
+/// unless set to another).
+pub fn as_task(dir: &Path, info: &Value, text: &str) -> Result<String, String> {
+    let task = profile(dir, &task_profile(info)?)?;
     Ok(match task.body.as_str() {
         "" => text.to_owned(),
         body => format!("{text}\n\n{}", agent_client::policy::with_cli(body)),
@@ -53,14 +92,11 @@ fn default_name(dir: &Path) -> Result<String, String> {
     Ok(info["name"].as_str().unwrap_or("project").to_owned())
 }
 
-/// The lead's role: the folder's or the person's `lead.md`, else Sonny's.
+/// The lead's role: the profile its project is set to, `lead` unless
+/// set otherwise, the folder's or the person's, else Sonny's.
 fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
-    Ok(
-        match agent_client::policy::profile(dir, "lead").map_err(|e| e.to_string())? {
-            Some(role) => role,
-            None => agent_client::policy::Profile::parse("lead", None, LEAD),
-        },
-    )
+    let info = agent_client::project::read(dir)?;
+    profile(dir, &lead_profile(&info)?)
 }
 
 /// A lead's instructions as Sonny composes them for `dir` now: its role,
@@ -104,7 +140,7 @@ pub fn plain(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed = agent_client::policy::instructions(dir, None, &memory)
         .map_err(|e| format!("{}: {e}", e.code()))?;
-    as_task(dir, &composed.text)
+    as_task(dir, &agent_client::project::read(dir)?, &composed.text)
 }
 
 /// What attaching does with a lead's instructions.
@@ -654,6 +690,40 @@ mod tests {
         assert!(picks.threads.is_some_and(|t| t.model.is_none()
             && t.effort.as_deref() == Some("xhigh")
             && !t.in_project));
+    }
+
+    #[test]
+    fn a_project_sets_the_profile_its_lead_runs_as() {
+        let dir = std::env::temp_dir().join(format!("sonny-lead-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"top\"\nprofile = \"super-lead\"\n",
+        )
+        .unwrap();
+        // Named but not written: the lead is not made without it.
+        assert!(role(&dir).unwrap_err().starts_with("profile_not_found: "));
+        std::fs::write(
+            dir.join(".agents/agents/super-lead.md"),
+            "---\nextends: lead\n---\nHand each ask to the lead it belongs to.\n",
+        )
+        .unwrap();
+        let lead = role(&dir).unwrap();
+        assert_eq!(lead.name, "super-lead");
+        assert!(
+            lead.body
+                .ends_with("Hand each ask to the lead it belongs to.")
+        );
+        // The lead's text, the person's or Sonny's, comes first.
+        let base = profile(&dir, "lead").unwrap().body;
+        assert!(lead.body.starts_with(&base));
+        let text = instructions(&dir).unwrap();
+        assert!(text.contains("# Role: super-lead\n\n"), "{text}");
+        // A variant of the lead is no role to start a peer in.
+        assert!(!text.contains("- super-lead:"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

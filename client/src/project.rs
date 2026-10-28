@@ -2,7 +2,8 @@
 //! `.agents/project.toml` in that folder, which holds mechanics only: the
 //! name, the coordinator's model and effort level, and its tasks' model and
 //! effort and whether they work in their own worktrees or the project
-//! folder, and whether the folders below it are the project's too. Clients
+//! folder, the profiles its coordinator and its tasks run as, and whether
+//! the folders below it are the project's too. Clients
 //! read it, and write it when they make a project; the
 //! daemon knows nothing of projects.
 use serde_json::{Value, json};
@@ -13,13 +14,15 @@ pub const FILE: &str = ".agents/project.toml";
 /// The largest project file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
-const KEYS: [&str; 8] = [
+const KEYS: [&str; 10] = [
     "name",
     "coordinator",
     "model",
     "effort",
+    "profile",
     "threads_model",
     "threads_effort",
+    "threads_profile",
     "threads_in",
     "subfolders",
 ];
@@ -98,9 +101,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         let name = default_name(dir);
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
-            "model": null, "effort": null, "threads_model": null,
-            "threads_effort": null, "threads_in": "worktree", "subfolders": "own",
-            "file": false,
+            "model": null, "effort": null, "profile": null, "threads_model": null,
+            "threads_effort": null, "threads_profile": null, "threads_in": "worktree",
+            "subfolders": "own", "file": false,
         }));
     };
     let table: toml::Table = text
@@ -145,6 +148,20 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         said("threads_model")?,
         said("threads_effort")?,
     );
+    // Profiles are looked up when the agents are made.
+    let named = |key: &str| {
+        let value = field(key)?;
+        if value
+            .as_deref()
+            .is_some_and(|v| !crate::policy::profile_name(v))
+        {
+            return Err(invalid(&format!(
+                "{key} must be a profile name: letters, digits, '-', '_' and '.'"
+            )));
+        }
+        Ok(value)
+    };
+    let (profile, threads_profile) = (named("profile")?, named("threads_profile")?);
     let threads_in = field("threads_in")?.unwrap_or_else(|| "worktree".into());
     if !THREADS_IN.contains(&threads_in.as_str()) {
         return Err(invalid("threads_in must be \"worktree\" or \"project\""));
@@ -155,9 +172,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     }
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model,
-        "effort": effort, "threads_model": threads_model,
-        "threads_effort": threads_effort, "threads_in": threads_in,
-        "subfolders": subfolders, "file": true,
+        "effort": effort, "profile": profile, "threads_model": threads_model,
+        "threads_effort": threads_effort, "threads_profile": threads_profile,
+        "threads_in": threads_in, "subfolders": subfolders, "file": true,
     }))
 }
 
@@ -883,6 +900,8 @@ mod tests {
             "name = \"demo\"\nthreads_effort = \"\"",
             "name = \"demo\"\nsubfolders = \"mine\"",
             "name = \"demo\"\nthreads_model = \"\"",
+            "name = \"demo\"\nprofile = \"../lead\"",
+            "name = \"demo\"\nthreads_profile = \"\"",
         ] {
             std::fs::write(dir.join(FILE), text).unwrap();
             let error = read(&dir).unwrap_err();
@@ -890,6 +909,16 @@ mod tests {
         }
         std::fs::write(dir.join(FILE), "name = \"demo\"\nsubfolders = \"project\"").unwrap();
         assert_eq!(read(&dir).unwrap()["subfolders"], "project");
+        std::fs::write(
+            dir.join(FILE),
+            "name = \"demo\"\nprofile = \"super-lead\"\nthreads_profile = \"worker\"",
+        )
+        .unwrap();
+        let info = read(&dir).unwrap();
+        assert_eq!(
+            (&info["profile"], &info["threads_profile"]),
+            (&json!("super-lead"), &json!("worker"))
+        );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

@@ -15,6 +15,8 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
+//! lead_profile = "super-lead"   # the role a new lead starts in, not lead
+//! task_profile = "worker"       # what every other agent is told, not task
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -62,6 +64,11 @@ pub struct Judge {
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
+    /// The profile a lead runs as, in place of `lead`.
+    pub lead_profile: Option<String>,
+    /// The profile every other agent Sonny starts is told, in place of
+    /// `task`.
+    pub task_profile: Option<String>,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -127,7 +134,7 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
-            "sonny" => &["lead_effort", "task_effort"],
+            "sonny" => &["lead_effort", "task_effort", "lead_profile", "task_profile"],
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
@@ -140,6 +147,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 ("judge", "model") => &mut config.judge.model,
                 ("judge", "effort") => &mut config.judge.effort,
                 ("sonny", "lead_effort") => &mut config.sonny.lead_effort,
+                ("sonny", "lead_profile") => &mut config.sonny.lead_profile,
+                ("sonny", "task_profile") => &mut config.sonny.task_profile,
                 _ => &mut config.sonny.task_effort,
             } = Some(value);
         }
@@ -249,7 +258,12 @@ mod tests {
         assert_eq!(config.judge.effort, None);
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
+        assert_eq!(config.sonny.lead_profile, None);
         assert_eq!(config.web_search, WebSearch::Live);
+        let roles =
+            parse("[sonny]\nlead_profile = \"super-lead\"\ntask_profile = \"worker\"").unwrap();
+        assert_eq!(roles.sonny.lead_profile.as_deref(), Some("super-lead"));
+        assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         for (text, error) in [
