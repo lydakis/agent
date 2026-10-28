@@ -239,11 +239,11 @@ the model and records each call: `react`, `ask`, `plan` and `resolve_task`
 run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
-`tool_unserved`, and the agent goes on. `start_task`, `new_project`,
-`remove_task` and `run_in_pane` wait for a verdict wherever the agent's
-other calls do (`/approvals`): the first runs the folder's setup script,
-the next makes a lead, a removal can drop work, and a pane runs a command
-outside the agent's sandbox. An agent of Sonny's reaches Sonny only through these tools: none
+`tool_unserved`, and the agent goes on. All but `show_agent` wait for a
+verdict wherever the agent's other calls do (`/approvals`): a start runs
+the folder's setup script, a new project makes a lead, a removal can drop
+work, a subscription sends other bots' words to the subscriber's judge,
+and a pane runs a command outside the agent's sandbox. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
 and a call answered with an error says why under it. The lead's Sonny keeps each
 task the lead resolved beside the store (`state.sqlite.resolved/`), with

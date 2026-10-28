@@ -31,9 +31,10 @@ pub const SUBSCRIPTIONS: &str = "subscriptions";
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
-/// lead, outside the agent's sandbox as a pane's command is, and a
-/// removal can drop work.
-pub const GATED: [&str; 4] = [START, REMOVE, PROJECT, RUN];
+/// lead, outside the agent's sandbox as a pane's command is, a removal can
+/// drop work, and a subscription sends other bots' words to the
+/// subscriber's judge.
+pub const GATED: [&str; 5] = [START, REMOVE, PROJECT, SUBSCRIPTIONS, RUN];
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.

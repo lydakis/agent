@@ -224,8 +224,9 @@ mod tests {
         let lapsing = json!({"tools": ["shell", "read"],
             "gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
         assert!(regate(&lapsing, "auto").is_some());
-        // Of the tools its client declared, those that can drop work or
-        // run something outside the sandbox wait for the verdict too.
+        // Of the tools its client declared, those that can drop work, run
+        // something outside the sandbox or send words elsewhere wait for
+        // the verdict too.
         let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(true),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
         assert_eq!(
@@ -235,6 +236,7 @@ mod tests {
                 "start_task",
                 "remove_task",
                 "new_project",
+                "subscriptions",
                 "run_in_pane"
             ])
         );
