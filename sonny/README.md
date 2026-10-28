@@ -35,8 +35,8 @@ project holds the folder above it. In a git repository, Sonny opens the
 nearest project in that repository, else makes the repository's top one,
 so `src` reaches the repository's lead and a task's worktree its main
 checkout's; a subfolder of a repository is its own project once it has a
-file (`sonny project add DIR`). A lead made below another project's folder
-says which lead holds the folder above. Sonny refuses to make a lead in a
+file, which a lead makes with its new_project tool. A lead made below
+another project's folder says which lead holds the folder above. Sonny refuses to make a lead in a
 task's own folder under `~/.agent`.
 
 Sonny's two roles are normal profiles the person can read and edit in
@@ -239,10 +239,13 @@ every Sonny window closed; a call nobody answers in time ends as
 wait for a verdict wherever the agent's other calls do (`/approvals`),
 since one can drop work and the other runs a command outside the agent's
 sandbox. An agent of Sonny's reaches Sonny only through these tools: none
-of them has a command form. Sonny draws the calls, live and from history. The lead's Sonny keeps each
+of them has a command form. Sonny draws the calls, live and from history,
+and a call answered with an error says why under it. The lead's Sonny keeps each
 task the lead resolved beside the store (`state.sqlite.resolved/`), with
 the task's newest turn finished by then: a turn of the task numbered after
 that one reopens it.
+
+![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 
 ![A plan and a question set with the plan and ask tools](../docs/sonny/ask-and-plan.png)
 

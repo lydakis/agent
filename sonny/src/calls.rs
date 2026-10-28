@@ -780,7 +780,7 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
         }
         crate::served::REMOVE => Some(said(
             match arguments["discard"] == true {
-                true => "Removed, dropping its work,",
+                true => "Discarded",
                 false => "Removed",
             },
             field("task")?,
