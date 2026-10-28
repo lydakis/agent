@@ -1402,7 +1402,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 29] = [
+const KEPT: [&str; 28] = [
     "Started",
     "Messaged",
     "Steered",
@@ -1431,7 +1431,6 @@ const KEPT: [&str; 29] = [
     "Opened a split",
     "Stopped Errand job",
     "Applied the changes of Errand job",
-    "Applied the changes of",
 ];
 
 fn kept(said: &crate::calls::Said) -> bool {
@@ -2638,11 +2637,6 @@ mod tests {
                 "  └ triggers_unsupported: only macOS",
                 "    Check the queue."
             ]
-        );
-        assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
-        assert_eq!(
-            shell(r#"sonny task changes calc.fix --apply"#, ""),
-            ["• Applied the changes of calc.fix"]
         );
     }
 

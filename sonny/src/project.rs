@@ -64,8 +64,8 @@ fn role(dir: &Path) -> Result<agent_client::policy::Profile, String> {
 }
 
 /// A lead's instructions as Sonny composes them for `dir` now: its role,
-/// the folder's rules, skills and memory, then the project's task rule
-/// with the copies Sonny is set to. Rex is the rex-windows skill's to
+/// the folder's rules, skills and memory, then the project's task rule.
+/// Rex is the rex-windows skill's to
 /// explain, so they read the same in any client.
 pub fn instructions(dir: &Path) -> Result<String, String> {
     compose(dir).map(|(text, _)| text)
@@ -75,8 +75,7 @@ pub fn instructions(dir: &Path) -> Result<String, String> {
 fn compose(dir: &Path) -> Result<(String, Vec<String>), String> {
     let (composed, skills) = folder(dir, &role(dir)?)?;
     let info = agent_client::project::read(dir)?;
-    let copies = crate::settings::Settings::load().copies;
-    let rule = agent_client::project::rule(&info, &copies);
+    let rule = agent_client::project::rule(&info);
     Ok((format!("{composed}\n\n{rule}"), skills))
 }
 
@@ -87,7 +86,7 @@ fn folder(
     dir: &Path,
     role: &agent_client::policy::Profile,
 ) -> Result<(String, Vec<String>), String> {
-    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
+    let memory = memory(dir)?;
     let composed =
         agent_client::policy::instructions(dir, Some(role), &memory).map_err(|e| e.to_string())?;
     let skills = composed
@@ -96,6 +95,16 @@ fn folder(
         .map(|skill| skill.name)
         .collect();
     Ok((composed.text, skills))
+}
+
+/// The memory a lead of `dir` reads: its own project's, by the name its
+/// lead takes, even before the folder has a project file. Looked up from
+/// the folder, one made below another project, outside git, would take
+/// that project's.
+fn memory(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(agent_client::policy::project_memory_indexes(&default_name(
+        dir,
+    )?))
 }
 
 /// What an agent a trigger starts in `dir` is told: the folder's rules,
@@ -365,22 +374,18 @@ fn folder_in(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
         None => dir.to_owned(),
     };
     let folder = claimed(&folder, home.as_deref())?.unwrap_or(folder);
-    if let Some(home) = home {
-        for kept in ["worktrees", "tasks"] {
-            let under = home.join(".agent").join(kept);
-            if let Some(task) = folder
-                .strip_prefix(&under)
-                .ok()
-                .and_then(|rest| rest.components().next())
-            {
-                let task = task.as_os_str().to_string_lossy();
-                return Err(format!(
-                    "task_folder: {} is in task {task}'s folder; run sonny in its project's \
-                     folder, or sonny --bot {task} for the task",
-                    dir.display()
-                ));
-            }
-        }
+    if let Some(home) = home
+        && let Some(task) = folder
+            .strip_prefix(home.join(".agent/worktrees"))
+            .ok()
+            .and_then(|rest| rest.components().next())
+    {
+        let task = task.as_os_str().to_string_lossy();
+        return Err(format!(
+            "task_folder: {} is in task {task}'s folder; run sonny in its project's \
+             folder, or sonny --bot {task} for the task",
+            dir.display()
+        ));
     }
     Ok(folder)
 }
@@ -486,8 +491,7 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     make(client, dir, &role, &picks).await.map(|_| ())
 }
 
-/// Make the project in `dir` with its lead in `role`, told the task rule
-/// with the copies Sonny is set to.
+/// Make the project in `dir` with its lead in `role`, told the task rule.
 async fn make(
     client: &Client,
     dir: &Path,
@@ -521,17 +525,7 @@ async fn make(
         "gate": gate,
         "settings": crate::approvals::sandbox(mode, true, dir),
     });
-    let copies = crate::settings::Settings::load().copies;
-    agent_client::project::create(
-        client,
-        dir,
-        &policy,
-        client.providers(),
-        picks,
-        &copies,
-        None,
-    )
-    .await
+    agent_client::project::create(client, dir, &policy, client.providers(), picks, None).await
 }
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
@@ -552,6 +546,13 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
     let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
     if let Ok(made) = &mut made {
+        // Composed from its folder, so the lead follows the folder's
+        // changes as one Sonny opened there does, when it opens.
+        if made["created"] == true
+            && let Some(text) = made["record"]["instructions"].as_str()
+        {
+            wrote(&lead(&socket, &made["record"]), text);
+        }
         open_new_lead(&client, &socket, caller, made).await;
         made.as_object_mut().map(|m| m.remove("record"));
     }
@@ -707,12 +708,26 @@ mod tests {
         assert_eq!(at(&new), real(&new));
         assert_eq!(at(&ws), real(&ws));
         assert_eq!(above(&real(&new)).as_deref(), Some("ws.lead"));
+        // Its lead reads its own memory, not the workspace's, though the
+        // folder has no project file of its own until the lead is made.
+        assert_eq!(
+            agent_client::policy::project(&real(&new))
+                .unwrap()
+                .as_deref(),
+            Some("ws")
+        );
+        let read = memory(&real(&new)).unwrap();
+        assert!(
+            read.last()
+                .is_some_and(|index| index.ends_with("projects/new/MEMORY.md")),
+            "{read:?}"
+        );
         // In a repository, its project or its top, never a subfolder.
         assert_eq!(at(&repo.join("src/deep")), real(&repo));
         assert_eq!(at(&bare.join("src")), real(&bare));
         assert_eq!(above(&real(&bare)).as_deref(), Some("ws.lead"));
         // A task's folder under ~/.agent is no project's.
-        let task = home.join(".agent/tasks/ws.fix/sub");
+        let task = home.join(".agent/worktrees/ws.fix/sub");
         std::fs::create_dir_all(&task).unwrap();
         let error = folder_in(&task.canonicalize().unwrap(), Some(&home)).unwrap_err();
         assert!(error.starts_with("task_folder: "), "{error}");
