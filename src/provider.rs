@@ -1540,11 +1540,15 @@ pub fn paced(code: &str) -> bool {
 /// A refusal with the wait its response asks for, as the fact
 /// `retry_after_ms`, so a retry of a server error can honour it as the
 /// providers' SDKs do.
-pub(crate) fn waits(error: Error, headers: &reqwest::header::HeaderMap) -> Error {
-    match retry_after(headers) {
-        Some(after) => error.facts(json!({"retry_after_ms": after.as_millis() as u64})),
-        None => error,
+/// Facts the error already carries are kept.
+pub(crate) fn waits(mut error: Error, headers: &reqwest::header::HeaderMap) -> Error {
+    if let Some(after) = retry_after(headers) {
+        error
+            .facts
+            .get_or_insert_default()
+            .insert("retry_after_ms".into(), json!(after.as_millis() as u64));
     }
+    error
 }
 
 /// Whether a paced refusal is an overload rather than a rate limit.
