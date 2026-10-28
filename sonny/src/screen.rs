@@ -1,4 +1,4 @@
-//! The full screen (`/fullscreen`): Sonny keeps the conversation's rows
+//! The conversation on the screen Sonny owns: it keeps the rows
 //! itself and draws them above the rows that move, on the alternate
 //! screen, instead of handing them to the terminal's scrollback. So the
 //! wheel scrolls them, and the mouse selects and copies them with no key
