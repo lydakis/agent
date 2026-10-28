@@ -433,7 +433,7 @@ async fn make(
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "model": role.model,
         "tools": role.tools,
-        "declare": crate::declared::tools(),
+        "declare": crate::declared::tools(true),
     });
     let copies = crate::settings::Settings::load().copies;
     agent_client::project::create(

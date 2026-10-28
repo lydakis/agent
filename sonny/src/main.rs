@@ -31,6 +31,7 @@ mod plan;
 mod project;
 mod prompt;
 mod reactions;
+mod resolved;
 mod rex;
 mod settings;
 mod shell;
@@ -728,7 +729,7 @@ async fn run() -> Result<(), String> {
     }
     // The person's agent can react to them; a side chat calls no tool.
     if options.side.is_none() {
-        app.declare = declared::declare(&bot);
+        app.declare = declared::declare(&bot, project.is_some());
     }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
@@ -1089,6 +1090,17 @@ const COMMANDS: [(&str, &str); 14] = [
     ("/quit", "the agents keep working"),
 ];
 
+/// What an agent's last few items say, for `/status`.
+#[derive(Default)]
+struct Latest {
+    /// Its latest step, as a line.
+    step: String,
+    /// The pull request its latest reply links.
+    pr: Option<String>,
+    /// The question it asked the person and has no answer to yet.
+    ask: Option<String>,
+}
+
 /// `/status` on its own screen, its timers ticking and its rows read
 /// again every two seconds, until Esc.
 struct Watch {
@@ -1101,6 +1113,8 @@ struct Watch {
     read: Instant,
     /// The lookout's line for the lead.
     lookout: String,
+    /// The resolved tasks are listed, not only counted.
+    resolved: bool,
 }
 
 struct App {
@@ -1561,6 +1575,19 @@ impl Fleet {
                     self.name_windows();
                 }
             }
+        }
+    }
+
+    /// A task the lead resolved: its window closes, unless new work has
+    /// it at work again.
+    fn resolved(&mut self, task: &str) {
+        if self.lineage.contains(task)
+            && !matches!(self.doing.get(task), Some(&"working" | &"needs you"))
+        {
+            self.ended.remove(task);
+            self.layout.close(task);
+            self.doing.remove(task);
+            self.name_windows();
         }
     }
 
@@ -2508,6 +2535,8 @@ impl App {
         // On attach the newest page; on reconnecting, every page back to
         // the last node this window drew, so nothing missed is skipped.
         let mut nodes: Vec<i64> = Vec::new();
+        // The turn each node was made in, for the tasks the lead resolved.
+        let mut turns: HashMap<i64, i64> = HashMap::new();
         let mut asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS});
         if every {
             asked["min_node"] = json!(after + 1);
@@ -2516,14 +2545,15 @@ impl App {
             let Ok(page) = self.client.request("history_nodes", asked.clone()).await else {
                 return;
             };
-            nodes.extend(
-                page["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|n| n["node"].as_i64())
-                    .filter(|node| *node > after),
-            );
+            for n in page["nodes"].as_array().into_iter().flatten() {
+                let Some(node) = n["node"].as_i64().filter(|node| *node > after) else {
+                    continue;
+                };
+                nodes.push(node);
+                if let Some(turn) = n["turn"].as_i64() {
+                    turns.insert(node, turn);
+                }
+            }
             if !every || page["next_from"].is_null() {
                 break;
             }
@@ -2639,6 +2669,9 @@ impl App {
                         {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
+                            if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                                self.resolve(&arguments, turns.get(&node).copied(), false);
+                            }
                             if name == asks::TOOL
                                 && !failed
                                 && !reactions::refused(&item)
@@ -3199,6 +3232,12 @@ impl App {
                 if name == asks::TOOL && !shown.1 {
                     self.asked(id, &arguments);
                 }
+                if name == resolved::TOOL
+                    && !shown.1
+                    && !reactions::refused(&json!({"output": shown.0}))
+                {
+                    self.resolve(&arguments, turn, true);
+                }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
                     self.rows_drawn += held.len();
@@ -3306,6 +3345,31 @@ impl App {
         }
     }
 
+    /// The store as the daemon names it, which the marks of resolved
+    /// tasks are kept beside.
+    fn store(&self) -> PathBuf {
+        agent_client::socket::canonical_store(&self.options.store)
+            .unwrap_or_else(|_| self.options.store.clone())
+    }
+
+    /// Note the task a lead's `resolve_task` call in `turn` names as
+    /// resolved; `now`, as it happens rather than replayed, its window
+    /// closes too.
+    fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
+            return;
+        };
+        if let Err(error) = resolved::keep(&self.store(), &task, turn) {
+            self.notice = Some(error);
+        }
+        if now && let Some(fleet) = &mut self.fleet {
+            fleet.resolved(&task);
+        }
+    }
+
     /// The project's agents on one card, from the daemon and Rex alone.
     /// Open `/status`: its own screen, live until Esc.
     async fn status(&mut self) {
@@ -3327,6 +3391,7 @@ impl App {
                     jobs,
                     read: Instant::now(),
                     lookout: self.lookout_line(),
+                    resolved: false,
                 })
             }
             Err(error) => {
@@ -3395,6 +3460,7 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let store = self.store();
         let mut rows = Vec::new();
         // Side chats are not the project's agents.
         for bot in page["bots"].as_array().into_iter().flatten() {
@@ -3437,6 +3503,17 @@ impl App {
             } else {
                 turn["finished_ms"].as_u64()
             };
+            let resolved =
+                resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
+            let Latest { mut step, pr, ask } = self.latest(name).await;
+            if let Some(question) = &ask {
+                step = format!("asks: {}", first_line(question));
+            }
+            let state = match ask {
+                Some(_) if !running && !resolved => "needs you".to_owned(),
+                _ => state,
+            };
+            let group = status::group(&state, running, ask.is_some(), pr.is_some(), resolved);
             let place = match places.get(name) {
                 Some((tab, Some((side, other)))) => {
                     format!("tab {tab}, {side} {}", short(other, &project, &lead))
@@ -3458,30 +3535,33 @@ impl App {
                 state,
                 seconds: at.map(|at| now.saturating_sub(at) / 1000),
                 model,
-                latest: self.latest(name).await,
+                latest: step,
                 place,
+                pr: pr.unwrap_or_default(),
+                group,
             });
         }
-        // The lead first, then what needs the person, what works, the rest.
-        let rank = |row: &status::Row| match row.state.as_str() {
-            _ if row.name == "lead" => 0,
-            "needs you" => 1,
-            "working" => 2,
-            s if s.starts_with("waiting") => 3,
-            _ => 4,
-        };
-        rows.sort_by_key(|row| (rank(row), row.seconds.unwrap_or(u64::MAX)));
+        // The lead first, then by group, the latest first in each.
+        rows.sort_by_key(|row| {
+            (
+                row.name != "lead",
+                row.group,
+                row.seconds.unwrap_or(u64::MAX),
+            )
+        });
         Ok((project, rows))
     }
 
-    /// An agent's latest step, as a line.
-    async fn latest(&self, bot: &str) -> String {
+    /// An agent's latest step, as a line; the pull request its latest
+    /// reply links; and the question it asked the person, when that is
+    /// still open. Its last few items say: asking ends a turn.
+    async fn latest(&self, bot: &str) -> Latest {
         let Ok(page) = self
             .client
-            .request("history_nodes", json!({"bot": bot, "limit": 3}))
+            .request("history_nodes", json!({"bot": bot, "limit": 4}))
             .await
         else {
-            return String::new();
+            return Latest::default();
         };
         let nodes: Vec<i64> = page["nodes"]
             .as_array()
@@ -3494,7 +3574,7 @@ impl App {
             .request("history_items", json!({"bot": bot, "nodes": nodes}))
             .await
         else {
-            return String::new();
+            return Latest::default();
         };
         // Newest first, as the nodes were asked for.
         let items: Vec<Value> = read["items"]
@@ -3503,6 +3583,23 @@ impl App {
             .flatten()
             .map(|entry| entry["item"].clone())
             .collect();
+        let pr = items
+            .iter()
+            .find(|item| item["role"] == "assistant")
+            .and_then(|item| status::pull_request(&text(item)));
+        let flat: Vec<Value> = items
+            .iter()
+            .flat_map(|item| responses(item).into_iter().rev())
+            .collect();
+        Latest {
+            ask: asks::open(&flat),
+            pr,
+            step: Self::step(items),
+        }
+    }
+
+    /// The newest of `items` that reads as a step, as a line.
+    fn step(items: Vec<Value>) -> String {
         for item in items {
             match (item["type"].as_str(), item["role"].as_str()) {
                 (_, Some("assistant")) => return status::plain_line(&text(&item)),
@@ -3640,7 +3737,15 @@ impl App {
             key.code = KeyCode::Backspace;
             key.modifiers = KeyModifiers::NONE;
         }
-        if self.watch.is_some() {
+        if let Some(watch) = &mut self.watch {
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+                && key.code == KeyCode::Char('r')
+                && key.modifiers.is_empty()
+            {
+                watch.resolved = !watch.resolved;
+                return;
+            }
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
                 && (matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
@@ -4924,12 +5029,14 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         .collect();
     let project = watch.project.clone();
     let lookout = watch.lookout.clone();
+    let resolved = watch.resolved;
+    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
-        let mut card = status::card(&project, &rows, &jobs, width);
+        let mut card = status::card(&project, &rows, &jobs, width, resolved);
         if !lookout.is_empty() {
             card.insert(1, Line::from(lookout.clone()).dim());
         }
@@ -4938,7 +5045,12 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
             spans.extend(line.spans);
             Line::from(spans).style(line.style)
         }));
-        let footer = Line::from("  esc to close").dim();
+        // The card says r shows them; once shown, here how to hide them.
+        let footer = match any_resolved && resolved {
+            true => "  esc to close · r hides resolved",
+            false => "  esc to close",
+        };
+        let footer = Line::from(footer).dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),
             ..area
@@ -5949,7 +6061,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}));
+        app.declare = declared::declare(&json!({}), false);
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -5961,7 +6073,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!(declared::tools()));
+        assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
     }
 

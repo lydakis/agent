@@ -52,6 +52,7 @@ fn rows(json: &str, project: &str, now: u64) -> Vec<Row> {
                 model: String::new(),
                 latest: String::new(),
                 place: format!("{peer}/{}", job["id"].as_str().unwrap_or("?")),
+                ..Row::default()
             }
         })
         .collect()

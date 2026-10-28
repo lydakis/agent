@@ -825,7 +825,7 @@ fn sonny_task(words: &[String], stdin: Option<&str>, output: &str, failed: bool)
 }
 
 /// A call of a tool Sonny declares, said as what it does: a question to
-/// the person with its choices, or the plan it sets.
+/// the person with its choices, the plan it sets, or the task it resolved.
 pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     match name {
         crate::asks::TOOL => {
@@ -848,6 +848,13 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             }
             Some(said)
         }
+        crate::resolved::TOOL => Some(Said {
+            verb: "Resolved".into(),
+            what: arguments["task"].as_str()?.trim().to_owned(),
+            under: Vec::new(),
+            failed,
+            output: None,
+        }),
         crate::plan::TOOL => {
             let steps: Vec<String> = arguments["steps"]
                 .as_array()?

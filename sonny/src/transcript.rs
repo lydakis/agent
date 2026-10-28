@@ -750,8 +750,8 @@ pub fn tool(
 
 /// What the clean view keeps of a call: the calls that move the work on,
 /// said as [`tool`] says them (an agent started, messaged or waited for,
-/// a question to the person, the plan, memory, a trigger, a window
-/// opened), and nothing of the rest. A command line keeps only those of
+/// a question to the person, the plan, a task resolved, memory, a
+/// trigger, a window opened), and nothing of the rest. A command line keeps only those of
 /// its commands.
 pub fn clean(
     name: &str,
@@ -765,7 +765,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 24] = [
+const KEPT: [&str; 25] = [
     "Started",
     "Messaged",
     "Steered",
@@ -777,6 +777,7 @@ const KEPT: [&str; 24] = [
     "Asked you",
     "Updated the plan",
     "Cleared the plan",
+    "Resolved",
     "Saved to memory",
     "Updated in memory",
     "Removed from memory",
