@@ -28,6 +28,8 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: never
+      # Sandbox tests fail here, rather than skip, when no sandbox runs.
+      AGENT_TEST_SANDBOX: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,9 +40,13 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Rust tests
         run: |
-          # Sonny's SandFS task copies mount through FUSE.
+          # Sonny's SandFS task copies mount through FUSE, and sandboxed
+          # commands run in bubblewrap.
           sudo apt-get update
-          sudo apt-get install -y fuse3
+          sudo apt-get install -y fuse3 bubblewrap
+          # Ubuntu 24.04 keeps the unprivileged user namespaces bubblewrap
+          # needs behind AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           cargo test --locked --workspace
       - name: Release script tests
         run: python3 -m unittest discover -s release
@@ -53,6 +59,8 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: never
+      # Sandbox tests fail here, rather than skip, when no sandbox runs.
+      AGENT_TEST_SANDBOX: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +68,12 @@ jobs:
       - name: Build the daemon and Sonny
         # The suite runs the release binaries in .local/target/release.
         run: cargo build --release --locked --workspace --bins
+      - name: Install bubblewrap
+        # Sandboxed commands run in it; see the rust job for the sysctl.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Runtime tests
         env:
           AGENT_TEST_RUNTIME: "1"
