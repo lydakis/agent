@@ -5,10 +5,14 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 from bench.runtime_client import Client, node_item
 from bench.socket_client import Connection, SocketClient
@@ -17,11 +21,13 @@ from tests.test_elision import drain, encoded
 from tests.test_runtime import ODD_CALL_ID, ModelFixture, is_summary
 from tests.test_turn_compaction import all_events
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ApprovalTests(ModelFixture):
-    def gated(self, extra=(), settings=None, bot='Bob', **gate):
-        client = self.client('echo,shell,wait', extra=extra, settings=settings)
+    def gated(self, extra=(), settings=None, bot='Bob', tools='echo,shell,wait', **gate):
+        client = self.client(tools, extra=extra, settings=settings)
         gate = {'approve': ['shell'], 'approver': 'manual', **gate}
         created = client.request('create', bot=bot, workspace=str(self.path), **gate)['result']
         self.assertEqual(created['gates'], [{'tag': gate['approver'], 'tools': gate['approve'],
@@ -91,6 +97,58 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(self.answer(client, turn, 'shell-1')['error'], 'stale_turn')
         # The live verdict took no park: the turn never waited.
         self.assertEqual(self.events(client, turn, 'turn_waiting'), [])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bot_asks_only_to_leave_its_sandbox(self):
+        # Outside the temporary directory, which a sandbox may write.
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.gated(tools='shell,write', approve=['shell', 'write'],
+                            settings={'sandbox': 'workspace-write'})
+        created = client.request('inspect', bot='Bob')['result']
+        self.assertEqual(created['settings']['sandbox'], 'workspace-write')
+        calls = [['shell', {'command': f'touch inside; touch {outside}/confined'}],
+                 ['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated',
+                            'justification': 'Do you want to write outside the workspace?'}],
+                 ['write', {'path': 'notes.md', 'content': 'x'}],
+                 ['write', {'path': f'{outside}/written', 'content': 'x'}]]
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        # Only the two that leave the sandbox wait for a verdict.
+        announced = self.announced(client, turn)
+        self.assertEqual([call['call_id'] for call in announced], ['shell-2', 'write-4'])
+        # The confined command's failure voids the round's verdicts, as any
+        # failure does; the escapes are asked again.
+        again = self.announced(client, turn, failed='shell-1')
+        self.assertEqual([call['call_id'] for call in again], ['shell-2', 'write-4'])
+        self.answer(client, turn, 'shell-2', request=2)
+        self.answer(client, turn, 'write-4', request=2)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The confined command wrote its folder and not past it; the
+        # allowed escapes ran unconfined.
+        self.assertTrue((self.path / 'inside').exists())
+        self.assertNotEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ['escaped', 'written'])
+        self.assertTrue((self.path / 'notes.md').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bot_without_a_gate_cannot_leave_its_sandbox(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.client('shell,write', settings={'sandbox': 'workspace-write'})
+        client.request('create', bot='Bob', workspace=str(self.path))
+        calls = [['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}],
+                 ['write', {'path': f'{outside}/written', 'content': 'x'}]]
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.events(client, turn, 'approval_requested'), [])
+        # As Codex refuses an escape under a policy that never asks.
+        self.assertEqual(self.tool_output(client, 'shell-1')[1]['error'], 'escalation_refused')
+        self.assertEqual(self.tool_output(client, 'write-2')[1]['error'], 'write_denied')
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()

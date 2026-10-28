@@ -160,8 +160,9 @@ identity is `bot_not_found`.
   setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
-  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, and
-  `--cache-ttl`; they are not daemon options, and an existing bot
+  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
+  `--sandbox`, `--writable` (repeatable, made absolute from the current
+  folder) and `--network`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope

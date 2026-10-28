@@ -5318,6 +5318,38 @@ about 285 to about 20 turns/s with p50 latency near 3 s. That is the pacer
 behaving as designed today; whether one refusal should close the pool is
 left to a pacer change.
 
+## Sandbox (#265)
+
+The sandbox adds work only to bots that set `sandbox`: their schema gains two
+fields, a confined call builds a policy off the runtime thread, and a
+confined command runs under bwrap or Seatbelt. An unsandboxed bot pays one
+boolean check per call. This screen checks that the paths every bot takes
+held. `cd58f3d` (main) against `fc13380` (this branch), release builds of
+`-p agent-runtime --bin agent`, one Linux x86_64 container, synthetic
+provider, two alternating rounds:
+
+| Measure | main | branch |
+| --- | ---: | ---: |
+| Completion burst p99 ms | 12.9 | 13.7 |
+| 32 lone submits, daemon CPU ms | 44.6 | 46.6 |
+| 32 lone submits, reply p50 ms | 1.63 | 1.64 |
+| 32 burst submits, reply p99 ms | 6.42 | 6.24 |
+| CPU per text turn (footprint), ms | 1.25 | 1.32 |
+| Store jobs per text turn | 7.53 | 7.53 |
+| Idle RSS (footprint), MiB | 17.3 | 17.7 |
+| RSS after 1000 turns, MiB | 26.3 | 27.2 |
+| 32-bot socket echo, CPU s | 1.19 | 1.12 |
+| 32-bot socket echo, peak RSS MiB | 23.1 | 23.5 |
+| 32-bot socket echo, turn p95 ms | 615 | 603 |
+
+Medians of 6 (completion, lifecycle), 10 (admission) or 4 (footprint)
+measured runs. Latency, CPU and store work overlap between builds. Idle RSS
+is about 0.4 MiB higher with ranges that do not overlap (17.09 to 17.34
+against 17.59 to 17.90). `/proc/<pid>/smaps` of idle daemons puts all of it
+in the executable's own mapped pages, 0.4 to 0.6 MiB more resident, with the
+heap the same to the KiB: the binary is 200 KiB larger, and nothing is
+allocated at startup. Sandboxed bots and macOS are not measured.
+
 ## Lone overloads back off their own call
 
 An overload naming no delay closed the model's pool for a second, doubling
