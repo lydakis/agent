@@ -1,15 +1,12 @@
 //! Where the bot works, as the footer names it beside the folder: the git
-//! branch checked out there, and the folder a sandfs copy was made from.
-//! Read off the screen's thread, since both ask outside programs or files.
+//! branch checked out there. Read off the screen's thread, since it asks
+//! git.
 use std::path::Path;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Place {
     /// The branch checked out, or the commit a detached checkout is on.
     pub branch: Option<String>,
-    /// What the folder is a sandfs copy of, when it is one, as sandfs
-    /// names its source: the folder it was made from, usually.
-    pub copy_of: Option<String>,
 }
 
 pub fn read(dir: &Path) -> Place {
@@ -17,11 +14,7 @@ pub fn read(dir: &Path) -> Place {
         .ok()
         .filter(|branch| !branch.is_empty())
         .or_else(|| crate::task::git(dir, &["rev-parse", "--short", "HEAD"]).ok());
-    let copy_of = crate::task::mount_of(dir)
-        .ok()
-        .flatten()
-        .map(|workspace| workspace.source);
-    Place { branch, copy_of }
+    Place { branch }
 }
 
 #[cfg(test)]
