@@ -38,11 +38,13 @@ pub fn tool() -> Value {
 }
 
 /// Whether a `resolve_task` call with `arguments`, made by `bot`, resolves
-/// `bot` itself: it names no task, or its own name.
+/// `bot` itself: it names no task, or its own name, whole or past its
+/// project's, which may hold dots too.
 pub fn itself(arguments: &Value, bot: &str) -> bool {
     match arguments["task"].as_str().map(str::trim) {
         None | Some("") => true,
-        Some(task) => task == bot || bot.split_once('.').is_some_and(|(_, short)| task == short),
+        Some(task) => (bot.strip_suffix(task))
+            .is_some_and(|project| project.is_empty() || project.ends_with('.')),
     }
 }
 
@@ -185,6 +187,9 @@ mod tests {
         assert!(by(json!({"task": "fix"})));
         assert!(by(json!({"task": "calc.fix"})));
         assert!(!by(json!({"task": "docs"})));
+        assert!(!by(json!({"task": "ix"})));
+        // A project's name may hold dots.
+        assert!(itself(&json!({"task": "fix"}), "shop.web.fix"));
     }
 
     #[test]

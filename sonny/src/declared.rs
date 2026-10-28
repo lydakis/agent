@@ -26,11 +26,17 @@ pub fn tools(lead: bool) -> Vec<Value> {
     tools
 }
 
-/// Whether the bot `record` describes is a lead's task: a lead made it.
-fn task(record: &Value) -> bool {
-    record["created_by"]
-        .as_str()
-        .is_some_and(|by| by.ends_with(".lead"))
+/// Whether the bot `record` describes resolves itself: a lead made it, or
+/// another bot made it with `resolve_task`, as a task's own helper takes it.
+fn resolves(record: &Value) -> bool {
+    let inherited = || {
+        (record["declared"].as_array().into_iter().flatten())
+            .any(|tool| tool["name"] == crate::resolved::TOOL)
+    };
+    match record["created_by"].as_str() {
+        Some(by) => by.ends_with(".lead") || inherited(),
+        None => false,
+    }
 }
 
 /// The tools the bot `record` describes, a lead or not, should declare:
@@ -40,7 +46,7 @@ pub fn declare(record: &Value, lead: bool) -> Option<Value> {
     let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
     let mut ours = tools(lead);
     // A task resolves itself, as its lead resolves it.
-    if !lead && task(record) {
+    if !lead && resolves(record) {
         ours.push(crate::resolved::tool());
     }
     // A gate Sonny did not set, as another client's tag or several, is
@@ -152,6 +158,15 @@ mod tests {
         let mut kept = task.clone();
         kept["declared"] = own;
         assert_eq!(declare(&kept, false), None);
+        // A task's own helper keeps what it took from the task.
+        let helper = json!({"created_by": "calc.fix", "declared": [crate::resolved::tool()]});
+        let kept = declare(&helper, false).unwrap();
+        assert!(
+            kept.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "resolve_task")
+        );
         // What a lead declares, a task it starts takes from its first turn.
         assert!(crate::resolved::tool().get("inherit").is_none());
     }
