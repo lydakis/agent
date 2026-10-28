@@ -188,8 +188,11 @@ pub struct Seen {
     pub node: Option<i64>,
     /// The subscriber was in the middle of a turn.
     pub busy: bool,
-    /// The node of the lead's latest message to the task, then.
+    /// The node of the lead's latest message to the task, or of the
+    /// person's words to it since, then.
     pub brief: Option<i64>,
+    /// The lead wrote that brief, not the person.
+    pub led: bool,
     /// The other tasks, each with the node of the lead's latest message to it.
     pub peers: Vec<(String, Option<i64>)>,
     /// What passed in the task since the lead last wrote to it, then.
@@ -995,8 +998,10 @@ async fn latest(client: &Client, task: &str) -> String {
 /// the lead's own brief, which a client sent without saying so.
 async fn unattributed(client: &Client, seen: &Seen, text: &str) -> bool {
     // Only a brief the lead is known to have sent: with none, `brief`
-    // falls back to the task's first message, which may be this one.
+    // falls back to the task's first message, which may be this one, and
+    // the person's own brief is theirs to say again.
     seen.kind == Kind::Said
+        && seen.led
         && seen.brief.is_some()
         && seen.from.as_deref() == Some(PERSON)
         && !text.trim().is_empty()
@@ -1947,6 +1952,8 @@ struct Lookout {
     told: VecDeque<(String, i64)>,
     /// The node of the lead's latest message to each task.
     briefs: HashMap<String, i64>,
+    /// The tasks whose brief the lead wrote, not the person.
+    led: HashSet<String>,
     /// What passed in each task since the lead last wrote to it.
     exchanges: HashMap<String, Vec<Passed>>,
     recent: Recent,
@@ -1995,6 +2002,7 @@ impl Lookout {
             retried: HashSet::new(),
             told: VecDeque::new(),
             briefs: HashMap::new(),
+            led: HashSet::new(),
             exchanges: HashMap::new(),
             recent: Recent::default(),
             due: Vec::new(),
@@ -2063,6 +2071,7 @@ impl Lookout {
                     }
                 }
                 self.briefs.remove(bot);
+                self.led.remove(bot);
                 self.exchanges.remove(bot);
             }
             _ => {}
@@ -2254,6 +2263,7 @@ impl Lookout {
     fn briefed_by(&mut self, task: &str, from: &str, node: Option<i64>) {
         if let (PERSON, Some(node)) = (from, node) {
             self.briefs.insert(task.to_owned(), node);
+            self.led.remove(task);
             self.passed(task, Passed::Person(node));
         }
     }
@@ -2261,6 +2271,7 @@ impl Lookout {
     /// The lead wrote to the task: what passes from now is a new exchange.
     fn briefed(&mut self, task: &str, node: i64) {
         self.briefs.insert(task.to_owned(), node);
+        self.led.insert(task.to_owned());
         self.exchanges.remove(task);
     }
 
@@ -2302,6 +2313,7 @@ impl Lookout {
             node,
             busy: self.updates.busy(),
             brief: self.briefs.get(task).copied(),
+            led: self.led.contains(task),
             peers,
             exchange: self.exchanges.get(task).cloned().unwrap_or_default(),
             asks,
@@ -2931,6 +2943,7 @@ mod tests {
             node: None,
             busy: true,
             brief: None,
+            led: false,
             peers: Vec::new(),
             exchange: Vec::new(),
             asks: Asks::default(),
@@ -3073,7 +3086,10 @@ mod tests {
         // whether the lead rests or not.
         let said = lookout.due.last().unwrap();
         assert!(!said.busy);
-        assert_eq!((said.kind, said.brief), (Kind::Said, Some(50)));
+        assert_eq!(
+            (said.kind, said.brief, said.led),
+            (Kind::Said, Some(50), true)
+        );
         assert_eq!(
             said.exchange,
             [Passed::Reply {
@@ -3095,6 +3111,8 @@ mod tests {
             json!({"status": "completed"}),
         ));
         let ended = lookout.due.last().unwrap();
+        // The person's words are the brief now, and theirs to say again.
+        assert_eq!((ended.brief, ended.led), (Some(52), false));
         assert_eq!(ended.exchange.len(), 2);
         assert_eq!(ended.exchange[1], Passed::Person(52));
         assert_eq!(ids(ended), ["drifts"]);
