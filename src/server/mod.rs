@@ -1754,29 +1754,38 @@ impl Service {
                 // A fork that may call nothing touches nothing: an ask.
                 if !matches!(allow, Some(Some(tools)) if tools.is_empty()) {
                     let source = source.clone();
-                    let source = self
+                    let source = match self
                         .store
                         .op("inspect", move |db| db.inspect(&source))
-                        .await?;
-                    // A fork keeps its source's declared tools; those it may
-                    // call are the caller's to pass on.
-                    let callable = |tool: &&agent_runtime::tools::Declared| match allow {
-                        Some(Some(names)) => names.contains(&tool.name),
-                        _ => source
-                            .allowed
-                            .as_ref()
-                            .is_none_or(|allowed| allowed.contains(&tool.name)),
-                    };
-                    if source
-                        .declared
-                        .iter()
-                        .filter(callable)
-                        .any(|tool| !passes(tool))
+                        .await
                     {
-                        return refuse("fork a bot whose tools a client answers for it");
+                        Ok(source) => Some(source),
+                        // A resent fork whose source is gone since answers
+                        // as its duplicate; a new one finds no source.
+                        Err(error) if error.code == "bot_not_found" => None,
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(source) = source {
+                        // A fork keeps its source's declared tools; those it may
+                        // call are the caller's to pass on.
+                        let callable = |tool: &&agent_runtime::tools::Declared| match allow {
+                            Some(Some(names)) => names.contains(&tool.name),
+                            _ => source
+                                .allowed
+                                .as_ref()
+                                .is_none_or(|allowed| allowed.contains(&tool.name)),
+                        };
+                        if source
+                            .declared
+                            .iter()
+                            .filter(callable)
+                            .any(|tool| !passes(tool))
+                        {
+                            return refuse("fork a bot whose tools a client answers for it");
+                        }
+                        folders.extend(workspace.clone().or(source.workspace));
+                        folders.extend(source.settings.writable);
                     }
-                    folders.extend(workspace.clone().or(source.workspace));
-                    folders.extend(source.settings.writable);
                 }
             }
             Command::Submit {
