@@ -7,8 +7,7 @@
 //! by default, decides what cannot wait: while the subscriber is in the
 //! middle of a turn, each event is a check of whether to steer it now. It
 //! also picks a task drifting from what the person means, busy or not,
-//! or going without what another agent has, which a lead reading
-//! everything lets pass too often, and whatever the
+//! which a lead reading everything lets pass too often, and whatever the
 //! subscriptions look for. One lookout watches a
 //! daemon, for every subscriber on it, started by the first Sonny to open;
 //! the daemon is unchanged: this follows every bot and submits to the
@@ -92,11 +91,10 @@ pub struct Question {
 
 /// What a check may ask, as predicates over the input `input` builds:
 /// whether the event cannot wait for the subscriber's turn to end, asked
-/// only while one runs, whether a task drifts from what the person
-/// means, and whether a task goes without what another has, which a lead
-/// reading every message lets pass too often. Everything else it hears
-/// when it rests, and judges itself.
-pub const QUESTIONS: [Question; 3] = [
+/// only while one runs, and whether a task drifts from what the person
+/// means, which a lead reading every message lets pass too often.
+/// Everything else it hears when it rests, and judges itself.
+pub const QUESTIONS: [Question; 2] = [
     Question {
         id: "interrupt",
         text: "The agent being told is in the middle of a turn. Can `event` not wait until that turn ends: does it change what that agent or one of the tasks in `tasks` is doing right now, or is the task blocked on something only that agent or the person can give?",
@@ -110,13 +108,6 @@ pub const QUESTIONS: [Question; 3] = [
         kinds: &[Kind::Said, Kind::Ended],
         mid_turn: false,
         todo: "settle what the person means and steer the task with that reading",
-    },
-    Question {
-        id: "lacks",
-        text: "Does `event` show the task going without something it needs or was asked for, such as a fact, a finding, a decision, a file or access, that `tasks`, `memory` or `lead` shows another agent or the lead has, or is better placed to get: saying it does not know or cannot find it, guessing, asking the person for it, or stopping for want of it? Something only the person can give is not one another has.",
-        kinds: &[Kind::Ended],
-        mid_turn: false,
-        todo: "get it to this task from whoever has it, and tell this task it is coming",
     },
 ];
 
@@ -154,8 +145,6 @@ pub fn questions(seen: &Seen) -> Vec<Asked> {
             q.id != "drifts"
                 || (asked && (seen.kind != Kind::Said || seen.from.as_deref() == Some(PERSON)))
         })
-        // What a task goes without, another must have.
-        .filter(|q| q.id != "lacks" || !seen.peers.is_empty())
         .filter(|q| {
             seen.asks
                 .builtins
@@ -316,7 +305,7 @@ pub enum Band {
 type Reasons = Vec<(&'static str, f64)>;
 
 /// A check's band, from a yes: one to `interrupt` steers the subscriber,
-/// one to `drifts` or `lacks` wakes it once it rests, and one to what a subscription
+/// one to `drifts` wakes it once it rests, and one to what a subscription
 /// looks for wakes it, steering when it said `--urgent`. Anything less is a no: the subscriber hears of the
 /// event with its task updates, if it asked for them. What said yes comes
 /// back, the look-fors by name.
@@ -1068,10 +1057,7 @@ async fn check(
             latest: latest(client, task).await,
         });
     }
-    let exchange = match questions
-        .iter()
-        .any(|q| ["drifts", "lacks"].contains(&q.id.as_str()))
-    {
+    let exchange = match questions.iter().any(|q| q.id == "drifts") {
         true => exchange(client, &seen.task, &seen.exchange).await,
         false => Vec::new(),
     };
@@ -3296,8 +3282,7 @@ mod tests {
             (ended.task.as_str(), ended.exchange.len()),
             ("calc.docs", 1)
         );
-        // It may still go without what calc.fix has.
-        assert_eq!(ids(ended), ["lacks"]);
+        assert!(ids(ended).is_empty());
     }
 
     #[test]
@@ -3350,7 +3335,6 @@ mod tests {
             json!([
                 {"type": "predicate", "name": "interrupt", "instructions": QUESTIONS[0].text},
                 {"type": "predicate", "name": "drifts", "instructions": QUESTIONS[1].text},
-                {"type": "predicate", "name": "lacks", "instructions": QUESTIONS[2].text},
             ])
         );
     }
@@ -3814,7 +3798,7 @@ mod tests {
         // The lead's tasks keep the built-ins.
         let asks = lookout.asks_for("calc.fix", Kind::Ended).unwrap();
         assert_eq!(asks.subs, ["tasks"]);
-        assert_eq!(asks.builtins.unwrap(), ["interrupt", "drifts", "lacks"]);
+        assert_eq!(asks.builtins.unwrap(), ["interrupt", "drifts"]);
     }
 
     #[test]
