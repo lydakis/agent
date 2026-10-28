@@ -741,6 +741,172 @@ fn gates_are_capped_before_a_bot_is_written() {
     gated_bot(&mut db, "g8", "t8", None, None).unwrap();
 }
 
+/// A bot that a sandboxed bot makes takes its sandbox unless it names a
+/// stricter one, as Codex's subagents inherit their parent's.
+#[test]
+fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
+    use agent_runtime::sandbox::Mode;
+    let mut db = db();
+    let ann = db
+        .create(
+            "Ann",
+            Some("/work"),
+            Binding {
+                settings: Settings {
+                    sandbox: Some(Mode::WorkspaceWrite),
+                    writable: vec!["/shared".into()],
+                    ..Settings::default()
+                },
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    let made = |db: &mut Database, name: &str, settings: Settings| {
+        db.create(
+            name,
+            Some("/elsewhere"),
+            Binding {
+                settings,
+                created_by: Some(ann.name.as_str()),
+                created_by_id: Some(ann.bot_id),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0
+        .settings
+    };
+    let unconfined = made(&mut db, "Bob", Settings::default());
+    assert_eq!(unconfined.sandbox, Some(Mode::WorkspaceWrite));
+    assert_eq!(unconfined.writable, ["/shared"]);
+    let full = made(
+        &mut db,
+        "Cid",
+        Settings {
+            sandbox: Some(Mode::DangerFullAccess),
+            ..Settings::default()
+        },
+    );
+    assert_eq!(full.sandbox, Some(Mode::WorkspaceWrite));
+    let networked = made(
+        &mut db,
+        "Dee",
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            writable: vec!["/other".into()],
+            network: true,
+            ..Settings::default()
+        },
+    );
+    assert!(!networked.network);
+    assert_eq!(networked.writable, ["/other"]);
+    let read_only = made(
+        &mut db,
+        "Eve",
+        Settings {
+            sandbox: Some(Mode::ReadOnly),
+            ..Settings::default()
+        },
+    );
+    assert_eq!(read_only.sandbox, Some(Mode::ReadOnly));
+    assert!(read_only.writable.is_empty());
+    // An unconfined creator imposes nothing.
+    assert_eq!(
+        Settings::default().under(&Settings::default()),
+        Settings::default()
+    );
+}
+
+#[test]
+fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "write".to_owned()];
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let binding = Binding {
+        tools: &tools,
+        gate: Some(&gate),
+        settings: Settings {
+            sandbox: Some(agent_runtime::sandbox::Mode::WorkspaceWrite),
+            ..Settings::default()
+        },
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), binding).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = |id: &str, name: &str, arguments: Value| {
+        let arguments = arguments.to_string();
+        let item = json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+            "name":name,"arguments":arguments});
+        let call = ToolCall {
+            name: name.into(),
+            call_id: id.into(),
+            arguments,
+        };
+        (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
+    };
+    let round = [
+        call("plain", "shell", json!({"command":"make"})),
+        call(
+            "up",
+            "shell",
+            json!({"command":"git push","sandbox_permissions":"require_escalated",
+            "justification":"Do you want to push the branch?"}),
+        ),
+        call(
+            "inside",
+            "write",
+            json!({"path":"notes/a.md","content":"x"}),
+        ),
+        call(
+            "climbs",
+            "write",
+            json!({"path":"../elsewhere/a.md","content":"x"}),
+        ),
+        call(
+            "outside",
+            "write",
+            json!({"path":"/etc/hosts","content":"x"}),
+        ),
+    ];
+    let (items, calls): (Vec<_>, Vec<_>) = round.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    let bot = db.inspect("Bob").unwrap();
+    let folder = std::path::Path::new("/synthetic");
+    let gated: Vec<&str> = calls
+        .iter()
+        .filter(|call| bot.gated(call, folder))
+        .map(|call| call.call_id.as_str())
+        .collect();
+    assert_eq!(gated, ["up", "climbs", "outside"]);
+    // What runs confined was never announced; each escape was.
+    for call in &calls {
+        let announced = db.approval_start(turn, call, 0);
+        match gated.contains(&call.call_id.as_str()) {
+            true => assert!(
+                matches!(announced, Ok(Gated::Pending { .. })),
+                "{}",
+                call.call_id
+            ),
+            false => assert_eq!(announced.err().unwrap().code, "invalid_tool_state"),
+        }
+    }
+}
+
 #[test]
 fn an_expiry_that_came_first_beats_a_later_denial() {
     let mut db = db();
@@ -2957,7 +3123,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             "Bob",
             Some("/synthetic"),
             Binding {
-                settings,
+                settings: settings.clone(),
                 ..binding()
             },
         )
@@ -2968,7 +3134,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h"})
+            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3038,7 +3204,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
                 "Bad",
                 Some("/synthetic"),
                 Binding {
-                    settings,
+                    settings: settings.clone(),
                     ..binding()
                 },
             )
@@ -7278,7 +7444,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
         ..Settings::default()
     };
     let made = || Binding {
-        settings,
+        settings: settings.clone(),
         request_id: Some("once"),
         ..binding()
     };
@@ -11311,8 +11477,14 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
     );
     assert_eq!(forked.unwrap()["data"]["allowed"], json!(["read"]));
     // A call it may not make waits for no verdict: it is refused.
-    assert!(db.inspect("Bob").unwrap().gated("shell"));
-    assert!(!reader.gated("shell"));
+    let shell = ToolCall {
+        name: "shell".into(),
+        call_id: "c".into(),
+        arguments: r#"{"command":"true"}"#.into(),
+    };
+    let folder = std::path::Path::new("/synthetic");
+    assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
+    assert!(!reader.gated(&shell, folder));
     let (plain, _) = db.fork("Reader", "Plain", Fork::default()).unwrap();
     assert_eq!(plain.allowed.as_deref(), Some(&read[..]));
     assert_eq!(

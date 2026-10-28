@@ -709,10 +709,16 @@ class DeliveryTests(ModelFixture):
         # Recovery ends the interrupted turn and the line moves at once.
         self.assertEqual(poll(client, 'Bob', first)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
-        outcome = client.finished(third)['data']
-        # The steer joins the next turn at its first boundary, or runs alone.
+        # The steer joins the first turn if it reached a boundary before the
+        # restart (that outcome is in the bot's events, not this client's
+        # stream), the next turn at its first boundary, or runs alone.
+        before = [e['data'] for e in self.events(client, 'Bob')
+                  if e['event'] == 'turn_finished' and e['turn'] == third]
+        outcome = before[0] if before else client.finished(third)['data']
         text = poll(client, 'Bob', second)['result']['text']
-        if outcome['status'] == 'steered':
+        if outcome['status'] == 'steered' and outcome['into'] == first:
+            self.assertEqual(text, 'reply:second')
+        elif outcome['status'] == 'steered':
             self.assertEqual((outcome['into'], text), (second, 'reply:third'))
         else:
             self.assertEqual((outcome['status'], text), ('completed', 'reply:second'))

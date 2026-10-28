@@ -240,6 +240,16 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(json.loads(done.stdout)['results'][quick]['text'], 'reply:hi')
         mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout=0', slow, quick)
         self.assertEqual(json.loads(mixed.stdout)['pending'], [slow])
+        # A queued message taken back with --turn never runs, and the running
+        # turn goes on.
+        queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
+                                       '--delivery', 'queue', 'later').stdout)
+        taken = json.loads(self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow',
+                                      '--turn', str(queued['turn'])).stdout)
+        self.assertEqual((taken['handle'], taken['status'], taken['interrupt_requested']),
+                         (queued['handle'], 'interrupted', True))
+        still = json.loads(self.agent('wait', '--store', str(self.store), '--timeout=0', slow, check=False).stdout)
+        self.assertEqual(still['pending'], [slow])
         # interrupt prints the turn view, as it stood when asked.
         printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
         self.assertIn('\n  "handle"', printed)
@@ -1438,6 +1448,19 @@ class ModelListTests(ModelFixture):
         self.assertIn('models_none_listed', refused.stderr)
         self.assertIn('gone: provider_', refused.stderr)
         self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
+
+    def test_a_fresh_install_names_the_missing_provider_and_stats_starts_its_daemon(self):
+        refused = self.agent('stats', *self.store, check=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(json.loads(refused.stderr)['error'], 'provider_required')
+        self.assertFalse((self.path / 'state.sqlite').exists())
+        stats = json.loads(self.agent('stats', *self.store, '--provider', f'openai=responses,{self.url}').stdout)
+        self.assertEqual(stats['active_turns'], 0)
+        self.assertTrue((self.path / 'state.sqlite').exists())
+        # A command on a bot still never makes a store of its own.
+        other = ['--store', str(self.path / 'other.sqlite')]
+        missing = self.agent('inspect', *other, '--bot', 'Bob', check=False)
+        self.assertEqual(json.loads(missing.stderr)['error'], 'store_not_found')
 
     def test_discover_writes_nothing_when_rendering_discards_every_model(self):
         url = self.url.removesuffix('/v1') + '/invalid/v1'

@@ -4,20 +4,26 @@
 every message someone else wrote in them and how each turn ended. It is a
 Sonny feature and a client of the daemon like any other: it follows every
 bot and submits one short note to the subscriber as soon as it rests,
-which decides itself what matters. A judge decides only what cannot wait
-for a busy subscriber's turn to end. Neither the daemon nor the `agent`
+which decides itself what matters. A judge decides what cannot wait for a
+busy subscriber's turn to end, and picks out a task drifting from what the
+person means. Neither the daemon nor the `agent`
 CLI knows of it.
 
 The lookout knows no leads. Sonny subscribes each lead to its tasks when it
 opens the lead's project, and that subscription is what makes a lead hear
-from them; any other bot can subscribe the same way.
+from them; a lead subscribes to more the same way. The lookout also
+answers the calls of the tools Sonny answers (`start_task`, `show_agent`
+and the rest, `sonny/src/served.rs`).
 
 ## One lookout a daemon
 
 Sonny starts `sonny lookout --store STORE --socket SOCKET` detached when it
 opens a project, and again after the daemon restarts. A lookout holds
 `STORE.lookout.lock` while it runs, so a second one prints
-`{"event":"already_watching"}` and exits. It watches for every bot with
+`{"event":"already_watching"}` and exits, unless another build of Sonny
+started the one running, as an upgrade leaves it: that one is stopped, and
+the new one takes its place, so the tools the new Sonny gives its agents
+are answered. `STORE.lookout.sonny` says which build runs. It watches for every bot with
 subscriptions on the daemon, whichever Sonny opened it, so a lead hears
 from its tasks even while no window shows that project. It exits
 once the daemon has been unreachable for 30 seconds; the Sonny that starts
@@ -43,20 +49,35 @@ tasks made, and every bot named `PROJECT.*`. Two events count:
 | Said | someone other than the lead writes in a task: the person, a program, another task |
 | Ended | a task's turn ends, unless the lead is waiting on it |
 
-Each is task updates (below), told unjudged once the lead rests. While the
-lead is in the middle of a turn, each is also one check, with one
-question, `interrupt`: can it not wait until that turn ends, because it
-changes what the lead or another task is doing right now, or the task is
-blocked on something only the lead or the person can give? The judge
-reads the event's text, the lead's latest message to that task (its
-brief), the other tasks' briefs and latest lines, and the project's memory
-indexes. A yes (0.70 or more) steers the lead at once with
-`--delivery steer`; anything else waits for the lead to rest, as all news
-does. A resting lead is never judged for: it hears everything anyway. A
-judge answers at most two checks at once for one subscriber, so many busy
-tasks never crowd the model pool they work in; up to 16 more wait their
-turn, one still waiting when the lead comes to rest is not asked, and
-past those the rest go unjudged, told once the lead rests.
+Each is task updates (below), told once the lead rests. Each is also one
+check, with up to two questions:
+
+- `interrupt`, only while the lead is in the middle of a turn: can it not
+  wait until that turn ends, because it changes what the lead or another
+  task is doing right now, or the task is blocked on something only the
+  lead or the person can give? A yes (0.70 or more) steers the lead at
+  once with `--delivery steer`.
+- `drifts`, busy or not, of the person's own messages and of turn ends, in
+  a task with a brief: is the task drifting from what the person means,
+  misreading them, swinging between readings as they correct it, going in
+  circles, arguing past what they asked, or doing part of it while
+  presenting it as done? A yes is picked, with what to do, in the note the
+  lead gets once it rests. A lead that hears every message reads a
+  person's correction or the end of a turn they asked for as theirs and
+  lets it pass: in `bench/lookout_turns.py` (3-run means) it caught 11 of
+  24 drifting tasks on its own and 13 with drift picked, with no fewer
+  results told.
+
+The judge reads the event's text, the lead's latest message to that task
+(its brief) or the person's latest words in it, for `drifts` what passed
+in that task since the lead last wrote there (the person's messages and the
+first line of each reply, the last six), the other tasks' briefs and latest
+lines, and the project's memory indexes. Anything less than a yes is told
+unjudged with the rest. A resting lead's news waits up to 15 seconds for
+checks under way, so a pick and its news usually go in one note. A judge
+answers at most two checks at once for one subscriber, so many busy tasks
+never crowd the model pool they work in; up to 16 more wait their turn,
+and past those the rest go unjudged.
 
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person
@@ -73,43 +94,44 @@ lead's file already holds one by that name, which it keeps as it is:
  "on": ["said", "ended"], "updates": true}
 ```
 
-Any bot can subscribe to more:
+A lead subscribes to more with its `subscriptions` tool, whose `add` takes
+a subscription in the file's shape, and whose `remove` takes a name; each
+call answers with all of them:
 
 ```
-sonny lookout add deploys --bot 'ops.*' --on ended \
-  --look-for "a deploy finished or failed" --then "tell the person which" --urgent
-sonny lookout add review --tasks-of review.lead --ask interrupt --context "we own the parser"
-sonny lookout ls
-sonny lookout rm deploys
+{"add": {"name": "deploys", "bots": ["ops.*"], "on": ["ended"],
+  "look_for": [{"text": "a deploy finished or failed", "then": "tell the person which", "urgent": true}]}}
+{"add": {"name": "review", "tasks_of": ["review.lead"], "ask": ["interrupt"], "context": "we own the parser"}}
+{}
+{"remove": "deploys"}
 ```
 
-- `--tasks-of BOT` watches every bot BOT or one of its tasks made, and
-  `--bot GLOB` every bot its name matches, `*` matching any run of
-  characters. A subscription needs one of them, and may have several.
-- `--on said,ended` picks the events; both by default.
-- `--ask interrupt` asks the built-in question; with no `--ask`, a
-  subscription asks it, unless it looks for something of its own, when it
-  asks only that.
-- `--look-for TEXT --then ACTION` adds a question of the subscriber's own,
-  asked of every event it watches, busy or not; a yes wakes it, steering
-  with `--urgent`.
-- `--context TEXT` is a line every check of it reads.
-- `--updates` adds the task updates below for the bots the subscriber made.
+- `tasks_of` watches every bot one of them or one of its tasks made, and
+  `bots` every bot its name matches, `*` matching any run of characters.
+  A subscription needs one of them, and may have several.
+- `on` picks the events, `said` and `ended`; both by default.
+- `ask: ["interrupt"]`, `ask: ["drifts"]` ask those built-in questions;
+  with no `ask`, a subscription asks both, unless it looks for something of
+  its own, when it asks only that.
+- `look_for` adds questions of the subscriber's own, each `text` with what
+  it does `then`, asked of every event it watches, busy or not; a yes
+  wakes it, steering when `urgent`.
+- `context` is a line every check of it reads.
+- `updates` adds the task updates below for the bots the subscriber made.
 
 A glob never names a judge or a side chat, nor a bot that deletes itself
 once idle.
 
-A bot's shell sets `AGENT_BOT`, so a bot changes only its own
-subscriptions; the person names one with `--for BOT`. `add` under a name
-already taken does nothing when it says the same and is refused when it
-does not, so `rm` it first. Each subscriber's are one file,
+A call changes only the calling bot's own subscriptions. `add` under a
+name already taken does nothing when it says the same and is refused when
+it does not, so remove it first. Each subscriber's are one file,
 `STORE.lookout/BOT.json`, which a running lookout reads again every 15
-seconds. `rm tasks` stops a lead's lookout until Sonny next opens its
+seconds. Removing `tasks` stops a lead's lookout until Sonny next opens its
 project.
 
 The note names a subscription's answer as `deploys look-for 1 0.90` and
-says "do what your deploys look-for 1 says (sonny lookout ls)", where
-`ls` numbers each subscription's look-fors from 1: the
+says "do what your deploys look-for 1 says (your subscriptions tool lists
+it)", numbering each subscription's look-fors from 1: the
 subscriber's own words stay in its file, since the note reaches the
 approver as the person's. `/background` in Sonny lists the project's
 agents' subscriptions, with their triggers, and how many checks each asked
@@ -159,9 +181,13 @@ A quoted message is the person's own words.
 Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 ```
 
-A note that steers a busy lead lists what was picked first, under "Picked
-by your lookout:", with why (`interrupt 0.90; it cannot wait for your turn
-to end`), and ends "Handle what cannot wait, then carry on with your turn."
+What the judge picked is listed first, under "Picked by your lookout:",
+with why and what to do (`drifts 0.82; settle what the person means and
+steer the task with that reading`). A note that steers a busy lead says
+`interrupt 0.90; it cannot wait for your turn to end` and ends "Handle what
+cannot wait, then carry on with your turn." A turn the person asked for in
+the task is listed apart as theirs only once it completed: one that failed
+or was stopped is listed with the rest.
 
 It quotes only the person's own words and names everything else by handle
 and status, so it reaches the approver as the person's and the lead can act
@@ -205,5 +231,4 @@ projects, with 126 labelled checks (73 the lead should hear about, 24 of
 them a task drifting from what the person means), and replays and scores it
 with the decision model, the lead's fork, and the decision model reading
 the lead's words. A store from before Sonny wrote leads' subscriptions has
-none: add one per lead with
-`sonny lookout add tasks --for LEAD --tasks-of LEAD --bot 'PROJECT.*' --updates`.
+none: write one per lead to `STORE.lookout/LEAD.json`, as above.

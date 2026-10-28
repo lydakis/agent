@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network",
         startup: true,
     },
     Command {
@@ -42,9 +42,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "interrupt",
-        about: "Stop a bot's running turn; prints its turn view",
-        usage: "interrupt --bot NAME",
-        flags: "--bot --pretty",
+        about: "Stop a bot's running turn, or with --turn end one still queued; prints its turn view",
+        usage: "interrupt --bot NAME [--turn TURN]",
+        flags: "--bot --turn --pretty",
         settings: "",
         startup: false,
     },
@@ -229,7 +229,7 @@ fn print_flags(flags: &str) {
             "--after" => ("ID", "Start after this event cursor or turn ID"),
             "--turn" => (
                 "ID",
-                "Select a turn; with run --delivery steer, the turn to steer",
+                "Select a turn; with run --delivery steer, the turn to steer; with interrupt, the turn to end, also one still queued",
             ),
             "--new" => ("", "Create a new bot instead of continuing a named bot"),
             "--fork" => (
@@ -367,6 +367,15 @@ fn print_flags(flags: &str) {
                 "A new bot's summarizer; default: its own model",
             ),
             "--no-compaction" => ("", "Create the bot without compaction"),
+            "--sandbox" => (
+                "MODE",
+                "A new bot's command sandbox: read-only, workspace-write or danger-full-access; default none",
+            ),
+            "--writable" => (
+                "PATH",
+                "Another folder a workspace-write bot may change; repeat for more",
+            ),
+            "--network" => ("", "A workspace-write bot's commands may use the network"),
             "--fallbacks" => (
                 "",
                 "A new bot's declined Anthropic requests rerun on the recommended model",
@@ -533,7 +542,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if !allowed {
             return fail_with("usage", format!("{} does not accept {flag}", c.name));
         }
-        if flags.iter().any(|f| f == flag) && !matches!(flag, "--provider" | "--image") {
+        if flags.iter().any(|f| f == flag)
+            && !matches!(flag, "--provider" | "--image" | "--writable")
+        {
             return fail_with("usage", format!("{flag} may only be specified once"));
         }
         flags.push(flag.to_owned());
@@ -552,6 +563,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--fallbacks"
+                | "--network"
                 | "--discover"
         ) {
             if inline.is_some() {
@@ -677,6 +689,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--profile",
             "--budget-tokens",
             "--fallbacks",
+            "--sandbox",
+            "--writable",
+            "--network",
             "--approval",
             "--approve",
         ]
@@ -685,7 +700,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, budget, and approval are creation options; use --new",
+            "instructions, budget, approval and sandbox are creation options; use --new",
         );
     }
     Ok(Some(out))

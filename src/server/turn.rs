@@ -16,6 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
+    sandbox::Policy,
     store::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Settings, Slot,
         Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
@@ -1482,7 +1483,9 @@ impl Turn {
                 None => match summarizer.family() {
                     agent_runtime::codec::Family::Anthropic => (Body::Span(&plan, stripped), tools),
                     agent_runtime::codec::Family::Responses => {
-                        empty = self.registry.encoded(summarizer.family(), &[], &[])?;
+                        empty = self
+                            .registry
+                            .encoded(summarizer.family(), &[], &[], false)?;
                         (Body::Span(&plan, stripped), &*empty)
                     }
                 },
@@ -1856,7 +1859,7 @@ impl Turn {
             + match family {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
                 agent_runtime::codec::Family::Responses => {
-                    self.registry.encoded(family, &[], &[])?.get().len()
+                    self.registry.encoded(family, &[], &[], false)?.get().len()
                 }
             })
     }
@@ -1930,7 +1933,7 @@ impl Turn {
     ) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
-        self.settings.get_or_init(|| record.settings);
+        self.settings.get_or_init(|| record.settings.clone());
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
@@ -2082,9 +2085,12 @@ impl Turn {
         let mut model_rounds = context.model_rounds;
         let called = context.model.as_str();
         // This bot's tools, encoded once per distinct selection and shared.
-        let tools = self
-            .registry
-            .encoded(provider.family(), &record.tools, &record.declared)?;
+        let tools = self.registry.encoded(
+            provider.family(),
+            &record.tools,
+            &record.declared,
+            record.sandboxed(),
+        )?;
         // A stub names the `read` call that returns its result, so only a
         // bot that has the tool elides.
         let elides = record.tools.iter().any(|tool| tool == "read");
@@ -2445,7 +2451,7 @@ impl Turn {
                 });
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
-            let gated = calls.iter().any(|call| record.gated(&call.name));
+            let gated = calls.iter().any(|call| record.gated(call, &workspace));
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
@@ -2993,16 +2999,21 @@ impl Turn {
                 .then(|| provider.blocked_for(model))
                 .flatten()
                 .filter(|block| *block >= MIN_PARK);
-            // Rate limits and overloads already hold the pool; other transient failures
-            // back off exponentially with a little spread.
+            // A rate limit holds the pool, as do clustered overloads; a lone
+            // overload backs off from half a second as the providers' SDKs
+            // do, and other transient failures from a quarter, with a little
+            // spread.
             let delay = match pool {
                 Some(block) => block,
+                None if paced && agent_runtime::provider::overload(&error.code) => {
+                    backoff(attempt + 1, turn as u64)
+                }
                 None if paced => std::time::Duration::ZERO,
                 None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
                 None if error.code == "provider_stream_stalled" => {
                     backoff(attempt + STALL_START, turn as u64)
                 }
-                None => backoff(attempt, turn as u64),
+                None => asked(&error).unwrap_or_else(|| backoff(attempt, turn as u64)),
             };
             // A backoff of a second or more parks too: an outage's retries
             // are not this turn's to sleep through with a live task and an
@@ -3354,13 +3365,17 @@ impl Turn {
         let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
-            if record.gated(&call.name) {
+            // An escape from a sandbox runs unconfined only once a gate
+            // allowed it.
+            let approved = record.gated(&call, workspace);
+            if approved {
                 match self
                     .approve(
                         &call,
                         &mut calls,
                         announced.take(),
                         record,
+                        workspace,
                         route,
                         summary_retry_ms,
                     )
@@ -3386,6 +3401,54 @@ impl Turn {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
+            };
+            // A call its sandbox confines runs in it; one that can't be
+            // confined fails rather than run unconfined. An escape no gate
+            // approved is refused, as Codex refuses one under a policy that
+            // never asks: a command, or a write or edit held to the sandbox.
+            let mut sandbox = None;
+            let confined =
+                record.sandboxed() && agent_runtime::sandbox::confinable(&call.name) && !approved;
+            let prepared = match prepared {
+                Ok(Prepared::Shell { .. } | Prepared::Detach(_))
+                    if confined && !record.confines(&call, workspace) =>
+                {
+                    Err(Error::with(
+                        "escalation_refused",
+                        "no approval lets this bot run a command outside its sandbox; \
+                         run it without sandbox_permissions",
+                    ))
+                }
+                Ok(prepared) if confined => {
+                    // Reading the roots touches the filesystem: off the
+                    // runtime thread.
+                    let (settings, daemon) =
+                        (record.settings.clone(), self.registry.daemon().clone());
+                    let root = record
+                        .workspace
+                        .as_ref()
+                        .map_or_else(|| workspace.to_owned(), PathBuf::from);
+                    tokio::task::spawn_blocking(move || {
+                        // The probe for a sandbox runs once, here off the
+                        // runtime thread, also for a bot from before a restart.
+                        agent_runtime::sandbox::available()?;
+                        Policy::new(
+                            settings.sandbox,
+                            Some(&root),
+                            &settings.writable,
+                            settings.network,
+                            &daemon,
+                        )
+                    })
+                    .await
+                    .map_err(|_| Error::new("sandbox_unavailable"))
+                    .flatten()
+                    .map(|policy| {
+                        sandbox = policy.map(Arc::new);
+                        prepared
+                    })
+                }
+                other => other,
             };
             let answered = record
                 .declared(&call.name)
@@ -3436,6 +3499,7 @@ impl Turn {
                             workspace.to_path_buf(),
                             timeout_ms,
                             environment.to_vec(),
+                            sandbox,
                         )
                         .await
                     {
@@ -3525,6 +3589,7 @@ impl Turn {
                         workspace.to_path_buf(),
                         timeout_ms,
                         environment.to_vec(),
+                        sandbox,
                         started,
                     );
                     match self
@@ -3541,7 +3606,8 @@ impl Turn {
                 }
                 Ok(prepared) => match self
                     .run_tool(
-                        self.registry.execute(prepared, workspace, environment),
+                        self.registry
+                            .execute(prepared, workspace, environment, sandbox),
                         None,
                         warm.as_deref_mut(),
                     )
@@ -3567,12 +3633,14 @@ impl Turn {
     /// Wait for a gated call's verdict: live for the hold, then parked like
     /// `wait`, holding no task and no slot. Answers wake the task through
     /// the worker, so each check is one job and no commit.
+    #[allow(clippy::too_many_arguments)]
     async fn approve(
         &self,
         call: &ToolCall,
         calls: &mut std::vec::IntoIter<ToolCall>,
         announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         record: &Bot,
+        workspace: &std::path::Path,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Approval> {
@@ -3592,7 +3660,7 @@ impl Turn {
                 .filter(|gate| {
                     round
                         .clone()
-                        .any(|c| record.gated(&c.name) && gate.tools.contains(&c.name))
+                        .any(|c| record.gated(c, workspace) && gate.tools.contains(&c.name))
                 })
                 .filter_map(|gate| gate.expire_ms)
                 .min();
@@ -3953,6 +4021,7 @@ impl Turn {
         workspace: PathBuf,
         timeout_ms: u64,
         environment: Vec<(String, String)>,
+        sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
         // The place in line is taken before anything durable is written.
         let queued = self.registry.queue()?;
@@ -3962,8 +4031,15 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
-        self.registry
-            .background(command, workspace, timeout_ms, environment, queued, sender);
+        self.registry.background(
+            command,
+            workspace,
+            timeout_ms,
+            environment,
+            sandbox,
+            queued,
+            sender,
+        );
         self.collect(id, call_id, receiver);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
@@ -4113,9 +4189,15 @@ fn retryable(code: &str) -> bool {
 }
 
 /// A stream that stalled on this request stalls again when resent at once
-/// with the same context: its retries start at 2 s. An overload is the
-/// pool's to wait out, as a rate limit is.
+/// with the same context: its retries start at 2 s.
 const STALL_START: u32 = 3;
+
+/// The wait a server error's response asked for, when it is one a retry
+/// takes: up to a minute, as the OpenAI and Anthropic SDKs take it.
+fn asked(error: &Error) -> Option<std::time::Duration> {
+    let ms = error.facts.as_ref()?.get("retry_after_ms")?.as_u64()?;
+    (ms <= 60_000).then(|| std::time::Duration::from_millis(ms))
+}
 
 /// Retry backoffs at least this long park the turn instead of sleeping in it.
 const BACKOFF_PARK: std::time::Duration = std::time::Duration::from_secs(1);

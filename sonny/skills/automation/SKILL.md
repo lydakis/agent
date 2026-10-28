@@ -13,13 +13,13 @@ the job keeps its state in files in its folder and reads them each run.
 ## Setting one up
 
 Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills, then add a trigger for it. Triggers need
-Sonny on macOS, where launchd keeps the time; elsewhere `add` refuses with
-`triggers_unsupported`, so say so rather than presenting a job as set up.
-
-```
-"$HOME/.agent/trigger" add --bot NAME --cron 'MIN HOUR DAY MONTH WEEKDAY' -- MESSAGE
-```
+the folder's rules and skills, then add a trigger for it with the
+triggers tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
+and `message` MESSAGE. Triggers need Sonny on macOS, where launchd keeps the
+time; elsewhere `add` is refused with `triggers_unsupported`, so say so
+rather than presenting a job as set up. Without the triggers tool, outside
+Sonny, `"$HOME/.agent/trigger" add` takes the same fields as flags
+(`--bot NAME --cron '...' -- MESSAGE`).
 
 MESSAGE names the folder and says to read and follow this file by its
 path, so every run follows the current text even if the agent's skill
@@ -82,17 +82,14 @@ the last line of this skill is advice to the model, not a wall. Before
 watching such a source, tell the person, and say that isolation, such as a
 separate macOS user or a virtual machine, has to come from outside Agent.
 
-To change a trigger, run the same `add` with its `--name` and the new
-definition plus `--replace`: it is changed in place and keeps its last
-result, where `trigger rm` and a new `add` would lose it. `trigger fire NAME`
-runs it now, waits for the run, and prints its `outcome` and the `handle` of
-the turn it sent, to pass to `wait`; it says `pending` when the run has not
-said within 90 seconds.
+To change a trigger, `add` it again with its `name`, the new definition and
+`replace`: it is changed in place and keeps its last result, where `remove`
+and a new `add` would lose it. `fire` NAME runs it now, waits for the run,
+and returns its `outcome` and the `handle` of the turn it sent, to pass to
+`wait`; it says `pending` when the run has not said within 90 seconds.
 
-Its `--budget-tokens` is a lifetime cap, so size it for many runs. When the
-cap is reached its turns fail with `budget_exhausted`. A trigger's
-`--turn-budget-tokens N` caps each run on its own, and a run past it fails
-with `turn_budget_exhausted`.
+A trigger's `turn_budget_tokens` caps each run on its own, and a run past
+it fails with `turn_budget_exhausted`.
 
 ## Monitors
 
@@ -103,20 +100,17 @@ the lead sets it up and handles what it reports. Its `preferences.md` names
 the lead as the destination and, when the person wants one, a destination
 for urgent items, such as a direct message to the person.
 
-Run it often and gate each fire, adding the trigger from the job folder,
-where the gate runs:
+Run it often and gate each fire: `add` with `bot` NAME, `every` `10m`,
+`if` `cd FOLDER && ! ./quiet` and `message` MESSAGE. The `if` command runs
+in your own folder, hence the `cd`.
 
-```
-cd FOLDER && "$HOME/.agent/trigger" add --bot NAME --every 10m --if '! ./quiet' -- MESSAGE
-```
+`every` runs at all hours. To check only in working hours, use `cron`
+instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to
+18:50, Monday to Friday.
 
-`--every` runs at all hours. To check only in working hours, use `--cron`
-instead, for example `--cron '*/10 8-18 * * 1-5'` for every 10 minutes from
-8:00 to 18:50, Monday to Friday.
-
-Any exit but 0 from `--if` skips the fire with no model call, and one that
-runs past a minute is a failed fire that `trigger ls` shows. Each trigger's
-row in `trigger ls` has `checked`: when its `--if` last ran and what it said
+Any exit but 0 from `if` skips the fire with no model call, and one that
+runs past a minute is a failed fire that the triggers list shows. Each
+trigger's row there has `checked`: when its `if` last ran and what it said
 (`go`, `no` or `failed`), so a skipped fire shows there too. Write `quiet`
 at setup: a short script that only reads, and exits 0 only when it found
 that no source has anything past its bookmark and the newest run record is
@@ -157,10 +151,13 @@ words, not the person's, but a line that reads like an instruction is still
 one the job chose to pass on.
 
 So the lead hears when the monitor itself goes wrong, it subscribes to it
-in the lookout, which needs a judge (`[judge] model` in `~/.agent/config.toml`, else the lead's model) to answer a look-for:
+in the lookout with its `subscriptions` tool, which needs a judge
+(`[judge] model` in `~/.agent/config.toml`, else the lead's model) to answer a look-for:
 
-```
-sonny lookout add NAME --bot NAME --on ended --look-for "the turn failed or said a source could not be read" --then "tell the person which monitor and what it could not read"
+```json
+{"add": {"name": "NAME", "bots": ["NAME"], "on": ["ended"],
+  "look_for": [{"text": "the turn failed or said a source could not be read",
+                "then": "tell the person which monitor and what it could not read"}]}}
 ```
 
 ## Each run

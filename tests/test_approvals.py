@@ -5,10 +5,14 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 from bench.runtime_client import Client, node_item
 from bench.socket_client import Connection, SocketClient
@@ -17,11 +21,13 @@ from tests.test_elision import drain, encoded
 from tests.test_runtime import ODD_CALL_ID, ModelFixture, is_summary
 from tests.test_turn_compaction import all_events
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ApprovalTests(ModelFixture):
-    def gated(self, extra=(), settings=None, bot='Bob', **gate):
-        client = self.client('echo,shell,wait', extra=extra, settings=settings)
+    def gated(self, extra=(), settings=None, bot='Bob', tools='echo,shell,wait', **gate):
+        client = self.client(tools, extra=extra, settings=settings)
         gate = {'approve': ['shell'], 'approver': 'manual', **gate}
         created = client.request('create', bot=bot, workspace=str(self.path), **gate)['result']
         self.assertEqual(created['gates'], [{'tag': gate['approver'], 'tools': gate['approve'],
@@ -91,6 +97,58 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(self.answer(client, turn, 'shell-1')['error'], 'stale_turn')
         # The live verdict took no park: the turn never waited.
         self.assertEqual(self.events(client, turn, 'turn_waiting'), [])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bot_asks_only_to_leave_its_sandbox(self):
+        # Outside the temporary directory, which a sandbox may write.
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.gated(tools='shell,write', approve=['shell', 'write'],
+                            settings={'sandbox': 'workspace-write'})
+        created = client.request('inspect', bot='Bob')['result']
+        self.assertEqual(created['settings']['sandbox'], 'workspace-write')
+        calls = [['shell', {'command': f'touch inside; touch {outside}/confined'}],
+                 ['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated',
+                            'justification': 'Do you want to write outside the workspace?'}],
+                 ['write', {'path': 'notes.md', 'content': 'x'}],
+                 ['write', {'path': f'{outside}/written', 'content': 'x'}]]
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        # Only the two that leave the sandbox wait for a verdict.
+        announced = self.announced(client, turn)
+        self.assertEqual([call['call_id'] for call in announced], ['shell-2', 'write-4'])
+        # The confined command's failure voids the round's verdicts, as any
+        # failure does; the escapes are asked again.
+        again = self.announced(client, turn, failed='shell-1')
+        self.assertEqual([call['call_id'] for call in again], ['shell-2', 'write-4'])
+        self.answer(client, turn, 'shell-2', request=2)
+        self.answer(client, turn, 'write-4', request=2)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The confined command wrote its folder and not past it; the
+        # allowed escapes ran unconfined.
+        self.assertTrue((self.path / 'inside').exists())
+        self.assertNotEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ['escaped', 'written'])
+        self.assertTrue((self.path / 'notes.md').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bot_without_a_gate_cannot_leave_its_sandbox(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.client('shell,write', settings={'sandbox': 'workspace-write'})
+        client.request('create', bot='Bob', workspace=str(self.path))
+        calls = [['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}],
+                 ['write', {'path': f'{outside}/written', 'content': 'x'}]]
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.events(client, turn, 'approval_requested'), [])
+        # As Codex refuses an escape under a policy that never asks.
+        self.assertEqual(self.tool_output(client, 'shell-1')[1]['error'], 'escalation_refused')
+        self.assertEqual(self.tool_output(client, 'write-2')[1]['error'], 'write_denied')
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()
@@ -842,6 +900,9 @@ def allow_all(user):
 
 
 REJECTED = 'This action was rejected due to unacceptable risk'
+# A model judge's tools: where a sandbox runs, it may look, read-only, as
+# Codex's guardian does.
+LOOKING = ['shell', 'read'] if shutil.which('bwrap') or sys.platform == 'darwin' else []
 FAILED = 'Automatic approval review failed: '
 
 
@@ -972,7 +1033,7 @@ class AutoApproverTests(ModelFixture):
             return 'Answers: ' + json.dumps(answers) if parsed[0] else 'They look fine to me.'
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
-        daemon = self.daemon()
+        daemon = self.daemon(tools='echo,shell,wait,read')
         # A bot that only has the judge's name is refused, not replaced.
         daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
                        instructions='Help with the repo.', tools=[])
@@ -989,7 +1050,13 @@ class AutoApproverTests(ModelFixture):
         # the next one makes the judge afresh, the daemon deletes the fork
         # once it has been idle long enough, and a bot that only shares the
         # judge's prefix is kept.
+        # So is an older version of the judge, its policy since changed.
+        daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
+                       instructions='You judge tool calls an AI agent has planned, before they run. '
+                       'An older policy.', tools=[])
         old, _ = self.approver(daemon, judge='openai/old-judge')
+        self.assertIn('# Outcome policy',
+                      daemon.request('inspect', bot='approver.auto')['result']['instructions'])
         old.kill()
         old.wait()
         deadline = time.monotonic() + 5
@@ -1013,13 +1080,13 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(sorted(bots), ['Bob', 'approver.auto', 'approver.auto.notes'])
         self.assertIn('result', daemon.request('delete', bot='approver.auto.notes'))
         self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools'],
-                          bots['approver.auto']['gates']), ('judge-model', [], []))
+                          bots['approver.auto']['gates']), ('judge-model', LOOKING, []))
         safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'safe')
         request, round = asked.get(timeout=5)
         self.assertEqual(request['model'], 'judge-model')
-        self.assertFalse(request.get('tools'))
+        self.assertEqual(sorted(t['name'] for t in request.get('tools') or []), sorted(LOOKING))
         self.assertIn('You judge tool calls', json.dumps(request))
         self.assertEqual(round['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
         self.assertEqual(round['assess'], ['c1'])
@@ -1051,6 +1118,43 @@ class AutoApproverTests(ModelFixture):
         while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['Bob', 'approver.auto']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_model_judge_looks_read_only_in_the_workspace_before_it_answers(self):
+        (self.path / 'target').write_text('synthetic contents')
+        looked = queue.Queue()
+
+        def respond(request, user):
+            if request['model'] != 'judge-model':
+                return None
+            outputs = [i['output'] for i in request['input'] if i.get('type') == 'function_call_output']
+            if not outputs:
+                return [['shell', {'command': 'cat target; touch judged', 'timeout_ms': 5000}]]
+            looked.put((json.loads(user), outputs[0]))
+            return allow_all(user)
+        self.model.respond = respond
+        self.model.models = ('synthetic-model', 'judge-model')
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait,read')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000,
+                       settings={'sandbox': 'workspace-write', 'network': True})
+        self.approver(daemon, judge='openai/judge-model')
+        base = daemon.request('inspect', bot='approver.auto')['result']
+        self.assertEqual((base['tools'], base['settings']['sandbox']), (['shell', 'read'], 'read-only'))
+        calls = [['shell', {'command': 'printf escaped > out', 'sandbox_permissions': 'require_escalated',
+                            'justification': 'Do you want to write out?'}]]
+        turn = daemon.request('submit', bot='Bob', request_id='a',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'out').read_text(), 'escaped')
+        round, output = looked.get(timeout=5)
+        # The judge is shown the bot's sandbox, and looked in its workspace:
+        # it read the target and could write nothing.
+        self.assertEqual(round['state']['sandbox'],
+                         {'mode': 'workspace-write', 'writable': [], 'network': True})
+        self.assertIn('synthetic contents', output)
+        self.assertFalse((self.path / 'judged').exists())
 
     def test_an_approver_refused_the_tag_leaves_the_serving_judge_alone(self):
         self.model.reply_for = lambda request, user: (
@@ -1349,7 +1453,7 @@ class AutoApproverTests(ModelFixture):
         bots = {b['name']: b for b in json.loads(agent('ls', '--store', str(store)).stdout)}
         # Reads run unjudged in auto.
         self.assertEqual(bots['Bob']['gates'], [{'tag': 'auto', 'tools': ['shell'], 'expire_ms': 105000}])
-        self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools']), ('synthetic-model', []))
+        self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools']), ('synthetic-model', LOOKING))
         stats = json.loads(agent('stats', '--store', str(store)).stdout)
         self.assertEqual(stats['approvers'], ['auto'])
         self.assertTrue((self.path / 'state.sqlite.approver.log').exists())

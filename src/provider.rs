@@ -887,18 +887,21 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                pace.limited(retry_after(&headers));
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
-            return Err(Error {
-                code: if quota {
-                    "provider_quota_exhausted".to_owned()
-                } else {
-                    format!("provider_http_{status}")
+            return Err(waits(
+                Error {
+                    code: if quota {
+                        "provider_quota_exhausted".to_owned()
+                    } else {
+                        format!("provider_http_{status}")
+                    },
+                    detail: body.detail,
+                    facts: None,
                 },
-                detail: body.detail,
-                facts: None,
-            });
+                &headers,
+            ));
         }
         reservation.learn(response.headers(), self.family);
         // The answer is a message with no content; only its usage matters.
@@ -915,7 +918,7 @@ impl Provider {
         let message: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
         let usage = anthropic::message_usage(&message, self.cache_hour);
-        reservation.settle_usage(Some(&usage), estimate);
+        reservation.settle_refresh(&usage);
         pace.accepted();
         Ok((usage, sent_at))
     }
@@ -1002,9 +1005,20 @@ impl Provider {
         }
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
+        let input = ((prefix.len() + request.items.weight) / 4) as u64;
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.weight) / 4) as u64,
-            output: u64::from(self.max_output_tokens.unwrap_or(512)),
+            input,
+            // Anthropic counts output as it is written, not the cap a
+            // request asks for: reserve what this model's calls have been
+            // writing. OpenAI counts the cap, so it is reserved whole.
+            output: match self.family {
+                Family::Anthropic => pace.output_estimate(
+                    u64::from(self.max_output_tokens.unwrap_or(512)),
+                    u64::from(self.anthropic_max_tokens(request.model)),
+                    input,
+                ),
+                Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
+            },
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
@@ -1125,7 +1139,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                pace.limited(retry_after(&headers));
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             let code = if quota {
@@ -1133,11 +1147,14 @@ impl Provider {
             } else {
                 format!("provider_http_{status}")
             };
-            return Err(Error {
-                code,
-                detail: body.detail,
-                facts: None,
-            });
+            return Err(waits(
+                Error {
+                    code,
+                    detail: body.detail,
+                    facts: None,
+                },
+                &headers,
+            ));
         }
         reservation.learn(response.headers(), self.family);
         if self.family == Family::Responses
@@ -1265,12 +1282,16 @@ impl Provider {
         };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
-        // An overload or rate limit inside the stream closes the pool as
+        // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
         if let Err(error) = &result
             && paced(&error.code)
         {
-            pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+            refused(
+                &pace,
+                overload(&error.code),
+                error.detail.as_deref().and_then(pace::named_delay),
+            );
         }
         result?;
         // Only a completed stream ends a refusal streak: a 200 can still end
@@ -1280,7 +1301,11 @@ impl Provider {
             .inspect(|_| pace.accepted())
             .inspect_err(|error| {
                 if paced(&error.code) {
-                    pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+                    refused(
+                        &pace,
+                        overload(&error.code),
+                        error.detail.as_deref().and_then(pace::named_delay),
+                    );
                 }
             })
     }
@@ -1512,6 +1537,35 @@ pub fn paced(code: &str) -> bool {
     )
 }
 
+/// A refusal with the wait its response asks for, as the fact
+/// `retry_after_ms`, so a retry of a server error can honour it as the
+/// providers' SDKs do.
+/// Facts the error already carries are kept.
+pub(crate) fn waits(mut error: Error, headers: &reqwest::header::HeaderMap) -> Error {
+    if let Some(after) = retry_after(headers) {
+        error
+            .facts
+            .get_or_insert_default()
+            .insert("retry_after_ms".into(), json!(after.as_millis() as u64));
+    }
+    error
+}
+
+/// Whether a paced refusal is an overload rather than a rate limit.
+pub fn overload(code: &str) -> bool {
+    matches!(code, "provider_overloaded" | "provider_http_529")
+}
+
+/// Tell the model's pool a call was refused: an overload, which closes it
+/// only when it names a delay or overloads cluster, or a rate limit.
+fn refused(pace: &pace::Pace, overload: bool, after: Option<Duration>) {
+    if overload {
+        pace.overloaded(after);
+    } else {
+        pace.limited(after);
+    }
+}
+
 /// How long a response asks to be left alone: `retry-after-ms`, which
 /// OpenAI and Anthropic send beside `retry-after` and both SDKs read first,
 /// else `retry-after` in seconds.
@@ -1528,9 +1582,9 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
-/// Close the model's pool for a rate limit a socket reported: a 429 or 529
+/// Tell the model's pool of a refusal a socket reported: a 429 or 529
 /// status with its `retry-after`, as on HTTP, or an in-stream rate limit or
-/// overload naming its delay.
+/// overload with the delay it names.
 fn limit(pace: &pace::Pace, failure: &socket::Failure) {
     if matches!(failure.status, Some(429 | 529)) || paced(&failure.error.code) {
         let after = failure
@@ -1538,7 +1592,9 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
             .as_deref()
             .and_then(retry_after)
             .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
-        pace.limited(after);
+        let overload = failure.status == Some(529)
+            || (failure.status != Some(429) && overload(&failure.error.code));
+        refused(pace, overload, after);
     }
 }
 
@@ -1752,12 +1808,15 @@ fn looks_like_sse_prefix(body: &[u8]) -> bool {
 }
 
 /// An error code that means the account's allowance is spent, not that the
-/// pace is too fast: an API key's quota, or a ChatGPT plan's usage limit,
-/// which OpenAI says not to retry or guess a reset for.
+/// pace is too fast: an API key's quota, a ChatGPT plan's usage limit, which
+/// OpenAI says not to retry or guess a reset for, or Anthropic's spend cap,
+/// which refuses every retry until the next month.
 pub(crate) fn quota(code: &str) -> bool {
     matches!(
         code,
-        "insufficient_quota" | "subscription_sharing_usage_limit_exceeded"
+        "insufficient_quota"
+            | "subscription_sharing_usage_limit_exceeded"
+            | "enforced_spend_limit_reached"
     )
 }
 
@@ -1781,9 +1840,15 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
     }
     match serde_json::from_str::<Value>(text) {
         Ok(value) => Some(ErrorBody {
-            quota: ["code", "type"]
-                .iter()
-                .any(|field| value["error"][field].as_str().is_some_and(quota)),
+            // Anthropic's spend cap is a `rate_limit_error` told apart only
+            // by `details.error_code`.
+            quota: [
+                &value["error"]["code"],
+                &value["error"]["type"],
+                &value["error"]["details"]["error_code"],
+            ]
+            .iter()
+            .any(|field| field.as_str().is_some_and(quota)),
             detail: value
                 .as_str()
                 .or_else(|| value["error"]["message"].as_str())
@@ -2079,7 +2144,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[])
+                .encoded(family, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {

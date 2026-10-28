@@ -96,6 +96,42 @@ struct State {
     /// Blocks in a row that ended in another refusal naming no delay.
     unnamed_blocks: u32,
     reserved_requests: u64,
+    /// Calls answered and overloads refused since the window began.
+    overloads: Overloads,
+    /// Output tokens the pool's latest calls reported, oldest first.
+    outputs: std::collections::VecDeque<u32>,
+}
+
+/// The output estimate follows this many of the latest calls, once it has
+/// `OUTPUT_KNOWN` of them.
+const OUTPUT_SAMPLES: usize = 32;
+const OUTPUT_KNOWN: usize = 8;
+
+/// Overload refusals that name no delay close the pool only when they
+/// cluster: this many within one window, a quarter or more of its answers.
+const OVERLOAD_CLUSTER: u32 = 3;
+const OVERLOAD_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Default)]
+struct Overloads {
+    since: Option<Instant>,
+    answered: u32,
+    refused: u32,
+}
+impl Overloads {
+    /// The current window, a fresh one once the last has run out.
+    fn at(&mut self, now: Instant) -> &mut Self {
+        if self
+            .since
+            .is_none_or(|since| now - since >= OVERLOAD_WINDOW)
+        {
+            *self = Overloads {
+                since: Some(now),
+                ..Overloads::default()
+            };
+        }
+        self
+    }
 }
 
 /// An unsent reservation is fully refundable. After dispatch, cancellation
@@ -128,12 +164,30 @@ impl Reservation<'_> {
             output: 0,
         });
     }
-    /// Final accounting by what the provider reported billing.
+    /// Final accounting by what the provider reported billing, for a call
+    /// whose output tells what the pool's calls write.
     pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost) {
+        if let Some(usage) = usage {
+            let mut state = self.pace.state.lock().unwrap();
+            if state.outputs.len() == OUTPUT_SAMPLES {
+                state.outputs.pop_front();
+            }
+            state
+                .outputs
+                .push_back(u32::try_from(usage.output_tokens).unwrap_or(u32::MAX));
+        }
         self.settle_cost(usage.map_or(estimate, |u| Cost {
             input: u.input_tokens,
             output: u.output_tokens,
         }));
+    }
+    /// Final accounting for a call that asked for no output, such as a
+    /// cache refresh, which says nothing of what the pool's calls write.
+    pub fn settle_refresh(self, usage: &Usage) {
+        self.settle_cost(Cost {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+        });
     }
     fn settle_cost(mut self, actual: Cost) {
         debug_assert!(self.dispatched);
@@ -355,10 +409,53 @@ impl Pace {
         // It parks and releases the gate; queued callers then observe the block.
         self.changed.notify_one();
     }
+    /// What a call of this pool is likely to write, for a provider that
+    /// counts output as it is written: the 90th percentile of the latest
+    /// calls' output, at most `cap`, or `unknown` until enough have
+    /// reported. A call that writes more is charged the rest when it settles.
+    /// Output is written over time, so a reply longer than the limit can
+    /// still be served: beside the call's `input`, the estimate waits for a
+    /// full allowance at most, and is never refused.
+    pub fn output_estimate(&self, unknown: u64, cap: u64, input: u64) -> u64 {
+        let state = self.state.lock().unwrap();
+        let mut estimate = match state.outputs.len() < OUTPUT_KNOWN {
+            true => unknown,
+            false => {
+                let mut seen: Vec<u32> = state.outputs.iter().copied().collect();
+                let at = (seen.len() * 9).div_ceil(10) - 1;
+                u64::from(*seen.select_nth_unstable(at).1).min(cap)
+            }
+        };
+        if let Some(limit) = state.tokens[OUTPUT].bucket.per_minute {
+            estimate = estimate.min(limit as u64);
+        }
+        if let Some(limit) = state.tokens[TOTAL].bucket.per_minute {
+            estimate = estimate.min((limit as u64).saturating_sub(input));
+        }
+        estimate
+    }
     /// A call completed: the next unnamed refusal starts again at a second.
     pub fn accepted(&self) {
         let mut state = self.state.lock().unwrap();
         state.unnamed_blocks = 0;
+        state.overloads.at(Instant::now()).answered += 1;
+    }
+    /// An overload refused a call. With a delay named it closes the pool as
+    /// a rate limit does. With none, the refused call backs off alone, as
+    /// Codex and the providers' SDKs retry an overload per request, unless
+    /// overloads cluster: then the pool closes as for an unnamed rate limit.
+    /// Whether it closed.
+    pub fn overloaded(&self, after: Option<Duration>) -> bool {
+        let clustered = after.is_some() || {
+            let mut state = self.state.lock().unwrap();
+            let window = state.overloads.at(Instant::now());
+            window.refused += 1;
+            window.refused >= OVERLOAD_CLUSTER && window.refused * 3 >= window.answered
+        };
+        if clustered {
+            self.limited(after);
+        }
+        clustered
     }
     /// Learn the allowance from headers that precede every call they could
     /// count, such as a WebSocket upgrade's. Outstanding reservations stay
@@ -586,6 +683,94 @@ mod tests {
         .expect("unknown capacity must not impose an admission cap");
         assert!(held.iter().all(|r| r.waited.is_zero()));
         assert_eq!(pace.state.lock().unwrap().reserved_requests, 128);
+    }
+
+    #[tokio::test]
+    async fn the_output_estimate_follows_what_calls_wrote() {
+        async fn wrote(pace: &Pace, calls: usize, output: u64) {
+            for _ in 0..calls {
+                let usage = Usage {
+                    input_tokens: 1,
+                    output_tokens: output,
+                    ..Usage::default()
+                };
+                sent(pace, 2)
+                    .await
+                    .unwrap()
+                    .settle_usage(Some(&usage), Cost::default());
+            }
+        }
+        let pace = Pace::default();
+        // Until eight calls report, a call reserves what it did before.
+        wrote(&pace, 7, 100).await;
+        assert_eq!(pace.output_estimate(512, 4096, 0), 512);
+        wrote(&pace, 1, 100).await;
+        assert_eq!(pace.output_estimate(512, 4096, 0), 100);
+        // The 90th percentile of the latest 32: three long replies in 32
+        // still leave it at the short ones; a fourth moves it.
+        wrote(&pace, 21, 100).await;
+        wrote(&pace, 3, 3000).await;
+        assert_eq!(pace.output_estimate(512, 4096, 0), 100);
+        wrote(&pace, 1, 3000).await;
+        assert_eq!(pace.output_estimate(512, 4096, 0), 3000);
+        // Never above the cap the call asks for.
+        assert_eq!(pace.output_estimate(512, 1000, 0), 1000);
+        // Nor above the limit, which a reply written over time can pass.
+        pace.seed(
+            &headers(&[
+                ("anthropic-ratelimit-output-tokens-limit", "2000"),
+                ("anthropic-ratelimit-output-tokens-remaining", "2000"),
+            ]),
+            crate::codec::Family::Anthropic,
+        );
+        assert_eq!(pace.output_estimate(512, 4096, 0), 2000);
+        assert!(sent(&pace, 0).await.is_ok());
+        // A cache refresh writes nothing and says nothing of what calls
+        // write.
+        for _ in 0..32 {
+            sent(&pace, 1)
+                .await
+                .unwrap()
+                .settle_refresh(&Usage::default());
+        }
+        assert_eq!(pace.output_estimate(512, 4096, 0), 2000);
+        // Beside its input, a call never asks for more than the total limit.
+        pace.seed(
+            &headers(&[
+                ("anthropic-ratelimit-tokens-limit", "10000"),
+                ("anthropic-ratelimit-tokens-remaining", "10000"),
+            ]),
+            crate::codec::Family::Anthropic,
+        );
+        assert_eq!(pace.output_estimate(512, 4096, 9000), 1000);
+        assert_eq!(pace.output_estimate(512, 4096, 3000), 2000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_overload_leaves_the_pool_open_and_clustered_ones_close_it() {
+        let pace = Pace::default();
+        let answered = |pace: &Pace, calls: u32| (0..calls).for_each(|_| pace.accepted());
+        // One refusal among many answers is that call's to back off.
+        answered(&pace, 20);
+        assert!(!pace.overloaded(None));
+        assert!(!pace.overloaded(None));
+        assert_eq!(pace.blocked_for(), None);
+        // A third, still under a quarter of the answers, leaves it open too.
+        answered(&pace, 10);
+        assert!(!pace.overloaded(None));
+        assert_eq!(pace.blocked_for(), None);
+        // A new window: three refusals and few answers are the provider's.
+        tokio::time::advance(OVERLOAD_WINDOW).await;
+        answered(&pace, 2);
+        assert!(!pace.overloaded(None));
+        assert!(!pace.overloaded(None));
+        assert!(pace.overloaded(None));
+        assert!(pace.blocked_for().is_some());
+        // A named delay closes it whatever the window holds.
+        tokio::time::advance(Duration::from_secs(40)).await;
+        assert_eq!(pace.blocked_for(), None);
+        assert!(pace.overloaded(Some(Duration::from_secs(3))));
+        assert_eq!(pace.blocked_for().unwrap().as_secs_f64().round(), 3.0);
     }
 
     #[tokio::test(start_paused = true)]

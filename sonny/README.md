@@ -13,7 +13,12 @@ Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
 `opt` path. On Linux, each release also has
 `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and aarch64): static builds of
 Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
-`bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
+`bin/sonny`, or let [install.sh](../install.sh) fetch, check and link the
+latest one into `~/.local`:
+
+    curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
+
+With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
 the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
@@ -35,13 +40,37 @@ project holds the folder above it. In a git repository, Sonny opens the
 nearest project in that repository, else makes the repository's top one,
 so `src` reaches the repository's lead and a task's worktree its main
 checkout's; a subfolder of a repository is its own project once it has a
-file (`sonny project add DIR`). A project whose file says
+file, which a lead makes with its new_project tool. A project whose file says
 `subfolders = "project"` keeps the folders below it: Sonny opened in any of
 them that has no project file of its own, a repository among them, opens
 that project's lead (the nearest project above decides; the home folder's
 file never does). A lead made below another project's folder says which
 lead holds the folder above. Sonny refuses to make a lead in a task's own
 folder under `~/.agent`.
+
+`~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
+keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
+the daemon, the approver and the lookout. Settings go in
+`~/.agent/config.toml`, as Codex keeps them: `provider` (the daemon's
+`--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
+agent's when none is named) and the efforts below. When no provider is named
+and no key is set, the first `sonny` in a terminal asks for one, as Codex and
+Claude Code ask for a sign-in: a ChatGPT plan (signed in with `agent login
+chatgpt`), an Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS
+profile. A new project's model is `--model`, else the project file's or the
+role's, else `AGENT_MODEL`, else the config's `model`, else the newest
+agent's; with none, Sonny lists what the providers offer and keeps the pick
+as `model`. Either step also suggests efforts, `[sonny] lead_effort =
+"medium"` and `task_effort = "high"`, unless the config already sets them.
+Outside a terminal both fail, naming what to set. The first start also writes
+`~/.agent/models`, the list agents read with `agent models`, when there is
+none, as `agent models --discover` does.
+
+A new project's empty transcript opens with a welcome: Sonny, the robot
+the client is named for, drawn in half blocks, as a portrait the first
+time Sonny ever runs (noted in `~/.agent/sonny/welcomed`) and as a small
+icon for each project after that. A folder that already has a lead opens
+on its history, with no welcome over it.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -54,9 +83,8 @@ changes, and writes it again once it is deleted, but never over an edit,
 since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
 and a file that no longer matches, or one Sonny never wrote, is the
 person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
-first. How the lead starts a task with `sonny task`, which names this
-Sonny, and where the project's tasks work are composed after the lead's
-role, not kept in the file.
+first. The task settings from `.agents/project.toml` are composed after
+the lead's role, not kept in the file.
 
 #### Effort for leads and tasks
 
@@ -74,8 +102,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
 
-`sonny task` applies them in code, so the lead's prompt says nothing about
-effort; the lead names `--model` or `--effort` only for one the person asks
+`start_task` applies them in code, so the lead's prompt says nothing about
+effort; the lead names a `model` or `effort` only for one the person asks
 for. A task on its lead's model with neither set takes the lead's effort,
 as before; one on another model takes that model's own. `/model` changes a
 lead's effort after it is made.
@@ -104,9 +132,9 @@ The daemon, lookout and approver Sonny starts run in a session of their own,
 so closing their pane or stopping Herdr leaves them and their turns running.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
-`sonny run` and `sonny show` go to that Herdr workspace or Rex session, in
-that multiplexer, rather than one guessed from the agent's shell, which runs
-in the daemon and is in neither. A task's window
+`run_in_pane` and `show_agent` calls go to that Herdr workspace or Rex
+session, in that multiplexer, rather than one guessed from where the
+lookout answering them runs, which is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -114,14 +142,14 @@ run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows` or
 `herdr-panes`, from `skills/`), so any agent can run a long command where
-the person can watch it, and read it back: `sonny run NAME [--split
-right|left|above|below] -- COMMAND...` opens a block labelled `AGENT/NAME`
-in a tab of its own (or on that side of the agent's own block) and prints
-its ID. `sonny show TASK [--split SIDE [--beside BOT] | --window]` moves a
-task's window. Tabs are the default; the skills tell agents to split only
+the person can watch it, and read it back: the `run_in_pane` tool
+(`name`, `command`, `split` right, left, above or below) opens a block
+labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
+own block) and gives its ID. The `show_agent` tool (`agent`, `split`,
+`beside`) moves a task's window. Tabs are the default; the skills tell agents to split only
 to show the person something now, such as a server's or a tool's output, or
 an agent to watch beside them. Sessions are for leads, tabs and splits for
-their tasks: `sonny show PROJECT.lead`, from another project's lead (one
+their tasks: `show_agent` on `PROJECT.lead`, from another project's lead (one
 that leads the projects in its folder), opens that lead's Sonny in its own
 project's session or workspace, made when needed in the same multiplexer,
 and leaves one already open alone. Sonny never lays another project's lead,
@@ -203,7 +231,14 @@ off again never shows.
   model (a new lead starts here, and Sonny starts `agent approver` when
   nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
   the gate it had; a pick reaches every agent the lead made too, one busy
-  now once it is idle.
+  now once it is idle. While the judge reviews a call the status row says
+  `Reviewing approval request`, and a denied call is drawn as
+  `✗ Request denied for …` with the judge's reason, in either view.
+- `/approve` lists the calls the judge denied while Sonny watched, with
+  the reason for each. Enter writes the call out whole, and a second
+  Enter sends your approval of that exact call as your own message, so
+  the agent may retry it once; the retry is still reviewed, and the judge
+  reads your words as consent. This is Codex's `/approve`.
 - `/status` shows the project's agents, and its running Errand jobs. The
   lead comes first; its tasks follow grouped by where they stand: **Needs
   you** (waiting on your approval, asking you a question, or failed),
@@ -229,15 +264,15 @@ off again never shows.
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
   take the folder's uncommitted changes along, cost no disk until written,
   and work outside git too. Every task gets one; only the lead works in the
-  folder. The lead starts each task with `sonny task NAME [--setup] [run
-  flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
-  there with `--setup`, starts the task with `agent run`, and leaves no
-  folder behind when that fails. Every agent Sonny starts, leads and tasks
+  folder. The lead starts each task with its `start_task` tool (`name`,
+  `brief`, `setup`, `profile`, `model`, `effort`), which makes its folder
+  that way, runs `.agents/setup` there with `setup`, starts the task with
+  `agent run`, and leaves no folder behind when that fails. Every agent Sonny starts, leads and tasks
   alike, is told that the person it works for may be under pressure, and
   to care whether they succeed: take work off their plate, do or offer
   what they will need next, and say once when a better way of working
   would help them (in `lead.md`, and in `task.md` for the rest); so
-  `sonny task` gives what `--agents` or `--profile` would compose as the
+  `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
   in the task's copy, so the task never writes the lead's folder by its
@@ -248,46 +283,63 @@ off again never shows.
   inside a plain folder stay in its copy, and in the copy of a linked
   worktree, whose `.git` names its repository outside the copy, git is
   turned off, so it can't change that repository while the files stay
-  behind. A plain folder on another disk than sandfs's home
-  (`~/.local/share/sandfs`), such as an external volume, can't be copied,
-  so its task gets a sandfs workspace over the folder itself: the task's
-  changes still stay in the workspace, but a file it has looked at stays
-  as it first saw it, and `--apply` writes over what changed in the folder
-  meanwhile without asking. `sonny task rm NAME [--discard]` removes a
-  task that is done and the folder Sonny made it, refusing while its work
-  isn't back yet: changes not applied, uncommitted or not pushed. A
-  worktree's branch is kept unless it is merged. `sonny task` also works
-  from a plain terminal, with the `agent` installed beside Sonny. sandfs is
+  behind. A plain folder on another disk than sandfs's home, such as an
+  external volume, is copied on its own disk, in a `.sandfs` folder at
+  that disk's top; on a disk that can't clone files (ext4) its files are
+  copied in full. A task that is done, fails or needs the person has its
+  copy give back the memory it can do without. The `remove_task` tool
+  (`task`, `discard`) removes a task that is done and the folder Sonny made
+  it, refusing while its work isn't back yet: changes not applied,
+  uncommitted or not pushed. A worktree's branch is kept unless it is
+  merged. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
   on Linux, nothing on macOS). Its mounts are served by Sonny run again in
   the background, which outlives Sonny; Sonny mounts task copies a restart
   unmounted again when it opens the lead, but not those whose task is gone,
   which it names instead.
-- **Needs you:** when the lead needs the person to decide something, it
-  calls its `ask` tool with the question and up to nine choices. Sonny
-  pins the open questions above the composer, oldest first, until each is
-  answered: what you type next answers the first (a choice's number picks
-  it), and goes to the lead as `You asked: QUESTION` and your answer. Esc
-  sets the questions aside for a message of your own, and Esc again goes
-  back to them. The open questions are read from the lead's history (its
-  `ask` calls not yet answered), so one asked while Sonny was closed is
-  pinned when it opens; Sonny keeps them in `~/.agent/sonny/asks` too, so
-  one asked before the history it replays still comes back.
+- **Decisions:** when the lead reaches a fork in the road, an
+  architectural choice or a step that cannot be undone, it calls its `ask`
+  tool with the question, why it asks, two to four options each with what
+  picking it means, and the one it recommends and why. Sonny draws the
+  decision in the conversation where it was asked, and the composer's hint
+  names it: what you type next answers it (an option's number picks it),
+  and goes to the lead as `You asked: QUESTION` and your answer. Esc sets
+  it aside for a message of your own, and Esc again goes back to it. The
+  lead does not wait: it goes on with the option it recommends when that
+  can be undone, or ends its turn. Open questions are read from the
+  history Sonny replays (its `ask` calls not yet answered), so one asked
+  while Sonny was closed is answered the same way when it opens.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
   leaves the agents working.
 
-Sonny declares three tools on the agents it opens and the leads it makes,
-which agents they make inherit: `react`, `ask` and `plan` (the plan the
-person sees, as a checklist), and on a lead `resolve_task` too. The daemon
-shows them to the model and records each call without running anything;
-Sonny draws the calls, live and from history. The lead's Sonny keeps each
+Sonny declares its tools on the agents it opens and the leads it makes,
+which agents they make inherit: `react`, `ask`, `plan` (the plan the
+person sees, as a checklist), `show_agent` and `run_in_pane`; a lead's own,
+which its tasks don't take, are `resolve_task`, `start_task`,
+`remove_task`, `new_project` and `subscriptions`. The daemon shows them to
+the model and records each call: `react`, `ask`, `plan` and `resolve_task`
+run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
+those, running each call in the calling agent's folder, so they work with
+every Sonny window closed; a call nobody answers in time ends as
+`tool_unserved`, and the agent goes on. All but `show_agent` wait for a
+verdict wherever the agent's other calls do (`/approvals`): a start runs
+the folder's setup script, a new project makes a lead, a removal can drop
+work, a subscription sends other bots' words to the subscriber's judge,
+a pane runs a command outside the agent's sandbox, and a trigger is a
+LaunchAgent that runs as you. An agent whose
+gate Sonny did not set, as another client's, goes without these until the
+person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
+of them has a command form. Sonny draws the calls, live and from history,
+and a call answered with an error says why under it. The lead's Sonny keeps each
 task the lead resolved beside the store (`state.sqlite.resolved/`), with
 the task's newest turn finished by then: a turn of the task numbered after
 that one reopens it.
 
-![A plan and a question set with the plan and ask tools](../docs/sonny/ask-and-plan.png)
+![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
+
+![A decision the lead asked with the ask tool, drawn where it asked it](../docs/sonny/ask-asked.png)
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
@@ -295,11 +347,12 @@ Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
-`~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, scripts that
-run this Sonny as `sonny memory ...` (facts saved for later agents, in
-`~/.agents/memory`), `sonny project add DIR ...` (a project and its lead, as
-a lead makes one when the person asks) and `sonny trigger ...` (launchd jobs
-that wake an agent, on a Mac). A skill Sonny wrote is rewritten when Sonny's
+`~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
+`sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
+and `sonny trigger ...` (launchd jobs that wake an agent, on a Mac), which
+other harnesses, scripts and launchd run too; Sonny's own agents use the
+`memory` and `triggers` tools instead, which the lookout answers outside
+their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
@@ -321,9 +374,12 @@ turn a note started that ends with nothing to say stays folded under the
 note, with no sound. It judges with the config's `[judge] model`, the
 approver's setting, else the lead's own model, at `[judge] effort` when
 set, and with the judge `off` sends the task updates alone. Any agent can
-subscribe to more with `sonny lookout add` (other agents' tasks, bots by
-name, questions of its own), and `/background` lists what it watches; see
-[docs/LOOKOUT.md](../docs/LOOKOUT.md).
+subscribe to more with its `subscriptions` tool (other agents' tasks, bots
+by name, questions of its own), and `/background` lists what it watches;
+see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout also answers
+Sonny's tools. A Sonny that finds another build's lookout running, as one
+an upgrade left, stops it and starts its own, so its agents' new tools are
+answered.
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
 goes into the terminal's own scrollback above a small inline viewport,

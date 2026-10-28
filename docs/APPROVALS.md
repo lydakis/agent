@@ -148,7 +148,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   and the model's own prose, so text in a file or web page cannot address
   the judge; adding them made its results worse. OpenAI shows them, marked
   untrusted, but behind a sandbox that still bounds a wrong allow. Agent
-  has no sandbox behind the approver, so it takes Anthropic's side.
+  had no sandbox behind the approver, so it took Anthropic's side until
+  2026-10-28, when it took OpenAI's ([Automatic mode](#automatic-mode)).
 - **Ask narrow questions.** Anthropic's classifier answers against named
   rules and denies with a rule tag; Codex's reviewer returns a risk level
   and the user's authorization separately. Our own Jev probes found the
@@ -517,6 +518,25 @@ this replaced:
   Transcript entries are redacted
   whole before they are cut to size, so a cut never keeps an
   unrecognizable piece of a secret.
+- **Only escapes reach the judge, and it may look before it answers**
+  (2026-10-28, once the daemon's sandbox landed). A sandboxed bot's
+  commands, writes, and edits inside its sandbox run unjudged; the judge
+  gets what leaves it: a command with `sandbox_permissions`
+  `require_escalated` and its `justification`, or a write or edit outside
+  the writable folders. The state gains `sandbox` (its mode, writable
+  folders, and network), and the policy carries Codex's investigation and
+  execution-environment sections: an escalation, or a retry after a
+  sandbox denial, is not suspicious in itself, so the judge weighs the
+  action run unsandboxed, and the justification is the agent's words,
+  untrusted. As Codex runs its guardian, a model judge is a read-only
+  agent turn: its base has `shell` and `read` in a read-only sandbox, so it
+  writes nothing and has no network, and each round's fork starts in the
+  bot's workspace. It calls a tool only when the answer would flip allow
+  or deny, inspects the target of a destructive change first, and treats
+  what it reads as untrusted. Where no sandbox runs, the judge has no
+  tools and judges from the state alone. A judge base left by an older
+  approver, its policy since changed, is remade rather than refused as a
+  bot that is not a judge.
 
 The approver is a client program with its policy as data, like the CLI's
 default compaction text: `agent approver`, a long-running command, and the

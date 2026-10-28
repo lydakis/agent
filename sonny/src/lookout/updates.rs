@@ -498,7 +498,9 @@ impl Updates {
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
         });
-        let theirs = by.as_deref() == Some("the person") && !answered;
+        // One that failed or was stopped is news to the person too: the
+        // lead hears it with its own.
+        let theirs = by.as_deref() == Some("the person") && !answered && status == "completed";
         let turn = Turn {
             first: turn,
             turn,
@@ -1000,6 +1002,21 @@ mod tests {
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
         );
+    }
+
+    #[test]
+    fn a_turn_the_person_asked_for_is_theirs_only_once_it_completed() {
+        let mut updates = fleet();
+        turn(&mut updates, "shop.fix", 4, json!({}), "completed");
+        turn(&mut updates, "shop.docs", 2, json!({}), "failed");
+        let told = updates.take();
+        assert_eq!(
+            text(&told),
+            "- shop.docs: turn:shop.docs/2 failed, asked by the person\n\
+             - shop.fix: turn:shop.fix/4 completed, asked by the person"
+        );
+        let theirs: Vec<bool> = told.items.iter().map(|i| i.theirs).collect();
+        assert_eq!(theirs, [false, true]);
     }
 
     #[test]

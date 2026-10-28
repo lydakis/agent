@@ -12,6 +12,7 @@ mod approvals;
 mod asks;
 mod attach;
 mod background;
+mod banner;
 mod cache;
 mod calls;
 mod declared;
@@ -36,7 +37,9 @@ mod reactions;
 mod resolved;
 mod rex;
 mod screen;
+mod served;
 mod settings;
+mod setup;
 mod shell;
 mod skills;
 mod sound;
@@ -155,104 +158,83 @@ fn usage() -> String {
      --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
      worktrees (the default), or sandfs copies (experimental, built in), which take\n\
      uncommitted changes along and work outside git too.\n\
-     sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
-     folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
-     (or writes here) what a sandfs copy of a plain folder changed.\n\
-     sonny memory ..., sonny project add DIR ... and sonny trigger ... are what\n\
-     ~/.agent/memory, ~/.agent/project and ~/.agent/trigger run, which Sonny writes\n\
-     at each start.\n\
-     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon and\n\
-     wakes it when its tasks need it; Sonny starts one. sonny lookout --replay --judge\n\
-     SPEC[,SPEC]... [--limit N] runs its checks over what the store kept.\n\
+     Agents start tasks, put windows and panes where the person looks, make projects\n\
+     and subscribe to the lookout with tools Sonny gives them, which the lookout answers.\n\
+     sonny task changes NAME [--apply] lists (or writes here) what a sandfs copy of a\n\
+     plain folder changed.\n\
+     sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
+     run, which Sonny writes at each start.\n\
+     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon, wakes\n\
+     it when its tasks need it and answers its agents' calls of Sonny's tools; Sonny\n\
+     starts one. sonny lookout --replay --judge SPEC[,SPEC]... [--limit N] runs its\n\
+     checks over what the store kept.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH."
         .into()
 }
 
-/// `sonny show TASK [--split SIDE [--beside BOT]] [--rex-host HOST]`: put a
-/// task's window where the person asked, from the lead's shell. A task gets
-/// a window of its own unless told otherwise; `--split` puts it beside the
-/// lead's block, or `--beside` another bot's. Another project's lead gets
-/// its project's own home instead (a Rex session, a Herdr workspace),
-/// running that lead's Sonny, unless it is there already.
-async fn show() -> Result<(), String> {
-    let usage =
-        "usage: sonny show AGENT [--split right|left|above|below [--beside BOT]] [--rex-host HOST]";
-    let mut args = std::env::args().skip(2);
-    let bot = args.next().filter(|b| !b.starts_with('-')).ok_or(usage)?;
-    let caller = std::env::var("AGENT_BOT").ok();
-    let (mut side, mut beside, mut host) = (None, caller.clone(), None);
-    while let Some(arg) = args.next() {
-        let mut value = || args.next().ok_or(usage);
-        match arg.as_str() {
-            "--split" => side = Some(value()?),
-            "--beside" => beside = Some(value()?),
-            "--window" => side = None,
-            "--rex-host" => host = Some(value()?),
-            _ => return Err(usage.into()),
-        }
+/// A `show_agent` call of `caller`'s: put `bot`'s window where the person
+/// asked. A task gets a window of its own unless told otherwise; `split`
+/// puts it beside the caller's block, or `beside` another bot's. Another
+/// project's lead gets its project's own home instead (a Rex session, a
+/// Herdr workspace), running that lead's Sonny, unless it is there already.
+async fn show(
+    caller: &str,
+    bot: &str,
+    split: Option<String>,
+    beside: Option<String>,
+) -> Result<Value, String> {
+    if let Some(side) = split.as_deref().filter(|side| !mux::SIDES.contains(side)) {
+        return Err(format!(
+            "{side:?} is not a side: right, left, above or below"
+        ));
     }
-    let (socket, project) = agents_project(caller.as_deref().unwrap_or(&bot)).await?;
+    let (socket, project) = agents_project(caller).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    if side.is_none()
+    if split.is_none()
         && let Some(other) = bot.strip_suffix(".lead").filter(|p| *p != project)
     {
-        return show_lead(&socket, other, &project, host.as_deref(), &me);
+        let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
+        let (home, opened) = open_lead(&socket, store.as_deref(), other, &project, &me)?;
+        return Ok(json!({"bot": bot, "in": home, "opened": opened}));
     }
-    let mut layout = mux::for_agent(&socket, &project, host.as_deref(), None)?;
+    let mut layout = mux::for_agent(&socket, &project, None)?;
     let command = [
         me.to_string_lossy().into_owned(),
         "--socket".into(),
         socket.to_string_lossy().into_owned(),
         "--no-sound".into(),
         "--bot".into(),
-        bot.clone(),
+        bot.to_owned(),
     ];
-    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(&bot);
-    let placement = match side {
+    let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
+    let placement = match split {
         Some(side) => mux::Placement::Split {
             side,
-            beside: beside.ok_or("--split needs --beside BOT outside an agent")?,
+            beside: beside.unwrap_or_else(|| caller.to_owned()),
         },
         None => mux::Placement::Window,
     };
-    layout.place(&bot, short, &command, &placement)?;
+    layout.place(bot, short, &command, &placement)?;
     // The lead's Sonny opens a window for a task whose turn starts, maybe
     // while this placed it: what it opened then goes.
-    std::thread::sleep(Duration::from_millis(1500));
-    layout.close_others(&bot);
-    println!("{}", json!({"bot": bot, "in": layout.home()}));
-    Ok(())
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    layout.close_others(bot);
+    Ok(json!({"bot": bot, "in": layout.home()}))
 }
 
-/// Another project's lead in its project's own home, made when needed in
+/// Open `project`'s lead in that project's own home, made when needed in
 /// the multiplexer `like`'s home is in, running Sonny on it: a session for
-/// each lead, and in it a window for each of its tasks.
-fn show_lead(
-    socket: &std::path::Path,
-    project: &str,
-    like: &str,
-    host: Option<&str>,
-    me: &std::path::Path,
-) -> Result<(), String> {
-    let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
-    let (home, opened) = open_lead(socket, store.as_deref(), project, like, host, me)?;
-    let bot = format!("{project}.lead");
-    println!("{}", json!({"bot": bot, "in": home, "opened": opened}));
-    Ok(())
-}
-
-/// Open `project`'s lead in that project's own home, as `show_lead` says,
-/// unless its Sonny is there already. Returns the home, and whether it
+/// each lead, and in it a window for each of its tasks. A lead whose Sonny
+/// is there already is left as it is. Returns the home, and whether it
 /// was opened now.
 fn open_lead(
     socket: &std::path::Path,
     store: Option<&std::path::Path>,
     project: &str,
     like: &str,
-    host: Option<&str>,
     me: &std::path::Path,
 ) -> Result<(String, bool), String> {
-    let mut layout = mux::for_agent(socket, project, host, Some(like))?;
+    let mut layout = mux::for_agent(socket, project, Some(like))?;
     let bot = format!("{project}.lead");
     let mut command = vec![me.to_string_lossy().into_owned()];
     if let Some(store) = store {
@@ -268,55 +250,45 @@ fn open_lead(
     Ok((layout.home(), opened))
 }
 
-/// The daemon's socket and the project `bot` belongs to, from an agent's
-/// shell.
+/// The daemon's socket and the project `bot` belongs to, for a call of
+/// `bot`'s.
 async fn agents_project(bot: &str) -> Result<(PathBuf, String), String> {
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
-        .ok_or("run this from an agent's shell (AGENT_SOCKET is not set)")?;
+        .ok_or("AGENT_SOCKET is not set")?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
     Ok((socket, project))
 }
 
-/// `sonny run NAME [--split SIDE] [--rex-host HOST] -- COMMAND...`: run a
-/// command an agent wants watched (a dev server, a long build) in a block
-/// labelled `AGENT/NAME`, in a tab of its own, or with `--split` on that
-/// side of the agent's own block, and print the block's ID. It closes with
-/// the agent's window.
-async fn run_command() -> Result<(), String> {
-    let usage =
-        "usage: sonny run NAME [--split right|left|above|below] [--rex-host HOST] -- COMMAND...";
-    let mut args = std::env::args().skip(2);
-    let name = args.next().filter(|n| !n.starts_with('-')).ok_or(usage)?;
-    if name.contains('/') {
+/// A `run_in_pane` call of `owner`'s: run a command it wants watched (a
+/// dev server, a long build) in `cwd`, in a block labelled `OWNER/NAME`,
+/// in a tab of its own, or with `split` on that side of the owner's own
+/// block, and say the block's ID. It closes with the owner's window.
+async fn run_in_pane(
+    owner: &str,
+    name: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    split: Option<String>,
+) -> Result<Value, String> {
+    if name.is_empty() || name.contains('/') {
         return Err("a name without /".into());
     }
-    let owner = std::env::var("AGENT_BOT")
-        .map_err(|_| "run this from an agent's shell (AGENT_BOT is not set)")?;
-    let (mut side, mut host) = (None, None);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--split" => side = Some(args.next().ok_or(usage)?),
-            "--rex-host" => host = Some(args.next().ok_or(usage)?),
-            "--" => break,
-            _ => return Err(usage.into()),
-        }
+    if let Some(side) = split.as_deref().filter(|side| !mux::SIDES.contains(side)) {
+        return Err(format!(
+            "{side:?} is not a side: right, left, above or below"
+        ));
     }
-    let command: Vec<String> = args.collect();
-    if command.is_empty() {
-        return Err(usage.into());
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        return Err(format!("{} is not a folder", cwd.display()));
     }
-    let (socket, project) = agents_project(&owner).await?;
-    let mut layout = mux::for_agent(&socket, &project, host.as_deref(), None)?;
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let block = layout.split(&owner, &name, &cwd, &command, side.as_deref())?;
-    println!(
-        "{}",
-        json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()})
-    );
-    Ok(())
+    let (socket, project) = agents_project(owner).await?;
+    let mut layout = mux::for_agent(&socket, &project, None)?;
+    let command = ["sh".to_owned(), "-c".to_owned(), command.to_owned()];
+    let block = layout.split(owner, name, cwd, &command, split.as_deref())?;
+    Ok(json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()}))
 }
 
 /// The project a bot's name starts with: the longest start that names a
@@ -452,8 +424,9 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
 }
 
 /// The lookout, `sonny lookout`, which wakes leads when their tasks need
-/// them: started detached, logging beside the store. One already watching
-/// this daemon keeps it, and the new one exits.
+/// them and answers Sonny's tools: started detached, logging beside the
+/// store. One already watching this daemon keeps it, and the new one
+/// exits.
 fn start_lookout(options: &Options) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut log = options.store.clone().into_os_string();
@@ -484,14 +457,62 @@ fn start_lookout(options: &Options) -> Result<(), String> {
 }
 
 /// The daemon, started the way the CLI starts it when it is not running.
+/// With no provider set anywhere, the person is asked for one first, and a
+/// first model list is written once it runs.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
-    start_daemon(&options.store, &options.socket, false)?;
-    Client::connect(&options.socket)
+    match start_daemon(&options.store, &options.socket, false) {
+        Err(failed) if failed.code.as_deref() == Some("provider_required") => {
+            if !setup::interactive() {
+                return Err(format!("{failed}; run sonny in a terminal to choose one"));
+            }
+            let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+            setup::provider(&bin)?;
+            start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
+        }
+        started => started.map_err(|e| e.to_string())?,
+    }
+    let connected = Client::connect(&options.socket)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
+        tokio::spawn(first_models(connected.0.clone(), path));
+    }
+    Ok(connected)
+}
+
+/// `~/.agent/models`, the list agents read with `agent models`, written
+/// from the providers' listings when there is none yet, as `agent models
+/// --discover` writes it. A provider that will not list leaves it for the
+/// next start.
+async fn first_models(client: Arc<Client>, path: PathBuf) {
+    let Ok(listing) = client.request("provider_models", json!({})).await else {
+        return;
+    };
+    if let Ok(text) = agent_client::models::render(&listing, &[]) {
+        let _ = agent_client::models::install(&path, &text);
+    }
+}
+
+/// Why the daemon did not start: the CLI's error code when it named one,
+/// and what it said.
+pub struct NotStarted {
+    pub code: Option<String>,
+    reason: String,
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not start the daemon: {}", self.reason)
+    }
+}
+
+impl From<String> for NotStarted {
+    fn from(reason: String) -> Self {
+        NotStarted { code: None, reason }
+    }
 }
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
@@ -501,9 +522,9 @@ fn start_daemon(
     store: &std::path::Path,
     socket: &std::path::Path,
     login: bool,
-) -> Result<(), String> {
+) -> Result<(), NotStarted> {
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
     let mut command = std::process::Command::new(&bin);
     if let Some(environment) = login.then(login::environment).flatten() {
@@ -521,13 +542,15 @@ fn start_daemon(
         .map_err(|e| format!("{}: {e}", bin.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let reason = stderr
+        let failure = stderr
             .lines()
             .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|failure| Some(failure["detail"].as_str()?.to_owned()))
-            .unwrap_or_else(|| stderr.trim().to_owned());
-        return Err(format!("could not start the daemon: {reason}"));
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        let field = |name: &str| Some(failure.as_ref()?[name].as_str()?.to_owned());
+        return Err(NotStarted {
+            code: field("error"),
+            reason: field("detail").unwrap_or_else(|| stderr.trim().to_owned()),
+        });
     }
     Ok(())
 }
@@ -639,12 +662,11 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((task, rest)) if task == "task" => task::run(rest),
-        // `~/.agent/memory` and `~/.agent/project` run these, from agents' shells.
+        // The lookout runs this for each call of a tool Sonny answers.
+        Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
+        // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
-        }
-        Some((verb, rest)) if verb == "project" => {
-            return std::process::ExitCode::from(project::cli(rest) as u8);
         }
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
@@ -672,11 +694,6 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    match std::env::args().nth(1).as_deref() {
-        Some("show") => return show().await,
-        Some("run") => return run_command().await,
-        _ => {}
-    }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("sonny {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -701,7 +718,7 @@ async fn run() -> Result<(), String> {
                 create(&client, &options, bot).await?;
             }
             // Sonny on a project's lead is that lead's Sonny, wherever it
-            // was opened, as by `sonny show` in the project's own home.
+            // was opened, as by `show_agent` in the project's own home.
             (bot.clone(), bot.strip_suffix(".lead").map(str::to_owned))
         }
         None => {
@@ -810,9 +827,8 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(format!("the lookout: {error}"));
     }
-    if project.is_some()
-        && let Err(error) = start_lookout(&app.options)
-    {
+    // It answers the tools Sonny gives every agent, a lead or not.
+    if let Err(error) = start_lookout(&app.options) {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -844,6 +860,10 @@ async fn run() -> Result<(), String> {
         app.move_to = Some(app.workspace.clone());
     }
     app.project = project;
+    // A new project's lead has no history yet: Sonny says hello over it.
+    if fresh && options.side.is_none() {
+        app.welcome = Some(Vec::new());
+    }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
@@ -868,7 +888,13 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .model
         .clone()
         .or_else(|| std::env::var("AGENT_MODEL").ok())
-        .ok_or("--new needs --model PROVIDER/MODEL")?;
+        .map_or_else(
+            || agent_client::config::load().map(|c| c.model),
+            |m| Ok(Some(m)),
+        )?
+        .ok_or(
+            "--new needs --model PROVIDER/MODEL, AGENT_MODEL, or model in ~/.agent/config.toml",
+        )?;
     let workspace = match &options.workspace {
         Some(dir) => std::path::absolute(dir).map_err(|e| e.to_string())?,
         None => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -877,14 +903,15 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
     let instructions = project::as_task(&workspace, &composed.text)?;
+    let declare = json!(declared::tools(false));
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
-        "instructions": instructions, "tools": DEFAULT_TOOLS,
+        "instructions": instructions, "tools": DEFAULT_TOOLS, "declare": declare,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
         asked["settings"] = json!({"cache_ttl": ttl});
     }
-    let tools = DEFAULT_TOOLS.map(String::from);
+    let tools = approvals::gateable(&DEFAULT_TOOLS.map(String::from), &declare);
     if let Value::Object(fields) = &mut asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
     }
@@ -1106,6 +1133,71 @@ enum Words {
     Reply,
 }
 
+/// A call the approver denied: the call, and why.
+#[derive(Debug, Clone, PartialEq)]
+struct Denial {
+    call_id: String,
+    name: String,
+    arguments: Value,
+    reason: String,
+}
+
+/// The most denials `/approve` offers.
+const DENIALS: usize = 8;
+
+/// What the person sends to approve one retry of a denied call: their own
+/// words, so the judge reads the consent, as Codex words it.
+fn approval(denial: &Denial) -> String {
+    format!(
+        "I approve one retry of the action auto-review denied: {} {}\n\n\
+         Treat this as approval to perform that exact action in the same context in which it \
+         was originally requested. Do not assume this also authorizes similar operations with \
+         different payloads.",
+        denial.name, denial.arguments
+    )
+}
+
+/// The most rows of a denied call `/approve` writes out for the person to
+/// read; a longer one is approved in words.
+const RETRY_ROWS: usize = 500;
+
+/// A denied call written out whole before its retry is approved: a
+/// command as it would run with every other argument after it, anything
+/// else as its arguments.
+fn retry_shown(denial: &Denial) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(
+        Span::raw(format!("Approve one retry of {}?", denial.name)).bold(),
+    )];
+    let what = match (denial.arguments["command"].as_str(), &denial.arguments) {
+        (Some(command), Value::Object(fields)) => {
+            let mut what = command.to_owned();
+            for (key, value) in fields.iter().filter(|(key, _)| *key != "command") {
+                what.push_str(&format!("\n{key}: {value}"));
+            }
+            what
+        }
+        _ => serde_json::to_string_pretty(&denial.arguments).unwrap_or_default(),
+    };
+    lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+    lines
+}
+
+/// What the status row says while the approver reviews calls.
+fn reviewing(count: usize) -> String {
+    match count {
+        1 => "Reviewing approval request".into(),
+        n => format!("Reviewing {n} approval requests"),
+    }
+}
+
+/// Why a call was denied, when its output says it was: the reason given,
+/// empty when there was none.
+fn denial(item: &Value) -> Option<String> {
+    let output: Value = serde_json::from_str(item["output"].as_str()?).ok()?;
+    (output["error"] == "approval_denied")
+        .then(|| output["detail"].as_str().unwrap_or("").to_owned())
+}
+
 struct Running {
     turn: i64,
     started: Instant,
@@ -1141,7 +1233,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
 /// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 16] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1152,6 +1244,10 @@ const COMMANDS: [(&str, &str); 15] = [
         "summarize the lead's conversation before its next call",
     ),
     ("/approvals", "whether calls wait for a verdict"),
+    (
+        "/approve",
+        "approve one retry of a recent auto-review denial",
+    ),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     (
@@ -1230,6 +1326,9 @@ struct App {
     /// Lines let go while `/status` held the screen, past what is kept.
     skipped: usize,
     any_history: bool,
+    /// The welcome over a new project's empty transcript: asked for at
+    /// start, drawn once the width is known, and kept for a repaint.
+    welcome: Option<Vec<Line<'static>>>,
     width: usize,
     /// The terminal's rows, which bound how much of the bot's words is held.
     height: usize,
@@ -1249,9 +1348,6 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
-    /// Where its open questions are kept, for those older than the
-    /// history Sonny replays.
-    asks_file: Option<PathBuf>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -1353,10 +1449,23 @@ struct App {
     switch: Option<(String, Option<String>)>,
     /// The bot's tools, which an approval mode gates.
     tools: Vec<String>,
+    /// The tools its client declared, of which a mode gates Sonny's that
+    /// can drop work or run outside the sandbox.
+    declared: Value,
     /// Its approval mode, when it is one of Sonny's.
     mode: Option<&'static str>,
     /// `/approvals`, open over the composer: the mode picked.
     choosing: Option<usize>,
+    /// Calls the approver serving `auto` is reviewing in this turn.
+    reviewing: std::collections::HashSet<String>,
+    /// Calls it denied while Sonny watched, newest last: what `/approve`
+    /// offers to retry once.
+    denials: Vec<Denial>,
+    /// `/approve`, open over the composer: the denial picked.
+    approving: Option<usize>,
+    /// The denied call written out whole for the person to read, which a
+    /// second Enter then approves.
+    approve_shown: Option<String>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
     /// The mode picked, still to give the agents the lead made, and when
@@ -1781,6 +1890,10 @@ impl Fleet {
                 _ => None,
             };
             self.alerts.extend(alert);
+            // A task that waits needs little of its copy's memory.
+            if bot != self.lead && matches!(doing, "done" | "failed" | "needs you") {
+                task::trim(bot);
+            }
         }
     }
 
@@ -1946,6 +2059,7 @@ impl App {
             pending: Vec::new(),
             skipped: 0,
             any_history: false,
+            welcome: None,
             width: 80,
             height: 24,
             live: None,
@@ -1965,7 +2079,6 @@ impl App {
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
                 reactions::key(&store, id)
             }),
-            asks_file: None,
             chatting: false,
             asked: None,
             following: true,
@@ -2020,8 +2133,13 @@ impl App {
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect(),
+            declared: record["declared"].clone(),
             mode: approvals::mode(record),
             choosing: None,
+            reviewing: std::collections::HashSet::new(),
+            denials: Vec::new(),
+            approving: None,
+            approve_shown: None,
             gating: approvals::refresh(record),
             spread: None,
             last_reply: String::new(),
@@ -2041,7 +2159,10 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
-        self.asks_file = self.reactions_key.as_deref().and_then(asks::file);
+        if let Some(welcome) = self.welcome.as_mut() {
+            *welcome = banner::welcome(&self.bot, &tilde(&self.workspace), &self.model, self.width);
+        }
+        self.draw_welcome();
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2266,7 +2387,19 @@ impl App {
             return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
-        let declare = self.declare.take();
+        let mut declare = self.declare.take();
+        // A bot that went without the tools Sonny gates, as its gate was
+        // not Sonny's, has them with the mode the person picks.
+        if declare.is_none() && gating.is_some() && self.mode.is_none() {
+            declare =
+                declared::declare(&json!({"declared": self.declared}), self.project.is_some());
+        }
+        // New tools are gated as the bot's mode gates the rest, so a tool
+        // Sonny gates never runs unjudged where the mode judges.
+        let gating = gating.or(declare
+            .as_ref()
+            .and(self.mode)
+            .filter(|mode| *mode != "full"));
         let mut asked = json!({"bot": self.bot});
         if let Some(text) = &text {
             asked["instructions"] = json!(text);
@@ -2279,10 +2412,17 @@ impl App {
             asked["effort"] = json!(effort);
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
-            fields.extend(approvals::gate(mode, &self.tools));
+            let declared = declare.as_ref().unwrap_or(&self.declared);
+            fields.extend(approvals::gate(
+                mode,
+                &approvals::gateable(&self.tools, declared),
+            ));
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {
+                if let Some(declare) = &declare {
+                    self.declared = declare.clone();
+                }
                 if let Some(text) = &text {
                     project::wrote(&self.lead, text);
                 }
@@ -2354,7 +2494,17 @@ impl App {
         }
         let mut busy = false;
         for bot in approvals::made_by(&bots, &self.bot) {
-            let Some(fields) = approvals::regate(bot, mode) else {
+            // As `inspect` gives it, with the tools its client declared.
+            let Ok(record) = (self.client)
+                .request(
+                    "inspect",
+                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
+                )
+                .await
+            else {
+                continue;
+            };
+            let Some(fields) = approvals::regate(&record, mode) else {
                 continue;
             };
             // That bot, not one given its name since it was listed.
@@ -2458,6 +2608,7 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        self.draw_welcome();
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
             Some(first) => self.history_since(first - 1, true).await,
@@ -2588,9 +2739,7 @@ impl App {
                 .await;
             // A daemon that restarted took the approver and the lookout
             // Sonny started with it.
-            if self.project.is_some()
-                && let Err(error) = start_lookout(&self.options)
-            {
+            if let Err(error) = start_lookout(&self.options) {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
@@ -2612,6 +2761,14 @@ impl App {
     /// A finished call, quiet, as the view shows it: every call when
     /// verbose, else only those [`transcript::clean`] keeps.
     fn commit_call(&mut self, name: &str, arguments: &Value, output: &str, failed: bool) {
+        // A decision for the person stands out where it was asked.
+        if name == asks::TOOL
+            && !failed
+            && let Some(ask) = asks::call("", arguments)
+        {
+            self.commit(asks::lines(&ask, self.width));
+            return;
+        }
         let draw = match self.verbose {
             true => transcript::tool,
             false => transcript::clean,
@@ -2627,7 +2784,20 @@ impl App {
         self.commit(transcript::quiet(lines));
     }
 
+    /// Commit a denied call, in either view.
+    fn commit_denied(&mut self, name: &str, arguments: &Value, reason: &str) {
+        let lines = transcript::denied(name, arguments, reason, &self.workspace, self.width);
+        self.commit(lines);
+    }
+
     /// Commit a finished cell, a blank line apart from the one before.
+    /// The welcome, first in the transcript, when this window has one.
+    fn draw_welcome(&mut self) {
+        if let Some(welcome) = self.welcome.clone() {
+            self.commit(welcome);
+        }
+    }
+
     fn commit(&mut self, lines: Vec<Line<'static>>) {
         self.commit_after(lines, true);
     }
@@ -2762,20 +2932,14 @@ impl App {
         // Drawn from the start (attaching, or a repaint), the bot's
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
-        // The open questions kept, those asked before the history replayed
-        // among them, are joined with the replay's once it is read.
-        let mut kept = None;
+        // The open questions are those the replay asks and does not answer.
         if self.seen_node == 0 || after < self.seen_node {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
-            kept = Some(asks::load(self.asks_file.as_deref()));
             self.asks.clear();
             self.sent_answers.clear();
         }
-        // The questions the replay asks, and the answers to none of them.
-        let mut asked_here: std::collections::HashSet<String> = Default::default();
-        let mut answered_older: Vec<String> = Vec::new();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
@@ -2800,11 +2964,7 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
-                        if !asks::close(&mut self.asks, &text(&item))
-                            && let Some(question) = asks::answered(&text(&item))
-                        {
-                            answered_older.push(question.to_owned());
-                        }
+                        asks::close(&mut self.asks, &text(&item));
                         // What the person ran is shown as it was when it ran.
                         let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
@@ -2838,9 +2998,6 @@ impl App {
                             .and_then(|a| serde_json::from_str(a).ok())
                             .unwrap_or(Value::Null);
                         let name = item["name"].as_str().unwrap_or("tool").to_owned();
-                        if name == asks::TOOL {
-                            asked_here.insert(item["call_id"].as_str().unwrap_or("").to_owned());
-                        }
                         calls.insert(
                             item["call_id"].as_str().unwrap_or("").to_owned(),
                             (name, arguments),
@@ -2866,8 +3023,15 @@ impl App {
                         if let Some((name, arguments)) =
                             calls.remove(id).or_else(|| self.calls.remove(id))
                         {
-                            let (output, failed) = output(&item);
-                            self.commit_call(&name, &arguments, &output, failed);
+                            let (output, mut failed) = output(&item);
+                            match denial(&item) {
+                                Some(reason) => {
+                                    // It never ran: nothing it would have done follows.
+                                    failed = true;
+                                    self.commit_denied(&name, &arguments, &reason);
+                                }
+                                None => self.commit_call(&name, &arguments, &output, failed),
+                            }
                             if name == resolved::TOOL && !failed && !reactions::refused(&item) {
                                 self.resolve(&arguments, id, turns.get(&node).copied(), false)
                                     .await;
@@ -2895,19 +3059,6 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
-        // Kept ones the replay asked are as it left them; the rest were
-        // asked before it, and stay open unless it answered them.
-        if let Some(mut older) = kept {
-            older.retain(|ask| !asked_here.contains(&ask.id));
-            for question in &answered_older {
-                if let Some(at) = older.iter().position(|ask| &ask.question == question) {
-                    older.remove(at);
-                }
-            }
-            older.append(&mut self.asks);
-            self.asks = older;
-        }
-        self.keep_asks();
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
@@ -2953,19 +3104,27 @@ impl App {
             .flat_map(|(_, prompt)| {
                 let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
                     Some(ran) => user_shell::header(&ran.command, width, true),
-                    None => prompt
-                        .split('\n')
-                        .enumerate()
-                        .flat_map(|(at, line)| {
-                            let lead = if at == 0 { "› " } else { "  " };
-                            transcript::wrap(
-                                Line::from(line.to_owned()).dim(),
-                                width,
-                                Span::raw(lead).dim(),
-                                Span::raw("  "),
-                            )
-                        })
-                        .collect(),
+                    None => {
+                        // An answer shows as itself, under the question it answers.
+                        let (asked, prompt) = match asks::split(prompt) {
+                            Some((question, answer)) => {
+                                (Some(asks::answering(question, width)), answer)
+                            }
+                            None => (None, prompt.as_str()),
+                        };
+                        asked
+                            .into_iter()
+                            .chain(prompt.split('\n').enumerate().flat_map(|(at, line)| {
+                                let lead = if at == 0 { "› " } else { "  " };
+                                transcript::wrap(
+                                    Line::from(line.to_owned()).dim(),
+                                    width,
+                                    Span::raw(lead).dim(),
+                                    Span::raw("  "),
+                                )
+                            }))
+                            .collect()
+                    }
                 };
                 std::iter::once(Line::default()).chain(shown)
             })
@@ -3386,6 +3545,7 @@ impl App {
                 self.end_live(Words::Step);
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
+                self.reviewing.remove(id);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
                     true => self.call(id).await.map(|(_, arguments)| arguments),
@@ -3406,6 +3566,9 @@ impl App {
                 let id = data["call_id"].as_str().unwrap_or("");
                 // A call denied before it started has no start to have
                 // kept it: it is read from the bot's items.
+                // Done with review, whatever came of it: a call cancelled
+                // before it started ends here too.
+                self.reviewing.remove(id);
                 let call = match self.calls.remove(id) {
                     Some(call) => Some(call),
                     None if data["denied"] == true => self.call(id).await,
@@ -3416,6 +3579,7 @@ impl App {
                 };
                 self.end_live(Words::Step);
                 let mut shown = (String::new(), data["failed"] == true);
+                let mut reason = String::new();
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self
                         .items(&[node])
@@ -3425,11 +3589,34 @@ impl App {
                 {
                     shown = output(item);
                     shown.1 |= data["failed"] == true;
+                    reason = denial(item).unwrap_or_default();
                 }
                 if data["denied"] == true {
-                    shown = ("denied".into(), true);
+                    // It never ran: nothing it would have done follows.
+                    shown.1 = true;
+                    self.commit_denied(&name, &arguments, &reason);
+                    // The approver's, not the person's: `/approve` may
+                    // retry it once.
+                    let by_auto = data["approvals"].as_array().is_some_and(|verdicts| {
+                        verdicts
+                            .iter()
+                            .any(|v| v["tag"] == "auto" && v["allow"] == false)
+                    });
+                    if by_auto {
+                        self.denials.retain(|d| d.call_id != id);
+                        self.denials.push(Denial {
+                            call_id: id.to_owned(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            reason,
+                        });
+                        if self.denials.len() > DENIALS {
+                            self.denials.remove(0);
+                        }
+                    }
+                } else {
+                    self.commit_call(&name, &arguments, &shown.0, shown.1);
                 }
-                self.commit_call(&name, &arguments, &shown.0, shown.1);
                 if name == asks::TOOL && !shown.1 {
                     self.asked(id, &arguments);
                 }
@@ -3446,7 +3633,11 @@ impl App {
                 }
                 self.approvals.retain(|call| call["call_id"] != id);
                 if let Some(running) = &mut self.running {
-                    running.phase = "Working".into();
+                    // The judge may still be reviewing the round's others.
+                    running.phase = match self.approvals.is_empty() && !self.reviewing.is_empty() {
+                        true => reviewing(self.reviewing.len()),
+                        false => "Working".into(),
+                    };
                 }
             }
             "approval_requested" | "approval_asked" => self.approvals_for(turn).await,
@@ -3478,6 +3669,8 @@ impl App {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
+                // Nothing of an ended turn is still under review.
+                self.reviewing.clear();
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
                 let running = self.running.take();
@@ -4057,6 +4250,21 @@ impl App {
         else {
             return;
         };
+        // What the approver serving `auto` is still reviewing: not yet
+        // handed to the person.
+        self.reviewing = page["approvals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|call| {
+                call["turn"].as_i64() == turn
+                    && call["asked"].is_null()
+                    && call["gates"]
+                        .as_array()
+                        .is_some_and(|gates| gates.iter().any(|g| g == "auto"))
+            })
+            .filter_map(|call| call["call_id"].as_str().map(str::to_owned))
+            .collect();
         self.approvals = page["approvals"]
             .as_array()
             .into_iter()
@@ -4097,6 +4305,12 @@ impl App {
                 Some(arguments) => call["arguments"] = arguments,
                 None => call["incomplete"] = json!(true),
             }
+        }
+        if let Some(running) = &mut self.running
+            && self.approvals.is_empty()
+            && !self.reviewing.is_empty()
+        {
+            running.phase = reviewing(self.reviewing.len());
         }
         if !self.approvals.is_empty() {
             status_report("blocked", &self.bot);
@@ -4319,6 +4533,65 @@ impl App {
                     KeyCode::Esc => self.reacting = None,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.reacting = None
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if let Some(pick) = &mut self.approving {
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+            {
+                let count = self.denials.len().max(1);
+                match key.code {
+                    KeyCode::Up => *pick = (*pick + count - 1) % count,
+                    KeyCode::Down => *pick = (*pick + 1) % count,
+                    KeyCode::Enter => {
+                        let at = *pick;
+                        // The person approves only what they have read:
+                        // the whole call first, then a second Enter.
+                        if let Some(denied) = self.denials.get(at)
+                            && self.approve_shown.as_deref() != Some(denied.call_id.as_str())
+                        {
+                            let lines = retry_shown(denied);
+                            // Past what the screen keeps, the start would
+                            // scroll away unread.
+                            if lines.len() > RETRY_ROWS {
+                                self.notice = Some(format!(
+                                    "{} lines is too long to read here: say in a message what to retry",
+                                    lines.len() - 1
+                                ));
+                                return;
+                            }
+                            self.approve_shown = Some(denied.call_id.clone());
+                            self.commit(lines);
+                            self.notice = Some("enter again to approve this exact call".into());
+                            return;
+                        }
+                        self.approving = None;
+                        self.approve_shown = None;
+                        if at < self.denials.len() {
+                            let denied = self.denials.remove(at);
+                            self.notice =
+                                Some(match self.send(approval(&denied), None, false, &[]).await {
+                                    Ok(()) => {
+                                        "approved one retry; the retry is still reviewed".into()
+                                    }
+                                    Err(error) => {
+                                        self.denials.insert(at, denied);
+                                        error
+                                    }
+                                });
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.approving = None;
+                        self.approve_shown = None;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.approving = None;
+                        self.approve_shown = None;
                     }
                     _ => {}
                 }
@@ -4652,6 +4925,14 @@ impl App {
             }
             return;
         }
+        if prompt == "/approve" {
+            self.input.clear();
+            match self.denials.len() {
+                0 => self.notice = Some("no recent auto-review denials".into()),
+                newest => self.approving = Some(newest - 1),
+            }
+            return;
+        }
         if prompt == "/approvals" {
             self.input.clear();
             let current = self.gating.or(self.mode);
@@ -4831,8 +5112,6 @@ impl App {
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
-                    // After the notice is cleared, so a failure to keep shows.
-                    self.keep_asks();
                     if self.asks.is_empty() {
                         self.chatting = false;
                     }
@@ -4943,20 +5222,12 @@ impl App {
         }
     }
 
-    /// The question an `ask` call put, pinned until it is answered.
+    /// The question an `ask` call put, open until it is answered.
     fn asked(&mut self, id: &str, arguments: &Value) {
         if let Some(ask) = asks::call(id, arguments)
             && !self.asks.iter().any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
-            self.keep_asks();
-        }
-    }
-
-    /// The open questions kept for the next start.
-    fn keep_asks(&mut self) {
-        if let Err(error) = asks::keep(self.asks_file.as_deref(), &self.asks) {
-            self.notice = Some(error);
         }
     }
 
@@ -4971,7 +5242,6 @@ impl App {
             return;
         }
         asks::close(&mut self.asks, message);
-        self.keep_asks();
         if self.asks.is_empty() {
             self.chatting = false;
         }
@@ -5264,8 +5534,6 @@ impl App {
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
-        // The lead's questions stay pinned above the status row.
-        open_rows.extend(asks::rows(&self.asks, width, self.chatting));
         let spare = room.saturating_sub(composer_rows.len()) + 1;
         let hidden = open_rows.len().saturating_sub(spare.max(1));
         open_rows.drain(..hidden);
@@ -5430,6 +5698,63 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some(pick) = self.approving {
+                // Newest last, as they happened; the reason stays in view
+                // before a retry is approved.
+                let shown = self.denials.len().min(5);
+                let first = pick
+                    .saturating_sub(shown - 1)
+                    .min(self.denials.len() - shown);
+                let room = (composer.width as usize).saturating_sub(6);
+                let rows: Vec<Line> = self.denials[first..first + shown]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, denied)| {
+                        let what =
+                            transcript::action(&denied.name, &denied.arguments, &self.workspace);
+                        let why = denied
+                            .reason
+                            .lines()
+                            .find(|line| line.trim_start().starts_with("Reason:"))
+                            .or_else(|| denied.reason.lines().next())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned();
+                        let what = transcript::cut(&what, room / 2);
+                        let why =
+                            transcript::cut(&why, room.saturating_sub(what.chars().count() + 2));
+                        if first + i == pick {
+                            Line::from(vec![
+                                Span::raw("  "),
+                                Span::raw(format!(" {what}  {why} ")).reversed(),
+                            ])
+                        } else {
+                            Line::from(vec![
+                                Span::raw(format!("   {what}")),
+                                Span::raw(format!("  {why}")).dim(),
+                            ])
+                        }
+                    })
+                    .collect();
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(shown as u16),
+                    height: shown as u16,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw("auto-review denials: approve one retry").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(line), composer);
+                let keys = Line::from(
+                    "  ↑↓ denial · enter to read it whole, again to approve one retry · esc",
+                )
+                .dim();
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(pick) = self.choosing {
                 let rows: Vec<Line> = approvals::MODES
                     .iter()
@@ -5543,6 +5868,8 @@ impl App {
     /// column. A list or picker open over the composer keeps it to the
     /// cursor's row.
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
+        // What is sent answers the lead's first open question.
+        let answering = (!self.chatting).then(|| self.asks.first()).flatten();
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
@@ -5550,16 +5877,20 @@ impl App {
                 None => self.bot.clone(),
             };
             let hint = match self.running {
-                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat".into(),
+                _ if let Some(ask) = answering => {
+                    asks::hint(ask, self.asks.len() - 1, width.saturating_sub(prompt::LEAD))
+                }
                 _ if self.react_to.is_some() => "An emoji for that reply, or Esc".into(),
+                _ if !self.asks.is_empty() => "A message of your own, or Esc to answer".into(),
                 Some(_) => format!("Steer {name}"),
                 None => format!("Message {name}"),
             };
+            let lead = match answering {
+                Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
+                None => Span::raw("› ").bold(),
+            };
             return (
-                vec![Line::from(vec![
-                    Span::raw("› ").bold(),
-                    Span::raw(hint).dim(),
-                ])],
+                vec![Line::from(vec![lead, Span::raw(hint).dim()])],
                 (0, prompt::LEAD),
             );
         }
@@ -5573,6 +5904,7 @@ impl App {
             .map(|(at, part)| {
                 let lead = match at {
                     0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
+                    0 if answering.is_some() => Span::raw("? ").bold().fg(Color::Yellow),
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
@@ -5583,6 +5915,7 @@ impl App {
             })
             .collect();
         let keep = match self.choosing.is_some()
+            || self.approving.is_some()
             || self.picker.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
@@ -5950,7 +6283,7 @@ mod tests {
         let mut leads = std::collections::HashSet::new();
         assert_eq!(kin("ws.fix2", "ws.fix", "ws", &lineage, &leads), Kin::Task);
         assert_eq!(kin("ws.side", "", "ws", &lineage, &leads), Kin::Task);
-        // Whoever made it, as `sonny project add` says no one.
+        // Whoever made it, as the new_project tool says no one.
         assert_eq!(
             kin("ws.web.lead", "", "ws", &lineage, &leads),
             Kin::Lead("ws.web".into())
@@ -6092,10 +6425,14 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        let ask = |id: &str, question: &str| asks::Ask {
-            id: id.into(),
-            question: question.into(),
-            choices: vec!["Keep it".into(), "Drop it".into()],
+        let ask = |id: &str, question: &str| {
+            asks::call(
+                id,
+                &json!({"question": question, "options": [
+                    {"label": "Keep it", "explanation": "e"},
+                    {"label": "Drop it", "explanation": "e"}]}),
+            )
+            .unwrap()
         };
         app.asks = vec![
             ask("c1", "Keep the old API?"),
@@ -6124,71 +6461,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kept_questions_join_the_replay_by_the_call_that_asked_them() {
-        let user = |text: &str| {
-            json!({"type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": text}]})
-        };
-        let ask = |id: &str, question: &str| {
-            [
-                json!({"type": "function_call", "name": "ask", "call_id": id,
-                    "arguments": json!({"question": question}).to_string()}),
-                json!({"type": "function_call_output", "call_id": id, "output": "Asked."}),
-            ]
-        };
-        // Asked twice, answered between: the second is the one open. An
-        // older question, answered in the history replayed, is closed; one
-        // never answered stays.
-        let mut items = vec![user("go on")];
-        items.extend(ask("c1", "Proceed?"));
-        items.push(user("You asked: Proceed?\n\nyes"));
-        items.extend(ask("c2", "Proceed?"));
-        items.push(user("You asked: Rename the crate?\n\nno"));
-        let count = items.len() as i64;
-        let client = daemon_answering(move |asked| match asked["op"].as_str() {
-            Some("history_nodes") => {
-                json!({"nodes": (1..=count).rev().map(|node| json!({"node": node}))
-                .collect::<Vec<_>>(), "next_from": null})
-            }
-            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
-                .map(|node| json!({"node": node,
-                    "item": items[node.as_u64().unwrap() as usize - 1]}))
-                .collect::<Vec<_>>()}),
-        })
-        .await;
-        let mut app = app(client);
-        let file =
-            std::env::temp_dir().join(format!("sonny-asks-join-{}.json", std::process::id()));
-        let kept =
-            |id: &str, question: &str| asks::call(id, &json!({"question": question})).unwrap();
-        asks::keep(
-            Some(&file),
-            &[
-                kept("o1", "Rename the crate?"),
-                kept("o2", "Bump the version?"),
-                kept("c2", "Proceed?"),
-            ],
-        )
-        .unwrap();
-        app.asks_file = Some(file.clone());
-        app.history().await;
-        assert_eq!(
-            app.asks,
-            [kept("o2", "Bump the version?"), kept("c2", "Proceed?")]
-        );
-        let _ = std::fs::remove_file(&file);
-    }
-
-    #[tokio::test]
-    async fn a_question_asked_is_pinned_until_an_answer_lands() {
+    async fn a_question_asked_stays_open_until_an_answer_lands() {
         let items = json!({
             "1": {"type": "message", "role": "user",
                   "content": [{"type": "input_text", "text": "ship it?"}]},
             "2": {"type": "function_call", "name": "ask", "call_id": "a1",
-                  "arguments": "{\"question\":\"Tag 0.4.1?\",\"choices\":[\"Yes\",\"No\"]}"},
+                  "arguments": json!({"question": "Tag 0.4.1?", "why": "Main is green.",
+                      "options": [{"label": "Yes", "explanation": "Brew gets it tonight."},
+                          {"label": "No", "explanation": "It waits for #240."}],
+                      "recommended": 1, "reason": "Nothing else is due."}).to_string()},
             "3": {"type": "function_call_output", "call_id": "a1", "output": "Asked."},
             "4": {"type": "function_call", "name": "ask", "call_id": "a2",
-                  "arguments": "{\"question\":\"Bump?\",\"choices\":[1]}"},
+                  "arguments": "{\"question\":\"Bump?\",\"options\":[1]}"},
             "5": {"type": "function_call_output", "call_id": "a2",
                   "output": "{\"error\":\"invalid_arguments\"}"},
             "6": {"type": "function_call", "name": "ask", "call_id": "a3",
@@ -6208,32 +6492,23 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        // Kept from before: one asked earlier than the history replayed,
-        // and one the history asks again.
-        let file = std::env::temp_dir().join(format!("sonny-asks-app-{}.json", std::process::id()));
-        let older = asks::call("o1", &json!({"question": "Rename the crate?"})).unwrap();
-        let tag = asks::Ask {
-            id: "a1".into(),
-            question: "Tag 0.4.1?".into(),
-            choices: vec!["Yes".into(), "No".into()],
-        };
-        asks::keep(Some(&file), &[older.clone(), tag.clone()]).unwrap();
-        app.asks_file = Some(file.clone());
         app.history().await;
-        // The refused one was never asked, and the answered one is closed;
-        // the older one is still open.
-        assert_eq!(app.asks, [older.clone(), tag]);
-        assert_eq!(asks::load(Some(&file)), app.asks);
-        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
-        assert!(
-            rows.contains(&"• Asked you Tag 0.4.1?".to_owned()),
-            "{rows:?}"
+        // The refused one was never asked, and the answered one is closed.
+        assert_eq!(
+            app.asks.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a1"]
         );
+        // Drawn where it was asked, with what each option means.
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        let at = rows
+            .iter()
+            .position(|r| r == "? Tag 0.4.1?")
+            .expect("asked");
+        assert_eq!(rows[at + 4], "     Brew gets it tonight.");
+        assert_eq!(rows[at + 8], "  Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
-        app.answered("You asked: Rename the crate?\n\nNo");
         assert!(app.asks.is_empty());
-        assert!(!file.exists());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
         app.daemon(turn_event("accepted", 4, json!({}))).await;
@@ -6247,7 +6522,186 @@ mod tests {
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "a4"})))
             .await;
         assert_eq!(app.asks[0].question, "Merge?");
-        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn an_auto_review_denial_is_drawn_and_approve_sends_one_retry() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let reason = "This action was rejected due to unacceptable risk (risk: high, authorization: low).\n\
+            Reason: It force-pushes the default branch.\n\
+            The agent must not attempt to achieve the same outcome via workaround.";
+        let items = json!({
+            "6": {"type": "function_call", "call_id": "c1", "name": "shell",
+                "arguments": json!({"command": "git push --force origin main"}).to_string()},
+            "7": {"type": "function_call_output", "call_id": "c1",
+                "output": json!({"error": "approval_denied", "detail": reason}).to_string()},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                seen.lock().unwrap().push(asked["prompt"].clone());
+                json!({"turn": 5})
+            }
+            Some("history_nodes") => json!({"nodes": [{"node": 7}, {"node": 6}]}),
+            Some("history_items") => {
+                let read: Vec<Value> = asked["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                    .collect();
+                json!({"items": read})
+            }
+            Some("approvals") => json!({"approvals": [
+                {"turn": 4, "call_id": "c1", "gates": ["auto"], "asked": null},
+                {"turn": 4, "call_id": "c2", "gates": ["auto"], "asked": null}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        app.daemon(turn_event("approval_requested", 4, json!({"calls": []})))
+            .await;
+        // While the approver reviews, the status row says so.
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Reviewing 2 approval requests"
+        );
+        app.daemon(turn_event(
+            "tool_completed",
+            4,
+            json!({"call_id": "c1", "node": 7, "denied": true,
+                "approvals": [{"tag": "auto", "by": "approver", "allow": false}]}),
+        ))
+        .await;
+        // The other is still under review.
+        assert_eq!(app.reviewing.len(), 1);
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Reviewing approval request"
+        );
+        // A question denied was never asked.
+        let question = json!({"question": "Merge?"}).to_string();
+        app.daemon(turn_event(
+            "tool_started",
+            4,
+            json!({"call_id": "c2", "name": "ask", "arguments": question}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            4,
+            json!({"call_id": "c2", "denied": true,
+                "approvals": [{"tag": "auto", "by": "approver", "allow": false}]}),
+        ))
+        .await;
+        assert!(app.reviewing.is_empty() && app.asks.is_empty());
+        assert_eq!(app.running.as_ref().unwrap().phase, "Working");
+        app.denials.retain(|denial| denial.call_id == "c1");
+        // One cancelled before it started leaves review too.
+        app.reviewing.insert("c3".into());
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c3"})))
+            .await;
+        assert!(app.reviewing.is_empty());
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rows.contains(&"✗ Request denied for git push --force origin main".to_owned()),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row == "    Reason: It force-pushes the default branch."),
+            "{rows:?}"
+        );
+        // `/approve` offers it; Enter sends the person's approval of that
+        // exact call, once.
+        app.running = None;
+        app.input.set("/approve");
+        app.submit().await;
+        assert_eq!(app.approving, Some(0));
+        let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The first Enter writes the whole call out; nothing is sent yet.
+        app.key(enter()).await;
+        assert_eq!(app.approving, Some(0));
+        assert!(sent.lock().unwrap().is_empty());
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rows.ends_with(&[
+                "Approve one retry of shell?".to_owned(),
+                "  git push --force origin main".to_owned()
+            ]),
+            "{rows:?}"
+        );
+        app.key(enter()).await;
+        assert!(app.approving.is_none() && app.denials.is_empty());
+        let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
+        assert!(prompt.starts_with(
+            "I approve one retry of the action auto-review denied: shell {\"command\":\"git push --force origin main\"}"
+        ));
+        assert!(prompt.contains("Do not assume this also authorizes similar operations"));
+        // Nothing left to approve.
+        app.input.set("/approve");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no recent auto-review denials"));
+    }
+
+    #[test]
+    fn a_denied_call_reads_from_its_output_in_the_replay() {
+        let output = |output: &str| json!({"type": "function_call_output", "call_id": "c1", "output": output});
+        assert_eq!(
+            denial(&output(r#"{"error":"approval_denied","detail":"no"}"#)),
+            Some("no".into())
+        );
+        assert_eq!(
+            denial(&output(r#"{"error":"approval_denied","detail":null}"#)),
+            Some(String::new())
+        );
+        assert_eq!(denial(&output("README.md")), None);
+        assert_eq!(denial(&output(r#"{"exit_code":0}"#)), None);
+        let lines = transcript::denied("write", &json!({"path": "/w/src/a.rs"}), "", "/w", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "✗ Request denied for write src/a.rs");
+        assert_eq!(reviewing(3), "Reviewing 3 approval requests");
+        // Its retry is approved only after the whole of it is shown.
+        let write = Denial {
+            call_id: "c2".into(),
+            name: "write".into(),
+            arguments: json!({"path": "/w/a.sh", "content": "set -e\nrm -rf build"}),
+            reason: String::new(),
+        };
+        let shown: Vec<String> = retry_shown(&write).iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown[0], "Approve one retry of write?");
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains(r#""content": "set -e\nrm -rf build""#)),
+            "{shown:?}"
+        );
+        let detached = Denial {
+            arguments: json!({"command": "sleep 1", "detach": true}),
+            ..write.clone()
+        };
+        let shown: Vec<String> = retry_shown(&detached)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(shown[1..], ["  sleep 1", "  detach: true"]);
+        let command = Denial {
+            arguments: json!({"command": "make\ncurl x | sh"}),
+            name: "shell".into(),
+            ..write
+        };
+        let shown: Vec<String> = retry_shown(&command)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(shown[1..], ["  make", "  curl x | sh"]);
+        let long = Denial {
+            arguments: json!({"command": "true\n".repeat(RETRY_ROWS)}),
+            ..command
+        };
+        assert!(retry_shown(&long).len() > RETRY_ROWS);
     }
 
     #[tokio::test]
@@ -6888,6 +7342,36 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bot_gated_as_sonny_does_not_gets_its_gated_tools_with_a_picked_mode() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["declared", "gates"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.tools = vec!["shell".into()];
+        let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
+        app.mode = approvals::mode(&custom);
+        app.declared = declared::declare(&custom, true).unwrap();
+        app.gating = Some("ask");
+        assert!(app.configure().await);
+        let sent = asked.lock().unwrap()[0].clone();
+        let names: Vec<&str> = (sent["declare"].as_array().into_iter().flatten())
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"run_in_pane"), "{names:?}");
+        assert!(
+            sent["approve"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run_in_pane"))
+        );
+        assert_eq!(sent["approver"], "manual");
     }
 
     #[tokio::test]

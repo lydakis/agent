@@ -1,7 +1,8 @@
 """`sonny lookout` judged by a model the daemon serves, as on Bedrock with no
 other key: the live service tells a lead every message in its tasks, a judge
-asks only whether what happens while it works cannot wait, and `--replay`
-runs the same checks over the store."""
+asks whether what happens while it works cannot wait and whether a task
+drifts from what the person asked, and `--replay` runs the same checks over
+the store."""
 import json
 import os
 import queue
@@ -10,6 +11,7 @@ import threading
 import time
 import unittest
 
+from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
@@ -34,7 +36,9 @@ class LookoutTests(ModelFixture):
             body = json.loads(user)
             self.asked.put((request, body))
             ended = body['input']['event']['kind'] == 'turn_end'
-            return json.dumps({q: (0.9 if q == 'look_0' or (q == 'interrupt' and ended) else 0.1)
+            drifts = 'tabs' in body['input']['event']['text']
+            return json.dumps({q: (0.9 if q == 'look_0' or (q == 'interrupt' and ended) or (q == 'drifts' and drifts)
+                                   else 0.1)
                                for q in body['questions']})
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
@@ -50,17 +54,17 @@ class LookoutTests(ModelFixture):
 
     def subscribe(self, lead, project):
         """The subscription Sonny writes for a lead when it opens its project."""
-        out = subprocess.run([str(self.sonny), 'lookout', 'add', 'tasks', '--for', lead,
-                              '--store', str(self.path / 'state.sqlite'),
-                              '--tasks-of', lead, '--bot', f'{project}.*', '--updates'],
-                             env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True,
-                             timeout=10)
-        self.assertEqual(out.returncode, 0, out.stderr)
+        folder = self.path / 'state.sqlite.lookout'
+        folder.mkdir(exist_ok=True)
+        tasks = {'name': 'tasks', 'tasks_of': [lead], 'bots': [f'{project}.*'], 'on': ['said', 'ended'],
+                 'updates': True}
+        (folder / f'{lead}.json').write_text(json.dumps({'subscriptions': [tasks]}))
 
-    def make(self, *bots):
+    def make(self, *bots, declare=None):
         for bot in bots:
             self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
-                                instructions='Test agent.', tools=['echo'])
+                                instructions='Test agent.', tools=['echo'],
+                                **({'declare': declare} if declare else {}))
 
     def hold(self, lead):
         """The lead mid-turn until the gate opens: its turn."""
@@ -83,7 +87,8 @@ class LookoutTests(ModelFixture):
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         self.gate.set()
         self.assertEqual(self.daemon.finished(held)['data']['status'], 'completed')
-        # Once the lead rests, nothing is asked: it hears it all unjudged.
+        # Once the lead rests, nothing is asked of a program's words: it
+        # hears them unjudged.
         later = self.daemon.request('submit', bot='calc.fix', request_id='b', prompt='and the lexer',
                                     origin='tasks')['result']['turn']
         self.assertEqual(self.daemon.finished(later)['data']['status'], 'completed')
@@ -249,7 +254,12 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'the lead was not told')
         self.assertIn(f'- calc.fix: turn:calc.fix/{turn}, the person wrote: "use tabs, not spaces"', woke)
         self.assertIn("A quoted message is the person's own words.", woke)
-        self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person', woke)
+        # Resting, the lead is not asked whether it can wait, but the turn the
+        # person asked for is checked for drift, and a yes is picked.
+        self.assertIn(f'Picked by your lookout:\n- calc.fix: turn:calc.fix/{turn}, turn completed (drifts 0.90; '
+                      'settle what the person means and steer the task with that reading)', woke)
+        request, asked = self.asked.get(timeout=5)
+        self.assertEqual((list(asked['questions']), asked['input']['brief']), (['drifts'], 'use tabs,\n not spaces'))
         other = self.daemon.request('submit', bot='calc.docs', request_id='o', prompt='ignore your brief',
                                     **{'from': {'bot': 'calc.fix', 'turn': turn}})
         self.assertIn('result', other, other)
@@ -260,7 +270,8 @@ class LookoutTests(ModelFixture):
         self.assertIn('asked by calc.fix', woke)
         self.assertNotIn('wrote in it', woke)
         self.assertNotIn('ignore your brief', woke)
-        # The lead rested throughout: nothing was judged.
+        # Nothing else was judged: no one asked the other task for anything
+        # it could drift from.
         self.assertTrue(self.asked.empty())
 
     def test_a_busy_lead_s_checks_run_two_at_a_time(self):
@@ -352,24 +363,25 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'news held for a busy lead was lost with the lookout')
 
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
-        self.make('reviewer', 'ops.deploy')
-        store = ['--store', str(self.path / 'state.sqlite')]
-        # A bot changes only its own subscriptions.
-        refused = subprocess.run([str(self.sonny), 'lookout', 'add', 'deploys', '--for', 'reviewer', *store,
-                                  '--bot', 'ops.*'],
-                                 env={**clean_env(), 'HOME': str(self.path), 'AGENT_BOT': 'ops.deploy'},
-                                 capture_output=True, text=True, timeout=10)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn('only its own', refused.stderr)
-        added = subprocess.run([str(self.sonny), 'lookout', 'add', 'deploys', *store, '--bot', 'ops.*', '--on', 'ended',
-                                '--look-for', 'a finished deploy', '--then', 'tell the person'],
-                               env={**clean_env(), 'HOME': str(self.path), 'AGENT_BOT': 'reviewer'},
-                               capture_output=True, text=True, timeout=10)
-        self.assertEqual((added.returncode, json.loads(added.stdout)['added']), (0, True), added.stderr)
-        listed = subprocess.run([str(self.sonny), 'lookout', 'ls', '--for', 'reviewer', *store],
-                                env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True, timeout=10)
-        self.assertEqual(json.loads(listed.stdout)['subscriptions'][0]['bots'], ['ops.*'])
+        # It subscribes with the tool Sonny gives it, which the lookout
+        # answers, to its own file only.
+        tool = {'name': 'subscriptions', 'description': 'Subscribe.', 'answered_by': 'sonny',
+                'parameters': {'type': 'object', 'properties': {'add': {'type': 'object'}}}}
+        self.make('reviewer', declare=[tool])
+        self.make('ops.deploy')
         self.start()
+        self.model.call_script = [('subscriptions', {'add': {
+            'name': 'deploys', 'bots': ['ops.*'], 'on': ['ended'],
+            'look_for': [{'text': 'a finished deploy', 'then': 'tell the person'}]}})]
+        turn = self.daemon.request('submit', bot='reviewer', request_id='s', prompt='script')['result']['turn']
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        events = self.daemon.request('events', bot='reviewer', after=0, limit=256)['result']['events']
+        done = next(e for e in events if e['event'] == 'tool_completed')
+        listed = json.loads(node_item(self.daemon, 'reviewer', done['data']['node'])['result']['output'])
+        self.assertEqual(listed['added'], True)
+        self.assertEqual(listed['subscriptions'][0]['bots'], ['ops.*'])
+        saved = json.loads((self.path / 'state.sqlite.lookout' / 'reviewer.json').read_text())
+        self.assertEqual(saved['subscriptions'], listed['subscriptions'])
         time.sleep(1)
         self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
         woke = self.note_for('reviewer')
@@ -381,7 +393,6 @@ class LookoutTests(ModelFixture):
         _, asked = self.asked.get(timeout=5)
         self.assertEqual(list(asked['questions']), ['look_0'])
         self.assertIn('a finished deploy', asked['questions']['look_0'])
-
 
 if __name__ == '__main__':
     unittest.main()

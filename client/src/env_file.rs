@@ -85,6 +85,77 @@ pub fn read(path: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(environment)
 }
 
+/// What a program Sonny starts sees as `name`: the file's value over this
+/// process's own, as it is applied to them, an empty one unsetting it.
+pub fn var(name: &str) -> Option<String> {
+    let kept = path()
+        .and_then(|file| read(&file).ok())
+        .and_then(|pairs| pairs.into_iter().rev().find(|(key, _)| key == name));
+    match kept {
+        Some((_, value)) => Some(value),
+        None => std::env::var(name).ok(),
+    }
+    .filter(|value| !value.is_empty())
+}
+
+/// Sets each of `pairs` in the file at `path`, made readable only by its
+/// owner when it is new: earlier lines naming one of them are dropped,
+/// every other line is kept as it was, and the file is replaced whole.
+pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // A file this refuses to read is the person's to fix, not to replace.
+    read(path)?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("env_file_unreadable: {}: {error}", path.display())),
+    };
+    let named = |line: &str| {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        line.split_once('=')
+            .is_some_and(|(key, _)| pairs.iter().any(|(name, _)| *name == key.trim_end()))
+    };
+    let mut kept: String = text
+        .lines()
+        .filter(|line| !named(line))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    for (key, value) in pairs {
+        if value.contains(['\n', '\r']) {
+            return Err(format!("env_file_invalid: {key} holds a line break"));
+        }
+        kept.push_str(&format!("{key}={}\n", value.trim()));
+    }
+    if kept.len() as u64 > MAX {
+        return Err(format!(
+            "env_file_invalid: {} must be a regular file of at most {MAX} bytes",
+            path.display()
+        ));
+    }
+    let failed =
+        |error: std::io::Error| format!("env_file_unwritable: {}: {error}", path.display());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(failed)?;
+    }
+    let staged = path.with_file_name(format!(".env.{}", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)?;
+        file.write_all(kept.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&staged, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written.map_err(failed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +209,33 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
             read(&file)
+                .unwrap_err()
+                .starts_with("env_file_permissions: ")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setting_keys_replaces_theirs_and_keeps_every_other_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("agent-client-set-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let file = root.join("env");
+        set(&file, &[("AGENT_PROVIDER", "bedrock")]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&file, "# mine\nexport AGENT_MODEL=a/b\nOTHER=1\n").unwrap();
+        set(&file, &[("AGENT_MODEL", "c/d"), ("AWS_PROFILE", " dev ")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "# mine\nOTHER=1\nAGENT_MODEL=c/d\nAWS_PROFILE=dev\n"
+        );
+        assert!(set(&file, &[("KEY", "a\nb")]).is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            set(&file, &[("KEY", "1")])
                 .unwrap_err()
                 .starts_with("env_file_permissions: ")
         );
