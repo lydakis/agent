@@ -784,6 +784,58 @@ pub fn quiet(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// What a call would have done, in a few words: a command's first line,
+/// a file's path, else the tool's name.
+pub fn action(name: &str, arguments: &Value, workspace: &str) -> String {
+    match (arguments["command"].as_str(), arguments["path"].as_str()) {
+        (Some(command), _) => command.lines().next().unwrap_or("").trim().to_owned(),
+        (None, Some(path)) => format!("{name} {}", shown(path, workspace)),
+        _ => name.to_owned(),
+    }
+}
+
+/// The most of a denial's reason drawn under it.
+const DENIAL_ROWS: usize = 4;
+
+/// A call that was denied, as Codex draws one: what it would have done,
+/// then why, when a reason was given. Kept in the clean view too.
+pub fn denied(
+    name: &str,
+    arguments: &Value,
+    reason: &str,
+    workspace: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let what = action(name, arguments, workspace);
+    let mut lines = vec![Line::from(vec![
+        Span::raw("✗ ").fg(Color::Red),
+        Span::raw("Request "),
+        Span::raw("denied").bold(),
+        Span::raw(" for "),
+        Span::raw(cut(&what, width.saturating_sub(22).max(8))).dim(),
+    ])];
+    let mut rows = Vec::new();
+    for paragraph in reason.lines().filter(|line| !line.trim().is_empty()) {
+        rows.extend(wrap(
+            Line::from(paragraph.trim().to_owned()),
+            width,
+            Span::raw(if rows.is_empty() { "  └ " } else { "    " }),
+            Span::raw("    "),
+        ));
+    }
+    if rows.len() > DENIAL_ROWS {
+        rows.truncate(DENIAL_ROWS);
+        if let Some(last) = rows.last_mut() {
+            if let Some(span) = last.spans.last_mut() {
+                span.content = span.content.trim_end().to_owned().into();
+            }
+            last.spans.push(Span::raw(" …"));
+        }
+    }
+    lines.extend(rows.into_iter().map(|line| line.dim()));
+    lines
+}
+
 /// What a tool call did: one header line, then a short look at its result.
 pub fn tool(
     name: &str,

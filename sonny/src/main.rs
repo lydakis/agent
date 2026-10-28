@@ -1093,6 +1093,46 @@ enum Words {
     Reply,
 }
 
+/// A call the approver denied: the call, and why.
+#[derive(Debug, Clone, PartialEq)]
+struct Denial {
+    call_id: String,
+    name: String,
+    arguments: Value,
+    reason: String,
+}
+
+/// The most denials `/approve` offers.
+const DENIALS: usize = 8;
+
+/// What the person sends to approve one retry of a denied call: their own
+/// words, so the judge reads the consent, as Codex words it.
+fn approval(denial: &Denial) -> String {
+    format!(
+        "I approve one retry of the action auto-review denied: {} {}\n\n\
+         Treat this as approval to perform that exact action in the same context in which it \
+         was originally requested. Do not assume this also authorizes similar operations with \
+         different payloads.",
+        denial.name, denial.arguments
+    )
+}
+
+/// What the status row says while the approver reviews calls.
+fn reviewing(count: usize) -> String {
+    match count {
+        1 => "Reviewing approval request".into(),
+        n => format!("Reviewing {n} approval requests"),
+    }
+}
+
+/// Why a call was denied, when its output says it was: the reason given,
+/// empty when there was none.
+fn denial(item: &Value) -> Option<String> {
+    let output: Value = serde_json::from_str(item["output"].as_str()?).ok()?;
+    (output["error"] == "approval_denied")
+        .then(|| output["detail"].as_str().unwrap_or("").to_owned())
+}
+
 struct Running {
     turn: i64,
     started: Instant,
@@ -1119,7 +1159,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 16] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1130,6 +1170,10 @@ const COMMANDS: [(&str, &str); 15] = [
         "summarize the lead's conversation before its next call",
     ),
     ("/approvals", "whether calls wait for a verdict"),
+    (
+        "/approve",
+        "approve one retry of a recent auto-review denial",
+    ),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     ("/lookout", "what the lookout watches for this agent"),
@@ -1316,6 +1360,13 @@ struct App {
     mode: Option<&'static str>,
     /// `/approvals`, open over the composer: the mode picked.
     choosing: Option<usize>,
+    /// Calls the approver serving `auto` is reviewing in this turn.
+    reviewing: std::collections::HashSet<String>,
+    /// Calls it denied while Sonny watched, newest last: what `/approve`
+    /// offers to retry once.
+    denials: Vec<Denial>,
+    /// `/approve`, open over the composer: the denial picked.
+    approving: Option<usize>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
     /// The mode picked, still to give the agents the lead made, and when
@@ -1971,6 +2022,9 @@ impl App {
                 .collect(),
             mode: approvals::mode(record),
             choosing: None,
+            reviewing: std::collections::HashSet::new(),
+            denials: Vec::new(),
+            approving: None,
             gating: approvals::refresh(record),
             spread: None,
             last_reply: String::new(),
@@ -2536,6 +2590,12 @@ impl App {
         self.commit(transcript::quiet(lines));
     }
 
+    /// Commit a denied call, in either view.
+    fn commit_denied(&mut self, name: &str, arguments: &Value, reason: &str) {
+        let lines = transcript::denied(name, arguments, reason, &self.workspace, self.width);
+        self.commit(lines);
+    }
+
     /// Commit a finished cell, a blank line apart from the one before.
     fn commit(&mut self, lines: Vec<Line<'static>>) {
         self.commit_after(lines, true);
@@ -2772,7 +2832,10 @@ impl App {
                             calls.remove(id).or_else(|| self.calls.remove(id))
                         {
                             let (output, failed) = output(&item);
-                            self.commit_call(&name, &arguments, &output, failed);
+                            match denial(&item) {
+                                Some(reason) => self.commit_denied(&name, &arguments, &reason),
+                                None => self.commit_call(&name, &arguments, &output, failed),
+                            }
                             if name == resolved::TOOL && !failed && !reactions::refused(&item) {
                                 self.resolve(&arguments, id, turns.get(&node).copied(), false)
                                     .await;
@@ -3290,6 +3353,7 @@ impl App {
                 self.end_live(Words::Step);
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let id = data["call_id"].as_str().unwrap_or("");
+                self.reviewing.remove(id);
                 // A long call's event carries a preview; the call is kept whole.
                 let arguments = match data["arguments_truncated"] == true {
                     true => self.call(id).await.map(|(_, arguments)| arguments),
@@ -3320,6 +3384,7 @@ impl App {
                 };
                 self.end_live(Words::Step);
                 let mut shown = (String::new(), data["failed"] == true);
+                let mut reason = String::new();
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self
                         .items(&[node])
@@ -3329,11 +3394,33 @@ impl App {
                 {
                     shown = output(item);
                     shown.1 |= data["failed"] == true;
+                    reason = denial(item).unwrap_or_default();
                 }
+                self.reviewing.remove(id);
                 if data["denied"] == true {
-                    shown = ("denied".into(), true);
+                    self.commit_denied(&name, &arguments, &reason);
+                    // The approver's, not the person's: `/approve` may
+                    // retry it once.
+                    let by_auto = data["approvals"].as_array().is_some_and(|verdicts| {
+                        verdicts
+                            .iter()
+                            .any(|v| v["tag"] == "auto" && v["allow"] == false)
+                    });
+                    if by_auto {
+                        self.denials.retain(|d| d.call_id != id);
+                        self.denials.push(Denial {
+                            call_id: id.to_owned(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            reason,
+                        });
+                        if self.denials.len() > DENIALS {
+                            self.denials.remove(0);
+                        }
+                    }
+                } else {
+                    self.commit_call(&name, &arguments, &shown.0, shown.1);
                 }
-                self.commit_call(&name, &arguments, &shown.0, shown.1);
                 if name == asks::TOOL && !shown.1 {
                     self.asked(id, &arguments);
                 }
@@ -3829,6 +3916,21 @@ impl App {
         else {
             return;
         };
+        // What the approver serving `auto` is still reviewing: not yet
+        // handed to the person.
+        self.reviewing = page["approvals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|call| {
+                call["turn"].as_i64() == turn
+                    && call["asked"].is_null()
+                    && call["gates"]
+                        .as_array()
+                        .is_some_and(|gates| gates.iter().any(|g| g == "auto"))
+            })
+            .filter_map(|call| call["call_id"].as_str().map(str::to_owned))
+            .collect();
         self.approvals = page["approvals"]
             .as_array()
             .into_iter()
@@ -3869,6 +3971,12 @@ impl App {
                 Some(arguments) => call["arguments"] = arguments,
                 None => call["incomplete"] = json!(true),
             }
+        }
+        if let Some(running) = &mut self.running
+            && self.approvals.is_empty()
+            && !self.reviewing.is_empty()
+        {
+            running.phase = reviewing(self.reviewing.len());
         }
         if !self.approvals.is_empty() {
             status_report("blocked", &self.bot);
@@ -4018,6 +4126,40 @@ impl App {
                     KeyCode::Esc => self.reacting = None,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.reacting = None
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if let Some(pick) = &mut self.approving {
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+            {
+                let count = self.denials.len().max(1);
+                match key.code {
+                    KeyCode::Up => *pick = (*pick + count - 1) % count,
+                    KeyCode::Down => *pick = (*pick + 1) % count,
+                    KeyCode::Enter => {
+                        let at = *pick;
+                        self.approving = None;
+                        if at < self.denials.len() {
+                            let denied = self.denials.remove(at);
+                            self.notice =
+                                Some(match self.send(approval(&denied), None, false).await {
+                                    Ok(()) => {
+                                        "approved one retry; the retry is still reviewed".into()
+                                    }
+                                    Err(error) => {
+                                        self.denials.insert(at, denied);
+                                        error
+                                    }
+                                });
+                        }
+                    }
+                    KeyCode::Esc => self.approving = None,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.approving = None
                     }
                     _ => {}
                 }
@@ -4317,6 +4459,14 @@ impl App {
                 self.notice = Some("no reply to react to yet".into());
             } else {
                 self.reacting = Some(0);
+            }
+            return;
+        }
+        if prompt == "/approve" {
+            self.input.clear();
+            match self.denials.len() {
+                0 => self.notice = Some("no recent auto-review denials".into()),
+                newest => self.approving = Some(newest - 1),
             }
             return;
         }
@@ -5030,6 +5180,60 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some(pick) = self.approving {
+                // Newest last, as they happened; the reason stays in view
+                // before a retry is approved.
+                let shown = self.denials.len().min(5);
+                let first = pick
+                    .saturating_sub(shown - 1)
+                    .min(self.denials.len() - shown);
+                let room = (composer.width as usize).saturating_sub(6);
+                let rows: Vec<Line> = self.denials[first..first + shown]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, denied)| {
+                        let what =
+                            transcript::action(&denied.name, &denied.arguments, &self.workspace);
+                        let why = denied
+                            .reason
+                            .lines()
+                            .find(|line| line.trim_start().starts_with("Reason:"))
+                            .or_else(|| denied.reason.lines().next())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned();
+                        let what = transcript::cut(&what, room / 2);
+                        let why =
+                            transcript::cut(&why, room.saturating_sub(what.chars().count() + 2));
+                        if first + i == pick {
+                            Line::from(vec![
+                                Span::raw("  "),
+                                Span::raw(format!(" {what}  {why} ")).reversed(),
+                            ])
+                        } else {
+                            Line::from(vec![
+                                Span::raw(format!("   {what}")),
+                                Span::raw(format!("  {why}")).dim(),
+                            ])
+                        }
+                    })
+                    .collect();
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(shown as u16),
+                    height: shown as u16,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw("auto-review denials: approve one retry").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(line), composer);
+                let keys = Line::from("  ↑↓ denial · enter to approve one retry · esc").dim();
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(pick) = self.choosing {
                 let rows: Vec<Line> = approvals::MODES
                     .iter()
@@ -5182,7 +5386,10 @@ impl App {
                 ])
             })
             .collect();
-        let keep = match self.choosing.is_some() || self.picker.is_some() || self.reacting.is_some()
+        let keep = match self.choosing.is_some()
+            || self.approving.is_some()
+            || self.picker.is_some()
+            || self.reacting.is_some()
         {
             true => 1,
             false => COMPOSER_ROWS,
@@ -5794,6 +6001,109 @@ mod tests {
             .await;
         assert_eq!(app.asks[0].question, "Merge?");
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn an_auto_review_denial_is_drawn_and_approve_sends_one_retry() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let reason = "This action was rejected due to unacceptable risk (risk: high, authorization: low).\n\
+            Reason: It force-pushes the default branch.\n\
+            The agent must not attempt to achieve the same outcome via workaround.";
+        let items = json!({
+            "6": {"type": "function_call", "call_id": "c1", "name": "shell",
+                "arguments": json!({"command": "git push --force origin main"}).to_string()},
+            "7": {"type": "function_call_output", "call_id": "c1",
+                "output": json!({"error": "approval_denied", "detail": reason}).to_string()},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                seen.lock().unwrap().push(asked["prompt"].clone());
+                json!({"turn": 5})
+            }
+            Some("history_nodes") => json!({"nodes": [{"node": 7}, {"node": 6}]}),
+            Some("history_items") => {
+                let read: Vec<Value> = asked["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                    .collect();
+                json!({"items": read})
+            }
+            Some("approvals") => json!({"approvals": [
+                {"turn": 4, "call_id": "c1", "gates": ["auto"], "asked": null}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        app.daemon(turn_event("approval_requested", 4, json!({"calls": []})))
+            .await;
+        // While the approver reviews, the status row says so.
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Reviewing approval request"
+        );
+        app.daemon(turn_event(
+            "tool_completed",
+            4,
+            json!({"call_id": "c1", "node": 7, "denied": true,
+                "approvals": [{"tag": "auto", "by": "approver", "allow": false}]}),
+        ))
+        .await;
+        assert!(app.reviewing.is_empty());
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rows.contains(&"✗ Request denied for git push --force origin main".to_owned()),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row == "    Reason: It force-pushes the default branch."),
+            "{rows:?}"
+        );
+        // `/approve` offers it; Enter sends the person's approval of that
+        // exact call, once.
+        app.running = None;
+        app.input.set("/approve");
+        app.submit().await;
+        assert_eq!(app.approving, Some(0));
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert!(app.approving.is_none() && app.denials.is_empty());
+        let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
+        assert!(prompt.starts_with(
+            "I approve one retry of the action auto-review denied: shell {\"command\":\"git push --force origin main\"}"
+        ));
+        assert!(prompt.contains("Do not assume this also authorizes similar operations"));
+        // Nothing left to approve.
+        app.input.set("/approve");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no recent auto-review denials"));
+    }
+
+    #[test]
+    fn a_denied_call_reads_from_its_output_in_the_replay() {
+        let output = |output: &str| json!({"type": "function_call_output", "call_id": "c1", "output": output});
+        assert_eq!(
+            denial(&output(r#"{"error":"approval_denied","detail":"no"}"#)),
+            Some("no".into())
+        );
+        assert_eq!(
+            denial(&output(r#"{"error":"approval_denied","detail":null}"#)),
+            Some(String::new())
+        );
+        assert_eq!(denial(&output("README.md")), None);
+        assert_eq!(denial(&output(r#"{"exit_code":0}"#)), None);
+        let lines = transcript::denied("write", &json!({"path": "/w/src/a.rs"}), "", "/w", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "✗ Request denied for write src/a.rs");
+        assert_eq!(reviewing(3), "Reviewing 3 approval requests");
     }
 
     #[tokio::test]
