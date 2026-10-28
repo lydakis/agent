@@ -12,12 +12,13 @@ pub fn install_errand() {
     }
 }
 
-/// What every agent of Sonny's leans on: the lead's role, the memory, plan
-/// and automation skills, the nightly cleanup's, and `~/.agent/memory`,
-/// `~/.agent/project` and `~/.agent/trigger`, which run this Sonny. Written
-/// at each start, so they lead to this copy.
+/// What every agent of Sonny's leans on: the lead's and tasks' roles, the
+/// memory, plan and automation skills, the nightly cleanup's, and
+/// `~/.agent/memory`, `~/.agent/project` and `~/.agent/trigger`, which run
+/// this Sonny. Written at each start, so they lead to this copy.
 pub fn install_own() {
     install_role("lead", crate::project::LEAD);
+    install_role("task", crate::project::TASK);
     install("memory", include_str!("../skills/memory/SKILL.md"));
     install(
         "memory-cleanup",

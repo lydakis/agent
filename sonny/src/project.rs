@@ -14,17 +14,25 @@ use std::path::{Path, PathBuf};
 pub const LEAD: &str = include_str!("../agents/lead.md");
 pub const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 
-/// Who every agent Sonny starts works for, after its role: leads, tasks,
-/// a trigger's agents and the ones opened with `--new` alike.
-pub const PERSON: &str = "The person you work for may be under pressure, short on time, or carrying more than they mention. \
-     Care about how they are doing and whether they succeed, not only about the ask in front of you. \
-     Take work off their plate rather than adding to it. Notice what they will need next: do it when it plainly follows from what they asked, otherwise offer it. \
-     When you see a better way for them to work, something that keeps costing them time, or a risk they have not seen, tell them once, plainly and kindly. \
-     Do not lecture, flatter or pad a reply to look caring: helping them well is the care.";
+/// What Sonny ships for every agent it starts other than a lead (tasks,
+/// a trigger's agents and the ones opened with `--new`), written to the
+/// person's `~/.agents/agents/task.md` to edit, as [`LEAD`] is.
+pub const TASK: &str = include_str!("../agents/task.md");
 
-/// Composed instructions with [`PERSON`] after them.
-pub fn with_person(text: &str) -> String {
-    format!("{text}\n\n{PERSON}")
+/// `text`, an agent's composed instructions, with what every agent but a
+/// lead is told after it: the body of the folder's or the person's
+/// `task.md`, else Sonny's.
+pub fn as_task(dir: &Path, text: &str) -> Result<String, String> {
+    let task = match agent_client::policy::profile(dir, "task")
+        .map_err(|e| format!("{}: {e}", e.code()))?
+    {
+        Some(task) => task,
+        None => agent_client::policy::Profile::parse("task", None, TASK),
+    };
+    Ok(match task.body.as_str() {
+        "" => text.to_owned(),
+        body => format!("{text}\n\n{}", agent_client::policy::with_cli(body)),
+    })
 }
 
 pub struct Lead {
@@ -86,16 +94,16 @@ fn folder(
         .into_iter()
         .map(|skill| skill.name)
         .collect();
-    Ok((with_person(&composed.text), skills))
+    Ok((composed.text, skills))
 }
 
 /// What an agent a trigger starts in `dir` is told: the folder's rules,
-/// skills and memory, in no role, and who it works for.
+/// skills and memory, in no role, then what every task is told.
 pub fn plain(dir: &Path) -> Result<String, String> {
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
-    agent_client::policy::instructions(dir, None, &memory)
-        .map(|composed| with_person(&composed.text))
-        .map_err(|e| format!("{}: {e}", e.code()))
+    let composed = agent_client::policy::instructions(dir, None, &memory)
+        .map_err(|e| format!("{}: {e}", e.code()))?;
+    as_task(dir, &composed.text)
 }
 
 /// This Sonny's rule for starting a task, which names this binary, so it

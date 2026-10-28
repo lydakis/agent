@@ -39,9 +39,9 @@ Implemented 2026-09-19.
    `description`, `model`, and `tools` (a list of this runtime's tool
    names) are read, any other key is ignored, so an agent file written for
    another harness loads as it is. The body is the role. Sonny's own
-   role (`lead`, the client role in `policy.rs`) is left out of the
-   index: a file of that name replaces Sonny's text for that role, not a
-   role to start a peer in, so no agent is offered a nested lead.
+   roles (`lead` and `task`, the client roles in `policy.rs`) are left
+   out of the index: a file of either name replaces Sonny's text for it,
+   not a role to start a peer in, so no agent is offered a nested lead.
 5. **Memory.** The person's `~/.agents/memory/MEMORY.md` and, when the
    workspace is in a project, `~/.agents/memory/projects/NAME/MEMORY.md`,
    each as it is (an index carries its own `# Memory in DIR` heading); one
@@ -55,9 +55,11 @@ Implemented 2026-09-19.
    sends them recomposed with `configure`.
 6. **Role.** A bot started in a profile (`--profile ROLE`, or Sonny's
    lead) gets that body last, under `# Role: ROLE`. Sonny ships a
-   `lead` profile ([sonny/agents/lead.md](../sonny/agents/lead.md)) and
-   writes it to `~/.agents/agents/lead.md` until the person edits it; a
-   folder's `lead.md` comes first.
+   `lead` profile ([sonny/agents/lead.md](../sonny/agents/lead.md)) and a
+   `task` one ([sonny/agents/task.md](../sonny/agents/task.md)), whose
+   body follows the rest for every agent Sonny starts but a lead, and
+   writes both to `~/.agents/agents` until the person edits them; a
+   folder's file of the same name comes first.
 
 Everything a client reads lives under `.agents`, the folder Codex, OpenCode
 and Pi already read skills from (sources read 2026-09-27: Codex 9db8162,

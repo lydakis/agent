@@ -352,11 +352,11 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
-/// Roles a client starts its own bots in: Sonny's lead. A
-/// `.agents/agents` file of one of these names replaces the client's text
-/// for that role, so it is not a role to start a peer in, and the Profiles
-/// index leaves it out.
-pub const CLIENT_ROLES: [&str; 1] = ["lead"];
+/// Roles a client starts its own bots in: Sonny's lead, and the task
+/// text Sonny tells every other agent it starts. A `.agents/agents` file
+/// of one of these names replaces the client's text for that role, so it
+/// is not a role to start a peer in, and the Profiles index leaves it out.
+pub const CLIENT_ROLES: [&str; 2] = ["lead", "task"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
 /// case-insensitive filesystem (macOS's default) `Lead.md` is the

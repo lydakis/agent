@@ -29,16 +29,24 @@ skills it writes name `"…/sonny" agent` wherever they would say
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
 Sonny in its `lead` role, with the folder's
-`.agents/project.toml` written when it had none. The role is a normal
-profile: Sonny writes its own ([agents/lead.md](agents/lead.md)) to
-`~/.agents/agents/lead.md` at each start, as it writes its skills, so the
-person can read and edit it there. Sonny rewrites that file when its text
-changes, and writes it again once it is deleted, but never over an edit:
-it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`, and a
-file that no longer matches, or one Sonny never wrote, is the person's. A
-folder's own `.agents/agents/lead.md` comes first. How the lead starts a
-task with `sonny task`, which names this Sonny, and the task settings from
-`.agents/project.toml` are composed after the role, not kept in the file. A lead moved to another
+`.agents/project.toml` written when it had none.
+
+Sonny's two roles are normal profiles the person can read and edit in
+`~/.agents/agents`, beside their own: `lead.md`
+([agents/lead.md](agents/lead.md)), the lead's role, and `task.md`
+([agents/task.md](agents/task.md)), what every other agent Sonny starts
+is told after its instructions and any role (`--profile`) it starts in:
+tasks, a trigger's agents and `sonny --new` bots. Sonny writes both at
+each start, as it writes its skills: it rewrites a file when its text
+changes, and writes it again once it is deleted, but never over an edit,
+since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
+and a file that no longer matches, or one Sonny never wrote, is the
+person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
+first. How the lead starts a task with `sonny task`, which names this
+Sonny, and the task settings from `.agents/project.toml` are composed
+after the lead's role, not kept in the file.
+
+A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
@@ -152,11 +160,12 @@ off again never shows.
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
   folder behind when that fails. Every agent Sonny starts, leads and tasks
-  alike, is told after its role that the person it works for may be under
-  pressure, and to care whether they succeed: take work off their plate,
-  do or offer what they will need next, and say once when a better way of
-  working would help them; so `sonny task` gives what `--agents` or
-  `--profile` would compose as the task's instructions, with that after it; `sonny task changes NAME [--apply]` lists,
+  alike, is told that the person it works for may be under pressure, and
+  to care whether they succeed: take work off their plate, do or offer
+  what they will need next, and say once when a better way of working
+  would help them (in `lead.md`, and in `task.md` for the rest); so
+  `sonny task` gives what `--agents` or `--profile` would compose as the
+  task's instructions, with `task.md` after it. `sonny task changes NAME [--apply]` lists,
   or writes back, what a sandfs copy of a plain folder changed. A plain
   folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
   as an external volume, can't be copied, so its task gets a sandfs
