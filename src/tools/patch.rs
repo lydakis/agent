@@ -198,9 +198,14 @@ impl Patch {
         }
         // A file and a file below it can't both be written: one of them
         // would need a folder where the other puts a file.
-        if let Some(below) = seen
-            .iter()
-            .find(|key| key.ancestors().skip(1).any(|above| seen.contains(above)))
+        // In path order a file's descendants follow it directly, so
+        // comparing neighbours finds any, in one sort.
+        let mut keys: Vec<&PathBuf> = seen.iter().collect();
+        keys.sort();
+        if let Some(below) = keys
+            .windows(2)
+            .find(|pair| pair[1].starts_with(pair[0]))
+            .map(|pair| pair[1])
         {
             return Err(Error::with(
                 "invalid_patch",
@@ -581,6 +586,10 @@ fn seek(
     end_of_file: bool,
 ) -> Result<Option<usize>> {
     let lines = hay.lines.len();
+    // Nothing to match is found where the search starts, as in Codex.
+    if pattern.is_empty() {
+        return Ok(Some(start.min(lines)));
+    }
     if pattern.len() > lines {
         return Ok(None);
     }
@@ -695,6 +704,10 @@ mod tests {
                 "*** Begin Patch\n*** Add File: new\n+a\n*** Add File: new/child\n+b\n*** End Patch",
                 "new/child is below another file",
             ),
+            (
+                "*** Begin Patch\n*** Add File: a/b\n+a\n*** Add File: a.txt\n+b\n*** Add File: a/b/c/d\n+c\n*** End Patch",
+                "a/b/c/d is below another file",
+            ),
         ] {
             let error = Patch::parse(text).unwrap_err();
             assert_eq!(error.code, "invalid_patch", "{text}");
@@ -756,6 +769,12 @@ mod tests {
             panic!()
         };
         assert_eq!(update("a\n", chunks, "f").unwrap(), "\n");
+        // A lone empty old line not found falls back to nothing to match.
+        let parsed = patch("*** Update File: f\n@@\n-\n+new\n");
+        let Change::Update { chunks, .. } = &parsed.changes[0] else {
+            panic!()
+        };
+        assert_eq!(update("", chunks, "f").unwrap(), "new\n");
         // A long run of like lines whose last line is not there fails fast.
         let text = "x\n".repeat(20_000);
         let mut long = "*** Update File: f\n".to_owned();
