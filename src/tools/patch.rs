@@ -19,6 +19,7 @@
 //! ```
 use super::{FILE_BYTES, files};
 use crate::{Error, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// The Lark grammar OpenAI models are given for this tool, as Codex gives
@@ -101,15 +102,14 @@ fn file_key(path: &str) -> PathBuf {
 
 /// Note that the patch changes `path`. Each file is changed once: a
 /// second change would be computed from the file as it was.
-fn claim(seen: &mut Vec<PathBuf>, path: &str, line: usize) -> Result<()> {
+fn claim(seen: &mut HashSet<PathBuf>, path: &str, line: usize) -> Result<()> {
     let key = file_key(path);
-    if seen.contains(&key) {
+    if !seen.insert(key) {
         return Err(invalid(
             line,
             format!("{path} is changed twice; a patch changes each file once"),
         ));
     }
-    seen.push(key);
     Ok(())
 }
 
@@ -133,7 +133,7 @@ impl Patch {
         }
         let body = &lines[1..lines.len() - 1];
         let mut changes = Vec::new();
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         let mut at = 0;
         while at < body.len() {
             let number = at + 2;
@@ -600,6 +600,17 @@ mod tests {
                 "{error:?}"
             );
         }
+    }
+
+    #[test]
+    fn many_files_parse_quickly() {
+        let mut body = String::new();
+        for n in 0..40_000 {
+            body.push_str(&format!("*** Delete File: dir/file{n}.txt\n"));
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(patch(&body).paths().count(), 40_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

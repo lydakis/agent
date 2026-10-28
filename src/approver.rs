@@ -697,11 +697,12 @@ fn patch_paths(text: &str) -> Vec<String> {
         "*** Move to: ",
     ];
     let mut paths: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in text.split('\n').flat_map(|line| line.split("\\n")) {
         let line = line.trim();
         if let Some(path) = MARKERS.iter().find_map(|marker| line.strip_prefix(marker))
             && !path.is_empty()
-            && !paths.iter().any(|known| known == path)
+            && seen.insert(path)
         {
             paths.push(path.to_owned());
         }
