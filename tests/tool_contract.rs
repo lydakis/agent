@@ -537,8 +537,8 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     std::fs::write(dir.join("store"), "db").unwrap();
     let daemon = Daemon {
         store: Some(dir.join("store")),
-        socket: None,
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
+        ..Daemon::default()
     };
     let writable = [
         repo.to_str().unwrap().to_owned(),
@@ -704,8 +704,54 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         )
         .unwrap()
         .unwrap();
-        assert_ne!(run(Some(policy)).await, 0, "network {network}");
+        assert_ne!(run(Some(policy.clone())).await, 0, "network {network}");
+        // With the bot's own socket, laid out as the daemon lays them out,
+        // the daemon's path reaches that one.
+        let folder = base.join(format!("agent.sock.d-{network}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let own = folder.join("1");
+        let listener = std::os::unix::net::UnixListener::bind(&own).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let policy = Policy {
+            capability: Some(own),
+            ..policy
+        };
+        assert_eq!(run(Some(policy)).await, 0, "network {network}");
+        assert!(listener.accept().is_ok());
     }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A folder a bot may write that something swapped for a link since is
+/// refused, never bound where the link points: a bot's creator may write
+/// the folder above it. Each confined call builds its policy anew.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_folder_swapped_for_a_link_is_not_followed() {
+    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    if !sandboxes() {
+        return;
+    }
+    let base = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .join(format!("agent-swap-{}", std::process::id()));
+    let (given, outside) = (base.join("creator/child"), base.join("outside"));
+    std::fs::create_dir_all(&given).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let policy = |workspace: &std::path::Path| {
+        Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(workspace),
+            &[],
+            false,
+            &Daemon::default(),
+        )
+    };
+    assert!(policy(&given).is_ok());
+    std::fs::rename(&given, base.join("creator/moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, &given).unwrap();
+    let error = policy(&given).unwrap_err();
+    assert_eq!(error.code, "sandbox_unavailable");
     std::fs::remove_dir_all(base).unwrap();
 }
 

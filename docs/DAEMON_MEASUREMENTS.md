@@ -5562,6 +5562,36 @@ and 46.1–59.1 ms on the branch. The store is 26 KB (0.4 %) larger per 1000
 turns, from the new column. Requests that carry pictures are not
 screened; their cost is the picture bytes themselves.
 
+## Sandboxed bots' own sockets
+
+A sandboxed bot's commands reach the daemon through a socket of the bot's
+own, whose requests are held to what that bot may do. Every request now looks
+its session up among those sockets' sessions, one hash lookup; the rest runs
+only on a bot's own socket or for a sandboxed bot's confined call. This
+screen checks that the paths every bot takes held. `6cbd621` (main) against
+`7c7bad8` (this branch), release builds of `-p agent-runtime --bin agent`
+(17,589,392 and 17,661,768 bytes), one Linux x86_64 container, synthetic
+provider, two alternating rounds:
+
+| Measure | main | branch |
+| --- | ---: | ---: |
+| Completion burst p99 ms | 12.5 | 12.9 |
+| 32 lone submits, daemon CPU ms | 51.3 | 49.1 |
+| 32 lone submits, reply p50 ms | 1.83 | 1.75 |
+| 32 burst submits, reply p99 ms | 6.65 | 6.73 |
+| CPU per text turn (footprint), ms | 1.24 | 1.26 |
+| Store jobs per text turn | 7.53 | 7.53 |
+| Idle RSS (footprint), MiB | 18.7 | 18.9 |
+| RSS after 1000 turns, MiB | 28.2 | 27.5 |
+| 32-bot socket echo, CPU s | 1.15 | 1.12 |
+| 32-bot socket echo, peak RSS MiB | 24.5 | 24.7 |
+| 32-bot socket echo, turn p95 ms | 590 | 590 |
+
+Medians of 6 (completion, lifecycle), 10 (admission) or 4 (footprint)
+measured runs. Every measure's ranges overlap between builds: idle RSS 18.45
+to 19.02 MiB on main against 17.59 to 19.05, and after 1000 turns 27.69 to
+28.33 against 26.71 to 29.54. Sandboxed bots and macOS are not measured.
+
 ## Allowance refill waits park
 
 A call that had to wait for its pool's allowance to refill slept in the
