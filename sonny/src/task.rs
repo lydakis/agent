@@ -773,7 +773,7 @@ fn finish(here: &Path, name: &str, flags: &[String]) -> Result<(), String> {
             ));
         }
     }
-    let has_bot = bots(&agent)?.iter().any(|bot| bot == name);
+    let has_bot = bots(&agent, None)?.iter().any(|bot| bot == name);
     if !has_bot && copy.is_none() && worktree.is_none() {
         return Err(format!("{name}: no such task, and no folder of one"));
     }
@@ -859,12 +859,23 @@ fn unsaved(top: &Path, name: &str, dir: &Path) -> Result<Vec<String>, String> {
         )?;
         let mut entries = status.split('\0').filter(|entry| !entry.is_empty());
         let mut paths = Vec::new();
+        let mut staged = Vec::new();
         while let Some(entry) = entries.next() {
             let (code, path) = entry.split_at(3.min(entry.len()));
             paths.push(path.to_owned());
+            // Staged, the index holds a third version, which the copy's
+            // working file may no longer show.
+            if !code.starts_with([' ', '?', '!']) {
+                staged.push(path.to_owned());
+            }
             // A rename names where it came from next.
             if code.starts_with('R') || code.starts_with('C') {
                 paths.extend(entries.next().map(str::to_owned));
+            }
+        }
+        for path in staged {
+            if !same_staged(dir, &path, &top.join(&path))? {
+                left.push(format!("{path} (staged)"));
             }
         }
         paths
@@ -891,8 +902,42 @@ fn unsaved(top: &Path, name: &str, dir: &Path) -> Result<Vec<String>, String> {
     Ok(left)
 }
 
+/// Whether the copy at `dir` has staged for `path` what `lead` holds: no
+/// entry where `lead` is missing, or the same bytes, run the same way.
+fn same_staged(dir: &Path, path: &str, lead: &Path) -> Result<bool, String> {
+    let entry = git_raw(dir, &["ls-files", "--stage", "-z", "--", path])?;
+    let lead_meta = std::fs::symlink_metadata(lead).ok();
+    let Some((mode, rest)) = entry.split_once(' ') else {
+        return Ok(lead_meta.is_none());
+    };
+    let Some(meta) = lead_meta else {
+        return Ok(false);
+    };
+    let object = rest.split(' ').next().unwrap_or_default();
+    let bytes = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "blob", object])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("running git: {e}"))?
+        .stdout;
+    Ok(match mode {
+        "120000" => {
+            std::fs::read_link(lead).is_ok_and(|to| to.as_os_str().as_encoded_bytes() == bytes)
+        }
+        "100755" | "100644" => {
+            meta.is_file()
+                && runs(&meta) == (mode == "100755")
+                && std::fs::read(lead).is_ok_and(|lead| lead == bytes)
+        }
+        _ => false,
+    })
+}
+
 /// Whether `a` and `b` hold the same: both missing, folders, links to one
-/// target, or files with the same bytes.
+/// target, or files with the same bytes that both run or both don't.
 fn same(a: &Path, b: &Path) -> bool {
     match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
         (Err(_), Err(_)) => true,
@@ -901,16 +946,40 @@ fn same(a: &Path, b: &Path) -> bool {
             std::fs::read_link(a).ok() == std::fs::read_link(b).ok()
         }
         (Ok(x), Ok(y)) if x.is_file() && y.is_file() && x.len() == y.len() => {
-            matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+            runs(&x) == runs(&y)
+                && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
         }
         _ => false,
     }
 }
 
-/// The names of every bot the daemon has.
-fn bots(agent: &Path) -> Result<Vec<String>, String> {
-    let output = Command::new(agent)
-        .arg("ls")
+/// Whether a file with `meta` runs: any of its execute bits is set.
+fn runs(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The names of every bot the daemon has: the one at `daemon`'s store and
+/// socket when given, else the one this shell's environment names.
+fn bots(agent: &Path, daemon: Option<(&Path, &Path)>) -> Result<Vec<String>, String> {
+    let mut command = Command::new(agent);
+    command.arg("ls");
+    if let Some((store, socket)) = daemon {
+        command
+            .arg("--store")
+            .arg(store)
+            .arg("--socket")
+            .arg(socket);
+    }
+    let output = command
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -928,7 +997,7 @@ fn bots(agent: &Path) -> Result<Vec<String>, String> {
 /// task is gone, each holding its caches and mount until it ends.
 fn left_over() -> Result<(), String> {
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-    let bots = bots(&agent)?;
+    let bots = bots(&agent, None)?;
     let mut found = Vec::new();
     if Home::locate().is_ok_and(|home| home.root().exists()) {
         let tasks = tasks()?;
@@ -965,8 +1034,9 @@ fn left_over() -> Result<(), String> {
 /// Mount again the task copies a restart unmounted, so a task never works
 /// in an empty folder: every workspace whose folder in `~/.agent/tasks`
 /// is there but not mounted, and whose task is still there (`sonny task
-/// gc` lists the rest). Returns what could not be mounted.
-pub fn remount() -> Vec<String> {
+/// gc` lists the rest), asking the daemon at `store` and `socket`.
+/// Returns what could not be mounted.
+pub fn remount(store: &Path, socket: &Path) -> Vec<String> {
     let Ok(tasks) = tasks() else {
         return Vec::new();
     };
@@ -980,7 +1050,7 @@ pub fn remount() -> Vec<String> {
         return Vec::new();
     };
     // Unlisted, every copy might still have its task.
-    let bots = crate::agent_bin().and_then(|agent| bots(&agent).ok());
+    let bots = crate::agent_bin().and_then(|agent| bots(&agent, Some((store, socket))).ok());
     workspaces
         .into_iter()
         .filter(|ws| ws.mounted.is_none() && tasks.join(&ws.name).is_dir())

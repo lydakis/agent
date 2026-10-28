@@ -445,6 +445,38 @@ fn a_task_done_keeps_its_sandfs_copy_until_its_work_is_elsewhere() {
 }
 
 #[test]
+fn a_task_done_counts_a_staged_edit_and_a_file_made_to_run_as_work() {
+    let lab = Lab::new("done-staged");
+    lab.sandfs();
+    let (ok, said) = lab.task(false, &[]);
+    assert!(ok, "{said}");
+    lab.has_task(true);
+    let copy = lab.home.join(".agent/tasks/demo.fix");
+    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
+    // Staged, then the file put back as the lead has it: only the index
+    // holds the edit.
+    std::fs::write(copy.join("src/lib.rs"), "three\n").unwrap();
+    lab.git(&copy, &["add", "src/lib.rs"]);
+    std::fs::write(copy.join("src/lib.rs"), "two\n").unwrap();
+    let (ok, said_staged) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let refused_staged = !ok && said_staged.contains("src/lib.rs (staged)");
+    lab.git(&copy, &["reset", "-q"]);
+    let lib = copy.join("src/lib.rs");
+    std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, said_runs) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let refused_runs = !ok && said_runs.contains("src/lib.rs");
+    std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (ok, said_done) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let gone = sandfs.workspaces().unwrap().is_empty();
+    if !gone {
+        let _ = sandfs.remove("demo.fix", true);
+    }
+    assert!(refused_staged, "{said_staged}");
+    assert!(refused_runs, "{said_runs}");
+    assert!(ok && gone, "{said_done}");
+}
+
+#[test]
 fn a_task_done_with_apply_writes_a_plain_folder_s_copy_back_first() {
     // On another disk, as in a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it.
     let shm = Path::new("/dev/shm");
