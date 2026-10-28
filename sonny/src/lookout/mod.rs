@@ -379,11 +379,11 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     lines.push(match steers {
         true => "Handle what cannot wait, then carry on with your turn.".to_owned(),
         false => "Read the turns you need with one wait call (timeout_ms 0), and act where \
-            something changes the work. Tell the person, briefly, only: the outcome of work \
-            you started for them, once, when it ends; what only they can decide; and, when \
-            their latest words contradict what they asked before, which they mean. They saw \
-            what they asked for and wrote in a task themselves: say nothing of that unless \
-            it changes other work. If nothing, end your turn with an empty reply."
+            something changes the work. Tell the person, briefly, what they would want to \
+            hear: the outcome of work you started for them, once, when it ends, not again \
+            when they write in that task; what only they can decide; and where their latest \
+            words contradict what they asked before. If nothing, end your turn with an empty \
+            reply."
             .to_owned(),
     });
     let mut text = lines.join("\n");
@@ -2885,7 +2885,7 @@ mod tests {
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: turn:calc.docs/3 completed\n\
              Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. \
-             Tell the person, briefly, only: the outcome of work you started for them, once, when it ends; what only they can decide; and, when their latest words contradict what they asked before, which they mean. They saw what they asked for and wrote in a task themselves: say nothing of that unless it changes other work. If nothing, end your turn with an empty reply."
+             Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
         );
     }
 
