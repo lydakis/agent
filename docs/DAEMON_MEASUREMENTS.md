@@ -5483,8 +5483,10 @@ whose prompt was larger than the learned limit failed with
 have read nearly all of it from the cache. A call now reserves the 90th
 percentile of the share of input its model's latest 32 calls counted (all
 of it until eight have reported), at most the limit, and settles by input
-less cache reads. OpenAI does not say it leaves cache reads out, so
-Responses calls are paced as before.
+less cache reads. Shares are kept in parts per million and rounded up, so
+a few uncached tokens beside a long cached prompt still reserve their part
+(50 of 200,050 reserves 51). OpenAI does not say it leaves cache reads out,
+so Responses calls are paced as before.
 
 Screen, 2026-10-28, Linux x86_64 container (`itpm.py`): Anthropic bots with
 60 KB instructions (about 15,000 tokens) resubmitting as each turn ends, a
