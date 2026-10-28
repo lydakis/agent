@@ -1498,18 +1498,31 @@ fn as_unified(patch: &str, workspace: &str) -> String {
 }
 
 /// The first line, at or after `from`, where `text` holds `wanted` in a
-/// row, by content with ends trimmed.
+/// row, by content with ends trimmed. Drawing waits on it, so it gives up
+/// past a bounded number of line comparisons and the caller places the
+/// chunk where it would otherwise be.
 fn find_lines(text: &str, wanted: &[&str], from: usize) -> Option<usize> {
+    const COMPARED: usize = 1 << 20;
     let lines: Vec<&str> = text.lines().collect();
     if wanted.is_empty() || wanted.len() > lines.len() {
         return None;
     }
-    (from..=lines.len() - wanted.len()).find(|&at| {
-        wanted
-            .iter()
-            .zip(&lines[at..])
-            .all(|(want, have)| want.trim_end() == have.trim_end())
-    })
+    let (last, mut compared) = (wanted.len() - 1, 0);
+    (from..=lines.len() - wanted.len()).find_map(|at| {
+        if compared > COMPARED {
+            return Some(None);
+        }
+        compared += 1;
+        // The last line first: a long run rarely ends the same by chance.
+        if wanted[last].trim_end() != lines[at + last].trim_end() {
+            return None;
+        }
+        let same = wanted.iter().zip(&lines[at..]).take_while(|(want, have)| {
+            compared += 1;
+            want.trim_end() == have.trim_end()
+        });
+        (same.count() == wanted.len()).then_some(Some(at))
+    })?
 }
 
 /// The rule under a finished turn: how it ended, how long it took, what it cost.
@@ -1790,6 +1803,20 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_repeated_context_is_placed_quickly() {
+        let mut text = "x\n".repeat(100_000);
+        text.push_str("y\n");
+        let mut wanted = vec!["x"; 10_000];
+        wanted.push("y");
+        let started = std::time::Instant::now();
+        let found = find_lines(&text, &wanted, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(found.is_none_or(|at| at == 90_000), "{found:?}");
+        assert_eq!(find_lines("a\nb\nc\n", &["b", "c"], 0), Some(1));
+        assert_eq!(find_lines("a\nb\nc\n", &["c", "b"], 0), None);
     }
 
     #[test]
