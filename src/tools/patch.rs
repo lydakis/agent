@@ -212,16 +212,15 @@ impl Patch {
             .flatten()
     }
 
-    /// Apply the patch under `workspace`: read and check every file first,
-    /// then write, in `sandbox` when the bot has one. The summary lists each
-    /// file as added (A), modified (M) or deleted (D).
+    /// Apply the patch under `workspace`: [`stage`](Self::stage), then
+    /// [`commit`](Staged::commit).
     pub async fn apply(&self, workspace: &Path, sandbox: Option<Arc<Policy>>) -> Result<String> {
-        enum Write {
-            /// A file's new contents, and for a move the permissions of the
-            /// file it came from.
-            Put(PathBuf, String, Option<std::fs::Permissions>),
-            Remove(PathBuf),
-        }
+        self.stage(workspace).await?.commit(sandbox).await
+    }
+
+    /// Read and check every file the patch changes, and compute what each
+    /// becomes, writing nothing.
+    pub async fn stage(&self, workspace: &Path) -> Result<Staged> {
         let mut writes = Vec::new();
         let mut staged = 0;
         let mut summary = String::from("Success. Updated the following files:\n");
@@ -292,7 +291,36 @@ impl Patch {
                 }
             }
         }
-        for write in writes {
+        Ok(Staged { writes, summary })
+    }
+}
+
+/// A patch's changes, checked and computed, and its summary: each file as
+/// added (A), modified (M) or deleted (D).
+pub struct Staged {
+    writes: Vec<Write>,
+    summary: String,
+}
+
+enum Write {
+    /// A file's new contents, and for a move the permissions of the file it
+    /// came from.
+    Put(PathBuf, String, Option<std::fs::Permissions>),
+    Remove(PathBuf),
+}
+
+impl Staged {
+    /// Whether committing writes any file, through the sandbox's helper
+    /// when the bot has one; a patch that only deletes writes none.
+    pub fn writes(&self) -> bool {
+        self.writes
+            .iter()
+            .any(|write| matches!(write, Write::Put(..)))
+    }
+
+    /// Write the changes, in `sandbox` when the bot has one.
+    pub async fn commit(self, sandbox: Option<Arc<Policy>>) -> Result<String> {
+        for write in self.writes {
             match write {
                 Write::Put(target, contents, permissions) => {
                     files::write(&target, contents.as_bytes(), sandbox.clone()).await?;
@@ -305,7 +333,7 @@ impl Patch {
                 Write::Remove(target) => tokio::fs::remove_file(&target).await?,
             }
         }
-        Ok(summary)
+        Ok(self.summary)
     }
 }
 

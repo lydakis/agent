@@ -1247,9 +1247,14 @@ impl Registry {
                 for path in patch.paths() {
                     writable(sandbox.clone(), &resolve(workspace, path), path).await?;
                 }
+                let staged = patch.stage(workspace).await?;
+                // A process slot only while the sandbox's helper writes.
                 let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
-                let _slot = self.helper_slot(&sandbox).await?;
-                Ok(Outcome::text(patch.apply(workspace, sandbox).await?))
+                let _slot = match staged.writes() {
+                    true => self.helper_slot(&sandbox).await?,
+                    false => None,
+                };
+                Ok(Outcome::text(staged.commit(sandbox).await?))
             }
             Prepared::Edit {
                 path,

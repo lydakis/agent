@@ -1338,6 +1338,17 @@ fn waited(output: Option<&str>) -> Option<Vec<String>> {
     crate::calls::waited(&serde_json::from_str(output?.trim()).ok()?)
 }
 
+/// The text of the file at `path` as it is now, when it is a regular file
+/// no larger than the daemon writes: never a FIFO or a device, whose
+/// read could block the screen.
+fn current(path: &std::path::Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 4 << 20 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// An edit as diffs.com draws one: the whole lines it touched, the words
 /// that changed within them, and two lines either side, numbered where
 /// the file now has them when the new text can be found there.
@@ -1352,7 +1363,7 @@ fn diff(arguments: &Value, workspace: &str) -> crate::diff::Edit {
     // An edit replaces text, not lines: show the whole lines it touched,
     // read from the file as it is now, so indentation and numbers are right.
     if !new.is_empty()
-        && let Ok(now) = std::fs::read_to_string(path)
+        && let Some(now) = current(&path)
         && let Some(at) = now.find(&new)
     {
         let line_start = now[..at].rfind('\n').map_or(0, |i| i + 1);
@@ -1436,8 +1447,7 @@ fn as_unified(patch: &str, workspace: &str) -> String {
             if let Some(to) = lines.next_if(|l| l.starts_with("*** Move to: ")) {
                 path = to["*** Move to: ".len()..].trim().to_owned();
             }
-            let now = std::fs::read_to_string(std::path::Path::new(workspace).join(&path))
-                .unwrap_or_default();
+            let now = current(&std::path::Path::new(workspace).join(&path)).unwrap_or_default();
             out.push_str(&format!("--- {path}\n+++ {path}\n"));
             // Each chunk's lines, then its place: the line where its new
             // side starts now, and that less what earlier chunks added.
@@ -1780,6 +1790,23 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_could_block_is_not_read_for_a_diff() {
+        let dir = std::env::temp_dir().join(format!("sonny-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(current(&fifo), None);
+        assert_eq!(current(&dir), None);
+        std::fs::write(dir.join("f"), "a\n").unwrap();
+        assert_eq!(current(&dir.join("f")).as_deref(), Some("a\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
