@@ -5917,9 +5917,10 @@ impl App {
             };
             let width = wide.saturating_sub(2) as usize;
             if let Some(view) = &watch.background {
-                // Its card, then what was done or the keys the pick takes.
+                // Its card, with what was done or the keys the pick takes
+                // kept in view under it.
                 let (card, at) = view.card(width);
-                let mut lines: Vec<Line<'static>> = card
+                let lines: Vec<Line<'static>> = card
                     .into_iter()
                     .map(|line| {
                         let mut spans = vec![Span::raw(" ")];
@@ -5927,9 +5928,8 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                lines.push(Line::default());
-                lines.push(view.footer());
                 pane.set_card(lines, STATUS_KEYS);
+                pane.foot = Some(view.footer());
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
                     watch.picked = Some(at);

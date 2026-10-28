@@ -54,6 +54,9 @@ pub struct Pane {
     keys: &'static str,
     /// A program drawn here instead of rows: a side chat's Sonny.
     pub program: Option<crate::embed::Embedded>,
+    /// A line kept on the last row under a card, however it is scrolled:
+    /// `/background`'s keys, or what its last key did.
+    pub foot: Option<Line<'static>>,
 }
 
 impl Pane {
@@ -84,6 +87,7 @@ impl Pane {
             card: None,
             keys: "esc closes",
             program: None,
+            foot: None,
         })
     }
 
@@ -99,6 +103,7 @@ impl Pane {
             card: Some(Vec::new()),
             keys,
             program: None,
+            foot: None,
         }
     }
 
@@ -114,6 +119,7 @@ impl Pane {
             card: None,
             keys: "shift+tab back",
             program: Some(program),
+            foot: None,
         }
     }
 
@@ -192,12 +198,18 @@ impl Pane {
             Span::raw(keys).dim(),
         ]);
         buf.set_line(area.x, area.y, &head, area.width);
-        // A row between the name and what it holds.
-        let rows = Rect {
+        // A row between the name and what it holds, and above the foot.
+        let mut rows = Rect {
             y: area.y + 2,
             height: area.height.saturating_sub(2),
             ..area
         };
+        if let Some(foot) = &self.foot
+            && rows.height > 2
+        {
+            rows.height -= 2;
+            buf.set_line(area.x, rows.bottom() + 1, foot, area.width);
+        }
         match &mut self.program {
             // A column off the line between, as the title is.
             Some(program) => {
@@ -403,6 +415,24 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_cards_foot_stays_on_the_last_row_however_it_is_scrolled() {
+        let mut pane = Pane::card("/background", "esc closes");
+        let lines = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        pane.set_card(lines, "esc closes");
+        pane.foot = Some(Line::from("d again removes nightly"));
+        let shown = rows(&mut pane, 30, 8);
+        assert_eq!(shown[0], " /background       esc closes");
+        assert_eq!(shown[2], "row 0");
+        assert_eq!(shown[5], "row 3");
+        assert_eq!(shown[6], "");
+        assert_eq!(shown[7], "d again removes nightly");
+        pane.screen.latest();
+        let shown = rows(&mut pane, 30, 8);
+        assert_eq!(shown[5], "row 19");
+        assert_eq!(shown[7], "d again removes nightly");
     }
 
     #[test]
