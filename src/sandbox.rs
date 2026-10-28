@@ -515,6 +515,7 @@ pub fn command(
 mod linux {
     use super::{Policy, depth};
     use crate::{Error, Result};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::{Path, PathBuf};
 
     /// Where a system's bubblewrap is installed. Never looked up on PATH:
@@ -588,8 +589,10 @@ mod linux {
     /// bubblewrap's arguments for `policy`, as Codex builds them: the whole
     /// filesystem read-only, each root bound writable from the shallowest
     /// down with its read-only folders bound back over it, and what may not
-    /// be made held by an empty read-only folder in its place.
-    pub(super) fn args(policy: &Policy, detached: bool) -> Vec<String> {
+    /// be made held by an empty read-only folder in its place. Each root is
+    /// bound from `pinned`, the folder [`pin`] opened for it.
+    pub(super) fn args(policy: &Policy, detached: bool, pinned: &[RawFd]) -> Vec<String> {
+        debug_assert_eq!(policy.roots.len(), pinned.len());
         let path = |path: &Path| path.to_string_lossy().into_owned();
         // A new session keeps the command from typing into the daemon's
         // terminal (TIOCSTI).
@@ -598,8 +601,12 @@ mod linux {
             args.push("--die-with-parent".into());
         }
         args.extend(["--ro-bind", "/", "/", "--dev", "/dev"].map(String::from));
-        for root in &policy.roots {
-            args.extend(["--bind".into(), path(&root.path), path(&root.path)]);
+        for (root, folder) in policy.roots.iter().zip(pinned) {
+            args.extend([
+                "--bind".into(),
+                format!("/proc/self/fd/{folder}"),
+                path(&root.path),
+            ]);
             let mut kept: Vec<&PathBuf> = root.read_only.iter().collect();
             kept.sort_by_key(|path| depth(path));
             for kept in kept {
@@ -653,13 +660,74 @@ mod linux {
         rest: &[&str],
         detached: bool,
     ) -> Result<tokio::process::Command> {
+        let pinned = policy
+            .roots
+            .iter()
+            .map(|root| pin(&root.path))
+            .collect::<Result<Vec<_>>>()?;
+        let folders: Vec<RawFd> = pinned.iter().map(AsRawFd::as_raw_fd).collect();
         let mut command = tokio::process::Command::new(checked()?);
         command
-            .args(args(policy, detached))
+            .args(args(policy, detached, &folders))
             .arg("--")
             .arg(program)
             .args(rest);
+        // SAFETY: fcntl is async-signal-safe and changes only the child's
+        // descriptors: bubblewrap inherits the pinned folders, and the
+        // daemon's other children never see them. The closure owns them, so
+        // they stay open until the command is dropped, after it spawns.
+        unsafe {
+            command.pre_exec(move || {
+                for folder in &pinned {
+                    if libc::fcntl(folder.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         Ok(command)
+    }
+
+    /// A root, a real path, opened as itself for bubblewrap to bind: each
+    /// folder on the way is opened without following a link. A folder a bot
+    /// was given can sit in one its creator may write, and the creator can
+    /// swap a link in for it later; bound by its path, that link would carry
+    /// the sandbox wherever it points. Opened this way the swap is refused,
+    /// and what is bound is the folder that was opened, wherever it has
+    /// moved since.
+    pub(super) fn pin(path: &Path) -> Result<OwnedFd> {
+        use std::os::unix::ffi::OsStrExt;
+        let refused = |detail: String| Error::with("sandbox_unavailable", detail);
+        let open = |at: RawFd, name: &std::ffi::CStr| -> std::io::Result<OwnedFd> {
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            // SAFETY: `name` is NUL-terminated and outlives the call, and `at`
+            // is open.
+            match unsafe { libc::openat(at, name.as_ptr(), flags) } {
+                fd if fd < 0 => Err(std::io::Error::last_os_error()),
+                // SAFETY: a descriptor openat just returned belongs to
+                // nothing else.
+                fd => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+            }
+        };
+        let mut folder = open(libc::AT_FDCWD, c"/").map_err(|e| refused(format!("/: {e}")))?;
+        for component in path.components() {
+            let name = match component {
+                std::path::Component::RootDir => continue,
+                std::path::Component::Normal(name) => std::ffi::CString::new(name.as_bytes())
+                    .map_err(|_| refused(format!("{} is not a real path", path.display())))?,
+                _ => return Err(refused(format!("{} is not a real path", path.display()))),
+            };
+            folder =
+                open(folder.as_raw_fd(), &name).map_err(|error| match error.raw_os_error() {
+                    Some(libc::ELOOP | libc::ENOTDIR) => refused(format!(
+                        "{} is reached through a link, so it is not the folder the bot was given",
+                        path.display()
+                    )),
+                    _ => refused(format!("{}: {error}", path.display())),
+                })?;
+        }
+        Ok(folder)
     }
 }
 
@@ -1079,7 +1147,7 @@ mod tests {
             assert!(profile.contains(&anchor(&key(&inner.join("state")))));
             #[cfg(target_os = "linux")]
             assert!(
-                linux::args(&policy, false)
+                linux::args(&policy, false, &vec![3; policy.roots.len()])
                     .windows(3)
                     .any(|w| w[0] == "--ro-bind"
                         && w[1] == "/dev/null"
@@ -1100,9 +1168,13 @@ mod tests {
                 "(allow network-outbound (remote unix-socket (subpath (param \"{own_key}\"))))"
             )));
             #[cfg(target_os = "linux")]
-            assert!(linux::args(&own, false).windows(3).any(|w| w[0] == "--bind"
-                && w[1] == base.join("own.sock").to_string_lossy()
-                && w[2] == socket.to_string_lossy()));
+            assert!(
+                linux::args(&own, false, &vec![3; own.roots.len()])
+                    .windows(3)
+                    .any(|w| w[0] == "--bind"
+                        && w[1] == base.join("own.sock").to_string_lossy()
+                        && w[2] == socket.to_string_lossy())
+            );
             // Never another bot's, from the same folder.
             let folder_key = params
                 .iter()
@@ -1118,7 +1190,7 @@ mod tests {
             assert!(profile.find(&denied).unwrap() < profile.find(&allowed).unwrap());
             #[cfg(target_os = "linux")]
             assert!(
-                linux::args(&own, false)
+                linux::args(&own, false, &vec![3; own.roots.len()])
                     .windows(2)
                     .any(|w| w[0] == "--tmpfs" && w[1] == base.to_string_lossy())
             );
