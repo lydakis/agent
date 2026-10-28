@@ -35,6 +35,38 @@ correctness, and performance; earlier Agent revisions impose no requirements.
   handling. This policy concerns Agent's own earlier versions; it is not a
   reason to drop models or providers.
 
+## Keep the daemon fast and light
+
+The daemon is one `current_thread` runtime that every bot shares. A change to
+it keeps these, and says in its PR how:
+
+- Nothing blocks the runtime thread. File and SQLite work runs off it
+  (`tokio::fs`, the storage threads). Work that grows with a payload, such as
+  decoding, hashing or copying megabytes, stays bounded and off hot paths.
+- A waiting bot holds nothing live. A wait of a second or more (a closed
+  pool, an allowance refill, a retry backoff, `wait`, an approval, an answered
+  tool) parks durably: no task, no active slot, no timer of its own. The run
+  loop owns the one wake-up schedule.
+- Bots never block each other. Shared bounds (active slots, the process
+  budget, a provider pool, a session's output queue) are taken in fair order
+  and never held while waiting on something else; one bot's wide round does
+  not take every slot.
+- An idle bot costs about a kilobyte. Large content (tool output, artifacts,
+  pictures) lives in SQLite once and streams from it; nothing kept per bot
+  grows with its history.
+- Store writes on a turn's path join a group commit: submit independent jobs
+  without awaiting each other. Count store jobs per turn when adding one.
+- The pacer learns from everything a provider says (rate-limit headers,
+  `retry-after-ms` and `retry-after`, named delays, usage) and estimates what
+  the provider counts. It invents no caps and refuses only what can never fit.
+- Every provider error has a class: pace (429, 529, overloaded, slow down)
+  closes the pool and parks; transient (5xx, stalls, connections) backs off
+  and parks; the rest are final. A new error code gets a class and a test.
+- A change on a hot path carries a matched before/after screen against main,
+  recorded in docs/DAEMON_MEASUREMENTS.md: `bench.lifecycle` (32-bot socket
+  echo), `bench.completion_burst`, `bench.admission_burst`, and
+  `bench.footprint` for memory.
+
 ## Working rules
 
 - George explicitly selected a custom Rust core as a performance engineering
