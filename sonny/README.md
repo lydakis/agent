@@ -35,9 +35,13 @@ project holds the folder above it. In a git repository, Sonny opens the
 nearest project in that repository, else makes the repository's top one,
 so `src` reaches the repository's lead and a task's worktree its main
 checkout's; a subfolder of a repository is its own project once it has a
-file (`sonny project add DIR`). A lead made below another project's folder
-says which lead holds the folder above. Sonny refuses to make a lead in a
-task's own folder under `~/.agent`.
+file (`sonny project add DIR`). A project whose file says
+`subfolders = "project"` keeps the folders below it: Sonny opened in any of
+them that has no project file of its own, a repository among them, opens
+that project's lead (the nearest project above decides; the home folder's
+file never does). A lead made below another project's folder says which
+lead holds the folder above. Sonny refuses to make a lead in a task's own
+folder under `~/.agent`.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
