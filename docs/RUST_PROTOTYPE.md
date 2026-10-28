@@ -2102,14 +2102,40 @@ runs hooks and config from there outside the sandbox, and agents trust what
 is there. The daemon's store and the files beside it stay read-only too. A
 protected folder that is a symlink refuses the call with
 `sandbox_unavailable`, since the link could be swapped from inside. Network is
-off unless `network` is set. The daemon's socket is out of reach either way,
-as Codex keeps its own from a sandboxed command: nothing confined may drive
-the daemon, so a sandboxed bot delegates through tools its client declares,
-not through `agent` in its shell. A socket inside a writable folder stays
-read-only. On macOS the folders between a writable folder and anything kept
-inside it (the socket, the store, a worktree's git folder) can't be renamed,
-so nothing kept can be moved to a name its rule doesn't cover. `danger-full-access`, or no `sandbox`, runs
+off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
+
+A sandboxed bot's commands reach the daemon through the bot's own socket,
+never the daemon's: so `agent` and the clients built on it work in its shell,
+as that bot and only as far as a sandboxed bot may go. The daemon opens the
+socket, `SOCKET.d/BOT_ID` beside its own, the first time one of the bot's
+commands runs, and closes it when the bot is deleted. On Linux it is bound over the
+daemon's socket in the sandbox, and the folder of the bots' sockets is
+hidden; on macOS Seatbelt denies the daemon's socket and that folder and
+allows the bot's own, network on or off. Either way the command's
+`AGENT_SOCKET` names it, and no command reaches another bot's. A request on
+it:
+
+| Request | On a bot's own socket |
+|---|---|
+| `configure`, `answer`, `tool_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
+| `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
+| `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
+| Everything else | As on the daemon's socket |
+
+The folder of these sockets stays read-only in every root, so no bot can
+put its own listener in another's place. A tool a client answers, declared
+for a bot the caller makes or callable by a fork it makes, must be one the
+caller has, may call and passes on, answered by the same client; another is
+`not_permitted`, and one it may not call isn't inherited. A root reached
+through a link, which something swapped in since, is `sandbox_unavailable`.
+A socket inside a writable folder
+stays read-only too. On macOS the folders between a writable folder and
+anything kept inside it (a socket, the store, a worktree's git folder) can't
+be renamed, so nothing kept can be moved to a name its rule doesn't cover. A
+daemon on stdio, or whose socket path leaves no room for the bots' sockets,
+gives a sandboxed command no way to it.
 
 Creating a sandboxed bot checks that sandboxes run here and refuses with
 `sandbox_unavailable` otherwise: on Linux, a system bubblewrap
