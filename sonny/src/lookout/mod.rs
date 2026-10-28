@@ -427,8 +427,10 @@ enum Api {
 pub struct Judge {
     api: Api,
     pub name: String,
-    /// For `Model`: its `provider/model`.
+    /// For `Model`: its `provider/model`, and its effort (the config's
+    /// `[judge] effort`; unset, the model's own).
     model: String,
+    effort: Option<String>,
     /// For `Decisions`: the API.
     decisions: Option<judge::Decisions>,
     /// For `Model`: the idle base bot each check forks, once made.
@@ -478,22 +480,26 @@ impl Judge {
             Some(base) if base != "lead" => (base, true),
             _ => (spec, false),
         };
-        let judge = |api, model: &str, decisions| Judge {
+        let judge = |api, model: &str, effort, decisions| Judge {
             api,
             name: name.to_owned(),
             model: model.to_owned(),
+            effort,
             decisions,
             base: Default::default(),
             context,
         };
         if spec == "lead" {
-            return Ok(judge(Api::Lead, "", None));
+            return Ok(judge(Api::Lead, "", None, None));
         }
         match judge::spec(spec) {
             None => Err(format!(
                 "lookout: {spec} is not openai-decisions/MODEL, PROVIDER/MODEL or lead"
             )),
-            Some(judge::Spec::Model(model)) => Ok(judge(Api::Model, model, None)),
+            Some(judge::Spec::Model(model)) => {
+                let config = agent_client::config::load().map_err(|e| format!("lookout: {e}"))?;
+                Ok(judge(Api::Model, model, config.judge.effort, None))
+            }
             Some(judge::Spec::Decisions(model)) => {
                 let key = key(judge::DECISIONS_KEY)
                     .ok_or_else(|| format!("lookout: set {} for {spec}", judge::DECISIONS_KEY))?;
@@ -502,7 +508,7 @@ impl Judge {
                     .filter(|url| !url.is_empty());
                 let decisions = judge::Decisions::new(model, url.as_deref(), key)
                     .map_err(|e| format!("lookout: {e}"))?;
-                Ok(judge(Api::Decisions, "", Some(decisions)))
+                Ok(judge(Api::Decisions, "", None, Some(decisions)))
             }
         }
     }
@@ -562,9 +568,13 @@ impl Judge {
         }
         let name = format!(
             "lookout.{}",
-            &digest(&format!("{}\n{MODEL_INSTRUCTIONS}", self.model))[..12]
+            &digest(&match &self.effort {
+                Some(effort) => format!("{}\n{effort}\n{MODEL_INSTRUCTIONS}", self.model),
+                None => format!("{}\n{MODEL_INSTRUCTIONS}", self.model),
+            })[..12]
         );
-        let made = judge::Base::make(client, &name, &self.model, None, MODEL_INSTRUCTIONS)
+        let effort = self.effort.as_deref();
+        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS)
             .await
             .map(Arc::new)
             .map_err(|e| failed(format!("the judge could not be made: {e}")))?;
@@ -675,12 +685,20 @@ fn judge_bot(name: &str) -> bool {
         .is_some_and(|hash| hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// The judge for a lead on `lead_model`: `--judge SPEC`, else
-/// `AGENT_JUDGE`, else the lead's own model. `None` when it is `off`,
-/// which judges nothing.
-fn pick(spec: Option<&str>, lead_model: &str) -> Option<String> {
-    let named = spec.map(str::to_owned).or_else(|| key(judge::VAR));
-    judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off")
+/// The judge for a lead on `lead_model`: `--judge SPEC`, else the
+/// config's `[judge] model`, else the lead's own model. `None` when it is
+/// `off`, which judges nothing.
+fn pick(spec: Option<&str>, lead_model: &str) -> Result<Option<String>, String> {
+    let named = match spec {
+        Some(spec) => Some(spec.to_owned()),
+        None => {
+            (agent_client::config::load())
+                .map_err(|e| format!("lookout: {e}"))?
+                .judge
+                .model
+        }
+    };
+    Ok(judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off"))
 }
 
 #[derive(Debug)]
@@ -1525,8 +1543,12 @@ impl Service {
             record["model"].as_str().unwrap_or_default()
         );
         let judge = match self::pick(self.judge.as_deref(), &model) {
-            Some(spec) => self.judge_for(&spec, lead),
-            None => None,
+            Ok(Some(spec)) => self.judge_for(&spec, lead),
+            Ok(None) => None,
+            Err(why) => {
+                self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "no_judge": why}));
+                None
+            }
         };
         // Said once a lead is watched, so `/status` shows it from the start.
         self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "seated": true,
@@ -2723,6 +2745,7 @@ mod tests {
             api,
             name: "test".into(),
             model: "m".into(),
+            effort: None,
             decisions,
             base: Default::default(),
             context: false,

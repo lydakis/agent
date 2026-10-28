@@ -55,8 +55,30 @@ since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
 and a file that no longer matches, or one Sonny never wrote, is the
 person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
 first. How the lead starts a task with `sonny task`, which names this
-Sonny, and the task settings from `.agents/project.toml` are composed
-after the lead's role, not kept in the file.
+Sonny, and where the project's tasks work are composed after the lead's
+role, not kept in the file.
+
+#### Effort for leads and tasks
+
+Each agent's effort is the daemon's to keep; Sonny only picks what a new
+one starts with, and imposes nothing. With nothing set, a new lead starts
+at its model's own effort (`AGENT_EFFORT` when its model is
+`AGENT_MODEL`'s), and each task at its lead's. Defaults go in
+`~/.agent/config.toml` (`agent_client::config`), and a project's
+`.agents/project.toml` overrides them for that project:
+
+| What | `~/.agent/config.toml` | `.agents/project.toml` |
+| --- | --- | --- |
+| A new lead's effort | `[sonny] lead_effort` | `effort` |
+| Each new task's model | (the lead's) | `threads_model` |
+| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
+| The approver's and lookout's judge | `[judge] model`, `effort` | |
+
+`sonny task` applies them in code, so the lead's prompt says nothing about
+effort; the lead names `--model` or `--effort` only for one the person asks
+for. A task on its lead's model with neither set takes the lead's effort,
+as before; one on another model takes that model's own. `/model` changes a
+lead's effort after it is made.
 
 A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
@@ -113,7 +135,21 @@ The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits.
+pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
+Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
+keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
+Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
+character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
+Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
+last of those took.
+
+Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
+Codex and Claude Code (terminals paste only text), and an image file
+dropped on the terminal, or its path pasted, is attached rather than typed.
+Each shows as `[Image #N]` where it goes in the message; a PNG longer than
+1568 pixels on a side is scaled down first. Web addresses, a link's text and
+paths of files that are there open on a click (Cmd-click in most terminals,
+Ctrl-click in Herdr).
 
 `!COMMAND` runs a command of your own with your shell, in the agent's
 folder, in any agent's window: the lead's or a task's. You see what it
@@ -181,7 +217,9 @@ off again never shows.
   **Resolved**, only counted until `r` shows them. The lead marks a task
   resolved with its `resolve_task` tool once nothing is left to do in it,
   such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it.
+  task's window closes. New work sent to the task reopens it. Each agent's
+  time is how long its running turn has been at it, or how long its last
+  turn took.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
@@ -276,9 +314,9 @@ one "Task updates" note, by the handles its wait tool reads them with; the
 lead decides what matters. While the lead is mid-turn, a judge asks of each
 event only whether it cannot wait, and steers the lead at once if so. A
 turn a note started that ends with nothing to say stays folded under the
-note, with no sound. It judges with `AGENT_JUDGE`, the approver's setting,
-else the lead's own model, and with the judge `off` sends the task updates
-alone. Any agent can
+note, with no sound. It judges with the config's `[judge] model`, the
+approver's setting, else the lead's own model, at `[judge] effort` when
+set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).

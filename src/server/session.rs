@@ -17,7 +17,8 @@ pub enum Inbound {
     Closed(u64),
 }
 
-pub const LINE_LIMIT: usize = 1024 * 1024;
+/// Room for a prompt with its pictures: 5 MiB of images, in base64.
+pub const LINE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// A request line. A line that is JSON but not a request is refused with
 /// what is wrong with it, under its `id` when that is one, so the client

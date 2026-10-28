@@ -10,6 +10,7 @@
 //! says how long the turn has run and how to stop it.
 mod approvals;
 mod asks;
+mod attach;
 mod cache;
 mod calls;
 mod declared;
@@ -766,6 +767,7 @@ async fn run() -> Result<(), String> {
     }
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
         app.notice = Some(format!(
@@ -1286,6 +1288,12 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// Pictures given with the message being written, each behind its
+    /// placeholder in the composer: [`attach::placeholder`] of its place
+    /// here, from 1.
+    /// Pictures attached to the draft, by their placeholders' numbers; one
+    /// neither the draft nor Ctrl-Y can bring back is let go.
+    pictures: Vec<Option<attach::Picture>>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The bot's latest replies, by node, with their first lines: what
@@ -1988,6 +1996,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
             reacting: None,
@@ -2206,7 +2215,7 @@ impl App {
             self.shown.extend(user_shell::lines(&ran, self.prose()));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
-            match self.send(record.clone(), Some(SHELL), false).await {
+            match self.send(record.clone(), Some(SHELL), false, &[]).await {
                 Ok(()) => self.ran_here.extend(user_shell::read(&record)),
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
@@ -2588,6 +2597,7 @@ impl App {
                     phase: "Working".into(),
                     note: false,
                 });
+                self.turn_began().await;
                 status_report("working", &self.bot);
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
@@ -3737,15 +3747,25 @@ impl App {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            let turn = self
+            let turns = self
                 .client
-                .request("turns", json!({"bot": name, "newest": true, "limit": 1}))
+                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
                 .await
                 .ok()
-                .and_then(|page| page["turns"].get(0).cloned())
-                .unwrap_or(Value::Null);
+                .and_then(|page| page["turns"].as_array().cloned())
+                .unwrap_or_default();
+            let turn = turns.first().cloned().unwrap_or(Value::Null);
+            // A message steered into a running turn is recorded as a turn
+            // of its own that never ran: the time is the one it joined.
+            let ran = turns
+                .iter()
+                .find(|turn| turn["status"] != "steered")
+                .unwrap_or(&Value::Null);
             let running = !bot["running_turn"].is_null();
-            let state = match (running, turn["status"].as_str()) {
+            let state = match (
+                running,
+                if running { &turn } else { ran }["status"].as_str(),
+            ) {
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
                 }
@@ -3768,10 +3788,18 @@ impl App {
                 (false, Some(other)) => other.to_owned(),
                 (false, None) => "idle".into(),
             };
-            let at = if running {
-                turn["started_ms"].as_u64()
-            } else {
-                turn["finished_ms"].as_u64()
+            // A running turn counts on from its start; one that ended
+            // shows how long it took.
+            let started = ran["started_ms"].as_u64();
+            let finished = ran["finished_ms"].as_u64();
+            let (at, seconds) = match running {
+                true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
+                false => (
+                    finished,
+                    started
+                        .zip(finished)
+                        .map(|(began, ended)| ended.saturating_sub(began) / 1000),
+                ),
             };
             let resolved =
                 resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
@@ -3819,7 +3847,9 @@ impl App {
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 state,
-                seconds: at.map(|at| now.saturating_sub(at) / 1000),
+                running,
+                seconds,
+                at,
                 model,
                 latest: step,
                 place,
@@ -3832,10 +3862,45 @@ impl App {
             (
                 row.name != "lead",
                 row.group,
-                row.seconds.unwrap_or(u64::MAX),
+                std::cmp::Reverse(row.at.unwrap_or(0)),
             )
         });
         Ok((project, rows))
+    }
+
+    /// Count the running turn's time from when the daemon started it, not
+    /// from when this window first saw it run.
+    async fn turn_began(&mut self) {
+        let Some(turn) = self.running.as_ref().map(|r| r.turn) else {
+            return;
+        };
+        let Ok(page) = self
+            .client
+            .request(
+                "turns",
+                json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
+            )
+            .await
+        else {
+            return;
+        };
+        let Some(started) = page["turns"]
+            .get(0)
+            .filter(|row| row["turn"] == turn)
+            .and_then(|row| row["started_ms"].as_u64())
+        else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ago = Duration::from_millis(now.saturating_sub(started));
+        if let Some(running) = &mut self.running
+            && let Some(began) = Instant::now().checked_sub(ago)
+        {
+            running.started = began;
+        }
     }
 
     /// The oldest question `bot` asked and has no answer to, read from its
@@ -4322,14 +4387,20 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
-        // Ctrl-H is the backspace a terminal sends as 0x08, which reads as
-        // Ctrl and `h`: it deletes, as in a shell.
+        // Keys a shell reads as others: Ctrl-H is the backspace a terminal
+        // sends as 0x08, which reads as Ctrl and `h` (with Alt, it deletes
+        // a word, as Alt-Backspace does); Ctrl-P and Ctrl-N go up and down.
         if let Event::Key(key) = &mut event
-            && key.code == KeyCode::Char('h')
-            && key.modifiers == KeyModifiers::CONTROL
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(code) = match key.code {
+                KeyCode::Char('h') => Some(KeyCode::Backspace),
+                KeyCode::Char('p') => Some(KeyCode::Up),
+                KeyCode::Char('n') => Some(KeyCode::Down),
+                _ => None,
+            }
         {
-            key.code = KeyCode::Backspace;
-            key.modifiers = KeyModifiers::NONE;
+            key.code = code;
+            key.modifiers -= KeyModifiers::CONTROL;
         }
         if full() && !self.watching() && self.full_screen(&event) {
             return;
@@ -4467,7 +4538,11 @@ impl App {
                     self.pick = 0;
                     return;
                 }
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
                     self.input.set(picked);
                     self.pick = 0;
                     self.submit().await;
@@ -4483,9 +4558,19 @@ impl App {
         }
         match event {
             // Terminals send a pasted line break as a carriage return.
-            Event::Paste(text) => self
-                .input
-                .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
+            // Image files dropped on the terminal arrive as their paths.
+            Event::Paste(text) => {
+                match attach::paths(&text, std::path::Path::new(&self.workspace)) {
+                    Some(paths) => {
+                        for path in paths {
+                            self.attach(attach::load(&path));
+                        }
+                    }
+                    None => self
+                        .input
+                        .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
+                }
+            }
             Event::Resize(width, _) => self.width = width as usize,
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -4497,13 +4582,13 @@ impl App {
                         if self.input.is_empty() {
                             self.quit = true;
                         } else {
-                            self.input.clear();
+                            self.discard();
                         }
                     }
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
-                        if !self.approvals.is_empty() && self.input.is_empty() =>
+                        if !ctrl && !alt && !self.approvals.is_empty() && self.input.is_empty() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -4521,11 +4606,23 @@ impl App {
                     KeyCode::Char('u') if ctrl => self.input.delete_to_start(),
                     KeyCode::Char('k') if ctrl => self.input.delete_to_end(),
                     KeyCode::Char('w') if ctrl => self.input.delete_word(),
+                    KeyCode::Char('y') if ctrl => self.input.yank(),
+                    // Ctrl-J is the line feed a terminal sends for it.
+                    KeyCode::Char('j') if ctrl => self.input.insert("\n"),
+                    // A picture on the clipboard, as Codex and Claude Code
+                    // take one: terminals paste only text.
+                    KeyCode::Char('v') if ctrl => match attach::clipboard() {
+                        Ok(Some(picture)) => self.attach(Ok(picture)),
+                        Ok(None) => self.notice = Some("no picture on the clipboard".into()),
+                        Err(error) => self.notice = Some(error),
+                    },
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
+                    KeyCode::Char('d') if alt => self.input.delete_word_forward(),
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
+                    KeyCode::Delete if ctrl || alt => self.input.delete_word_forward(),
                     KeyCode::Delete => self.input.delete(),
                     KeyCode::Left if ctrl || alt => self.input.word_left(),
                     KeyCode::Right if ctrl || alt => self.input.word_right(),
@@ -4539,7 +4636,9 @@ impl App {
                     KeyCode::Down => {
                         self.input.down(self.prose());
                     }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Alt-Enter too, for terminals that send Shift-Enter
+                    // as a plain Enter.
+                    KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
                         self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
@@ -4558,7 +4657,7 @@ impl App {
                             if self.input.is_empty() {
                                 self.quit = true;
                             } else {
-                                self.input.clear();
+                                self.discard();
                             }
                         } else if !self.asks.is_empty() {
                             self.chatting = !self.chatting;
@@ -4811,8 +4910,10 @@ impl App {
             .strip_prefix("/side")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
+            let pictures = self.placed(question);
             self.input.clear();
-            self.side(question.trim().to_owned()).await;
+            self.pictures.clear();
+            self.side(question.trim().to_owned(), &pictures).await;
             return;
         }
         // What is typed answers the lead's first open question, and goes
@@ -4837,7 +4938,7 @@ impl App {
         // first, each on its own, and this message joins the turn they start.
         let mut join = false;
         while let Some(record) = self.unsent.first().cloned() {
-            if let Err(error) = self.send(record.clone(), Some(SHELL), join).await {
+            if let Err(error) = self.send(record.clone(), Some(SHELL), join, &[]).await {
                 self.notice = Some(error);
                 return;
             }
@@ -4845,10 +4946,12 @@ impl App {
             self.unsent.remove(0);
             join = true;
         }
-        match self.send(prompt, None, join).await {
+        let pictures = self.placed(&prompt);
+        match self.send(prompt, None, join, &pictures).await {
             Ok(()) => {
                 self.input.clear();
                 self.notice = None;
+                self.pictures.clear();
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
@@ -4863,6 +4966,21 @@ impl App {
         }
     }
 
+    /// Drop what is being written, with the pictures it was given.
+    fn discard(&mut self) {
+        self.input.clear();
+        self.pictures.clear();
+    }
+
+    /// The pictures whose placeholders are still in `prompt`, which go
+    /// with it.
+    fn placed(&self, prompt: &str) -> Vec<attach::Picture> {
+        (self.pictures.iter().enumerate())
+            .filter(|(at, _)| prompt.contains(&attach::placeholder(at + 1)))
+            .filter_map(|(_, picture)| picture.clone())
+            .collect()
+    }
+
     /// Send `prompt`: a turn of its own, or a steer of the running one (or
     /// of the one just started, `join`); staged until it lands. `origin`
     /// names what sent it when the person's words did not.
@@ -4871,6 +4989,7 @@ impl App {
         prompt: String,
         origin: Option<&str>,
         join: bool,
+        pictures: &[attach::Picture],
     ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = (join || self.running.is_some()).then_some("steer");
@@ -4887,7 +5006,7 @@ impl App {
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
                     "delivery": delivery, "model": model, "workspace": workspace,
-                    "origin": origin}),
+                    "origin": origin, "images": attach::submitted(pictures)}),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4898,6 +5017,37 @@ impl App {
             self.move_to = None;
         }
         Ok(())
+    }
+
+    /// A picture for the message being written, behind a placeholder put
+    /// where the cursor is; or why there is none.
+    fn attach(&mut self, picture: Result<attach::Picture, String>) {
+        for (at, picture) in self.pictures.iter_mut().enumerate() {
+            let placeholder = attach::placeholder(at + 1);
+            if !self.input.contains(&placeholder) && !self.input.killed().contains(&placeholder) {
+                *picture = None;
+            }
+        }
+        // The daemon takes a message's pictures up to a size together.
+        let placed: usize = (self.placed(&self.input).iter())
+            .map(|placed| placed.data.len())
+            .sum();
+        match picture {
+            Ok(picture) if placed + picture.data.len() > attach::MOST_BYTES => {
+                self.notice = Some(format!(
+                    "a message's pictures may be {} MB together; this one makes {} MB",
+                    attach::MOST_BYTES / 1024 / 1024,
+                    (placed + picture.data.len()).div_ceil(1024 * 1024)
+                ));
+            }
+            Ok(picture) => {
+                self.pictures.push(Some(picture));
+                self.input
+                    .insert(&format!("{} ", attach::placeholder(self.pictures.len())));
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     /// A reply the bot gave, which `/react` offers until newer ones push
@@ -5057,7 +5207,7 @@ impl App {
     /// screen. The copy may call no tool, so it answers from what the bot
     /// knows; the daemon deletes it once it has been idle a quarter hour.
     /// This bot carries on, and its lines wait for the main screen.
-    async fn side(&mut self, question: String) {
+    async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
@@ -5089,7 +5239,8 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "model": self.turn_model}),
+                        "prompt": question, "model": self.turn_model,
+                        "images": attach::submitted(pictures)}),
                 )
                 .await
         {
@@ -5783,8 +5934,6 @@ impl App {
     }
 }
 
-/// `/status` on its own screen: the card, its times counted on since it was
-/// read, and how to leave.
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc closes";
 
@@ -5826,7 +5975,7 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
 }
 
 /// `/status`'s card at `width`, each line after a space, its times
-/// counted on from when its rows were read; and whether any task in it
+/// running turns counted on from when its rows were read; and whether any task in it
 /// is resolved.
 fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
     let since = watch.read.elapsed().as_secs();
@@ -5835,7 +5984,9 @@ fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
         .iter()
         .cloned()
         .map(|mut row| {
-            row.seconds = row.seconds.map(|s| s + since);
+            if row.running {
+                row.seconds = row.seconds.map(|s| s + since);
+            }
             row
         })
         .collect();
@@ -5938,7 +6089,12 @@ fn first_line(text: &str) -> String {
 
 /// A message item's text.
 fn text(item: &Value) -> String {
-    match &item["content"] {
+    joined(&item["content"])
+}
+
+/// Text, or the text of a list of parts, leaving out the pictures.
+fn joined(content: &Value) -> String {
+    match content {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
@@ -5952,10 +6108,11 @@ fn text(item: &Value) -> String {
 /// A tool result's text, and whether it failed. A shell result is JSON
 /// with its streams and exit status.
 fn output(item: &Value) -> (String, bool) {
-    let raw = item["output"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| text(item));
+    // A result with a picture (an image file read) is a list of parts.
+    let raw = match &item["output"] {
+        Value::Null => text(item),
+        output => joined(output),
+    };
     let failed = item["failed"] == true;
     match serde_json::from_str::<Value>(&raw) {
         Ok(shell) if shell.get("exit_code").is_some() => {
@@ -7108,6 +7265,88 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn pictures_go_with_their_placeholders_and_a_discarded_draft_drops_them() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let picture = |n| attach::Picture {
+            media_type: "image/png",
+            data: vec![n],
+        };
+        app.attach(Ok(picture(1)));
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert!(app.input.is_empty() && app.pictures.is_empty());
+        app.attach(Ok(picture(1)));
+        app.attach(Ok(picture(2)));
+        app.input.set("only [Image #2] now");
+        assert_eq!(app.placed(&app.input), [picture(2)]);
+        assert_eq!(
+            attach::submitted(&app.placed(&app.input)),
+            Some(json!([{"media_type": "image/png", "data": "Ag=="}]))
+        );
+        assert_eq!(attach::submitted(&[]), None);
+        // Pictures past what a message takes together are not attached.
+        app.input.clear();
+        let large = || attach::Picture {
+            media_type: "image/jpeg",
+            data: vec![0; 3 << 20],
+        };
+        app.attach(Ok(large()));
+        app.attach(Ok(large()));
+        assert_eq!(app.placed(&app.input).len(), 1);
+        assert!(app.notice.as_deref().unwrap().contains("5 MB together"));
+        // A picture whose placeholder is gone, and that Ctrl-Y cannot put
+        // back, is let go at the next attachment; Ctrl-Y's is kept.
+        let ctrl_u = || {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.attach(Ok(picture(4)));
+        app.key(ctrl_u()).await;
+        app.attach(Ok(picture(5)));
+        let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
+        assert_eq!(kept, [false, false, true, true, true]);
+        app.key(ctrl_u()).await;
+        app.attach(Ok(picture(6)));
+        let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
+        assert_eq!(kept, [false, false, false, false, true, true]);
+    }
+
+    #[tokio::test]
+    async fn the_shell_editing_keys_work_in_the_composer() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let press = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        let ctrl = |c| press(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let alt = |c| press(KeyCode::Char(c), KeyModifiers::ALT);
+        app.input.set("one two three");
+        app.key(ctrl('w')).await;
+        app.key(ctrl('a')).await;
+        app.key(alt('d')).await;
+        assert_eq!(&*app.input, " two ");
+        app.key(ctrl('y')).await;
+        app.key(ctrl('e')).await;
+        app.key(ctrl('j')).await;
+        app.key(ctrl('y')).await;
+        assert_eq!(&*app.input, "one two \none");
+        app.key(ctrl('p')).await;
+        app.key(press(KeyCode::Delete, KeyModifiers::CONTROL)).await;
+        assert_eq!(&*app.input, "one \none", "Ctrl-P went up a row");
+        app.key(ctrl('n')).await;
+        app.key(press(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .await;
+        assert_eq!(&*app.input, "one \n");
+        app.key(press(KeyCode::Enter, KeyModifiers::ALT)).await;
+        assert_eq!(&*app.input, "one \n\n");
     }
 
     #[test]

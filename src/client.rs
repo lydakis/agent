@@ -101,6 +101,8 @@ struct Options {
     budget_tokens: Option<u64>,
     /// `run --turn-budget-tokens`: the submitted turn's own cap.
     turn_budget_tokens: Option<u64>,
+    /// `run --image`: pictures sent with the prompt, by path.
+    images: Vec<String>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
     /// `follow --all`: every bot on one connection.
@@ -174,6 +176,7 @@ fn parse(args: &[String]) -> Result<Options> {
         grace_ms: 0,
         budget_tokens: None,
         turn_budget_tokens: None,
+        images: Vec::new(),
         turn: None,
         keep_turns: None,
         all: false,
@@ -189,9 +192,7 @@ fn parse(args: &[String]) -> Result<Options> {
         tag: None,
         reason: None,
         note: std::env::var_os("AGENT_APPROVER_NOTE").map(PathBuf::from),
-        judge: std::env::var("AGENT_JUDGE")
-            .ok()
-            .filter(|judge| !judge.is_empty()),
+        judge: None,
         judge_url: None,
         daemon_flags: Vec::new(),
         settings: serde_json::Map::new(),
@@ -374,6 +375,7 @@ fn parse(args: &[String]) -> Result<Options> {
                             Error::with("usage", "--budget-tokens needs an integer")
                         })?)
                     }
+                    "--image" => options.images.push(value),
                     "--turn-budget-tokens" => {
                         options.turn_budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--turn-budget-tokens needs an integer")
@@ -1388,10 +1390,16 @@ fn run(options: &Options) -> Result<i32> {
     // Existing bots keep their model and effort unless --model or
     // --effort overrides them for this turn. AGENT_MODEL and
     // AGENT_EFFORT are only creation defaults, including in a peer's shell.
+    let images = options
+        .images
+        .iter()
+        .map(|path| image(path))
+        .collect::<Result<Vec<_>>>()?;
     let submitted = connection
         .request(
             "submit",
             json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
+                "images":(!images.is_empty()).then_some(images),
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
                 "effort":if created { Value::Null } else { json!(options.effort) },
@@ -1431,6 +1439,33 @@ fn run(options: &Options) -> Result<i32> {
 /// A busy bot's refusal, with the ways past it as flags to copy: callers,
 /// models included, do not act on a description of them. The daemon names
 /// the same ways as request fields.
+/// `run --image PATH`: the file as the daemon takes a picture, its media
+/// type from its name.
+fn image(path: &str) -> Result<agent_runtime::codec::Image> {
+    use base64::Engine;
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    let media_type = match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => {
+            return fail_with(
+                "usage",
+                format!("--image {path}: name a .png, .jpg, .jpeg, .gif or .webp file"),
+            );
+        }
+    };
+    let data = std::fs::read(path)
+        .map_err(|error| Error::with("image_unreadable", format!("--image {path}: {error}")))?;
+    Ok(agent_runtime::codec::Image {
+        media_type: media_type.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(data),
+    })
+}
 fn ways_past_busy(bot: &str, error: Error) -> Error {
     if error.code == "active_agent_limit" {
         let mut error = Error {
@@ -1811,12 +1846,17 @@ fn note(path: &Path) -> Result<String> {
 fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let note = options.note.as_deref().map(note).transpose()?;
+    // The flags over the person's `[judge]` in ~/.agent/config.toml.
+    let config = agent_client::config::load().map_err(|error| match error.split_once(": ") {
+        Some((code, detail)) => Error::with(code, detail),
+        None => Error::with("config_invalid", error),
+    })?;
     crate::approver::main(crate::approver::Settings {
         socket: options.socket.clone(),
         tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
-        judge: options.judge.clone(),
+        judge: (options.judge.clone()).or(config.judge.model),
         caller: env("AGENT_MODEL"),
-        effort: options.effort.clone(),
+        effort: (options.effort.clone()).or(config.judge.effort),
         url: options.judge_url.clone(),
         key: env(DECISIONS_KEY),
         note,
