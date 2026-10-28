@@ -510,7 +510,10 @@ this replaced:
   to the workspace, when they all read now exactly as the bot was given
   them when it was made. If any was edited, cut short, added, or removed
   since, by the agent or anyone, none is shown, so an agent cannot write
-  itself permission or drop a restriction. Transcript entries are redacted
+  itself permission or drop a restriction. Where the bot's memory index
+  is all that follows the files in what it was given, none is shown
+  either: agents write memory, so it can't mark where a file ended.
+  Transcript entries are redacted
   whole before they are cut to size, so a cut never keeps an
   unrecognizable piece of a secret.
 

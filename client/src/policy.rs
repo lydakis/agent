@@ -797,9 +797,12 @@ fn agents_header(path: &Path) -> String {
 /// The AGENTS.md files that apply to `workspace`, with their text, when
 /// `instructions`, a bot's, hold them all as they read now: what the bot
 /// was given, unchanged since. The files must be the whole of what it was
-/// given, with no file before them and a section composed after them (or
-/// the end) right after the last, so a file cut short, added, or removed
-/// since reads as changed, and then none is returned.
+/// given, with no file before them and, right after the last, the end or
+/// a heading only composing writes, so a file cut short, added, or removed
+/// since reads as changed, and then none is returned. Memory never marks
+/// that end: agents write it, so an index could be made to read as the
+/// paragraphs cut from a file. Where memory is all that follows, none is
+/// returned.
 pub fn given_agents_files(workspace: &Path, instructions: &str) -> Vec<(PathBuf, String)> {
     let Ok(paths) = agents_files(workspace) else {
         return Vec::new();
@@ -822,20 +825,14 @@ pub fn given_agents_files(workspace: &Path, instructions: &str) -> Vec<(PathBuf,
     if files.is_empty() {
         return files;
     }
-    // What the instructions compose after the files: skills, profiles,
-    // memory as it reads now, the role.
-    let memory: Vec<String> = memory_indexes(workspace)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|path| read_bounded(path, MAX_INSTRUCTIONS).ok()?)
-        .map(|body| format!("\n\n{}", body.trim()))
-        .collect();
+    // What the instructions compose after the files: the skills or
+    // profiles list, or the role, which comes last, so no list follows it.
+    let lists = [Kind::Skills.header(), Kind::Profiles.header()];
     let follows = |rest: &str| {
         rest.is_empty()
-            || rest.starts_with(&Kind::Skills.header())
-            || rest.starts_with(&Kind::Profiles.header())
-            || rest.starts_with(ROLE_HEADING)
-            || memory.iter().any(|body| rest.starts_with(body.as_str()))
+            || lists.iter().any(|header| rest.starts_with(header.as_str()))
+            || (rest.starts_with(ROLE_HEADING)
+                && !lists.iter().any(|header| rest.contains(header.as_str())))
     };
     let given = instructions.match_indices(&blocks).any(|(at, _)| {
         !instructions[..at].contains(AGENTS_HEADING) && follows(&instructions[at + blocks.len()..])
@@ -1005,6 +1002,29 @@ mod tests {
         // Nor when one is cut short at a paragraph, dropping its restriction.
         std::fs::write(root.join("AGENTS.md"), "Push when finished.").unwrap();
         assert!(found().is_empty());
+        // Nor when memory, which agents write, is what follows them: an
+        // index made to read as the cut paragraph would pass for it.
+        let cut = "Act freely.\n\nNever push.";
+        std::fs::write(root.join("AGENTS.md"), cut).unwrap();
+        let cut_given = instructions(&deep, None, &[]).unwrap().text;
+        std::fs::write(root.join("AGENTS.md"), "Act freely.").unwrap();
+        assert!(given_agents_files(&deep, &cut_given).is_empty());
+        // Nor when the cut leaves a role-like heading of the file's own
+        // before a list: the role comes last.
+        let headed = "Act freely.\n\n# Role: careful\n\nNever push.";
+        std::fs::write(root.join("AGENTS.md"), headed).unwrap();
+        std::fs::create_dir_all(deep.join(".agents/skills/deploy")).unwrap();
+        std::fs::write(
+            deep.join(".agents/skills/deploy/SKILL.md"),
+            "# Deploy\n\nShip.",
+        )
+        .unwrap();
+        let headed_given = instructions(&deep, None, &[]).unwrap().text;
+        std::fs::write(root.join("AGENTS.md"), "Act freely.").unwrap();
+        assert!(given_agents_files(&deep, &headed_given).is_empty());
+        std::fs::write(root.join("AGENTS.md"), headed).unwrap();
+        assert!(!given_agents_files(&deep, &headed_given).is_empty());
+        std::fs::remove_dir_all(deep.join(".agents")).unwrap();
         // Nor when one is removed.
         std::fs::write(root.join("AGENTS.md"), outer).unwrap();
         assert_eq!(found().len(), 2);
