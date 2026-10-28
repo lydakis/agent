@@ -23,6 +23,9 @@
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
 //! bearer_token_env_var = "LINEAR_TOKEN"
+//! [sonny.sources.slack]         # what Sonny's lookout runs for news
+//! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
+//! every = "1m"                  # how long after it exits it runs again
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -85,6 +88,8 @@ pub struct Sonny {
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// What the lookout runs for news from outside, by name.
+    pub sources: Vec<Source>,
 }
 
 impl Default for Sonny {
@@ -96,8 +101,21 @@ impl Default for Sonny {
             task_profile: None,
             mcp_servers: BTreeMap::new(),
             suggest: true,
+            sources: Vec::new(),
         }
     }
+}
+
+/// A command Sonny's lookout runs, whose every printed line is news for
+/// the agents subscribed to it by name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Source {
+    pub name: String,
+    /// Run with `sh -c`.
+    pub command: String,
+    /// How long after it exits it runs again, as `30s`, `5m` or `1h`;
+    /// unset, a minute.
+    pub every: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -326,6 +344,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 }
                 continue;
             }
+            if (name.as_str(), key.as_str()) == ("sonny", "sources") {
+                config.sonny.sources = sources(value)?;
+                continue;
+            }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
             }
@@ -348,6 +370,40 @@ fn parse(text: &str) -> Result<Config, String> {
         }
     }
     Ok(config)
+}
+
+/// `[sonny.sources.NAME]` tables, each with a `command` and maybe `every`.
+fn sources(value: &toml::Value) -> Result<Vec<Source>, String> {
+    let table = (value.as_table()).ok_or("sonny.sources must be a table of sources")?;
+    let mut sources = Vec::new();
+    for (name, source) in table {
+        let key = |field: &str| format!("sonny.sources.{name}.{field}");
+        if name.is_empty()
+            || name.len() > 64
+            || !(name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err(format!(
+                "sonny.sources.{name}: a source's name is 1 to 64 of A-Z a-z 0-9 _ -"
+            ));
+        }
+        let fields =
+            (source.as_table()).ok_or_else(|| format!("sonny.sources.{name} must be a table"))?;
+        let mut command = None;
+        let mut every = None;
+        for (field, value) in fields {
+            match field.as_str() {
+                "command" => command = Some(string(&key(field), value)?),
+                "every" => every = Some(string(&key(field), value)?),
+                _ => return Err(format!("unknown key {}", key(field))),
+            }
+        }
+        sources.push(Source {
+            name: name.clone(),
+            command: command.ok_or_else(|| format!("{} is missing", key("command")))?,
+            every,
+        });
+    }
+    Ok(sources)
 }
 
 fn string(key: &str, value: &toml::Value) -> Result<String, String> {
@@ -582,6 +638,45 @@ mod tests {
             (
                 "[sonny.mcp_servers.\"a b\"]\ncommand = \"a\"",
                 "sonny.mcp_servers.a b: a name is 1 to 64 letters, digits, _ or -",
+            ),
+        ] {
+            assert_eq!(parse(text).unwrap_err(), error, "{text}");
+        }
+    }
+
+    #[test]
+    fn sources_are_named_commands() {
+        let config = parse(
+            "[sonny]\nlead_effort = \"low\"\n\n[sonny.sources.slack]\ncommand = \"~/bin/slack-poll\"\nevery = \"5m\"\n\n[sonny.sources.mail]\ncommand = \"mail-poll\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.sonny.lead_effort.as_deref(), Some("low"));
+        let named: Vec<(&str, &str, Option<&str>)> = (config.sonny.sources.iter())
+            .map(|s| (s.name.as_str(), s.command.as_str(), s.every.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("mail", "mail-poll", None),
+                ("slack", "~/bin/slack-poll", Some("5m"))
+            ]
+        );
+        for (text, error) in [
+            (
+                "[sonny.sources.slack]\nevery = \"1m\"",
+                "sonny.sources.slack.command is missing",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nargs = \"y\"",
+                "unknown key sonny.sources.slack.args",
+            ),
+            (
+                "[sonny.sources.\"a b\"]\ncommand = \"x\"",
+                "sonny.sources.a b: a source's name is 1 to 64 of A-Z a-z 0-9 _ -",
+            ),
+            (
+                "[sonny]\nsources = 3",
+                "sonny.sources must be a table of sources",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
