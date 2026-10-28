@@ -128,6 +128,11 @@ impl Prompt {
         self.kill(start..self.at);
     }
 
+    /// What Ctrl-Y would put back.
+    pub fn killed(&self) -> &str {
+        &self.killed
+    }
+
     /// Put back what the last word or line deletion took, at the cursor.
     pub fn yank(&mut self) {
         let killed = self.killed.clone();

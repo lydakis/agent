@@ -1256,7 +1256,9 @@ struct App {
     /// Pictures given with the message being written, each behind its
     /// placeholder in the composer: [`attach::placeholder`] of its place
     /// here, from 1.
-    pictures: Vec<attach::Picture>,
+    /// Pictures attached to the draft, by their placeholders' numbers; one
+    /// neither the draft nor Ctrl-Y can bring back is let go.
+    pictures: Vec<Option<attach::Picture>>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The bot's latest replies, by node, with their first lines: what
@@ -4558,7 +4560,7 @@ impl App {
     fn placed(&self, prompt: &str) -> Vec<attach::Picture> {
         (self.pictures.iter().enumerate())
             .filter(|(at, _)| prompt.contains(&attach::placeholder(at + 1)))
-            .map(|(_, picture)| picture.clone())
+            .filter_map(|(_, picture)| picture.clone())
             .collect()
     }
 
@@ -4603,6 +4605,12 @@ impl App {
     /// A picture for the message being written, behind a placeholder put
     /// where the cursor is; or why there is none.
     fn attach(&mut self, picture: Result<attach::Picture, String>) {
+        for (at, picture) in self.pictures.iter_mut().enumerate() {
+            let placeholder = attach::placeholder(at + 1);
+            if !self.input.contains(&placeholder) && !self.input.killed().contains(&placeholder) {
+                *picture = None;
+            }
+        }
         // The daemon takes a message's pictures up to a size together.
         let placed: usize = (self.placed(&self.input).iter())
             .map(|placed| placed.data.len())
@@ -4616,7 +4624,7 @@ impl App {
                 ));
             }
             Ok(picture) => {
-                self.pictures.push(picture);
+                self.pictures.push(Some(picture));
                 self.input
                     .insert(&format!("{} ", attach::placeholder(self.pictures.len())));
                 self.notice = None;
@@ -6647,6 +6655,23 @@ mod tests {
         app.attach(Ok(large()));
         assert_eq!(app.placed(&app.input).len(), 1);
         assert!(app.notice.as_deref().unwrap().contains("5 MB together"));
+        // A picture whose placeholder is gone, and that Ctrl-Y cannot put
+        // back, is let go at the next attachment; Ctrl-Y's is kept.
+        let ctrl_u = || {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.attach(Ok(picture(4)));
+        app.key(ctrl_u()).await;
+        app.attach(Ok(picture(5)));
+        let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
+        assert_eq!(kept, [false, false, true, true, true]);
+        app.key(ctrl_u()).await;
+        app.attach(Ok(picture(6)));
+        let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
+        assert_eq!(kept, [false, false, false, false, true, true]);
     }
 
     #[tokio::test]
