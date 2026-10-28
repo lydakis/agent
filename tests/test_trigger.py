@@ -259,7 +259,8 @@ class TriggerFireTests(ModelFixture):
         submit = {'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'],
                   'prompt': prompt, 'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}
         (taking / '100.1.1').write_text(json.dumps({'store_id': self.store_identity(), 'submit': submit}))
-        again = self.fire('p.task', 'second', generation='g2')
+        # Its `--if` said go once already: one that would say no now is not asked.
+        again = self.fire('p.task', 'second', generation='g2', extra=['--if', 'exit 1', '--dir', str(self.path)])
         self.assertEqual((again['last']['outcome'], again['last']['turn']), ('sent', turn['turn']), again)
         self.assertEqual(len(self.turns('p.task')), 2)
         self.assertFalse((taking / '100.1.1').exists())

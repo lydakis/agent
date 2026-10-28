@@ -2545,6 +2545,13 @@ async fn deliver(
     why: &str,
     ask: Option<&Asked>,
 ) -> Value {
+    // An ask keeps the request sent for it, before it goes: a fire cut
+    // short, or the trigger that replaced this one, sends it again as it
+    // was, which the daemon takes once.
+    if let Some(sent) = ask.and_then(|ask| sent_for(ask, trigger)) {
+        let bot = sent["bot"].as_str().unwrap_or_default().to_owned();
+        return submit(client, trigger, &bot, sent, false, ask).await;
+    }
     let prompt = format!(
         "[trigger {} · {} · {why}]\n{}",
         trigger.name,
@@ -2572,28 +2579,37 @@ async fn deliver(
     } else {
         "reject"
     };
-    let mut asking = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
+    let asking = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
         "prompt": prompt, "delivery": delivery, "origin": "trigger",
         "budget_tokens": trigger.turn_budget_tokens});
-    // An ask keeps the request sent for it, before it goes: a fire cut
-    // short, or the trigger that replaced this one, sends it again as it
-    // was, which the daemon takes once. Only to the store it went to: one
-    // that replaced it on another store sends its own.
     if let Some(ask) = ask {
-        match std::fs::read(&ask.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .filter(|sent| sent["store_id"] == trigger.store_id.as_str())
-            .filter(|sent| sent["submit"]["request_id"].is_string())
-        {
-            Some(sent) => asking = sent["submit"].clone(),
-            None => {
-                let sent = json!({"store_id": trigger.store_id, "submit": asking});
-                let _ = std::fs::write(&ask.path, sent.to_string());
-            }
-        }
+        let sent = json!({"store_id": trigger.store_id, "submit": asking});
+        let _ = std::fs::write(&ask.path, sent.to_string());
     }
-    let bot = asking["bot"].as_str().unwrap_or(bot).to_owned();
+    submit(client, trigger, bot, asking, started, ask).await
+}
+
+/// The request an ask sent before, to send again: only to the store it
+/// went to, since one that replaced its trigger on another store sends its
+/// own.
+fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<Value> {
+    std::fs::read(&ask.path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|sent| sent["store_id"] == trigger.store_id.as_str())
+        .map(|sent| sent["submit"].clone())
+        .filter(|submit| submit["request_id"].is_string() && submit["bot"].is_string())
+}
+
+/// Send a fire's turn, and its answer on to `--reply-to`.
+async fn submit(
+    client: &Client,
+    trigger: &Trigger,
+    bot: &str,
+    asking: Value,
+    started: bool,
+    ask: Option<&Asked>,
+) -> Value {
     let submitted = client.request("submit", asking).await;
     let outcome = match submitted {
         Ok(turn) => {
@@ -2618,7 +2634,7 @@ async fn deliver(
         }
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
-    reply(client, trigger, &bot, outcome).await
+    reply(client, trigger, bot, outcome).await
 }
 
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire
@@ -2788,6 +2804,17 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     let now = now();
     let durable = state(places, trigger);
     let mut kept = Kept::of(&durable);
+    // An ask that sent its request is past its time, its commit and its
+    // `--if`: what is left is sending it again, which the daemon takes once,
+    // and passing its answer on.
+    if ask.is_some_and(|a| sent_for(a, trigger).is_some()) {
+        let outcome = with_daemon(trigger, async |client| {
+            deliver(client, places, trigger, &mut kept, "fired", ask).await
+        });
+        let (Ok(outcome) | Err(outcome)) = outcome;
+        settle(places, trigger, &named(outcome), &kept, &launchctl);
+        return;
+    }
     // Its last run went out but its end did not (launchd would not unload
     // it): it ends now, sending nothing more.
     if trigger.runs.is_some_and(|runs| kept.sent >= runs) {
