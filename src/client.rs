@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
 use agent_client::approver::{AUTO_EXPIRE_MS, AUTO_UNGATED, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 
@@ -144,7 +143,7 @@ fn parse(args: &[String]) -> Result<Options> {
         providers: Vec::new(),
         providers_explicit: false,
         tools_explicit: false,
-        tools: DEFAULT_TOOLS.into(),
+        tools: String::new(),
         allow: None,
         model: None,
         instructions: None,
@@ -1376,9 +1375,16 @@ fn run(options: &Options) -> Result<i32> {
         };
         let instructions = composed_instructions(options, workspace, role.as_ref())?;
         let (created_by, created_by_id) = created_by()?;
-        // --tools, else the role's, else the default set.
+        // --tools, else the role's, else the default set for its model.
         let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
             Some(tools) if !options.tools_explicit => tools,
+            _ if !options.tools_explicit => {
+                let search = config()?.web_search;
+                agent_client::default_tools(&connection.ready["providers"], &model, search)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
             _ => options
                 .tools
                 .split(',')
@@ -2465,6 +2471,7 @@ fn summary_keys(name: &str) -> &'static [&'static str] {
         "shell" => &["command"],
         "read" => &["path", "artifact"],
         "write" | "edit" => &["path"],
+        "apply_patch" => &["input"],
         _ => &[],
     }
 }
@@ -2515,9 +2522,33 @@ fn summary(name: &str, arguments: &str) -> String {
             Some(args) => args[key].as_str().map(str::to_owned),
             None => preview_field(arguments, key),
         })
+        .map(|text| match name {
+            "apply_patch" => patch_files(&text),
+            _ => text,
+        })
         .unwrap_or_else(|missing| format!("[no {missing} in the arguments shown]"))
     };
     one_line(&text, false)
+}
+
+/// The files a patch changes, from its file lines: `+path` added,
+/// `-path` deleted, `path` updated, `path → new` moved.
+fn patch_files(patch: &str) -> String {
+    let mut files: Vec<String> = Vec::new();
+    for line in patch.lines().map(str::trim) {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            files.push(format!("+{path}"));
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            files.push(format!("-{path}"));
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            files.push(path.to_owned());
+        } else if let Some(path) = line.strip_prefix("*** Move to: ")
+            && let Some(last) = files.last_mut()
+        {
+            last.push_str(&format!(" → {path}"));
+        }
+    }
+    files.join(", ")
 }
 
 /// The first line of `text`, marked when more lines follow or it was cut,
@@ -3112,6 +3143,16 @@ mod tests {
                 json!({"arguments":{"path":"a.txt","old":"gone","new":""}})
             ),
             "edit a.txt\n  │ old:\n  │ gone\n  │ new:"
+        );
+        // A patch shows every line of itself; started, only its files.
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n*** Move to: b.rs\n@@\n-x\n+y\n*** Add File: c.rs\n+z\n*** Delete File: d.rs\n*** End Patch";
+        assert_eq!(
+            line("apply_patch", json!({"arguments":{"input":patch}})),
+            format!("apply_patch {}", patch.replace('\n', "\n  │ "))
+        );
+        assert_eq!(
+            tool_line("apply_patch", &json!({"input":patch}).to_string()),
+            "▸ apply_patch a.rs → b.rs, +c.rs, -d.rs"
         );
         assert_eq!(
             line(

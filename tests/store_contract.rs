@@ -374,6 +374,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                 .unwrap()
                 .turn;
             let calls = ["executing", "planned"].map(|id| ToolCall {
+                custom: false,
                 name: "write".into(),
                 call_id: id.into(),
                 arguments: r#"{"path":"file","content":"hello"}"#.into(),
@@ -483,6 +484,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                 .unwrap()
                 .turn;
             let call = ToolCall {
+                custom: false,
                 name: "write".into(),
                 call_id: "c1".into(),
                 arguments: "{}".into(),
@@ -491,6 +493,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
             // must repair only the unanswered suffix, not duplicate results.
             for id in ["done", "c1"] {
                 let call = ToolCall {
+                    custom: false,
                     call_id: id.into(),
                     ..call.clone()
                 };
@@ -576,6 +579,7 @@ fn tool_results_and_cursor_events_commit_together() {
         .unwrap()
         .turn;
     let call = ToolCall {
+        custom: false,
         name: "echo".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
@@ -633,6 +637,7 @@ fn shell_call(item_id: &str, call_id: &str, command: &str) -> (Bytes, ToolCall) 
     let item = json!({"type":"function_call","id":item_id,"call_id":call_id,
         "name":"shell","arguments":arguments});
     let call = ToolCall {
+        custom: false,
         name: "shell".into(),
         call_id: call_id.into(),
         arguments,
@@ -856,6 +861,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
             name: name.into(),
             call_id: id.into(),
             arguments,
+            custom: false,
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -1044,6 +1050,7 @@ fn lapsing_round(db: &mut Database, calls: &[(&str, &str)]) -> (i64, Vec<ToolCal
             let item = json!({"type":"function_call","id":format!("fc_{i}"),
                 "call_id":call_id,"name":name,"arguments":arguments});
             let call = ToolCall {
+                custom: false,
                 name: name.into(),
                 call_id: call_id.into(),
                 arguments,
@@ -1316,6 +1323,7 @@ fn a_long_field_hides_no_other_in_a_listing() {
     let item = json!({"type":"function_call","id":"fc_1","call_id":"s1",
         "name":"shell","arguments":arguments});
     let call = ToolCall {
+        custom: false,
         name: "shell".into(),
         call_id: "s1".into(),
         arguments,
@@ -3358,6 +3366,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
             name: "start".into(),
             call_id: format!("c{n}"),
             arguments: "{}".into(),
+            custom: false,
         })
         .collect();
     db.append(turn, vec![], &calls, None).unwrap();
@@ -3520,6 +3529,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         .unwrap()
         .turn;
     let call = ToolCall {
+        custom: false,
         name: "shell".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
@@ -4811,6 +4821,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
         .unwrap()
         .turn;
     let call = ToolCall {
+        custom: false,
         name: "echo".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
@@ -4929,6 +4940,7 @@ fn call(call_id: &str) -> (Bytes, ToolCall) {
     .unwrap()
     .into();
     let call = ToolCall {
+        custom: false,
         name: "echo".into(),
         call_id: call_id.into(),
         arguments: "{}".into(),
@@ -5364,6 +5376,7 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
     let calls: Vec<ToolCall> = ["c1", "c2"]
         .into_iter()
         .map(|id| ToolCall {
+            custom: false,
             name: "echo".into(),
             call_id: id.into(),
             arguments: "{}".into(),
@@ -5489,6 +5502,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
     let calls: Vec<ToolCall> = ["a", "b"]
         .into_iter()
         .map(|id| ToolCall {
+            custom: false,
             name: "echo".into(),
             call_id: id.into(),
             arguments: "{}".into(),
@@ -6559,6 +6573,7 @@ fn ready_turns_wait_for_a_slot_and_survive_interrupted_predecessors() {
         .begin("Carol", "c2", "more", true, &queue, allow_provider)
         .unwrap();
     let call = ToolCall {
+        custom: false,
         name: "echo".into(),
         call_id: "call-1".into(),
         arguments: "{}".into(),
@@ -6678,6 +6693,7 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
         .unwrap();
     // A newer terminal row must not move retention past live tool intents.
     let call = ToolCall {
+        custom: false,
         name: "echo".into(),
         call_id: "live".into(),
         arguments: "{}".into(),
@@ -8566,6 +8582,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             .unwrap()
             .turn;
         let call = ToolCall {
+            custom: false,
             name: "note".into(),
             call_id: format!("note-{n}"),
             arguments: json!({"text":text}).to_string(),
@@ -9585,6 +9602,7 @@ fn a_store_keeps_its_identity_and_forks_inherit_fallbacks() {
 /// result. Returns the call's node and the result's.
 fn exchange(db: &mut Database, turn: i64, call_id: &str, output: &str) -> (i64, i64) {
     let call = ToolCall {
+        custom: false,
         name: "shell".into(),
         call_id: call_id.into(),
         arguments: "{}".into(),
@@ -9721,6 +9739,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         name: "read".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        custom: false,
     };
     let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":"{}"});
     db.append(
@@ -9952,6 +9971,7 @@ fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
             .turn;
         for n in 0..8 {
             let call = ToolCall {
+                custom: false,
                 name: "shell".into(),
                 call_id: format!("c{n}"),
                 arguments: "{}".into(),
@@ -11481,6 +11501,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         name: "shell".into(),
         call_id: "c".into(),
         arguments: r#"{"command":"true"}"#.into(),
+        custom: false,
     };
     let folder = std::path::Path::new("/synthetic");
     assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
@@ -11527,6 +11548,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
     let (shell, s) = shell_call("fc_2", "s2", "true");
     let arguments = json!({"path":"x"}).to_string();
     let read = ToolCall {
+        custom: false,
         name: "read".into(),
         call_id: "r2".into(),
         arguments: arguments.clone(),

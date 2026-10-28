@@ -77,7 +77,9 @@ It supplies no agent behavior: `create` names the bot's model, instructions,
 and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
-`--tools` or `shell,read,write,edit,wait,history` before it asks. A bot's
+`--tools` or `shell,read,write,wait,history` with `apply_patch` for a
+Responses model and `edit` otherwise, plus `web_search` where the provider
+offers it unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
 other tool is answered with a `tool_not_available` result, whatever the
 model was told. Tool definitions live once in the daemon and their request
@@ -107,7 +109,9 @@ of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
 for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,read,write,edit,wait,history`; `note`, the
+daemon. Default tools are `shell,read,write,wait,history` and the file editor
+the model's family is trained on, `apply_patch` (Responses) or `edit`, and
+`web_search` where the provider offers it; `note`, the
 carry-forward note, is in the universe and chosen per bot.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
@@ -475,7 +479,8 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 binding and waited on at most three seconds. Keys the CLI cannot resolve
 by then (no login yet, an expired SSO session, a stalled CLI) do not stop
 the daemon: the binding's `ready.providers` entry (its `family`, `url`,
-`transport` and the `efforts` its family takes) carries `unresolved` with
+`transport`, the `efforts` its family takes and whether it offers
+`web_search`) carries `unresolved` with
 the reason (its detail clipped to 200 bytes), and its next call resolves
 again, so `aws sso login` fixes it without a restart.
 A call with no usable keys fails before it is paced, admitted or its body
@@ -2033,8 +2038,8 @@ which is future work, or deleting the bot.
 
 ## Tools and validation scope
 
-The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
-`history`; each bot is created with the subset it may call (`run --tools`),
+The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
+`wait`, `history`, `note` and `web_search`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -2820,13 +2825,35 @@ but has more than 64 megapixels is `image_limit`, refused before it is
 decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
 directories and writes up to
 1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
-is set. Paths are relative to the workspace unless absolute; nothing confines a
+is set. `apply_patch` takes Codex's patch format: one patch adds, deletes,
+updates and moves any number of files, every change checked before any file is
+written, so a patch that does not apply changes nothing. Its context lines
+match exactly, then ignoring trailing and surrounding whitespace, then with
+typographic punctuation read as ASCII. On Responses it is a custom tool whose
+call is the patch itself, constrained by its Lark grammar, and its result a
+`custom_tool_call_output`; on Anthropic, a function taking the patch as
+`input`. Paths are relative to the workspace unless absolute; nothing confines a
 tool to the workspace, and tools run with the service's OS permissions.
 Native file tools accept regular files, including symlinks to regular files.
 Known pipes, devices, and other special files return `file_not_regular`. Opens
 are nonblocking and the opened descriptor is checked before reading or
 truncating, so replacing a checked path with a FIFO cannot block a filesystem
 worker or daemon shutdown. Use the shell tool for special-file operations.
+
+`web_search` searches the web the way the bot's provider offers it, as Codex
+does. On OpenAI's API with a key it is Codex's `web.run` function in the `web`
+namespace, which the daemon answers by posting the call's commands to the
+provider's `alpha/search` (bounded at 1 MiB and two minutes) and returning its
+`output`. Searches are paced in a pool of their own and their failures classed
+as a model call's: a rate limit closes the pool, a server or connection failure
+backs off, and both retry within the two minutes before the model hears of them. Bedrock's GPT models get the hosted `web_search` tool over indexed
+results, and Anthropic's API gets its hosted server tool, `web_search_20260209`
+for Claude 4.6 and later but Haiku, `web_search_20250305` otherwise; the
+provider runs both, its blocks and citations are kept in the history as sent,
+and a `pause_turn` stop asks again without a new message. A ChatGPT plan login,
+Claude on Bedrock and any other gateway offer none: `create` refuses the tool
+there with `web_search_unavailable`, and `ready` says per provider whether it
+searches (`web_search`). It runs without approval, as Codex's does.
 
 Shell children inherit the service environment except the provider key
 variables, plus the CLI location/context variables described above. Exact occurrences of provider key

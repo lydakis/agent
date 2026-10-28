@@ -66,6 +66,32 @@ impl From<serde_json::Error> for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A new bot's tools when its client names none: the daemon's own, with
+/// the file editor its model family is trained on, Codex's `apply_patch`
+/// for a Responses model and Claude Code's `edit` for an Anthropic one.
+/// `providers` is `ready.providers`; a model whose provider it does not
+/// name gets `edit`. Web search comes too where the provider offers it,
+/// unless `search` is the person's `web_search = "disabled"`, as Codex
+/// turns it on.
+pub fn default_tools(
+    providers: &Value,
+    model: &str,
+    search: config::WebSearch,
+) -> Vec<&'static str> {
+    let provider = model
+        .split_once('/')
+        .map_or(model, |(provider, _)| provider);
+    let editor = match providers[provider]["family"].as_str() {
+        Some("responses") => "apply_patch",
+        _ => "edit",
+    };
+    let mut tools = vec!["shell", "read", "write", editor, "wait", "history"];
+    if search == config::WebSearch::Live && providers[provider]["web_search"] == true {
+        tools.push("web_search");
+    }
+    tools
+}
+
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
 pub const PROTOCOL: u64 = 21;
@@ -368,6 +394,37 @@ mod tests {
         let _ = child.wait();
         assert_eq!(theirs, pid);
         assert_ne!(theirs, ours);
+    }
+
+    #[test]
+    fn a_new_bot_edits_files_the_way_its_family_is_trained_to() {
+        let providers = json!({"chatgpt": {"family": "responses"},
+            "anthropic": {"family": "anthropic", "web_search": true}});
+        let live = config::WebSearch::Live;
+        assert_eq!(
+            default_tools(&providers, "chatgpt/gpt-6-sol", live),
+            ["shell", "read", "write", "apply_patch", "wait", "history"]
+        );
+        // Search comes where the provider offers it, unless turned off.
+        assert_eq!(
+            default_tools(&providers, "anthropic/claude-opus-5-5", live),
+            [
+                "shell",
+                "read",
+                "write",
+                "edit",
+                "wait",
+                "history",
+                "web_search"
+            ]
+        );
+        let off = default_tools(
+            &providers,
+            "anthropic/claude-opus-5-5",
+            config::WebSearch::Disabled,
+        );
+        assert!(!off.contains(&"web_search"));
+        assert_eq!(default_tools(&providers, "unknown/model", live)[3], "edit");
     }
 
     #[tokio::test]

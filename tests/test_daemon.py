@@ -78,6 +78,63 @@ class DaemonTests(ModelFixture):
                 model.server_close()
                 worker.join(timeout=2)
 
+    def test_a_provider_without_search_says_so_and_refuses_the_tool(self):
+        client = self.client()
+        self.assertIs(client.ready['providers']['openai']['web_search'], False)
+        refused = client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'web_search'])
+        self.assertEqual(refused['error'], 'web_search_unavailable')
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['echo']))
+
+    def test_a_patch_is_a_custom_tool_call_answered_in_kind(self):
+        patch = ('*** Begin Patch\n*** Add File: notes.md\n+# Notes\n'
+                 '*** Update File: calc.py\n@@\n-x = 1\n+x = 2\n*** End Patch')
+        call = dict(type='custom_tool_call', id='ctc_1', call_id='p1', name='apply_patch', input=patch)
+        requests = []
+        class PatchModel(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(request)
+                output = [call] if len(requests) == 1 else [
+                    dict(type='message', role='assistant', content=[dict(type='output_text', text='')])]
+                event = dict(type='response.completed', response=dict(status='completed', output=output))
+                body = ('data: '+json.dumps(event)+'\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        model = http.server.ThreadingHTTPServer(('127.0.0.1', 0), PatchModel)
+        worker = threading.Thread(target=model.serve_forever, daemon=True)
+        worker.start()
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            root = Path(directory)
+            (root/'calc.py').write_text('x = 1\n')
+            client = None
+            try:
+                client = Client(self.binary, root/'state.db', f'http://127.0.0.1:{model.server_port}/v1', 'apply_patch')
+                client.request('create', bot='Bob', workspace=str(root))
+                turn = client.request('submit', bot='Bob', request_id='patch', prompt='patch it')['result']['turn']
+                self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                # Declared as a grammar-constrained custom tool.
+                tool, = requests[0]['tools']
+                self.assertEqual((tool['type'], tool['name'], tool['format']['syntax']), ('custom', 'apply_patch', 'lark'))
+                # The call goes back as the model made it, answered by a
+                # custom tool call output.
+                *_, sent, answer = requests[1]['input']
+                self.assertEqual(sent, call)
+                self.assertEqual(answer, dict(type='custom_tool_call_output', call_id='p1',
+                                              output='Success. Updated the following files:\nA notes.md\nM calc.py\n'))
+                self.assertEqual((root/'notes.md').read_text(), '# Notes\n')
+                self.assertEqual((root/'calc.py').read_text(), 'x = 2\n')
+            finally:
+                if client is not None:
+                    client.close(kill=True)
+                model.shutdown()
+                model.server_close()
+                worker.join(timeout=2)
+
     def test_one_socket_follows_every_bot_and_stats_report_the_fleet(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

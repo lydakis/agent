@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 /// `~/.agents/agents/lead.md` to edit; used when neither the folder nor
 /// the person has a `lead.md`.
 pub const LEAD: &str = include_str!("../agents/lead.md");
-pub const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 
 /// What Sonny ships for every agent it starts other than a lead (tasks,
 /// a trigger's agents and the ones opened with `--new`), written to the
@@ -480,8 +479,8 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     };
     let picks = agent_client::project::Picks {
         model: Some(model),
-        effort: (agent_client::config::load()?.sonny.lead_effort)
-            .or(effort.filter(|e| !e.is_empty())),
+        effort: (config.sonny.lead_effort.clone()).or(effort.filter(|e| !e.is_empty())),
+        web_search: config.web_search,
         ..Default::default()
     };
     make(client, dir, &role, &picks).await.map(|_| ())
@@ -501,7 +500,15 @@ async fn make(
     let mode = crate::approvals::MODES[0].0;
     let tools: Vec<String> = match &role.tools {
         Some(tools) => tools.clone(),
-        None => TOOLS.map(String::from).to_vec(),
+        // The tools the client will give it; one the gate names that the
+        // lead doesn't get is left out there.
+        None => {
+            let model = picks.model.as_deref().or(role.model.as_deref());
+            agent_client::default_tools(client.providers(), model.unwrap_or(""), picks.web_search)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
     };
     let declare = json!(crate::declared::tools(true));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
@@ -515,7 +522,16 @@ async fn make(
         "settings": crate::approvals::sandbox(mode, true, dir),
     });
     let copies = crate::settings::Settings::load().copies;
-    agent_client::project::create(client, dir, &policy, &json!(TOOLS), picks, &copies, None).await
+    agent_client::project::create(
+        client,
+        dir,
+        &policy,
+        client.providers(),
+        picks,
+        &copies,
+        None,
+    )
+    .await
 }
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
@@ -523,9 +539,11 @@ async fn make(
 /// already), its lead opened in a home of its own.
 pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     let (dir, mut picks) = picks(arguments)?;
+    let config = agent_client::config::load()?;
     if picks.effort.is_none() {
-        picks.effort = agent_client::config::load()?.sonny.lead_effort;
+        picks.effort = config.sonny.lead_effort;
     }
+    picks.web_search = config.web_search;
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;

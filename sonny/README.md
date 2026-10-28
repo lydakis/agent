@@ -257,10 +257,13 @@ off again never shows.
   **Working** (a turn running, queued, rate limited or waiting on other
   tasks), **Ready for review** (finished, its last reply linking a pull
   request), **Idle** (finished or stopped with nothing open), and
-  **Resolved**, only counted until `r` shows them. The lead marks a task
-  resolved with its `resolve_task` tool once nothing is left to do in it,
-  such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it. Each agent's
+  **Resolved**, only counted until `r` shows them. As threads in a
+  claude.ai project do, a task resolves itself with the `resolve_task`
+  tool once nothing is left to do in it, such as when its pull request
+  merged or you dropped the work, and the lead can resolve any of its
+  tasks the same way; the lead hears when a task resolved itself, and the
+  task's window closes once its turn ends. New work sent to the task
+  reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
   shows `↻ 2 triggers` beside its model.
@@ -331,8 +334,8 @@ off again never shows.
 
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
-person sees, as a checklist), `show_agent` and `run_in_pane`; a lead's own,
-which its tasks don't take, are `resolve_task`, `start_task`,
+person sees, as a checklist), `resolve_task`, `show_agent` and
+`run_in_pane`; a lead's own, which its tasks don't take, are `start_task`,
 `remove_task`, `new_project` and `subscriptions`. The daemon shows them to
 the model and records each call: `react`, `ask`, `plan` and `resolve_task`
 run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
@@ -347,10 +350,11 @@ LaunchAgent that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
-and a call answered with an error says why under it. The lead's Sonny keeps each
-task the lead resolved beside the store (`state.sqlite.resolved/`), with
-the task's newest turn finished by then: a turn of the task numbered after
-that one reopens it.
+and a call answered with an error says why under it. A task's own
+`resolve_task` is read from its history: its last turn resolved it. The
+lead's Sonny keeps each task the lead resolved beside the store
+(`state.sqlite.resolved/`), with the task's newest turn finished by then: a
+turn of the task numbered after that one reopens it.
 
 ![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 

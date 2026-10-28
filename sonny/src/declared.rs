@@ -4,7 +4,7 @@
 //! meaning. A bot reacts to the person, asks them to decide something,
 //! keeps its plan where they see it, and puts windows and panes where they
 //! look; a lead also starts, removes and resolves its tasks, makes
-//! projects and subscribes to the lookout.
+//! projects and subscribes to the lookout, and a task resolves itself.
 use serde_json::Value;
 
 /// The most tools a bot may have declared, and the most bytes they take,
@@ -26,12 +26,29 @@ pub fn tools(lead: bool) -> Vec<Value> {
     tools
 }
 
+/// Whether the bot `record` describes resolves itself: a lead made it, or
+/// another bot made it with `resolve_task`, as a task's own helper takes it.
+fn resolves(record: &Value) -> bool {
+    let inherited = || {
+        (record["declared"].as_array().into_iter().flatten())
+            .any(|tool| tool["name"] == crate::resolved::TOOL)
+    };
+    match record["created_by"].as_str() {
+        Some(by) => by.ends_with(".lead") || inherited(),
+        None => false,
+    }
+}
+
 /// The tools the bot `record` describes, a lead or not, should declare:
 /// its own with Sonny's, or `None` when it has those already, or when they
 /// would not fit beside its own.
 pub fn declare(record: &Value, lead: bool) -> Option<Value> {
     let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
     let mut ours = tools(lead);
+    // A task resolves itself, as its lead resolves it.
+    if !lead && resolves(record) {
+        ours.push(crate::resolved::tool());
+    }
     // A gate Sonny did not set, as another client's tag or several, is
     // not one Sonny can add its gated tools to, so that bot goes without
     // them rather than run them unjudged.
@@ -114,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_lead_resolves_tasks() {
+    fn a_lead_and_its_tasks_resolve_tasks() {
         let lead = declare(&json!({}), true).unwrap();
         assert_eq!(lead, Value::Array(tools(true)));
         assert!(
@@ -124,10 +141,33 @@ mod tests {
                 .any(|t| t["name"] == "resolve_task")
         );
         assert_eq!(declare(&json!({"declared": lead}), true), None);
-        // A bot no longer a lead gives it up.
+        // A bot no longer a lead gives it up, unless a lead made it: a
+        // task resolves itself.
         assert_eq!(
             declare(&json!({"declared": lead}), false),
             Some(Value::Array(tools(false)))
         );
+        let task = json!({"created_by": "calc.lead"});
+        let own = declare(&task, false).unwrap();
+        assert!(
+            own.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "resolve_task")
+        );
+        let mut kept = task.clone();
+        kept["declared"] = own;
+        assert_eq!(declare(&kept, false), None);
+        // A task's own helper keeps what it took from the task.
+        let helper = json!({"created_by": "calc.fix", "declared": [crate::resolved::tool()]});
+        let kept = declare(&helper, false).unwrap();
+        assert!(
+            kept.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "resolve_task")
+        );
+        // What a lead declares, a task it starts takes from its first turn.
+        assert!(crate::resolved::tool().get("inherit").is_none());
     }
 }

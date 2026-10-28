@@ -10,7 +10,12 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 
 enum Block {
-    Text(String),
+    Text {
+        text: String,
+        /// Where its words came from, when a search the provider ran
+        /// gave them: kept so the reply replays as it was written.
+        citations: Vec<Value>,
+    },
     Thinking {
         thinking: String,
         signature: String,
@@ -24,6 +29,14 @@ enum Block {
     /// Where a server-side fallback switched models. Kept in place: the
     /// API checks the thinking around it by its position.
     Fallback(Value),
+    /// A tool the provider runs itself, such as its web search: no call
+    /// for the runtime, replayed as it came with its input.
+    ServerTool {
+        block: Value,
+        input: String,
+    },
+    /// What a provider-run tool found, whole in its start event.
+    ServerResult(Value),
 }
 
 /// Input usage from a Messages `usage` object. Anthropic reports cache
@@ -142,14 +155,16 @@ impl State {
                         .map(str::to_owned)
                         .ok_or(Error::new("invalid_content"))
                 };
-                if matches!(
-                    block["type"].as_str(),
-                    Some("redacted_thinking" | "fallback")
-                ) {
+                let kind = block["type"].as_str().unwrap_or_default();
+                let result = kind.ends_with("_tool_result");
+                if matches!(kind, "redacted_thinking" | "fallback" | "server_tool_use") || result {
                     self.account(frame.len())?;
                 }
                 let started = match block["type"].as_str() {
-                    Some("text") => Block::Text(String::new()),
+                    Some("text") => Block::Text {
+                        text: String::new(),
+                        citations: Vec::new(),
+                    },
                     Some("thinking") => Block::Thinking {
                         thinking: String::new(),
                         signature: String::new(),
@@ -163,6 +178,15 @@ impl State {
                         self.fallbacks.push((from, to.to_owned()));
                         Block::Fallback(block.clone())
                     }
+                    Some("server_tool_use") => {
+                        string("id")?;
+                        string("name")?;
+                        Block::ServerTool {
+                            block: block.clone(),
+                            input: String::new(),
+                        }
+                    }
+                    _ if result => Block::ServerResult(block.clone()),
                     Some("tool_use") => {
                         // Stored in the item, and a gated call's id again in
                         // its announcement, so they count like any output.
@@ -193,6 +217,20 @@ impl State {
                     "thinking_delta" => text("thinking")?,
                     "input_json_delta" => text("partial_json")?,
                     "signature_delta" => text("signature")?,
+                    "citations_delta" => {
+                        let citation = delta["citation"].clone();
+                        if !citation.is_object() {
+                            return fail("invalid_content");
+                        }
+                        self.account(frame.len())?;
+                        return match self.block(&event["index"])? {
+                            Block::Text { citations, .. } => {
+                                citations.push(citation);
+                                Ok(Frame::Quiet)
+                            }
+                            _ => fail("invalid_content"),
+                        };
+                    }
                     _ => return Ok(Frame::Quiet),
                 };
                 // Partial JSON and signatures are stored as they arrive;
@@ -202,7 +240,7 @@ impl State {
                     _ => part.len(),
                 })?;
                 match (kind.as_str(), self.block(&event["index"])?) {
-                    ("text_delta", Block::Text(text)) => {
+                    ("text_delta", Block::Text { text, .. }) => {
                         text.push_str(&part);
                         Ok(Frame::Delta(Delta::Text(part)))
                     }
@@ -214,7 +252,10 @@ impl State {
                         signature.push_str(&part);
                         Ok(Frame::Quiet)
                     }
-                    ("input_json_delta", Block::ToolUse { input, .. }) => {
+                    (
+                        "input_json_delta",
+                        Block::ToolUse { input, .. } | Block::ServerTool { input, .. },
+                    ) => {
                         input.push_str(&part);
                         Ok(Frame::Quiet)
                     }
@@ -341,8 +382,9 @@ impl State {
         if !self.done {
             return fail("missing_completion");
         }
+        let paused = self.stop_reason.as_deref() == Some("pause_turn");
         match self.stop_reason.as_deref() {
-            Some("end_turn" | "stop_sequence" | "tool_use") => {}
+            Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn") => {}
             Some("max_tokens") => return fail_with("provider_incomplete", "max_tokens"),
             // With a fallback requested, the whole chain declined.
             Some("refusal") => {
@@ -379,14 +421,28 @@ impl State {
             .unwrap_or(0);
         for (index, block) in self.blocks.into_iter().enumerate() {
             if index < switch
-                && !matches!(&block, Block::Text(text) if !text.is_empty())
+                && !matches!(&block, Block::Text { text, .. } if !text.is_empty())
                 && !matches!(block, Block::Fallback(_))
             {
                 continue;
             }
             content.push(match block {
                 Block::Fallback(block) => block,
-                Block::Text(text) => json!({"type":"text","text":text}),
+                Block::Text { text, citations } if citations.is_empty() => {
+                    json!({"type":"text","text":text})
+                }
+                Block::Text { text, citations } => {
+                    json!({"type":"text","text":text,"citations":citations})
+                }
+                Block::ServerTool { mut block, input } => {
+                    block["input"] = match input.trim() {
+                        "" => json!({}),
+                        input => serde_json::from_str(input)
+                            .map_err(|_| Error::new("invalid_tool_arguments"))?,
+                    };
+                    block
+                }
+                Block::ServerResult(block) => block,
                 Block::Thinking {
                     thinking,
                     signature,
@@ -404,6 +460,7 @@ impl State {
                         return fail("invalid_tool_call_id");
                     }
                     calls.push(ToolCall {
+                        custom: false,
                         name: name.clone(),
                         call_id: id.clone(),
                         arguments,
@@ -427,6 +484,7 @@ impl State {
             items,
             calls,
             usage: self.saw_usage.then_some(self.usage),
+            paused,
         })
     }
 }
@@ -532,6 +590,43 @@ mod tests {
                 served_model: "claude-test-20260926".to_owned(),
             })
         );
+    }
+    /// A hosted search comes back as its call, its results and cited text,
+    /// all kept as sent; a turn the server paused is resent, not ended.
+    #[test]
+    fn hosted_search_blocks_and_citations_are_kept_and_a_pause_resumes() {
+        let mut state = State::default();
+        let deltas = feed(
+            &mut state,
+            &[
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"rust\"}"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.test","title":"T","encrypted_content":"e"}]}}"#,
+                r#"{"type":"content_block_stop","index":1}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","url":"https://example.test","title":"T","encrypted_index":"i","cited_text":"c"}}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Rust is"}}"#,
+                r#"{"type":"content_block_stop","index":2}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":5}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert_eq!(deltas, ["text:Rust is"]);
+        let completion = state.finish().unwrap();
+        assert!(completion.paused);
+        assert!(completion.calls.is_empty());
+        let item: Value = serde_json::from_slice(&completion.items[0]).unwrap();
+        assert_eq!(
+            item["content"][0],
+            json!({"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"rust"}})
+        );
+        assert_eq!(item["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(item["content"][1]["content"][0]["encrypted_content"], "e");
+        assert_eq!(item["content"][2]["text"], "Rust is");
+        assert_eq!(item["content"][2]["citations"][0]["encrypted_index"], "i");
     }
     /// A message's usage, as a refresh's is read, counts every attempt a
     /// server-side fallback billed, as the stream's final usage does.

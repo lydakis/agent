@@ -293,6 +293,8 @@ struct Warm<'a> {
     thinking: Strip,
     /// The call's fallback choice: a refresh renders the same request.
     fallbacks: bool,
+    /// Whether the call offered web search; a refresh offers the same.
+    web_search: bool,
     after: std::time::Duration,
     /// When the cache was last read, by the call or a refresh.
     read_at: tokio::time::Instant,
@@ -2068,6 +2070,7 @@ impl Turn {
                 if let Some(stop) = self
                     .execute_calls(
                         waiting.pending.clone(),
+                        (provider, model),
                         None,
                         &workspace,
                         &environment,
@@ -2525,7 +2528,9 @@ impl Turn {
                     Err(error) => return Err(error),
                 };
             }
-            if response.calls.is_empty() {
+            // A reply the provider paused partway through its own tools is
+            // sent back as it is, and the provider resumes it.
+            if response.calls.is_empty() && !response.paused {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard,
                 // when the budget and round limit allow one. A refresh the
@@ -2570,6 +2575,7 @@ impl Turn {
                     context: &context,
                     thinking: context.thinking,
                     fallbacks: record.fallbacks,
+                    web_search: searches(&record),
                     after,
                     read_at,
                     stopped: stopped || record.exhausted().is_some(),
@@ -2582,6 +2588,7 @@ impl Turn {
             let stop = self
                 .execute_calls(
                     response.calls,
+                    (provider, model),
                     announced,
                     &workspace,
                     &environment,
@@ -2800,6 +2807,9 @@ impl Turn {
                         reasoning: record.effort.as_deref(),
                         tools,
                         allow_tool_calls: tool_calls && !matches!(body, Body::Span(..)),
+                        // A summary offers it too, so its request reads
+                        // the cache the bot's calls write.
+                        web_search: searches(record),
                         fallbacks: record.fallbacks,
                         cache_key: Some(&cache_key),
                         items,
@@ -2834,6 +2844,7 @@ impl Turn {
                         context,
                         thinking: withheld.unwrap_or(context.thinking),
                         fallbacks: record.fallbacks,
+                        web_search: searches(record),
                         after,
                         read_at: tokio::time::Instant::now(),
                         stopped: false,
@@ -3259,7 +3270,7 @@ impl Turn {
         let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
         let reasoning = warm.reasoning.map(str::to_owned);
         let tools = warm.tools.to_owned();
-        let fallbacks = warm.fallbacks;
+        let (fallbacks, web_search) = (warm.fallbacks, warm.web_search);
         let items = self.items(warm.context, warm.thinking);
         let sent = refresh.clone();
         let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
@@ -3270,6 +3281,7 @@ impl Turn {
                 reasoning: reasoning.as_deref(),
                 tools: &tools,
                 allow_tool_calls: true,
+                web_search,
                 fallbacks,
                 cache_key: None,
                 items,
@@ -3354,6 +3366,7 @@ impl Turn {
     async fn execute_calls(
         &self,
         calls: Vec<ToolCall>,
+        (provider, model): (&Provider, &str),
         mut announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         workspace: &std::path::Path,
         environment: &[(String, String)],
@@ -3475,6 +3488,22 @@ impl Turn {
                     ControlFlow::Break(stop) => return Ok(Some(stop)),
                 },
                 Ok(Prepared::Declared(result)) => Outcome::text(result),
+                // Codex's `web.run`, answered by the provider that serves
+                // the bot; it keeps the bot's searches under its cache key.
+                Ok(Prepared::WebSearch(commands)) => {
+                    let session = cache_key(self.identity, record.cache_bot(), false);
+                    let search = async {
+                        provider
+                            .run_search(model, &session, &commands)
+                            .await
+                            .map(Outcome::text)
+                    };
+                    match self.run_tool(search, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(outcome)) => annotate(outcome, turn, &call.call_id),
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
                 Ok(Prepared::Wait {
                     handles,
                     timeout_ms,
@@ -3868,7 +3897,7 @@ impl Turn {
             // all count: shrink the page by what the item overshoots until
             // the item itself fits.
             let output = self.registry.redact_text(page);
-            let item = family.tool_result_item(call_id, &output)?.len();
+            let item = family.tool_result_item(call_id, false, &output)?.len();
             if item <= budget {
                 return Ok(Outcome::text(output));
             }
@@ -3899,7 +3928,7 @@ impl Turn {
                 })
                 .await?;
             let output = self.registry.redact_text(listed.to_string());
-            if family.tool_result_item(call_id, &output)?.len() > budget {
+            if family.tool_result_item(call_id, false, &output)?.len() > budget {
                 return fail("history_context_exhausted");
             }
             return Ok(Outcome::text(output));
@@ -3915,7 +3944,7 @@ impl Turn {
             // Page metadata, JSON escaping, redaction, and the provider's tool
             // result envelope all count. Shrink in memory, without rereading
             // history, until the actual encoded item fits the reserved budget.
-            if family.tool_result_item(call_id, &output)?.len() <= budget {
+            if family.tool_result_item(call_id, false, &output)?.len() <= budget {
                 return Ok(Outcome::text(output));
             }
             let text = page["text"].as_str().unwrap();
@@ -4171,6 +4200,12 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 }
 
 /// Whether the turn may make another model call.
+/// Whether the bot may search the web: its provider declares the search
+/// when it offers one, and a fork's allowed list narrows it as any tool.
+fn searches(record: &agent_runtime::store::Bot) -> bool {
+    record.callable().iter().any(|tool| tool == "web_search")
+}
+
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
     model_rounds < MAX_ROUNDS && record.exhausted().is_none()
 }

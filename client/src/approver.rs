@@ -36,12 +36,13 @@ pub const ATTEMPTS: u32 = 3;
 /// the turn ends: the approver's own deadline, plus margin.
 pub const AUTO_EXPIRE_MS: u64 = DEADLINE_MS + 15_000;
 /// Tools the approval modes never gate: they touch only the bot's own
-/// store records.
-pub const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
+/// store records, or, for web search, ask its provider as its model does
+/// (Codex never gates search, and a provider-hosted one can't be).
+pub const UNGATED: [&str; 5] = ["history", "wait", "note", "echo", "web_search"];
 /// Tools `auto` also leaves to run unjudged. A read's result goes to the
 /// model provider, so reading a key sends it off the machine, but judging
 /// every read cost a round each for what is nearly always allowed.
-pub const AUTO_UNGATED: [&str; 5] = ["history", "wait", "note", "echo", "read"];
+pub const AUTO_UNGATED: [&str; 6] = ["history", "wait", "note", "echo", "web_search", "read"];
 /// The breaker, as Codex sets it: denials in a row, or among the turn's
 /// last `WINDOW` judged calls.
 pub const IN_ROW: u64 = 3;
@@ -140,7 +141,7 @@ macro_rules! policy {
 - If important context is missing and cannot be verified, lean conservative and explain the uncertainty in your rationale.
 
 # Execution environment
-- A sandboxed agent's commands, writes, and edits inside its sandbox run without review. What comes to you leaves it: a `shell` call with `sandbox_permissions` `require_escalated`, which runs unconfined, or a write or edit outside the folders it may write. An agent without a sandbox sends you every gated call.
+- A sandboxed agent's commands, writes, edits, and patches inside its sandbox run without review. What comes to you leaves it: a `shell` call with `sandbox_permissions` `require_escalated`, which runs unconfined, or a write, edit, or patch outside the folders it may write. An agent without a sandbox sends you every gated call.
 - A sandbox escalation, or a retry after a sandbox denial, is not suspicious in itself. Evaluate the risk of the unsandboxed action, not the escalation.
 - You share the agent's machine and start in its workspace. When you have `shell` and `read` tools, they only run read-only commands, with no network access. Do not provide `sandbox_permissions` for any reason: such commands are rejected. Without tools, judge from the state alone.
 
@@ -478,7 +479,15 @@ pub fn entries(item: &Value, judged: &[&str], redactor: &Redactor) -> Vec<Entry>
             let arguments = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
             call(&item["call_id"], &item["name"], &arguments);
         }
-        Some("function_call_output") => found.push(Entry {
+        // A custom tool's call is its input, read as the daemon reads it.
+        Some("custom_tool_call") => {
+            call(
+                &item["call_id"],
+                &item["name"],
+                &json!({"input": item["input"]}),
+            );
+        }
+        Some("function_call_output" | "custom_tool_call_output") => found.push(Entry {
             said: Said::Output,
             call: item["call_id"].as_str().map(str::to_owned),
             text: output_text(&item["output"], redactor),
@@ -894,11 +903,15 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
 }
 
 /// The whole arguments of `call_id` in a planning item, in either family's
-/// encoding: a Responses `function_call` item, or an Anthropic assistant
-/// message holding `tool_use` blocks.
+/// encoding: a Responses `function_call` item, or a `custom_tool_call`
+/// whose free-form input reads as `{"input": ...}`, as the daemon runs it,
+/// or an Anthropic assistant message holding `tool_use` blocks.
 pub fn call_arguments(item: &Value, call_id: &str) -> Option<Value> {
     if item["type"] == "function_call" && item["call_id"] == call_id {
         return serde_json::from_str(item["arguments"].as_str()?).ok();
+    }
+    if item["type"] == "custom_tool_call" && item["call_id"] == call_id {
+        return Some(json!({"input":item["input"].as_str()?}));
     }
     item["content"]
         .as_array()?
@@ -1443,6 +1456,8 @@ mod tests {
             json!({"type":"function_call","call_id":"a","name":"shell","arguments":"{\"command\":\"ls\"}"}),
             json!({"type":"function_call_output","call_id":"a","output":"README.md"}),
             json!({"type":"function_call","call_id":"judged","name":"shell","arguments":"{}"}),
+            json!({"type":"custom_tool_call","call_id":"p","name":"apply_patch","input":"*** Begin Patch"}),
+            json!({"type":"custom_tool_call_output","call_id":"p","output":"Success."}),
         ];
         let found: Vec<Entry> = responses
             .iter()
@@ -1466,6 +1481,16 @@ mod tests {
                     said: Said::Output,
                     call: call("a"),
                     text: "README.md".into()
+                },
+                Entry {
+                    said: Said::Call,
+                    call: call("p"),
+                    text: "apply_patch {\"input\":\"*** Begin Patch\"}".into()
+                },
+                Entry {
+                    said: Said::Output,
+                    call: call("p"),
+                    text: "Success.".into()
                 },
             ]
         );

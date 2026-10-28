@@ -337,6 +337,7 @@ pub const ELISION_MIN_SAVING: usize = 1024;
 pub fn stub(
     family: Family,
     call_id: &str,
+    custom: bool,
     output: &str,
     node: i64,
     item: usize,
@@ -358,7 +359,7 @@ pub fn stub(
         &output[..head],
         &output[tail..]
     );
-    let stub = family.tool_result_item(call_id, &text)?;
+    let stub = family.tool_result_item(call_id, custom, &text)?;
     Ok((stub.len() + ELISION_MIN_SAVING <= item).then_some(stub))
 }
 
@@ -377,7 +378,7 @@ pub fn picture_stub(
     let text = format!(
         "[tool result's picture elided from this request; read the file again to see it. Its text:]\n{output}"
     );
-    let stub = family.tool_result_item(call_id, &text)?;
+    let stub = family.tool_result_item(call_id, false, &text)?;
     Ok((stub.len() < weight).then_some(stub))
 }
 
@@ -442,7 +443,7 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         content: Text,
     }
     if let Ok(result) = serde_json::from_slice::<Output>(item) {
-        return (result.kind == "function_call_output").then_some((
+        return RESULT_KINDS.contains(&result.kind.as_str()).then_some((
             Family::Responses,
             result.call_id,
             result.output.text(),
@@ -454,8 +455,13 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         .then_some((Family::Anthropic, block.tool_use_id, block.content.text()))
 }
 
+/// The Responses items that answer a call: a function's, or a custom
+/// tool's.
+pub const RESULT_KINDS: [&str; 2] = ["function_call_output", "custom_tool_call_output"];
+
 /// Whether a stored item is a tool result, in either family: a Responses
-/// function call output, or a Messages user turn of tool result blocks.
+/// function or custom tool call output, or a Messages user turn of tool
+/// result blocks.
 pub fn is_tool_result(item: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Item<'a> {
@@ -474,7 +480,11 @@ pub fn is_tool_result(item: &[u8]) -> bool {
     let Ok(item) = serde_json::from_slice::<Item<'_>>(item) else {
         return false;
     };
-    if item.kind.as_deref() == Some("function_call_output") {
+    if item
+        .kind
+        .as_deref()
+        .is_some_and(|kind| RESULT_KINDS.contains(&kind))
+    {
         return true;
     }
     item.role.as_deref() == Some("user")
@@ -497,7 +507,11 @@ pub fn model_output(item: &[u8]) -> bool {
         kind: Option<std::borrow::Cow<'a, str>>,
     }
     serde_json::from_slice::<Kind<'_>>(item).is_ok_and(|item| {
-        item.role.as_deref() != Some("user") && item.kind.as_deref() != Some("function_call_output")
+        item.role.as_deref() != Some("user")
+            && !item
+                .kind
+                .as_deref()
+                .is_some_and(|kind| RESULT_KINDS.contains(&kind))
     })
 }
 
@@ -523,7 +537,7 @@ mod tests {
         }];
         for family in [Family::Responses, Family::Anthropic] {
             let item = family
-                .tool_result_item_with("c1", "a.png: a PNG image", &images)
+                .tool_result_item_with("c1", false, "a.png: a PNG image", &images)
                 .unwrap();
             assert!(is_tool_result(&item));
             let (read, call_id, text) = tool_result(&item).unwrap();

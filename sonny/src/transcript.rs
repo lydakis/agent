@@ -1114,6 +1114,14 @@ fn drawn(
         "read" => ("Read", shown(&field("path"), workspace)),
         "write" => ("Wrote", shown(&field("path"), workspace)),
         "edit" => ("Edited", shown(&field("path"), workspace)),
+        "apply_patch" => (
+            "Patched",
+            patch_files(&field("input"))
+                .iter()
+                .map(|path| shown(path, workspace))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         "wait" => (
             "Waited for",
             arguments["handles"]
@@ -1135,7 +1143,7 @@ fn drawn(
     ]);
     // A file tool that failed changed nothing: what it was asked to do is
     // not drawn, its error is.
-    if failed && matches!(name, "edit" | "write" | "read") {
+    if failed && matches!(name, "edit" | "write" | "read" | "apply_patch") {
         let mut out = wrap(header, width, bullet, Span::raw("    "));
         out.extend(preview(output.unwrap_or(""), width));
         return out;
@@ -1146,9 +1154,30 @@ fn drawn(
         header.spans.push(Span::raw("  "));
         header.spans.extend(crate::diff::counts(removed, added));
     }
+    let patch = (name == "apply_patch").then(|| as_unified(&field("input"), workspace));
+    if let Some(patch) = &patch {
+        let (removed, added) = patch.lines().fold((0, 0), |(removed, added), line| {
+            match (
+                line.starts_with("--- "),
+                line.starts_with("+++ "),
+                line.chars().next(),
+            ) {
+                (false, false, Some('-')) => (removed + 1, added),
+                (false, false, Some('+')) => (removed, added + 1),
+                _ => (removed, added),
+            }
+        });
+        header.spans.push(Span::raw("  "));
+        header.spans.extend(crate::diff::counts(removed, added));
+    }
     let mut out = wrap(header, width, bullet, Span::raw("    "));
     match name {
         "edit" => out.extend(edit.map(|e| e.lines(width, EDIT_ROWS)).unwrap_or_default()),
+        "apply_patch" => out.extend(
+            patch
+                .and_then(|text| crate::diff::unified(&text, width, EDIT_ROWS))
+                .unwrap_or_default(),
+        ),
         "write" => {
             let lines = field("content").lines().count();
             out.push(Line::from(vec![
@@ -1309,6 +1338,17 @@ fn waited(output: Option<&str>) -> Option<Vec<String>> {
     crate::calls::waited(&serde_json::from_str(output?.trim()).ok()?)
 }
 
+/// The text of the file at `path` as it is now, when it is a regular file
+/// no larger than the daemon writes: never a FIFO or a device, whose
+/// read could block the screen.
+fn current(path: &std::path::Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 4 << 20 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// An edit as diffs.com draws one: the whole lines it touched, the words
 /// that changed within them, and two lines either side, numbered where
 /// the file now has them when the new text can be found there.
@@ -1323,7 +1363,7 @@ fn diff(arguments: &Value, workspace: &str) -> crate::diff::Edit {
     // An edit replaces text, not lines: show the whole lines it touched,
     // read from the file as it is now, so indentation and numbers are right.
     if !new.is_empty()
-        && let Ok(now) = std::fs::read_to_string(path)
+        && let Some(now) = current(&path)
         && let Some(at) = now.find(&new)
     {
         let line_start = now[..at].rfind('\n').map_or(0, |i| i + 1);
@@ -1358,6 +1398,133 @@ fn diff(arguments: &Value, workspace: &str) -> crate::diff::Edit {
         before,
         after,
     }
+}
+
+/// The files a patch changes, each once: where an update moves a file,
+/// the file it becomes.
+fn patch_files(patch: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let named = ["*** Add File: ", "*** Delete File: ", "*** Update File: "]
+            .iter()
+            .find_map(|marker| line.strip_prefix(marker));
+        if let Some(path) = named {
+            files.push(path.trim().to_owned());
+        } else if let Some(path) = line.strip_prefix("*** Move to: ")
+            && let Some(last) = files.last_mut()
+        {
+            *last = path.trim().to_owned();
+        }
+    }
+    files.dedup();
+    files
+}
+
+/// A patch (Codex's format) as a unified diff, to draw as one. Its chunks
+/// carry no line numbers: each is placed where its new side is in the
+/// file as it is now, after the patch; a deleted file shows no lines.
+fn as_unified(patch: &str, workspace: &str) -> String {
+    let mut out = String::new();
+    let mut lines = patch.lines().peekable();
+    let ends = |line: &str| line.starts_with("*** ") && line != "*** End of File";
+    while let Some(line) = lines.next() {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            let added: Vec<&str> = std::iter::from_fn(|| lines.next_if(|l| !ends(l)))
+                .map(|l| l.strip_prefix('+').unwrap_or(l))
+                .collect();
+            out.push_str(&format!("--- /dev/null\n+++ {}\n", path.trim()));
+            out.push_str(&format!("@@ -0,0 +1,{} @@\n", added.len()));
+            for line in added {
+                out.push_str(&format!("+{line}\n"));
+            }
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            out.push_str(&format!(
+                "--- {}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n",
+                path.trim()
+            ));
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            let mut path = path.trim().to_owned();
+            if let Some(to) = lines.next_if(|l| l.starts_with("*** Move to: ")) {
+                path = to["*** Move to: ".len()..].trim().to_owned();
+            }
+            let now = current(&std::path::Path::new(workspace).join(&path)).unwrap_or_default();
+            let now: Vec<&str> = now.lines().collect();
+            out.push_str(&format!("--- {path}\n+++ {path}\n"));
+            // Each chunk's lines, then its place: the line where its new
+            // side starts now, and that less what earlier chunks added.
+            let mut chunks: Vec<Vec<String>> = Vec::new();
+            while let Some(line) = lines.next_if(|l| !ends(l)) {
+                if line.starts_with("@@") || chunks.is_empty() {
+                    chunks.push(Vec::new());
+                }
+                if line.starts_with("@@") || line == "*** End of File" {
+                    continue;
+                }
+                // A line with no change mark, as in a patch the daemon
+                // refused, is drawn as context.
+                let line = match line.chars().next() {
+                    Some('+' | '-' | ' ') => line.to_owned(),
+                    _ => format!(" {line}"),
+                };
+                if let Some(chunk) = chunks.last_mut() {
+                    chunk.push(line);
+                }
+            }
+            let (mut grown, mut from, mut budget) = (0isize, 0, PLACING);
+            for chunk in chunks.into_iter().filter(|c| !c.is_empty()) {
+                let new: Vec<&str> = chunk
+                    .iter()
+                    .filter(|l| !l.starts_with('-'))
+                    .map(|l| &l[1..])
+                    .collect();
+                let old = chunk.iter().filter(|l| !l.starts_with('+')).count();
+                let start = find_lines(&now, &new, from, &mut budget).unwrap_or(from);
+                from = start + new.len();
+                let old_start = (start as isize - grown).max(0) as usize;
+                grown += new.len() as isize - old as isize;
+                out.push_str(&format!(
+                    "@@ -{},{old} +{},{} @@\n",
+                    old_start + 1,
+                    start + 1,
+                    new.len()
+                ));
+                for line in chunk {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Line comparisons placing one file's chunks may make. Drawing waits on
+/// them, so past this the rest are placed where they would otherwise be.
+const PLACING: usize = 1 << 20;
+
+/// The first line, at or after `from`, where `lines` holds `wanted` in a
+/// row, by content with ends trimmed. Each comparison comes out of
+/// `budget`, and once it runs out nothing more is found.
+fn find_lines(lines: &[&str], wanted: &[&str], from: usize, budget: &mut usize) -> Option<usize> {
+    if wanted.is_empty() || wanted.len() > lines.len() {
+        return None;
+    }
+    let last = wanted.len() - 1;
+    (from..=lines.len() - wanted.len()).find_map(|at| {
+        if *budget == 0 {
+            return Some(None);
+        }
+        *budget -= 1;
+        // The last line first: a long run rarely ends the same by chance.
+        if wanted[last].trim_end() != lines[at + last].trim_end() {
+            return None;
+        }
+        let same = wanted.iter().zip(&lines[at..]).take_while(|(want, have)| {
+            *budget = budget.saturating_sub(1);
+            want.trim_end() == have.trim_end()
+        });
+        (same.count() == wanted.len()).then_some(Some(at))
+    })?
 }
 
 /// The rule under a finished turn: how it ended, how long it took, what it cost.
@@ -1637,6 +1804,100 @@ mod tests {
                 "   4   print(average([2, 4]))",
             ]
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_repeated_context_is_placed_quickly() {
+        let mut lines = vec!["x"; 100_000];
+        lines.push("y");
+        let mut wanted = vec!["x"; 10_000];
+        wanted.push("y");
+        let started = std::time::Instant::now();
+        let found = find_lines(&lines, &wanted, 0, &mut { PLACING });
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(found.is_none_or(|at| at == 90_000), "{found:?}");
+        let find = |wanted: &[&str]| find_lines(&["a", "b", "c"], wanted, 0, &mut { PLACING });
+        assert_eq!(find(&["b", "c"]), Some(1));
+        assert_eq!(find(&["c", "b"]), None);
+    }
+
+    #[test]
+    fn many_chunks_against_a_long_file_are_drawn_quickly() {
+        let dir = std::env::temp_dir().join(format!("sonny-chunks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "x\n".repeat(100_000)).unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: f\n{}*** End Patch\n",
+            "@@\n-x\n+x\n".repeat(5_000)
+        );
+        let started = std::time::Instant::now();
+        let unified = as_unified(&patch, dir.to_str().unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(unified.matches("@@ -").count(), 5_000);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_could_block_is_not_read_for_a_diff() {
+        let dir = std::env::temp_dir().join(format!("sonny-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(current(&fifo), None);
+        assert_eq!(current(&dir), None);
+        std::fs::write(dir.join("f"), "a\n").unwrap();
+        assert_eq!(current(&dir.join("f")).as_deref(), Some("a\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_patch_with_an_unmarked_line_still_draws() {
+        let unified = as_unified(
+            "*** Begin Patch\n*** Update File: f\n@@\nα\n-a\n+b\n*** End Patch",
+            "/nonexistent",
+        );
+        assert!(unified.contains("\n α\n-a\n+b\n"), "{unified}");
+    }
+
+    #[test]
+    fn a_patch_shows_each_file_as_a_diff_at_its_lines() {
+        let dir = std::env::temp_dir().join(format!("sonny-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("calc.py"),
+            "def average(values):\n    return sum(values) / len(values)\n\nprint(average([2, 4]))\n",
+        )
+        .unwrap();
+        let patch = "*** Begin Patch\n*** Update File: calc.py\n@@ def average(values):\n-    return sum(values) / (len(values) - 1)\n+    return sum(values) / len(values)\n \n*** Add File: notes.md\n+# Notes\n*** Delete File: old.py\n*** End Patch";
+        let rows = tool(
+            "apply_patch",
+            &serde_json::json!({"input": patch}),
+            None,
+            false,
+            dir.to_str().unwrap(),
+            80,
+        );
+        let rows = text(&rows);
+        assert_eq!(rows[0], "• Patched calc.py, notes.md, old.py  -1 +2");
+        assert!(
+            rows.contains(&"   2 ▎     return sum(values) / (len(values) - 1)".to_owned()),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.contains(&"   2 ▎     return sum(values) / len(values)".to_owned()),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("notes.md") && row.contains("+1")),
+            "{rows:#?}"
+        );
+        assert_eq!(rows.last().unwrap(), "    old.py  deleted");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

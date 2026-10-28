@@ -231,8 +231,32 @@ fn parse_completion_with_usage(
                     }
                 }
             }
-            Some("function_call") => {
-                let call: ToolCall = serde_json::from_value(item)?;
+            Some(kind @ ("function_call" | "custom_tool_call")) => {
+                // Search comes back as Codex declares it, `web.run`; the
+                // bot calls it `web_search`.
+                let search =
+                    item["namespace"] == super::RUN_NAMESPACE && item["name"] == super::RUN_NAME;
+                let mut call = match kind {
+                    "function_call" => serde_json::from_value::<ToolCall>(item)?,
+                    _ => {
+                        #[derive(Deserialize)]
+                        struct Custom {
+                            name: String,
+                            call_id: String,
+                            input: String,
+                        }
+                        let custom: Custom = serde_json::from_value(item)?;
+                        ToolCall {
+                            name: custom.name,
+                            call_id: custom.call_id,
+                            arguments: serde_json::json!({"input":custom.input}).to_string(),
+                            custom: true,
+                        }
+                    }
+                };
+                if search {
+                    call.name = "web_search".into();
+                }
                 if calls.iter().any(|c: &ToolCall| c.call_id == call.call_id)
                     || !valid_call_id(&call.call_id)
                 {
@@ -241,6 +265,8 @@ fn parse_completion_with_usage(
                 calls.push(call);
             }
             Some("reasoning") => {} // Preserve opaque provider reasoning for replay.
+            // A search the provider ran itself, replayed as it came.
+            Some("web_search_call") => {}
             _ => return fail("unsupported_output_item"),
         }
         items.push(raw);
@@ -255,6 +281,7 @@ fn parse_completion_with_usage(
         items,
         calls,
         usage,
+        paused: false,
     })
 }
 
@@ -285,6 +312,44 @@ mod tests {
 
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
+    }
+    #[test]
+    fn a_custom_tool_call_reads_as_its_input() {
+        let raw = r#"{"status":"completed","output":[{"type":"custom_tool_call","id":"ctc_1","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}]}"#;
+        let completion = parse_completion(&RawValue::from_string(raw.into()).unwrap(), "").unwrap();
+        assert_eq!(
+            completion.calls,
+            [ToolCall {
+                name: "apply_patch".into(),
+                call_id: "c1".into(),
+                arguments: json!({"input":"*** Begin Patch\n*** End Patch"}).to_string(),
+                custom: true,
+            }]
+        );
+        // Stored as the provider sent it, so it replays unchanged.
+        let item = &raw[raw.find("[{").unwrap() + 1..raw.len() - 2];
+        assert_eq!(completion.items[0], item.as_bytes());
+    }
+    #[test]
+    fn web_run_reads_as_web_search_and_hosted_searches_are_kept() {
+        let raw = r#"{"status":"completed","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"rust"}},{"type":"function_call","namespace":"web","name":"run","call_id":"c1","arguments":"{\"search_query\":[{\"q\":\"rust\"}]}"},{"type":"function_call","namespace":"other","name":"run","call_id":"c2","arguments":"{}"}]}"#;
+        let completion = parse_completion(&RawValue::from_string(raw.into()).unwrap(), "").unwrap();
+        assert_eq!(completion.calls[0].name, "web_search");
+        assert_eq!(
+            completion.calls[0].arguments,
+            r#"{"search_query":[{"q":"rust"}]}"#
+        );
+        // Only Codex's own namespace is search.
+        assert_eq!(completion.calls[1].name, "run");
+        // The hosted search and the call replay as the provider sent them.
+        assert_eq!(completion.items.len(), 3);
+        let search: Value = serde_json::from_slice(&completion.items[0]).unwrap();
+        assert_eq!(search["type"], "web_search_call");
+        let call: Value = serde_json::from_slice(&completion.items[1]).unwrap();
+        assert_eq!(
+            (&call["namespace"], &call["name"]),
+            (&json!("web"), &json!("run"))
+        );
     }
     #[test]
     fn a_call_id_over_the_bound_fails_by_its_encoded_size() {

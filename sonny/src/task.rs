@@ -1,14 +1,16 @@
 //! A lead's tasks, each in a folder of its own: the `start_task` tool Sonny
 //! answers makes the folder the way Sonny's `copies` setting says, then
 //! starts the task there with the daemon's `agent run`. A git worktree
-//! (the default) starts at the last commit on a branch of its own. A
-//! sandfs copy (experimental), made with the sandfs library built into
-//! Sonny so nothing needs installing, is the checkout as it is, uncommitted
-//! changes included, on a branch of its own; in a folder sandfs mounts, a
-//! fork of that workspace; in any other folder, the folder as it is now.
-//! A task that could not start leaves no folder behind, and the
-//! `remove_task` tool takes away one that is done. `sonny task changes`
-//! lists, and applies here, what a sandfs copy of a plain folder changed.
+//! (the default) starts at the last commit on a branch of its own, with
+//! clones of the lead's build folders where the disk makes them
+//! copy-on-write (seed.rs). A sandfs copy (experimental), made with the
+//! sandfs library built into Sonny so nothing needs installing, is the
+//! checkout as it is, uncommitted changes included, on a branch of its own;
+//! in a folder sandfs mounts, a fork of that workspace; in any other folder,
+//! the folder as it is now. A task that could not start leaves no folder
+//! behind, and the `remove_task` tool takes away one that is done. `sonny
+//! task changes` lists, and applies here, what a sandfs copy of a plain
+//! folder changed.
 //!
 //! sandfs mounts are served by Sonny run again as `sonny sandfs daemon`,
 //! which outlives the command that asked for them and shares sandfs's home
@@ -100,7 +102,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
         flags.extend(["--effort".to_owned(), effort]);
     }
-    let place = if info["threads_in"] == "project" {
+    let mut place = if info["threads_in"] == "project" {
         in_place(here)
     } else {
         match crate::settings::Settings::load().copies.as_str() {
@@ -146,6 +148,20 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
                 return failed(&place, false, error);
             }
             Err(e) => return failed(&place, false, format!("{}: {e}", script.display())),
+        }
+    }
+    // A new worktree takes clones of the lead's build folders only once
+    // setup has run: setup runs outside any sandbox and must not run what
+    // the lead's folders hold.
+    if let (Undo::Worktree { path, .. }, Some((top, _))) = (&place.undo, &place.copy) {
+        let seeded = crate::seed::seed(top, path);
+        // Named so the person knows why the first build is quicker.
+        if let (false, Some(note)) = (seeded.is_empty(), place.note.as_mut()) {
+            let folders: Vec<_> = seeded.iter().map(|f| f.to_string_lossy()).collect();
+            note.push_str(&format!(
+                "; it starts with copy-on-write clones of {}",
+                folders.join(", ")
+            ));
         }
     }
     let lead = (
@@ -580,7 +596,8 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
         dir: within(&path, Path::new(prefix.trim_end_matches('/'))),
         note: Some(format!(
             "{name}: a worktree at {} on branch {branch}, from the last commit (uncommitted \
-             changes here are not in it); its commits are on {branch} here as it makes them",
+             changes here are not in it); its commits are on {branch} here as it makes \
+             them",
             shell_quote(&path)
         )),
         undo,

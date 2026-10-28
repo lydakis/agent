@@ -22,8 +22,10 @@ use tokio::{
 };
 
 mod files;
+mod patch;
 mod picture;
 use files::read_bounded;
+pub use patch::Patch;
 
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
@@ -52,9 +54,11 @@ enum Tool {
     Read,
     Write,
     Edit,
+    ApplyPatch,
     Wait,
     History,
     Note,
+    WebSearch,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -64,9 +68,11 @@ impl Tool {
             "read" => Tool::Read,
             "write" => Tool::Write,
             "edit" => Tool::Edit,
+            "apply_patch" => Tool::ApplyPatch,
             "wait" => Tool::Wait,
             "history" => Tool::History,
             "note" => Tool::Note,
+            "web_search" => Tool::WebSearch,
             _ => return None,
         })
     }
@@ -77,9 +83,11 @@ impl Tool {
             Tool::Read => "read",
             Tool::Write => "write",
             Tool::Edit => "edit",
+            Tool::ApplyPatch => "apply_patch",
             Tool::Wait => "wait",
             Tool::History => "history",
             Tool::Note => "note",
+            Tool::WebSearch => "web_search",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -113,6 +121,11 @@ impl Tool {
                 "new":{"type":"string"},"replace_all":{"type":"boolean"}},
                 "required":["path","old","new"],"additionalProperties":false}),
             ),
+            Tool::ApplyPatch => (
+                "Edit files with a patch: add, update, move and delete any number of files in one call. The patch is checked against every file first, so one that does not apply changes nothing. Format: `*** Begin Patch`, then for each file `*** Add File: PATH` followed by its lines each starting with +, or `*** Delete File: PATH`, or `*** Update File: PATH` with an optional `*** Move to: NEW_PATH` and chunks of lines starting with a space (kept), - (removed) or + (added); an `@@ LINE` before a chunk names a line above it, such as a function's, to place it, and `*** End of File` after a chunk anchors it at the end. Show about three kept lines around each change. Finish with `*** End Patch`. Paths are relative to the workspace unless absolute.",
+                json!({"type":"object","properties":{"input":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch."}},
+                "required":["input"],"additionalProperties":false}),
+            ),
             Tool::History => (
                 "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
@@ -123,6 +136,12 @@ impl Tool {
                 "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes and must fit the current context budget; an oversized write preserves the previous note. Empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
                 json!({"type":"object","properties":{"text":{"type":"string","maxLength":8192}},
                 "required":["text"],"additionalProperties":false}),
+            ),
+            // What a model is shown is its provider's: Codex's `web.run`,
+            // or the provider's own hosted tool (see provider::Search).
+            Tool::WebSearch => (
+                include_str!("tools/web_run.md"),
+                serde_json::from_str(include_str!("tools/web_run.json")).expect("web.run schema"),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
@@ -135,6 +154,7 @@ impl Tool {
             name: self.name().into(),
             description: description.into(),
             parameters,
+            grammar: (self == Tool::ApplyPatch).then_some(patch::GRAMMAR),
         }
     }
 }
@@ -622,6 +642,9 @@ pub enum Prepared {
         timeout_ms: Option<u64>,
         any: bool,
     },
+    /// A `web.run` call's commands, which the bot's provider answers.
+    /// Resolved by the runtime, never by the registry.
+    WebSearch(String),
     /// A client's declared tool, whose call that fits gets this result.
     /// Resolved by the runtime, never by the registry.
     Declared(String),
@@ -639,6 +662,7 @@ pub enum Prepared {
         path: String,
         content: String,
     },
+    ApplyPatch(Patch),
     Edit {
         path: String,
         old: String,
@@ -731,9 +755,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,wait,history,note"
+            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search"
         } else {
-            "echo,read,write,edit,wait,history,note"
+            "echo,read,write,edit,apply_patch,wait,history,note,web_search"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -797,7 +821,8 @@ impl Registry {
         let schemas: Vec<ToolSchema> = names
             .iter()
             .filter_map(|name| Tool::parse(name))
-            .filter(|tool| self.tools.contains(tool))
+            // Search is declared by the provider, as it offers it.
+            .filter(|tool| self.tools.contains(tool) && *tool != Tool::WebSearch)
             .map(Tool::schema)
             .map(|mut schema| {
                 if sandboxed && schema.name == "shell" {
@@ -809,6 +834,7 @@ impl Registry {
                 name: tool.name.clone().into(),
                 description: tool.description.clone().into(),
                 parameters: tool.parameters.clone(),
+                grammar: None,
             }))
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
@@ -962,6 +988,11 @@ impl Registry {
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
+        struct ApplyPatch {
+            input: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Edit {
             path: String,
             old: String,
@@ -1061,6 +1092,13 @@ impl Registry {
                     limit,
                 }
             }
+            Tool::WebSearch => {
+                let commands: serde_json::Value = serde_json::from_str(args).map_err(invalid)?;
+                if !commands.is_object() {
+                    return fail("invalid_tool_arguments");
+                }
+                Prepared::WebSearch(args.to_owned())
+            }
             Tool::Note => {
                 #[derive(serde::Deserialize)]
                 struct Note {
@@ -1117,6 +1155,17 @@ impl Registry {
                     content: args.content,
                 }
             }
+            Tool::ApplyPatch => {
+                let args: ApplyPatch = serde_json::from_str(args).map_err(invalid)?;
+                if args.input.len() > WRITE_BYTES {
+                    return fail("tool_input_limit");
+                }
+                let patch = Patch::parse(&args.input)?;
+                for target in patch.paths() {
+                    path(target)?;
+                }
+                Prepared::ApplyPatch(patch)
+            }
             Tool::Edit => {
                 let args: Edit = serde_json::from_str(args).map_err(invalid)?;
                 path(&args.path)?;
@@ -1155,6 +1204,7 @@ impl Registry {
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
+            Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -1213,6 +1263,19 @@ impl Registry {
                     content.len(),
                     path
                 )))
+            }
+            Prepared::ApplyPatch(patch) => {
+                for path in patch.paths() {
+                    writable(sandbox.clone(), &resolve(workspace, path), path).await?;
+                }
+                let staged = patch.stage(workspace).await?;
+                // A process slot only while the sandbox's helper writes.
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = match staged.writes() {
+                    true => self.helper_slot(&sandbox).await?,
+                    false => None,
+                };
+                Ok(Outcome::text(staged.commit(sandbox).await?))
             }
             Prepared::Edit {
                 path,

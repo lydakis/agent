@@ -288,6 +288,8 @@ pub struct Picks {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub threads: Option<ThreadPicks>,
+    /// The person's `web_search`, for a coordinator its role gives no tools.
+    pub web_search: crate::config::WebSearch,
 }
 
 #[derive(Debug, Default)]
@@ -319,12 +321,13 @@ impl Requests for crate::Client {
 /// the coordinator. A project that already exists in this folder is
 /// returned with `created: false`, its coordinator's row as the record, and
 /// nothing changed; a name another
-/// folder's coordinator holds is refused.
+/// folder's coordinator holds is refused. A role that names no tools gets
+/// the default set for its model, from `providers` (`ready.providers`).
 pub async fn create(
     daemon: &impl Requests,
     dir: &Path,
     policy: &Value,
-    tools: &Value,
+    providers: &Value,
     picks: &Picks,
     copies: &str,
     after: Option<&str>,
@@ -391,7 +394,10 @@ pub async fn create(
         "bot": coordinator, "workspace": at, "model": model,
         "instructions": instructions,
         "compaction_instructions": policy["compaction_instructions"],
-        "tools": if policy["tools"].is_null() { tools } else { &policy["tools"] },
+        "tools": match &policy["tools"] {
+            Value::Null => json!(crate::default_tools(providers, model, picks.web_search)),
+            tools => tools.clone(),
+        },
     });
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
@@ -408,9 +414,28 @@ pub async fn create(
     if !policy["declare"].is_null() {
         params["declare"] = policy["declare"].clone();
     }
-    // The client's gate, `create`'s approval fields.
+    // The client's gate, `create`'s approval fields, for the tools the lead
+    // has: the client may not know which its model is given.
     if let (Value::Object(params), Some(gate)) = (&mut params, policy["gate"].as_object()) {
-        params.extend(gate.clone());
+        let has = |name: &str| {
+            params["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|tool| tool == name)
+                || (params.get("declare").and_then(Value::as_array))
+                    .into_iter()
+                    .flatten()
+                    .any(|tool| tool["name"] == name)
+        };
+        let mut gate = gate.clone();
+        if let Some(Value::Array(approve)) = gate.get_mut("approve") {
+            approve.retain(|tool| tool.as_str().is_some_and(has));
+            if approve.is_empty() {
+                gate.remove("approver");
+            }
+        }
+        params.extend(gate);
     }
     let record = match daemon.request("create", params).await {
         Ok(record) => record,
@@ -511,7 +536,7 @@ mod tests {
                 daemon,
                 dir,
                 policy,
-                &json!(["shell", "read"]),
+                &json!({"alpha": {"family": "responses"}}),
                 picks,
                 "worktree",
                 None,
@@ -531,6 +556,7 @@ mod tests {
                 effort: Some("low".into()),
                 in_project: true,
             }),
+            web_search: Default::default(),
         };
         let made = make(&daemon, &dir, &policy, &picks).unwrap();
         assert_eq!(
@@ -567,7 +593,10 @@ mod tests {
         );
         assert_eq!(
             (&create["tools"], &create["compaction_instructions"]),
-            (&json!(["shell", "read"]), &json!("keep"))
+            (
+                &json!(["shell", "read", "write", "apply_patch", "wait", "history"]),
+                &json!("keep")
+            )
         );
         let file = read(&dir).unwrap();
         assert_eq!(
@@ -732,6 +761,7 @@ mod tests {
             model: Some("gamma/three".into()),
             effort: Some("max".into()),
             threads: None,
+            web_search: Default::default(),
         };
         let made = make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();
         assert_eq!(
