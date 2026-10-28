@@ -364,8 +364,9 @@ pub fn stub(
 
 /// What a request sends in place of a result that carried pictures (an
 /// image file read) below the bot's elision floor: its text, without the
-/// pictures, which the file holds if the model needs them again. `None`
-/// when it would not save `ELISION_MIN_SAVING` bytes over `weight`, what the
+/// pictures, which the file holds if the model needs them again. Any saving
+/// makes one, so that a request can always leave older pictures out (see
+/// [`prompt_stub`]); `None` when it would weigh as much as `weight`, what the
 /// result weighs with its pictures at their token cost.
 pub fn picture_stub(
     family: Family,
@@ -377,7 +378,25 @@ pub fn picture_stub(
         "[tool result's picture elided from this request; read the file again to see it. Its text:]\n{output}"
     );
     let stub = family.tool_result_item(call_id, &text)?;
-    Ok((stub.len() + ELISION_MIN_SAVING <= weight).then_some(stub))
+    Ok((stub.len() < weight).then_some(stub))
+}
+
+/// What a request sends in place of a prompt that came with pictures below
+/// the bot's elision floor: its words, and a line on the pictures left out.
+/// Any saving makes one, as a request may take only so many pictures and
+/// leaves the oldest out; `None` when it would weigh as much as `weight`,
+/// what the prompt weighs with its pictures at their token cost.
+pub fn prompt_stub(
+    family: Family,
+    prompt: &str,
+    pictures: usize,
+    weight: usize,
+) -> Result<Option<Vec<u8>>> {
+    let text = format!(
+        "{prompt}\n[{pictures} picture(s) sent with this message, elided from this request]"
+    );
+    let stub = family.user_item_with(&text, &[])?;
+    Ok((stub.len() < weight).then_some(stub))
 }
 
 /// The family, call id and output of a stored tool result; `None` for any

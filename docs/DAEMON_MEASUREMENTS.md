@@ -5524,6 +5524,44 @@ Hot-path screen, in the same alternating run: the previous pacer change against 
 
 Every difference is inside the run-to-run range.
 
+## Request picture limits
+
+A request keeps its newest 50 pictures and 10 MiB of picture bytes beyond
+their weight; older messages go as their words with a line saying how many
+pictures they had. Prompt nodes now store a picture count, and a prompt with
+pictures stores its stub at insert. Before each model call the round checks
+the window's picture totals, which the window query now sums. This screen
+checks that turns without pictures cost what they did.
+
+Builds: main (`9a5e785`) against this branch merged with it (`c48258a` +
+merge). Release binaries, Linux x86_64 container, 4 vCPUs, 2026-10-28. The
+builds alternate round by round.
+
+| Measure | main | branch |
+| --- | ---: | ---: |
+| 32-bot socket echo, turn p50 | 581.4 ms | 580.2 ms |
+| 32-bot socket echo, turn p99 | 598.0 ms | 594.9 ms |
+| 32-bot socket echo, restart ready | 245 ms | 235 ms |
+| 32-bot socket echo, peak RSS | 24.0 MiB | 24.1 MiB |
+| 32-bot socket echo, daemon CPU | 1.19 s | 1.16 s |
+| Completion burst, release to terminal p50 | 14.6 ms | 12.8 ms |
+| 32 lone submits, reply p50 | 1.71 ms | 1.79 ms |
+| 32 lone submits, daemon CPU | 51.0 ms | 53.0 ms |
+| 32-submit burst, reply p50 | 6.49 ms | 6.69 ms |
+| 32-submit burst, daemon CPU | 17.1 ms | 17.2 ms |
+| Idle RSS (footprint) | 18.3 MiB | 18.0 MiB |
+| RSS after 1000 turns | 27.3 MiB | 27.3 MiB |
+| CPU per text turn (footprint) | 1.32 ms | 1.34 ms |
+| Store jobs per turn | 7.51 | 7.52 |
+| Store bytes after 1000 turns | 6.48 MB | 6.51 MB |
+
+Lifecycle and completion cells are medians of ten runs (two rounds of five);
+admission of 16 and footprint of 12 (four rounds). Every difference is inside
+the run-to-run range of either build: lone-submit CPU ran 41.7–58.0 ms on main
+and 46.1–59.1 ms on the branch. The store is 26 KB (0.4 %) larger per 1000
+turns, from the new column. Requests that carry pictures are not
+screened; their cost is the picture bytes themselves.
+
 ## Allowance refill waits park
 
 A call that had to wait for its pool's allowance to refill slept in the

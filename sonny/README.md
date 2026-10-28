@@ -206,10 +206,13 @@ off again never shows.
 `/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
-  window, taken where it is now, mid-turn included, on the alternate
-  screen. The copy answers from the agent's history and may call no tool;
-  follow-ups stay with it, and Esc goes back. The agent carries on
-  meanwhile, and what it said is waiting on the main screen. The daemon
+  window, taken where it is now, mid-turn included: in the pane beside
+  the conversation on the full screen, on the alternate screen inline.
+  The copy answers from the agent's history and may call no tool;
+  follow-ups stay with it, and Esc goes back. In the pane, every key goes
+  to the side chat but Shift+Tab, which goes back to the main composer
+  while the side chat stays open. The agent carries on meanwhile, in
+  view on the full screen, waiting on the main screen inline. The daemon
   deletes the copy once it has been idle 15 minutes (`fork --expires`), and
   no copy shows among the project's agents, in `/status`, or to the
   lookout.
@@ -239,7 +242,8 @@ off again never shows.
   Enter sends your approval of that exact call as your own message, so
   the agent may retry it once; the retry is still reviewed, and the judge
   reads your words as consent. This is Codex's `/approve`.
-- `/status` shows the project's agents, and its running Errand jobs. The
+- `/status` shows the project's agents, and its running Errand jobs, in
+  the pane beside the conversation on the full screen. The
   lead comes first; its tasks follow grouped by where they stand: **Needs
   you** (waiting on your approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
@@ -252,13 +256,16 @@ off again never shows.
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
   shows `↻ 2 triggers` beside its model.
-- `/background` (or `/triggers`, `/lookout`) lists what runs for the
-  project's agents with no one typing: the triggers that wake them, with
+- `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
+  conversation on the full screen, what runs for the project's agents with
+  no one typing: the triggers that wake them, with
   when each fires, its message and what its last fire did, and the
   lookout's subscriptions, with how many checks each asked for in the last
   day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
   removes it; the subscription Sonny keeps for a lead's tasks stays. The
   footer says `↻ 2 in background` while the window's agent has any.
+
+  ![/background in the pane](../docs/sonny/pane-background.png)
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
@@ -396,7 +403,9 @@ opened). Commands, reads and edits are left out. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-Sonny owns the whole screen, as Codex does. The conversation is Sonny's
+Sonny owns the whole screen, as Codex does. The conversation and the
+composer keep to a column 100 wide, however wide the window, so a reply
+reads as a column rather than a band across the screen. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
 it, older messages loading as you go past the first; rows that arrive
 while you have scrolled back leave the view still, and PgDn or Enter
@@ -405,12 +414,31 @@ a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
-Sonny drew around it. A click on a link opens it. Ctrl+F finds text in
+Sonny drew around it. A click on a web link opens it in the browser, and
+a click on a file opens it in a pane beside the conversation: code in
+syntax colors with its line numbers, at the line the link names
+(`src/main.rs:120`), and Markdown as replies read. The pane scrolls,
+selects and copies as the conversation does; a click on its name opens
+the file in the app the system opens it with, and Esc closes it. Links
+are the terminal's own links too, so its link click (Cmd+click, or
+Shift+Cmd+click in Ghostty) opens a file outside Sonny from the
+conversation. Keys go
+to the pane after a click in it; Tab takes them back to the composer, and
+Tab with nothing typed puts them in the pane again. A window too narrow for
+both shows the one the keys are in. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are. `/fullscreen` switches
 to inline, where Sonny writes into the terminal's own scrollback, and back;
 the choice is kept with the other settings.
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
+
+![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)
+
+![README.md beside the chat, read as a reply: headings, a list, a table and a Python block in color](../docs/sonny/pane-markdown.png)
+
+![/status beside the conversation, its times still counting](../docs/sonny/pane-status.png)
+
+![A side chat beside the conversation, answering a question about it](../docs/sonny/pane-side.png)
 
 `demo/` has the scripted model and folder the recordings use.

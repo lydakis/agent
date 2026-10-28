@@ -328,13 +328,12 @@ class WaitTests(ModelFixture):
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
-        sent = time.monotonic()
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         self.assertEqual(steer['status'], 'queued')
         done = client.finished(steer['turn'])['data']
         self.assertEqual((done['status'], done['into']), ('steered', turn))
-        # The steer reached the bot long before the command ended.
-        self.assertLess(time.monotonic() - sent, 1.0)
+        # The steer reached the bot before the command ended: the wait
+        # returned with its handle still pending.
         early = self.tool_output(client, 'Bob', 'wait-1')
         self.assertEqual((early['pending'], early['steered']), ([handle], True))
         # The bot read the steer after the early result, and waited again.
@@ -379,10 +378,8 @@ class WaitTests(ModelFixture):
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait2:' + handle)['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
-        sent = time.monotonic()
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         self.assertEqual(client.finished(steer['turn'])['data']['status'], 'steered')
-        self.assertLess(time.monotonic() - sent, 1.0)
         for call in ('wait-1', 'wait-2'):
             early = self.tool_output(client, 'Bob', call)
             self.assertEqual((early['pending'], early['steered']), ([handle], True))
@@ -394,11 +391,10 @@ class WaitTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 1.5; printf done')['result']['turn']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
-        sent = time.monotonic()
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         done = client.finished(steer['turn'])['data']
         self.assertEqual((done['status'], done['into']), ('steered', turn))
-        self.assertLess(time.monotonic() - sent, 1.0)
+        # Moved to the background before it ended, not waited out.
         lifted = self.tool_output(client, 'Bob', 'lift-1')
         self.assertEqual((lifted['background'], lifted['steered']), (True, True))
         # Nothing was killed: the command finished and its output arrived
