@@ -3623,15 +3623,25 @@ impl App {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            let turn = self
+            let turns = self
                 .client
-                .request("turns", json!({"bot": name, "newest": true, "limit": 1}))
+                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
                 .await
                 .ok()
-                .and_then(|page| page["turns"].get(0).cloned())
-                .unwrap_or(Value::Null);
+                .and_then(|page| page["turns"].as_array().cloned())
+                .unwrap_or_default();
+            let turn = turns.first().cloned().unwrap_or(Value::Null);
+            // A message steered into a running turn is recorded as a turn
+            // of its own that never ran: the time is the one it joined.
+            let ran = turns
+                .iter()
+                .find(|turn| turn["status"] != "steered")
+                .unwrap_or(&Value::Null);
             let running = !bot["running_turn"].is_null();
-            let state = match (running, turn["status"].as_str()) {
+            let state = match (
+                running,
+                if running { &turn } else { ran }["status"].as_str(),
+            ) {
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
                 }
@@ -3656,8 +3666,8 @@ impl App {
             };
             // A running turn counts on from its start; one that ended
             // shows how long it took.
-            let started = turn["started_ms"].as_u64();
-            let finished = turn["finished_ms"].as_u64();
+            let started = ran["started_ms"].as_u64();
+            let finished = ran["finished_ms"].as_u64();
             let (at, seconds) = match running {
                 true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
                 false => (
