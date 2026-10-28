@@ -829,12 +829,12 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 failed,
                 output: None,
             };
-            if !ask.choices.is_empty() {
+            if !ask.options.is_empty() {
                 let numbered: Vec<String> = ask
-                    .choices
+                    .options
                     .iter()
                     .enumerate()
-                    .map(|(at, choice)| format!("{} {choice}", at + 1))
+                    .map(|(at, choice)| format!("{} {}", at + 1, choice.label))
                     .collect();
                 said.under.push(dim(numbered.join(" · ")));
             }
@@ -1079,7 +1079,8 @@ Keep the rest.'"#,
     fn a_question_reads_with_its_choices() {
         let said = declared(
             "ask",
-            &serde_json::json!({"question": "Round each line?", "choices": ["Yes", "No"]}),
+            &serde_json::json!({"question": "Round each line?", "options": [
+                {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
             false,
         )
         .unwrap();
