@@ -1804,12 +1804,15 @@ fn looks_like_sse_prefix(body: &[u8]) -> bool {
 }
 
 /// An error code that means the account's allowance is spent, not that the
-/// pace is too fast: an API key's quota, or a ChatGPT plan's usage limit,
-/// which OpenAI says not to retry or guess a reset for.
+/// pace is too fast: an API key's quota, a ChatGPT plan's usage limit, which
+/// OpenAI says not to retry or guess a reset for, or Anthropic's spend cap,
+/// which refuses every retry until the next month.
 pub(crate) fn quota(code: &str) -> bool {
     matches!(
         code,
-        "insufficient_quota" | "subscription_sharing_usage_limit_exceeded"
+        "insufficient_quota"
+            | "subscription_sharing_usage_limit_exceeded"
+            | "enforced_spend_limit_reached"
     )
 }
 
@@ -1833,9 +1836,15 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
     }
     match serde_json::from_str::<Value>(text) {
         Ok(value) => Some(ErrorBody {
-            quota: ["code", "type"]
-                .iter()
-                .any(|field| value["error"][field].as_str().is_some_and(quota)),
+            // Anthropic's spend cap is a `rate_limit_error` told apart only
+            // by `details.error_code`.
+            quota: [
+                &value["error"]["code"],
+                &value["error"]["type"],
+                &value["error"]["details"]["error_code"],
+            ]
+            .iter()
+            .any(|field| field.as_str().is_some_and(quota)),
             detail: value
                 .as_str()
                 .or_else(|| value["error"]["message"].as_str())
