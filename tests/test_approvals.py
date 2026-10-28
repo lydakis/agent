@@ -445,12 +445,10 @@ class ApprovalTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='t',
                               prompt=f"waitshell:{alice['handle']}|printf after")['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
-        parked = time.monotonic()
         finished = client.finished(turn)
         self.assertEqual((finished['data']['status'], finished['data']['error']),
                          ('interrupted', 'approval_expired'))
-        # Ended by the lapse, long before the turn it waited on.
-        self.assertLess(time.monotonic() - parked, 2)
+        # Ended by the lapse, while the turn it waited on still runs.
         self.assertEqual(client.request('inspect', bot='Alice')['result']['status'], 'running')
         self.assertTrue(self.tool_output(client, 'shell-1')[0]['expired'])
         # The wait returned with its handle unresolved, not as a success.

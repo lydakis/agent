@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, Cell},
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -43,6 +43,8 @@ pub enum Action {
 /// one that did not fit the width.
 struct Shown {
     line: Line<'static>,
+    /// Where its text opens, when its line said so rather than its words.
+    link: Option<String>,
     /// The columns of the row's lead, when it goes on with the row above.
     joins: Option<usize>,
     /// The columns of its lead (a bullet, an indent) otherwise.
@@ -57,6 +59,8 @@ struct Row {
     line: Line<'static>,
     /// The lead the rows it goes on to start with, as it was written.
     rest: Option<Line<'static>>,
+    /// Where its text opens, whatever its words are.
+    link: Option<String>,
 }
 
 /// A place in the rows shown: a row and a column.
@@ -107,6 +111,10 @@ pub struct Screen {
     /// Counts each change to the rows shown, so what was found in them is
     /// looked for again.
     laid: usize,
+    /// A line to show at the top once the rows are laid out; or a row,
+    /// as they were drawn.
+    go_to: Option<(usize, usize)>,
+    top_row: Option<usize>,
 }
 
 /// The place found is to be picked again, the rows having been drawn anew.
@@ -145,7 +153,11 @@ impl Screen {
         for line in lines {
             let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty())
             else {
-                self.rows.push(Row { line, rest: None });
+                self.rows.push(Row {
+                    line,
+                    rest: None,
+                    link: None,
+                });
                 continue;
             };
             // A row the line above was wrapped onto joins it again.
@@ -165,6 +177,45 @@ impl Screen {
             }
             row.rest.get_or_insert(rest);
         }
+    }
+
+    /// A line whose rows after its first start with `rest` when wrapped,
+    /// as a numbered line of code goes on under its code.
+    pub fn push_hanging(&mut self, line: Line<'static>, rest: Line<'static>) {
+        self.rows.push(Row {
+            line,
+            rest: Some(rest),
+            link: None,
+        });
+    }
+
+    /// A line whose text opens `url`, a name that may hold spaces or
+    /// anything else a link read from words would stop at.
+    pub fn push_linked(&mut self, line: Line<'static>, url: String) {
+        self.rows.push(Row {
+            line,
+            rest: None,
+            link: Some(url),
+        });
+    }
+
+    /// Its lines replaced by `lines`, the view kept as far down from the
+    /// first row as it was.
+    pub fn replace(&mut self, lines: Vec<Line<'static>>) {
+        let top = self.top;
+        *self = Self {
+            area: self.area,
+            clicks: self.clicks.take(),
+            ..Self::default()
+        };
+        self.push(lines);
+        self.top_row = Some(top);
+    }
+
+    /// The view put with the line `row` of those pushed `above` drawn
+    /// rows under its top.
+    pub fn show_row(&mut self, row: usize, above: usize) {
+        self.go_to = Some((row, above));
     }
 
     /// The last line's rows taken off the screen, to be wrapped again.
@@ -260,6 +311,7 @@ impl Screen {
                 span.content.starts_with(crate::image::PLACEHOLDER)
                     || span.content.contains(['▀', '▄'])
             });
+            let link = row.link.clone();
             let rows = match line.width() <= width || picture {
                 true => vec![line],
                 false => {
@@ -273,6 +325,7 @@ impl Screen {
                 let first = at == 0;
                 self.shown.push(Shown {
                     line,
+                    link: link.clone(),
                     joins,
                     opens,
                     first,
@@ -422,6 +475,17 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
+        if let Some((row, above)) = self.go_to.take() {
+            let at = (self.shown.iter().enumerate())
+                .filter(|(_, shown)| shown.first)
+                .nth(row)
+                .map_or(0, |(at, _)| at)
+                .saturating_sub(above);
+            self.back = self.shown.len().saturating_sub(at + height);
+        }
+        if let Some(top) = self.top_row.take() {
+            self.back = self.shown.len().saturating_sub(top + height);
+        }
         self.back = self.back.min(self.most(height));
         let bottom = self.shown.len() - self.back;
         let top = bottom.saturating_sub(height);
@@ -504,6 +568,43 @@ impl Screen {
         }
     }
 
+    /// The cells of the links drawn last, from `buf` they were drawn in,
+    /// each link's first opening an OSC 8 hyperlink and its last closing
+    /// it: written again over themselves, they let the terminal's own
+    /// link click (Cmd+click) open the file or page outside Sonny.
+    pub fn link_cells(&self, buf: &Buffer) -> Vec<(u16, u16, Cell)> {
+        let mut cells = Vec::new();
+        for (y, from, to, url) in &self.links {
+            // The line a preview opens at is no part of the file's address.
+            let url = match url.starts_with("file://") {
+                true => url.split('#').next().unwrap_or(url),
+                false => url,
+            };
+            // The cells a character starts in: the column a wide one
+            // goes on into is drawn by it, and written over would cut it.
+            let mut glyphs = Vec::new();
+            let mut x = *from;
+            while x < *to {
+                glyphs.push(x);
+                x += buf[(x, *y)].symbol().width().max(1) as u16;
+            }
+            let last = glyphs.len().saturating_sub(1);
+            for (at, x) in glyphs.into_iter().enumerate() {
+                let mut cell = buf[(x, *y)].clone();
+                let mut symbol = cell.symbol().to_owned();
+                if at == 0 {
+                    symbol = format!("\x1b]8;;{url}\x1b\\{symbol}");
+                }
+                if at == last {
+                    symbol.push_str("\x1b]8;;\x1b\\");
+                }
+                cell.set_symbol(&symbol);
+                cells.push((x, *y, cell));
+            }
+        }
+        cells
+    }
+
     /// The links in the rows just drawn, as `links::cells` finds them.
     /// An address cut over rows is read whole, rows past the screen's
     /// edges included, and only its part on screen is kept.
@@ -545,6 +646,23 @@ impl Screen {
                 && last.0 == y
             {
                 last.2 = x + 1;
+            }
+        }
+        // A row its line links opens there across its text, whatever was
+        // read from its words.
+        for row in top..bottom {
+            let Some(url) = &self.shown[row].link else {
+                continue;
+            };
+            let y = drawn.y + (row - top) as u16;
+            let text: String = (self.shown[row].line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+            let from = text.width() - text.trim_start().width();
+            let to = text.trim_end().width().min(drawn.width as usize);
+            links.retain(|link| link.0 != y);
+            if from < to {
+                links.push((y, drawn.x + from as u16, drawn.x + to as u16, url.clone()));
             }
         }
         links
@@ -1191,6 +1309,26 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0).trim_end(), "row 10");
         assert!(!screen.at_top());
+    }
+
+    #[test]
+    fn a_card_put_in_anew_keeps_the_rows_scrolled_to() {
+        // A long line wraps over rows above where the view is.
+        let mut lines = vec![Line::from("one two three four five six seven")];
+        lines.extend((0..20).map(|i| Line::from(format!("row {i}"))));
+        let (mut screen, _) = screen(lines.clone(), 10, 5);
+        screen.show_row(0, 0);
+        let area = Rect::new(0, 0, 10, 5);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        screen.scroll(-6);
+        screen.render(area, &mut buf, |_| None);
+        let before = row(&buf, 0);
+        for _ in 0..3 {
+            screen.replace(lines.clone());
+            screen.render(area, &mut buf, |_| None);
+            assert_eq!(row(&buf, 0), before);
+        }
     }
 
     #[test]

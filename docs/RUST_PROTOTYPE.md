@@ -2458,8 +2458,14 @@ before if the view is still over its threshold.
 
 A result is elidable when its stub saves at least 1 KiB. A result that
 carried a picture is stubbed as its text alone, with a line that the file
-holds the picture if the model needs it again; what it saves is counted with
-the picture at its weight, so only a large one is elided. For a bot with
+holds the picture if the model needs it again, and a prompt that came with
+pictures as its words, with a line on how many were left out; what either
+saves is counted with the pictures at their weight, and any saving makes
+one. A request takes at most 100 pictures and 20 MiB of their bytes beyond
+weight (Anthropic takes 100 pictures and 32 MB in a request): past either,
+before a call, the floor moves, for any bot, until at most 50 pictures and
+10 MiB remain, the newest, so it moves seldom. Each node records how many
+pictures it has. For a bot with
 `read`, the stub is made when the result is recorded, with the node id its insert takes, and stored
 beside it. Each node records what its stub saves and, like its byte total,
 the cumulative savings along its lineage; each floor version records the

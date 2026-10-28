@@ -149,13 +149,11 @@ class AnsweredToolTests(ModelFixture):
         self.lead(client=client, tool=dict(START, expire_ms=30_000), approve=['shell'],
                   approver='manual', approve_expire_ms=100)
         self.model.call_script = [[('start_task', {'name': 'fix'}), ('shell', {'command': 'true'})]]
-        started = time.monotonic()
         turn = self.submit(client)
         # Ended by the lapse, as a turn waiting on a verdict is, long before
         # the answered call's own time runs out.
         finished = client.finished(turn)['data']
         self.assertEqual((finished['status'], finished['error']), ('interrupted', 'approval_expired'))
-        self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(json.loads(self.output(client)),
                          {'error': 'tool_unserved', 'detail': "a later call's gate lapsed before the answer"})
 

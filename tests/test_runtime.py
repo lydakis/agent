@@ -136,6 +136,10 @@ class Model(http.server.BaseHTTPRequestHandler):
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
+            # When each attempt reached the model, by this process's clock.
+            arrived = getattr(self.server, 'arrived', {})
+            arrived[user, attempt] = time.monotonic()
+            self.server.arrived = arrived
             pace_at = getattr(self.server, 'pace_at', None)
             if (pace_at is not None and not is_summary(request)
                     and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at):
@@ -2223,16 +2227,21 @@ class RuntimeTests(ModelFixture):
         self.assertEqual([e['data']['error'] for e in kept if e['event'] == 'retry'],
                          ['provider_http_503', 'provider_http_429', 'provider_rate_limited',
                           'provider_rate_limited', 'provider_http_520'])
-        self.assertGreaterEqual(turns[1]['paced_ms'], 40)   # the retry waited for the pool's Retry-After
-        self.assertGreaterEqual(turns[2]['paced_ms'], 250)  # and for the delay named in the stream
-        self.assertGreaterEqual(turns[3]['paced_ms'], 250)  # top-level error uses the same pool delay
+        # The retry waited for the pool's Retry-After, then for the delay
+        # named in the stream, which a top-level error names the same way.
+        # Each is timed here from the refused attempt's arrival, before the
+        # refusal, so a slow machine only lengthens it.
+        arrived = self.model.arrived
+        for prompt, wait in (('limited:1', .05), ('streamlimit:1', .3), ('streamlimit-flat:1', .3)):
+            self.assertGreaterEqual(arrived[prompt, 2] - arrived[prompt, 1], wait, prompt)
         # Headers saying the allowance is spent pace the next call; nothing fails.
         self.assertEqual(run('paced:1')[0]['status'], 'completed')
         data, retries = run('hello')
         self.assertEqual((data['status'], retries), ('completed', []))
         held = client.request('turns', bot='Bob')['result']['turns'][-1]
         self.assertEqual(held['retries'], 0)
-        self.assertGreaterEqual(held['paced_ms'], 300)
+        self.assertGreater(held['paced_ms'], 0)
+        self.assertGreaterEqual(arrived['hello', 1] - arrived['paced:1', 1], .3)
         # A response the model could not finish is final, not retried.
         data, retries = run('incomplete')
         self.assertEqual((data['status'], data['error'], retries), ('failed', 'provider_incomplete', []))
