@@ -6779,15 +6779,19 @@ fn draw_background(watch: &mut Watch) -> std::io::Result<()> {
 
 /// `/usage` on its own screen: its card and the keys it takes.
 fn draw_usage(watch: &mut Watch) -> std::io::Result<()> {
-    let (Some(view), Some(screen)) = (&watch.usage, &mut watch.screen) else {
+    let (Some(view), Some(screen)) = (&mut watch.usage, &mut watch.screen) else {
         return Ok(());
     };
     screen.autoresize()?;
     screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
+        let card = view.card(width);
+        // Scrolled no further than shows its last row above the footer.
+        let room = area.height.saturating_sub(2) as usize;
+        view.scroll = view.scroll.min(card.len().saturating_sub(room));
         let mut lines = vec![Line::default()];
-        lines.extend(view.card(width).into_iter().map(|line| {
+        lines.extend(card.into_iter().skip(view.scroll).map(|line| {
             let mut spans = vec![Span::raw(" ")];
             spans.extend(line.spans);
             Line::from(spans).style(line.style)

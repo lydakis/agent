@@ -1,7 +1,8 @@
 //! `/usage`: the tokens the project's agents spent, or every agent's, in
 //! the last day, week or month: in all, over time as stacked bars, by
 //! agent (or project) and by model. One daemon read, `usage`, each time
-//! the view changes and every quarter minute while it is open.
+//! the view changes and every minute while it is open: it reads every
+//! matching turn, so it is not asked for often.
 use crate::background::Scope;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -13,7 +14,9 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 /// How often the open view reads again.
-const FRESH: Duration = Duration::from_secs(15);
+const FRESH: Duration = Duration::from_secs(60);
+/// The most rows the card scrolls by: more than it ever has.
+const MOST_SCROLL: usize = 200;
 /// The chart's height in rows.
 const ROWS: usize = 8;
 /// The most agents or models listed, the rest summed on one row.
@@ -118,6 +121,9 @@ pub struct View {
     error: Option<String>,
     /// When it was read last; none until it is, or once it must be again.
     at: Option<Instant>,
+    /// Rows scrolled past on its own screen, inline; the pane scrolls
+    /// itself.
+    pub scroll: usize,
 }
 
 struct Read {
@@ -139,6 +145,7 @@ impl View {
             read: None,
             error: None,
             at: None,
+            scroll: 0,
         }
     }
 
@@ -204,6 +211,26 @@ impl View {
             KeyCode::Char('a') => {
                 self.all = !self.all;
                 self.at = None;
+                return Key::Stay;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll = self.scroll.saturating_sub(1);
+                return Key::Stay;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll = (self.scroll + 1).min(MOST_SCROLL);
+                return Key::Stay;
+            }
+            KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_sub(10);
+                return Key::Stay;
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.scroll = (self.scroll + 10).min(MOST_SCROLL);
+                return Key::Stay;
+            }
+            KeyCode::Home => {
+                self.scroll = 0;
                 return Key::Stay;
             }
             KeyCode::Char('c') => {
@@ -713,6 +740,13 @@ mod tests {
         // The busiest bar reaches the top row.
         let top = view.card(60)[4].clone();
         assert!(text(&[top]).ends_with('█'), "{card}");
+
+        // Inline, the card scrolls on its own keys.
+        view.key(KeyEvent::from(KeyCode::Down));
+        view.key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(view.scroll, 11);
+        view.key(KeyEvent::from(KeyCode::Home));
+        assert_eq!(view.scroll, 0);
 
         // Every agent's, by project, asks with no name.
         view.key(KeyEvent::from(KeyCode::Char('a')));

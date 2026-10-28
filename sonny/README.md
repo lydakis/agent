@@ -283,7 +283,7 @@ off again never shows.
   provider's cache), by agent and by model. `d`, `w` and `m` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
-  A turn counts where it started. It reads again every 15 seconds.
+  A turn counts where it started. It reads again every minute.
 
   ![/usage in the pane](../docs/sonny/usage.gif)
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get

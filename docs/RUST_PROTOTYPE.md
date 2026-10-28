@@ -1229,7 +1229,12 @@ the rest with how many (`null` when none), and `models`, the turn's model as
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a
 `since_ms` and fewer than 1024 buckets to now (`invalid_usage_window`). Usage
 is read from `turns`, so a deleted bot's turns, and the judge's own copies once
-deleted, no longer count. Sonny's `/usage` draws it.
+deleted, no longer count. Its cost grows with the turns it matches, so it is
+answered off the dispatch path, like `provider_models`, and other requests go
+on while it reads; it holds only the reader connection. As an observation, not
+a screen: the same statement in Python's SQLite over a synthetic store of 164k
+turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
+Sonny's `/usage` draws it, reading again once a minute while it is open.
 
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure
