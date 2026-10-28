@@ -198,6 +198,14 @@ class Model(http.server.BaseHTTPRequestHandler):
                             'arguments': json.dumps({'handles': [user[7:] if count == 100 else 'proc:999']})}]
                           if count <= 205 else [{'type': 'message', 'role': 'assistant',
                                                  'content': [{'type': 'output_text', 'text': text}]}])
+            elif (respond := getattr(self.server, 'respond', None)) and (said := respond(request, user)) is not None:
+                # A test's own model: calls as [[name, arguments], ...], or
+                # an answer in words.
+                text = '' if isinstance(said, list) else said
+                output = ([{'type': 'function_call', 'name': name, 'call_id': f'{name}-{n + 1}',
+                            'arguments': json.dumps(arguments)} for n, (name, arguments) in enumerate(said)]
+                          if isinstance(said, list) else
+                          [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': said}]}])
             elif getattr(self.server, 'task_script', None) is not None:
                 # A scripted agent: one shell command a model call, then an
                 # answer quoting every throughput the last result reported,
