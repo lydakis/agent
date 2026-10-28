@@ -452,12 +452,17 @@ fn update(text: &str, chunks: &[Chunk], path: &str) -> Result<String> {
     if lines.last() == Some(&"") {
         lines.pop();
     }
+    let mut hay = Haystack {
+        lines: &lines,
+        plain: None,
+        left: COMPARED,
+    };
     let mut replacements: Vec<(usize, usize, &[String])> = Vec::new();
     let mut cursor = 0;
     for chunk in chunks {
         if let Some(context) = &chunk.context {
             let found =
-                seek(&lines, std::slice::from_ref(context), cursor, false).ok_or_else(|| {
+                seek(&mut hay, std::slice::from_ref(context), cursor, false)?.ok_or_else(|| {
                     Error::with(
                         "patch_context_not_found",
                         format!("{path}: no line matches @@ {context}"),
@@ -475,14 +480,14 @@ fn update(text: &str, chunks: &[Chunk], path: &str) -> Result<String> {
             continue;
         }
         let (mut old, mut new) = (&chunk.old[..], &chunk.new[..]);
-        let mut found = seek(&lines, old, cursor, chunk.end_of_file);
+        let mut found = seek(&mut hay, old, cursor, chunk.end_of_file)?;
         // A trailing empty line can stand for the file's final newline.
         if found.is_none() && old.last().is_some_and(String::is_empty) {
             old = &old[..old.len() - 1];
             if new.last().is_some_and(String::is_empty) {
                 new = &new[..new.len() - 1];
             }
-            found = seek(&lines, old, cursor, chunk.end_of_file);
+            found = seek(&mut hay, old, cursor, chunk.end_of_file)?;
         }
         let at = found.ok_or_else(|| {
             Error::with(
@@ -527,39 +532,91 @@ fn update(text: &str, chunks: &[Chunk], path: &str) -> Result<String> {
     Ok(updated)
 }
 
-/// Where `pattern` first occurs in `lines` at or after `start`, matched
+/// Line comparisons one update may make before it gives up: well past
+/// what a real patch needs, short of what stalls the daemon's blocking pool.
+const COMPARED: usize = 50_000_000;
+
+/// What `seek` reads a file through: its lines, the same lines with
+/// typographic punctuation made plain once for every chunk, and the line
+/// comparisons left.
+struct Haystack<'a> {
+    lines: &'a [&'a str],
+    plain: Option<Vec<String>>,
+    left: usize,
+}
+
+impl Haystack<'_> {
+    /// Line `at` as pass `pass` reads it.
+    fn line(&self, pass: usize, at: usize) -> &str {
+        let line = self.lines[at];
+        match pass {
+            0 => line,
+            1 => line.trim_end(),
+            2 => line.trim(),
+            _ => &self.plain.as_ref().unwrap()[at],
+        }
+    }
+}
+
+/// `line` as pass `pass` reads it: exactly, then without trailing
+/// whitespace, then trimmed, then trimmed with punctuation made plain.
+fn normal(pass: usize, line: &str) -> std::borrow::Cow<'_, str> {
+    match pass {
+        0 => line.into(),
+        1 => line.trim_end().into(),
+        2 => line.trim().into(),
+        _ => line.trim().chars().map(plain).collect::<String>().into(),
+    }
+}
+
+/// Where `pattern` first occurs in the file at or after `start`, matched
 /// exactly, then ignoring trailing whitespace, then surrounding
 /// whitespace, then common typographic punctuation. With `end_of_file`
-/// a match at the very end is preferred.
-fn seek(lines: &[&str], pattern: &[String], start: usize, end_of_file: bool) -> Option<usize> {
-    if pattern.len() > lines.len() {
-        return None;
+/// a match at the very end is preferred. Fails with `invalid_patch` once
+/// the update has compared too many lines.
+fn seek(
+    hay: &mut Haystack,
+    pattern: &[String],
+    start: usize,
+    end_of_file: bool,
+) -> Result<Option<usize>> {
+    let lines = hay.lines.len();
+    if pattern.len() > lines {
+        return Ok(None);
     }
-    let last = lines.len() - pattern.len();
+    let last = lines - pattern.len();
     let from = if end_of_file { last.max(start) } else { start };
-    let passes: [fn(&str) -> String; 4] = [
-        str::to_owned,
-        |line| line.trim_end().to_owned(),
-        |line| line.trim().to_owned(),
-        |line| line.trim().chars().map(plain).collect(),
-    ];
-    for norm in passes {
-        let wanted: Vec<String> = pattern.iter().map(|line| norm(line)).collect();
-        let normed: Vec<String> = lines[start.min(from)..]
-            .iter()
-            .map(|line| norm(line))
-            .collect();
-        let base = start.min(from);
+    for pass in 0..4 {
+        if pass == 3 && hay.plain.is_none() {
+            hay.plain = Some(
+                hay.lines
+                    .iter()
+                    .map(|l| normal(3, l).into_owned())
+                    .collect(),
+            );
+        }
+        let wanted: Vec<_> = pattern.iter().map(|line| normal(pass, line)).collect();
         for at in (from..=last).chain(start..from.min(last + 1)) {
-            let lines = &normed[at - base..at - base + pattern.len()];
             // The ends first: most places differ there, and a long run of
             // like lines is then not compared whole at every place.
-            if lines.last() == wanted.last() && lines == &wanted[..] {
-                return Some(at);
+            hay.left = hay.left.checked_sub(1).ok_or_else(too_slow)?;
+            if hay.line(pass, at + pattern.len() - 1) != wanted[pattern.len() - 1] {
+                continue;
+            }
+            hay.left = hay.left.checked_sub(pattern.len()).ok_or_else(too_slow)?;
+            if (0..pattern.len()).all(|i| hay.line(pass, at + i) == wanted[i]) {
+                return Ok(Some(at));
             }
         }
     }
-    None
+    Ok(None)
+}
+
+fn too_slow() -> Error {
+    Error::with(
+        "invalid_patch",
+        "matching this patch's chunks compares too many lines; split it into smaller patches",
+    )
 }
 
 /// Typographic dashes, quotes and spaces as their ASCII forms.
@@ -711,6 +768,19 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(update(&text, chunks, "f").is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Many chunks that each scan the rest of a long file stop at a
+        // bound on the lines compared, rather than stall the daemon.
+        let mut text = "\u{201C}q\u{201D}\n".repeat(300);
+        text.push_str(&"x\n".repeat(100_000));
+        let mut many = "*** Update File: f\n".to_owned();
+        many.push_str(&"@@\n-\"q\"\n+r\n".repeat(300));
+        let parsed = patch(&many);
+        let Change::Update { chunks, .. } = &parsed.changes[0] else {
+            panic!()
+        };
+        let error = update(&text, chunks, "f").unwrap_err();
+        assert_eq!(error.code, "invalid_patch");
+        assert!(error.detail.unwrap().contains("too many lines"));
         // An insertion with no context lands at the end even when a later
         // chunk changes an earlier line.
         let parsed = patch("*** Update File: f\n@@\n+tail\n@@\n-first\n+changed\n");
