@@ -2539,6 +2539,7 @@ fn sent_by(trigger: &Trigger) -> String {
 /// `--start` trigger's first fire makes its agent, whose id `kept` takes.
 async fn deliver(
     client: &Client,
+    places: &Places,
     trigger: &Trigger,
     kept: &mut Kept,
     why: &str,
@@ -2560,6 +2561,9 @@ async fn deliver(
     };
     if started {
         kept.started_id = Some(id);
+        // On its row at once: a trigger that replaces this one while its
+        // answer is on its way messages the agent this one made.
+        made(places, trigger, id);
     }
     // A new agent is resting, so its first message never waits.
     let asked = ask.is_some_and(|a| a.kind.sends());
@@ -2855,7 +2859,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
     }
     let outcome = with_daemon(trigger, async |client| {
-        deliver(client, trigger, &mut kept, &why, ask).await
+        deliver(client, places, trigger, &mut kept, &why, ask).await
     });
     let (Ok(outcome) | Err(outcome)) = outcome;
     settle(places, trigger, &named(outcome), &kept, &launchctl);
@@ -2867,6 +2871,25 @@ fn noted(places: &Places, trigger: &Trigger, kept: &Kept) {
     let written = Lock::take(places).and_then(|_lock| match ours(places, trigger) {
         true => write_row(places, trigger, &state(places, trigger)["last"], kept),
         false => Ok(()),
+    });
+    if let Err(error) = written {
+        eprintln!("{}", error_json(&error));
+    }
+}
+
+/// The agent a `--start` trigger made, on its row before the fire is done.
+/// Under the lock, and only while the plist is this trigger's.
+fn made(places: &Places, trigger: &Trigger, id: i64) {
+    let written = Lock::take(places).and_then(|_lock| {
+        let durable = state(places, trigger);
+        let kept = Kept {
+            started_id: Some(id),
+            ..Kept::of(&durable)
+        };
+        match ours(places, trigger) {
+            true => write_row(places, trigger, &durable["last"], &kept),
+            false => Ok(()),
+        }
     });
     if let Err(error) = written {
         eprintln!("{}", error_json(&error));
@@ -4016,6 +4039,17 @@ mod tests {
         };
         add(&elsewhere, true).unwrap();
         assert_eq!(Kept::of(&state(&w.places, &elsewhere)).started_id, None);
+        // One it made goes on its row before its fire is done, so a
+        // replacement made while its answer is on its way messages it.
+        made(&w.places, &elsewhere, 11);
+        let again = Trigger {
+            generation: "test-7".into(),
+            message: "again".into(),
+            ..elsewhere.clone()
+        };
+        add(&again, true).unwrap();
+        assert_eq!(Kept::of(&state(&w.places, &again)).started_id, Some(11));
+        assert_eq!(w.rows()[0]["last"]["outcome"], "sent");
     }
 
     #[test]
