@@ -59,8 +59,9 @@ check, with up to two questions:
   presenting it as done? A yes is picked, with what to do, in the note the
   lead gets once it rests. A lead that hears every message reads a
   person's correction or the end of a turn they asked for as theirs and
-  lets it pass: in `bench/lookout_turns.py` it caught 10 of 24 drifting
-  tasks on its own (a 3-run mean).
+  lets it pass: in `bench/lookout_turns.py` (3-run means) it caught 11 of
+  24 drifting tasks on its own and 13 with drift picked, with no fewer
+  results told.
 
 The judge reads the event's text, the lead's latest message to that task
 (its brief) or the person's latest words in it, for `drifts` what passed
