@@ -445,6 +445,9 @@ fn key_bytes(key: KeyEvent, application: bool) -> Option<Vec<u8>> {
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        // As the kitty keyboard protocol sends it, which keeps the Ctrl
+        // a word's deletion needs.
+        KeyCode::Backspace if ctrl => return Some(format!("\x1b[127;{modifier}u").into_bytes()),
         KeyCode::Backspace => b"\x7f".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
         KeyCode::Up => return Some(csi('A')),
@@ -540,6 +543,11 @@ mod tests {
         assert_eq!(key(KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
         assert_eq!(key(KeyCode::Left, KeyModifiers::ALT), b"\x1b[1;3D");
         assert_eq!(key(KeyCode::Enter, KeyModifiers::SHIFT), b"\x1b[13;2u");
+        assert_eq!(
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            b"\x1b[127;5u"
+        );
+        assert_eq!(key(KeyCode::Backspace, KeyModifiers::ALT), b"\x1b\x7f");
         // Alt+Enter is a new line in Sonny's composer, as Shift+Enter is.
         assert_eq!(key(KeyCode::Enter, KeyModifiers::ALT), b"\x1b\r");
         assert_eq!(key(KeyCode::PageUp, KeyModifiers::NONE), b"\x1b[5~");

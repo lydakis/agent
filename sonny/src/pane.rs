@@ -263,6 +263,13 @@ fn preview(
         }
         return Ok(0);
     }
+    // A pipe, socket or device may never end, or never start.
+    if !meta.is_file() {
+        screen.push(vec![note(
+            "not a file a preview reads: a pipe, socket or device",
+        )]);
+        return Ok(0);
+    }
     let size = meta.len();
     let mut bytes = Vec::new();
     use std::io::Read;
@@ -462,6 +469,21 @@ mod tests {
         let shown = rows(&mut pane, 30, 8);
         // Three drawn rows above it, however many lines they are.
         assert_eq!(shown[5], " 20  line 20", "{shown:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pipe_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("sonny-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.is_ok_and(|s| s.success()) {
+            // Opening it would wait for a writer that never comes.
+            let mut pane = Pane::preview(&format!("file://{}", fifo.display()), &dir, 60).unwrap();
+            let shown = rows(&mut pane, 60, 3);
+            assert!(shown[2].contains("not a file a preview reads"), "{shown:?}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
