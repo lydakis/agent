@@ -12,7 +12,7 @@
 //! subscribers like any client.
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
-mod subs;
+pub(crate) mod subs;
 mod updates;
 
 use agent_client::{
@@ -456,21 +456,6 @@ where a lead agent coordinates task agents for a person. The user message is a J
 how to read `input`, and `questions` maps each question's id to the question. Answer with one JSON object \
 mapping every question id to the probability, from 0 to 1, that the answer is yes, and nothing else.";
 
-/// A key from this shell, else from `~/.agent/env`.
-fn key(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .or_else(|| {
-            let file = agent_client::env_file::path()?;
-            agent_client::env_file::read(&file)
-                .ok()?
-                .into_iter()
-                .find(|(key, value)| key == name && !value.is_empty())
-                .map(|(_, value)| value)
-        })
-}
-
 impl Judge {
     /// `openai-decisions/MODEL` with `OPENAI_API_KEY` (`LOOKOUT_URL`
     /// points it elsewhere), any other `provider/model`, which the daemon
@@ -503,7 +488,7 @@ impl Judge {
                 Ok(judge(Api::Model, model, config.judge.effort, None))
             }
             Some(judge::Spec::Decisions(model)) => {
-                let key = key(judge::DECISIONS_KEY)
+                let key = agent_client::env_file::var(judge::DECISIONS_KEY)
                     .ok_or_else(|| format!("lookout: set {} for {spec}", judge::DECISIONS_KEY))?;
                 let url = std::env::var("LOOKOUT_URL")
                     .ok()
@@ -1729,30 +1714,25 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
     subs::ensure(store, lead, subs::Sub::lead(lead, project))
 }
 
-/// What `/lookout` shows: the lookout's line, then each subscription the
-/// bot has and how many checks it asked for in the last day.
-pub fn subscriptions(store: &std::path::Path, bot: &str) -> Vec<String> {
-    let subs = subs::read(store, bot);
-    let logged = logged(store, bot);
-    let mut lines = vec![status(store, bot)];
-    if subs.is_empty() {
-        lines.push("No subscriptions: sonny lookout add NAME --tasks-of BOT".to_owned());
+/// How many checks each of the subscriber's subscriptions asked for in
+/// the last day, by its name, as `/background` lists them.
+pub fn checks(store: &std::path::Path, bot: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for line in logged(store, bot) {
+        if !today(&line) || line.get("answers").is_none() {
+            continue;
+        }
+        match line["subs"].as_array() {
+            Some(names) => {
+                for name in names.iter().filter_map(Value::as_str) {
+                    *counts.entry(name.to_owned()).or_default() += 1;
+                }
+            }
+            // Logged before subscriptions: the lead's own tasks.
+            None => *counts.entry("tasks".to_owned()).or_default() += 1,
+        }
     }
-    for sub in subs {
-        let checks = (logged.iter())
-            .filter(|line| today(line) && line.get("answers").is_some())
-            .filter(|line| match line["subs"].as_array() {
-                Some(names) => names.iter().any(|n| *n == sub.name.as_str()),
-                // Logged before subscriptions: the lead's own tasks.
-                None => sub.name == "tasks",
-            })
-            .count();
-        lines.push(format!(
-            "{} · {checks} checks in the last day",
-            sub.describe()
-        ));
-    }
-    lines
+    counts
 }
 
 /// Every bot the daemon lists, page by page.
@@ -3518,7 +3498,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_lookout_lists_each_subscription_and_its_checks() {
+    fn each_subscription_counts_its_checks_in_the_last_day() {
         let dir = std::env::temp_dir().join(format!("lookout-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3533,28 +3513,18 @@ mod tests {
             &log,
             &json!({"at_ms": now, "lead": "calc.lead", "answers": {}, "subs": ["tasks", "ops"]}),
         );
-        std::fs::create_dir_all(subs::dir(&store)).unwrap();
-        std::fs::write(
-            subs::dir(&store).join("calc.lead.json"),
-            json!({"subscriptions": [subs::Sub::lead("calc.lead", "calc").to_json(),
-                sub("ops", &[], &["ops.*"]).to_json()]})
-            .to_string(),
-        )
-        .unwrap();
-        let lines = subscriptions(&store, "calc.lead");
-        assert_eq!(lines[0], "Lookout · not running");
-        assert_eq!(
-            lines[1],
-            "tasks · tasks of calc.lead, bots calc.* · on said, ended · asks every built-in · task updates · 2 checks in the last day"
+        append(
+            &log,
+            &json!({"at_ms": now - 2 * 24 * 60 * 60 * 1000, "lead": "calc.lead", "answers": {}, "subs": ["ops"]}),
         );
-        assert_eq!(
-            lines[2],
-            "ops · bots ops.* · on said, ended · asks every built-in · 1 checks in the last day"
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "woke": {}, "subs": ["ops"]}),
         );
-        assert_eq!(
-            subscriptions(&store, "reviewer")[1],
-            "No subscriptions: sonny lookout add NAME --tasks-of BOT"
-        );
+        let counts = checks(&store, "calc.lead");
+        assert_eq!(counts.get("tasks"), Some(&2));
+        assert_eq!(counts.get("ops"), Some(&1));
+        assert!(checks(&store, "reviewer").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

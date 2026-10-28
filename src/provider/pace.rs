@@ -96,6 +96,35 @@ struct State {
     /// Blocks in a row that ended in another refusal naming no delay.
     unnamed_blocks: u32,
     reserved_requests: u64,
+    /// Calls answered and overloads refused since the window began.
+    overloads: Overloads,
+}
+
+/// Overload refusals that name no delay close the pool only when they
+/// cluster: this many within one window, a quarter or more of its answers.
+const OVERLOAD_CLUSTER: u32 = 3;
+const OVERLOAD_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Default)]
+struct Overloads {
+    since: Option<Instant>,
+    answered: u32,
+    refused: u32,
+}
+impl Overloads {
+    /// The current window, a fresh one once the last has run out.
+    fn at(&mut self, now: Instant) -> &mut Self {
+        if self
+            .since
+            .is_none_or(|since| now - since >= OVERLOAD_WINDOW)
+        {
+            *self = Overloads {
+                since: Some(now),
+                ..Overloads::default()
+            };
+        }
+        self
+    }
 }
 
 /// An unsent reservation is fully refundable. After dispatch, cancellation
@@ -359,6 +388,24 @@ impl Pace {
     pub fn accepted(&self) {
         let mut state = self.state.lock().unwrap();
         state.unnamed_blocks = 0;
+        state.overloads.at(Instant::now()).answered += 1;
+    }
+    /// An overload refused a call. With a delay named it closes the pool as
+    /// a rate limit does. With none, the refused call backs off alone, as
+    /// Codex and the providers' SDKs retry an overload per request, unless
+    /// overloads cluster: then the pool closes as for an unnamed rate limit.
+    /// Whether it closed.
+    pub fn overloaded(&self, after: Option<Duration>) -> bool {
+        let clustered = after.is_some() || {
+            let mut state = self.state.lock().unwrap();
+            let window = state.overloads.at(Instant::now());
+            window.refused += 1;
+            window.refused >= OVERLOAD_CLUSTER && window.refused * 3 >= window.answered
+        };
+        if clustered {
+            self.limited(after);
+        }
+        clustered
     }
     /// Learn the allowance from headers that precede every call they could
     /// count, such as a WebSocket upgrade's. Outstanding reservations stay
@@ -586,6 +633,33 @@ mod tests {
         .expect("unknown capacity must not impose an admission cap");
         assert!(held.iter().all(|r| r.waited.is_zero()));
         assert_eq!(pace.state.lock().unwrap().reserved_requests, 128);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_overload_leaves_the_pool_open_and_clustered_ones_close_it() {
+        let pace = Pace::default();
+        let answered = |pace: &Pace, calls: u32| (0..calls).for_each(|_| pace.accepted());
+        // One refusal among many answers is that call's to back off.
+        answered(&pace, 20);
+        assert!(!pace.overloaded(None));
+        assert!(!pace.overloaded(None));
+        assert_eq!(pace.blocked_for(), None);
+        // A third, still under a quarter of the answers, leaves it open too.
+        answered(&pace, 10);
+        assert!(!pace.overloaded(None));
+        assert_eq!(pace.blocked_for(), None);
+        // A new window: three refusals and few answers are the provider's.
+        tokio::time::advance(OVERLOAD_WINDOW).await;
+        answered(&pace, 2);
+        assert!(!pace.overloaded(None));
+        assert!(!pace.overloaded(None));
+        assert!(pace.overloaded(None));
+        assert!(pace.blocked_for().is_some());
+        // A named delay closes it whatever the window holds.
+        tokio::time::advance(Duration::from_secs(40)).await;
+        assert_eq!(pace.blocked_for(), None);
+        assert!(pace.overloaded(Some(Duration::from_secs(3))));
+        assert_eq!(pace.blocked_for().unwrap().as_secs_f64().round(), 3.0);
     }
 
     #[tokio::test(start_paused = true)]
