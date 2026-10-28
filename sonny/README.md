@@ -431,8 +431,9 @@ a click on a file opens it in a pane beside the conversation: code in
 syntax colors with its line numbers, at the line the link names
 (`src/main.rs:120`), Markdown as replies read, with its pictures and
 the HTML a README is written with, and a picture, SVG, Mermaid file or
-HTML page drawn as it looks. A file reads at the 100 columns the
-conversation is written at. A click on a picture, diagram or page in the
+HTML page drawn as it looks. Markdown and plain text read at the 100
+columns the conversation is written at; code, pictures, diagrams and
+pages fill the pane. A click on a picture, diagram or page in the
 conversation opens it in the pane, bigger. The pane scrolls,
 selects and copies as the conversation does; a click on its name opens
 the file in the app the system opens it with, and Esc closes it. Links

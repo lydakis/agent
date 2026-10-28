@@ -4778,8 +4778,8 @@ impl App {
     fn follow(&mut self, link: &str) {
         if link.starts_with("file://") {
             let workspace = std::path::Path::new(&self.workspace);
-            let width = pane::width(self.full_width, PROSE as u16).clamp(20, PROSE as u16);
-            match pane::Pane::preview(link, workspace, width as usize) {
+            let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+            match pane::Pane::preview(link, workspace, width) {
                 Ok(pane) => self.open_pane(pane),
                 Err(error) => self.notice = Some(error),
             }
