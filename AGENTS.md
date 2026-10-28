@@ -68,6 +68,9 @@ it keeps these, and says in its PR how:
   recorded in docs/DAEMON_MEASUREMENTS.md: `bench.lifecycle` (32-bot socket
   echo), `bench.completion_burst`, `bench.admission_burst`, and
   `bench.footprint` for memory.
+  The Perf workflow screens every pull request that touches `src/` against
+  its base this way (`bench/perf_gate.py`): more store work per turn fails
+  it, and CPU, latency or memory past 15% with no overlap warns.
 
 ## Working rules
 
