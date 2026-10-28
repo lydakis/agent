@@ -100,12 +100,42 @@ struct State {
     overloads: Overloads,
     /// Output tokens the pool's latest calls reported, oldest first.
     outputs: std::collections::VecDeque<u32>,
+    /// Per mille of each latest call's input that counted against the
+    /// limit, oldest first, for a provider that leaves cache reads out.
+    counted: std::collections::VecDeque<u32>,
 }
 
-/// The output estimate follows this many of the latest calls, once it has
-/// `OUTPUT_KNOWN` of them.
+/// The output and counted-input estimates follow this many of the latest
+/// calls, once they have `OUTPUT_KNOWN` of them.
 const OUTPUT_SAMPLES: usize = 32;
 const OUTPUT_KNOWN: usize = 8;
+
+/// The 90th percentile of a pool's latest samples, once enough are known.
+fn p90(samples: &std::collections::VecDeque<u32>) -> Option<u64> {
+    if samples.len() < OUTPUT_KNOWN {
+        return None;
+    }
+    let mut seen: Vec<u32> = samples.iter().copied().collect();
+    let at = (seen.len() * 9).div_ceil(10) - 1;
+    Some(u64::from(*seen.select_nth_unstable(at).1))
+}
+
+/// The input a call's usage counts toward its provider's limits: all of
+/// it, or for a provider that leaves cache reads out, the rest.
+fn counted(usage: &Usage, family: super::Family) -> u64 {
+    match family.counts_cache_reads() {
+        true => usage.input_tokens,
+        false => usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+    }
+}
+
+/// Keep the latest `OUTPUT_SAMPLES` samples.
+fn sample(samples: &mut std::collections::VecDeque<u32>, value: u64) {
+    if samples.len() == OUTPUT_SAMPLES {
+        samples.pop_front();
+    }
+    samples.push_back(u32::try_from(value).unwrap_or(u32::MAX));
+}
 
 /// Overload refusals that name no delay close the pool only when they
 /// cluster: this many within one window, a quarter or more of its answers.
@@ -164,28 +194,30 @@ impl Reservation<'_> {
             output: 0,
         });
     }
-    /// Final accounting by what the provider reported billing, for a call
-    /// whose output tells what the pool's calls write.
-    pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost) {
-        if let Some(usage) = usage {
-            let mut state = self.pace.state.lock().unwrap();
-            if state.outputs.len() == OUTPUT_SAMPLES {
-                state.outputs.pop_front();
-            }
-            state
-                .outputs
-                .push_back(u32::try_from(usage.output_tokens).unwrap_or(u32::MAX));
+    /// Final accounting by what the provider reported billing, without the
+    /// cache reads a provider leaves out of its limits.
+    pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost, family: super::Family) {
+        let Some(usage) = usage else {
+            return self.settle_cost(estimate);
+        };
+        let input = counted(usage, family);
+        let mut state = self.pace.state.lock().unwrap();
+        sample(&mut state.outputs, usage.output_tokens);
+        if !family.counts_cache_reads() && usage.input_tokens > 0 {
+            sample(&mut state.counted, input * 1000 / usage.input_tokens);
         }
-        self.settle_cost(usage.map_or(estimate, |u| Cost {
-            input: u.input_tokens,
-            output: u.output_tokens,
-        }));
+        drop(state);
+        self.settle_cost(Cost {
+            input,
+            output: usage.output_tokens,
+        });
     }
     /// Final accounting for a call that asked for no output, such as a
     /// cache refresh, which says nothing of what the pool's calls write.
-    pub fn settle_refresh(self, usage: &Usage) {
+    /// Its cache read is no sample of what the pool's calls read either.
+    pub fn settle_refresh(self, usage: &Usage, family: super::Family) {
         self.settle_cost(Cost {
-            input: usage.input_tokens,
+            input: counted(usage, family),
             output: usage.output_tokens,
         });
     }
@@ -414,23 +446,34 @@ impl Pace {
     /// calls' output, at most `cap`, or `unknown` until enough have
     /// reported. A call that writes more is charged the rest when it settles.
     /// Output is written over time, so a reply longer than the limit can
-    /// still be served: beside the call's `input`, the estimate waits for a
-    /// full allowance at most, and is never refused.
-    pub fn output_estimate(&self, unknown: u64, cap: u64, input: u64) -> u64 {
+    /// still be served: the estimate waits for a full allowance at most,
+    /// and is never refused. Under a total limit, the input estimate
+    /// leaves room for it.
+    pub fn output_estimate(&self, unknown: u64, cap: u64) -> u64 {
         let state = self.state.lock().unwrap();
-        let mut estimate = match state.outputs.len() < OUTPUT_KNOWN {
-            true => unknown,
-            false => {
-                let mut seen: Vec<u32> = state.outputs.iter().copied().collect();
-                let at = (seen.len() * 9).div_ceil(10) - 1;
-                u64::from(*seen.select_nth_unstable(at).1).min(cap)
+        let mut estimate = p90(&state.outputs).map_or(unknown, |p90| p90.min(cap));
+        for dim in [OUTPUT, TOTAL] {
+            if let Some(limit) = state.tokens[dim].bucket.per_minute {
+                estimate = estimate.min(limit as u64);
             }
-        };
-        if let Some(limit) = state.tokens[OUTPUT].bucket.per_minute {
+        }
+        estimate
+    }
+    /// How much of a call's `input` is likely to count beside `output`,
+    /// for a provider that leaves cache reads out: the 90th percentile of
+    /// the share that counted in the latest calls, or all of it until enough
+    /// have reported. A call that counts more is charged the rest when it
+    /// settles. A prompt larger than the limit can still be read from the
+    /// cache, so it waits for a full allowance rather than being refused.
+    pub fn input_estimate(&self, input: u64, output: u64) -> u64 {
+        let state = self.state.lock().unwrap();
+        let mut estimate =
+            p90(&state.counted).map_or(input, |share| (input * share).div_ceil(1000).min(input));
+        if let Some(limit) = state.tokens[INPUT].bucket.per_minute {
             estimate = estimate.min(limit as u64);
         }
         if let Some(limit) = state.tokens[TOTAL].bucket.per_minute {
-            estimate = estimate.min((limit as u64).saturating_sub(input));
+            estimate = estimate.min((limit as u64).saturating_sub(output));
         }
         estimate
     }
@@ -694,27 +737,28 @@ mod tests {
                     output_tokens: output,
                     ..Usage::default()
                 };
-                sent(pace, 2)
-                    .await
-                    .unwrap()
-                    .settle_usage(Some(&usage), Cost::default());
+                sent(pace, 2).await.unwrap().settle_usage(
+                    Some(&usage),
+                    Cost::default(),
+                    crate::codec::Family::Anthropic,
+                );
             }
         }
         let pace = Pace::default();
         // Until eight calls report, a call reserves what it did before.
         wrote(&pace, 7, 100).await;
-        assert_eq!(pace.output_estimate(512, 4096, 0), 512);
+        assert_eq!(pace.output_estimate(512, 4096), 512);
         wrote(&pace, 1, 100).await;
-        assert_eq!(pace.output_estimate(512, 4096, 0), 100);
+        assert_eq!(pace.output_estimate(512, 4096), 100);
         // The 90th percentile of the latest 32: three long replies in 32
         // still leave it at the short ones; a fourth moves it.
         wrote(&pace, 21, 100).await;
         wrote(&pace, 3, 3000).await;
-        assert_eq!(pace.output_estimate(512, 4096, 0), 100);
+        assert_eq!(pace.output_estimate(512, 4096), 100);
         wrote(&pace, 1, 3000).await;
-        assert_eq!(pace.output_estimate(512, 4096, 0), 3000);
+        assert_eq!(pace.output_estimate(512, 4096), 3000);
         // Never above the cap the call asks for.
-        assert_eq!(pace.output_estimate(512, 1000, 0), 1000);
+        assert_eq!(pace.output_estimate(512, 1000), 1000);
         // Nor above the limit, which a reply written over time can pass.
         pace.seed(
             &headers(&[
@@ -723,7 +767,7 @@ mod tests {
             ]),
             crate::codec::Family::Anthropic,
         );
-        assert_eq!(pace.output_estimate(512, 4096, 0), 2000);
+        assert_eq!(pace.output_estimate(512, 4096), 2000);
         assert!(sent(&pace, 0).await.is_ok());
         // A cache refresh writes nothing and says nothing of what calls
         // write.
@@ -731,10 +775,11 @@ mod tests {
             sent(&pace, 1)
                 .await
                 .unwrap()
-                .settle_refresh(&Usage::default());
+                .settle_refresh(&Usage::default(), crate::codec::Family::Anthropic);
         }
-        assert_eq!(pace.output_estimate(512, 4096, 0), 2000);
-        // Beside its input, a call never asks for more than the total limit.
+        assert_eq!(pace.output_estimate(512, 4096), 2000);
+        // Beside its output, a call never asks for more than the total
+        // limit: its input estimate yields.
         pace.seed(
             &headers(&[
                 ("anthropic-ratelimit-tokens-limit", "10000"),
@@ -742,8 +787,70 @@ mod tests {
             ]),
             crate::codec::Family::Anthropic,
         );
-        assert_eq!(pace.output_estimate(512, 4096, 9000), 1000);
-        assert_eq!(pace.output_estimate(512, 4096, 3000), 2000);
+        assert_eq!(pace.output_estimate(512, 4096), 2000);
+        assert_eq!(pace.input_estimate(9000, 2000), 8000);
+        assert_eq!(pace.input_estimate(3000, 2000), 3000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_input_estimate_leaves_out_what_cache_reads_spared() {
+        async fn read(
+            pace: &Pace,
+            calls: usize,
+            input: u64,
+            cached: u64,
+            family: crate::codec::Family,
+        ) {
+            for _ in 0..calls {
+                let usage = Usage {
+                    input_tokens: input,
+                    cached_input_tokens: cached,
+                    output_tokens: 1,
+                    ..Usage::default()
+                };
+                sent(pace, 2)
+                    .await
+                    .unwrap()
+                    .settle_usage(Some(&usage), Cost::default(), family);
+            }
+        }
+        let pace = Pace::default();
+        // Until eight calls report, a call reserves all of its input.
+        read(&pace, 7, 10_000, 9_500, crate::codec::Family::Anthropic).await;
+        assert_eq!(pace.input_estimate(100_000, 0), 100_000);
+        read(&pace, 1, 10_000, 9_500, crate::codec::Family::Anthropic).await;
+        assert_eq!(pace.input_estimate(100_000, 0), 5_000);
+        // Four misses in 32 move the 90th percentile to a whole prompt.
+        read(&pace, 20, 10_000, 9_500, crate::codec::Family::Anthropic).await;
+        read(&pace, 4, 10_000, 0, crate::codec::Family::Anthropic).await;
+        assert_eq!(pace.input_estimate(100_000, 0), 100_000);
+        // The input a cache read spared is not charged when the call settles.
+        let pace = Pace::default();
+        pace.seed(
+            &headers(&[
+                ("anthropic-ratelimit-input-tokens-limit", "10000"),
+                ("anthropic-ratelimit-input-tokens-remaining", "10000"),
+            ]),
+            crate::codec::Family::Anthropic,
+        );
+        let usage = Usage {
+            input_tokens: 1_000,
+            cached_input_tokens: 900,
+            ..Usage::default()
+        };
+        sent(&pace, 1).await.unwrap().settle_usage(
+            Some(&usage),
+            Cost::default(),
+            crate::codec::Family::Anthropic,
+        );
+        assert_eq!(pace.split_snapshot()[INPUT].1, 9_900.0);
+        // A prompt larger than the limit waits for a full allowance: it may
+        // be read from the cache.
+        assert_eq!(pace.input_estimate(50_000, 0), 10_000);
+        // A provider that counts cache reads learns nothing to leave out.
+        let pace = Pace::default();
+        read(&pace, 8, 10_000, 9_500, crate::codec::Family::Responses).await;
+        assert_eq!(pace.input_estimate(100_000, 0), 100_000);
     }
 
     #[tokio::test(start_paused = true)]
