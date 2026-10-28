@@ -597,6 +597,15 @@ impl Provider {
         self
     }
 
+    /// Whether a call to `model` asks for the hour-long cache. Bedrock takes
+    /// it from Claude 4.5 on and may refuse a request that asks older Claude
+    /// for it (its prompt-caching guide, read 2026-10-28), so those calls keep
+    /// five minutes whatever the bot's setting, including after a switch to
+    /// such a model.
+    fn cache_hour_for(&self, model: &str) -> bool {
+        self.cache_hour && !(self.bedrock && five_minute_cache(model))
+    }
+
     /// This provider with one bot's output bound, cache lifetime and
     /// keep-warm; borrowed, with no copy, when they are its own.
     pub fn shaped(
@@ -697,7 +706,7 @@ impl Provider {
         let max_tokens = self.anthropic_max_tokens(request.model);
         // Both markers take the same lifetime: a longer one may not follow
         // a shorter one.
-        let cache = match self.cache_hour {
+        let cache = match self.cache_hour_for(request.model) {
             true => json!({"type":"ephemeral","ttl":"1h"}),
             false => json!({"type":"ephemeral"}),
         };
@@ -1166,7 +1175,9 @@ impl Provider {
         let mut decoder = Decoder::default();
         let mut parser = match self.family {
             Family::Responses => Parser::Responses(responses::State::default()),
-            Family::Anthropic => Parser::Anthropic(anthropic::State::new(self.cache_hour)),
+            Family::Anthropic => {
+                Parser::Anthropic(anthropic::State::new(self.cache_hour_for(request.model)))
+            }
         };
         let unnamed = content_type.is_none();
         let mut frames = 0usize;
@@ -1613,6 +1624,21 @@ fn anthropic_max_tokens(model: &str) -> u32 {
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
         .map_or(128_000, |&(_, limit)| limit)
+}
+
+/// Claude that Bedrock caches for five minutes only.
+fn five_minute_cache(model: &str) -> bool {
+    let model = claude_model(model);
+    [
+        "claude-3-",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-opus-4-2025",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-2025",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
 }
 
 /// Model ids that predate adaptive thinking and still require a token budget.
@@ -2308,6 +2334,68 @@ mod tests {
             .unwrap()
             .with_cache_hour(true);
         assert!(!responses.cache_hour);
+    }
+
+    /// Bedrock asks for the hour only where it takes one: Claude before 4.5
+    /// keeps five minutes there, also on a bot set to an hour.
+    #[test]
+    fn bedrock_asks_older_claude_for_five_minutes_whatever_the_setting() {
+        let transport = Transport::new(64, 1).unwrap();
+        let bedrock = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+            None,
+        )
+        .unwrap()
+        .with_cache_hour(true);
+        let anthropic = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap()
+        .with_cache_hour(true);
+        for (provider, model, hour) in [
+            (&bedrock, "us.anthropic.claude-opus-5-5-v1:0", true),
+            (
+                &bedrock,
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                true,
+            ),
+            (&bedrock, "anthropic.claude-haiku-4-5-20251001-v1:0", true),
+            (&bedrock, "anthropic.claude-3-7-sonnet-20250219-v1:0", false),
+            (&bedrock, "us.anthropic.claude-opus-4-20250514-v1:0", false),
+            (
+                &bedrock,
+                "us.anthropic.claude-opus-4-1-20250805-v1:0",
+                false,
+            ),
+            (&bedrock, "anthropic.claude-sonnet-4-20250514-v1:0", false),
+            (&anthropic, "claude-3-7-sonnet-20250219", true),
+        ] {
+            let tools = none();
+            let request = Request {
+                model,
+                instructions: "i",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                fallbacks: false,
+                cache_key: None,
+                items: Items::empty(),
+                chain: None,
+                route: None,
+                sent: None,
+            };
+            let mut bytes = provider.prefix(&request).unwrap();
+            bytes.extend_from_slice(b"]}");
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let ttl = body["cache_control"]["ttl"].as_str();
+            assert_eq!(ttl, hour.then_some("1h"), "{model}");
+            assert_eq!(body["system"][0]["cache_control"], body["cache_control"]);
+        }
     }
 
     /// A bot's own call settings shape a copy of the shared provider; one
