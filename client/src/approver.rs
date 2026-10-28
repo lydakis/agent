@@ -13,6 +13,10 @@ use std::borrow::Cow;
 /// The judge's state limit, and the share of it earlier prompts may take.
 pub const STATE_TOKENS: usize = 32_000;
 pub const EARLIER_TOKENS: usize = 16_000;
+/// The most the whole state may take as text, the standing instructions
+/// and the transcript with it: a judge prompt is at most 256 KiB, and the
+/// round's ids and keys take the rest.
+pub const STATE_BYTES: usize = 240 * 1024;
 /// What the judge is shown of the agent's own history, as Codex's
 /// synchronous reviewer bounds it: each model message and each tool entry
 /// cut to its share, the newest kept within what messages and tool entries
@@ -174,12 +178,15 @@ pub fn questions(calls: &[&str]) -> Vec<(String, String)> {
 /// The state's fields in the order the judge reads them: what holds for the
 /// whole turn first and the calls being judged last, so consecutive rounds
 /// share the longest prefix the provider can cache.
-const STATE_ORDER: [&str; 9] = [
+const STATE_ORDER: [&str; 12] = [
     "environment_note",
     "workspace",
+    "standing_instructions",
     "earlier_prompts",
     "request",
     "request_cut",
+    "transcript",
+    "transcript_cut",
     "already_allowed",
     "already_allowed_cut",
     "authorization_unreadable",
@@ -438,9 +445,12 @@ impl Transcript {
 /// encoding: the model's text, its calls, and calls' outputs. A person's
 /// words are shown with who wrote them, from the turns; reasoning is not
 /// shown, as Codex does not; calls in `judged` are shown whole elsewhere.
-pub fn entries(item: &Value, judged: &[&str]) -> Vec<Entry> {
+pub fn entries(item: &Value, judged: &[&str], redactor: &Redactor) -> Vec<Entry> {
     let mut found = Vec::new();
-    let mut call = |id: &Value, name: &Value, arguments: String| {
+    // Arguments are redacted as values, as planned calls are: a secret
+    // with a quote in it reads otherwise once escaped.
+    let mut call = |id: &Value, name: &Value, arguments: &Value| {
+        let arguments = redactor.redact_value(arguments).to_string();
         let id = id.as_str().unwrap_or_default();
         if !judged.contains(&id) {
             found.push(Entry {
@@ -452,8 +462,9 @@ pub fn entries(item: &Value, judged: &[&str]) -> Vec<Entry> {
     };
     match item["type"].as_str() {
         Some("function_call") => {
-            let arguments = item["arguments"].as_str().unwrap_or_default().to_owned();
-            call(&item["call_id"], &item["name"], arguments);
+            let text = item["arguments"].as_str().unwrap_or_default();
+            let arguments = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+            call(&item["call_id"], &item["name"], &arguments);
         }
         Some("function_call_output") => found.push(Entry {
             said: Said::Output,
@@ -475,7 +486,7 @@ pub fn entries(item: &Value, judged: &[&str]) -> Vec<Entry> {
                             text.push_str(block["text"].as_str().unwrap_or_default());
                         }
                         Some("tool_use") => {
-                            call(&block["id"], &block["name"], block["input"].to_string());
+                            call(&block["id"], &block["name"], &block["input"]);
                         }
                         _ => {}
                     }
@@ -826,6 +837,25 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
     );
     if intent.transcript.cut {
         state.insert("transcript_cut".into(), json!(true));
+    }
+    // The whole state must also fit one judge prompt: past it the oldest
+    // transcript entries go first, then the standing instructions, which
+    // then authorize nothing. What is left fits, as its limit says.
+    let mut over = Value::Object(state.clone())
+        .to_string()
+        .len()
+        .saturating_sub(STATE_BYTES);
+    if over > 0
+        && let Some(Value::Array(entries)) = state.get_mut("transcript")
+        && !entries.is_empty()
+    {
+        while over > 0 && !entries.is_empty() {
+            over = over.saturating_sub(entries.remove(0).to_string().len() + 1);
+        }
+        state.insert("transcript_cut".into(), json!(true));
+    }
+    if over > 0 {
+        state.remove("standing_instructions");
     }
     State::Built {
         state: Value::Object(state),
@@ -1386,7 +1416,7 @@ mod tests {
         ];
         let found: Vec<Entry> = responses
             .iter()
-            .flat_map(|item| entries(item, &["judged"]))
+            .flat_map(|item| entries(item, &["judged"], &Redactor::default()))
             .collect();
         let call = |id: &str| Some(id.to_owned());
         assert_eq!(
@@ -1420,7 +1450,7 @@ mod tests {
         ];
         let found: Vec<Entry> = anthropic
             .iter()
-            .flat_map(|item| entries(item, &["judged"]))
+            .flat_map(|item| entries(item, &["judged"], &Redactor::default()))
             .collect();
         assert_eq!(
             found,
@@ -1554,6 +1584,56 @@ mod tests {
         );
         assert!(JUDGE_INSTRUCTIONS.contains("the whole `transcript` (tool outputs above all)"));
         assert!(JUDGE_INSTRUCTIONS.contains("and the `standing_instructions` are trusted"));
+    }
+
+    #[test]
+    fn the_whole_state_fits_one_judge_prompt() {
+        let mut transcript = Transcript::default();
+        for _ in 0..3 {
+            transcript.offer_plain(Entry {
+                said: Said::Model,
+                call: None,
+                text: "\"".repeat(MESSAGE_ENTRY_TOKENS * 3),
+            });
+        }
+        assert_eq!(transcript.entries.len(), 3);
+        let intent = Intent {
+            planned: vec![Planned {
+                id: "c1".into(),
+                tool: "shell".into(),
+                arguments: json!({"command":"ls"}),
+                files: Vec::new(),
+                unseen: false,
+            }],
+            request: vec![Words {
+                by: By::Person,
+                text: "\"".repeat(STATE_TOKENS),
+                refused: Vec::new(),
+            }],
+            transcript: transcript.finish(),
+            instructions: vec![("/w/AGENTS.md".into(), "\"".repeat(60 * 1024))],
+            ..Intent::default()
+        };
+        let State::Built { state, .. } = build(&intent, &Redactor::default()) else {
+            panic!()
+        };
+        assert!(model_prompt(&state, &["c1"]).len() <= 256 * 1024);
+        assert_eq!(state["transcript_cut"], true);
+        assert!(state["transcript"].as_array().unwrap().len() < 3);
+    }
+
+    #[test]
+    fn a_call_in_the_transcript_is_redacted_as_values() {
+        let secret = "synthetic\"deploy\\value";
+        let redactor = Redactor::from_env([("DEPLOY_TOKEN".to_owned(), secret.to_owned())]);
+        let arguments = json!({"command": format!("deploy --token '{secret}'")}).to_string();
+        let item =
+            json!({"type":"function_call","call_id":"a","name":"shell","arguments":arguments});
+        let [call] = &entries(&item, &[], &redactor)[..] else {
+            panic!()
+        };
+        assert!(!call.text.contains("synthetic"), "{}", call.text);
+        assert!(call.text.contains("[secret:"), "{}", call.text);
     }
 
     #[test]

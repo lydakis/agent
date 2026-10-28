@@ -1016,7 +1016,10 @@ async fn transcript(
                     continue;
                 }
                 // An item's entries newest first, as the transcript is read.
-                for said in policy::entries(&entry["item"], judged).into_iter().rev() {
+                for said in policy::entries(&entry["item"], judged, redactor)
+                    .into_iter()
+                    .rev()
+                {
                     if !transcript.offer(said, redactor) {
                         break 'read;
                     }
