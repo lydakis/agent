@@ -40,6 +40,7 @@ mod reactions;
 mod resolved;
 mod rex;
 mod screen;
+mod seed;
 mod served;
 mod settings;
 mod setup;
