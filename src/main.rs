@@ -32,7 +32,8 @@ fn main() {
         Err(error) => {
             report(&error);
             std::process::exit(match error.code.as_str() {
-                "usage" => 2,
+                // A missing provider is a missing flag, as usage errors are.
+                "usage" | "provider_required" => 2,
                 "store_already_owned" | "socket_already_owned" => DAEMON_OWNERSHIP_CONFLICT,
                 _ => 1,
             });
