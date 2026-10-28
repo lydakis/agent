@@ -22,6 +22,9 @@ const PROMPT_SHARE_BYTES: usize = 4096;
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
+/// The most bytes of pictures one absorption takes in, past its first
+/// steer's: a message's pictures may be 5 MiB once decoded.
+const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
@@ -165,7 +168,7 @@ impl Denials {
 /// its approvals. `None` takes the runtime's default; a fork keeps its
 /// source's. Stored as given, so a bot that chose nothing follows the
 /// defaults.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     /// Model context per request: the newest turns within these bounds, in
@@ -209,6 +212,17 @@ pub struct Settings {
     /// Anthropic prompt-cache lifetime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
+    /// How its shell, write and edit calls are confined, by Codex's
+    /// sandbox modes; none runs them unconfined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::Mode>,
+    /// Folders a workspace-write sandbox may write besides the bot's own
+    /// and the temporary directories, each by its real path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<String>,
+    /// Whether a workspace-write sandbox reaches the network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -218,6 +232,9 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
+/// The most a bot's `writable` folders take as JSON, by their real paths,
+/// so a reply that repeats them has a bound.
+pub const FOLDERS_JSON: usize = 32 << 10;
 const MIN_COMPACT_TOKENS: u64 = 1024;
 /// Where a model with a `window`-token context compacts unless the bot
 /// sets `compact_tokens`, as Codex and Claude Code compute it: the window
@@ -266,6 +283,34 @@ impl Settings {
             None => Some(crate::provider::KEEP_WARM),
         }
     }
+    /// These settings for a bot that a bot with `creator`'s settings
+    /// makes: no weaker a sandbox than its creator's, as Codex's subagents
+    /// inherit their parent's. A sandboxed creator's child takes the
+    /// creator's sandbox and writable folders unless it names a stricter
+    /// sandbox, and reaches the network only if both do.
+    pub fn under(mut self, creator: &Settings) -> Settings {
+        use crate::sandbox::Mode;
+        let sandboxed = |settings: &Settings| {
+            matches!(
+                settings.sandbox,
+                Some(Mode::ReadOnly | Mode::WorkspaceWrite)
+            )
+        };
+        if !sandboxed(creator) {
+            return self;
+        }
+        if !sandboxed(&self) {
+            self.writable = creator.writable.clone();
+            self.network = creator.network;
+        }
+        self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
+        if self.sandbox != Some(Mode::WorkspaceWrite) {
+            self.writable.clear();
+            self.network = false;
+        }
+        self.network &= creator.network;
+        self
+    }
     pub fn cache_hour(&self) -> bool {
         self.cache_ttl == Some(CacheTtl::Hour)
     }
@@ -309,6 +354,22 @@ impl Settings {
         {
             return refuse("keep_warm is below 300 seconds; 0 never refreshes");
         }
+        let confined = self.sandbox == Some(crate::sandbox::Mode::WorkspaceWrite);
+        if !confined && (!self.writable.is_empty() || self.network) {
+            return refuse("writable and network go with sandbox workspace-write");
+        }
+        if self.writable.len() > 64
+            || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
+        {
+            return refuse("writable names at most 64 folders, 32 KiB in all");
+        }
+        if self
+            .writable
+            .iter()
+            .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("writable folders are absolute paths");
+        }
         Ok(())
     }
     /// Every setting as it applies, defaults included, for clients.
@@ -319,7 +380,8 @@ impl Settings {
             "keep_turns":self.keep_turns,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
-            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes)})
+            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
+            "sandbox":self.sandbox,"writable":self.writable,"network":self.network})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -370,10 +432,45 @@ impl Bot {
             .facts(json!({"turn_budget_tokens":cap.tokens,"turn_tokens_used":spent})),
         )
     }
-    /// Whether a call of this tool waits for a verdict. A call the bot may
-    /// not make is refused, never announced.
-    pub fn gated(&self, tool: &str) -> bool {
-        gated(&self.gates, tool) && self.callable().iter().any(|t| t == tool)
+    /// Whether this call, of the daemon's tool or a declared one, waits
+    /// for a verdict, run in the turn's `workspace`. A call the bot may not
+    /// make is refused, never announced, and one its sandbox confines runs
+    /// without a verdict: only an escape is gated, as in Codex.
+    pub fn gated(&self, call: &ToolCall, workspace: &std::path::Path) -> bool {
+        gated(&self.gates, &call.name)
+            && self.may_call(&call.name)
+            && !self.confines(call, workspace)
+    }
+    /// Whether the bot's commands run in a sandbox.
+    pub fn sandboxed(&self) -> bool {
+        use crate::sandbox::Mode;
+        matches!(
+            self.settings.sandbox,
+            Some(Mode::ReadOnly | Mode::WorkspaceWrite)
+        )
+    }
+    /// Whether this call runs inside the bot's sandbox: the bot has one, the
+    /// tool is one a sandbox holds, and the call doesn't ask to leave it.
+    pub fn confines(&self, call: &ToolCall, workspace: &std::path::Path) -> bool {
+        use crate::sandbox::{Mode, confinable, escapes};
+        match self.settings.sandbox {
+            None | Some(Mode::DangerFullAccess) => false,
+            Some(mode) => {
+                confinable(&call.name)
+                    && !escapes(
+                        mode,
+                        Some(
+                            self.workspace
+                                .as_deref()
+                                .map_or(workspace, std::path::Path::new),
+                        ),
+                        &self.settings.writable,
+                        &call.name,
+                        &call.arguments,
+                        workspace,
+                    )
+            }
+        }
     }
     /// The tools this bot may call: its allowed list, else its tools.
     pub fn callable(&self) -> &[String] {
@@ -488,6 +585,8 @@ pub struct TurnOptions {
     /// The most input plus output tokens this turn may spend; none is
     /// bounded only by the bot's own budget.
     pub budget_tokens: Option<u64>,
+    /// Pictures sent with the prompt, after its words in the user item.
+    pub images: Vec<crate::codec::Image>,
 }
 /// What a submission does when the bot is busy or the daemon is full.
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
@@ -597,6 +696,10 @@ pub struct Waiting {
     /// and has not started; `deadline_ms` is its gates' expiry, if any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approval: bool,
+    /// Parked on the answer to `call_id`, which has started, from the
+    /// client this tag names; `deadline_ms` is when the call stops waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
     /// What a paced summary copied of the bot's last call, so its retry
     /// sends the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,6 +769,25 @@ pub fn merge_gates<'a>(gates: impl IntoIterator<Item = &'a Gate>, tools: &[Strin
     }
     merged.retain(|g| !g.tools.is_empty());
     merged
+}
+/// The tools a gate may hold back: the daemon's a bot has and those its
+/// client declared.
+/// An answered call's result when nobody answered it in time.
+pub fn unserved(detail: String) -> Outcome {
+    Outcome {
+        output: json!({"error":"tool_unserved","detail":detail}).to_string(),
+        artifacts: Vec::new(),
+        images: Vec::new(),
+        note: None,
+        failed: true,
+    }
+}
+fn gateable(tools: &[String], declared: &[Declared]) -> Vec<String> {
+    tools
+        .iter()
+        .cloned()
+        .chain(declared.iter().map(|tool| tool.name.clone()))
+        .collect()
 }
 /// An item's top-level `type`, read without the rest of it.
 #[derive(serde::Deserialize)]
@@ -761,6 +883,10 @@ struct Live {
     /// that writes the verdicts deletes the entries, so a crash loses
     /// neither.
     answered: HashMap<i64, Vec<String>>,
+    /// Answers to the turn's answered calls, by call: the call's result,
+    /// which its `tool_finish` writes. A park writes none: it parks only
+    /// on a call with no answer held.
+    answers: HashMap<String, Outcome>,
 }
 /// One page of `approvals` as it fills.
 struct ApprovalPage {
@@ -821,6 +947,17 @@ pub enum Gated {
     Pending {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
+    },
+}
+/// What an answered call has, read on the storage worker.
+pub enum CallAnswer {
+    /// Its client's answer, or `tool_unserved` once its time ran out.
+    Given(Outcome),
+    /// Still waiting until `expires_ms`; `notify` fires when an answer is
+    /// held for the turn.
+    Pending {
+        notify: Arc<Notify>,
+        expires_ms: u64,
     },
 }
 /// A gate's decision on a call, from a client's `answer`.
@@ -885,11 +1022,16 @@ fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
 pub struct Window {
     pub family: Family,
     pub ids: Vec<i64>,
-    /// Each item's encoded length, so read-ahead can be bounded in bytes.
+    /// Each item's weight: its encoded length, with pictures counted at
+    /// their token cost.
     pub sizes: Vec<u32>,
     /// Bytes each item loses when sent without its thinking blocks.
     pub thinking: Vec<u32>,
-    /// Sum of item lengths, without separators.
+    /// What each item's pictures add to its length beyond their weight
+    /// (less, for one that compresses to less than it costs): an item is
+    /// sent with `sizes` plus these bytes.
+    pub pictured: Vec<i32>,
+    /// Sum of item weights, without separators.
     pub item_bytes: i64,
     /// Full unsummarized span, even when the bounded window omits a backlog.
     pub unsummarized: super::ContextUsage,
@@ -986,9 +1128,11 @@ pub struct CompactionPlan {
     pub cut: i64,
     /// For a cut inside a turn, that turn's prompt, sent whole ahead of it.
     pub pinned: Option<i64>,
-    /// The nodes to summarize, oldest first.
+    /// The nodes to summarize, oldest first, with their weights.
     pub ids: Vec<i64>,
     pub sizes: Vec<u32>,
+    /// What each node's pictures add to its length beyond their weight.
+    pub pictured: Vec<i32>,
     /// The covered turns' user prompts, bounded, oldest first.
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
@@ -1042,8 +1186,8 @@ pub enum Planning {
     CatchUp(CatchUp),
 }
 /// Oldest node, depth, own total, ordinal, child on the lineage and its
-/// ordinal, the bounded prompt text inside the budget, and thinking
-/// through the node.
+/// ordinal, the bounded prompt text inside the budget, thinking through the
+/// node, and what its pictures add beyond their weight as it is sent.
 type CatchUpRow = (
     i64,
     i64,
@@ -1052,6 +1196,7 @@ type CatchUpRow = (
     Option<i64>,
     Option<i64>,
     Option<String>,
+    i64,
     i64,
 );
 /// A catch-up walk from the head back to the previous cut. Only the rows
@@ -1108,6 +1253,11 @@ pub struct TurnContext {
     /// first turn.
     pub previous_call: Option<(String, Option<String>)>,
 }
+/// Prepared statements each connection keeps. rusqlite keeps 16, fewer than
+/// one admission uses, so each `begin` evicted and parsed its statements
+/// again. Every `prepare_cached` site fits, at a few KiB of SQLite memory
+/// each for the ones in use.
+const STATEMENTS: usize = 256;
 pub struct Database {
     conn: Connection,
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
@@ -1146,9 +1296,9 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.cached_input_tokens,t.output_tokens,t.model_rounds,t.retries,t.paced_ms,t.started_ms,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
-    json_extract(t.waiting,'$.deadline_ms')";
+    json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 18;
+const TURN_VIEW_COLUMNS: usize = 19;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1176,7 +1326,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let status: String = r.get(4)?;
     let call_id: Option<String> = r.get(13)?;
     let deadline_ms: Option<i64> = r.get(17)?;
+    let answer: Option<String> = r.get(18)?;
     let waiting_on = match status.as_str() {
+        "waiting" if answer.is_some() => {
+            json!({"call_id":call_id,"answer":answer,"deadline_ms":deadline_ms})
+        }
         "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
             json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
         }
@@ -1309,7 +1463,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 54;
+    pub const SCHEMA: i32 = 57;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1327,6 +1481,7 @@ impl Database {
     /// checkpoint SQLite makes when the last connection closes, so it syncs
     /// checkpoints the way the writer does.
     pub fn reader(conn: Connection) -> Result<Self> {
+        conn.set_prepared_statement_cache_capacity(STATEMENTS);
         conn.execute_batch(
             "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
         )?;
@@ -1359,6 +1514,7 @@ impl Database {
         // created, written and deleted for every admission, and a write that
         // fails with SQLITE_FULL when the disk is. In memory it is freed
         // when the job ends, bounded by the pages one job changes.
+        conn.set_prepared_statement_cache_capacity(STATEMENTS);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
@@ -1393,7 +1549,7 @@ impl Database {
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
-                total_thinking INTEGER NOT NULL DEFAULT 0);
+                total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -1473,7 +1629,7 @@ impl Database {
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT,
+                bot_model TEXT, bot_reasoning TEXT, images TEXT,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -1495,6 +1651,11 @@ impl Database {
             CREATE TABLE IF NOT EXISTS approval_tags(approval INTEGER NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
                 tag TEXT NOT NULL, turn INTEGER NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval,turn);
+            CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
+                call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
+                expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0);
+            CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
+            CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
@@ -1942,13 +2103,34 @@ impl Database {
             None => Vec::new(),
         })
     }
+    /// The settings of the bot a client creates for, whose sandbox the new
+    /// bot may not weaken.
+    fn creator_settings(conn: &Connection, creator: Option<i64>) -> Result<Option<Settings>> {
+        let Some(id) = creator else {
+            return Ok(None);
+        };
+        let settings: Option<String> =
+            conn.query_row("SELECT settings FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        Ok(Some(match settings {
+            Some(text) => serde_json::from_str(&text)?,
+            None => Settings::default(),
+        }))
+    }
     /// The tools the creating bot's client declared, which a bot it
-    /// creates takes unless its own client declares others.
+    /// creates takes unless its own client declares others: all but those
+    /// declared as the creator's own.
     fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<Option<String>> {
         let Some(id) = creator else {
             return Ok(None);
         };
-        Ok(conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?)
+        let stored: Option<String> =
+            conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let mut declared: Vec<Declared> = serde_json::from_str(&stored)?;
+        declared.retain(|tool| tool.inherit);
+        stored_declared(&declared)
     }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
@@ -2027,16 +2209,19 @@ impl Database {
     /// Replace a bot's gates, those it took from its creator or its source
     /// included: whoever configures it decides, as the person overriding a
     /// bot another bot made does. Whether anything changed.
+    /// `declared` is the set the same change declares, when it does.
     pub fn set_gate(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
         gate: Option<Gate>,
+        declared: Option<&[Declared]>,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
         if let Some(gate) = &gate {
-            not_in_tools(&gate.tools, &bot.tools)?;
+            let declared = declared.unwrap_or(&bot.declared);
+            not_in_tools(&gate.tools, &gateable(&bot.tools, declared))?;
         }
         let gates = stored_gates(gate.as_slice())?;
         let changed = self.conn.execute(
@@ -2221,21 +2406,32 @@ impl Database {
             }
             return Ok((bot, None));
         }
-        if let Some(gate) = binding.gate {
-            not_in_tools(&gate.tools, binding.tools)?;
-        }
         binding.settings.validate()?;
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
-        let inherited = Self::creator_gates(&tx, created_by_id)?;
-        let gates = stored_gates(&merge_gates(
-            inherited.iter().chain(binding.gate),
-            binding.tools,
-        ))?;
         let declared = match binding.declared {
             Some(declared) => stored_declared(declared)?,
             None => Self::creator_declared(&tx, created_by_id)?,
+        };
+        // A gate may hold back the tools the bot is declared, its own or
+        // its creator's.
+        let tools = gateable(
+            binding.tools,
+            &declared
+                .as_deref()
+                .map(serde_json::from_str::<Vec<Declared>>)
+                .transpose()?
+                .unwrap_or_default(),
+        );
+        if let Some(gate) = binding.gate {
+            not_in_tools(&gate.tools, &tools)?;
+        }
+        let inherited = Self::creator_gates(&tx, created_by_id)?;
+        let gates = stored_gates(&merge_gates(inherited.iter().chain(binding.gate), &tools))?;
+        let settings = match Self::creator_settings(&tx, created_by_id)? {
+            Some(creator) => binding.settings.clone().under(&creator),
+            None => binding.settings.clone(),
         };
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
@@ -2256,7 +2452,7 @@ impl Database {
                 binding.compaction_model,
                 binding.fallbacks,
                 gates,
-                binding.settings.stored()?,
+                settings.stored()?,
                 creation(binding.request_id, request),
                 declared,
             ],
@@ -2352,8 +2548,9 @@ impl Database {
             elided: i64,
             saved: i64,
             /// A cut inside a turn: that turn's prompt, its size, ordinal and
-            /// depth, and whether the window still starts at the cut.
-            pinned: Option<(i64, i64, i64, i64, bool)>,
+            /// depth, whether the window still starts at the cut, and what
+            /// its pictures add beyond their weight.
+            pinned: Option<(i64, i64, i64, i64, bool, i64)>,
         }
         // Under the bot's own floor (`e`), or an earlier one given by its
         // `through` node (`f`), whose cumulative savings are its own.
@@ -2369,7 +2566,7 @@ impl Database {
                     note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
                     instr(','||b.tools||',',',history,')>0,COALESCE(e.through,f.id,0),COALESCE(e.saved,f.total_elided,0),
                     c.pinned,pn.total_bytes-COALESCE(pp.total_bytes,0),pn.turn_seq,pn.depth,
-                    c.cut IS b.context_start
+                    c.cut IS b.context_start,pn.pictured
              FROM bots b LEFT JOIN nodes h ON h.id=b.head
              LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
              LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
@@ -2408,7 +2605,7 @@ impl Database {
                     pinned: r
                         .get::<_, Option<i64>>(19)?
                         .map(|id| -> rusqlite::Result<_> {
-                            Ok((id, r.get(20)?, r.get(21)?, r.get(22)?, r.get(23)?))
+                            Ok((id, r.get(20)?, r.get(21)?, r.get(22)?, r.get(23)?, r.get(24)?))
                         })
                         .transpose()?,
                 })
@@ -2425,10 +2622,14 @@ impl Database {
             id: i64,
             parent: Option<i64>,
             depth: i64,
-            /// Cumulative bytes as sent, through this node.
+            /// Cumulative bytes as sent, through this node, with pictures
+            /// at their weight.
             total: i64,
             thinking: i64,
             turn_seq: Option<i64>,
+            /// What its pictures add beyond their weight, unless it goes as
+            /// its stub.
+            pictured: i64,
         }
         let row = |r: &rusqlite::Row<'_>| {
             Ok(Row {
@@ -2438,33 +2639,39 @@ impl Database {
                 total: r.get(3)?,
                 thinking: r.get(4)?,
                 turn_seq: r.get(5)?,
+                pictured: r.get(6)?,
             })
         };
         let rows: Vec<Row> = match state.start {
             Some(_) => self
                 .conn
                 .prepare_cached(
-                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq) AS (
-                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?3),thinking,turn_seq
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq,pictured) AS (
+                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?3),thinking,turn_seq,
+                            CASE WHEN id<=?4 AND elided>0 THEN 0 ELSE pictured END
                         FROM nodes WHERE id=?1
                         UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?3),
-                            n.thinking,n.turn_seq
+                            n.thinking,n.turn_seq,CASE WHEN n.id<=?4 AND n.elided>0 THEN 0 ELSE n.pictured END
                         FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
-                     SELECT id,parent,depth,total_bytes,thinking,turn_seq FROM chain ORDER BY depth DESC",
+                     SELECT id,parent,depth,total_bytes,thinking,turn_seq,pictured FROM chain ORDER BY depth DESC",
                 )?
-                .query_map(params![head, state.start_depth, state.saved], row)?
+                .query_map(
+                    params![head, state.start_depth, state.saved, state.elided],
+                    row,
+                )?
                 .collect::<rusqlite::Result<_>>()?,
             None => self
                 .conn
                 .prepare_cached(
-                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq) AS (
-                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?6),thinking,turn_seq
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq,pictured) AS (
+                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?6),thinking,turn_seq,
+                            CASE WHEN id<=?7 AND elided>0 THEN 0 ELSE pictured END
                         FROM nodes WHERE id=?1
                         UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?6),
-                            n.thinking,n.turn_seq
+                            n.thinking,n.turn_seq,CASE WHEN n.id<=?7 AND n.elided>0 THEN 0 ELSE n.pictured END
                         FROM nodes n JOIN chain c ON n.id=c.parent
                         WHERE ?2 - c.total_bytes <= ?3 AND ?4 - c.depth <= ?5)
-                     SELECT id,parent,depth,total_bytes,thinking,turn_seq FROM chain ORDER BY depth DESC",
+                     SELECT id,parent,depth,total_bytes,thinking,turn_seq,pictured FROM chain ORDER BY depth DESC",
                 )?
                 .query_map(
                     params![
@@ -2473,7 +2680,8 @@ impl Database {
                         context_bytes,
                         state.depth,
                         context_items,
-                        state.saved
+                        state.saved,
+                        state.elided
                     ],
                     row,
                 )?
@@ -2502,8 +2710,8 @@ impl Database {
         // prompt goes whole ahead of it, as one more item.
         let pinned = state
             .pinned
-            .filter(|&(.., at_start)| at_start && state.start.is_some())
-            .map(|(id, size, seq, depth, _)| (id, size, seq, depth));
+            .filter(|&(.., at_start, _)| at_start && state.start.is_some())
+            .map(|(id, size, seq, depth, _, pictured)| (id, size, seq, depth, pictured));
         let lead = |index: usize| match pinned {
             Some((_, size, ..)) if index == saved_start => (size + 1, 1),
             _ => (0, 0),
@@ -2563,14 +2771,18 @@ impl Database {
             None => None,
         };
         let clamp = |bytes: i64| bytes.clamp(0, u32::MAX as i64) as u32;
-        let (mut ids, mut sizes, mut thinking) = match pinned {
+        let signed = |bytes: i64| bytes.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        let (mut ids, mut sizes, mut thinking, mut pictured) = match pinned {
             // A prompt carries no thinking.
-            Some((id, size, ..)) => (vec![id], vec![clamp(size)], vec![0]),
+            Some((id, size, .., pictures)) => {
+                (vec![id], vec![clamp(size)], vec![0], vec![signed(pictures)])
+            }
             None => Default::default(),
         };
         ids.extend(window.iter().rev().map(|r| r.id));
         sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
         thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
+        pictured.extend(window.iter().rev().map(|r| signed(r.pictured)));
         // The view since the summary includes the prompt it keeps in full.
         let mut unsummarized = state.unsummarized;
         if let Some((_, size, ..)) = state.pinned {
@@ -2582,11 +2794,12 @@ impl Database {
             ids,
             sizes,
             thinking,
+            pictured,
             item_bytes: through[chosen] + pinned.map_or(0, |(_, size, ..)| size),
             unsummarized,
-            omitted_items: pinned.map_or(start.depth, |(.., depth)| depth) - 1,
-            omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, _)| seq) - 1,
-            omitted_in_turn: pinned.map_or(0, |(.., depth)| start.depth - 1 - depth),
+            omitted_items: pinned.map_or(start.depth, |(.., depth, _)| depth) - 1,
+            omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, ..)| seq) - 1,
+            omitted_in_turn: pinned.map_or(0, |(.., depth, _)| start.depth - 1 - depth),
             history: state.history,
             note: state.note,
             compaction,
@@ -2887,29 +3100,32 @@ impl Database {
         // in a fork. Decode only prompt nodes, outside the metadata-only walk,
         // and return bounded text rather than whole native items to Rust.
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking) AS (
-                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking
+            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking,pictured) AS (
+                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking,
+                    CASE WHEN id<=?5 AND elided>0 THEN 0 ELSE pictured END
                 FROM nodes WHERE id=?1
                 UNION ALL SELECT n.id,n.parent,n.total_bytes-MIN(n.total_elided,?4),n.turn_seq,
-                    n.total_thinking
+                    n.total_thinking,CASE WHEN n.id<=?5 AND n.elided>0 THEN 0 ELSE n.pictured END
                 FROM nodes n JOIN chain c ON n.id=c.parent
                 WHERE c.id IS NOT ?2)
              SELECT c.id,c.total_bytes,COALESCE(p.total_bytes-MIN(p.total_elided,?4),0),c.turn_seq,
                 CASE WHEN c.turn_seq IS NOT NULL THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?3)
-                     FROM nodes WHERE id=c.id) END,c.total_thinking
+                     FROM nodes WHERE id=c.id) END,c.total_thinking,c.pictured
              FROM chain c LEFT JOIN nodes p ON p.id=c.parent ORDER BY c.id DESC",
         )?;
-        // Newest first: id, own total, parent's total, ordinal, prompt, and
-        // thinking through it.
-        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>, i64);
+        // Newest first: id, own total, parent's total, ordinal, prompt,
+        // thinking through it, and what its pictures add beyond their weight
+        // as it is sent.
+        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>, i64, i64);
         let rows: Vec<SpanRow> = statement
             .query_map(
                 params![
                     head,
                     previous_cut,
                     Self::COMPACTION_PROMPT_BYTES as i64 + 1,
-                    saved
+                    saved,
+                    elided
                 ],
                 |r| {
                     Ok((
@@ -2919,6 +3135,7 @@ impl Database {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )?
@@ -2979,8 +3196,8 @@ impl Database {
         let span = older
             .iter()
             .rev()
-            .map(|(id, total, before, seq, prompt, _)| {
-                (*id, total - before, *seq, prompt.as_deref())
+            .map(|(id, total, before, seq, prompt, _, pictured)| {
+                (*id, total - before, *seq, prompt.as_deref(), *pictured)
             });
         let previous_summary = self.previous_summary(&bot)?;
         let mut plan = Self::span_plan(
@@ -3048,23 +3265,24 @@ impl Database {
         };
         let (_, before, depth_before, thinking_before) = walk.totals;
         let (_, _, max_bytes, max_items) = walk.bounds;
-        let (_, saved) = walk.elision;
+        let (elided, saved) = walk.elision;
         // Each row carries its child on the lineage, so cutting at a prompt
         // child needs no parent lookup: the span ends at this row. Only rows
         // inside the budget, the piece's oldest row, and, until the newest
         // prompt is found, prompts leave SQLite. The budget holds bytes as
         // the summarizer is sent them, without thinking.
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k,total_thinking) AS (
-                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1,total_thinking
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k,total_thinking,pictured) AS (
+                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1,total_thinking,
+                    CASE WHEN id<=?11 AND elided>0 THEN 0 ELSE pictured END
                 FROM nodes WHERE id=?1
                 UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?9),
-                    n.turn_seq,c.id,c.turn_seq,c.k+1,n.total_thinking
+                    n.turn_seq,c.id,c.turn_seq,c.k+1,n.total_thinking,CASE WHEN n.id<=?11 AND n.elided>0 THEN 0 ELSE n.pictured END
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
              SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
                 CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8 THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
-                     FROM nodes WHERE id=c.id) END,c.total_thinking
+                     FROM nodes WHERE id=c.id) END,c.total_thinking,c.pictured
              FROM chain c WHERE (c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8)
                 OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
@@ -3082,7 +3300,8 @@ impl Database {
             max_total,
             max_depth,
             saved,
-            walk.newest_prompt.is_none()
+            walk.newest_prompt.is_none(),
+            elided
         ])?;
         let mut last: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
         while let Some(r) = rows.next()? {
@@ -3099,6 +3318,7 @@ impl Database {
                     r.get(6)?,
                     r.get(7)?,
                     thinking,
+                    r.get(9)?,
                 ));
             }
             if seq.is_some() && walk.newest_prompt.is_none_or(|newest| depth > newest) {
@@ -3162,7 +3382,7 @@ impl Database {
         let newest_depth = newest_prompt.unwrap_or(depth_before);
         let fits = rows
             .iter()
-            .take_while(|(_, depth, total, .., thinking)| {
+            .take_while(|(_, depth, total, .., thinking, _)| {
                 let items = depth - depth_before;
                 items <= span_items
                     && total - thinking - (before - thinking_before) + items <= span_bytes
@@ -3214,10 +3434,10 @@ impl Database {
         let mut previous = before;
         let span = rows[..=end]
             .iter()
-            .map(|(id, _, total, seq, _, _, prompt, _)| {
+            .map(|(id, _, total, seq, _, _, prompt, _, pictured)| {
                 let size = total - previous;
                 previous = *total;
-                (*id, size, *seq, prompt.as_deref())
+                (*id, size, *seq, prompt.as_deref(), *pictured)
             });
         let mut plan = Self::span_plan(
             cut,
@@ -3278,20 +3498,23 @@ impl Database {
         })
     }
     /// A plan from the span's nodes, oldest first: id, own size, ordinal,
-    /// and the prompt's bounded text for prompt nodes.
+    /// the prompt's bounded text for prompt nodes, and what its pictures
+    /// add beyond their weight.
     fn span_plan<'a>(
         cut: i64,
-        span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>)>,
+        span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>, i64)>,
         previous_summary: Option<String>,
         catch_up: bool,
         summary_bytes: usize,
         elided: i64,
     ) -> CompactionPlan {
-        let (mut ids, mut sizes, mut prompts) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ids, mut sizes, mut pictured, mut prompts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut from, mut to) = (i64::MAX, 0);
-        for (id, size, seq, prompt) in span {
+        for (id, size, seq, prompt, pictures) in span {
             ids.push(id);
             sizes.push(size.clamp(0, u32::MAX as i64) as u32);
+            pictured.push(pictures.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
             if let (Some(seq), Some(prompt)) = (seq, prompt) {
                 from = from.min(seq);
                 to = to.max(seq);
@@ -3304,6 +3527,7 @@ impl Database {
             pinned: None,
             ids,
             sizes,
+            pictured,
             prompts,
             covered: (from, to),
             previous_summary,
@@ -3842,6 +4066,40 @@ impl Database {
     /// provider replay remain unchanged.
     /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
     /// their text before decoding; no content is replaced with previews.
+    /// A bot's newest `limit` conversation turns, newest first, as its
+    /// history numbers them: each one's number, handle, status and the
+    /// start of its prompt. Its own turns and those it took from a source.
+    pub fn history_turns(&self, name: &str, limit: usize) -> Result<Value> {
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        // Walk back only as far as the `limit`th turn start.
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,turn,turn_seq,seen) AS (
+                SELECT id,parent,turn,turn_seq,turn_seq IS NOT NULL FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.turn,n.turn_seq,c.seen+(n.turn_seq IS NOT NULL)
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.seen<?2)
+             SELECT c.turn_seq,t.bot,c.turn,t.status,
+                    substr(json_extract(CAST(n.item AS TEXT),'$.content[0].text'),1,200),
+                    length(json_extract(CAST(n.item AS TEXT),'$.content[0].text'))
+             FROM chain c JOIN nodes n ON n.id=c.id LEFT JOIN turns t ON t.id=c.turn
+             WHERE c.turn_seq IS NOT NULL ORDER BY c.turn_seq DESC",
+        )?;
+        let mut rows = statement.query(params![head, limit as i64])?;
+        let mut turns = Vec::new();
+        while let Some(r) = rows.next()? {
+            let (owner, id): (Option<String>, Option<i64>) = (r.get(1)?, r.get(2)?);
+            turns.push(json!({"turn":r.get::<_, i64>(0)?,
+                "handle":owner.zip(id).map(|(owner, id)| format!("turn:{owner}/{id}")),
+                "status":r.get::<_, Option<String>>(3)?,
+                "prompt":r.get::<_, Option<String>>(4)?,
+                "prompt_bytes":r.get::<_, Option<i64>>(5)?}));
+        }
+        Ok(json!({"bot":name,"turns":turns}))
+    }
     pub fn history_read(
         &self,
         name: &str,
@@ -3896,6 +4154,7 @@ impl Database {
         // Compact provider whitespace in this view only: each item must occupy
         // one JSONL record even when its original response spans multiple lines.
         // Already single-line items need no rewrite (escaped newlines are fine).
+        // Pictures go without their bytes, as other history reads return them.
         const READING_ITEM: &str = "CASE
             WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
              AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
@@ -3903,10 +4162,10 @@ impl Database {
             WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
             ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length({READING_ITEM}) FROM nodes WHERE id=?"
+            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr({READING_ITEM},?,?) FROM nodes WHERE id=?"
+            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -4041,10 +4300,18 @@ impl Database {
         if deleting {
             return fail_with("bot_not_found", format!("{name} is being deleted"));
         }
-        let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
+        type Prior = (
+            i64,
+            String,
+            String,
+            TurnOptions,
+            Option<i64>,
+            Option<String>,
+        );
+        let prior: Option<Prior> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images
                  FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
@@ -4064,13 +4331,16 @@ impl Database {
                             },
                             origin: r.get(10)?,
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
+                            // Checked by their digest below.
+                            images: Vec::new(),
                         },
                         r.get(7)?,
+                        r.get(13)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((turn, mut saved, status, saved_options, prompt_node)) = prior {
+        if let Some((turn, mut saved, status, saved_options, prompt_node, saved_images)) = prior {
             if let Some(node) = prompt_node {
                 saved = self.conn.prepare_cached(
                     "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
@@ -4095,7 +4365,9 @@ impl Database {
                 from,
                 origin,
                 budget_tokens,
+                images: _,
             } = &saved_options;
+            let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
                 ("prompt", saved != prompt),
                 ("workspace", *workspace != same.workspace),
@@ -4106,6 +4378,10 @@ impl Database {
                 ("from", *from != same.from),
                 ("origin", *origin != same.origin),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
+                (
+                    "images",
+                    images != stored_images(&same.images)?.map(|json| pictures_digest(&json)),
+                ),
             ]
             .into_iter()
             .find_map(|(field, differs)| differs.then_some(field));
@@ -4269,8 +4545,8 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
@@ -4278,7 +4554,8 @@ impl Database {
                 if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { workspace.as_deref() },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
-                options.effort, options.budget_tokens.map(|n| n as i64)],
+                options.effort, options.budget_tokens.map(|n| n as i64),
+                stored_images(&options.images)?],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -4541,9 +4818,11 @@ impl Database {
                 share_items.saturating_sub(used_items + reserved.items),
             )
         };
-        // Id, item, prompt bytes, and whether it was attached, which no
-        // pending count holds.
-        let mut steers: Vec<(i64, Vec<u8>, usize, bool)> = Vec::new();
+        // Each steer's id, item, prompt size, whether it was attached (which
+        // no pending count holds), its pictures' JSON, and what they add
+        // beyond their weight.
+        type Steer = (i64, Vec<u8>, usize, bool, Option<String>, i64);
+        let mut steers: Vec<Steer> = Vec::new();
         let mut more = false;
         let mut capped = false;
         {
@@ -4554,7 +4833,7 @@ impl Database {
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
-                    s.status='attached'
+                    s.status='attached',length(s.images)
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -4570,7 +4849,7 @@ impl Database {
                 through,
                 attached
             ])?;
-            let mut bytes = 0;
+            let (mut bytes, mut picture_bytes) = (0, 0);
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
                 if !row.get::<_, bool>(3)? {
@@ -4582,15 +4861,33 @@ impl Database {
                     more = !steers.is_empty();
                     break;
                 }
+                // Pictures are read only once they fit their own budget,
+                // which the first steer's always do; the rest wait for the
+                // next batch.
+                let pictured_size = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as usize;
+                if !steers.is_empty() && pictured_size > STEER_BATCH_PICTURE_BYTES - picture_bytes {
+                    more = true;
+                    break;
+                }
                 bytes += size;
-                let item = family.user_item(&row.get::<_, String>(1)?)?;
-                if item.len() + 1 > room_bytes || room_items == 0 {
+                picture_bytes += pictured_size;
+                let id: i64 = row.get(0)?;
+                let images: Option<String> = self
+                    .conn
+                    .prepare_cached("SELECT images FROM turns WHERE id=?")?
+                    .query_row([id], |r| r.get(0))?;
+                let pictures = images_from(images.as_deref())?;
+                let item = family.user_item_with(&row.get::<_, String>(1)?, &pictures)?;
+                // Its pictures count at their weight, as the node will.
+                let pictured = crate::codec::pictured(&pictures);
+                let weight = (item.len() as i64 - pictured) as usize;
+                if weight + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
                 }
-                room_bytes -= item.len() + 1;
+                room_bytes -= weight + 1;
                 room_items -= 1;
-                steers.push((row.get(0)?, item, size, row.get(4)?));
+                steers.push((id, item, size, row.get(4)?, images, pictured));
             }
         }
         let mut absorbed = Absorbed {
@@ -4608,9 +4905,10 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, item, size, was_attached) in steers {
-            let id = node(&tx, head, &item)?;
+        for (steer, item, size, was_attached, images, pictured) in steers {
+            let id = node_with_turn(&tx, head, &item, None, pictured)?;
             head = Some(id);
+            keep_once(&tx, steer, images.as_deref())?;
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
                     (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
@@ -4679,11 +4977,23 @@ impl Database {
         usage: Option<&Usage>,
     ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
+        // A gated round notes which item plans each call. Whether a
+        // sandboxed bot's call is gated can turn on the folder it runs in.
+        let workspace: Option<String> = match calls.is_empty() || !bot.sandboxed() {
+            true => None,
+            false => self
+                .conn
+                .prepare_cached(
+                    "SELECT COALESCE(t.workspace,b.workspace) FROM turns t
+                     JOIN bots b ON b.name=t.bot WHERE t.id=?",
+                )?
+                .query_row([turn], |r| r.get(0))?,
+        };
+        let workspace = std::path::Path::new(workspace.as_deref().unwrap_or("/"));
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        // A gated round notes which item plans each call.
-        let gated = calls.iter().any(|call| bot.gated(&call.name));
+        let gated = calls.iter().any(|call| bot.gated(call, workspace));
         let mut planned = HashMap::new();
         let last_reasoning = items.last().is_some_and(|item| {
             serde_json::from_slice::<Kind>(item).is_ok_and(|k| k.kind == "reasoning")
@@ -4722,7 +5032,7 @@ impl Database {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
             let mut judged = Vec::new();
-            for call in calls.iter().filter(|call| bot.gated(&call.name)) {
+            for call in calls.iter().filter(|call| bot.gated(call, workspace)) {
                 let gates: Vec<CallGate> = bot
                     .gates
                     .iter()
@@ -4904,7 +5214,8 @@ impl Database {
         {
             return fail("invalid_tool_state");
         }
-        let data = started(call);
+        let mut data = started(call);
+        ask(&tx, &bot, turn, call, &mut data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "tool_started", data.clone())?;
         tx.commit()?;
         Ok(entry(cursor, &bot.name, Some(turn), "tool_started", data))
@@ -4917,7 +5228,7 @@ impl Database {
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
         let family = bot.family()?;
-        let item = family.tool_result_item(call_id, &outcome.output)?;
+        let item = family.tool_result_item_with(call_id, &outcome.output, &outcome.images)?;
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -4941,16 +5252,20 @@ impl Database {
         // the result, eliding it later reads no output. A bot without the
         // read tool never elides, since the model could not follow a stub,
         // so it gets none.
+        // Pictures count at their weight, so a stub saves only what the
+        // result weighs over it.
         let next = next_node(&tx)?;
-        let stub = if bot.tools.iter().any(|tool| tool == "read") {
-            super::context::stub(family, call_id, &outcome.output, next, item.len())?
+        let pictured = crate::codec::pictured(&outcome.images);
+        let weight = (item.len() as i64 - pictured) as usize;
+        let stub = if !outcome.images.is_empty() {
+            super::context::picture_stub(family, call_id, &outcome.output, weight)?
+        } else if bot.tools.iter().any(|tool| tool == "read") {
+            super::context::stub(family, call_id, &outcome.output, next, weight)?
         } else {
             None
         };
-        let elided = stub
-            .as_ref()
-            .map_or(0, |stub| (item.len() - stub.len()) as i64);
-        let head = insert_node(&tx, bot.head, &item, None, elided)?;
+        let elided = stub.as_ref().map_or(0, |stub| (weight - stub.len()) as i64);
+        let head = insert_node(&tx, bot.head, &item, None, elided, pictured)?;
         if head != next {
             return fail("storage_error");
         }
@@ -5139,6 +5454,7 @@ impl Database {
             data["approvals"] = request.approvals();
             // The planning item, which holds the whole arguments.
             data["node"] = json!(node);
+            ask(&tx, &bot, turn, call, &mut data)?;
             event(&tx, &bot.name, Some(turn), "tool_started", data)?;
             tx.commit()?;
             Gated::Started
@@ -5239,6 +5555,7 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: true,
+            answer: None,
             copied: None,
             summary_retry_ms,
         };
@@ -5254,6 +5571,253 @@ impl Database {
         tx.commit()?;
         self.forget_live(turn);
         Ok(Some(deadline_ms))
+    }
+    /// An answered call's answer, held or stored, `tool_unserved` once its
+    /// time ran out, or how long it may still wait.
+    pub fn answer_take(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
+        if let Some(given) = self
+            .live_changed(turn)
+            .and_then(|live| live.answers.remove(call_id))
+        {
+            return Ok(CallAnswer::Given(given));
+        }
+        let (tag, expires_ms, output, failed): (String, i64, Option<String>, bool) = self
+            .conn
+            .prepare_cached(
+                "SELECT tag,expires_ms,output,failed FROM answers WHERE turn=? AND call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let expires_ms = expires_ms.max(0) as u64;
+        Ok(match output {
+            Some(output) => CallAnswer::Given(Outcome {
+                output,
+                artifacts: Vec::new(),
+                images: Vec::new(),
+                note: None,
+                failed,
+            }),
+            None if now_ms >= expires_ms => {
+                CallAnswer::Given(unserved(format!("no answer from {tag} in time")))
+            }
+            // A later call's gate that lapses ends the turn's wait, as
+            // it ends a gated call's.
+            None if self.next_lapse(turn)?.is_some_and(|at| now_ms >= at) => CallAnswer::Given(
+                unserved("a later call's gate lapsed before the answer".into()),
+            ),
+            None => CallAnswer::Pending {
+                notify: self.live.entry(turn).or_default().notify.clone(),
+                expires_ms,
+            },
+        })
+    }
+    /// Park a running turn on an answered call: its task ends and it holds
+    /// no slot. The verdicts the worker holds are written with the park.
+    /// An answer that landed as the hold ran out is taken instead: `None`
+    /// means the turn goes on. Otherwise, when to wake it: the call's
+    /// deadline, or a later gated call's lapse when that comes first.
+    pub fn suspend_answer(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        pending: &[ToolCall],
+        now_ms: u64,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<Option<u64>> {
+        let bot = self.active(turn)?;
+        if bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        if self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id))
+        {
+            return Ok(None);
+        }
+        let (tag, expires_ms): (String, i64) = self
+            .conn
+            .prepare_cached(
+                "SELECT tag,expires_ms FROM answers WHERE turn=? AND call_id=? AND output IS NULL",
+            )?
+            .query_row(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let deadline_ms = expires_ms.max(0) as u64;
+        let wake_at = self
+            .next_lapse(turn)?
+            .map_or(deadline_ms, |lapse| lapse.min(deadline_ms));
+        if now_ms >= wake_at {
+            return Ok(None);
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: call_id.to_owned(),
+            handles: Vec::new(),
+            deadline_ms: Some(deadline_ms),
+            any: false,
+            pending: pending.to_vec(),
+            paced_since_ms: None,
+            call_attempts: 0,
+            call_spent_ms: 0,
+            compaction: false,
+            route: route.map(str::to_owned),
+            approval: false,
+            answer: Some(tag.clone()),
+            copied: None,
+            summary_retry_ms,
+        };
+        let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
+        tx.execute(
+            "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":call_id,"answer":tag,"deadline_ms":deadline_ms});
+        event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+        tx.commit()?;
+        self.forget_live(turn);
+        Ok(Some(wake_at))
+    }
+    /// Record a client's answer to an answered call. A running turn's is
+    /// held by the worker and wakes its task, so its `tool_finish` is the
+    /// one commit; a parked turn's is committed now and resumes the turn.
+    pub fn answer_call(
+        &mut self,
+        bot: &str,
+        turn: i64,
+        call_id: &str,
+        outcome: Outcome,
+        now_ms: u64,
+    ) -> Result<Answered> {
+        let owner: Option<(String, String)> = self
+            .conn
+            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
+            return fail("turn_not_found");
+        };
+        let call: Option<(bool, Option<String>, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms FROM answers a
+                 LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
+                 WHERE a.turn=? AND a.call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((stored, tool, expires_ms)) = call else {
+            if !matches!(status.as_str(), "running" | "waiting") {
+                return Err(Error::with(
+                    "stale_turn",
+                    format!("turn {turn} is {status}"),
+                ));
+            }
+            return fail("no_pending_call");
+        };
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id));
+        if stored || held {
+            return fail("call_already_answered");
+        }
+        if tool.as_deref() != Some("executing") {
+            return fail_with("no_pending_call", "the call ended unanswered");
+        }
+        // Out of time is unserved, whenever the turn gets to say so.
+        if now_ms >= expires_ms.max(0) as u64 {
+            return fail_with("no_pending_call", "the call ran out of time");
+        }
+        let reply = json!({"bot":bot,"turn":turn,"call_id":call_id});
+        match status.as_str() {
+            "running" => {
+                self.keep_live(turn);
+                let live = self.live.entry(turn).or_default();
+                live.answers.insert(call_id.to_owned(), outcome);
+                Ok(Answered {
+                    reply,
+                    notify: Some(live.notify.clone()),
+                    resume: false,
+                })
+            }
+            "waiting" => {
+                self.conn
+                    .prepare_cached(
+                        "UPDATE answers SET output=?,failed=? WHERE turn=? AND call_id=?",
+                    )?
+                    .execute(params![outcome.output, outcome.failed, turn, call_id])?;
+                let resume = self
+                    .waiting(turn)?
+                    .is_some_and(|w| w.answer.is_some() && w.call_id == call_id);
+                Ok(Answered {
+                    reply,
+                    notify: None,
+                    resume,
+                })
+            }
+            _ => Err(Error::with(
+                "stale_turn",
+                format!("turn {turn} is {status}"),
+            )),
+        }
+    }
+    /// Answered calls still waiting for the client `tag` names, oldest
+    /// first: at most `limit` and 256 KiB of them (or the one call, when it
+    /// alone is larger). `next_after` continues the listing.
+    pub fn tool_calls(&self, tag: &str, after: i64, limit: usize) -> Result<Value> {
+        if !(1..=256).contains(&limit) || after < 0 {
+            return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms FROM answers a
+             JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
+             WHERE a.tag=? AND a.id>? AND a.output IS NULL AND l.status='executing'
+               AND t.status IN ('running','waiting') ORDER BY a.id LIMIT ?",
+        )?;
+        let mut listed = Vec::new();
+        let (mut bytes, mut last, mut more, mut scanned) = (0, after, false, 0);
+        let mut rows = statement.query(params![tag, after, limit as i64 + 1])?;
+        while let Some(r) = rows.next()? {
+            scanned += 1;
+            let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
+            // An answer the worker holds is given already.
+            if self
+                .live
+                .get(&turn)
+                .is_some_and(|live| live.answers.contains_key(&call_id))
+            {
+                last = id;
+                continue;
+            }
+            let arguments: String = r.get(5)?;
+            let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+                "name":r.get::<_, String>(4)?,
+                "arguments":serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null),
+                "expires_ms":r.get::<_, i64>(6)?});
+            let size = crate::output::encoded_len(&entry)? + 1;
+            if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
+                more = true;
+                break;
+            }
+            bytes += size;
+            last = id;
+            listed.push(entry);
+        }
+        // Held answers skipped took rows the page did not fill: there may
+        // be more past the last one read.
+        more |= scanned > limit;
+        Ok(json!({"calls":listed,"next_after":more.then_some(last)}))
     }
     /// Record one gate's verdict on the current request of a planned call.
     /// A running turn's verdict is held by the worker and wakes its task;
@@ -6023,6 +6587,9 @@ impl Database {
             true => 0,
             false => tx.execute("DELETE FROM approvals WHERE turn=?", [turn])? as i64,
         };
+        if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
+            tx.execute("DELETE FROM answers WHERE turn=?", [turn])?;
+        }
         let code = error.map(|e| e.code.as_str());
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down around the turn, a daemon that died with it running, or a
@@ -6116,6 +6683,7 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            answer: None,
             copied: None,
             summary_retry_ms,
         };
@@ -6169,6 +6737,7 @@ impl Database {
             compaction,
             route: route.map(str::to_owned),
             approval: false,
+            answer: None,
             copied,
             summary_retry_ms,
         };
@@ -6214,6 +6783,40 @@ impl Database {
     /// since the lapse ends the turn. Otherwise it answers when to look
     /// again: a partial verdict can move a call's lapse later.
     pub fn wake(&self, name: &str, turn: i64, due: bool) -> Result<Wake> {
+        let parked: Option<(Option<bool>, String, Option<String>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT json_extract(t.waiting,'$.approval'),b.status,json_extract(t.waiting,'$.call_id')
+                 FROM bots b JOIN turns t ON t.id=b.running_turn
+                 WHERE b.name=? AND b.status IN ('waiting','paced') AND b.running_turn=?
+                   AND json_extract(t.waiting,'$.answer') IS NOT NULL",
+            )?
+            .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let now = epoch_ms().max(0) as u64;
+        // Parked on an answer: the answer, its deadline, or a later gated
+        // call's lapse resumes it.
+        if let Some((_, _, Some(call_id))) = parked {
+            let answer: Option<(bool, i64)> = self
+                .conn
+                .prepare_cached(
+                    "SELECT output IS NOT NULL,expires_ms FROM answers WHERE turn=? AND call_id=?",
+                )?
+                .query_row(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((answered, expires_ms)) = answer else {
+                return Ok(Wake::Resume);
+            };
+            let at = self
+                .next_lapse(turn)?
+                .map_or(expires_ms.max(0) as u64, |lapse| {
+                    lapse.min(expires_ms.max(0) as u64)
+                });
+            return Ok(match answered || now >= at {
+                true => Wake::Resume,
+                false => Wake::Later(Some(at)),
+            });
+        }
         let parked: Option<(Option<bool>, String)> = self
             .conn
             .prepare_cached(
@@ -6222,7 +6825,6 @@ impl Database {
             )?
             .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let now = epoch_ms().max(0) as u64;
         Ok(match parked {
             None => Wake::Stale,
             // Parked on a verdict: an answer that decided the call, or the
@@ -6640,8 +7242,9 @@ impl Database {
         let parent = self.inspect(source)?;
         // A fork starts where its source is unless told otherwise.
         let workspace = workspace.or(parent.workspace.as_deref());
+        let tools = gateable(&parent.tools, &parent.declared);
         if let Some(gate) = gate {
-            not_in_tools(&gate.tools, &parent.tools)?;
+            not_in_tools(&gate.tools, &tools)?;
         }
         // A fork never widens what its source may call.
         let allowed = match allow {
@@ -6714,8 +7317,13 @@ impl Database {
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(
             parent.gates.iter().chain(&inherited).chain(gate),
-            &parent.tools,
+            &tools,
         ))?;
+        // And the stricter of its source's sandbox and its creator's.
+        let settings = match Self::creator_settings(&tx, created_by_id)? {
+            Some(creator) => parent.settings.clone().under(&creator),
+            None => parent.settings.clone(),
+        };
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
@@ -6748,7 +7356,7 @@ impl Database {
                 thinking.2,
                 gates,
                 allowed.as_ref().map(|allowed| allowed.join(",")),
-                parent.settings.stored()?,
+                settings.stored()?,
                 creation(request_id, request),
                 expire_ms.map(|ms| ms as i64),
                 expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
@@ -7393,11 +8001,13 @@ impl Database {
         let maximum = crate::output::MAX_EVENT - 1024;
         // Check the encoded blob length in SQLite before allocating it. An
         // unrenderable item gets its own error; adjacent items remain readable.
-        // A prompt another bot's turn or a named client sent says so.
-        let mut query = self.conn.prepare_cached(
+        // A prompt another bot's turn or a named client sent says so. The
+        // bound is on the item as read, its pictures left out.
+        let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
-             FROM nodes n LEFT JOIN senders s ON s.node=n.id WHERE n.id=?1",
-        )?;
+             FROM (SELECT id,{PICTURELESS} AS item FROM nodes WHERE id=?1) n
+             LEFT JOIN senders s ON s.node=n.id"
+        ))?;
         for &node in wanted {
             type Row = (
                 Option<Vec<u8>>,
@@ -7784,6 +8394,36 @@ fn started(call: &ToolCall) -> Value {
     let preview: String = call.arguments.chars().take(2048).collect();
     json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
         "arguments_truncated":preview.len() < call.arguments.len()})
+}
+/// In an answered call's start, note it as waiting for its client, and
+/// name that client and the call's deadline in `tool_started`. A call
+/// whose arguments do not fit is refused at once, so it waits for none.
+fn ask(tx: &Connection, bot: &Bot, turn: i64, call: &ToolCall, data: &mut Value) -> Result<()> {
+    let Some(tool) = bot.declared(&call.name) else {
+        return Ok(());
+    };
+    let (Some(tag), Some(expires_ms)) =
+        (&tool.answered_by, tool.answer_by(epoch_ms().max(0) as u64))
+    else {
+        return Ok(());
+    };
+    if crate::tools::check_declared(tool, &call.arguments).is_err() {
+        return Ok(());
+    }
+    tx.prepare_cached(
+        "INSERT INTO answers(turn,call_id,tag,name,arguments,expires_ms) VALUES (?,?,?,?,?,?)",
+    )?
+    .execute(params![
+        turn,
+        call.call_id,
+        tag,
+        call.name,
+        call.arguments,
+        expires_ms as i64
+    ])?;
+    data["answered_by"] = json!(tag);
+    data["expires_ms"] = json!(expires_ms);
+    Ok(())
 }
 /// A denied call's result, in the one commit a finished call makes. The
 /// daemon writes the code; the reason is the approver's.
@@ -8196,8 +8836,14 @@ fn start_locked(
     prompt: &str,
     data: &mut Value,
 ) -> Result<Option<i64>> {
-    let item = bot.family()?.user_item(prompt)?;
-    let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
+    let images: Option<String> = tx
+        .prepare_cached("SELECT images FROM turns WHERE id=?")?
+        .query_row([turn], |r| r.get(0))?;
+    let pictures = images_from(images.as_deref())?;
+    let item = bot.family()?.user_item_with(prompt, &pictures)?;
+    let pictured = crate::codec::pictured(&pictures);
+    let head = node_with_turn(tx, bot.head, &item, Some(turn), pictured)?;
+    keep_once(tx, turn, images.as_deref())?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
@@ -8218,6 +8864,79 @@ fn start_locked(
     )?;
     Ok(Some(head))
 }
+/// The pictures a turn's prompt was sent with, as its `images` column
+/// keeps them.
+fn images_from(json: Option<&str>) -> rusqlite::Result<Vec<crate::codec::Image>> {
+    json.map_or(Ok(Vec::new()), |json| {
+        serde_json::from_str(json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+    })
+}
+/// The `images` column for a turn's pictures: their JSON, or nothing for
+/// none.
+fn stored_images(images: &[crate::codec::Image]) -> Result<Option<String>> {
+    Ok((!images.is_empty())
+        .then(|| serde_json::to_string(images))
+        .transpose()?)
+}
+/// What a retry's pictures are checked against: the SHA-256 of their JSON,
+/// as `keep_once` leaves it in place of the JSON.
+fn pictures_digest(kept: &str) -> String {
+    if !kept.starts_with('[') {
+        return kept.to_owned();
+    }
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, kept.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+/// Once a turn's prompt is a node, its pictures live there: the turn keeps
+/// only their digest, for a retry to be checked against.
+fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
+    if let Some(json) = images.filter(|json| json.starts_with('[')) {
+        tx.prepare_cached("UPDATE turns SET images=? WHERE id=?")?
+            .execute(params![pictures_digest(json), turn])?;
+    }
+    Ok(())
+}
+/// SQL for `item`, a node's item, as history reads return it: the pictures
+/// of a user item or a tool's result without their bytes, each counted in
+/// `omitted_bytes` (a data URL keeps its media type). The model is sent
+/// them whole.
+const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
+THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CAST(item AS TEXT),'$.content')='array'
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',(SELECT json_group_array(
+        CASE WHEN json_extract(b.value,'$.type')='tool_result'
+            AND json_type(b.value,'$.content')='array'
+        THEN json_set(b.value,'$.content',(SELECT json_group_array(CASE
+            WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
+            THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
+                '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
+            WHEN json_extract(p.value,'$.type')='image' AND json_extract(p.value,'$.source.type')='base64'
+            THEN json_set(p.value,'$.source.data','',
+                '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
+            ELSE json(p.value) END)
+            FROM json_each(b.value,'$.content') AS p))
+        ELSE CASE
+            WHEN json_extract(b.value,'$.type')='input_image' AND json_extract(b.value,'$.image_url') LIKE 'data:%'
+            THEN json_set(b.value,'$.image_url',substr(json_extract(b.value,'$.image_url'),1,instr(json_extract(b.value,'$.image_url'),',')),
+                '$.omitted_bytes',length(json_extract(b.value,'$.image_url'))-instr(json_extract(b.value,'$.image_url'),','))
+            WHEN json_extract(b.value,'$.type')='image' AND json_extract(b.value,'$.source.type')='base64'
+            THEN json_set(b.value,'$.source.data','',
+                '$.omitted_bytes',length(json_extract(b.value,'$.source.data')))
+            ELSE json(b.value) END END)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b)) AS BLOB)
+    WHEN json_extract(CAST(item AS TEXT),'$.type')='function_call_output' AND json_type(CAST(item AS TEXT),'$.output')='array'
+    THEN CAST(json_set(CAST(item AS TEXT),'$.output',(SELECT json_group_array(CASE
+        WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
+        THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
+            '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
+        WHEN json_extract(p.value,'$.type')='image' AND json_extract(p.value,'$.source.type')='base64'
+        THEN json_set(p.value,'$.source.data','',
+            '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
+        ELSE json(p.value) END)
+        FROM json_each(CAST(item AS TEXT),'$.output') AS p)) AS BLOB)
+    ELSE item END
+ELSE item END";
 /// The bot's oldest queued turn now waits only for a slot. True when that
 /// turn was a steer, for the queued-steer count.
 fn promote(tx: &Connection, bot: &str) -> Result<bool> {
@@ -8242,7 +8961,7 @@ fn turn_status_name(status: &str) -> &'static str {
     }
 }
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
-    node_with_turn(conn, parent, item, None)
+    node_with_turn(conn, parent, item, None, 0)
 }
 /// Bring an older versioned store forward to the current schema inside the
 /// caller's transaction. Each step converts stored data once; the runtime has
@@ -8951,6 +9670,25 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     if from < 54 {
         migrate_denial_windows(conn)?;
     }
+    // 54 -> 55: calls waiting for a client's answer, in a table the schema
+    // creates; no declared tool had a client that answers it.
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='images')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 55 -> 56: a prompt may come with pictures. None did.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN images TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='pictured')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 56 -> 57: a picture counts at its weight. Older nodes count theirs
+        // at its size, which `total_bytes` already holds.
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN pictured INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -9247,13 +9985,15 @@ fn previous_turn_seq(conn: &Connection, node: i64) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// `pictured`: what the item's pictures add beyond their weight.
 fn node_with_turn(
     conn: &Connection,
     parent: Option<i64>,
     item: &[u8],
     turn: Option<i64>,
+    pictured: i64,
 ) -> Result<i64> {
-    insert_node(conn, parent, item, turn, 0)
+    insert_node(conn, parent, item, turn, 0, pictured)
 }
 /// Whether a bot other than `name` sees the compaction version at `node`:
 /// bound to it, or through a later version made on it. A version made at
@@ -9286,12 +10026,16 @@ fn next_node(conn: &Connection) -> Result<i64> {
         .query_row([], |r| r.get(0))?)
 }
 /// `elided`: what a request saves by sending the item's stub instead.
+/// `pictured`: what the item's pictures add beyond their weight, which
+/// `total_bytes` leaves out: context accounting counts a picture at its
+/// token cost, and only a request's length counts its bytes.
 fn insert_node(
     conn: &Connection,
     parent: Option<i64>,
     item: &[u8],
     turn: Option<i64>,
     elided: i64,
+    pictured: i64,
 ) -> Result<i64> {
     let (bytes, depth, saved, thought): (i64, i64, i64, i64) = match parent {
         Some(id) => conn
@@ -9315,21 +10059,22 @@ fn insert_node(
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
         "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
-            total_thinking)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?
+            total_thinking,pictured)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
         parent,
         item,
-        bytes + item.len() as i64,
+        bytes + item.len() as i64 - pictured,
         depth + 1,
         turn,
         turn_seq,
         thinking,
         elided,
         saved + elided,
-        thought + thinking
+        thought + thinking,
+        pictured
     ])?;
     Ok(conn.last_insert_rowid())
 }

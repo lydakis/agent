@@ -729,9 +729,12 @@ class WaitTests(ModelFixture):
         with sqlite3.connect(database) as db:
             db.execute("CREATE TRIGGER reject_completion BEFORE UPDATE OF result ON processes BEGIN "
                        "SELECT RAISE(ABORT, 'synthetic write failure'); END")
-        # Hold the write lock: the failing result queues first and a full
-        # window of admissions behind it. A group holds 32 jobs, so the last
-        # admission commits after the failure is already known.
+        # Hold the write lock: the failing result queues first and the
+        # admissions behind it, all before the failure is known. They must
+        # all fit the stdio session's output queue together, or the rest
+        # wait until after the failure, when nothing admits them:
+        # each creation counts its worst-case reply against that queue, so
+        # about 17 fit, and eight leave room.
         lock = sqlite3.connect(database, isolation_level=None)
         lock.execute('BEGIN IMMEDIATE')
         try:
@@ -740,14 +743,17 @@ class WaitTests(ModelFixture):
             while not (self.path / 'marker').exists():
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
-            time.sleep(.2)
+            # Time for the result to queue, then for the daemon to read every
+            # admission behind it; both stay well inside SQLite's 5 s busy
+            # timeout, so the lock alone decides the order.
+            time.sleep(.5)
             lines = [{'id': f'create-{n}', 'op': 'create', 'bot': f'New{n}', 'workspace': str(self.path),
                       'model': client.model, 'instructions': client.instructions, 'tools': client.tools}
-                     for n in range(31)]
+                     for n in range(8)]
             lines.append({'id': 'submit', 'op': 'submit', 'bot': 'Carol', 'request_id': 'late', 'prompt': 'hi'})
             client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
             client.process.stdin.flush()
-            time.sleep(.2)
+            time.sleep(1)
         finally:
             lock.execute('ROLLBACK')
             lock.close()
@@ -760,4 +766,4 @@ class WaitTests(ModelFixture):
         with sqlite3.connect(database) as db:
             status = db.execute("SELECT status FROM turns WHERE request_id='late'").fetchone()[0]
             self.assertEqual(status, 'interrupted')
-            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE name LIKE 'New%'").fetchone()[0], 31)
+            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE name LIKE 'New%'").fetchone()[0], 8)

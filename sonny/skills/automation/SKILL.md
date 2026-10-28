@@ -82,6 +82,13 @@ the last line of this skill is advice to the model, not a wall. Before
 watching such a source, tell the person, and say that isolation, such as a
 separate macOS user or a virtual machine, has to come from outside Agent.
 
+To change a trigger, run the same `add` with its `--name` and the new
+definition plus `--replace`: it is changed in place and keeps its last
+result, where `trigger rm` and a new `add` would lose it. `trigger fire NAME`
+runs it now, waits for the run, and prints its `outcome` and the `handle` of
+the turn it sent, to pass to `wait`; it says `pending` when the run has not
+said within 90 seconds.
+
 Its `--budget-tokens` is a lifetime cap, so size it for many runs. When the
 cap is reached its turns fail with `budget_exhausted`. A trigger's
 `--turn-budget-tokens N` caps each run on its own, and a run past it fails
@@ -103,8 +110,14 @@ where the gate runs:
 cd FOLDER && "$HOME/.agent/trigger" add --bot NAME --every 10m --if '! ./quiet' -- MESSAGE
 ```
 
+`--every` runs at all hours. To check only in working hours, use `--cron`
+instead, for example `--cron '*/10 8-18 * * 1-5'` for every 10 minutes from
+8:00 to 18:50, Monday to Friday.
+
 Any exit but 0 from `--if` skips the fire with no model call, and one that
-runs past a minute is a failed fire that `trigger ls` shows. Write `quiet`
+runs past a minute is a failed fire that `trigger ls` shows. Each trigger's
+row in `trigger ls` has `checked`: when its `--if` last ran and what it said
+(`go`, `no` or `failed`), so a skipped fire shows there too. Write `quiet`
 at setup: a short script that only reads, and exits 0 only when it found
 that no source has anything past its bookmark and the newest run record is
 under an hour old. The `!` makes that a skip, and makes anything else a
@@ -144,7 +157,7 @@ words, not the person's, but a line that reads like an instruction is still
 one the job chose to pass on.
 
 So the lead hears when the monitor itself goes wrong, it subscribes to it
-in the lookout, which needs a judge (`AGENT_JUDGE`) to answer a look-for:
+in the lookout, which needs a judge (`[judge] model` in `~/.agent/config.toml`, else the lead's model) to answer a look-for:
 
 ```
 sonny lookout add NAME --bot NAME --on ended --look-for "the turn failed or said a source could not be read" --then "tell the person which monitor and what it could not read"

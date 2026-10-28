@@ -121,6 +121,42 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
     })
 }
 
+/// The oldest question still open among a bot's `items`, newest first:
+/// an `ask` call that was taken, with no answer to it after, as the pinned
+/// questions are closed: only by the person's `You asked:` message naming
+/// it, one answer to one question.
+pub fn open(items: &[Value]) -> Option<String> {
+    let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
+    for item in items {
+        if item["role"] == "user"
+            && let Some(question) = answered(&crate::text(item))
+        {
+            answers.push(question.to_owned());
+        }
+        if item["type"] == "function_call_output"
+            && (item["failed"] == true || crate::reactions::refused(item))
+        {
+            refused.push(item["call_id"].clone());
+        }
+        if item["type"] == "function_call"
+            && item["name"] == TOOL
+            && !refused.contains(&item["call_id"])
+            && let Some(ask) = item["arguments"]
+                .as_str()
+                .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                .and_then(|arguments| call("", &arguments))
+        {
+            match answers.iter().position(|q| *q == ask.question) {
+                Some(at) => {
+                    answers.remove(at);
+                }
+                None => open = Some(ask.question),
+            }
+        }
+    }
+    open
+}
+
 /// The question a person's message answers, when [`answer`] wrote it.
 pub fn answered(text: &str) -> Option<&str> {
     split(text).map(|(question, _)| question)
@@ -352,5 +388,50 @@ mod tests {
             "Answer “Keep the old API?”: 1–2 or your own words · 1 more open · Esc to chat"
         );
         assert!(hint(&ask, 0, 50).contains('…'));
+    }
+
+    #[test]
+    fn a_question_is_open_until_its_answer_lands() {
+        let asked = json!({"type": "function_call", "name": TOOL, "call_id": "a1",
+            "arguments": json!({"question": "Keep it?", "options": [{"label": "Yes", "explanation": "e"}]}).to_string()});
+        let reply =
+            json!({"role": "assistant", "content": [{"type": "output_text", "text": "Asked."}]});
+        let output = json!({"type": "function_call_output", "call_id": "a1", "output": "Asked."});
+        let person =
+            |text: &str| json!({"role": "user", "content": [{"type": "input_text", "text": text}]});
+        // Newest first.
+        assert_eq!(
+            open(&[reply.clone(), output.clone(), asked.clone()]),
+            Some("Keep it?".into())
+        );
+        // A reaction, or a message of the person's own, answers nothing.
+        assert_eq!(
+            open(&[
+                person("👍"),
+                person("Meanwhile, why?"),
+                reply.clone(),
+                asked.clone()
+            ]),
+            Some("Keep it?".into())
+        );
+        assert_eq!(
+            open(&[
+                reply.clone(),
+                person("You asked: Keep it?\n\nYes"),
+                asked.clone()
+            ]),
+            None
+        );
+        assert_eq!(open(&[reply, output]), None);
+        // Two asked, one answered: the other stays open.
+        let other = json!({"type": "function_call", "name": TOOL, "call_id": "a2",
+            "arguments": json!({"question": "Ship it?"}).to_string()});
+        assert_eq!(
+            open(&[person("You asked: Keep it?\n\nYes"), other, asked.clone()]),
+            Some("Ship it?".into())
+        );
+        let unknown = json!({"type": "function_call_output", "call_id": "a1",
+            "output": json!({"error": "unknown_tool"}).to_string()});
+        assert_eq!(open(&[unknown, asked]), None);
     }
 }

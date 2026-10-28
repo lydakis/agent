@@ -26,7 +26,7 @@ impl Default for Settings {
             chime: true,
             copies: "worktree".into(),
             verbose: false,
-            fullscreen: false,
+            fullscreen: true,
         }
     }
 }
@@ -83,7 +83,7 @@ mod tests {
         assert!(Settings::from(&json!({"chime": "no"})).chime);
         assert!(Settings::from(&json!({"verbose": true})).verbose);
         assert!(!Settings::from(&json!({"verbose": "yes"})).verbose);
-        assert!(Settings::from(&json!({"fullscreen": true})).fullscreen);
+        assert!(!Settings::from(&json!({"fullscreen": false})).fullscreen);
         assert_eq!(
             Settings::from(&json!({"copies": "sandfs"})).copies,
             "sandfs"

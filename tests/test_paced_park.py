@@ -49,6 +49,27 @@ class PacedParkTests(ModelFixture):
         for t in throttled[1:]:
             client.request('interrupt', bot=t['bot'], turn=t['turn'])
 
+    def test_a_provider_outage_parks_its_retries_and_leaves_the_slot_to_others(self):
+        # Four 503s back off about 250 ms, 500 ms, 1 s and 2 s; from a second up
+        # (give or take the spread) they park.
+        client = self.client(extra=('--max-active', '1'))
+        for bot in ('Outage', 'Healthy'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           model=('b' if bot == 'Healthy' else 'openai') + '/synthetic-model')
+        outage = client.request('submit', bot='Outage', request_id='o', prompt='outage:4')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == outage, timeout=5)
+        healthy = client.request('submit', bot='Healthy', request_id='h', prompt='hello', delivery='queue')['result']['turn']
+        started = time.monotonic()
+        ended = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == healthy, timeout=2)
+        self.assertEqual(ended['data']['status'], 'completed')
+        # Before, the healthy turn waited out the outage's backoffs behind it.
+        self.assertLess(time.monotonic() - started, .9)
+        # The outage's turn resumes from its park and finishes on the fifth attempt.
+        self.assertEqual(client.finished(outage, timeout=10)['data']['status'], 'completed')
+        row = client.request('turns', bot='Outage')['result']['turns'][0]
+        self.assertEqual(row['retries'], 4)
+        self.assertEqual(self.model.attempts['outage:4'], 5)
+
     def test_new_call_on_closed_pool_leaves_capacity_for_healthy_work(self):
         self.model.retry_delays = ['10']
         client = self.client(extra=('--max-active', '1'))

@@ -99,6 +99,7 @@ async def serve(config, stats_path, mode, engine='rust'):
                         assert result == 'tool-ok'
                     else:
                         result = json.loads(result)
+                        assert isinstance(result.pop('wall_time_ms'), int)
                         assert result == dict(stdout='tool-ok', stderr='', exit_code=0, success=True)
                     stats['tool_results'] += 1
                     del pending[agent]

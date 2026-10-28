@@ -160,16 +160,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             if ((user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1)
+                    or (user.startswith('outage:') and attempt <= int(user.split(':')[1]))
                     or user.startswith('limited-forever:') or (user == 'tool:limited' and attempt == 2)):
                 # Transport-level refusals: a 503 or a CDN's 520 the next
                 # attempt clears, a 429 with Retry-After (for tool:limited, on
                 # the call after the tool), or a 429 that never lifts.
                 body = json.dumps({'error': {'message': 'try later'}}).encode()
                 self.send_response(520 if user.startswith('origin:') else
-                                   503 if user.startswith(('flaky:', 'waitretry:')) else 429)
+                                   503 if user.startswith(('flaky:', 'waitretry:', 'outage:')) else 429)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
-                if not user.startswith(('flaky:', 'origin:', 'waitretry:')):
+                if not user.startswith(('flaky:', 'origin:', 'waitretry:', 'outage:')):
                     delays = getattr(self.server, 'retry_delays', ['0.05'])
                     self.send_header('Retry-After', delays[min(attempt - 1, len(delays) - 1)])
                 self.end_headers()
@@ -260,16 +261,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'script' and getattr(self.server, 'call_script', None):
-                # One call a round from `call_script`, then an answer; a cut
-                # inside the turn keeps at least its newest call in view.
-                done = max((int(i['call_id'][7:]) + 1 for i in request['input']
+                # One round a step of `call_script`, then an answer; a cut
+                # inside the turn keeps at least its newest call in view. A
+                # step is a call, or a list of calls made in one round.
+                done = max((int(i['call_id'][7:].split('.')[0]) + 1 for i in request['input']
                             if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
                            default=0)
                 text = ''
                 if done < len(self.server.call_script):
-                    name, arguments = self.server.call_script[done]
-                    output = [{'type': 'function_call', 'name': name, 'call_id': f'script-{done}',
-                               'arguments': json.dumps(arguments)}]
+                    step = self.server.call_script[done]
+                    calls = step if isinstance(step, list) else [step]
+                    output = [{'type': 'function_call', 'name': name,
+                               'call_id': f'script-{done}' + (f'.{n}' if n else ''),
+                               'arguments': json.dumps(arguments)}
+                              for n, (name, arguments) in enumerate(calls)]
                 else:
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
@@ -319,7 +324,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
                            'arguments': '{"text":"ok"}'}]
             elif last.get('type') == 'function_call_output':
-                text = 'echo:' + last['output']
+                # A result with pictures is a list of parts: its text echoes.
+                result = last['output']
+                text = 'echo:' + (result if isinstance(result, str) else
+                                  ''.join(part.get('text', '') for part in result))
                 output = [{'id': 'msg_echo', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
             elif user.startswith('bg:') or user.startswith('bgwait:'):
@@ -341,6 +349,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                     arguments.update(offset=int(offset), limit=int(limit))
                 output = [{'type': 'function_call', 'name': 'read', 'call_id': 'readart-1',
                            'arguments': json.dumps(arguments)}]
+            elif user.startswith('readpic:') and last.get('type') != 'function_call_output':
+                text = ''
+                output = [{'type': 'function_call', 'name': 'read', 'call_id': 'readpic-1',
+                           'arguments': json.dumps({'path': user[8:]})}]
             elif user.startswith('history:') and last.get('type') != 'function_call_output':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'history', 'call_id': 'history-1',
@@ -397,6 +409,12 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
                            'arguments': json.dumps({'command': user[6:], 'timeout_ms': 2000})}]
+            elif user.startswith('calls:'):
+                # Calls given whole, as [[name, arguments], ...], in one response.
+                text = ''
+                output = [{'type': 'function_call', 'name': name, 'call_id': f'{name}-{i + 1}',
+                           'arguments': json.dumps(arguments)}
+                          for i, (name, arguments) in enumerate(json.loads(user[6:]))]
             elif user.startswith('shellecho:'):
                 # A command, then an echo, in one response.
                 text = ''
@@ -1059,7 +1077,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
                        decision='allow', by='test')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
-    def test_an_overload_mid_stream_closes_the_pool_and_is_retried_when_it_reopens(self):
+    def test_a_lone_overload_mid_stream_backs_off_its_own_call(self):
         client, model, path = self.start()
         model.overloads = 1
         client.request('create', bot='Bob', workspace=str(path))
@@ -1068,10 +1086,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
         retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
         self.assertEqual([r['error'] for r in retried], ['provider_http_529'])
         self.assertEqual(retried[0]['detail'], 'Overloaded')
-        # The pool closes for a second, for every bot on the model, and the
-        # turn waits it out parked.
-        self.assertTrue(retried[0]['parked'])
-        self.assertGreaterEqual(retried[0]['delay_ms'], 500)
+        # One overload leaves the pool open for the other bots on the model:
+        # this call retries after half a second, as the providers' SDKs do.
+        self.assertFalse(retried[0]['parked'])
+        self.assertTrue(400 <= retried[0]['delay_ms'] <= 600, retried[0])
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()
@@ -1789,7 +1807,9 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='cancel',
                               prompt='shell:sleep 30 & echo $! > child.pid; wait')['result']['turn']
         deadline = time.monotonic() + 3
-        while not (self.path / 'child.pid').exists() and time.monotonic() < deadline:
+        # The shell makes the file before it writes the PID.
+        while not (self.path / 'child.pid').exists() or not (self.path / 'child.pid').read_text().endswith('\n'):
+            self.assertLess(time.monotonic(), deadline)
             time.sleep(.01)
         pid = int((self.path / 'child.pid').read_text())
         child = psutil.Process(pid)

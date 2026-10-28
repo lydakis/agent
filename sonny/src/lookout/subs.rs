@@ -339,6 +339,25 @@ fn subscriber(named: Option<String>, caller: Option<String>) -> Result<String, S
     }
 }
 
+/// Remove the subscriber's subscription by that name: whether it had one.
+pub fn remove(store: &Path, subscriber: &str, name: &str) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read(store, subscriber);
+    drop_named(store, subscriber, &mut subs, name)
+}
+
+fn drop_named(
+    store: &Path,
+    subscriber: &str,
+    subs: &mut Vec<Sub>,
+    name: &str,
+) -> Result<bool, String> {
+    let before = subs.len();
+    subs.retain(|s| s.name != name);
+    write(store, subscriber, subs)?;
+    Ok(subs.len() < before)
+}
+
 /// `sonny lookout ls|add|rm`, printing one JSON line.
 pub fn run(store: &Path, command: &str, args: &[String]) -> Result<(), String> {
     let caller = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
@@ -434,10 +453,7 @@ fn edit(
         }
         "rm" => {
             let name = name.ok_or(USAGE)?;
-            let before = subs.len();
-            subs.retain(|s| s.name != name);
-            let removed = subs.len() < before;
-            write(store, &subscriber, &subs)?;
+            let removed = drop_named(store, &subscriber, &mut subs, &name)?;
             println!(
                 "{}",
                 json!({"for": subscriber, "removed": removed, "name": name})
@@ -504,12 +520,11 @@ mod tests {
     #[test]
     fn a_subscription_asks_what_it_names() {
         let mut sub = Sub::lead("shop.lead", "shop");
-        assert_eq!(
-            sub.builtins(Kind::Said),
-            ["redirects", "conflict", "drifts"]
-        );
-        sub.ask = Some(vec!["result".into(), "stuck".into()]);
-        assert_eq!(sub.builtins(Kind::Ended), ["stuck", "result"]);
+        assert_eq!(sub.builtins(Kind::Said), ["interrupt"]);
+        sub.ask = Some(Vec::new());
+        assert!(sub.builtins(Kind::Ended).is_empty());
+        sub.ask = Some(vec!["interrupt".into()]);
+        assert_eq!(sub.builtins(Kind::Ended), ["interrupt"]);
         sub.on = vec![Kind::Ended];
         assert!(sub.builtins(Kind::Said).is_empty());
         // Looking for something of its own asks only that, unless --ask says more.

@@ -10,6 +10,9 @@
 //! says how long the turn has run and how to stop it.
 mod approvals;
 mod asks;
+mod attach;
+mod background;
+mod banner;
 mod cache;
 mod calls;
 mod declared;
@@ -31,9 +34,11 @@ mod plan;
 mod project;
 mod prompt;
 mod reactions;
+mod resolved;
 mod rex;
 mod screen;
 mod settings;
+mod setup;
 mod shell;
 mod skills;
 mod sound;
@@ -41,6 +46,8 @@ mod status;
 mod table;
 mod task;
 mod term;
+#[cfg(test)]
+mod testing;
 mod transcript;
 mod trigger;
 mod user_shell;
@@ -430,10 +437,7 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
         .open(&log)
         .map_err(|e| e.to_string())?;
     let mut command = agent_command(&bin)?;
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     command
         .env("AGENT_MODEL", model)
         .arg("approver")
@@ -464,10 +468,7 @@ fn start_lookout(options: &Options) -> Result<(), String> {
     // The judge's settings and keys are in Agent's env file, as for the
     // approver.
     let mut command = agent_command(&me)?;
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     let mut child = command
         .arg("lookout")
         .arg("--store")
@@ -485,14 +486,62 @@ fn start_lookout(options: &Options) -> Result<(), String> {
 }
 
 /// The daemon, started the way the CLI starts it when it is not running.
+/// With no provider set anywhere, the person is asked for one first, and a
+/// first model list is written once it runs.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
-    start_daemon(&options.store, &options.socket, false)?;
-    Client::connect(&options.socket)
+    match start_daemon(&options.store, &options.socket, false) {
+        Err(failed) if failed.code.as_deref() == Some("provider_required") => {
+            if !setup::interactive() {
+                return Err(format!("{failed}; run sonny in a terminal to choose one"));
+            }
+            let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+            setup::provider(&bin)?;
+            start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
+        }
+        started => started.map_err(|e| e.to_string())?,
+    }
+    let connected = Client::connect(&options.socket)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
+        tokio::spawn(first_models(connected.0.clone(), path));
+    }
+    Ok(connected)
+}
+
+/// `~/.agent/models`, the list agents read with `agent models`, written
+/// from the providers' listings when there is none yet, as `agent models
+/// --discover` writes it. A provider that will not list leaves it for the
+/// next start.
+async fn first_models(client: Arc<Client>, path: PathBuf) {
+    let Ok(listing) = client.request("provider_models", json!({})).await else {
+        return;
+    };
+    if let Ok(text) = agent_client::models::render(&listing, &[]) {
+        let _ = agent_client::models::install(&path, &text);
+    }
+}
+
+/// Why the daemon did not start: the CLI's error code when it named one,
+/// and what it said.
+pub struct NotStarted {
+    pub code: Option<String>,
+    reason: String,
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not start the daemon: {}", self.reason)
+    }
+}
+
+impl From<String> for NotStarted {
+    fn from(reason: String) -> Self {
+        NotStarted { code: None, reason }
+    }
 }
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
@@ -502,9 +551,9 @@ fn start_daemon(
     store: &std::path::Path,
     socket: &std::path::Path,
     login: bool,
-) -> Result<(), String> {
+) -> Result<(), NotStarted> {
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
     let mut command = std::process::Command::new(&bin);
     if let Some(environment) = login.then(login::environment).flatten() {
@@ -522,13 +571,15 @@ fn start_daemon(
         .map_err(|e| format!("{}: {e}", bin.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let reason = stderr
+        let failure = stderr
             .lines()
             .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|failure| Some(failure["detail"].as_str()?.to_owned()))
-            .unwrap_or_else(|| stderr.trim().to_owned());
-        return Err(format!("could not start the daemon: {reason}"));
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        let field = |name: &str| Some(failure.as_ref()?[name].as_str()?.to_owned());
+        return Err(NotStarted {
+            code: field("error"),
+            reason: field("detail").unwrap_or_else(|| stderr.trim().to_owned()),
+        });
     }
     Ok(())
 }
@@ -694,6 +745,8 @@ async fn run() -> Result<(), String> {
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
     let mut moving = None;
+    // A lead made below another project's folder, and that project's lead.
+    let mut above = None;
     let (name, project) = match &options.bot {
         Some(bot) => {
             if options.new {
@@ -715,6 +768,7 @@ async fn run() -> Result<(), String> {
             let lead = project::open(&client, &dir, options.model.as_deref()).await?;
             fresh = lead.new;
             moving = lead.moving;
+            above = lead.above;
             (lead.bot, Some(lead.project))
         }
     };
@@ -755,6 +809,7 @@ async fn run() -> Result<(), String> {
     }
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
         app.notice = Some(format!(
@@ -763,7 +818,7 @@ async fn run() -> Result<(), String> {
     }
     // The person's agent can react to them; a side chat calls no tool.
     if options.side.is_none() {
-        app.declare = declared::declare(&bot);
+        app.declare = declared::declare(&bot, project.is_some());
     }
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
@@ -785,11 +840,18 @@ async fn run() -> Result<(), String> {
             app.notice = fleet.note.clone();
         }
     }
+    if let Some(above) = above
+        && app.notice.is_none()
+    {
+        app.notice = Some(format!(
+            "a new lead for this folder; {above} leads the folder above: sonny --bot {above}"
+        ));
+    }
     app.lead = project::lead(&app.options.socket, &bot);
     // Task copies a restart unmounted are mounted again before any task
     // works in its folder.
     if project.is_some()
-        && let Some(error) = task::remount().pop()
+        && let Some(error) = task::remount(&app.options.socket).pop()
     {
         app.notice = Some(error);
     }
@@ -834,6 +896,10 @@ async fn run() -> Result<(), String> {
         app.move_to = Some(app.workspace.clone());
     }
     app.project = project;
+    // A new project's lead has no history yet: Sonny says hello over it.
+    if fresh && options.side.is_none() {
+        app.welcome = Some(Vec::new());
+    }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
@@ -858,7 +924,13 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .model
         .clone()
         .or_else(|| std::env::var("AGENT_MODEL").ok())
-        .ok_or("--new needs --model PROVIDER/MODEL")?;
+        .map_or_else(
+            || agent_client::config::load().map(|c| c.model),
+            |m| Ok(Some(m)),
+        )?
+        .ok_or(
+            "--new needs --model PROVIDER/MODEL, AGENT_MODEL, or model in ~/.agent/config.toml",
+        )?;
     let workspace = match &options.workspace {
         Some(dir) => std::path::absolute(dir).map_err(|e| e.to_string())?,
         None => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -871,6 +943,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
+    if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
+        asked["settings"] = json!({"cache_ttl": ttl});
+    }
     let tools = DEFAULT_TOOLS.map(String::from);
     if let Value::Object(fields) = &mut asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
@@ -1098,6 +1173,14 @@ struct Running {
     started: Instant,
     /// What the status row says the bot is doing.
     phase: String,
+    /// The lookout's note started it: it ends quietly unless the bot
+    /// says something.
+    note: bool,
+}
+
+/// Whether the lookout sent the turn: its note, by its request ID.
+fn from_lookout(data: &Value) -> bool {
+    (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
 }
 
 /// The most of the person's refused commands kept for their next
@@ -1118,7 +1201,8 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, unlisted.
+/// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
+/// open `/background`, unlisted.
 const COMMANDS: [(&str, &str); 15] = [
     (
         "/side",
@@ -1132,7 +1216,10 @@ const COMMANDS: [(&str, &str); 15] = [
     ("/approvals", "whether calls wait for a verdict"),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
-    ("/lookout", "what the lookout watches for this agent"),
+    (
+        "/background",
+        "triggers and lookout subscriptions: fire or remove them",
+    ),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/verbose",
@@ -1140,7 +1227,7 @@ const COMMANDS: [(&str, &str); 15] = [
     ),
     (
         "/fullscreen",
-        "Sonny owns the screen (select, copy, scroll), or writes into the scrollback",
+        "full screen (the default), or inline in the terminal's scrollback",
     ),
     (
         "/copies",
@@ -1151,6 +1238,17 @@ const COMMANDS: [(&str, &str); 15] = [
     ("/open", "the last HTML page, in your browser"),
     ("/quit", "the agents keep working"),
 ];
+
+/// What an agent's last few items say, for `/status`.
+#[derive(Default)]
+struct Latest {
+    /// Its latest step, as a line.
+    step: String,
+    /// The pull request its latest reply links.
+    pr: Option<String>,
+    /// The question it asked the person and has no answer to yet.
+    ask: Option<String>,
+}
 
 /// `/status` on its own screen, its timers ticking and its rows read
 /// again every two seconds, until Esc.
@@ -1164,6 +1262,10 @@ struct Watch {
     read: Instant,
     /// The lookout's line for the lead.
     lookout: String,
+    /// The resolved tasks are listed, not only counted.
+    resolved: bool,
+    /// `/background` holds the screen instead of the card.
+    background: Option<background::View>,
 }
 
 struct App {
@@ -1190,6 +1292,9 @@ struct App {
     /// Lines let go while `/status` held the screen, past what is kept.
     skipped: usize,
     any_history: bool,
+    /// The welcome over a new project's empty transcript: asked for at
+    /// start, drawn once the width is known, and kept for a repaint.
+    welcome: Option<Vec<Line<'static>>>,
     width: usize,
     /// The terminal's rows, which bound how much of the bot's words is held.
     height: usize,
@@ -1227,6 +1332,9 @@ struct App {
     /// The slash command picked in the menu.
     pick: usize,
     watch: Option<Watch>,
+    /// What `/status` read of each idle agent's history: its last turn
+    /// then, and the question left open.
+    asks_seen: HashMap<String, (i64, Option<String>)>,
     /// The live area is drawn afresh: the main screen is back from `/status`.
     redraw: bool,
     sounds: sound::Sounds,
@@ -1236,6 +1344,12 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// Pictures given with the message being written, each behind its
+    /// placeholder in the composer: [`attach::placeholder`] of its place
+    /// here, from 1.
+    /// Pictures attached to the draft, by their placeholders' numbers; one
+    /// neither the draft nor Ctrl-Y can bring back is let go.
+    pictures: Vec<Option<attach::Picture>>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
     /// The bot's latest replies, by node, with their first lines: what
@@ -1243,6 +1357,8 @@ struct App {
     replies: Vec<(i64, String)>,
     /// `/react`'s list is open, at this reply from the newest.
     reacting: Option<usize>,
+    /// What Ctrl+F looks for on the full screen, while it does.
+    finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
     react_to: Option<(i64, String)>,
     /// The turn of the last reaction sent, whose attaching says nothing.
@@ -1274,6 +1390,12 @@ struct App {
     repaint: bool,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
+    /// The node before it, while the bot has older ones.
+    older: Option<i64>,
+    /// The full screen was scrolled past its first row: older items are
+    /// read, and the view held where it was while all is drawn again.
+    want_older: bool,
+    hold_view: bool,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -1322,6 +1444,9 @@ struct App {
     screen: screen::Screen,
     /// Into the full screen, or out of it, at the next repaint.
     switch_screen: bool,
+    /// How many triggers and subscriptions run for this agent, as the
+    /// footer's `↻` says, and when they were last counted.
+    behind: (usize, Option<Instant>),
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1628,6 +1753,19 @@ impl Fleet {
         }
     }
 
+    /// A task the lead resolved: its window closes, unless new work has
+    /// it at work again.
+    fn resolved(&mut self, task: &str) {
+        if self.lineage.contains(task)
+            && !matches!(self.doing.get(task), Some(&"working" | &"needs you"))
+        {
+            self.ended.remove(task);
+            self.layout.close(task);
+            self.doing.remove(task);
+            self.name_windows();
+        }
+    }
+
     /// A window for each Errand job started since: `errand attach` on its
     /// handle, named after its command.
     async fn follow_jobs(&mut self) {
@@ -1696,15 +1834,19 @@ impl Fleet {
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
-                "done" if bot == self.lead => {
-                    Some((sound::Alert::LeadDone, format!("{short} is done")))
-                }
+                // The lead's view rings for its own ends: only it knows
+                // whether a turn the lookout started said anything.
+                "done" if bot == self.lead => None,
                 "done" => Some((sound::Alert::TaskDone, format!("{short} is done"))),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
                 "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
                 _ => None,
             };
             self.alerts.extend(alert);
+            // A task that waits needs little of its copy's memory.
+            if bot != self.lead && matches!(doing, "done" | "failed" | "needs you") {
+                task::trim(bot);
+            }
         }
     }
 
@@ -1870,6 +2012,7 @@ impl App {
             pending: Vec::new(),
             skipped: 0,
             any_history: false,
+            welcome: None,
             width: 80,
             height: 24,
             live: None,
@@ -1878,6 +2021,7 @@ impl App {
                 turn,
                 started: Instant::now(),
                 phase: "Working".into(),
+                note: false,
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
@@ -1900,13 +2044,17 @@ impl App {
             turn_model: None,
             pick: 0,
             watch: None,
+            behind: (0, None),
+            asks_seen: HashMap::new(),
             redraw: false,
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
             reacting: None,
+            finding: None,
             react_to: None,
             reaction_turn: None,
             declare: None,
@@ -1920,6 +2068,9 @@ impl App {
             down: false,
             repaint: false,
             first_node: None,
+            older: None,
+            want_older: false,
+            hold_view: false,
             verbose: false,
             instruct: None,
             move_to: None,
@@ -1956,6 +2107,10 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        if let Some(welcome) = self.welcome.as_mut() {
+            *welcome = banner::welcome(&self.bot, &tilde(&self.workspace), &self.model, self.width);
+        }
+        self.draw_welcome();
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2090,6 +2245,10 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
+            self.count_behind();
+            if std::mem::take(&mut self.want_older) {
+                self.older().await;
+            }
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
             {
@@ -2109,7 +2268,7 @@ impl App {
             self.shown.extend(user_shell::lines(&ran, self.width));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
-            match self.send(record.clone(), Some(SHELL), false).await {
+            match self.send(record.clone(), Some(SHELL), false, &[]).await {
                 Ok(()) => self.ran_here.extend(user_shell::read(&record)),
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
@@ -2341,7 +2500,11 @@ impl App {
             own_screen(!full());
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
+        let back = self.screen.back();
         self.screen.clear();
+        if std::mem::take(&mut self.hold_view) {
+            self.screen.hold(back);
+        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2364,12 +2527,43 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        self.draw_welcome();
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
             Some(first) => self.history_since(first - 1, true).await,
             None => self.history().await,
         }
         Ok(())
+    }
+
+    /// The page of items before the oldest drawn, read by drawing the
+    /// conversation again from there once idle.
+    async fn older(&mut self) {
+        let Some(from) = self.older else {
+            return;
+        };
+        let asked = json!({"bot": self.bot, "from": from, "limit": HISTORY_ITEMS});
+        let page = match self.client.request("history_nodes", asked).await {
+            Ok(page) => page,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(oldest) = (page["nodes"].as_array())
+            .and_then(|nodes| nodes.last())
+            .and_then(|node| node["node"].as_i64())
+        else {
+            self.older = None;
+            return;
+        };
+        self.first_node = Some(oldest);
+        self.older = page["next_from"].as_i64();
+        self.hold_view = true;
+        self.repaint = true;
+        if self.running.is_some() {
+            self.notice = Some("older messages once this turn ends".into());
+        }
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -2455,7 +2649,9 @@ impl App {
                     turn,
                     started: Instant::now(),
                     phase: "Working".into(),
+                    note: false,
                 });
+                self.turn_began().await;
                 status_report("working", &self.bot);
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
@@ -2510,6 +2706,13 @@ impl App {
     }
 
     /// Commit a finished cell, a blank line apart from the one before.
+    /// The welcome, first in the transcript, when this window has one.
+    fn draw_welcome(&mut self) {
+        if let Some(welcome) = self.welcome.clone() {
+            self.commit(welcome);
+        }
+    }
+
     fn commit(&mut self, lines: Vec<Line<'static>>) {
         self.commit_after(lines, true);
     }
@@ -2540,12 +2743,17 @@ impl App {
 
     /// [`App::items`], each with the node it is kept at.
     async fn items_at(&self, nodes: &[i64]) -> Vec<(i64, Value)> {
+        self.items_of(&self.bot, nodes).await
+    }
+
+    /// [`App::items_at`] for any bot.
+    async fn items_of(&self, bot: &str, nodes: &[i64]) -> Vec<(i64, Value)> {
         let mut items = Vec::new();
         let mut rest = nodes;
         while !rest.is_empty() {
             let Ok(read) = self
                 .client
-                .request("history_items", json!({"bot": self.bot, "nodes": rest}))
+                .request("history_items", json!({"bot": bot, "nodes": rest}))
                 .await
             else {
                 break;
@@ -2607,6 +2815,8 @@ impl App {
         // On attach the newest page; on reconnecting, every page back to
         // the last node this window drew, so nothing missed is skipped.
         let mut nodes: Vec<i64> = Vec::new();
+        // The turn each node was made in, for the tasks the lead resolved.
+        let mut turns: HashMap<i64, i64> = HashMap::new();
         let mut asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS});
         if every {
             asked["min_node"] = json!(after + 1);
@@ -2615,14 +2825,19 @@ impl App {
             let Ok(page) = self.client.request("history_nodes", asked.clone()).await else {
                 return;
             };
-            nodes.extend(
-                page["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|n| n["node"].as_i64())
-                    .filter(|node| *node > after),
-            );
+            // On attach, where older items start.
+            if !every {
+                self.older = page["next_from"].as_i64();
+            }
+            for n in page["nodes"].as_array().into_iter().flatten() {
+                let Some(node) = n["node"].as_i64().filter(|node| *node > after) else {
+                    continue;
+                };
+                nodes.push(node);
+                if let Some(turn) = n["turn"].as_i64() {
+                    turns.insert(node, turn);
+                }
+            }
             if !every || page["next_from"].is_null() {
                 break;
             }
@@ -2725,6 +2940,10 @@ impl App {
                         {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
+                            if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                                self.resolve(&arguments, id, turns.get(&node).copied(), false)
+                                    .await;
+                            }
                             if name == asks::TOOL
                                 && !failed
                                 && !reactions::refused(&item)
@@ -3033,6 +3252,7 @@ impl App {
                     turn: turn.unwrap_or(0),
                     started: Instant::now(),
                     phase: "Working".into(),
+                    note: from_lookout(data),
                 });
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
@@ -3280,6 +3500,12 @@ impl App {
                 if name == asks::TOOL && !shown.1 {
                     self.asked(id, &arguments);
                 }
+                if name == resolved::TOOL
+                    && !shown.1
+                    && !reactions::refused(&json!({"output": shown.0}))
+                {
+                    self.resolve(&arguments, id, turn, true).await;
+                }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
                     self.rows_drawn += held.len();
@@ -3321,28 +3547,32 @@ impl App {
                 }
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
-                let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
+                let running = self.running.take();
+                let note = running.as_ref().is_some_and(|r| r.note);
+                let seconds = running.map(|r| r.started.elapsed().as_secs());
                 let line = transcript::finished(status, detail, seconds, self.width);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
-                let words = self.live.as_ref().is_some_and(|live| !live.rows.is_empty());
+                // Rows already drawn above, as a long reply spills, count.
+                let words =
+                    (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
+                let ended = matches!(status, "completed" | "steered");
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
                     && self.answering.as_ref().map(|(_, at)| *at) == Some(self.rows_drawn);
                 if only_reacted {
                     self.draw_bot_reactions();
                 }
+                // A turn the lookout's note started that ended with nothing
+                // to say stays under its task updates: no line, no sound.
+                let quiet = note && !words && ended;
                 // A turn that ended well puts its reply under the line, apart
                 // from the steps above; one written as it came, or one
                 // that failed, keeps the line under it.
                 match self.live.take() {
-                    _ if only_reacted && matches!(status, "completed" | "steered") => {}
-                    Some(live)
-                        if !live.spilled
-                            && !live.rows.is_empty()
-                            && matches!(status, "completed" | "steered") =>
-                    {
+                    _ if (only_reacted || quiet) && ended => {}
+                    Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
                         self.commit(vec![line]);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
                     }
@@ -3358,6 +3588,7 @@ impl App {
                 self.notice = None;
                 status_report(
                     match status {
+                        _ if quiet => "idle",
                         "completed" | "steered" => "done",
                         "interrupted" => "idle",
                         _ => "error",
@@ -3365,18 +3596,21 @@ impl App {
                     &self.bot,
                 );
                 self.configure().await;
-                if self.fleet.is_none() {
-                    match status {
-                        "completed" | "steered" => {
-                            let what = format!("{} is done", self.bot);
-                            self.sounds.alert(sound::Alert::LeadDone, &what)
-                        }
-                        "interrupted" => {}
-                        _ => {
-                            let what = format!("{} failed", self.bot);
-                            self.sounds.alert(sound::Alert::Failed, &what)
-                        }
+                // Only this view knows whether the turn said anything, so it
+                // rings for the end of every turn of its own; the project's
+                // other ends ring from the fleet.
+                match status {
+                    _ if quiet => {}
+                    "completed" | "steered" => {
+                        let what = format!("{} is done", self.bot);
+                        self.sounds.alert(sound::Alert::LeadDone, &what)
                     }
+                    "interrupted" => {}
+                    _ if self.fleet.is_none() => {
+                        let what = format!("{} failed", self.bot);
+                        self.sounds.alert(sound::Alert::Failed, &what)
+                    }
+                    _ => {}
                 }
             }
             "deleted" => {
@@ -3384,6 +3618,61 @@ impl App {
                 self.running = None;
             }
             _ => {}
+        }
+    }
+
+    /// The store as the daemon names it, which the marks of resolved
+    /// tasks are kept beside.
+    fn store(&self) -> PathBuf {
+        agent_client::socket::canonical_store(&self.options.store)
+            .unwrap_or_else(|_| self.options.store.clone())
+    }
+
+    /// Note the task a lead's `resolve_task` call `call` in `turn` names
+    /// as resolved, up to its newest turn finished by then: `now`, as it
+    /// happens, when its window closes too; replayed, by the time the
+    /// lead's turn ended, unless the mark it made then is kept.
+    async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
+            return;
+        };
+        if !now && resolved::made_by(&self.store(), &task, call) {
+            return;
+        }
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let at = match now {
+            true => clock,
+            false => self
+                .client
+                .request(
+                    "turns",
+                    json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
+                )
+                .await
+                .ok()
+                .and_then(|page| page["turns"][0]["finished_ms"].as_i64())
+                .unwrap_or(clock),
+        };
+        // A task that is gone has nothing to resolve.
+        let Ok(page) = self
+            .client
+            .request("turns", json!({"bot": task, "newest": true, "limit": 16}))
+            .await
+        else {
+            return;
+        };
+        let upto = resolved::upto(page["turns"].as_array().map_or(&[][..], Vec::as_slice), at);
+        if let Err(error) = resolved::keep(&self.store(), &task, upto, call) {
+            self.notice = Some(error);
+        }
+        if now && let Some(fleet) = &mut self.fleet {
+            fleet.resolved(&task);
         }
     }
 
@@ -3398,6 +3687,31 @@ impl App {
             }
         };
         let jobs = errand::jobs(self.folder_name()).await;
+        self.watch(project, rows, jobs, None);
+    }
+
+    /// What runs for the project's agents with no one typing. Open
+    /// `/background`: its own screen, as `/status` has, until Esc.
+    fn background(&mut self) {
+        let scope = self.scope();
+        let project = scope.project.clone();
+        let view = background::View::open(
+            scope,
+            self.options.store.clone(),
+            self.client.store().map(str::to_owned),
+            self.bot.clone(),
+        );
+        self.watch(project, Vec::new(), Vec::new(), Some(view));
+    }
+
+    /// Give `/status`, or `/background`, the screen.
+    fn watch(
+        &mut self,
+        project: String,
+        rows: Vec<status::Row>,
+        jobs: Vec<status::Row>,
+        background: Option<background::View>,
+    ) {
         // The full screen is the alternate screen already.
         if !full() {
             let _ = execute!(std::io::stdout(), EnterAlternateScreen);
@@ -3415,6 +3729,8 @@ impl App {
                     jobs,
                     read: Instant::now(),
                     lookout: self.lookout_line(),
+                    resolved: false,
+                    background,
                 })
             }
             Err(error) => {
@@ -3427,6 +3743,13 @@ impl App {
     }
 
     async fn reread(&mut self) {
+        if let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.background
+        {
+            view.reload();
+            watch.read = Instant::now();
+            return;
+        }
         let jobs = errand::jobs(self.folder_name()).await;
         let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
@@ -3437,6 +3760,23 @@ impl App {
             watch.read = Instant::now();
             watch.lookout = lookout;
         }
+    }
+
+    /// Count what runs for this agent in the background again, every ten
+    /// seconds: files read, no daemon call.
+    fn count_behind(&mut self) {
+        if self
+            .behind
+            .1
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
+            || self.options.side.is_some()
+        {
+            return;
+        }
+        let items = background::read(&self.options.store, self.client.store(), |bot| {
+            bot == self.bot
+        });
+        self.behind = (background::count(&items, &self.bot), Some(Instant::now()));
     }
 
     /// What the lookout does for this window's lead.
@@ -3455,8 +3795,9 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// The project's agents, as `/status` shows them.
-    async fn status_rows(&self) -> Result<(String, Vec<status::Row>), String> {
+    /// The agents `/status` and `/background` cover: the project's, and
+    /// its lead; a lone agent's only.
+    fn scope(&self) -> background::Scope {
         let (project, lead) = match &self.project {
             Some(project) => (project.clone(), format!("{project}.lead")),
             None => (
@@ -3464,11 +3805,28 @@ impl App {
                 self.bot.clone(),
             ),
         };
-        let pattern = if self.bot.contains('.') || self.project.is_some() {
+        let glob = if self.bot.contains('.') || self.project.is_some() {
             format!("{project}.*")
         } else {
             self.bot.clone()
         };
+        background::Scope {
+            project,
+            lead,
+            glob,
+        }
+    }
+
+    /// The project's agents, as `/status` shows them.
+    async fn status_rows(&mut self) -> Result<(String, Vec<status::Row>), String> {
+        let background::Scope {
+            project,
+            lead,
+            glob: pattern,
+        } = self.scope();
+        let behind = background::read(&self.options.store, self.client.store(), |bot| {
+            lookout::subs::matches(&pattern, bot)
+        });
         let Ok(page) = self
             .client
             .request("bots", json!({"name": pattern, "limit": 256}))
@@ -3485,21 +3843,32 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let store = self.store();
         let mut rows = Vec::new();
         // Side chats are not the project's agents.
         for bot in page["bots"].as_array().into_iter().flatten() {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            let turn = self
+            let turns = self
                 .client
-                .request("turns", json!({"bot": name, "newest": true, "limit": 1}))
+                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
                 .await
                 .ok()
-                .and_then(|page| page["turns"].get(0).cloned())
-                .unwrap_or(Value::Null);
+                .and_then(|page| page["turns"].as_array().cloned())
+                .unwrap_or_default();
+            let turn = turns.first().cloned().unwrap_or(Value::Null);
+            // A message steered into a running turn is recorded as a turn
+            // of its own that never ran: the time is the one it joined.
+            let ran = turns
+                .iter()
+                .find(|turn| turn["status"] != "steered")
+                .unwrap_or(&Value::Null);
             let running = !bot["running_turn"].is_null();
-            let state = match (running, turn["status"].as_str()) {
+            let state = match (
+                running,
+                if running { &turn } else { ran }["status"].as_str(),
+            ) {
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
                 }
@@ -3522,11 +3891,46 @@ impl App {
                 (false, Some(other)) => other.to_owned(),
                 (false, None) => "idle".into(),
             };
-            let at = if running {
-                turn["started_ms"].as_u64()
-            } else {
-                turn["finished_ms"].as_u64()
+            // A running turn counts on from its start; one that ended
+            // shows how long it took.
+            let started = ran["started_ms"].as_u64();
+            let finished = ran["finished_ms"].as_u64();
+            let (at, seconds) = match running {
+                true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
+                false => (
+                    finished,
+                    started
+                        .zip(finished)
+                        .map(|(began, ended)| ended.saturating_sub(began) / 1000),
+                ),
             };
+            let resolved =
+                resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
+            let Latest { mut step, pr, ask } = self.latest(name).await;
+            // A question stays open until its answer lands, past work that
+            // does not wait on it and messages that answer something else:
+            // an idle agent's recent history is read once per turn it
+            // ended. A running turn shows its work, as its last items say;
+            // a question still open shows again once it ends.
+            let ask = match turn["turn"].as_i64() {
+                Some(last) if !running => match self.asks_seen.get(name) {
+                    Some((seen, ask)) if *seen == last => ask.clone(),
+                    _ => {
+                        let ask = self.open_ask(name).await;
+                        self.asks_seen.insert(name.to_owned(), (last, ask.clone()));
+                        ask
+                    }
+                },
+                _ => ask,
+            };
+            if let Some(question) = &ask {
+                step = format!("asks: {}", first_line(question));
+            }
+            let state = match ask {
+                Some(_) if !running && !resolved => "needs you".to_owned(),
+                _ => state,
+            };
+            let group = status::group(&state, running, ask.is_some(), pr.is_some(), resolved);
             let place = match places.get(name) {
                 Some((tab, Some((side, other)))) => {
                     format!("tab {tab}, {side} {}", short(other, &project, &lead))
@@ -3546,32 +3950,102 @@ impl App {
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 state,
-                seconds: at.map(|at| now.saturating_sub(at) / 1000),
+                running,
+                seconds,
+                at,
                 model,
-                latest: self.latest(name).await,
+                latest: step,
                 place,
+                pr: pr.unwrap_or_default(),
+                background: background::fact(&behind, name),
+                group,
             });
         }
-        // The lead first, then what needs the person, what works, the rest.
-        let rank = |row: &status::Row| match row.state.as_str() {
-            _ if row.name == "lead" => 0,
-            "needs you" => 1,
-            "working" => 2,
-            s if s.starts_with("waiting") => 3,
-            _ => 4,
-        };
-        rows.sort_by_key(|row| (rank(row), row.seconds.unwrap_or(u64::MAX)));
+        // The lead first, then by group, the latest first in each.
+        rows.sort_by_key(|row| {
+            (
+                row.name != "lead",
+                row.group,
+                std::cmp::Reverse(row.at.unwrap_or(0)),
+            )
+        });
         Ok((project, rows))
     }
 
-    /// An agent's latest step, as a line.
-    async fn latest(&self, bot: &str) -> String {
+    /// Count the running turn's time from when the daemon started it, not
+    /// from when this window first saw it run.
+    async fn turn_began(&mut self) {
+        let Some(turn) = self.running.as_ref().map(|r| r.turn) else {
+            return;
+        };
         let Ok(page) = self
             .client
-            .request("history_nodes", json!({"bot": bot, "limit": 3}))
+            .request(
+                "turns",
+                json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
+            )
             .await
         else {
-            return String::new();
+            return;
+        };
+        let Some(started) = page["turns"]
+            .get(0)
+            .filter(|row| row["turn"] == turn)
+            .and_then(|row| row["started_ms"].as_u64())
+        else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ago = Duration::from_millis(now.saturating_sub(started));
+        if let Some(running) = &mut self.running
+            && let Some(began) = Instant::now().checked_sub(ago)
+        {
+            running.started = began;
+        }
+    }
+
+    /// The oldest question `bot` asked and has no answer to, read from its
+    /// newest 400 nodes.
+    async fn open_ask(&self, bot: &str) -> Option<String> {
+        let page = self
+            .client
+            .request("history_nodes", json!({"bot": bot, "limit": 400}))
+            .await
+            .ok()?;
+        let nodes: Vec<i64> = page["nodes"]
+            .as_array()?
+            .iter()
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        let mut items = Vec::new();
+        for chunk in nodes.chunks(100) {
+            // Newest first, as the nodes were asked for; each node's items
+            // newest first too.
+            let mut read = self.items_of(bot, chunk).await.into_iter().peekable();
+            while let Some((node, item)) = read.next() {
+                let mut kept = vec![item];
+                while let Some((_, item)) = read.next_if(|(next, _)| *next == node) {
+                    kept.push(item);
+                }
+                items.extend(kept.into_iter().rev());
+            }
+        }
+        asks::open(&items)
+    }
+
+    /// An agent's latest step, as a line; the pull request its latest
+    /// reply links; and the question it asked the person, when that is
+    /// still open. Its last few items say: asking ends a turn.
+    async fn latest(&self, bot: &str) -> Latest {
+        let Ok(page) = self
+            .client
+            .request("history_nodes", json!({"bot": bot, "limit": 4}))
+            .await
+        else {
+            return Latest::default();
         };
         let nodes: Vec<i64> = page["nodes"]
             .as_array()
@@ -3584,7 +4058,7 @@ impl App {
             .request("history_items", json!({"bot": bot, "nodes": nodes}))
             .await
         else {
-            return String::new();
+            return Latest::default();
         };
         // Newest first, as the nodes were asked for.
         let items: Vec<Value> = read["items"]
@@ -3593,6 +4067,23 @@ impl App {
             .flatten()
             .map(|entry| entry["item"].clone())
             .collect();
+        let pr = items
+            .iter()
+            .find(|item| item["role"] == "assistant")
+            .and_then(|item| status::pull_request(&text(item)));
+        let flat: Vec<Value> = items
+            .iter()
+            .flat_map(|item| responses(item).into_iter().rev())
+            .collect();
+        Latest {
+            ask: asks::open(&flat),
+            pr,
+            step: Self::step(items),
+        }
+    }
+
+    /// The newest of `items` that reads as a step, as a line.
+    fn step(items: Vec<Value>) -> String {
         for item in items {
             match (item["type"].as_str(), item["role"].as_str()) {
                 (_, Some("assistant")) => return status::plain_line(&text(&item)),
@@ -3724,7 +4215,17 @@ impl App {
     /// the selection, and the keys that scroll. Whether it took `event`.
     fn full_screen(&mut self, event: &Event) -> bool {
         let key = match event {
+            // A paste while finding is more to find.
+            Event::Paste(text) if let Some(query) = &mut self.finding => {
+                query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
+                self.screen.find(query);
+                return true;
+            }
             Event::Mouse(mouse) => {
+                let up = mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp;
+                if up && self.screen.at_top() && self.older.is_some() {
+                    self.want_older = true;
+                }
                 match self.screen.mouse(*mouse) {
                     Some(screen::Action::Copy(text)) => self.copied(&text),
                     Some(screen::Action::Open(link)) => {
@@ -3739,16 +4240,52 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return false,
         };
-        let copy = key.code == KeyCode::Char('c')
-            && (key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::SUPER));
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let copy =
+            key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        if let Some(query) = &mut self.finding {
+            match key.code {
+                KeyCode::Esc => self.finding = None,
+                _ if copy => self.finding = None,
+                KeyCode::Up | KeyCode::Enter => self.screen.find_next(true),
+                KeyCode::Char('f' | 'p') if ctrl => self.screen.find_next(true),
+                KeyCode::Down => self.screen.find_next(false),
+                KeyCode::Char('n') if ctrl => self.screen.find_next(false),
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.screen.find(query);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    query.push(c);
+                    self.screen.find(query);
+                }
+                KeyCode::PageUp => self.page_up(),
+                KeyCode::PageDown => self.screen.page(false),
+                _ => {}
+            }
+            if self.finding.is_none() {
+                self.screen.end_find();
+            }
+            return true;
+        }
         match key.code {
+            // Over the composer, not over a list open on it.
+            KeyCode::Char('f')
+                if ctrl
+                    && self.picker.is_none()
+                    && self.choosing.is_none()
+                    && self.reacting.is_none() =>
+            {
+                self.screen.unselect();
+                self.finding = Some(String::new());
+                self.screen.find("");
+            }
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
             }
             KeyCode::Esc if self.screen.unselect() => {}
-            KeyCode::PageUp => self.screen.page(true),
+            KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.screen.page(false),
             // Sending goes back to the newest rows, where its answer comes.
             KeyCode::Enter => {
@@ -3758,6 +4295,14 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A page up the full screen, or the page before its first row.
+    fn page_up(&mut self) {
+        if self.screen.at_top() && self.older.is_some() {
+            self.want_older = true;
+        }
+        self.screen.page(true);
     }
 
     /// `text` put on the clipboard, and said so.
@@ -3771,19 +4316,46 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
-        // Ctrl-H is the backspace a terminal sends as 0x08, which reads as
-        // Ctrl and `h`: it deletes, as in a shell.
+        // Keys a shell reads as others: Ctrl-H is the backspace a terminal
+        // sends as 0x08, which reads as Ctrl and `h` (with Alt, it deletes
+        // a word, as Alt-Backspace does); Ctrl-P and Ctrl-N go up and down.
         if let Event::Key(key) = &mut event
-            && key.code == KeyCode::Char('h')
-            && key.modifiers == KeyModifiers::CONTROL
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(code) = match key.code {
+                KeyCode::Char('h') => Some(KeyCode::Backspace),
+                KeyCode::Char('p') => Some(KeyCode::Up),
+                KeyCode::Char('n') => Some(KeyCode::Down),
+                _ => None,
+            }
         {
-            key.code = KeyCode::Backspace;
-            key.modifiers = KeyModifiers::NONE;
+            key.code = code;
+            key.modifiers -= KeyModifiers::CONTROL;
         }
         if full() && self.watch.is_none() && self.full_screen(&event) {
             return;
         }
-        if self.watch.is_some() {
+        if let Some(watch) = &mut self.watch {
+            if let Some(view) = &mut watch.background {
+                if let Event::Key(key) = event
+                    && key.kind != KeyEventKind::Release
+                    && view.key(key) == background::Key::Close
+                {
+                    self.watch = None;
+                    if !full() {
+                        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                    }
+                    self.redraw = true;
+                }
+                return;
+            }
+            if let Event::Key(key) = event
+                && key.kind != KeyEventKind::Release
+                && key.code == KeyCode::Char('r')
+                && key.modifiers.is_empty()
+            {
+                watch.resolved = !watch.resolved;
+                return;
+            }
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
                 && (matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
@@ -3906,7 +4478,11 @@ impl App {
                     self.pick = 0;
                     return;
                 }
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
                     self.input.set(picked);
                     self.pick = 0;
                     self.submit().await;
@@ -3922,9 +4498,19 @@ impl App {
         }
         match event {
             // Terminals send a pasted line break as a carriage return.
-            Event::Paste(text) => self
-                .input
-                .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
+            // Image files dropped on the terminal arrive as their paths.
+            Event::Paste(text) => {
+                match attach::paths(&text, std::path::Path::new(&self.workspace)) {
+                    Some(paths) => {
+                        for path in paths {
+                            self.attach(attach::load(&path));
+                        }
+                    }
+                    None => self
+                        .input
+                        .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
+                }
+            }
             Event::Resize(width, _) => self.width = width as usize,
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -3936,13 +4522,13 @@ impl App {
                         if self.input.is_empty() {
                             self.quit = true;
                         } else {
-                            self.input.clear();
+                            self.discard();
                         }
                     }
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
-                        if !self.approvals.is_empty() && self.input.is_empty() =>
+                        if !ctrl && !alt && !self.approvals.is_empty() && self.input.is_empty() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -3960,11 +4546,23 @@ impl App {
                     KeyCode::Char('u') if ctrl => self.input.delete_to_start(),
                     KeyCode::Char('k') if ctrl => self.input.delete_to_end(),
                     KeyCode::Char('w') if ctrl => self.input.delete_word(),
+                    KeyCode::Char('y') if ctrl => self.input.yank(),
+                    // Ctrl-J is the line feed a terminal sends for it.
+                    KeyCode::Char('j') if ctrl => self.input.insert("\n"),
+                    // A picture on the clipboard, as Codex and Claude Code
+                    // take one: terminals paste only text.
+                    KeyCode::Char('v') if ctrl => match attach::clipboard() {
+                        Ok(Some(picture)) => self.attach(Ok(picture)),
+                        Ok(None) => self.notice = Some("no picture on the clipboard".into()),
+                        Err(error) => self.notice = Some(error),
+                    },
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
+                    KeyCode::Char('d') if alt => self.input.delete_word_forward(),
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
+                    KeyCode::Delete if ctrl || alt => self.input.delete_word_forward(),
                     KeyCode::Delete => self.input.delete(),
                     KeyCode::Left if ctrl || alt => self.input.word_left(),
                     KeyCode::Right if ctrl || alt => self.input.word_right(),
@@ -3978,7 +4576,9 @@ impl App {
                     KeyCode::Down => {
                         self.input.down(self.width);
                     }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    // Alt-Enter too, for terminals that send Shift-Enter
+                    // as a plain Enter.
+                    KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
                         self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
@@ -3997,7 +4597,7 @@ impl App {
                             if self.input.is_empty() {
                                 self.quit = true;
                             } else {
-                                self.input.clear();
+                                self.discard();
                             }
                         } else if !self.asks.is_empty() {
                             self.chatting = !self.chatting;
@@ -4043,10 +4643,13 @@ impl App {
             }
             return;
         }
-        if prompt == "/lookout" {
+        if matches!(prompt.as_str(), "/background" | "/triggers" | "/lookout") {
             self.input.clear();
-            let lines = lookout::subscriptions(&self.options.store, &self.bot);
-            self.commit(lines.into_iter().map(|l| Line::from(l).dim()).collect());
+            if self.options.side.is_some() {
+                self.notice = Some("/background is for the agent itself, not a side chat".into());
+            } else {
+                self.background();
+            }
             return;
         }
         if prompt == "/open" {
@@ -4250,8 +4853,10 @@ impl App {
             .strip_prefix("/side")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
+            let pictures = self.placed(question);
             self.input.clear();
-            self.side(question.trim().to_owned()).await;
+            self.pictures.clear();
+            self.side(question.trim().to_owned(), &pictures).await;
             return;
         }
         // What is typed answers the lead's first open question, and goes
@@ -4276,7 +4881,7 @@ impl App {
         // first, each on its own, and this message joins the turn they start.
         let mut join = false;
         while let Some(record) = self.unsent.first().cloned() {
-            if let Err(error) = self.send(record.clone(), Some(SHELL), join).await {
+            if let Err(error) = self.send(record.clone(), Some(SHELL), join, &[]).await {
                 self.notice = Some(error);
                 return;
             }
@@ -4284,10 +4889,12 @@ impl App {
             self.unsent.remove(0);
             join = true;
         }
-        match self.send(prompt, None, join).await {
+        let pictures = self.placed(&prompt);
+        match self.send(prompt, None, join, &pictures).await {
             Ok(()) => {
                 self.input.clear();
                 self.notice = None;
+                self.pictures.clear();
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
@@ -4300,6 +4907,21 @@ impl App {
         }
     }
 
+    /// Drop what is being written, with the pictures it was given.
+    fn discard(&mut self) {
+        self.input.clear();
+        self.pictures.clear();
+    }
+
+    /// The pictures whose placeholders are still in `prompt`, which go
+    /// with it.
+    fn placed(&self, prompt: &str) -> Vec<attach::Picture> {
+        (self.pictures.iter().enumerate())
+            .filter(|(at, _)| prompt.contains(&attach::placeholder(at + 1)))
+            .filter_map(|(_, picture)| picture.clone())
+            .collect()
+    }
+
     /// Send `prompt`: a turn of its own, or a steer of the running one (or
     /// of the one just started, `join`); staged until it lands. `origin`
     /// names what sent it when the person's words did not.
@@ -4308,6 +4930,7 @@ impl App {
         prompt: String,
         origin: Option<&str>,
         join: bool,
+        pictures: &[attach::Picture],
     ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = (join || self.running.is_some()).then_some("steer");
@@ -4324,7 +4947,7 @@ impl App {
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
                     "delivery": delivery, "model": model, "workspace": workspace,
-                    "origin": origin}),
+                    "origin": origin, "images": attach::submitted(pictures)}),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4335,6 +4958,37 @@ impl App {
             self.move_to = None;
         }
         Ok(())
+    }
+
+    /// A picture for the message being written, behind a placeholder put
+    /// where the cursor is; or why there is none.
+    fn attach(&mut self, picture: Result<attach::Picture, String>) {
+        for (at, picture) in self.pictures.iter_mut().enumerate() {
+            let placeholder = attach::placeholder(at + 1);
+            if !self.input.contains(&placeholder) && !self.input.killed().contains(&placeholder) {
+                *picture = None;
+            }
+        }
+        // The daemon takes a message's pictures up to a size together.
+        let placed: usize = (self.placed(&self.input).iter())
+            .map(|placed| placed.data.len())
+            .sum();
+        match picture {
+            Ok(picture) if placed + picture.data.len() > attach::MOST_BYTES => {
+                self.notice = Some(format!(
+                    "a message's pictures may be {} MB together; this one makes {} MB",
+                    attach::MOST_BYTES / 1024 / 1024,
+                    (placed + picture.data.len()).div_ceil(1024 * 1024)
+                ));
+            }
+            Ok(picture) => {
+                self.pictures.push(Some(picture));
+                self.input
+                    .insert(&format!("{} ", attach::placeholder(self.pictures.len())));
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     /// A reply the bot gave, which `/react` offers until newer ones push
@@ -4485,7 +5139,7 @@ impl App {
     /// screen. The copy may call no tool, so it answers from what the bot
     /// knows; the daemon deletes it once it has been idle a quarter hour.
     /// This bot carries on, and its lines wait for the main screen.
-    async fn side(&mut self, question: String) {
+    async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
@@ -4517,7 +5171,8 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "model": self.turn_model}),
+                        "prompt": question, "model": self.turn_model,
+                        "images": attach::submitted(pictures)}),
                 )
                 .await
         {
@@ -4774,6 +5429,22 @@ impl App {
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(Paragraph::new(rows), area);
             }
+            if let Some(query) = &self.finding {
+                let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
+                let place = match self.screen.found() {
+                    Some((_, 0)) if !query.is_empty() => "  not found · ".to_owned(),
+                    Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
+                    _ => "  ".to_owned(),
+                };
+                let keys = Line::from(vec![
+                    Span::raw(place),
+                    Span::raw("↑ or enter older · ↓ newer · esc").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(pick) = self.reacting {
                 // Newest at the bottom, nearest the composer, as they read.
                 let first = pick.saturating_sub(2);
@@ -4972,7 +5643,10 @@ impl App {
                 ])
             })
             .collect();
-        let keep = match self.choosing.is_some() || self.picker.is_some() || self.reacting.is_some()
+        let keep = match self.choosing.is_some()
+            || self.picker.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
         {
             true => 1,
             false => COMPOSER_ROWS,
@@ -5056,6 +5730,11 @@ impl App {
             (None, Some(size)) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
             (None, None) => format!("{}  ", self.bot),
         };
+        // Something runs for it with no one typing: /background lists it.
+        let right = match self.behind.0 {
+            0 => right,
+            n => format!("↻ {n} in background · {right}"),
+        };
         // The folder, and what it is a copy of; its branch is kept whole.
         let folder = match &self.place.copy_of {
             Some(source) => format!("{folder}, a sandfs copy of {}", tilde(source)),
@@ -5081,16 +5760,21 @@ impl App {
     }
 }
 
-/// `/status` on its own screen: the card, its times counted on since it was
-/// read, and how to leave.
+/// `/status` on its own screen: the card, running turns' times counted on
+/// since it was read, and how to leave.
 fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
+    if watch.background.is_some() {
+        return draw_background(watch);
+    }
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
         .rows
         .iter()
         .cloned()
         .map(|mut row| {
-            row.seconds = row.seconds.map(|s| s + since);
+            if row.running {
+                row.seconds = row.seconds.map(|s| s + since);
+            }
             row
         })
         .collect();
@@ -5105,12 +5789,14 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         .collect();
     let project = watch.project.clone();
     let lookout = watch.lookout.clone();
+    let resolved = watch.resolved;
+    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
     watch.screen.autoresize()?;
     watch.screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let mut lines = vec![Line::default()];
-        let mut card = status::card(&project, &rows, &jobs, width);
+        let mut card = status::card(&project, &rows, &jobs, width, resolved);
         if !lookout.is_empty() {
             card.insert(1, Line::from(lookout.clone()).dim());
         }
@@ -5119,7 +5805,12 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
             spans.extend(line.spans);
             Line::from(spans).style(line.style)
         }));
-        let footer = Line::from("  esc to close").dim();
+        // The card says r shows them; once shown, here how to hide them.
+        let footer = match any_resolved && resolved {
+            true => "  esc to close · r hides resolved",
+            false => "  esc to close",
+        };
+        let footer = Line::from(footer).dim();
         let body = ratatui::layout::Rect {
             height: area.height.saturating_sub(1),
             ..area
@@ -5131,6 +5822,41 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         };
         frame.render_widget(Paragraph::new(lines), body);
         frame.render_widget(Paragraph::new(footer), foot);
+    })?;
+    Ok(())
+}
+
+/// `/background` on its own screen: its card, scrolled to keep the picked
+/// row in sight, and the keys it takes.
+fn draw_background(watch: &mut Watch) -> std::io::Result<()> {
+    let Some(view) = &watch.background else {
+        return Ok(());
+    };
+    watch.screen.autoresize()?;
+    watch.screen.draw(|frame| {
+        let area = frame.area();
+        let width = area.width.saturating_sub(2) as usize;
+        let (card, at) = view.card(width);
+        let height = area.height.saturating_sub(2) as usize;
+        // The picked row, and the two under it, stay on the screen.
+        let skip = (at + 3).saturating_sub(height);
+        let mut lines = vec![Line::default()];
+        lines.extend(card.into_iter().skip(skip).map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
+        let body = ratatui::layout::Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let foot = ratatui::layout::Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(lines), body);
+        frame.render_widget(Paragraph::new(view.footer()), foot);
     })?;
     Ok(())
 }
@@ -5209,7 +5935,12 @@ fn first_line(text: &str) -> String {
 
 /// A message item's text.
 fn text(item: &Value) -> String {
-    match &item["content"] {
+    joined(&item["content"])
+}
+
+/// Text, or the text of a list of parts, leaving out the pictures.
+fn joined(content: &Value) -> String {
+    match content {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
@@ -5223,10 +5954,11 @@ fn text(item: &Value) -> String {
 /// A tool result's text, and whether it failed. A shell result is JSON
 /// with its streams and exit status.
 fn output(item: &Value) -> (String, bool) {
-    let raw = item["output"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| text(item));
+    // A result with a picture (an image file read) is a list of parts.
+    let raw = match &item["output"] {
+        Value::Null => text(item),
+        output => joined(output),
+    };
     let failed = item["failed"] == true;
     match serde_json::from_str::<Value>(&raw) {
         Ok(shell) if shell.get("exit_code").is_some() => {
@@ -5871,6 +6603,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_the_lookout_started_ends_quietly_unless_it_speaks() {
+        let client = daemon_answering(|_| {
+            json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Docs are blocked."}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        let lines = |app: &App| -> Vec<String> {
+            app.pending.iter().map(|line| line.to_string()).collect()
+        };
+        let note = json!({"request_id": "lookout-ab12"});
+        // Read what came in, nothing to say: no line under it.
+        app.daemon(turn_event("accepted", 1, note.clone())).await;
+        assert!(app.running.as_ref().is_some_and(|r| r.note));
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(!lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        // One that says something ends as any other turn.
+        app.daemon(turn_event("accepted", 2, note)).await;
+        app.daemon(
+            json!({"event": "text_delta", "bot": "b", "turn": 2, "text": "Docs are blocked."}),
+        )
+        .await;
+        app.daemon(turn_event("message", 2, json!({"node": 4})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let rows = lines(&app);
+        assert!(rows.iter().any(|row| row.starts_with("─ Worked")));
+        assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
+        // A reply long enough to spill above as it streams still speaks.
+        app.pending.clear();
+        app.height = 8;
+        app.daemon(turn_event(
+            "accepted",
+            4,
+            json!({"request_id": "lookout-cd34"}),
+        ))
+        .await;
+        let long: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 4, "text": long}))
+            .await;
+        assert!(app.live.as_ref().is_some_and(|live| live.spilled));
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        // The person's own turn, with nothing said, still ends with its line.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+    }
+
+    #[tokio::test]
     async fn an_emoji_reacts_to_a_reply_without_a_turn_and_again_takes_it_off() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -6071,11 +6875,12 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}));
+        app.declare = declared::declare(&json!({}), false);
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
             phase: "Working".into(),
+            note: false,
         });
         assert!(!app.configure().await);
         assert!(asked.lock().unwrap().is_empty());
@@ -6083,7 +6888,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(sent["declare"], json!(declared::tools()));
+        assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
     }
 
@@ -6247,6 +7052,88 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn pictures_go_with_their_placeholders_and_a_discarded_draft_drops_them() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let picture = |n| attach::Picture {
+            media_type: "image/png",
+            data: vec![n],
+        };
+        app.attach(Ok(picture(1)));
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert!(app.input.is_empty() && app.pictures.is_empty());
+        app.attach(Ok(picture(1)));
+        app.attach(Ok(picture(2)));
+        app.input.set("only [Image #2] now");
+        assert_eq!(app.placed(&app.input), [picture(2)]);
+        assert_eq!(
+            attach::submitted(&app.placed(&app.input)),
+            Some(json!([{"media_type": "image/png", "data": "Ag=="}]))
+        );
+        assert_eq!(attach::submitted(&[]), None);
+        // Pictures past what a message takes together are not attached.
+        app.input.clear();
+        let large = || attach::Picture {
+            media_type: "image/jpeg",
+            data: vec![0; 3 << 20],
+        };
+        app.attach(Ok(large()));
+        app.attach(Ok(large()));
+        assert_eq!(app.placed(&app.input).len(), 1);
+        assert!(app.notice.as_deref().unwrap().contains("5 MB together"));
+        // A picture whose placeholder is gone, and that Ctrl-Y cannot put
+        // back, is let go at the next attachment; Ctrl-Y's is kept.
+        let ctrl_u = || {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        app.attach(Ok(picture(4)));
+        app.key(ctrl_u()).await;
+        app.attach(Ok(picture(5)));
+        let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
+        assert_eq!(kept, [false, false, true, true, true]);
+        app.key(ctrl_u()).await;
+        app.attach(Ok(picture(6)));
+        let kept: Vec<_> = app.pictures.iter().map(Option::is_some).collect();
+        assert_eq!(kept, [false, false, false, false, true, true]);
+    }
+
+    #[tokio::test]
+    async fn the_shell_editing_keys_work_in_the_composer() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let press = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        let ctrl = |c| press(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let alt = |c| press(KeyCode::Char(c), KeyModifiers::ALT);
+        app.input.set("one two three");
+        app.key(ctrl('w')).await;
+        app.key(ctrl('a')).await;
+        app.key(alt('d')).await;
+        assert_eq!(&*app.input, " two ");
+        app.key(ctrl('y')).await;
+        app.key(ctrl('e')).await;
+        app.key(ctrl('j')).await;
+        app.key(ctrl('y')).await;
+        assert_eq!(&*app.input, "one two \none");
+        app.key(ctrl('p')).await;
+        app.key(press(KeyCode::Delete, KeyModifiers::CONTROL)).await;
+        assert_eq!(&*app.input, "one \none", "Ctrl-P went up a row");
+        app.key(ctrl('n')).await;
+        app.key(press(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .await;
+        assert_eq!(&*app.input, "one \n");
+        app.key(press(KeyCode::Enter, KeyModifiers::ALT)).await;
+        assert_eq!(&*app.input, "one \n\n");
     }
 
     #[test]

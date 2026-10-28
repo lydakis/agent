@@ -37,8 +37,21 @@ cargo install --locked --path .
 That puts `agent` in `~/.cargo/bin`. With [Homebrew](https://brew.sh),
 `brew install lydakis/agent/agent` builds the same from a release's source;
 `brew install lydakis/agent/sonny` adds [Sonny](#sonny), the terminal
-client, and pulls in `agent` with it. If Homebrew refuses the tap as
+client, and pulls in `agent` and `ripgrep` with it. If Homebrew refuses the tap as
 untrusted, run `brew trust lydakis/agent` first.
+
+On Linux without Homebrew (which does not run on ARM Linux), install Sonny
+and its daemon from the latest release's static build, checked against its
+published sha256:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
+```
+
+It unpacks `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 or aarch64) under
+`~/.local/opt` and links `~/.local/bin/sonny`; `PREFIX` installs elsewhere
+and `SONNY_VERSION` picks a release. [install.sh](install.sh) is short
+enough to read first.
 
 ## Quickstart
 
@@ -61,15 +74,18 @@ region holds the model (from any source region the profile supports), or `--prov
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
 `export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
 needs no flags.
+To keep them instead, put `provider = "bedrock"` and
+`model = "bedrock/global.anthropic.claude-sonnet-5"` in `~/.agent/config.toml`;
+the shell's variables come first.
 For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
 the daemon with `--provider chatgpt`; it signs in through OpenAI's
 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
 and keeps the token fresh itself.
 `agent models --discover` writes `~/.agent/models` from what your providers
-list; edit it down to the models the app and your agents should offer.
+list; edit it down to the models Sonny and your agents should offer.
 
-Each bot keeps the model it was created with, so bots on different providers
-can run side by side in one daemon. Other OpenAI Responses-compatible gateways
+Each bot has its own model, so bots on different providers can run side by
+side in one daemon. Other OpenAI Responses-compatible gateways
 can be added with `--provider`; see [providers and models](docs/RUST_PROTOTYPE.md#providers-and-models).
 
 From your project directory, start a bot:
@@ -90,8 +106,12 @@ Name the bot again to give it its next turn in the same conversation:
 agent run --pretty --bot scout -- "Which parts are tested?"
 ```
 
-A bot keeps its model, instructions, and tools for life. `--model` on a later
-turn overrides the model for that turn only.
+A bot keeps the model, instructions, and tools it was created with until a
+client changes them. `--model` on a later turn overrides the model for that
+turn only. Between turns, a client can give a bot a new model of the same
+provider, new instructions, or new approval gates with the socket protocol's
+`configure`, as Sonny does when you switch a lead's model or its skills and
+memory change; see the [software protocol](docs/RUST_PROTOTYPE.md#software-protocol).
 
 ### Leave it running and come back
 
@@ -177,8 +197,16 @@ of the folder, lays them out in Rex or Herdr, and hears what they did. It
 also gives every agent [triggers, memory and skills](docs/SONNY.md).
 
 ```sh
-brew install lydakis/agent/sonny
+brew install lydakis/agent/sonny        # or, on Linux, install.sh above
+sonny                                   # in your project's folder
 ```
+
+The first run asks how your agents reach a model (a ChatGPT plan, an
+Anthropic, OpenAI or OpenRouter key, or Bedrock with your AWS profile) and
+which model new projects use. As Codex does, it keeps the settings in
+`~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
+which Sonny applies to the daemon and everything else it starts, so nothing
+goes in your shell profile.
 
 ## How fast is it?
 

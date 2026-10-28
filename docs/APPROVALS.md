@@ -490,6 +490,33 @@ this replaced:
   lapses at 105 s to fit the longer budget.
 - **The breaker is Codex's:** 3 denials in a row, or 10 among the turn's
   last 50 decided calls, where it was 20 a turn.
+- **The judge reads the agent's history, outputs included** (2026-10-28).
+  Until now it saw no tool output and none of the model's prose, for fear
+  of text written to steer it. Codex shows its reviewer the transcript and
+  tells it every tool output is untrusted evidence, which needs context
+  the bare calls lack (what a script printed before the call that runs it,
+  what the model said it is doing). The state gains `transcript`: the
+  bot's own messages, calls, and outputs, newest kept within Codex's
+  synchronous bounds (5,000 tokens a message, 1,000 a call or output,
+  20,000 for messages and 10,000 for tool entries in all, 40 entries),
+  each call tied to its output, and `transcript_cut` when some were left
+  out. The person's words stay in `request` and `earlier_prompts`, with
+  who wrote them. The policy marks the whole transcript untrusted. A call's
+  arguments, and JSON outputs such as a shell's result, are redacted as
+  values, as planned calls are, and the whole state stays within 240 KiB
+  so it fits one judge prompt: past that the oldest transcript entries go
+  first, then the standing instructions.
+- **AGENTS.md is the person's standing instructions**, as Codex treats it.
+  The state gains `standing_instructions`: the AGENTS.md files that apply
+  to the workspace, when they all read now exactly as the bot was given
+  them when it was made. If any was edited, cut short, added, or removed
+  since, by the agent or anyone, none is shown, so an agent cannot write
+  itself permission or drop a restriction. Where the bot's memory index
+  is all that follows the files in what it was given, none is shown
+  either: agents write memory, so it can't mark where a file ended.
+  Transcript entries are redacted
+  whole before they are cut to size, so a cut never keeps an
+  unrecognizable piece of a secret.
 
 The approver is a client program with its policy as data, like the CLI's
 default compaction text: `agent approver`, a long-running command, and the
@@ -685,12 +712,13 @@ so only one instance runs at a time, and answers in layers:
 
 The approver and Sonny's lookout pick their judge the same way, in
 `agent_client::judge`: `agent approver --judge PROVIDER/MODEL`, else
-`AGENT_JUDGE`, else the bot's own model: `AGENT_MODEL` for `agent
-approver`, the bot's model for the approver the CLI starts. No smaller
-model is guessed for a provider (George, 2026-10-27): a cheaper judge is
-one `AGENT_JUDGE` names. `AGENT_JUDGE` is the one decision-model setting:
-the lookout reads it too, and the clients pass `~/.agent/env` to the
-approvers they start. Jev was dropped on
+`[judge] model` in `~/.agent/config.toml`, else the bot's own model:
+`AGENT_MODEL` for `agent approver`, the bot's model for the approver the
+CLI starts. No smaller model is guessed for a provider (George,
+2026-10-27): a cheaper judge is one the config names. `[judge]` is the one
+decision-model setting, which the lookout reads too; its `effort` sets a
+model judge's effort for both (`agent approver --effort` over it), and
+unset it is the model's own. Jev was dropped on
 2026-10-27 (George's call): nobody ran it, and on the lookout it woke the
 lead correctly 0.47 of the time against `gpt-6-luna`'s 0.92.
 
@@ -705,7 +733,7 @@ lead correctly 0.47 of the time against `gpt-6-luna`'s 0.92.
   with the question's id and what the API said), and a 429 whose error
   code is `insufficient_quota` fails at once instead of waiting. It takes an API
   key only; a ChatGPT plan cannot call it. It is never picked without
-  `--judge` or `AGENT_JUDGE`, since `OPENAI_API_KEY` is often set
+  `--judge` or `[judge] model`, since `OPENAI_API_KEY` is often set
   for the daemon's own provider.
 - **Any other model** runs through the daemon, with the providers and
   logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
@@ -731,7 +759,10 @@ what cost is measured, not assumed: the labeled calls of item 2 are replayed
 through the daemon and the approver with each judge
 ([Measure](#measure-before-building), item 4).
 
-**What the judge is shown.** The human prompts, the round's planned calls, the
+**What the judge is shown.** (Since 2026-10-28 also the bot's history,
+tool outputs included, and the AGENTS.md files it was given: see the top
+of [Automatic mode](#automatic-mode). What follows is the earlier design.)
+The human prompts, the round's planned calls, the
 calls already allowed in this turn with whether each succeeded, the
 workspace path, and the user's environment note (trusted remotes and
 hosts). Not tool results, not the model's prose, and not the model's
@@ -1310,7 +1341,8 @@ Where it differs from the design above:
 Built on 2026-09-27, the automatic approver:
 
 - `agent approver`: serves a tag, groups each round's calls, reads what
-  the judge is shown with `prompts` and `history_items`, follows delegations up to
+  the judge is shown with `prompts`, `history_nodes`, `history_items`, and
+  `inspect` (the bot's instructions), follows delegations up to
   8 turns to the person's words (past a deeper chain, more than 64
   delegating turns, or more prompt text across them than one 128 KiB read
   holds, the words are cut and consent is not counted), redacts, and asks one judge request per

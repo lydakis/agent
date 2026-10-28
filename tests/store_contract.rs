@@ -84,6 +84,7 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
+        images: Vec::new(),
         note: None,
         failed: false,
     }
@@ -160,6 +161,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -737,6 +739,172 @@ fn gates_are_capped_before_a_bot_is_written() {
     );
     // Nothing was written: the name is still free.
     gated_bot(&mut db, "g8", "t8", None, None).unwrap();
+}
+
+/// A bot that a sandboxed bot makes takes its sandbox unless it names a
+/// stricter one, as Codex's subagents inherit their parent's.
+#[test]
+fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
+    use agent_runtime::sandbox::Mode;
+    let mut db = db();
+    let ann = db
+        .create(
+            "Ann",
+            Some("/work"),
+            Binding {
+                settings: Settings {
+                    sandbox: Some(Mode::WorkspaceWrite),
+                    writable: vec!["/shared".into()],
+                    ..Settings::default()
+                },
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    let made = |db: &mut Database, name: &str, settings: Settings| {
+        db.create(
+            name,
+            Some("/elsewhere"),
+            Binding {
+                settings,
+                created_by: Some(ann.name.as_str()),
+                created_by_id: Some(ann.bot_id),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0
+        .settings
+    };
+    let unconfined = made(&mut db, "Bob", Settings::default());
+    assert_eq!(unconfined.sandbox, Some(Mode::WorkspaceWrite));
+    assert_eq!(unconfined.writable, ["/shared"]);
+    let full = made(
+        &mut db,
+        "Cid",
+        Settings {
+            sandbox: Some(Mode::DangerFullAccess),
+            ..Settings::default()
+        },
+    );
+    assert_eq!(full.sandbox, Some(Mode::WorkspaceWrite));
+    let networked = made(
+        &mut db,
+        "Dee",
+        Settings {
+            sandbox: Some(Mode::WorkspaceWrite),
+            writable: vec!["/other".into()],
+            network: true,
+            ..Settings::default()
+        },
+    );
+    assert!(!networked.network);
+    assert_eq!(networked.writable, ["/other"]);
+    let read_only = made(
+        &mut db,
+        "Eve",
+        Settings {
+            sandbox: Some(Mode::ReadOnly),
+            ..Settings::default()
+        },
+    );
+    assert_eq!(read_only.sandbox, Some(Mode::ReadOnly));
+    assert!(read_only.writable.is_empty());
+    // An unconfined creator imposes nothing.
+    assert_eq!(
+        Settings::default().under(&Settings::default()),
+        Settings::default()
+    );
+}
+
+#[test]
+fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "write".to_owned()];
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: tools.to_vec(),
+        expire_ms: None,
+    };
+    let binding = Binding {
+        tools: &tools,
+        gate: Some(&gate),
+        settings: Settings {
+            sandbox: Some(agent_runtime::sandbox::Mode::WorkspaceWrite),
+            ..Settings::default()
+        },
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), binding).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = |id: &str, name: &str, arguments: Value| {
+        let arguments = arguments.to_string();
+        let item = json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+            "name":name,"arguments":arguments});
+        let call = ToolCall {
+            name: name.into(),
+            call_id: id.into(),
+            arguments,
+        };
+        (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
+    };
+    let round = [
+        call("plain", "shell", json!({"command":"make"})),
+        call(
+            "up",
+            "shell",
+            json!({"command":"git push","sandbox_permissions":"require_escalated",
+            "justification":"Do you want to push the branch?"}),
+        ),
+        call(
+            "inside",
+            "write",
+            json!({"path":"notes/a.md","content":"x"}),
+        ),
+        call(
+            "climbs",
+            "write",
+            json!({"path":"../elsewhere/a.md","content":"x"}),
+        ),
+        call(
+            "outside",
+            "write",
+            json!({"path":"/etc/hosts","content":"x"}),
+        ),
+    ];
+    let (items, calls): (Vec<_>, Vec<_>) = round.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    let bot = db.inspect("Bob").unwrap();
+    let folder = std::path::Path::new("/synthetic");
+    let gated: Vec<&str> = calls
+        .iter()
+        .filter(|call| bot.gated(call, folder))
+        .map(|call| call.call_id.as_str())
+        .collect();
+    assert_eq!(gated, ["up", "climbs", "outside"]);
+    // What runs confined was never announced; each escape was.
+    for call in &calls {
+        let announced = db.approval_start(turn, call, 0);
+        match gated.contains(&call.call_id.as_str()) {
+            true => assert!(
+                matches!(announced, Ok(Gated::Pending { .. })),
+                "{}",
+                call.call_id
+            ),
+            false => assert_eq!(announced.err().unwrap().code, "invalid_tool_state"),
+        }
+    }
 }
 
 #[test]
@@ -2955,7 +3123,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
             "Bob",
             Some("/synthetic"),
             Binding {
-                settings,
+                settings: settings.clone(),
                 ..binding()
             },
         )
@@ -2966,7 +3134,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h"})
+            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3036,7 +3204,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
                 "Bad",
                 Some("/synthetic"),
                 Binding {
-                    settings,
+                    settings: settings.clone(),
                     ..binding()
                 },
             )
@@ -3054,23 +3222,39 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
+        inherit: true,
+        answered_by: None,
+        expire_ms: None,
+    };
+    // The lead's own tool, which a bot it creates does not take.
+    let resolve = Declared {
+        name: "resolve".into(),
+        description: "Resolve a task.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        inherit: false,
+        answered_by: None,
+        expire_ms: None,
     };
     let declared = [react.clone()];
+    let leads = [react.clone(), resolve];
     let (lead, _) = db
         .create(
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(&declared),
+                declared: Some(&leads),
                 ..binding()
             },
         )
         .unwrap();
-    assert_eq!(lead.declared, declared);
+    assert_eq!(lead.declared, leads);
     assert_eq!(
         serde_json::to_value(&lead).unwrap()["declared"],
         json!([{"name":"react","description":"React to a message.",
-            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"}])
+            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"},
+            {"name":"resolve","description":"Resolve a task.","parameters":{"type":"object"},
+            "result":"ok","inherit":false}])
     );
     // A bot the lead creates takes its tools unless its client declares others.
     let child = |db: &mut Database, name: &str, declared: Option<&[Declared]>| {
@@ -3080,21 +3264,22 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         b.declared = declared;
         db.create(name, Some("/synthetic"), b).unwrap().0
     };
+    // All but the lead's own.
     assert_eq!(child(&mut db, "Task", None).declared, declared);
     assert!(child(&mut db, "Own", Some(&[])).declared.is_empty());
     // A bot nobody created declares nothing it was not given.
     let plain = db.create("Plain", Some("/synthetic"), binding()).unwrap().0;
     assert!(plain.declared.is_empty() && !plain.may_call("react"));
     // Declaring again says whether anything changed.
-    assert!(!db.set_declared("Lead", None, &declared).unwrap());
+    assert!(!db.set_declared("Lead", None, &leads).unwrap());
     assert!(db.set_declared("Plain", None, &declared).unwrap());
     assert!(db.inspect("Plain").unwrap().may_call("react"));
     assert!(db.set_declared("Plain", None, &[]).unwrap());
     assert!(db.inspect("Plain").unwrap().declared.is_empty());
-    // A fork keeps them, and its allowed list narrows them like the rest.
+    // A fork keeps them all, and its allowed list narrows them like the rest.
     converse(&mut db, "Lead", 1);
     let fork = db.fork("Lead", "Copy", Fork::default()).unwrap().0;
-    assert_eq!(fork.declared, declared);
+    assert_eq!(fork.declared, leads);
     assert!(fork.declared("react").is_some());
     let only_read = ["read".to_owned()];
     let narrowed = db
@@ -3134,6 +3319,74 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         )
         .unwrap_err();
     assert_eq!(refused.code, "allow_not_in_source");
+}
+
+#[test]
+fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        inherit: true,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    let mut expires = 0;
+    for call in &calls {
+        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+            .as_u64()
+            .unwrap();
+    }
+    // The first two are answered and held by the worker: a page of one
+    // that reads only them still goes on to the third.
+    for id in ["c1", "c2"] {
+        db.answer_call("Lead", turn, id, result("started"), 0)
+            .unwrap();
+    }
+    let page = db.tool_calls("sonny", 0, 1).unwrap();
+    assert_eq!(page["calls"], json!([]));
+    let after = page["next_after"].as_i64().unwrap();
+    let page = db.tool_calls("sonny", after, 1).unwrap();
+    assert_eq!(page["calls"][0]["call_id"], "c3");
+    assert_eq!(page["next_after"], Value::Null);
+    // Out of time, an answer is refused, however late the turn learns it.
+    let Err(late) = db.answer_call("Lead", turn, "c3", result("late"), expires) else {
+        panic!("an answer out of time was taken");
+    };
+    assert_eq!(
+        (late.code.as_str(), late.detail.as_deref()),
+        ("no_pending_call", Some("the call ran out of time"))
+    );
 }
 
 #[test]
@@ -3280,6 +3533,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
+        images: Vec::new(),
         note: None,
         failed: false,
     };
@@ -3667,6 +3921,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -3796,6 +4051,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -4627,6 +4883,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 from: None,
                 origin: None,
                 budget_tokens: None,
+                images: Vec::new(),
             },
             allow_provider,
         )
@@ -7187,7 +7444,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
         ..Settings::default()
     };
     let made = || Binding {
-        settings,
+        settings: settings.clone(),
         request_id: Some("once"),
         ..binding()
     };
@@ -8319,6 +8576,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
+            images: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
         };
@@ -9354,20 +9612,168 @@ fn lines(tag: usize, count: usize) -> String {
         .collect()
 }
 /// A window's items as the runtime sends them, checked against the sizes
-/// the window counted for them.
+/// the window counted for them: each one's weight, and what its pictures
+/// add beyond it.
 fn sent(db: &Database, window: &agent_runtime::store::Window) -> Vec<Value> {
     let mut items = Vec::new();
-    for (id, size) in window.ids.iter().zip(&window.sizes) {
+    for ((id, size), pictured) in window.ids.iter().zip(&window.sizes).zip(&window.pictured) {
         let bytes = db.items_by_ids(&[*id], 0, window.elided).unwrap();
-        assert_eq!(bytes.len(), *size as usize, "node {id}");
+        assert_eq!(
+            bytes.len() as i64,
+            i64::from(*size) + i64::from(*pictured),
+            "node {id}"
+        );
         items.push(serde_json::from_slice(&bytes).unwrap());
     }
     let joined = db.items_by_ids(&window.ids, 0, window.elided).unwrap();
+    let pictured: i64 = window.pictured.iter().map(|&p| i64::from(p)).sum();
     assert_eq!(
         joined.len() as i64 + 1,
-        window.item_bytes + window.ids.len() as i64
+        window.item_bytes + pictured + window.ids.len() as i64
     );
     items
+}
+
+/// A picture of `side` × `side` pixels of noise: large for its size, as
+/// a photograph is.
+fn noise(side: u32) -> agent_runtime::codec::Image {
+    use base64::Engine;
+    let mut state = 0x2545_f491_u32;
+    let picture = image::RgbImage::from_fn(side, side, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        image::Rgb([state as u8, (state >> 8) as u8, (state >> 16) as u8])
+    });
+    let mut png = Vec::new();
+    picture
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    agent_runtime::codec::Image {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png),
+    }
+}
+
+#[test]
+fn a_picture_that_compresses_below_its_cost_counts_at_its_cost() {
+    use base64::Engine;
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // A blank 1568 × 1568 PNG is a few KB, and still 1600 tokens.
+    let mut png = Vec::new();
+    image::GrayImage::new(1568, 1568)
+        .write_with_encoder(image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Best,
+            image::codecs::png::FilterType::NoFilter,
+        ))
+        .unwrap();
+    let blank = agent_runtime::codec::Image {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png),
+    };
+    assert!(blank.data.len() < blank.weight());
+    db.begin(
+        "Bob",
+        "r1",
+        "look",
+        true,
+        &TurnOptions {
+            images: vec![blank.clone()],
+            ..TurnOptions::default()
+        },
+        allow_provider,
+    )
+    .unwrap();
+    let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert!(window.item_bytes > 6400, "{}", window.item_bytes);
+    assert!(window.pictured[0] < 0, "{:?}", window.pictured);
+    sent(&db, &window);
+}
+
+#[test]
+fn pictures_count_at_their_weight_and_go_whole() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // 300 × 300 is 120 tokens, which weigh 480 bytes; its PNG is 270 KB.
+    let shot = noise(300);
+    assert_eq!(shot.weight(), 480);
+    assert!(shot.data.len() > 300_000);
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "look",
+            true,
+            &TurnOptions {
+                images: vec![shot.clone()],
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A read of an image file: a result with a larger picture, whose 480
+    // tokens weigh enough for its stub to save something.
+    let photo = noise(600);
+    let call = ToolCall {
+        name: "read".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":"{}"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let read = Outcome {
+        images: vec![photo.clone()],
+        ..result("photo.png: a PNG image, 600×600; it follows")
+    };
+    db.tool_finish(turn, "c1", &read).unwrap();
+    db.append(turn, vec![assistant("noise")], &[], None)
+        .unwrap();
+    // Pictures of 360 KB and 1.4 MB fit a 64 KB budget, and go whole.
+    let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert_eq!(window.ids.len(), 4);
+    assert!(window.item_bytes < 8 << 10, "{}", window.item_bytes);
+    assert_eq!(
+        window.pictured.iter().filter(|&&p| p > 0).count(),
+        2,
+        "{:?}",
+        window.pictured
+    );
+    let items = sent(&db, &window);
+    let data =
+        |image: &agent_runtime::codec::Image| format!("data:image/png;base64,{}", image.data);
+    assert_eq!(items[0]["content"][1]["image_url"], data(&shot));
+    assert_eq!(items[2]["output"][1]["image_url"], data(&photo));
+    // A summary would send them whole too.
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    let raw = db.items_by_ids(&plan.ids, 0, plan.elided).unwrap();
+    let span: i64 = plan.sizes.iter().map(|&s| i64::from(s)).sum::<i64>()
+        + plan.pictured.iter().map(|&p| i64::from(p)).sum::<i64>();
+    assert_eq!(raw.len() as i64, span + plan.ids.len() as i64 - 1);
+    // Elided, the result goes as its text, and its picture no longer adds
+    // to what it sends.
+    let elision = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    db.elide("Bob", &elision).unwrap();
+    let elided = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert_eq!(elided.pictured, [window.pictured[0], 0, 0, 0]);
+    let items = sent(&db, &elided);
+    assert!(
+        items[2]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("[tool result's picture elided")
+    );
 }
 
 #[test]
@@ -11064,8 +11470,14 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
     );
     assert_eq!(forked.unwrap()["data"]["allowed"], json!(["read"]));
     // A call it may not make waits for no verdict: it is refused.
-    assert!(db.inspect("Bob").unwrap().gated("shell"));
-    assert!(!reader.gated("shell"));
+    let shell = ToolCall {
+        name: "shell".into(),
+        call_id: "c".into(),
+        arguments: r#"{"command":"true"}"#.into(),
+    };
+    let folder = std::path::Path::new("/synthetic");
+    assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
+    assert!(!reader.gated(&shell, folder));
     let (plain, _) = db.fork("Reader", "Plain", Fork::default()).unwrap();
     assert_eq!(plain.allowed.as_deref(), Some(&read[..]));
     assert_eq!(
@@ -11624,19 +12036,19 @@ fn a_bot_changes_its_gate_even_one_another_bot_made() {
         tools: vec![tool.into()],
         expire_ms: Some(45_000),
     };
-    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     assert_eq!(db.inspect("Ann").unwrap().gates, [gate("read")]);
-    assert!(!db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(!db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     assert_eq!(
-        db.set_gate("Ann", None, Some(gate("shell")))
+        db.set_gate("Ann", None, Some(gate("shell")), None)
             .unwrap_err()
             .code,
         "approve_not_in_tools"
     );
-    assert!(db.set_gate("Ann", None, None).unwrap());
+    assert!(db.set_gate("Ann", None, None, None).unwrap());
     assert!(db.inspect("Ann").unwrap().gates.is_empty());
     // A bot Ann makes takes her gate, and the person can still lift it.
-    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     db.create(
         "Bob",
         None,
@@ -11648,7 +12060,7 @@ fn a_bot_changes_its_gate_even_one_another_bot_made() {
     )
     .unwrap();
     assert_eq!(db.inspect("Bob").unwrap().gates, [gate("read")]);
-    assert!(db.set_gate("Bob", None, None).unwrap());
+    assert!(db.set_gate("Bob", None, None, None).unwrap());
     assert!(db.inspect("Bob").unwrap().gates.is_empty());
 }
 
@@ -11935,4 +12347,63 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
     );
     db.process_finish(process, &json!({}), &[]).unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
+}
+
+#[test]
+fn steer_batches_bound_the_bytes_of_their_pictures() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin(
+            "Bob",
+            "first",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Each picture is 3.2 MB of base64, so two fit a batch and the third
+    // waits for the next.
+    let shot = noise(900);
+    assert!(shot.data.len() > 3 << 20);
+    let mut submitted = Vec::new();
+    for n in 0..3 {
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            images: vec![shot.clone()],
+            ..TurnOptions::default()
+        };
+        submitted.push(
+            db.begin(
+                "Bob",
+                &n.to_string(),
+                "look",
+                true,
+                &options,
+                allow_provider,
+            )
+            .unwrap()
+            .turn,
+        );
+    }
+    let absorb = |db: &mut agent_runtime::store::Database, through| {
+        db.absorb(
+            first,
+            through,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let absorbed = absorb(&mut db, None);
+    let seen: Vec<_> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
+    assert_eq!(seen, submitted[..2]);
+    let absorbed = absorb(&mut db, absorbed.next_through);
+    assert_eq!(absorbed.outcomes[0].0, submitted[2]);
+    assert!(absorbed.next_through.is_none());
 }

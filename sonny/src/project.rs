@@ -43,6 +43,8 @@ pub struct Lead {
     /// The folder it is brought back to: it was moved elsewhere, and the
     /// next message it is sent moves it here.
     pub moving: Option<PathBuf>,
+    /// Made just now below another project's folder: that project's lead.
+    pub above: Option<String>,
 }
 
 /// The folder's own name reduced to name characters, the name of a
@@ -122,8 +124,8 @@ fn start_rule(sonny: &str) -> String {
         "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead, which makes its folder first; \
          messages to tasks that exist still go through \"$AGENT_BIN\" run, as above. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
          that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
-         {sonny} task NAME --agents --setup MODEL-FLAGS -- TASK\n\
-         with the task rule's --model and --effort as MODEL-FLAGS: \
+         {sonny} task NAME --agents --setup -- TASK\n\
+         which picks the task's model and effort as the person set them up (add --model or --effort only for one the person asks for): \
          it makes the task's folder the way the person set Sonny up, starts the task there and prints the turn's handle, as run --detach does. \
          Pass --profile ROLE in place of --agents when a listed role fits, and leave out --setup for a task that only reads, \
          so the folder's .agents/setup runs only for a task that will change files. \
@@ -134,7 +136,9 @@ fn start_rule(sonny: &str) -> String {
          A task works in its own folder only, and each file has one writer: Sonny turns paths in this folder named in the brief into the task's, \
          and never copy a task's files into this folder yourself (cp, a redirect, tee), which can write zeros over the files there; \
          take its work back only as above. \
-         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
+         Commits a task makes in a repository inside a copy of a plain folder do not come back, so work that commits starts in that repository's own folder. \
+         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it. \
+         Once the person says a task is done, {sonny} task rm NAME, from this folder, removes it and its folder; it refuses while its work is not here yet."
     ))
 }
 
@@ -265,7 +269,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     })?;
     let said = |key: &str| read.get(key).and_then(toml::Value::as_str);
     if said("model") != Some(model)
-        || said("reasoning") != effort
+        || said("effort") != effort
         || edited.len() as u64 > agent_client::project::LIMIT
     {
         return Err(format!(
@@ -284,7 +288,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     agent_client::project::read(dir).map(|_| ())
 }
 
-/// `text` with its top-level `model` and `reasoning` set (or `reasoning`
+/// `text` with its top-level `model` and `effort` set (or `effort`
 /// removed), each in place when there, else added after `model`.
 fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
     // A JSON string is a TOML basic string.
@@ -306,10 +310,10 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
                 at = Some(lines.len());
                 lines.push(format!("model = {}", quote(model)));
             }
-            Some("reasoning") => {
+            Some("effort") => {
                 placed = true;
                 if let Some(level) = effort {
-                    lines.push(format!("reasoning = {}", quote(level)));
+                    lines.push(format!("effort = {}", quote(level)));
                 }
             }
             _ => lines.push(line.to_owned()),
@@ -320,7 +324,7 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
         lines.len() - 1
     });
     if let Some(level) = effort.filter(|_| !placed) {
-        lines.insert(at + 1, format!("reasoning = {}", quote(level)));
+        lines.insert(at + 1, format!("effort = {}", quote(level)));
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -332,22 +336,17 @@ fn same_name(dir: &Path, name: &str) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    let root = match agent_client::policy::project_root(dir) {
-        Ok(Some((_, root))) => root,
-        _ => dir.to_owned(),
-    };
+    let root = dir
+        .canonicalize()
+        .map_err(|e| e.to_string())
+        .and_then(|dir| folder_of(&dir))
+        .unwrap_or_else(|_| dir.to_owned());
     default_name(&root).is_ok_and(|found| found == name)
 }
 
 /// The lead for `dir`, made first when the folder is not a project yet.
 pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Lead, String> {
-    let mut dir = dir.canonicalize().map_err(|e| e.to_string())?;
-    // Inside a project, wherever below its folder (or in a worktree of
-    // it), its lead, which works in that folder: made there first when
-    // missing, and brought back when moved.
-    if let Some((_, root)) = agent_client::policy::project_root(&dir).map_err(|e| e.to_string())? {
-        dir = root;
-    }
+    let dir = folder_of(&dir.canonicalize().map_err(|e| e.to_string())?)?;
     let project = default_name(&dir)?;
     let bot = format!("{project}.lead");
     if let Some(found) = find(client, &bot).await? {
@@ -367,6 +366,7 @@ pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Le
             bot,
             new: false,
             moving,
+            above: None,
         });
     }
     create(client, &dir, model).await?;
@@ -375,7 +375,76 @@ pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Le
         bot,
         new: true,
         moving: None,
+        above: above(&dir),
     })
+}
+
+/// The folder whose lead Sonny opens in `dir` (canonical): in a git
+/// repository, the nearest project in it, else the repository's top, so a
+/// subfolder such as `src` reaches the repository's lead, and a worktree
+/// its main checkout's; anywhere else `dir` itself, so every folder can
+/// have a lead, whatever project holds the folder above it. Either way,
+/// one with no project file of its own is the project's above it when
+/// that project keeps its subfolders. A task's folder under `~/.agent` is
+/// never a project's.
+fn folder_of(dir: &Path) -> Result<PathBuf, String> {
+    folder_in(dir, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn folder_in(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_owned()));
+    let folder = match agent_client::policy::checkout(dir) {
+        Some(top) => agent_client::policy::project_root(dir)
+            .map_err(|e| e.to_string())?
+            .map_or(top, |(_, root)| root),
+        None => dir.to_owned(),
+    };
+    let folder = claimed(&folder, home.as_deref())?.unwrap_or(folder);
+    if let Some(home) = home {
+        for kept in ["worktrees", "tasks"] {
+            let under = home.join(".agent").join(kept);
+            if let Some(task) = folder
+                .strip_prefix(&under)
+                .ok()
+                .and_then(|rest| rest.components().next())
+            {
+                let task = task.as_os_str().to_string_lossy();
+                return Err(format!(
+                    "task_folder: {} is in task {task}'s folder; run sonny in its project's \
+                     folder, or sonny --bot {task} for the task",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(folder)
+}
+
+/// The project folder above `folder` that keeps the folders below it as
+/// its own (`subfolders = "project"`), when `folder` has no project file:
+/// the nearest project above decides, looking no higher than the home
+/// folder.
+fn claimed(folder: &Path, home: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let file = agent_client::project::FILE;
+    if folder.join(file).is_file() {
+        return Ok(None);
+    }
+    for at in folder.ancestors().skip(1) {
+        if home == Some(at) {
+            break;
+        }
+        if at.join(file).is_file() {
+            let info = agent_client::project::read(at)?;
+            return Ok((info["subfolders"] == "project").then(|| at.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The lead of the project holding the folder above `dir`, when there is one.
+fn above(dir: &Path) -> Option<String> {
+    let (name, _) = agent_client::policy::project_root(dir.parent()?).ok()??;
+    Some(format!("{name}.lead"))
 }
 
 async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
@@ -416,23 +485,37 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     let role = role(dir)?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
-    // the role's, AGENT_MODEL's, then the newest agent's, so a bare
-    // `sonny` needs no flag.
+    // the role's, AGENT_MODEL's, the config's `model`, then the newest
+    // agent's, so a bare `sonny` needs no flag. With none, the person picks
+    // one, kept as the config's `model` for later projects. Its effort: the
+    // config's `[sonny] lead_effort`, else AGENT_EFFORT with AGENT_MODEL's
+    // model, as the CLI takes them.
+    let (mut effort, model) = (None, model.map(str::to_owned));
+    let config = agent_client::config::load()?;
     let model = match model
-        .map(str::to_owned)
         .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
     {
         Some(model) => model,
         None => match std::env::var("AGENT_MODEL").ok() {
-            Some(model) => model,
-            None => newest(client)
-                .await?
-                .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
+            Some(model) => {
+                effort = std::env::var("AGENT_EFFORT").ok();
+                model
+            }
+            None => match config.model.clone() {
+                Some(model) => model,
+                None => match newest(client).await? {
+                    Some(model) => model,
+                    None if crate::setup::interactive() => crate::setup::model(client).await?,
+                    None => return Err("model_required: no default model yet; set model in ~/.agent/config.toml or pass --model PROVIDER/MODEL once".into()),
+                },
+            },
         },
     };
     let picks = agent_client::project::Picks {
         model: Some(model),
+        effort: (agent_client::config::load()?.sonny.lead_effort)
+            .or(effort.filter(|e| !e.is_empty())),
         ..Default::default()
     };
     make(client, dir, &role, &picks).await.map(|_| ())
@@ -452,7 +535,7 @@ async fn make(
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "model": role.model,
         "tools": role.tools,
-        "declare": crate::declared::tools(),
+        "declare": crate::declared::tools(true),
     });
     let copies = crate::settings::Settings::load().copies;
     agent_client::project::create(
@@ -467,7 +550,7 @@ async fn make(
     .await
 }
 
-const USAGE: &str = "usage: project add DIR [--model PROVIDER/MODEL] [--effort LEVEL] [--threads-model PROVIDER/MODEL [--threads-effort LEVEL]] [--threads-in worktree|project]";
+const USAGE: &str = "usage: project add DIR [--model PROVIDER/MODEL] [--effort LEVEL] [--threads-model PROVIDER/MODEL] [--threads-effort LEVEL] [--threads-in worktree|project]";
 
 /// What `~/.agent/project` says it takes.
 pub fn usage() -> &'static str {
@@ -489,6 +572,10 @@ pub fn cli(args: &[String]) -> i32 {
                 let (client, _events) = Client::connect(&socket)
                     .await
                     .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
+                let mut picks = picks;
+                if picks.effort.is_none() {
+                    picks.effort = agent_client::config::load()?.sonny.lead_effort;
+                }
                 let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
                 if let Ok(made) = &mut made {
                     open_new_lead(&client, &socket, made).await;
@@ -558,15 +645,12 @@ fn add_args(args: &[String]) -> Result<(PathBuf, agent_client::project::Picks), 
             return Err(usage());
         }
     }
-    if threads_effort.is_some() && threads_model.is_none() {
-        return Err("usage: --threads-effort goes with --threads-model".into());
-    }
     let in_project = match threads_in.as_deref() {
         None | Some("worktree") => false,
         Some("project") => true,
         Some(_) => return Err(usage()),
     };
-    if threads_model.is_some() || threads_in.is_some() {
+    if threads_model.is_some() || threads_effort.is_some() || threads_in.is_some() {
         picks.threads = Some(agent_client::project::ThreadPicks {
             model: threads_model,
             effort: threads_effort,
@@ -627,7 +711,6 @@ mod tests {
             &["add", "/x", "--color", "red"],
             &["add", "/x", "--threads-in", "elsewhere"],
             &["add", "/x", "--model", "a", "--model", "b"],
-            &["add", "/x", "--threads-effort", "low"],
         ] {
             assert!(run(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
         }
@@ -643,6 +726,11 @@ mod tests {
                 .threads
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
+        // Tasks may take an effort of their own on the lead's model.
+        let (_, picks) = run(&["add", "/", "--threads-effort", "xhigh"]).unwrap();
+        assert!(picks.threads.is_some_and(|t| t.model.is_none()
+            && t.effort.as_deref() == Some("xhigh")
+            && !t.in_project));
         assert_eq!(error_json("project_exists: x")["error"], "project_exists");
     }
 
@@ -650,12 +738,14 @@ mod tests {
     fn a_lead_starts_its_tasks_with_sonny() {
         let text = start_rule("/opt/sonny");
         for said in [
-            "\"/opt/sonny\" task NAME --agents --setup MODEL-FLAGS -- TASK\n",
+            "\"/opt/sonny\" task NAME --agents --setup -- TASK\n",
+            "which picks the task's model and effort as the person set them up",
             "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead",
             "leave out --setup for a task that only reads",
             "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
             "\"/opt/sonny\" task changes NAME --apply writes it here",
             "never copy a task's files into this folder yourself",
+            "\"/opt/sonny\" task rm NAME, from this folder, removes it",
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }
@@ -673,6 +763,99 @@ mod tests {
         assert!(same_name(&two, "shop"));
         assert!(!same_name(&other, "shop"));
         assert!(!same_name(&base.join("gone/shop"), "shop"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn every_folder_outside_git_has_its_own_lead_and_a_repository_one() {
+        let base = std::env::temp_dir().join(format!("sonny-folder-of-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let (new, repo, bare) = (ws.join("new"), ws.join("repo"), ws.join("bare"));
+        for dir in [
+            &new,
+            &repo.join("src/deep"),
+            &bare.join("src"),
+            &ws.join(".agents"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(ws.join(".agents/project.toml"), "name = \"ws\"\n").unwrap();
+        let git = |dir: &Path| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&repo);
+        git(&bare);
+        std::fs::create_dir_all(repo.join(".agents")).unwrap();
+        std::fs::write(repo.join(".agents/project.toml"), "name = \"repo\"\n").unwrap();
+        let home = base.join("home");
+        let at = |dir: &Path| folder_in(&dir.canonicalize().unwrap(), Some(&home)).unwrap();
+        let real = |dir: &Path| dir.canonicalize().unwrap();
+        // A new folder in the workspace is a project of its own, not the
+        // workspace's, and knows whose folder is above it.
+        assert_eq!(at(&new), real(&new));
+        assert_eq!(at(&ws), real(&ws));
+        assert_eq!(above(&real(&new)).as_deref(), Some("ws.lead"));
+        // In a repository, its project or its top, never a subfolder.
+        assert_eq!(at(&repo.join("src/deep")), real(&repo));
+        assert_eq!(at(&bare.join("src")), real(&bare));
+        assert_eq!(above(&real(&bare)).as_deref(), Some("ws.lead"));
+        // A task's folder under ~/.agent is no project's.
+        let task = home.join(".agent/tasks/ws.fix/sub");
+        std::fs::create_dir_all(&task).unwrap();
+        let error = folder_in(&task.canonicalize().unwrap(), Some(&home)).unwrap_err();
+        assert!(error.starts_with("task_folder: "), "{error}");
+        assert!(error.contains("sonny --bot ws.fix"), "{error}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_project_that_keeps_its_subfolders_is_their_lead() {
+        let base = std::env::temp_dir().join(format!("sonny-subfolders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (top, a) = (base.join("top"), base.join("top/a"));
+        let (pkg, own) = (a.join("src/pkg"), a.join("src/own"));
+        for dir in [&top, &a, &pkg, &own, &top.join("new")] {
+            std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        }
+        let file = |dir: &Path, text: &str| {
+            std::fs::write(dir.join(agent_client::project::FILE), text).unwrap()
+        };
+        file(&top, "name = \"top\"\n");
+        file(&a, "name = \"a\"\nsubfolders = \"project\"\n");
+        file(&own, "name = \"own\"\n");
+        for repo in [&pkg, &own] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        let home = base.join("home");
+        let at = |dir: &Path| folder_in(&dir.canonicalize().unwrap(), Some(&home)).unwrap();
+        let real = |dir: &Path| dir.canonicalize().unwrap();
+        // Below a, a plain folder and a repository without a project are a's.
+        assert_eq!(at(&a.join("src")), real(&a));
+        assert_eq!(at(&pkg), real(&a));
+        assert_eq!(at(&pkg.join("src")), real(&a));
+        // A project of its own stays one, and top keeps the default.
+        assert_eq!(at(&own), real(&own));
+        assert_eq!(at(&top.join("new")), real(&top.join("new")));
+        // The home folder's file says nothing about the folders below it.
+        let plain = home.join("plain");
+        std::fs::create_dir_all(home.join(".agents")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        file(&home, "name = \"me\"\nsubfolders = \"project\"\n");
+        assert_eq!(at(&plain), real(&plain));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -718,12 +901,12 @@ mod tests {
             "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\nthreads_in = \"project\"\n";
         assert_eq!(
             with_model(file, "anthropic/b", Some("high")),
-            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\nreasoning = \"high\"\nthreads_in = \"project\"\n"
+            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\nthreads_in = \"project\"\n"
         );
-        let file = "name = \"shop\"\nreasoning = \"low\"\nmodel = \"openai/a\"\n";
+        let file = "name = \"shop\"\neffort = \"low\"\nmodel = \"openai/a\"\n";
         assert_eq!(
             with_model(file, "openai/a", Some("high")),
-            "name = \"shop\"\nreasoning = \"high\"\nmodel = \"openai/a\"\n"
+            "name = \"shop\"\neffort = \"high\"\nmodel = \"openai/a\"\n"
         );
         assert_eq!(
             with_model(file, "openai/c", None),

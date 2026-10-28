@@ -18,9 +18,14 @@ CARGO_HOME=.local/cargo cargo build --release --locked
 CARGO_HOME=.local/cargo cargo test --locked
 CARGO_HOME=.local/cargo cargo clippy --locked --all-targets -- -D warnings
 AGENT_TEST_RUNTIME=1 AGENT_BENCH_TEST_ENGINES=1 .local/venv/bin/python -m unittest discover -s tests -v
+AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m tests.run --jobs 4   # the same modules side by side
 .local/venv/bin/python -m bench run --engine rust --out .local/bench/rust
 .local/venv/bin/python -m bench.matrix --out .local/bench/three-engines
 ```
+
+Every pull request and push to main runs the format, Clippy and Rust test
+checks and, after a release build of the daemon and Sonny, the runtime suite
+with `tests.run` on Linux ([test.yml](../.github/workflows/test.yml)).
 
 The same checks run on Linux amd64 through Errand, with the build tree and
 the Python venv kept as named runner caches so a job pays for a build once
@@ -305,6 +310,18 @@ steer joins a turn that already has its cap: `budget_tokens` with
 `delivery: "steer"` is `invalid_delivery`. A summary held beside a call
 counts toward both caps.
 
+`submit` also accepts `images`, pictures sent with the prompt: up to 20 of
+`{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,
+`image/gif` or `image/webp` and the data standard base64 of an image of that
+type, at most 5 MiB together once decoded (`image_limit`; anything else is
+`invalid_image`, with the `index` it was at). They go in the user item after
+the prompt's words, as `input_image` data URLs for Responses and base64
+`image` blocks for Anthropic, in a turn of their own or a steer. The turn keeps
+them, so a resend with other pictures is an `idempotency_conflict`. History
+reads (`history_items`) return a person's prompt with each picture's bytes
+left out, its `omitted_bytes` counted; the model is sent them whole. A request
+line may be 8 MiB, room for a prompt and its pictures.
+
 A turn reads the same wherever a client meets it. Its view is `bot`,
 `bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,
 `input_tokens`, `cached_input_tokens`, `output_tokens`, `model_rounds`,
@@ -386,7 +403,10 @@ keep-warm when it sets any of them.
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
-| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
+| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. | `5m` |
+| `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
+| `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
+| `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1752,6 +1772,12 @@ allowance. The allowance counts the encoded summary, retained prompts, carry-for
 note, omission item, transcript items, and JSON separators. These are runtime
 conversation-byte/item bounds; system instructions, tool schemas, provider JSON
 framing, and model token limits are separate, not inferred from byte counts.
+A picture counts at its weight, not its size: four bytes for each token it is
+estimated to cost (width × height / 750 once its longest side fits 1,568
+pixels, at most 1,600 tokens, Anthropic's rule; OpenAI's high detail counts
+fewer). Each node records what its pictures add beyond their weight, which
+its byte total leaves out; only a request's length counts them, so the
+pacer's token estimate and every budget see a picture at its token cost.
 For compaction planning, a known output-token cap is estimated at four bytes
 per token, capped at a quarter of the envelope. The earlier of that headroom
 threshold and `compact_at` triggers compaction. An unset Responses cap adds
@@ -1789,7 +1815,14 @@ continues its source's. The `history` tool returns one turn's prompt, replies,
 tool calls, and results as provider JSONL with only the top-level
 `encrypted_content` field removed from reasoning items. Reasoning records and
 readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `history_items` reads, forks, and provider replay remain unchanged. The reading
+items, raw `history_items` reads, forks, and provider replay remain unchanged.
+With `bot`, it reads another agent's turn the same way, numbered along that
+agent's lineage and as it stands, a running turn included; with `bot` and no
+`turn`, it lists that agent's newest 20 turns, newest first, each with its
+number, handle, status and its prompt's first 200 characters, so an agent can
+see what another is doing without reading the store. A bot's own turns are
+read by number only. Any agent of the daemon can be read: the daemon holds
+one person's agents. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
@@ -2054,6 +2087,73 @@ cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
 
+### Sandbox
+
+A bot created with `sandbox` runs its `shell` commands, `write`s and `edit`s
+confined, as Codex confines its agent: the mode names, the writable folders,
+the folders kept read-only inside them, the bubblewrap arguments on Linux and
+the Seatbelt profile on macOS are Codex's, ported (see NOTICE). Reading stays
+open. `read-only` writes nothing; `workspace-write` writes the bot's folder
+(its stored workspace, else the turn's), each `writable` folder, `$TMPDIR`
+and `/tmp`. Inside each writable folder, `.git` (and a linked worktree's own
+git folder when the folder holds it), `.agents`, `.codex` and `.aws` stay
+read-only, and a missing `.git`, `.agents` or `.codex` may not be made: git
+runs hooks and config from there outside the sandbox, and agents trust what
+is there. The daemon's store and the files beside it stay read-only too. A
+protected folder that is a symlink refuses the call with
+`sandbox_unavailable`, since the link could be swapped from inside. Network is
+off unless `network` is set. The daemon's socket is out of reach either way,
+as Codex keeps its own from a sandboxed command: nothing confined may drive
+the daemon, so a sandboxed bot delegates through tools its client declares,
+not through `agent` in its shell. A socket inside a writable folder stays
+read-only. On macOS the folders between a writable folder and anything kept
+inside it (the socket, the store, a worktree's git folder) can't be renamed,
+so nothing kept can be moved to a name its rule doesn't cover. `danger-full-access`, or no `sandbox`, runs
+unconfined.
+
+Creating a sandboxed bot checks that sandboxes run here and refuses with
+`sandbox_unavailable` otherwise: on Linux, a system bubblewrap
+(`/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` or
+`/run/current-system/sw/bin/bwrap`, never one found on `PATH`, which could
+lie in a folder a bot may write) must make the user, pid and network
+namespaces; on
+macOS, `/usr/bin/sandbox-exec` must exist. A sandboxed bot never runs
+unconfined for want of one. A `writable` folder that doesn't exist is
+`path_not_found`.
+
+A confined command that touches what it may not fails as it would on a
+read-only filesystem, and the model sees that result. A confined `write` or
+`edit` is checked against the same folders by the target's real path and
+refused with `write_denied`; the write itself then runs inside the sandbox,
+as Codex runs `apply_patch`, in the agent binary started as
+`agent --agent-run-as-write PATH` with the content on stdin, so a link
+swapped in after the check can't carry it out. Being a process, it takes a
+slot of the daemon's process budget as a command does.
+
+To leave the sandbox, a shell call sets
+`sandbox_permissions: "require_escalated"` with a `justification`, which a
+sandboxed bot's `shell` schema shows with Codex's descriptions; a `write` or
+`edit` leaves it by naming a path outside its writable folders. Only such an
+escape is gated: a confined call runs without a verdict even under a gate,
+and an escape waits on the bot's gate as any gated call does
+(see [tool approval](#tool-approval)) and, allowed, runs unconfined. With no
+gate on the tool there is no one to ask, so, as Codex refuses an escape under
+a policy that never asks, a command asking to escalate is refused with
+`escalation_refused` and a write or edit stays held to the sandbox
+(`write_denied`). Whether a call escapes is read
+from its arguments and the folders' names alone, so the round that announces
+it and the run that starts it agree.
+
+A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
+creator's sandbox and `writable` folders unless it names a stricter sandbox,
+and reaches the network only if both do, as Codex's subagents inherit their
+parent's sandbox.
+
+On Linux, bubblewrap makes an empty folder on the host to mount a missing
+`.git` read-only over; the daemon removes it once no running sandbox holds
+it, and a detached command holds it until it exits. A sandbox that needs
+one being removed waits until it is gone.
+
 ### Declared tools
 
 Protocol version 19 lets a client declare tools of its own on a bot:
@@ -2076,6 +2176,50 @@ narrows them as it does the daemon's. Changing them changes the request's
 tool definitions, so a fork keys its own prompt cache from then on, as for
 instructions.
 
+Protocol version 20 adds `inherit` to a declared tool, default `true` and
+reported only when `false`: a tool declared with `"inherit": false` stays
+the declaring bot's own, so a bot it creates does not take it with the
+rest. A fork still keeps it. A lead's client uses it for a tool only the
+lead should call.
+
+Protocol version 21 lets a client answer its own declared tools. A tool
+declared with `answered_by`, a tag of 1 to 64 letters, digits, `_`, `-` or
+`.` that the daemon never reads, takes no `result`: a call that fits its
+`parameters` starts, and waits for the answer of whichever client acts for
+that tag. Its `tool_started` names `answered_by` and `expires_ms`, when it
+stops waiting: `expire_ms` after it started (1 to 3,600,000, default
+60,000). A client finds such calls by following the bot, or every bot with
+`*`, and lists those still waiting with
+`{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
+`bot`, `turn`, `call_id`, `name`, `arguments` and `expires_ms`, at most
+`limit` (1 to 256, default 64) and 256 KiB a page, continued from
+`next_after`. It answers with
+`{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
+reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
+the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
+lowercase letters, digits or `_`; output and detail each up to 64 KiB,
+redacted as command output is; anything else is `invalid_tool_result` or
+`tool_output_limit`). The first answer counts: another is
+`call_already_answered`, one for a call that ended or ran out of time is
+`no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
+to serve.
+
+The call waits as a gated call waits for its verdict. Its turn holds live
+for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that
+time is held by the storage worker and written with the call's result, so
+the call costs one commit. Past the hold the turn parks like `wait`: one
+commit, `turn_waiting` with `{call_id, answer: TAG, deadline_ms}` (also its
+view's `waiting_on`), no task, no active slot, and it survives restart. An
+answer to a parked call is committed on arrival and resumes the turn. A
+call still unanswered at `expires_ms` ends with
+`{"error":"tool_unserved","detail":...}` and the turn goes on, since the
+model can act on it; the service wakes a parked one then from its own
+schedule, so a waiting call costs a row and no timer. A later call's gate that
+lapses first ends the wait as `tool_unserved` and the turn as it ends one
+waiting on a verdict. An interrupt ends the call as cancelled, like any
+running call. A call that does not fit its
+parameters is refused at once and waits for no answer.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client
@@ -2083,8 +2227,10 @@ created or forked, can have all its gates replaced later with `configure`,
 its source's included): `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
-`approve` may name no more tools than the daemon registers (`invalid_gate`
-otherwise); a gate's tools must be among the new bot's own
+`approve` may name no more tools than the daemon registers and a bot may
+declare (`invalid_gate` otherwise); a gate's tools must be among the new
+bot's own, the daemon's and those its client declared or it takes from its
+creator or source
 (`approve_not_in_tools`). Without them none of this runs and nothing is paid. `fork` takes the same
 fields. A bot keeps every gate it descends from: a fork keeps its source's,
 and a `create` or `fork` whose `created_by` names a bot adds that bot's.
@@ -2246,7 +2392,7 @@ tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools but `read`, tagged `auto`, with a 105 s
 expiry (the approver's 90 s review budget plus margin), and
 starts `agent approver` detached if no session serves `auto`, logging to
-`STORE.approver.log`; its judge is `AGENT_JUDGE`, else the bot's own model, and a judge that
+`STORE.approver.log`; its judge is `[judge] model` in `~/.agent/config.toml`, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
 PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves
@@ -2284,7 +2430,10 @@ single long turn outgrows the window, and it comes first because it costs
 no call and keeps the model's own reasoning in view. Compaction then runs as
 before if the view is still over its threshold.
 
-A result is elidable when its stub saves at least 1 KiB. For a bot with
+A result is elidable when its stub saves at least 1 KiB. A result that
+carried a picture is stubbed as its text alone, with a line that the file
+holds the picture if the model needs it again; what it saves is counted with
+the picture at its weight, so only a large one is elided. For a bot with
 `read`, the stub is made when the result is recorded, with the node id its insert takes, and stored
 beside it. Each node records what its stub saves and, like its byte total,
 the cumulative savings along its lineage; each floor version records the
@@ -2292,7 +2441,8 @@ cumulative savings through its floor. A node's bytes as sent are then its
 byte total less the smaller of the two, so the window, turn admission, and
 compaction accounting stay constant-time lookups and read no item. A
 request reads the stub in place of the result's row. The stored transcript
-is never rewritten: `history_items`, `history`, and forks see every result whole,
+is never rewritten: `history_items`, `history`, and forks see every result whole
+(history reads leave out a picture's bytes, counting them in `omitted_bytes`),
 and `read` with `result/NODE` returns one on the bot's own lineage. A
 shell result is one JSON line, often longer than a `read` page, so that
 read splits lines longer than 4 KiB into numbered pieces and pages them.
@@ -2610,7 +2760,16 @@ the tool is offered is the client's choice at creation, like any tool.
 bound including paging notices (files up to 4 MiB). If the first requested line
 cannot fit the page, it returns `read_line_too_long` with the line number; use a
 byte-oriented tool to inspect that line. A page ending before an oversized line
-still returns its preceding lines and the next offset. `write` creates parent
+still returns its preceding lines and the next offset. A PNG, JPEG, GIF or
+WebP file comes back as the picture itself, after a line naming its kind, size
+and bytes, in each family's result shape: a list of an `input_text` and an
+`input_image` data URL for Responses, a `text` and a base64 `image` block for
+Anthropic. One longer than 1568 pixels on a side is scaled down to it, and one
+over 1 MiB as sent is re-encoded as a JPEG, so a screenshot fits what every
+provider takes. Any other binary file is `file_not_text`, naming its kind, and
+an image that cannot be decoded is `invalid_image`. One that must be scaled
+but has more than 64 megapixels is `image_limit`, refused before it is
+decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
 directories and writes up to
 1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
 is set. Paths are relative to the workspace unless absolute; nothing confines a

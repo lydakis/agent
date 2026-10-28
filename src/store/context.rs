@@ -45,6 +45,7 @@ impl Window {
         self.ids.truncate(len);
         self.sizes.truncate(len);
         self.thinking.truncate(len);
+        self.pictured.truncate(len);
     }
 
     pub fn prefix(&self, listed: &[(i64, String)], prefix_budget: usize) -> Result<ContextPrefix> {
@@ -361,15 +362,53 @@ pub fn stub(
     Ok((stub.len() + ELISION_MIN_SAVING <= item).then_some(stub))
 }
 
+/// What a request sends in place of a result that carried pictures (an
+/// image file read) below the bot's elision floor: its text, without the
+/// pictures, which the file holds if the model needs them again. `None`
+/// when it would not save `ELISION_MIN_SAVING` bytes over `weight`, what the
+/// result weighs with its pictures at their token cost.
+pub fn picture_stub(
+    family: Family,
+    call_id: &str,
+    output: &str,
+    weight: usize,
+) -> Result<Option<Vec<u8>>> {
+    let text = format!(
+        "[tool result's picture elided from this request; read the file again to see it. Its text:]\n{output}"
+    );
+    let stub = family.tool_result_item(call_id, &text)?;
+    Ok((stub.len() + ELISION_MIN_SAVING <= weight).then_some(stub))
+}
+
 /// The family, call id and output of a stored tool result; `None` for any
-/// other item.
+/// other item. A result with pictures gives its text.
 pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
     #[derive(serde::Deserialize)]
     struct Output {
         #[serde(rename = "type")]
         kind: String,
         call_id: String,
-        output: String,
+        output: Text,
+    }
+    /// A result's text: the text alone, or the text part of a list of
+    /// parts that also holds pictures.
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Text {
+        Alone(String),
+        Parts(Vec<Part>),
+    }
+    #[derive(serde::Deserialize)]
+    struct Part {
+        text: Option<String>,
+    }
+    impl Text {
+        fn text(self) -> String {
+            match self {
+                Text::Alone(text) => text,
+                Text::Parts(parts) => parts.into_iter().filter_map(|p| p.text).collect(),
+            }
+        }
     }
     #[derive(serde::Deserialize)]
     struct Message {
@@ -381,19 +420,19 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         #[serde(rename = "type")]
         kind: String,
         tool_use_id: String,
-        content: String,
+        content: Text,
     }
     if let Ok(result) = serde_json::from_slice::<Output>(item) {
         return (result.kind == "function_call_output").then_some((
             Family::Responses,
             result.call_id,
-            result.output,
+            result.output.text(),
         ));
     }
     let mut message = serde_json::from_slice::<Message>(item).ok()?;
     let block = message.content.pop()?;
     (message.role == "user" && message.content.is_empty() && block.kind == "tool_result")
-        .then_some((Family::Anthropic, block.tool_use_id, block.content))
+        .then_some((Family::Anthropic, block.tool_use_id, block.content.text()))
 }
 
 /// Whether a stored item is a tool result, in either family: a Responses
@@ -456,6 +495,32 @@ pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_result_with_a_picture_reads_as_its_text_and_elides_to_it() {
+        let images = [crate::codec::Image {
+            media_type: "image/png".into(),
+            data: "A".repeat(4096),
+        }];
+        for family in [Family::Responses, Family::Anthropic] {
+            let item = family
+                .tool_result_item_with("c1", "a.png: a PNG image", &images)
+                .unwrap();
+            assert!(is_tool_result(&item));
+            let (read, call_id, text) = tool_result(&item).unwrap();
+            assert_eq!((read, call_id.as_str()), (family, "c1"));
+            assert_eq!(text, "a.png: a PNG image");
+            let stub = picture_stub(family, "c1", &text, item.len())
+                .unwrap()
+                .unwrap();
+            let (_, _, stubbed) = tool_result(&stub).unwrap();
+            assert!(
+                stubbed.starts_with("[tool result's picture elided"),
+                "{stubbed}"
+            );
+            assert!(stubbed.ends_with("a.png: a PNG image"));
+        }
+    }
 
     #[test]
     fn the_context_note_names_the_history_tool_only_for_bots_that_have_it() {

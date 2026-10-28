@@ -307,12 +307,24 @@ pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<B
 pub struct Items {
     /// Exact byte length every stream yields.
     pub bytes: usize,
+    /// What the items weigh as input: their length, with pictures counted
+    /// at their token cost rather than their size.
+    pub weight: usize,
     open: Box<dyn Fn() -> ItemStream + Send + Sync>,
 }
 impl Items {
     pub fn new(bytes: usize, open: impl Fn() -> ItemStream + Send + Sync + 'static) -> Items {
+        Items::weighing(bytes, bytes, open)
+    }
+    /// Items of `bytes` that weigh `weight`.
+    pub fn weighing(
+        bytes: usize,
+        weight: usize,
+        open: impl Fn() -> ItemStream + Send + Sync + 'static,
+    ) -> Items {
         Items {
             bytes,
+            weight,
             open: Box::new(open),
         }
     }
@@ -597,6 +609,15 @@ impl Provider {
         self
     }
 
+    /// Whether a call to `model` asks for the hour-long cache. Bedrock takes
+    /// it from Claude 4.5 on and may refuse a request that asks older Claude
+    /// for it (its prompt-caching guide, read 2026-10-28), so those calls keep
+    /// five minutes whatever the bot's setting, including after a switch to
+    /// such a model.
+    fn cache_hour_for(&self, model: &str) -> bool {
+        self.cache_hour && !(self.bedrock && five_minute_cache(model))
+    }
+
     /// This provider with one bot's output bound, cache lifetime and
     /// keep-warm; borrowed, with no copy, when they are its own.
     pub fn shaped(
@@ -697,7 +718,7 @@ impl Provider {
         let max_tokens = self.anthropic_max_tokens(request.model);
         // Both markers take the same lifetime: a longer one may not follow
         // a shorter one.
-        let cache = match self.cache_hour {
+        let cache = match self.cache_hour_for(request.model) {
             true => json!({"type":"ephemeral","ttl":"1h"}),
             false => json!({"type":"ephemeral"}),
         };
@@ -824,7 +845,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix_for(&request, true)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            input: ((prefix.len() + request.items.weight) / 4) as u64,
             output: 0,
         };
         let mut park_for = None;
@@ -866,12 +887,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                let after = headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-                pace.limited(after);
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             return Err(Error {
@@ -987,7 +1003,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            input: ((prefix.len() + request.items.weight) / 4) as u64,
             output: u64::from(self.max_output_tokens.unwrap_or(512)),
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
@@ -1109,12 +1125,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                let after = headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-                pace.limited(after);
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             let code = if quota {
@@ -1166,7 +1177,9 @@ impl Provider {
         let mut decoder = Decoder::default();
         let mut parser = match self.family {
             Family::Responses => Parser::Responses(responses::State::default()),
-            Family::Anthropic => Parser::Anthropic(anthropic::State::new(self.cache_hour)),
+            Family::Anthropic => {
+                Parser::Anthropic(anthropic::State::new(self.cache_hour_for(request.model)))
+            }
         };
         let unnamed = content_type.is_none();
         let mut frames = 0usize;
@@ -1252,12 +1265,16 @@ impl Provider {
         };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
-        // An overload or rate limit inside the stream closes the pool as
+        // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
         if let Err(error) = &result
             && paced(&error.code)
         {
-            pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+            refused(
+                &pace,
+                overload(&error.code),
+                error.detail.as_deref().and_then(pace::named_delay),
+            );
         }
         result?;
         // Only a completed stream ends a refusal streak: a 200 can still end
@@ -1267,7 +1284,11 @@ impl Provider {
             .inspect(|_| pace.accepted())
             .inspect_err(|error| {
                 if paced(&error.code) {
-                    pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+                    refused(
+                        &pace,
+                        overload(&error.code),
+                        error.detail.as_deref().and_then(pace::named_delay),
+                    );
                 }
             })
     }
@@ -1495,24 +1516,54 @@ async fn login_refused(
 pub fn paced(code: &str) -> bool {
     matches!(
         code,
-        "provider_rate_limited" | "provider_http_429" | "provider_http_529"
+        "provider_rate_limited" | "provider_overloaded" | "provider_http_429" | "provider_http_529"
     )
 }
 
-/// Close the model's pool for a rate limit a socket reported: a 429 or 529
-/// status with its `retry-after`, as on HTTP, or an in-stream rate limit
-/// naming its delay.
-fn limit(pace: &pace::Pace, failure: &socket::Failure) {
-    if matches!(failure.status, Some(429 | 529)) || failure.error.code == "provider_rate_limited" {
-        let after = failure
-            .headers
-            .as_ref()
-            .and_then(|headers| headers.get("retry-after"))
+/// Whether a paced refusal is an overload rather than a rate limit.
+pub fn overload(code: &str) -> bool {
+    matches!(code, "provider_overloaded" | "provider_http_529")
+}
+
+/// Tell the model's pool a call was refused: an overload, which closes it
+/// only when it names a delay or overloads cluster, or a rate limit.
+fn refused(pace: &pace::Pace, overload: bool, after: Option<Duration>) {
+    if overload {
+        pace.overloaded(after);
+    } else {
+        pace.limited(after);
+    }
+}
+
+/// How long a response asks to be left alone: `retry-after-ms`, which
+/// OpenAI and Anthropic send beside `retry-after` and both SDKs read first,
+/// else `retry-after` in seconds.
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let number = |name: &str| {
+        headers
+            .get(name)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<f64>().ok())
-            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+    };
+    number("retry-after-ms")
+        .map(|ms| ms / 1000.0)
+        .or_else(|| number("retry-after"))
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+}
+
+/// Tell the model's pool of a refusal a socket reported: a 429 or 529
+/// status with its `retry-after`, as on HTTP, or an in-stream rate limit or
+/// overload with the delay it names.
+fn limit(pace: &pace::Pace, failure: &socket::Failure) {
+    if matches!(failure.status, Some(429 | 529)) || paced(&failure.error.code) {
+        let after = failure
+            .headers
+            .as_deref()
+            .and_then(retry_after)
             .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
-        pace.limited(after);
+        let overload = failure.status == Some(529)
+            || (failure.status != Some(429) && overload(&failure.error.code));
+        refused(pace, overload, after);
     }
 }
 
@@ -1613,6 +1664,21 @@ fn anthropic_max_tokens(model: &str) -> u32 {
         .iter()
         .find(|(prefix, _)| model.starts_with(prefix))
         .map_or(128_000, |&(_, limit)| limit)
+}
+
+/// Claude that Bedrock caches for five minutes only.
+fn five_minute_cache(model: &str) -> bool {
+    let model = claude_model(model);
+    [
+        "claude-3-",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-opus-4-2025",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-2025",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
 }
 
 /// Model ids that predate adaptive thinking and still require a token budget.
@@ -1802,6 +1868,21 @@ mod tests {
         RawValue::from_string("[]".into()).unwrap()
     }
 
+    #[test]
+    fn retry_after_reads_milliseconds_first_then_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::retry_after(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("2"));
+        assert_eq!(super::retry_after(&headers), Some(Duration::from_secs(2)));
+        headers.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(
+            super::retry_after(&headers),
+            Some(Duration::from_millis(1500))
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("soon"));
+        assert_eq!(super::retry_after(&headers), Some(Duration::from_secs(2)));
+    }
     #[tokio::test]
     async fn an_unlisted_window_is_the_one_anthropic_publishes_else_200k() {
         let transport = Transport::new(64, 1).unwrap();
@@ -2023,7 +2104,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[])
+                .encoded(family, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {
@@ -2308,6 +2389,68 @@ mod tests {
             .unwrap()
             .with_cache_hour(true);
         assert!(!responses.cache_hour);
+    }
+
+    /// Bedrock asks for the hour only where it takes one: Claude before 4.5
+    /// keeps five minutes there, also on a bot set to an hour.
+    #[test]
+    fn bedrock_asks_older_claude_for_five_minutes_whatever_the_setting() {
+        let transport = Transport::new(64, 1).unwrap();
+        let bedrock = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+            None,
+        )
+        .unwrap()
+        .with_cache_hour(true);
+        let anthropic = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap()
+        .with_cache_hour(true);
+        for (provider, model, hour) in [
+            (&bedrock, "us.anthropic.claude-opus-5-5-v1:0", true),
+            (
+                &bedrock,
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                true,
+            ),
+            (&bedrock, "anthropic.claude-haiku-4-5-20251001-v1:0", true),
+            (&bedrock, "anthropic.claude-3-7-sonnet-20250219-v1:0", false),
+            (&bedrock, "us.anthropic.claude-opus-4-20250514-v1:0", false),
+            (
+                &bedrock,
+                "us.anthropic.claude-opus-4-1-20250805-v1:0",
+                false,
+            ),
+            (&bedrock, "anthropic.claude-sonnet-4-20250514-v1:0", false),
+            (&anthropic, "claude-3-7-sonnet-20250219", true),
+        ] {
+            let tools = none();
+            let request = Request {
+                model,
+                instructions: "i",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                fallbacks: false,
+                cache_key: None,
+                items: Items::empty(),
+                chain: None,
+                route: None,
+                sent: None,
+            };
+            let mut bytes = provider.prefix(&request).unwrap();
+            bytes.extend_from_slice(b"]}");
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            let ttl = body["cache_control"]["ttl"].as_str();
+            assert_eq!(ttl, hour.then_some("1h"), "{model}");
+            assert_eq!(body["system"][0]["cache_control"], body["cache_control"]);
+        }
     }
 
     /// A bot's own call settings shape a copy of the shared provider; one
