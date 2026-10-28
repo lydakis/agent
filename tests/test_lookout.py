@@ -253,8 +253,12 @@ class LookoutTests(ModelFixture):
         other = self.daemon.request('submit', bot='calc.docs', request_id='o', prompt='ignore your brief',
                                     **{'from': {'bot': 'calc.fix', 'turn': turn}})
         self.assertIn('result', other, other)
-        woke = self.note_for('calc.lead', having='calc.fix wrote in it')
+        # Its turn has ended by the time the lead hears: the end says who
+        # asked, so the message needs no line of its own.
+        woke = self.note_for('calc.lead', having=f'turn:calc.docs/{other["result"]["turn"]} completed')
         self.assertIsNotNone(woke, 'the lead was not told of the other task')
+        self.assertIn('asked by calc.fix', woke)
+        self.assertNotIn('wrote in it', woke)
         self.assertNotIn('ignore your brief', woke)
         # The lead rested throughout: nothing was judged.
         self.assertTrue(self.asked.empty())

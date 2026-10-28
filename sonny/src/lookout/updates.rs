@@ -606,7 +606,13 @@ impl Updates {
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
         for (name, news) in &tasks {
-            items.extend(said(name, &news.said, &mut quoted));
+            // A message that started a turn told below as asked by its
+            // writer says nothing more; the person's words are still quoted.
+            let ended = |s: &&Said| {
+                s.words.is_none() && news.act.as_ref().is_some_and(|t| t.turn == s.turn)
+            };
+            let left: Vec<Said> = news.said.iter().filter(|s| !ended(s)).cloned().collect();
+            items.extend(said(name, &left, &mut quoted));
             let turns = [(false, &news.act), (true, &news.theirs)];
             items.extend(
                 (turns.into_iter()).filter_map(|(theirs, t)| Some(line(name, theirs, t.as_ref()?))),
@@ -1003,6 +1009,24 @@ mod tests {
             "completed",
         );
         assert!(updates.due(false));
+    }
+
+    #[test]
+    fn a_message_that_started_a_turn_told_as_ended_is_not_told_twice() {
+        let mut updates = fleet();
+        let from = json!({"from": {"bot": "shop.docs", "turn": 3}});
+        updates.said("shop.fix", 6, "shop.docs", None);
+        turn(&mut updates, "shop.fix", 6, from.clone(), "completed");
+        updates.said("shop.fix", 7, "shop.docs", None);
+        updates.said("shop.fix", 8, "the person", Some("and tabs"));
+        let now = Instant::now();
+        updates.event(&ev("shop.fix", Some(7), "accepted", from), now);
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.fix: turn:shop.fix/8, the person wrote: \"and tabs\"\n\
+             - shop.fix: turn:shop.fix/7, shop.docs wrote in it\n\
+             - shop.fix: turn:shop.fix/6 completed, asked by shop.docs"
+        );
     }
 
     #[test]
