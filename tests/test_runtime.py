@@ -160,16 +160,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             if ((user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1)
+                    or (user.startswith('outage:') and attempt <= int(user.split(':')[1]))
                     or user.startswith('limited-forever:') or (user == 'tool:limited' and attempt == 2)):
                 # Transport-level refusals: a 503 or a CDN's 520 the next
                 # attempt clears, a 429 with Retry-After (for tool:limited, on
                 # the call after the tool), or a 429 that never lifts.
                 body = json.dumps({'error': {'message': 'try later'}}).encode()
                 self.send_response(520 if user.startswith('origin:') else
-                                   503 if user.startswith(('flaky:', 'waitretry:')) else 429)
+                                   503 if user.startswith(('flaky:', 'waitretry:', 'outage:')) else 429)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
-                if not user.startswith(('flaky:', 'origin:', 'waitretry:')):
+                if not user.startswith(('flaky:', 'origin:', 'waitretry:', 'outage:')):
                     delays = getattr(self.server, 'retry_delays', ['0.05'])
                     self.send_header('Retry-After', delays[min(attempt - 1, len(delays) - 1)])
                 self.end_headers()
@@ -260,16 +261,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'script' and getattr(self.server, 'call_script', None):
-                # One call a round from `call_script`, then an answer; a cut
-                # inside the turn keeps at least its newest call in view.
-                done = max((int(i['call_id'][7:]) + 1 for i in request['input']
+                # One round a step of `call_script`, then an answer; a cut
+                # inside the turn keeps at least its newest call in view. A
+                # step is a call, or a list of calls made in one round.
+                done = max((int(i['call_id'][7:].split('.')[0]) + 1 for i in request['input']
                             if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
                            default=0)
                 text = ''
                 if done < len(self.server.call_script):
-                    name, arguments = self.server.call_script[done]
-                    output = [{'type': 'function_call', 'name': name, 'call_id': f'script-{done}',
-                               'arguments': json.dumps(arguments)}]
+                    step = self.server.call_script[done]
+                    calls = step if isinstance(step, list) else [step]
+                    output = [{'type': 'function_call', 'name': name,
+                               'call_id': f'script-{done}' + (f'.{n}' if n else ''),
+                               'arguments': json.dumps(arguments)}
+                              for n, (name, arguments) in enumerate(calls)]
                 else:
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',

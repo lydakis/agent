@@ -16,7 +16,9 @@ use agent_runtime::{
         Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Settings,
         Started, Store, TurnOptions, Waiting, Wake,
     },
-    tools::{DECLARED_BYTES, Declared, MAX_DECLARED, Registry, validate_declared},
+    tools::{
+        ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
+    },
 };
 use handles::{Completion, Handles, Waiter, now_ms};
 use hub::{Hub, replay};
@@ -174,6 +176,14 @@ pub struct Request {
     id: Value,
     #[serde(flatten)]
     command: Command,
+}
+/// A client's refusal of an answered call, which the model reads as the
+/// call's error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolError {
+    code: String,
+    detail: Option<String>,
 }
 /// Who wrote a submitted prompt: a bot's turn. Declared by the submitter.
 #[derive(Deserialize)]
@@ -403,6 +413,22 @@ enum Command {
         /// The lease of the session serving `tag`: an answer under a lease
         /// that ended is refused. Without one, the answer is an override.
         lease: Option<u64>,
+    },
+    /// A client's answer to a call of a declared tool it answers: the
+    /// output the model reads, or a typed error.
+    ToolResult {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        output: Option<String>,
+        error: Option<ToolError>,
+    },
+    /// Calls still waiting for the client `tag` names, oldest first.
+    ToolCalls {
+        tag: String,
+        #[serde(default)]
+        after: i64,
+        limit: Option<usize>,
     },
     /// Planned calls waiting on a gate, in announcement order.
     Approvals {
@@ -706,10 +732,11 @@ where
 {
     T::deserialize(deserializer).map(Some)
 }
-/// A client's own gate: tools whose calls wait for a verdict, and the tag
-/// of the approver that answers. Both or neither; the daemon never reads
-/// the tag. A list longer than the `known` tools is refused before it is
-/// sorted, so its cost is bounded by the registry, not the request.
+/// A client's own gate: tools whose calls wait for a verdict, the daemon's
+/// or declared ones, and the tag of the approver that answers. Both or
+/// neither; the daemon never reads the tag. A list longer than the `known`
+/// tools is refused before it is sorted, so its cost is bounded by the
+/// registry and the declared tools' cap, not the request.
 fn gate(
     approve: Option<Vec<String>>,
     approver: Option<String>,
@@ -920,8 +947,17 @@ struct Active {
     compact: Arc<std::sync::atomic::AtomicBool>,
     /// Armed by a `steer` alone, never by other deliveries.
     lift: Arc<turn::Lift>,
+    /// Set by the task before it submits its finish: from then on the store,
+    /// whose finishing commit also publishes `turn_finished`, says whether
+    /// the bot is still busy, though the task is not reaped yet.
+    ending: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Active {
+    /// The running turn, unless it has committed or is committing its end;
+    /// then a busy check asks the store.
+    fn running(&self) -> Option<i64> {
+        (!self.ending.load(std::sync::atomic::Ordering::Acquire)).then_some(self.turn)
+    }
     /// Cancel the turn with `code` unless a cause is already set: the first
     /// cause wins, so shutdown never relabels a client's pending interrupt.
     /// False when the task has already dropped its receiver.
@@ -1151,7 +1187,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             db.waiting_turns()?
                 .into_iter()
                 .map(|w| {
-                    let own = !w.approval && w.paced_since_ms.is_none();
+                    let own = !w.approval && w.answer.is_none() && w.paced_since_ms.is_none();
                     let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
                     // A steer sent while the daemon was down wakes the wait.
                     let steered = match own {
@@ -1171,7 +1207,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         // A verdict park wakes on an answer, which may have committed
         // before the restart, or when a gate lapses: check now as an answer
         // would, and keep the lapse unless it has already passed.
-        if waiting.approval {
+        if waiting.approval || waiting.answer.is_some() {
             if let Some(at) = waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 wakes.set(at, waiting.bot.clone(), waiting.turn);
             }
@@ -1956,6 +1992,7 @@ impl Service {
         if lifted {
             lift.arm();
         }
+        let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         self.active.insert(
             bot.clone(),
             Active {
@@ -1965,6 +2002,7 @@ impl Service {
                 steers: steers.clone(),
                 compact: compact.clone(),
                 lift: lift.clone(),
+                ending: ending.clone(),
             },
         );
         let task = Turn {
@@ -1995,6 +2033,7 @@ impl Service {
             let exit = task.execute(cancelled.clone()).await;
             let result = match &exit {
                 turn::Exit::Finished(error) => {
+                    ending.store(true, std::sync::atomic::Ordering::Release);
                     commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled)
                         .await
                         .map(|()| exit)
@@ -2094,7 +2133,7 @@ impl Service {
                     approve,
                     approver,
                     approve_expire_ms,
-                    self.registry.tool_count(),
+                    self.registry.tool_count() + MAX_DECLARED,
                 )?;
                 name("bot", &bot)?;
                 if let Some(creator) = &created_by {
@@ -2216,12 +2255,12 @@ impl Service {
                             "turns":0,"events":0,"nodes":0}));
                     }
                 }
-                if let Some(active) = self.active.get(&bot) {
+                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
-                        format!("turn {} of {bot} is running", active.turn),
+                        format!("turn {turn} of {bot} is running"),
                     )
-                    .facts(json!({"running_turn":active.turn})));
+                    .facts(json!({"running_turn":turn})));
                 }
                 // One bounded piece per job, on a task of its own, so other
                 // bots' requests and commits interleave with a large deletion
@@ -2308,7 +2347,7 @@ impl Service {
                         approve,
                         approver,
                         approve_expire_ms,
-                        self.registry.tool_count(),
+                        self.registry.tool_count() + MAX_DECLARED,
                     )?),
                 };
                 if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
@@ -2320,12 +2359,12 @@ impl Service {
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
                 }
-                if let Some(active) = self.active.get(&bot) {
+                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
-                        format!("turn {} of {bot} is running", active.turn),
+                        format!("turn {turn} of {bot} is running"),
                     )
-                    .facts(json!({"running_turn":active.turn})));
+                    .facts(json!({"running_turn":turn})));
                 }
                 // Another model of the bot's family: its history is kept in
                 // that family's encoding.
@@ -2368,7 +2407,7 @@ impl Service {
                         let mut changed = Vec::new();
                         // First: the one change that may be refused here.
                         if let Some(gate) = gate
-                            && db.set_gate(&bot, Some(id), gate)?
+                            && db.set_gate(&bot, Some(id), gate, declare.as_deref())?
                         {
                             changed.push("gates");
                         }
@@ -2597,6 +2636,74 @@ impl Service {
                 }
                 Ok(answered.reply)
             }
+            Command::ToolResult {
+                bot,
+                turn,
+                call_id,
+                output,
+                error,
+            } => {
+                let outcome = match (output, error) {
+                    (Some(output), None) if output.len() > ANSWER_BYTES => {
+                        return fail_with(
+                            "tool_output_limit",
+                            format!("output may be up to {ANSWER_BYTES} bytes"),
+                        );
+                    }
+                    (Some(output), None) => Outcome::text(self.registry.redact_text(output)),
+                    (None, Some(ToolError { code, detail })) => {
+                        let coded = !code.is_empty()
+                            && code.len() <= 64
+                            && code
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                        if !coded {
+                            return fail_with(
+                                "invalid_tool_result",
+                                "an error's code is 1 to 64 lowercase letters, digits or _",
+                            );
+                        }
+                        if detail.as_ref().is_some_and(|d| d.len() > ANSWER_BYTES) {
+                            return fail_with(
+                                "tool_output_limit",
+                                format!("detail may be up to {ANSWER_BYTES} bytes"),
+                            );
+                        }
+                        let detail = detail.map(|d| self.registry.redact_text(d));
+                        Outcome {
+                            output: json!({"error":code,"detail":detail}).to_string(),
+                            artifacts: Vec::new(),
+                            note: None,
+                            failed: true,
+                        }
+                    }
+                    _ => {
+                        return fail_with("invalid_tool_result", "give output or error, not both");
+                    }
+                };
+                let name = bot.clone();
+                let answered = store
+                    .op("tool_result", move |db| {
+                        db.answer_call(&name, turn, &call_id, outcome, now_ms())
+                    })
+                    .await?;
+                // Held by the worker or durable by now; only then does the
+                // turn look for it.
+                if let Some(notify) = answered.notify {
+                    notify.notify_one();
+                }
+                if answered.resume {
+                    self.handles.wake(bot, turn);
+                }
+                Ok(answered.reply)
+            }
+            Command::ToolCalls { tag, after, limit } => {
+                store
+                    .op("tool_calls", move |db| {
+                        db.tool_calls(&tag, after, limit.unwrap_or(64))
+                    })
+                    .await
+            }
             Command::Approvals {
                 bot,
                 tag,
@@ -2766,7 +2873,7 @@ impl Service {
                     approve,
                     approver,
                     approve_expire_ms,
-                    self.registry.tool_count(),
+                    self.registry.tool_count() + MAX_DECLARED,
                 )?;
                 name("bot", &bot)?;
                 if let Some(creator) = &created_by {
@@ -3357,6 +3464,7 @@ mod tests {
             steers: Arc::default(),
             compact: Arc::default(),
             lift: Arc::default(),
+            ending: Arc::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -3575,6 +3683,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_that_committed_its_end_does_not_hold_its_bot_busy_until_reaped() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-ending-busy-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = store
+            .op("create", |db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic-model",
+                        instructions: "test",
+                        effort: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                        gate: None,
+                        settings: Default::default(),
+                        declared: None,
+                        request_id: None,
+                    },
+                )?;
+                let turn = db
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                Ok(turn)
+            })
+            .await
+            .unwrap();
+        let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let mut service = Service {
+            store: store.clone(),
+            identity: 0,
+            transport: Transport::new(64, 1).unwrap(),
+            providers: Arc::new(HashMap::new()),
+            registry: Registry::new("wait").unwrap(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
+                processes: 16,
+                detached: 16,
+                active: 1024,
+                connecting: 64,
+                connections: 11,
+            },
+            sessions: 0,
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1,
+            active: HashMap::from([(
+                "Bob".into(),
+                Active {
+                    turn,
+                    task: 1,
+                    cancel: watch::channel(None).0,
+                    steers: Arc::default(),
+                    compact: Arc::default(),
+                    lift: Arc::default(),
+                    ending: ending.clone(),
+                },
+            )]),
+            next_task: 1,
+            jobs: JoinSet::new(),
+            replays: JoinSet::new(),
+            retention: JoinSet::new(),
+            ready_hint: false,
+            tokens: Arc::default(),
+            wakes: Wakes::default(),
+            steer_wakes: HashMap::new(),
+            draining: false,
+            admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
+            expiry: None,
+            reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
+        };
+        let output = Output::writer(tokio::io::sink());
+        let delete = || Command::Delete {
+            bot: "Bob".into(),
+            bot_id: None,
+        };
+        // Running: refused at once, without asking the store.
+        let busy = service
+            .dispatch(delete(), 0, &output, Value::Null, Bound::default())
+            .await
+            .unwrap_err();
+        assert_eq!(busy.code, "bot_busy");
+        // The task is submitting its end: the store decides, and the turn is
+        // still running there.
+        ending.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            service
+                .dispatch(delete(), 0, &output, Value::Null, Bound::default())
+                .await
+                .unwrap_err()
+                .code,
+            "deferred"
+        );
+        let refused = service.retention.join_next().await;
+        assert!(refused.is_some());
+        assert!(store.op("inspect", |db| db.inspect("Bob")).await.is_ok());
+        // Its end committed, which published `turn_finished`; the task is not
+        // reaped, and a client that saw the event may delete the bot.
+        store
+            .op("finish", move |db| db.finish(turn, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .dispatch(delete(), 0, &output, Value::Null, Bound::default())
+                .await
+                .unwrap_err()
+                .code,
+            "deferred"
+        );
+        service.retention.join_next().await;
+        assert_eq!(
+            store
+                .op("inspect", |db| db.inspect("Bob"))
+                .await
+                .unwrap_err()
+                .code,
+            "bot_not_found"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[tokio::test]
     async fn interrupt_reconciles_a_parked_task_before_it_is_reaped() {
         let dir = std::env::temp_dir().join(format!(
             "agent-parked-interrupt-test-{}",
@@ -3669,6 +3919,7 @@ mod tests {
                     steers: Arc::default(),
                     compact: Arc::default(),
                     lift: Arc::default(),
+                    ending: Arc::default(),
                 },
             )]),
             next_task: 1,
@@ -3877,6 +4128,7 @@ mod tests {
                             steers: Arc::default(),
                             compact: Arc::default(),
                             lift: Arc::default(),
+                            ending: Arc::default(),
                         },
                     )
                 })
@@ -4611,7 +4863,10 @@ mod tests {
         assert_eq!(service.storage_backoff, Duration::ZERO);
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
         service.complete(bot, turn, task, exit).await.unwrap();
-        assert_eq!(status().await, "failed", "the provider was missing");
+        // Nothing listens there: its retries back off, and a backoff of a
+        // second or more parks the turn again rather than sleeping in it.
+        assert_eq!(status().await, "paced", "the provider refused, backing off");
+        assert!(service.active.is_empty(), "the backoff holds no slot");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
