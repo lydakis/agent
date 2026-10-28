@@ -853,6 +853,15 @@ impl Registry {
         }));
         self
     }
+    /// How many of one bot's calls may run together: `cap` at most, and
+    /// no more than half the process budget, so one bot's wide round
+    /// leaves room for the others.
+    pub fn wide(&self, cap: usize) -> usize {
+        match self.budget {
+            0 => cap,
+            budget => cap.min(budget / 2).max(1),
+        }
+    }
     /// Take a place in line for a background command, or refuse when as many
     /// are already waiting as may run: a counter and a comparison, so a fleet
     /// cannot accumulate an invisible backlog behind the process bound.
@@ -1956,6 +1965,19 @@ async fn shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_bot_runs_at_most_half_the_process_budget_at_once() {
+        let wide = |budget| {
+            Registry::new("shell")
+                .unwrap()
+                .with_process_budget(budget)
+                .wide(4)
+        };
+        assert_eq!(
+            [wide(0), wide(1), wide(2), wide(4), wide(64)],
+            [4, 1, 1, 2, 4]
+        );
+    }
     #[test]
     fn binary_files_are_named_and_text_passes() {
         assert_eq!(binary(b"\x89PNG\r\n\x1a\n\0\0"), Some("a PNG image"));

@@ -3664,9 +3664,9 @@ impl Turn {
     }
 
     /// Run a batch of calls [`Self::parallel`] admits together, up to
-    /// [`PARALLEL_CALLS`] at a time: all started in one commit, each
-    /// result recorded in call order as soon as it and those before it
-    /// are done. A steer moves every command still running to the
+    /// [`PARALLEL_CALLS`] at a time and no more than half the process
+    /// budget: all started in one commit, each result recorded in call
+    /// order as soon as it and those before it are done. A steer moves every command still running to the
     /// background, as it does a lone one.
     async fn execute_parallel(
         &self,
@@ -3702,30 +3702,36 @@ impl Turn {
             self.run_parallel(call.call_id, prepared, workspace, environment, sandbox)
         });
         let record = async {
-            let mut results = stream::iter(runs).buffered(PARALLEL_CALLS);
-            // Each result is queued as it comes, in call order, and not
-            // waited on before the next: results done together share a
-            // commit, and the calls still running are polled meanwhile.
-            let mut writes = stream::FuturesOrdered::new();
-            loop {
-                tokio::select! {
-                    Some(written) = writes.next(), if !writes.is_empty() => drop(written?),
-                    next = results.next() => match next {
-                        Some((id, outcome)) => {
-                            let outcome = outcome?;
-                            writes.push_back(self.store.slot().await?.op(
-                                "tool_finish",
-                                move |db| db.tool_finish(turn, &id, &outcome),
-                            ));
-                        }
-                        None => break,
-                    },
+            // Results go to the store in call order as they come, each
+            // queued without waiting on the one before, so results done
+            // together share a commit. Waiting for room on the store's
+            // queue happens beside the calls still running, which go on
+            // being polled.
+            let (done, mut recorded) = tokio::sync::mpsc::unbounded_channel();
+            let run = async move {
+                let mut results = stream::iter(runs).buffered(self.registry.wide(PARALLEL_CALLS));
+                while let Some((id, outcome)) = results.next().await {
+                    let _ = done.send((id, outcome?));
                 }
-            }
-            while let Some(written) = writes.next().await {
-                written?;
-            }
-            Ok(())
+                Ok::<_, Error>(())
+            };
+            let write = async {
+                let mut written = Vec::new();
+                while let Some((id, outcome)) = recorded.recv().await {
+                    written.push(
+                        self.store
+                            .slot()
+                            .await?
+                            .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome)),
+                    );
+                }
+                for answer in written {
+                    answer.await?;
+                }
+                Ok::<_, Error>(())
+            };
+            let (ran, wrote) = tokio::join!(run, write);
+            ran.and(wrote)
         };
         match self.run_tool(record, None, warm).await? {
             Ran::Done(result) => result,
