@@ -1026,9 +1026,17 @@ async fn check(
         return Err(Failure::Unasked);
     }
     let text = &seen.text;
-    let same: Vec<&str> = (questions.iter().map(|q| q.text.as_str()))
-        .chain(seen.asks.context.iter().map(String::as_str))
+    let mut same: Vec<String> = (questions.iter().map(|q| q.text.clone()))
+        .chain(seen.asks.context.iter().cloned())
         .collect();
+    // Whether words drift depends on what passed before them in that task:
+    // the same correction again, after another reply, is a check of its own.
+    if questions.iter().any(|q| q.id == "drifts") {
+        same.push(format!(
+            "{} {:?} {:?}",
+            seen.task, seen.brief, seen.exchange
+        ));
+    }
     let same = same.join("\n");
     if seen.kind == Kind::Said && repeated(recent, text, &same, Instant::now()) {
         return Err(Failure::Duplicate);
@@ -1320,6 +1328,8 @@ impl Service {
         for lookout in self.lookouts.values_mut() {
             // The replay's turns were news then; the live ones are now.
             lookout.updates.live = false;
+            // What passed in each task is read again from the replay.
+            lookout.exchanges.clear();
             for bot in &bots {
                 lookout.updates.seat(bot);
             }
