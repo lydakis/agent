@@ -4996,9 +4996,19 @@ mod tests {
             lookout.heard_from(&slack(&escaped, true));
         }
         lookout.wake_sources(&client).await;
-        let prompt = got.recv().await.unwrap()["prompt"].as_str().unwrap().to_owned();
-        assert!(prompt.len() <= sources::NOTE_BYTES + 1024, "{}", prompt.len());
+        let prompt = got.recv().await.unwrap()["prompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            prompt.len() <= sources::NOTE_BYTES + 1024,
+            "{}",
+            prompt.len()
+        );
         let told = prompt.matches("- slack").count();
-        assert!(told > 0 && lookout.heard.len() == NOTE_ITEMS - told, "{told}");
+        assert!(
+            told > 0 && lookout.heard.len() == NOTE_ITEMS - told,
+            "{told}"
+        );
     }
 }
