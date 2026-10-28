@@ -383,7 +383,9 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             Err(_) => {}
         }
     }
-    if path.join("HEAD").is_file() {
+    if path.join("HEAD").is_file() && !git_folder_writable(path) {
+        read_only.push(path.to_owned());
+    } else if path.join("HEAD").is_file() {
         for name in GIT_PROTECTED {
             let kept = path.join(name);
             if held(&kept) {
@@ -422,6 +424,18 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         read_only,
         missing,
     })
+}
+
+/// Whether a git folder may be written with its hooks and config kept: not
+/// when its config is missing, which git would read once made, nor when it
+/// turns on per-worktree config, whose files git reads wherever a worktree
+/// keeps one, made or not. Any mention of that setting counts.
+fn git_folder_writable(path: &Path) -> bool {
+    let repository = path.join("objects").is_dir();
+    match std::fs::read_to_string(path.join("config")) {
+        Ok(config) => !config.to_ascii_lowercase().contains("worktreeconfig"),
+        Err(_) => !repository,
+    }
 }
 
 /// A symlink the sandbox may replace can't be held read-only: whatever is
@@ -1043,6 +1057,24 @@ mod tests {
         assert!(!policy.can_write(&git.join("config")));
         // Missing hooks may not be made.
         assert!(!policy.can_write(&git.join("hooks/pre-commit")));
+        // With per-worktree config on, whose files git reads wherever they
+        // are made, none of it is written.
+        std::fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!policy.can_write(&git.join("objects/ab/cdef")));
+        assert!(!policy.can_write(&git.join("worktrees/x/config.worktree")));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

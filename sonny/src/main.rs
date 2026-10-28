@@ -871,11 +871,14 @@ async fn run() -> Result<(), String> {
         app.move_to = Some(app.workspace.clone());
     }
     // A lead made before Sonny confined leads, or whose sandbox is not its
-    // mode's, takes its mode's again.
+    // mode's in the folder it now works in, takes its mode's again.
     if project.is_some()
         && app.gating.is_none()
         && let Some(mode) = app.mode
-        && !approvals::sandboxed_as(&bot, mode, true)
+        && !approvals::sandboxed_as(
+            &bot,
+            &approvals::sandbox(mode, true, std::path::Path::new(&app.workspace)),
+        )
     {
         app.gating = Some(mode);
     }

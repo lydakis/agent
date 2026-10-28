@@ -396,8 +396,13 @@ pub async fn create(
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
     }
+    // The client's settings, such as a sandbox, with the model's.
+    let mut settings = policy["settings"].as_object().cloned().unwrap_or_default();
     if let Some(ttl) = crate::policy::cache_ttl(model) {
-        params["settings"] = json!({"cache_ttl": ttl});
+        settings.insert("cache_ttl".into(), json!(ttl));
+    }
+    if !settings.is_empty() {
+        params["settings"] = Value::Object(settings);
     }
     // The tools its client declares on the lead, from its first turn.
     if !policy["declare"].is_null() {

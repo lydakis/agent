@@ -502,6 +502,8 @@ async fn make(
         "model": role.model,
         "tools": role.tools,
         "declare": crate::declared::tools(true),
+        // Confined from the start, as a new lead's mode confines it.
+        "settings": crate::approvals::sandbox(crate::approvals::MODES[0].0, true, dir),
     });
     let copies = crate::settings::Settings::load().copies;
     agent_client::project::create(client, dir, &policy, &json!(TOOLS), picks, &copies, None).await

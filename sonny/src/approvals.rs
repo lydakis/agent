@@ -88,23 +88,28 @@ pub fn sandbox(mode: &str, lead: bool, workspace: &std::path::Path) -> Map<Strin
 }
 
 /// The git folder of the repository `dir` is in, which its linked
-/// worktrees share.
+/// worktrees share, by its real path as the daemon keeps it.
 pub fn repository(dir: &std::path::Path) -> Option<String> {
-    crate::task::git(
+    let found = crate::task::git(
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .ok()
-    .filter(|path| !path.is_empty())
+    .filter(|path| !path.is_empty())?;
+    let real = std::fs::canonicalize(found).ok()?;
+    real.to_str().map(str::to_owned)
 }
 
-/// Whether `record`'s sandbox is the one `mode` gives it.
-pub fn sandboxed_as(record: &Value, mode: &str, lead: bool) -> bool {
-    let wanted = match mode {
-        "full" if lead => "danger-full-access",
-        _ => "workspace-write",
-    };
-    record["settings"]["sandbox"] == wanted
+/// Whether `record`'s sandbox is the one `fields` give it: its mode, its
+/// writable folders, which a moved folder leaves stale, and its network.
+pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
+    let fields = Value::Object(fields.clone());
+    let settings = &record["settings"];
+    let writable = |value: &Value| value["writable"].as_array().cloned().unwrap_or_default();
+    settings["sandbox"] == fields["sandbox"]
+        && writable(settings) == writable(&fields)
+        && settings["network"].as_bool().unwrap_or(false)
+            == fields["network"].as_bool().unwrap_or(false)
 }
 
 /// What a bot's gate may hold back: its own `tools`, and of the tools its
@@ -199,16 +204,25 @@ mod tests {
         let git = dir.join(".git").display().to_string();
         let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true});
         for (mode, _) in MODES {
-            let fields = Value::Object(sandbox(mode, false, &dir));
-            assert_eq!(fields, confined);
-            assert!(sandboxed_as(&json!({"settings": fields}), mode, false));
+            let fields = sandbox(mode, false, &dir);
+            assert_eq!(Value::Object(fields.clone()), confined);
+            assert!(sandboxed_as(&json!({"settings": fields}), &fields));
         }
         assert_eq!(Value::Object(sandbox("auto", true, &dir)), confined);
-        let full = Value::Object(sandbox("full", true, &dir));
-        assert_eq!(full, json!({"sandbox": "danger-full-access"}));
-        assert!(sandboxed_as(&json!({"settings": full}), "full", true));
-        // A lead made before leads were confined is confined again.
-        assert!(!sandboxed_as(&json!({"settings": {}}), "auto", true));
+        let full = sandbox("full", true, &dir);
+        assert_eq!(
+            Value::Object(full.clone()),
+            json!({"sandbox": "danger-full-access"})
+        );
+        let unconfined = json!({"settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
+        assert!(sandboxed_as(&unconfined, &full));
+        // A lead made before leads were confined is confined again, and
+        // one whose repository moved is given it where it is now.
+        let auto = sandbox("auto", true, &dir);
+        assert!(!sandboxed_as(&json!({"settings": {}}), &auto));
+        let moved = json!({"settings": {"sandbox": "workspace-write", "writable": ["/gone/.git"],
+            "network": true}});
+        assert!(!sandboxed_as(&moved, &auto));
         std::fs::remove_dir_all(&dir).unwrap();
         // Outside a repository, only its own folder.
         let plain = std::env::temp_dir();
