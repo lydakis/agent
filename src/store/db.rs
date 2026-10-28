@@ -1399,6 +1399,28 @@ fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> 
         .map(|(key, request)| json!({"request_id":key,"request":request}).to_string())
 }
 /// An offset must start a character: page from a returned `next_offset`.
+/// Matches one history search lists.
+const HISTORY_MATCHES: usize = 20;
+/// Item bytes one history search reads before it stops at a turn's start.
+const HISTORY_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
+const HISTORY_QUERY_BYTES: usize = 256;
+/// Text shown on each side of a history search's match.
+const HISTORY_AROUND_BYTES: usize = 160;
+
+/// The match at `at`, `len` bytes long, with up to `HISTORY_AROUND_BYTES`
+/// on each side, cut at character boundaries.
+fn around(text: &str, at: usize, len: usize) -> String {
+    let mut start = at.saturating_sub(HISTORY_AROUND_BYTES);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + len + HISTORY_AROUND_BYTES).min(text.len());
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    text[start..end].to_owned()
+}
+
 fn inside_character(code: &str) -> Error {
     Error::with(
         code,
@@ -4274,12 +4296,6 @@ impl Database {
         // one JSONL record even when its original response spans multiple lines.
         // Already single-line items need no rewrite (escaped newlines are fine).
         // Pictures go without their bytes, as other history reads return them.
-        const READING_ITEM: &str = "CASE
-            WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
-             AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
-            THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
-            WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
-            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
         let mut length = self.conn.prepare_cached(&format!(
             "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
         ))?;
@@ -4340,6 +4356,96 @@ impl Database {
             json!({"turn":turn_seq,"format":"jsonl","offset":offset,"next_offset":next,
             "items":items,"truncated":!done,"done":done,"text":text}),
         )
+    }
+
+    /// Search a bot's history, newest first, for literal text, ignoring
+    /// ASCII case: each match's turn, its item's type, and the text around
+    /// it in the view `history_read` pages. With `own`, the turn the search
+    /// runs in is left out, since it is the caller's own and holds the
+    /// call itself. With `before`, the search starts at the turn before
+    /// that one. It ends at a turn's start once `HISTORY_MATCHES` matches
+    /// are listed or `HISTORY_SEARCH_BYTES` of items are searched, naming
+    /// that turn as `next_before` to continue from.
+    pub fn history_search(
+        &self,
+        name: &str,
+        query: &str,
+        before: Option<i64>,
+        own: bool,
+    ) -> Result<Value> {
+        if query.is_empty() || query.len() > HISTORY_QUERY_BYTES {
+            return fail_with(
+                "invalid_history_search",
+                format!("query must be 1 to {HISTORY_QUERY_BYTES} bytes"),
+            );
+        }
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        let needle = query.to_ascii_lowercase();
+        // Ordered by depth, the walk yields the head first and ends at the
+        // root, so a search that finds enough stops early.
+        let mut chain = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth,turn_seq,size) AS (
+                SELECT id,parent,depth,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,COALESCE(length(n.item),0)
+                FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
+             SELECT id,turn_seq,size FROM chain",
+        )?;
+        // SQLite's lower() folds ASCII only, as to_ascii_lowercase does.
+        let mut contains = self.conn.prepare_cached(
+            "SELECT instr(lower(CAST(item AS TEXT)),?2)>0 FROM nodes WHERE id=?1",
+        )?;
+        // The raw item may match only in what the view leaves out, such as
+        // a picture's bytes, so a match counts once the view has it too.
+        let mut reading = self.conn.prepare_cached(&format!(
+            "SELECT CAST({READING_ITEM} AS TEXT),json_extract(CAST(item AS TEXT),'$.type')
+             FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+        ))?;
+        let mut rows = chain.query(params![head])?;
+        let mut skipping = own || before.is_some();
+        let mut found: Vec<Value> = Vec::new(); // In the turn being walked.
+        let mut matches: Vec<Value> = Vec::new();
+        let mut searched = 0_u64;
+        let mut next_before = None;
+        while let Some(row) = rows.next()? {
+            let (id, turn, size): (i64, Option<i64>, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            if skipping {
+                if let Some(turn) = turn
+                    && before.is_none_or(|before| before == turn)
+                {
+                    skipping = false;
+                }
+                continue;
+            }
+            searched += size as u64;
+            if matches.len() + found.len() < HISTORY_MATCHES
+                && contains.query_row(params![id, needle], |r| r.get::<_, bool>(0))?
+            {
+                let (text, kind): (String, Option<String>) =
+                    reading.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                if let Some(at) = text.to_ascii_lowercase().find(&needle) {
+                    found.push(json!({"type":kind,"text":around(&text, at, needle.len())}));
+                }
+            }
+            let Some(turn) = turn else { continue };
+            matches.extend(found.drain(..).map(|mut found| {
+                found["turn"] = json!(turn);
+                found
+            }));
+            if turn > 1 && (matches.len() >= HISTORY_MATCHES || searched >= HISTORY_SEARCH_BYTES) {
+                next_before = Some(turn);
+                break;
+            }
+        }
+        if skipping && before.is_some() {
+            return fail("turn_not_in_history");
+        }
+        Ok(json!({"bot":name,"query":query,"matches":matches,
+            "done":next_before.is_none(),"next_before":next_before}))
     }
 
     /// Reconcile duplicates first, then validate the effective provider using
@@ -9077,6 +9183,14 @@ fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
 /// of a user item or a tool's result without their bytes, each counted in
 /// `omitted_bytes` (a data URL keeps its media type). The model is sent
 /// them whole.
+/// An item as history reads show it: one line, without reasoning's
+/// encrypted content. Applied to `item`, which `PICTURELESS` provides.
+const READING_ITEM: &str = "CASE
+    WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
+     AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
+    THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+    WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
+    ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
 const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
 THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CAST(item AS TEXT),'$.content')='array'
     THEN CAST(json_set(CAST(item AS TEXT),'$.content',(SELECT json_group_array(

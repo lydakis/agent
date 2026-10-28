@@ -5698,6 +5698,134 @@ fn history_reads_one_turn_by_ordinal_along_the_lineage() {
     assert_eq!((window.omitted_items, window.omitted_turns), (6, 3));
 }
 
+/// A turn with `prompt` and one reply, left running unless `finish`.
+fn searched_turn(db: &mut Database, bot: &str, key: &str, prompt: &str, reply: &str, finish: bool) {
+    let turn = db
+        .begin(
+            bot,
+            key,
+            prompt,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant(reply)], &[], None).unwrap();
+    if finish {
+        db.finish(turn, None).unwrap();
+    }
+}
+
+#[test]
+fn history_search_finds_text_newest_first_and_continues_before_a_turn() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=30 {
+        let reply = if n % 2 == 0 {
+            format!("the NEEDLE is {n}")
+        } else {
+            format!("nothing at {n}")
+        };
+        searched_turn(
+            &mut db,
+            "Bob",
+            &format!("k{n}"),
+            &format!("task {n}"),
+            &reply,
+            true,
+        );
+    }
+    let found = db.history_search("Bob", "needle", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, (1..=15).rev().map(|n| n * 2).collect::<Vec<_>>());
+    assert_eq!(found["done"], true);
+    assert_eq!(found["next_before"], Value::Null);
+    let first = &found["matches"][0];
+    assert_eq!(first["type"], "message");
+    assert!(first["text"].as_str().unwrap().contains("the NEEDLE is 30"));
+    // A turn with more than one match lists each; past 20 the search ends
+    // at a turn's start and names it to continue from.
+    let found = db.history_search("Bob", "task 2", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, vec![29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 2]);
+    let found = db.history_search("Bob", "is", None, false).unwrap();
+    assert_eq!(found["matches"].as_array().unwrap().len(), 20);
+    assert_eq!(found["done"], false);
+    assert_eq!(found["next_before"], 11);
+    let older = db.history_search("Bob", "is", Some(11), false).unwrap();
+    assert_eq!(older["matches"][0]["turn"], 10);
+    assert_eq!(older["done"], true);
+    assert_eq!(
+        db.history_search("Bob", "is", Some(31), false)
+            .unwrap_err()
+            .code,
+        "turn_not_in_history"
+    );
+    assert_eq!(
+        db.history_search("Bob", "", None, false).unwrap_err().code,
+        "invalid_history_search"
+    );
+    // A search of the caller's own history leaves out the turn it runs in,
+    // which holds the call itself.
+    searched_turn(
+        &mut db,
+        "Bob",
+        "k31",
+        "find the needle",
+        "searching for needle",
+        false,
+    );
+    let own = db.history_search("Bob", "needle", None, true).unwrap();
+    assert_eq!(own["matches"][0]["turn"], 30);
+    let other = db.history_search("Bob", "needle", None, false).unwrap();
+    assert_eq!(other["matches"][0]["turn"], 31);
+    assert_eq!(other["matches"][1]["turn"], 31);
+}
+
+#[test]
+fn history_search_follows_the_lineage_of_a_fork() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    searched_turn(&mut db, "Bob", "k1", "shared fact", "ok", true);
+    db.fork(
+        "Bob",
+        "branch",
+        Fork {
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    searched_turn(&mut db, "branch", "k2", "branch fact", "ok", true);
+    let found = db.history_search("branch", "fact", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, vec![2, 1]);
+    let source = db.history_search("Bob", "branch", None, false).unwrap();
+    assert!(source["matches"].as_array().unwrap().is_empty());
+    assert_eq!(
+        db.history_search("nobody", "fact", None, false)
+            .unwrap_err()
+            .code,
+        "bot_not_found"
+    );
+}
+
 #[test]
 fn history_preserves_content_beyond_the_preview() {
     let mut db = db();
