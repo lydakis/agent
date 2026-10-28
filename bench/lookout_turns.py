@@ -2,7 +2,7 @@
 
 Usage:
   python3 -m bench.lookout_turns run REPLAY.jsonl --socket SOCK --out TURNS.jsonl
-      [--bands OLD_REPLAY.jsonl [--band-judge SPEC]] [--arms today,every]
+      [--bands OLD_REPLAY.jsonl [--band-judge SPEC]] [--arms today,every,drift]
       [--labels LABELS.jsonl [--old OLD_REPLAY.jsonl]] [--jobs 4]
   python3 -m bench.lookout_turns grade TURNS.jsonl LABELS.jsonl --socket SOCK
       --grader PROVIDER/MODEL --out GRADES.jsonl [--old OLD_REPLAY.jsonl] [--jobs 4]
@@ -25,6 +25,9 @@ stood at the event, so a turn still running then can show its final answer;
 `every` sends a note for each message where `today` sent few, so it meets
 that future more often, and a turn that tells the person an outcome is worth
 reading against when the turn it waits on ended.
+`drift` is `every` with the judge's drift answer from `--bands`: an event
+it read as a task drifting from what the person means (0.70 or more) is
+picked, with what to do, as a note picks what cannot wait.
 
 `grade` has a model grade each turn against the hand label for its event:
 whether the lead did what the label says it should, did something nothing
@@ -100,12 +103,15 @@ def words(text):
     return ' '.join(text.split())
 
 
-def ended_line(row):
-    """A turn's end as the task updates say it."""
+def ended_line(row, saw=False):
+    """A turn's end as the task updates say it, and whether it is the
+    person's own; with `saw`, only one that completed is, as one that
+    failed is news to them too."""
     status = (row.get('status') or 'ended').split(' (')[0].split(', after ')[0]
     by = row.get('asked_by') or PERSON
     task = row['task']
-    return f'- {task}: turn:{task}/{row["turn"]} {status}, asked by {by}', by == PERSON
+    return (f'- {task}: turn:{task}/{row["turn"]} {status}, asked by {by}',
+            by == PERSON and (not saw or status == 'completed'))
 
 
 ACTIONS = {
@@ -177,13 +183,33 @@ def counted(rows):
                 row['nth'] = run.index(row['turn']) + 1
 
 
-def every(row):
-    """The note that tells the lead every message, for one event."""
+def drifting(band):
+    """The judge's drift answer in an old replay's band, when it is a yes."""
+    for id, p in (band or {}).get('reasons') or []:
+        if id == 'drifts' and p >= 0.70:
+            return p
+    return None
+
+
+def every(row, band=None):
+    """The note that tells the lead every message, for one event; with
+    `band`, a drift the judge saw is picked, with what to do."""
     task, turn = row['task'], row['turn']
     handle = f'turn:{task}/{turn}'
     lines = ['Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.']
     quoted = False
-    if row['kind'] == 'Said':
+    drift = drifting(band)
+    if drift is not None:
+        what = (f'{row.get("from") or "someone"} wrote in it' if row['kind'] == 'Said'
+                else f'turn {(row.get("status") or "ended").split(" (")[0]}')
+        quote = ''
+        if row['kind'] == 'Said' and row.get('from') == PERSON:
+            quote = f': "{cut(words(row.get("words") or ""), QUOTE_CHARS)}"'
+            quoted = True
+        lines.append('Picked by your lookout:')
+        lines.append(f'- {task}: {handle}, {what} (drifts {drift:.2f}; settle what the person means and steer '
+                     f'the task with that reading){quote}')
+    elif row['kind'] == 'Said':
         if row.get('from') == PERSON:
             nth = row.get('nth') or 1
             run = f', their {ordinal(nth)} message in it since you last wrote there' if nth > 1 else ''
@@ -192,7 +218,7 @@ def every(row):
         else:
             lines.append(f'- {task}: {handle}, {row.get("from") or "someone"} wrote in it')
     else:
-        line, theirs = ended_line(row)
+        line, theirs = ended_line(row, saw=True)
         if theirs:
             lines.append('The person asked for these in the task themselves and saw how they ended:')
         lines.append(line)
@@ -353,9 +379,9 @@ def run(args):
     if args.labels:
         wanted = set(labelled(args.labels, args.old))
         rows = {k: r for k, r in rows.items() if event(k) in wanted}
-    if 'today' in args.arms.split(','):
+    if {'today', 'drift'} & set(args.arms.split(',')):
         missing = sum(k not in bands and (None, *event(k)) not in bands for k in rows)
-        print(f'{missing} of {len(rows)} events have no band: today sends them as no judge picked them',
+        print(f'{missing} of {len(rows)} events have no band: today and drift send them as no judge picked them',
               file=sys.stderr)
     arms = args.arms.split(',')
     done = set()
@@ -372,7 +398,8 @@ def run(args):
                 continue
             # A replay from before rows named their lead matches any lead.
             band = bands.get(k, bands.get((None, *event(k))))
-            note = today(row, band) if arm == 'today' else every(row)
+            note = {'today': lambda: today(row, band), 'every': lambda: every(row),
+                    'drift': lambda: every(row, band)}[arm]()
             work.append((row, arm, note, n))
     unsent = [w for w in work if w[2] is None]
     work = [w for w in work if w[2] is not None]
