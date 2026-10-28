@@ -62,7 +62,13 @@ supports Herdr the way its own agents do: each Sonny reports its bot through
 (working, idle, or blocked on an approval), the workspace rolls that up and
 notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 (`shop-fix-cart` for `shop.fix-cart`), and after a Herdr restart the pane runs
-`sonny` on the same bot again (when `sonny` is on the PATH). The place a
+`sonny` on the same bot again (when `sonny` is on the PATH; Herdr before
+0.9.2 lists Sonny but takes no command to restart it). Sonny reports from a
+pane of the Herdr server on its own machine: one reached by plain `ssh` from a
+Herdr pane is not listed, one in a remote machine Herdr itself connects to is.
+The daemon, lookout and approver Sonny starts run in a session of their own,
+so closing their pane or stopping Herdr leaves them and their turns running.
+The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `sonny run` and `sonny show` go to that Herdr workspace or Rex session, in
 that multiplexer, rather than one guessed from the agent's shell, which runs
