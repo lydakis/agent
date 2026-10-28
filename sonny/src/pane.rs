@@ -39,8 +39,9 @@ pub fn width(width: u16, prose: u16) -> u16 {
 pub struct Pane {
     /// What the pane shows, as its first row says it.
     title: String,
-    /// The file, opened outside Sonny when the title is clicked.
-    path: Option<PathBuf>,
+    /// The file's address, as its link held it, opened outside Sonny
+    /// when the title is clicked.
+    link: Option<String>,
     pub screen: Screen,
     /// Where it was drawn last: its title row and its rows.
     pub area: Rect,
@@ -66,9 +67,12 @@ impl Pane {
         let mut screen = Screen::default();
         let target = preview(&path, width, line, &mut screen)?;
         screen.show_row(target.saturating_sub(ABOVE));
+        // Its escapes kept, as the path read back may hold `#` or `%`;
+        // the line left off.
+        let link = url.split('#').next().unwrap_or(url);
         Ok(Self {
             title,
-            path: Some(path),
+            link: Some(link.to_owned()),
             screen,
             area: Rect::default(),
             card: None,
@@ -82,7 +86,7 @@ impl Pane {
     pub fn card(title: &str, keys: &'static str) -> Self {
         Self {
             title: title.to_owned(),
-            path: None,
+            link: None,
             screen: Screen::default(),
             area: Rect::default(),
             card: Some(Vec::new()),
@@ -96,7 +100,7 @@ impl Pane {
     pub fn program(title: &str, program: crate::embed::Embedded) -> Self {
         Self {
             title: title.to_owned(),
-            path: None,
+            link: None,
             screen: Screen::default(),
             area: Rect::default(),
             card: None,
@@ -128,8 +132,7 @@ impl Pane {
 
     /// The file's address, to open it outside, if it shows one.
     pub fn url(&self) -> Option<String> {
-        let path = self.path.as_ref()?;
-        Some(format!("file://{}", path.display()))
+        self.link.clone()
     }
 
     /// Whether `(column, row)` is on the title, which opens the file.
@@ -160,7 +163,7 @@ impl Pane {
         let title = crate::transcript::cut(&self.title, room);
         let mut style = Style::new();
         // A file's name is a link to it.
-        if self.path.is_some() {
+        if self.link.is_some() {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         if !focused {
@@ -389,6 +392,14 @@ mod tests {
         assert_eq!(path, PathBuf::from("/w/a b.rs"));
         assert_eq!(line, Some(12));
         assert_eq!(file_url("file:///w/c.rs").unwrap().1, None);
+        // The title opens the file by the address as the link wrote it.
+        let dir = std::env::temp_dir().join(format!("sonny-url-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a#1%20.rs"), "x\n").unwrap();
+        let url = format!("file://{}/a%231%2520.rs", dir.display());
+        let pane = Pane::preview(&format!("{url}#L1"), &dir, 40).unwrap();
+        assert_eq!(pane.url(), Some(url));
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(file_url("https://x").is_none());
     }
 

@@ -56,6 +56,8 @@ impl Embedded {
         let (screen, replies) = (parser.clone(), writer.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
+            // The start of a question a read cut off, kept for the next.
+            let mut held = Vec::new();
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
@@ -63,14 +65,18 @@ impl Embedded {
                 let Ok(mut parser) = screen.lock() else {
                     break;
                 };
+                let mut read = std::mem::take(&mut held);
+                read.extend_from_slice(&buf[..n]);
+                let (cut, rest) = pieces(&read);
                 let mut answers = Vec::new();
-                for piece in pieces(&buf[..n]) {
+                for piece in cut {
                     match piece {
                         Piece::Output(bytes) => parser.process(bytes),
                         Piece::Asked(query) => answers.push(answer(query, &parser, light)),
                     }
                 }
                 drop(parser);
+                held = rest.to_vec();
                 if !answers.is_empty()
                     && let Ok(mut writer) = replies.lock()
                 {
@@ -274,15 +280,26 @@ enum Piece<'a> {
     Asked(Query),
 }
 
+const ASKS: [(&[u8], Query); 4] = [
+    (b"\x1b]11;?\x1b\\", Query::Background),
+    (b"\x1b]11;?\x07", Query::Background),
+    (b"\x1b[c", Query::Device),
+    (b"\x1b[6n", Query::Cursor),
+];
+
 /// Output cut where it asks the terminal something, so each question is
-/// answered after the output before it, as a terminal would.
-fn pieces(bytes: &[u8]) -> Vec<Piece<'_>> {
-    const ASKS: [(&[u8], Query); 4] = [
-        (b"\x1b]11;?\x1b\\", Query::Background),
-        (b"\x1b]11;?\x07", Query::Background),
-        (b"\x1b[c", Query::Device),
-        (b"\x1b[6n", Query::Cursor),
-    ];
+/// answered after the output before it, as a terminal would; and the
+/// end of it that may be the start of a question the next read finishes,
+/// held back.
+fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
+    let longest = ASKS.iter().map(|(seq, _)| seq.len()).max().unwrap_or(0);
+    let held = (bytes.len().saturating_sub(longest - 1)..bytes.len())
+        .find(|&at| {
+            ASKS.iter()
+                .any(|(seq, _)| seq.len() > bytes.len() - at && seq.starts_with(&bytes[at..]))
+        })
+        .unwrap_or(bytes.len());
+    let (bytes, rest) = bytes.split_at(held);
     let mut out = Vec::new();
     let mut from = 0;
     let mut at = 0;
@@ -305,7 +322,7 @@ fn pieces(bytes: &[u8]) -> Vec<Piece<'_>> {
     if from < bytes.len() {
         out.push(Piece::Output(&bytes[from..]));
     }
-    out
+    (out, rest)
 }
 
 fn answer(query: Query, parser: &vt100::Parser, light: bool) -> Vec<u8> {
@@ -389,7 +406,8 @@ mod tests {
 
     #[test]
     fn questions_are_cut_out_of_the_output_in_order() {
-        let cut = pieces(b"ab\x1b]11;?\x1b\\cd\x1b[cef\x1b[6n");
+        let (cut, rest) = pieces(b"ab\x1b]11;?\x1b\\cd\x1b[cef\x1b[6n");
+        assert!(rest.is_empty());
         assert_eq!(
             cut,
             [
@@ -402,7 +420,12 @@ mod tests {
             ]
         );
         // Other sequences pass through whole.
-        assert_eq!(pieces(b"\x1b[2J"), [Piece::Output(b"\x1b[2J")]);
+        assert_eq!(pieces(b"\x1b[2J").0, [Piece::Output(b"\x1b[2J")]);
+        // A question a read cuts off waits for the rest.
+        let (cut, rest) = pieces(b"ab\x1b[6");
+        assert_eq!((cut, rest), (vec![Piece::Output(b"ab")], &b"\x1b[6"[..]));
+        let (cut, rest) = pieces(b"\x1b[6n");
+        assert_eq!((cut, rest), (vec![Piece::Asked(Query::Cursor)], &b""[..]));
     }
 
     #[test]

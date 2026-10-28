@@ -4057,6 +4057,12 @@ impl App {
                 program.paste(text);
                 return true;
             }
+            // A paste over a preview or `/status` is for the composer,
+            // which comes back into view to show it.
+            Event::Paste(_) if self.pane_keys && self.finding.is_none() => {
+                self.pane_keys = false;
+                return false;
+            }
             Event::Paste(text) if let Some(query) = &mut self.finding => {
                 query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
                 self.screen.find(query);
