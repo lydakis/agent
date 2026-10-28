@@ -169,7 +169,17 @@ keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
 Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
 character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
 Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
-last of those took.
+last of those took. Shift-Enter needs a terminal that speaks the kitty
+keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
+WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
+or Ctrl-J still start a line.
+
+On the full screen the mouse edits the composer too, as in Codex: a click
+puts the cursor there, a drag selects (and copies), two clicks select a word
+and three a line. Typing replaces the selection, Backspace or Delete takes it
+out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
+
+![A selection in the composer](../docs/sonny/composer-selection.png)
 
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file

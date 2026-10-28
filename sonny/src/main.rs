@@ -65,6 +65,7 @@ use ratatui::{
         event::{
             self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
             EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
         },
         execute,
         terminal::{
@@ -121,12 +122,33 @@ fn full() -> bool {
     FULL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Into the full screen, or out of it.
+/// Into the full screen, or out of it, the keys told apart on the screen
+/// it is on.
 fn own_screen(own: bool) {
     FULL.store(own, std::sync::atomic::Ordering::Relaxed);
+    keys_apart(false);
     let _ = match own {
         true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
         false => execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen),
+    };
+    keys_apart(true);
+}
+
+/// Ask the terminal to tell apart keys it otherwise sends alike, Shift-Enter
+/// from Enter among them, as Codex does: the kitty keyboard protocol, its
+/// escape codes made unambiguous, without release events. A terminal that
+/// does not know it ignores it. The main and alternate screens each keep
+/// their own, so each push is popped on the screen it was made on.
+fn keys_apart(on: bool) {
+    let _ = match on {
+        true => execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        ),
+        false => execute!(std::io::stdout(), PopKeyboardEnhancementFlags),
     };
 }
 
@@ -769,6 +791,7 @@ async fn run() -> Result<(), String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    keys_apart(true);
     if settings::Settings::load().fullscreen {
         own_screen(true);
     }
@@ -900,6 +923,7 @@ async fn run() -> Result<(), String> {
     if full() {
         own_screen(false);
     }
+    keys_apart(false);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     status_report("clear", &name);
@@ -1503,6 +1527,15 @@ struct App {
     pane: Option<pane::Pane>,
     pane_keys: bool,
     pane_mouse: bool,
+    /// Where the composer's text was last drawn on the full screen: its
+    /// area, the first of its rows shown there, and the width it was laid
+    /// out at; none while something else is drawn over it.
+    composer_at: Option<(Rect, usize, usize)>,
+    /// The mouse button went down on the composer's text, on what: a
+    /// spot, word or line a drag selects from. And the last press, to
+    /// count clicks.
+    composing: Option<std::ops::Range<usize>>,
+    composer_click: Option<(Instant, u16, u16, u8)>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2211,6 +2244,9 @@ impl App {
             pane: None,
             pane_keys: false,
             pane_mouse: false,
+            composer_at: None,
+            composing: None,
+            composer_click: None,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -4556,6 +4592,16 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
+                if !in_pane && self.composer_mouse(mouse) {
+                    // A press here lets go of what was selected there.
+                    if down {
+                        self.screen.unselect();
+                        if let Some(pane) = &mut self.pane {
+                            pane.screen.unselect();
+                        }
+                    }
+                    return true;
+                }
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
                         // A click on its name opens the file outside Sonny.
@@ -4581,8 +4627,11 @@ impl App {
                             self.want_older = true;
                         }
                         // A press here lets go of what was selected there.
-                        if down && let Some(pane) = &mut self.pane {
-                            pane.screen.unselect();
+                        if down {
+                            self.input.unselect();
+                            if let Some(pane) = &mut self.pane {
+                                pane.screen.unselect();
+                            }
                         }
                         self.screen.mouse(*mouse)
                     }
@@ -4736,7 +4785,12 @@ impl App {
                 self.copied(&text);
                 self.screen.unselect();
             }
-            KeyCode::Esc if self.screen.unselect() => {}
+            _ if copy && let Some(range) = self.input.selection() => {
+                let text = self.input[range].to_owned();
+                self.copied(&text);
+                self.input.unselect();
+            }
+            KeyCode::Esc if self.screen.unselect() || self.input.unselect() => {}
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.screen.page(false),
             // Sending goes back to the newest rows, where its answer comes.
@@ -4822,6 +4876,72 @@ impl App {
     }
 
     /// `text` put on the clipboard, and said so.
+    /// The mouse over the composer's text, as Codex's composer takes it:
+    /// a press puts the cursor there, a drag selects, which is copied,
+    /// two clicks select a word and three its line. Whether it took
+    /// `mouse`.
+    fn composer_mouse(&mut self, mouse: &event::MouseEvent) -> bool {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let Some((area, first, width)) = self.composer_at else {
+            self.composing = None;
+            return false;
+        };
+        let over = area.contains((mouse.column, mouse.row).into());
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if over => {}
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                if self.composing.is_some() => {}
+            _ => return false,
+        }
+        let rows = self.input.layout(width);
+        // Above the rows shown, the one before them; below, the last.
+        let row = match mouse.row < area.y {
+            true => first.saturating_sub(1),
+            false => first + (mouse.row - area.y) as usize,
+        }
+        .min(rows.len() - 1);
+        let at = self
+            .input
+            .spot(&rows[row], mouse.column.saturating_sub(area.x) as usize);
+        match mouse.kind {
+            MouseEventKind::Down(_) => {
+                let now = Instant::now();
+                let clicks = match self.composer_click {
+                    Some((then, x, y, n))
+                        if now.duration_since(then) < screen::DOUBLE
+                            && (x, y) == (mouse.column, mouse.row) =>
+                    {
+                        n % 3 + 1
+                    }
+                    _ => 1,
+                };
+                self.composer_click = Some((now, mouse.column, mouse.row, clicks));
+                let origin = match clicks {
+                    2 => self.input.word_at(at),
+                    3 => self.input.line_at(at),
+                    _ => at..at,
+                };
+                self.input.select(origin.start, origin.end);
+                self.composing = Some(origin);
+            }
+            _ => {
+                let origin = self.composing.clone().unwrap_or(at..at);
+                match at < origin.start {
+                    true => self.input.select(origin.end, at),
+                    false => self.input.select(origin.start, at.max(origin.end)),
+                }
+                if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                    self.composing = None;
+                    if let Some(range) = self.input.selection() {
+                        let text = self.input[range].to_owned();
+                        self.copied(&text);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn copied(&mut self, text: &str) {
         term::copy(text);
         let count = text.chars().count();
@@ -5807,6 +5927,8 @@ impl App {
         self.keys_paused
             .store(true, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(80)).await;
+        // The side chat's Sonny asks for its own keys.
+        keys_apart(false);
         let _ = execute!(
             std::io::stdout(),
             DisableBracketedPaste,
@@ -5851,6 +5973,7 @@ impl App {
             true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
             false => execute!(std::io::stdout(), LeaveAlternateScreen),
         };
+        keys_apart(true);
         self.keys_paused
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.redraw = true;
@@ -5948,6 +6071,12 @@ impl App {
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
+        // The first of the text's rows shown, for the mouse to find its spot.
+        let first_row = (!self.input.is_empty()).then(|| {
+            let layout = self.input.layout(width.min(PROSE));
+            self.input.cursor(&layout).0 - cursor_row
+        });
+        let mut composer_at = None;
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(PROSE));
@@ -6345,6 +6474,7 @@ impl App {
                 return;
             }
             frame.render_widget(Paragraph::new(composer_rows), composer);
+            composer_at = first_row.map(|first| (composer, first, width.min(PROSE)));
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys {
                 frame.set_cursor_position((
@@ -6354,6 +6484,7 @@ impl App {
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
+        self.composer_at = composer_at.filter(|_| full());
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -6407,6 +6538,7 @@ impl App {
         let (row, col) = self.input.cursor(&layout);
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
+        let selected = self.input.selection();
         let rows: Vec<Line<'static>> = layout
             .iter()
             .enumerate()
@@ -6417,10 +6549,19 @@ impl App {
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
-                Line::from(vec![
-                    lead,
-                    Span::raw(self.input[part.start..part.end].to_owned()),
-                ])
+                let text = |range: std::ops::Range<usize>| Span::raw(self.input[range].to_owned());
+                match &selected {
+                    Some(sel) if sel.start < part.end && sel.end > part.start => {
+                        let (from, to) = (sel.start.max(part.start), sel.end.min(part.end));
+                        Line::from(vec![
+                            lead,
+                            text(part.start..from),
+                            text(from..to).reversed(),
+                            text(to..part.end),
+                        ])
+                    }
+                    _ => Line::from(vec![lead, text(part.start..part.end)]),
+                }
             })
             .collect();
         let keep = match self.choosing.is_some()
@@ -8063,6 +8204,51 @@ mod tests {
             "{narrow}"
         );
         assert_eq!(narrow.trim_end().width(), 56 - 2);
+    }
+
+    #[tokio::test]
+    async fn shift_enter_breaks_the_line_and_a_selection_is_typed_over() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.input.set("one two");
+        let key = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        app.key(key(KeyCode::Enter, KeyModifiers::SHIFT)).await;
+        assert_eq!(&*app.input, "one two\n");
+        // Drawn on row 10 from column 0, its first row shown there.
+        app.input.set("one two three");
+        app.composer_at = Some((Rect::new(0, 10, 40, 3), 0, 40));
+        let mouse = |kind, column: usize, row| MouseEvent {
+            kind,
+            column: column as u16,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (down, drag) = (
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        );
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 4, 10)));
+        assert_eq!(
+            (
+                app.input.selection(),
+                app.input.cursor(&app.input.layout(40)).1
+            ),
+            (None, prompt::LEAD + 4)
+        );
+        assert!(app.composer_mouse(&mouse(drag, prompt::LEAD + 7, 10)));
+        assert_eq!(app.input.selection(), Some(4..7));
+        app.key(key(KeyCode::Backspace, KeyModifiers::NONE)).await;
+        assert_eq!(&*app.input, "one  three");
+        // Two clicks select a word, which typing replaces.
+        app.composing = None;
+        app.composer_click = None;
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 6, 10)));
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 6, 10)));
+        assert_eq!(app.input.selection(), Some(5..10));
+        app.key(key(KeyCode::Char('x'), KeyModifiers::NONE)).await;
+        assert_eq!(&*app.input, "one  x");
+        // A press off the composer is not its own.
+        assert!(!app.composer_mouse(&mouse(down, prompt::LEAD, 5)));
     }
 
     #[tokio::test]
