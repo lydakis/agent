@@ -26,10 +26,12 @@ the next daemon starts the next lookout. Its own lines go to
 note it sends (`woke`) and each item it held and dropped because the lead
 read that turn itself first (`"skipped": "the lead read it"`).
 
-It keeps the cursor of the newest event it saw in `STORE.lookout.cursor`.
-A lookout that starts again, after a crash or a lost connection, takes
-what happened after that cursor as news, so a task that finished while no
-lookout ran still reaches its lead.
+It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
+just before the oldest one whose news it has not told yet. A lookout that
+starts again, after a crash or a lost connection, takes what happened after
+that cursor as news, so a task that finished while no lookout ran, or whose
+news waited on a busy lead, still reaches its lead; news told already may
+be told again.
 
 ## What it checks
 
@@ -52,8 +54,9 @@ indexes. A yes (0.70 or more) steers the lead at once with
 `--delivery steer`; anything else waits for the lead to rest, as all news
 does. A resting lead is never judged for: it hears everything anyway. A
 judge answers at most two checks at once for one subscriber, so many busy
-tasks never crowd the model pool they work in; the rest wait their turn,
-and one still waiting when the lead comes to rest is not asked.
+tasks never crowd the model pool they work in; up to 16 more wait their
+turn, one still waiting when the lead comes to rest is not asked, and
+past those the rest go unjudged, told once the lead rests.
 
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person

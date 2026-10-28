@@ -136,6 +136,8 @@ pub struct Line {
     pub text: String,
     /// The news itself: the same news twice is one note.
     pub key: String,
+    /// It tells of more than one message.
+    pub many: bool,
 }
 
 type Key = (String, i64);
@@ -840,6 +842,7 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
         theirs,
         text,
         key: format!("{name}/{}/{}/{theirs}/{which}", t.turn, t.status),
+        many: false,
     }
 }
 
@@ -848,12 +851,13 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
 /// already, and everyone else's in one line by its latest turn.
 fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<Line> {
     let mut lines = Vec::new();
-    let line = |turn: i64, text: String| Line {
+    let line = |turn: i64, text: String, many: bool| Line {
         handle: format!("turn:{name}/{turn}"),
         said: true,
         theirs: false,
         text,
         key: format!("{name}/{turn}/said"),
+        many,
     };
     for message in said {
         let Some(words) = &message.words else {
@@ -866,7 +870,7 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
             None => format!("- {name}: {handle}, the person wrote: \"{words}\""),
         };
         quoted.entry(words.clone()).or_insert(handle);
-        lines.push(line(message.turn, text));
+        lines.push(line(message.turn, text, false));
     }
     let others: Vec<&Said> = said.iter().filter(|s| s.words.is_none()).collect();
     if let Some(last) = others.last() {
@@ -885,7 +889,7 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
                 from.join(", ")
             ),
         };
-        lines.push(line(last.turn, text));
+        lines.push(line(last.turn, text, others.len() > 1));
     }
     lines
 }

@@ -324,6 +324,33 @@ class LookoutTests(ModelFixture):
         # What it told before is not told again.
         self.assertNotIn(f'turn:calc.fix/{first} ', woke)
 
+    def test_news_waiting_on_a_busy_lead_outlives_a_lookout_restart(self):
+        self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
+        held_back = self.model.reply_for
+
+        def reply(request, user):
+            if request['model'] == 'judge-model':
+                return json.dumps({q: 0.1 for q in json.loads(user)['questions']})
+            return held_back(request, user)
+        self.model.reply_for = reply
+        service = self.start()
+        time.sleep(1)
+        held = self.hold('calc.lead')
+        turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser',
+                                   origin='tasks')['result']['turn']
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        # The news waits on the lead, in the lookout alone, past a cursor save.
+        time.sleep(3)
+        service.kill()
+        service.wait(timeout=5)
+        self.start()
+        time.sleep(1)
+        self.gate.set()
+        self.assertEqual(self.daemon.finished(held)['data']['status'], 'completed')
+        woke = self.note_for('calc.lead', having=f'turn:calc.fix/{turn} completed')
+        self.assertIsNotNone(woke, 'news held for a busy lead was lost with the lookout')
+
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
         self.make('reviewer', 'ops.deploy')
         store = ['--store', str(self.path / 'state.sqlite')]

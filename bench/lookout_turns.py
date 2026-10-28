@@ -247,6 +247,9 @@ def run_one(socket_path, row, arm, note, n):
             out['failed'] = 'timed out'
             return out
         out['status'] = outcome.get('status')
+        if out['status'] != 'completed':
+            out['failed'] = f"turn {out['status']}"
+            return out
         text = outcome.get('text') or ''
         out['would'] = [l[len('WOULD:'):].strip() for l in text.splitlines() if l.strip().startswith('WOULD:')]
         out['reply'] = '\n'.join(l for l in text.splitlines() if not l.strip().startswith('WOULD:')).strip()

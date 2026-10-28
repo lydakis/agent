@@ -30,6 +30,8 @@ const HIGH: f64 = 0.70;
 /// How many checks a judge answers at once for one subscriber; the rest
 /// wait their turn.
 const JUDGING: usize = 2;
+/// How many checks wait for a judge, a subscriber.
+const BACKLOG: usize = 16;
 /// How long a check may take before it counts as failed.
 const DEADLINE: Duration = Duration::from_secs(10);
 /// How long after a note is refused the next may go, even a steer.
@@ -353,12 +355,13 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
     if more > 0 {
         lines.push(format!("- {more} more in the next note"));
     }
-    // What was picked is told once, with why.
+    // What was picked is told once, with why; a line of several messages
+    // stays for the others.
     let picked: HashSet<(String, bool)> = (items.iter())
         .map(|item| (handle(item), item.seen.kind == Kind::Said))
         .collect();
     let told_items: Vec<&updates::Line> = (told.items.iter())
-        .filter(|line| !picked.contains(&(line.handle.clone(), line.said)))
+        .filter(|line| line.many || !picked.contains(&(line.handle.clone(), line.said)))
         .collect();
     if !items.is_empty() && told_items.iter().any(|line| !line.theirs) {
         lines.push("In your tasks:".to_owned());
@@ -1277,6 +1280,13 @@ impl Service {
                     }
                     for lookout in self.lookouts.values_mut() {
                         lookout.event(&event);
+                        // The oldest event whose news is not told yet: a
+                        // restart takes it up again from there.
+                        if live && let Some(at) = cursor
+                            && lookout.untold()
+                        {
+                            lookout.from.get_or_insert(at);
+                        }
                     }
                     // The replay tells who belongs to each lead and each
                     // task's current brief; what it holds was news then.
@@ -1361,10 +1371,19 @@ impl Service {
                         continue;
                     }
                     // A few model calls at once a subscriber, so many busy
-                    // tasks never crowd the pool they work in.
+                    // tasks never crowd the pool they work in. Past a short
+                    // backlog the rest go unjudged: still news, told once
+                    // the lead rests.
+                    let mut judge = judge;
                     if judge.is_some() && lookout.judging >= JUDGING {
-                        later.push(seen);
-                        continue;
+                        if later.len() < BACKLOG {
+                            later.push(seen);
+                            continue;
+                        }
+                        judge = None;
+                        if !quotes {
+                            continue;
+                        }
                     }
                     lookout.judging += usize::from(judge.is_some());
                     let (client, done) = (client.clone(), done.clone());
@@ -1548,7 +1567,19 @@ impl Service {
     /// The newest event seen live, kept beside the store for the next
     /// lookout, written whole and moved in.
     fn save_cursor(&mut self) {
-        let Some(cursor) = self.cursor.filter(|_| self.cursor != self.saved) else {
+        // Up to just before the oldest news a lookout has not told: news
+        // only in memory is told again after a restart, not lost.
+        for lookout in self.lookouts.values_mut() {
+            if !lookout.untold() {
+                lookout.from = None;
+            }
+        }
+        let floor = self.lookouts.values().filter_map(|l| l.from).min();
+        let cursor = match (self.cursor, floor) {
+            (Some(at), Some(floor)) => Some(at.min(floor - 1)),
+            (at, _) => at,
+        };
+        let Some(cursor) = cursor.filter(|at| Some(*at) != self.saved) else {
             return;
         };
         let path = cursor_path(&self.store);
@@ -1750,6 +1781,8 @@ struct Lookout {
     checking: usize,
     /// Of those, the ones a judge answers.
     judging: usize,
+    /// The cursor of the oldest event whose news is not told yet.
+    from: Option<i64>,
     log: Option<PathBuf>,
 }
 
@@ -1784,6 +1817,7 @@ impl Lookout {
             since: None,
             checking: 0,
             judging: 0,
+            from: None,
             log: None,
         }
     }
@@ -2279,6 +2313,15 @@ impl Lookout {
                 _ => None,
             })
             .reduce(|a, b| a || b)
+    }
+
+    /// Whether anything it heard is not told yet: checks waiting or under
+    /// way, what they picked, or task updates.
+    fn untold(&self) -> bool {
+        !self.due.is_empty()
+            || self.checking > 0
+            || !self.held.is_empty()
+            || self.updates.news(self.urgent.is_some())
     }
 
     /// Tell the lead at once what an urgent answer found, steering it; or,
@@ -2854,6 +2897,27 @@ mod tests {
     }
 
     #[test]
+    fn a_line_of_several_messages_stays_when_one_was_picked() {
+        let picked = Item {
+            seen: seen("calc.api", 6, Kind::Said),
+            reasons: vec![("interrupt", 0.9)],
+            looks: Vec::new(),
+            band: Band::Wake { steer: true },
+        };
+        let mut told = updates::Told::default();
+        let text = "- calc.api: turn:calc.api/6, 2 messages in it since turn:calc.api/5, from calc.docs, calc.fix";
+        told.items = vec![updates::Line {
+            handle: "turn:calc.api/6".into(),
+            said: true,
+            theirs: false,
+            text: text.into(),
+            key: String::new(),
+            many: true,
+        }];
+        assert!(note(&[picked], 0, &told).contains(text));
+    }
+
+    #[test]
     fn one_note_carries_what_was_picked_and_the_task_updates() {
         let picked = Item {
             seen: seen("calc.fix", 12, Kind::Ended),
@@ -2870,6 +2934,7 @@ mod tests {
                 false => format!("- {task}: turn:{task}/{turn} completed"),
             },
             key: String::new(),
+            many: false,
         };
         let mut told = updates::Told::default();
         // The words that started the picked turn are still told.
