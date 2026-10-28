@@ -196,6 +196,20 @@ impl Patch {
         if changes.is_empty() {
             return Err(invalid(1, "a patch changes at least one file"));
         }
+        // A file and a file below it can't both be written: one of them
+        // would need a folder where the other puts a file.
+        if let Some(below) = seen
+            .iter()
+            .find(|key| key.ancestors().skip(1).any(|above| seen.contains(above)))
+        {
+            return Err(Error::with(
+                "invalid_patch",
+                format!(
+                    "{} is below another file this patch changes",
+                    below.display()
+                ),
+            ));
+        }
         Ok(Patch { changes })
     }
 
@@ -620,6 +634,10 @@ mod tests {
                 "*** Begin Patch\n*** Update File: f\n*** Move to: g\n-a\n+b\n*** Delete File: d/../g\n*** End Patch",
                 "changed twice",
             ),
+            (
+                "*** Begin Patch\n*** Add File: new\n+a\n*** Add File: new/child\n+b\n*** End Patch",
+                "new/child is below another file",
+            ),
         ] {
             let error = Patch::parse(text).unwrap_err();
             assert_eq!(error.code, "invalid_patch", "{text}");
@@ -727,7 +745,7 @@ mod tests {
         assert!(!dir.join("new.txt").exists());
         // So does one that adds a file where a folder is, or below a file.
         std::fs::create_dir_all(dir.join("folder")).unwrap();
-        for target in ["folder", "keep.txt/inner"] {
+        for target in ["folder", "gone.txt/inner"] {
             let failing = patch(&format!(
                 "*** Update File: keep.txt\n-b\n+b2\n*** Add File: {target}\n+n\n"
             ));
