@@ -237,7 +237,10 @@ impl Screen {
         self.laid += usize::from(self.wrapped < self.rows.len());
         for row in &self.rows[self.wrapped..] {
             let line = row.line.clone();
-            let rows = match line.width() <= width {
+            // A picture's row is cut at the edge, not wrapped into pieces.
+            let picture =
+                (line.spans.iter()).any(|span| span.content.starts_with(crate::image::PLACEHOLDER));
+            let rows = match line.width() <= width || picture {
                 true => vec![line],
                 false => {
                     let rest = row.rest.clone().unwrap_or(Line::from("    "));
@@ -1154,6 +1157,14 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0).trim_end(), "row 10");
         assert!(!screen.at_top());
+    }
+
+    #[test]
+    fn a_pictures_rows_are_cut_at_the_edge_not_wrapped() {
+        let cells: String = std::iter::repeat_n(crate::image::PLACEHOLDER, 30).collect();
+        let picture = Line::from(vec![Span::raw("  "), Span::raw(cells)]);
+        let (mut screen, _) = screen(vec![picture.clone(), picture], 20, 5);
+        assert_eq!(screen.height(20), 2);
     }
 
     #[test]
