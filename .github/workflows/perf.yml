@@ -1,0 +1,68 @@
+name: Perf
+
+# Screens a pull request's daemon against its base's on one runner: the
+# AGENTS.md hot-path benches (admission and completion bursts, lifecycle,
+# footprint), run alternately so both builds see the same machine. Store
+# work per turn is counted and fails the check when it rises; CPU, latency
+# and memory only warn, since a shared runner moves them by itself. The
+# table is in the job summary. Synthetic provider, nothing is spent.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/perf.yml"
+      - "bench/perf_gate.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build the pull request and its base
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cargo build --release --locked --bin agent
+          mkdir -p .local/perf
+          cp .local/target/release/agent .local/perf/agent-head
+          # The base builds in the same target folder, so only what the
+          # pull request changed compiles again.
+          git worktree add -q .local/base "$BASE"
+          (cd .local/base && CARGO_TARGET_DIR="$PWD/../target" cargo build --release --locked --bin agent)
+          cp .local/target/release/agent .local/perf/agent-base
+      - name: Screen both, alternately
+        run: |
+          python3 -m venv .local/venv
+          .local/venv/bin/pip install --quiet -r bench/requirements.txt
+          py=.local/venv/bin/python
+          for round in 1 2; do
+            for side in base head; do
+              bin=.local/perf/agent-$side
+              $py -m bench.admission_burst --binary $bin --repeat 5 --out .local/perf/admission-$side-$round
+              $py -m bench.completion_burst --binary $bin --repeat 5 --out .local/perf/completion-$side-$round
+              $py -m bench.footprint --binary $bin --repeat 2 --out .local/perf/footprint-$side-$round
+              $py -m bench.lifecycle --binary $bin --transport socket --agents 32 --mode echo \
+                --tools echo,shell,read,write,edit --repeat 1 --out .local/perf/lifecycle-$side-$round
+            done
+          done
+      - name: Compare
+        run: .local/venv/bin/python -m bench.perf_gate .local/perf
