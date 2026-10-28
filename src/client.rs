@@ -218,6 +218,10 @@ fn parse(args: &[String]) -> Result<Options> {
             "--full" => options.full = true,
             "--active" => options.active = true,
             "--newest" => options.newest = true,
+            "--network" => {
+                options.settings.insert("network".to_owned(), json!(true));
+                options.settings_flags.push("--network".to_owned());
+            }
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -361,6 +365,35 @@ fn parse(args: &[String]) -> Result<Options> {
                             .insert("keep_warm".to_owned(), json!(seconds));
                         options.settings_flags.push(flag.to_owned());
                     }
+                    "--sandbox" => {
+                        if !matches!(
+                            value.as_str(),
+                            "read-only" | "workspace-write" | "danger-full-access"
+                        ) {
+                            return fail_with(
+                                "usage",
+                                "--sandbox needs read-only, workspace-write or danger-full-access",
+                            );
+                        }
+                        options.settings.insert("sandbox".to_owned(), json!(value));
+                        options.settings_flags.push(flag.to_owned());
+                    }
+                    "--writable" => {
+                        let path = std::path::absolute(&value)?;
+                        let path = path
+                            .to_str()
+                            .ok_or(Error::with("usage", "--writable needs a UTF-8 path"))?;
+                        let writable = options
+                            .settings
+                            .entry("writable".to_owned())
+                            .or_insert_with(|| json!([]));
+                        if let Value::Array(paths) = writable {
+                            paths.push(json!(path));
+                        }
+                        if !options.settings_flags.iter().any(|f| f == flag) {
+                            options.settings_flags.push(flag.to_owned());
+                        }
+                    }
                     "--cache-ttl" => {
                         if !matches!(value.as_str(), "5m" | "1h") {
                             return fail_with("usage", "--cache-ttl needs 5m or 1h");
@@ -420,22 +453,27 @@ fn parse(args: &[String]) -> Result<Options> {
     };
     options.target = target(&options.store, &options.socket, home_store.as_deref());
     if options.providers.is_empty() {
-        options.providers = environment_providers(&|name| std::env::var(name).ok());
+        options.providers =
+            environment_providers(&|name| std::env::var(name).ok(), &|| Ok(config()?.provider))?;
     }
     Ok(options)
 }
 
 /// The providers a daemon starts with when no `--provider` is given:
-/// `AGENT_PROVIDER`, `--provider` specs separated by whitespace since a spec
-/// holds commas; otherwise those whose well-known key variable is set. Like
-/// `AGENT_MODEL`, they are defaults: a running daemon is not checked against
-/// them, since every shell a bot runs inherits the daemon's environment.
-fn environment_providers(var: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+/// `AGENT_PROVIDER`, else the config's `provider`, `--provider` specs
+/// separated by whitespace since a spec holds commas; otherwise those whose
+/// well-known key variable is set. Like `AGENT_MODEL`, they are defaults: a
+/// running daemon is not checked against them, since every shell a bot runs
+/// inherits the daemon's environment.
+fn environment_providers(
+    var: &dyn Fn(&str) -> Option<String>,
+    configured: &dyn Fn() -> Result<Option<String>>,
+) -> Result<Vec<String>> {
     let set = |name| var(name).filter(|value| !value.trim().is_empty());
-    if let Some(specs) = set("AGENT_PROVIDER") {
-        return specs.split_whitespace().map(str::to_owned).collect();
+    if let Some(specs) = set("AGENT_PROVIDER").map_or_else(configured, |specs| Ok(Some(specs)))? {
+        return Ok(specs.split_whitespace().map(str::to_owned).collect());
     }
-    [
+    Ok([
         ("anthropic", "ANTHROPIC_API_KEY"),
         ("openai", "OPENAI_API_KEY"),
         ("openrouter", "OPENROUTER_API_KEY"),
@@ -443,7 +481,15 @@ fn environment_providers(var: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     .into_iter()
     .filter(|(_, key)| set(key).is_some())
     .map(|(name, _)| name.to_owned())
-    .collect()
+    .collect())
+}
+
+/// The person's ~/.agent/config.toml, its error code kept.
+fn config() -> Result<agent_client::config::Config> {
+    agent_client::config::load().map_err(|error| match error.split_once(": ") {
+        Some((code, detail)) => Error::with(code, detail),
+        None => Error::with("config_invalid", error),
+    })
 }
 
 struct Connection {
@@ -686,7 +732,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
     if options.providers.is_empty() {
         return fail_with(
-            "usage",
+            "provider_required",
             "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
@@ -1079,8 +1125,9 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             print_json(&ready, options.pretty)?;
             refused.map_or(Ok(0), Err)
         }
+        // About the daemon, not its bots: a fresh install's first one starts.
         "stats" => {
-            let mut connection = ensure_existing_daemon(&options)?;
+            let mut connection = ensure_daemon(&options)?;
             let stats = connection.request("stats", json!({}))?;
             print_json(&stats, options.pretty)?;
             Ok(0)
@@ -1207,33 +1254,7 @@ fn models(options: &Options) -> Result<i32> {
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
         let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Written whole beside it, then linked into place: a failed write
-        // leaves no partial list, and a list made meanwhile is not replaced.
-        let staged = path.with_file_name(format!(".models.{}", std::process::id()));
-        let installed = (|| {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staged)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            std::fs::hard_link(&staged, &path)
-        })();
-        let _ = std::fs::remove_file(&staged);
-        installed.map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => {
-                Error::with("models_file_exists", path.display().to_string())
-            }
-            _ => error.into(),
-        })?;
-        // The new name is durable only once its directory is.
-        if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
+        agent_client::models::install(&path, &text).map_err(Error::from)?;
         eprintln!("wrote {}", path.display());
     }
     let models = agent_client::models::read(&path).map_err(Error::from)?;
@@ -1346,12 +1367,13 @@ fn run(options: &Options) -> Result<i32> {
                 .flatten()
                 .filter(|level| !level.is_empty())
         });
-        let model = chosen
-            .or_else(|| std::env::var("AGENT_MODEL").ok())
-            .ok_or(Error::with(
+        let model = match chosen.or_else(|| std::env::var("AGENT_MODEL").ok()) {
+            Some(model) => model,
+            None => config()?.model.ok_or(Error::with(
                 "usage",
-                "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
-            ))?;
+                "a new bot needs a model: pass --model PROVIDER/MODEL, set AGENT_MODEL, or set model in ~/.agent/config.toml",
+            ))?,
+        };
         let instructions = composed_instructions(options, workspace, role.as_ref())?;
         let (created_by, created_by_id) = created_by()?;
         // --tools, else the role's, else the default set.
@@ -1847,10 +1869,7 @@ fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let note = options.note.as_deref().map(note).transpose()?;
     // The flags over the person's `[judge]` in ~/.agent/config.toml.
-    let config = agent_client::config::load().map_err(|error| match error.split_once(": ") {
-        Some((code, detail)) => Error::with(code, detail),
-        None => Error::with("config_invalid", error),
-    })?;
+    let config = config()?;
     crate::approver::main(crate::approver::Settings {
         socket: options.socket.clone(),
         tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
@@ -3215,26 +3234,37 @@ mod tests {
                     .map(|(_, v)| (*v).to_owned())
             }
         };
+        let none = || Ok(None);
+        let providers = |pairs, configured: &dyn Fn() -> Result<Option<String>>| {
+            environment_providers(&env(pairs), configured).unwrap()
+        };
         let keys = &[("ANTHROPIC_API_KEY", "k"), ("OPENAI_API_KEY", "k")];
-        assert_eq!(environment_providers(&env(keys)), ["anthropic", "openai"]);
+        assert_eq!(providers(keys, &none), ["anthropic", "openai"]);
+        const SPEC: &str =
+            " bedrock  b=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1\n";
+        let named = [
+            "bedrock",
+            "b=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+        ];
         assert_eq!(
-            environment_providers(&env(&[
-                (
-                    "AGENT_PROVIDER",
-                    " bedrock  b=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1\n"
-                ),
-                ("ANTHROPIC_API_KEY", "k"),
-            ])),
-            [
-                "bedrock",
-                "b=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1"
-            ]
+            providers(
+                &[("AGENT_PROVIDER", SPEC), ("ANTHROPIC_API_KEY", "k")],
+                &none
+            ),
+            named
         );
+        // The config's provider comes after AGENT_PROVIDER, before the keys.
+        let configured = || Ok(Some(SPEC.to_owned()));
+        assert_eq!(providers(keys, &configured), named);
         assert_eq!(
-            environment_providers(&env(&[("AGENT_PROVIDER", " "), ("OPENAI_API_KEY", "k")])),
+            providers(&[("AGENT_PROVIDER", "openai")], &configured),
             ["openai"]
         );
-        assert!(environment_providers(&env(&[("OPENAI_API_KEY", "")])).is_empty());
+        assert_eq!(
+            providers(&[("AGENT_PROVIDER", " "), ("OPENAI_API_KEY", "k")], &none),
+            ["openai"]
+        );
+        assert!(providers(&[("OPENAI_API_KEY", "")], &none).is_empty());
     }
 
     /// A client asking for SigV4 must not attach to a daemon that sends a
