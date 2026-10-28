@@ -63,13 +63,15 @@ const UNBOUNDED: i64 = i64::MAX / 4;
 const WINDOW_BATCH: usize = 64;
 const WINDOW_BATCH_BYTES: u64 = 256 * 1024;
 
-/// Stored items to stream: ids with their sizes as sent, the bytes each
-/// loses without thinking, and the elision floor the sizes count stubs to.
+/// Stored items to stream: ids with their weights as sent, the bytes each
+/// loses without thinking, what each one's pictures add beyond their
+/// weight, and the elision floor the sizes count stubs to.
 #[derive(Clone, Copy)]
 struct Span<'a> {
     ids: &'a [i64],
     sizes: &'a [u32],
     thinking: &'a [u32],
+    pictured: &'a [u32],
     elided: i64,
 }
 impl Span<'_> {
@@ -77,6 +79,7 @@ impl Span<'_> {
         ids: &[],
         sizes: &[],
         thinking: &[],
+        pictured: &[],
         elided: 0,
     };
 }
@@ -104,11 +107,13 @@ fn fingerprint(prefix: &[u8], first: i64, url: &str, model: &str) -> i64 {
 }
 
 /// Split window items into read-ahead batches by count and by bytes.
-fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
+fn batches(ids: &[i64], sizes: &[u32], pictured: &[u32]) -> Vec<Vec<i64>> {
     let mut out: Vec<Vec<i64>> = Vec::with_capacity(ids.len().div_ceil(WINDOW_BATCH));
     let mut bytes = 0u64;
     for (index, id) in ids.iter().enumerate() {
-        let size = u64::from(sizes.get(index).copied().unwrap_or(0));
+        // Read as stored: with its pictures' bytes.
+        let size = u64::from(sizes.get(index).copied().unwrap_or(0))
+            + u64::from(pictured.get(index).copied().unwrap_or(0));
         let full = out
             .last()
             .is_some_and(|b| b.len() >= WINDOW_BATCH || bytes + size > WINDOW_BATCH_BYTES);
@@ -687,6 +692,7 @@ impl Turn {
                     ids: &w.ids,
                     sizes: &w.sizes,
                     thinking: &w.thinking,
+                    pictured: &w.pictured,
                     elided: w.elided,
                 },
                 strip,
@@ -784,6 +790,7 @@ impl Turn {
             ids: &window.ids[..len],
             sizes: &window.sizes[..len],
             thinking: &window.thinking[..len],
+            pictured: &window.pictured[..len],
             elided: window.elided,
         };
         self.framed_items(
@@ -801,6 +808,7 @@ impl Turn {
             ids,
             sizes,
             thinking,
+            pictured,
             elided,
         } = span;
         let stripped: usize = ids
@@ -809,13 +817,15 @@ impl Turn {
             .filter(|(id, _)| strip.strips(**id))
             .map(|(_, &bytes)| bytes as usize)
             .sum();
-        let total = (prefix.len()
+        let weight = (prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
             + ids.len().saturating_sub(1)
             + tail.len())
         .saturating_sub(stripped);
-        let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
-        Items::new(total, move || {
+        let pictures: usize = pictured.iter().map(|&bytes| bytes as usize).sum();
+        let (store, chunks): (_, Arc<[_]>) =
+            (self.store.clone(), batches(ids, sizes, pictured).into());
+        Items::weighing(weight + pictures, weight, move || {
             let items = stream::iter([Ok(prefix.clone())]).chain(item_chunks(
                 store.clone(),
                 chunks.clone(),
@@ -1868,11 +1878,14 @@ impl Turn {
             return fail("compaction_input_limit");
         }
         let (head, tail) = (Bytes::from(head), Bytes::from(tail));
-        let (store, chunks): (_, Arc<[_]>) =
-            (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
+        let (store, chunks): (_, Arc<[_]>) = (
+            self.store.clone(),
+            batches(&plan.ids, &plan.sizes, &plan.pictured).into(),
+        );
+        let pictures: usize = plan.pictured.iter().map(|&bytes| bytes as usize).sum();
         // Elided results go as the stubs the model last saw.
         let elided = plan.elided;
-        Ok(Items::new(total, move || {
+        Ok(Items::weighing(total + pictures, total, move || {
             stream::iter([Ok(head.clone())])
                 .chain(item_chunks(
                     store.clone(),
@@ -2964,6 +2977,7 @@ impl Turn {
                         ids: &window.ids[skip..],
                         sizes: &window.sizes[skip..],
                         thinking: &window.thinking[skip..],
+                        pictured: &window.pictured[skip..],
                         elided: window.elided,
                     };
                     self.window_items(Bytes::new(), span, *thinking)
@@ -4744,16 +4758,19 @@ mod tests {
     fn read_ahead_batches_stop_at_either_bound() {
         let ids: Vec<i64> = (1..=200).collect();
         let small = vec![10u32; 200];
-        let by_count = batches(&ids, &small);
+        let by_count = batches(&ids, &small, &[]);
         assert_eq!(
             by_count.iter().map(Vec::len).collect::<Vec<_>>(),
             [64, 64, 64, 8]
         );
         // Three 100 KiB items fill a batch; a 1 MiB item travels alone.
         let sizes = [100 << 10, 100 << 10, 100 << 10, 1 << 20, 10, 10];
-        let by_bytes = batches(&ids[..6], &sizes);
+        let by_bytes = batches(&ids[..6], &sizes, &[]);
         assert_eq!(by_bytes, [vec![1, 2], vec![3], vec![4], vec![5, 6]]);
-        assert!(batches(&[], &[]).is_empty());
+        // A picture's bytes count as read, though it weighs little.
+        let pictured = batches(&ids[..3], &[10, 10, 10], &[1 << 20, 0, 0]);
+        assert_eq!(pictured, [vec![1], vec![2, 3]]);
+        assert!(batches(&[], &[], &[]).is_empty());
     }
 
     /// A window of four 4000-byte items whose span is the first two, sent

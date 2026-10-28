@@ -18,6 +18,15 @@ def png(width=2, height=2):
             + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
 
 
+def noise(side):
+    """A PNG of random pixels: large for its size, as a photograph is."""
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    raw = b''.join(b'\x00' + os.urandom(3 * side) for _ in range(side))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', side, side, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+
 def image(data=None, media_type='image/png'):
     return {'media_type': media_type, 'data': base64.b64encode(data or png()).decode()}
 
@@ -67,6 +76,22 @@ class ImageTests(ModelFixture):
         retried = client.request('submit', bot='Bob', request_id='a', prompt='slow', images=[])
         self.assertEqual(retried['error'], 'idempotency_conflict')
         self.assertEqual(retried['field'], 'images')
+
+    def test_a_picture_counts_at_its_token_cost_not_its_size(self):
+        # Three pictures of 160 KB each stay in view under a 16 KB context
+        # budget: 200 × 200 pixels is 54 tokens.
+        client = self.client(settings={'context_bytes': 16384})
+        client.request('create', bot='Bob', workspace=str(self.path))
+        shots = [image(noise(200)) for _ in range(3)]
+        for n, shot in enumerate(shots):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'look {n}',
+                                  images=[shot])['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+        users = [i for i in request['input'] if i.get('role') == 'user']
+        self.assertEqual([pictures(user) for user in users],
+                         [[f"data:image/png;base64,{shot['data']}"] for shot in shots])
 
     def test_read_sends_an_image_file_as_a_picture_scaled_to_fit(self):
         (self.path / 'shot.png').write_bytes(png(3000, 2000))

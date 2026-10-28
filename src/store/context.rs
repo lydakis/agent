@@ -45,6 +45,7 @@ impl Window {
         self.ids.truncate(len);
         self.sizes.truncate(len);
         self.thinking.truncate(len);
+        self.pictured.truncate(len);
     }
 
     pub fn prefix(&self, listed: &[(i64, String)], prefix_budget: usize) -> Result<ContextPrefix> {
@@ -363,18 +364,20 @@ pub fn stub(
 
 /// What a request sends in place of a result that carried pictures (an
 /// image file read) below the bot's elision floor: its text, without the
-/// pictures, which the file holds if the model needs them again.
+/// pictures, which the file holds if the model needs them again. `None`
+/// when it would not save `ELISION_MIN_SAVING` bytes over `weight`, what the
+/// result weighs with its pictures at their token cost.
 pub fn picture_stub(
     family: Family,
     call_id: &str,
     output: &str,
-    item: usize,
+    weight: usize,
 ) -> Result<Option<Vec<u8>>> {
     let text = format!(
         "[tool result's picture elided from this request; read the file again to see it. Its text:]\n{output}"
     );
     let stub = family.tool_result_item(call_id, &text)?;
-    Ok((stub.len() + ELISION_MIN_SAVING <= item).then_some(stub))
+    Ok((stub.len() + ELISION_MIN_SAVING <= weight).then_some(stub))
 }
 
 /// The family, call id and output of a stored tool result; `None` for any

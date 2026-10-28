@@ -1764,6 +1764,12 @@ allowance. The allowance counts the encoded summary, retained prompts, carry-for
 note, omission item, transcript items, and JSON separators. These are runtime
 conversation-byte/item bounds; system instructions, tool schemas, provider JSON
 framing, and model token limits are separate, not inferred from byte counts.
+A picture counts at its weight, not its size: four bytes for each token it is
+estimated to cost (width × height / 750 once its longest side fits 1,568
+pixels, at most 1,600 tokens, Anthropic's rule; OpenAI's high detail counts
+fewer). Each node records what its pictures add beyond their weight, which
+its byte total leaves out; only a request's length counts them, so the
+pacer's token estimate and every budget see a picture at its token cost.
 For compaction planning, a known output-token cap is estimated at four bytes
 per token, capped at a quarter of the envelope. The earlier of that headroom
 threshold and `compact_at` triggers compaction. An unset Responses cap adds
@@ -2290,7 +2296,8 @@ before if the view is still over its threshold.
 
 A result is elidable when its stub saves at least 1 KiB. A result that
 carried a picture is stubbed as its text alone, with a line that the file
-holds the picture if the model needs it again. For a bot with
+holds the picture if the model needs it again; what it saves is counted with
+the picture at its weight, so only a large one is elided. For a bot with
 `read`, the stub is made when the result is recorded, with the node id its insert takes, and stored
 beside it. Each node records what its stub saves and, like its byte total,
 the cumulative savings along its lineage; each floor version records the

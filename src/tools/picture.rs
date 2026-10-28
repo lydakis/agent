@@ -6,9 +6,9 @@ use base64::Engine;
 use image::{GenericImageView, ImageFormat, imageops::FilterType};
 
 /// The longest side a picture is sent at: what Anthropic's models see at
-/// most (it scales larger ones down), and under the 2000 pixels it allows
-/// once a request holds more than 20 pictures.
-const LONGEST: u32 = 1568;
+/// most, and under the 2000 pixels it allows once a request holds more
+/// than 20 pictures.
+const LONGEST: u32 = crate::codec::LONGEST_SIDE;
 /// The most bytes a picture is sent with as it is, or as a scaled PNG:
 /// the context is measured in bytes, so a larger one goes as a JPEG, well
 /// under the 5 MB Anthropic takes for one.

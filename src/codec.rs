@@ -2,6 +2,7 @@
 //! encoding so requests stream them without translation; a bot is bound to
 //! one family for its lifetime.
 use crate::{Result, fail};
+use base64::Engine;
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,6 +23,50 @@ pub struct Image {
 
 /// The media types an [`Image`] may have: those both families take.
 pub const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// The longest side Anthropic's models see a picture at: larger ones are
+/// scaled down to it.
+pub const LONGEST_SIDE: u32 = 1568;
+
+impl Image {
+    /// What the picture weighs in context accounting: the bytes of text
+    /// that cost as many input tokens, at four bytes a token. Its tokens are
+    /// Anthropic's estimate, width × height / 750 once the longest side fits
+    /// [`LONGEST_SIDE`], at most 1600; OpenAI's high detail counts fewer. A
+    /// picture whose size cannot be read weighs the most.
+    pub fn weight(&self) -> usize {
+        const MOST_TOKENS: u64 = 1600;
+        let size = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .ok()
+            .and_then(|bytes| {
+                image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()?
+                    .into_dimensions()
+                    .ok()
+            });
+        let tokens = size.map_or(MOST_TOKENS, |(width, height)| {
+            let (width, height) = (u64::from(width), u64::from(height));
+            let longest = width.max(height).max(1);
+            let fit = u64::from(LONGEST_SIDE).min(longest);
+            // Scaled so the longest side is `fit`, in whole pixels.
+            let area = (width * fit / longest).max(1) * (height * fit / longest).max(1);
+            area.div_ceil(750).min(MOST_TOKENS)
+        });
+        tokens as usize * 4
+    }
+}
+
+/// What `images` add to the item they go in beyond their weight: their
+/// encoded bytes less what they weigh. Context accounting leaves this out,
+/// so a picture counts at its token cost rather than its size.
+pub fn pictured(images: &[Image]) -> usize {
+    images
+        .iter()
+        .map(|image| image.data.len().saturating_sub(image.weight()))
+        .sum()
+}
 
 /// Provider-neutral tool description; each family encodes it differently.
 #[derive(Clone, Debug)]
@@ -320,6 +365,39 @@ mod tests {
         assert_eq!(Family::Responses.pool_key("gpt-4-32k"), "gpt-4-32k");
     }
     use super::*;
+    #[test]
+    fn a_picture_weighs_its_estimated_tokens() {
+        let png = |width: u32, height: u32| {
+            let mut bytes = Vec::new();
+            image::RgbImage::new(width, height)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            Image {
+                media_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        };
+        // 40 × 30 is 1200 pixels: 2 tokens.
+        assert_eq!(png(40, 30).weight(), 8);
+        // 1000 × 600 is 800 tokens.
+        assert_eq!(png(1000, 600).weight(), 3200);
+        // 3000 × 2000 is seen at 1568 × 1045, past the 1600 tokens most.
+        assert_eq!(png(3000, 2000).weight(), 6400);
+        // A picture whose size cannot be read weighs the most.
+        let unreadable = Image {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        };
+        assert_eq!(unreadable.weight(), 6400);
+        // What a picture adds beyond its weight is left out of accounting;
+        // one smaller than its weight adds nothing.
+        let shot = png(40, 30);
+        assert_eq!(pictured(std::slice::from_ref(&shot)), shot.data.len() - 8);
+        assert_eq!(pictured(&[unreadable]), 0);
+    }
     #[test]
     fn pictures_follow_the_words_in_each_familys_shape() {
         let images = [Image {

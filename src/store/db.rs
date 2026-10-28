@@ -872,11 +872,15 @@ fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
 pub struct Window {
     pub family: Family,
     pub ids: Vec<i64>,
-    /// Each item's encoded length, so read-ahead can be bounded in bytes.
+    /// Each item's weight: its encoded length, with pictures counted at
+    /// their token cost.
     pub sizes: Vec<u32>,
     /// Bytes each item loses when sent without its thinking blocks.
     pub thinking: Vec<u32>,
-    /// Sum of item lengths, without separators.
+    /// What each item's pictures add to its length beyond their weight:
+    /// an item is sent with `sizes` plus these bytes.
+    pub pictured: Vec<u32>,
+    /// Sum of item weights, without separators.
     pub item_bytes: i64,
     /// Full unsummarized span, even when the bounded window omits a backlog.
     pub unsummarized: super::ContextUsage,
@@ -973,9 +977,11 @@ pub struct CompactionPlan {
     pub cut: i64,
     /// For a cut inside a turn, that turn's prompt, sent whole ahead of it.
     pub pinned: Option<i64>,
-    /// The nodes to summarize, oldest first.
+    /// The nodes to summarize, oldest first, with their weights.
     pub ids: Vec<i64>,
     pub sizes: Vec<u32>,
+    /// What each node's pictures add to its length beyond their weight.
+    pub pictured: Vec<u32>,
     /// The covered turns' user prompts, bounded, oldest first.
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
@@ -1029,8 +1035,8 @@ pub enum Planning {
     CatchUp(CatchUp),
 }
 /// Oldest node, depth, own total, ordinal, child on the lineage and its
-/// ordinal, the bounded prompt text inside the budget, and thinking
-/// through the node.
+/// ordinal, the bounded prompt text inside the budget, thinking through the
+/// node, and what its pictures add beyond their weight as it is sent.
 type CatchUpRow = (
     i64,
     i64,
@@ -1039,6 +1045,7 @@ type CatchUpRow = (
     Option<i64>,
     Option<i64>,
     Option<String>,
+    i64,
     i64,
 );
 /// A catch-up walk from the head back to the previous cut. Only the rows
@@ -1296,7 +1303,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 54;
+    pub const SCHEMA: i32 = 55;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1380,7 +1387,7 @@ impl Database {
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
-                total_thinking INTEGER NOT NULL DEFAULT 0);
+                total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -2339,8 +2346,9 @@ impl Database {
             elided: i64,
             saved: i64,
             /// A cut inside a turn: that turn's prompt, its size, ordinal and
-            /// depth, and whether the window still starts at the cut.
-            pinned: Option<(i64, i64, i64, i64, bool)>,
+            /// depth, whether the window still starts at the cut, and what
+            /// its pictures add beyond their weight.
+            pinned: Option<(i64, i64, i64, i64, bool, i64)>,
         }
         // Under the bot's own floor (`e`), or an earlier one given by its
         // `through` node (`f`), whose cumulative savings are its own.
@@ -2356,7 +2364,7 @@ impl Database {
                     note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
                     instr(','||b.tools||',',',history,')>0,COALESCE(e.through,f.id,0),COALESCE(e.saved,f.total_elided,0),
                     c.pinned,pn.total_bytes-COALESCE(pp.total_bytes,0),pn.turn_seq,pn.depth,
-                    c.cut IS b.context_start
+                    c.cut IS b.context_start,pn.pictured
              FROM bots b LEFT JOIN nodes h ON h.id=b.head
              LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
              LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
@@ -2395,7 +2403,7 @@ impl Database {
                     pinned: r
                         .get::<_, Option<i64>>(19)?
                         .map(|id| -> rusqlite::Result<_> {
-                            Ok((id, r.get(20)?, r.get(21)?, r.get(22)?, r.get(23)?))
+                            Ok((id, r.get(20)?, r.get(21)?, r.get(22)?, r.get(23)?, r.get(24)?))
                         })
                         .transpose()?,
                 })
@@ -2412,10 +2420,14 @@ impl Database {
             id: i64,
             parent: Option<i64>,
             depth: i64,
-            /// Cumulative bytes as sent, through this node.
+            /// Cumulative bytes as sent, through this node, with pictures
+            /// at their weight.
             total: i64,
             thinking: i64,
             turn_seq: Option<i64>,
+            /// What its pictures add beyond their weight, unless it goes as
+            /// its stub.
+            pictured: i64,
         }
         let row = |r: &rusqlite::Row<'_>| {
             Ok(Row {
@@ -2425,33 +2437,39 @@ impl Database {
                 total: r.get(3)?,
                 thinking: r.get(4)?,
                 turn_seq: r.get(5)?,
+                pictured: r.get(6)?,
             })
         };
         let rows: Vec<Row> = match state.start {
             Some(_) => self
                 .conn
                 .prepare_cached(
-                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq) AS (
-                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?3),thinking,turn_seq
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq,pictured) AS (
+                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?3),thinking,turn_seq,
+                            CASE WHEN id<=?4 AND elided>0 THEN 0 ELSE pictured END
                         FROM nodes WHERE id=?1
                         UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?3),
-                            n.thinking,n.turn_seq
+                            n.thinking,n.turn_seq,CASE WHEN n.id<=?4 AND n.elided>0 THEN 0 ELSE n.pictured END
                         FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
-                     SELECT id,parent,depth,total_bytes,thinking,turn_seq FROM chain ORDER BY depth DESC",
+                     SELECT id,parent,depth,total_bytes,thinking,turn_seq,pictured FROM chain ORDER BY depth DESC",
                 )?
-                .query_map(params![head, state.start_depth, state.saved], row)?
+                .query_map(
+                    params![head, state.start_depth, state.saved, state.elided],
+                    row,
+                )?
                 .collect::<rusqlite::Result<_>>()?,
             None => self
                 .conn
                 .prepare_cached(
-                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq) AS (
-                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?6),thinking,turn_seq
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq,pictured) AS (
+                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?6),thinking,turn_seq,
+                            CASE WHEN id<=?7 AND elided>0 THEN 0 ELSE pictured END
                         FROM nodes WHERE id=?1
                         UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?6),
-                            n.thinking,n.turn_seq
+                            n.thinking,n.turn_seq,CASE WHEN n.id<=?7 AND n.elided>0 THEN 0 ELSE n.pictured END
                         FROM nodes n JOIN chain c ON n.id=c.parent
                         WHERE ?2 - c.total_bytes <= ?3 AND ?4 - c.depth <= ?5)
-                     SELECT id,parent,depth,total_bytes,thinking,turn_seq FROM chain ORDER BY depth DESC",
+                     SELECT id,parent,depth,total_bytes,thinking,turn_seq,pictured FROM chain ORDER BY depth DESC",
                 )?
                 .query_map(
                     params![
@@ -2460,7 +2478,8 @@ impl Database {
                         context_bytes,
                         state.depth,
                         context_items,
-                        state.saved
+                        state.saved,
+                        state.elided
                     ],
                     row,
                 )?
@@ -2489,8 +2508,8 @@ impl Database {
         // prompt goes whole ahead of it, as one more item.
         let pinned = state
             .pinned
-            .filter(|&(.., at_start)| at_start && state.start.is_some())
-            .map(|(id, size, seq, depth, _)| (id, size, seq, depth));
+            .filter(|&(.., at_start, _)| at_start && state.start.is_some())
+            .map(|(id, size, seq, depth, _, pictured)| (id, size, seq, depth, pictured));
         let lead = |index: usize| match pinned {
             Some((_, size, ..)) if index == saved_start => (size + 1, 1),
             _ => (0, 0),
@@ -2550,14 +2569,17 @@ impl Database {
             None => None,
         };
         let clamp = |bytes: i64| bytes.clamp(0, u32::MAX as i64) as u32;
-        let (mut ids, mut sizes, mut thinking) = match pinned {
+        let (mut ids, mut sizes, mut thinking, mut pictured) = match pinned {
             // A prompt carries no thinking.
-            Some((id, size, ..)) => (vec![id], vec![clamp(size)], vec![0]),
+            Some((id, size, .., pictures)) => {
+                (vec![id], vec![clamp(size)], vec![0], vec![clamp(pictures)])
+            }
             None => Default::default(),
         };
         ids.extend(window.iter().rev().map(|r| r.id));
         sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
         thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
+        pictured.extend(window.iter().rev().map(|r| clamp(r.pictured)));
         // The view since the summary includes the prompt it keeps in full.
         let mut unsummarized = state.unsummarized;
         if let Some((_, size, ..)) = state.pinned {
@@ -2569,11 +2591,12 @@ impl Database {
             ids,
             sizes,
             thinking,
+            pictured,
             item_bytes: through[chosen] + pinned.map_or(0, |(_, size, ..)| size),
             unsummarized,
-            omitted_items: pinned.map_or(start.depth, |(.., depth)| depth) - 1,
-            omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, _)| seq) - 1,
-            omitted_in_turn: pinned.map_or(0, |(.., depth)| start.depth - 1 - depth),
+            omitted_items: pinned.map_or(start.depth, |(.., depth, _)| depth) - 1,
+            omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, ..)| seq) - 1,
+            omitted_in_turn: pinned.map_or(0, |(.., depth, _)| start.depth - 1 - depth),
             history: state.history,
             note: state.note,
             compaction,
@@ -2874,29 +2897,32 @@ impl Database {
         // in a fork. Decode only prompt nodes, outside the metadata-only walk,
         // and return bounded text rather than whole native items to Rust.
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking) AS (
-                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking
+            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking,pictured) AS (
+                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking,
+                    CASE WHEN id<=?5 AND elided>0 THEN 0 ELSE pictured END
                 FROM nodes WHERE id=?1
                 UNION ALL SELECT n.id,n.parent,n.total_bytes-MIN(n.total_elided,?4),n.turn_seq,
-                    n.total_thinking
+                    n.total_thinking,CASE WHEN n.id<=?5 AND n.elided>0 THEN 0 ELSE n.pictured END
                 FROM nodes n JOIN chain c ON n.id=c.parent
                 WHERE c.id IS NOT ?2)
              SELECT c.id,c.total_bytes,COALESCE(p.total_bytes-MIN(p.total_elided,?4),0),c.turn_seq,
                 CASE WHEN c.turn_seq IS NOT NULL THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?3)
-                     FROM nodes WHERE id=c.id) END,c.total_thinking
+                     FROM nodes WHERE id=c.id) END,c.total_thinking,c.pictured
              FROM chain c LEFT JOIN nodes p ON p.id=c.parent ORDER BY c.id DESC",
         )?;
-        // Newest first: id, own total, parent's total, ordinal, prompt, and
-        // thinking through it.
-        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>, i64);
+        // Newest first: id, own total, parent's total, ordinal, prompt,
+        // thinking through it, and what its pictures add beyond their weight
+        // as it is sent.
+        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>, i64, i64);
         let rows: Vec<SpanRow> = statement
             .query_map(
                 params![
                     head,
                     previous_cut,
                     Self::COMPACTION_PROMPT_BYTES as i64 + 1,
-                    saved
+                    saved,
+                    elided
                 ],
                 |r| {
                     Ok((
@@ -2906,6 +2932,7 @@ impl Database {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )?
@@ -2966,8 +2993,8 @@ impl Database {
         let span = older
             .iter()
             .rev()
-            .map(|(id, total, before, seq, prompt, _)| {
-                (*id, total - before, *seq, prompt.as_deref())
+            .map(|(id, total, before, seq, prompt, _, pictured)| {
+                (*id, total - before, *seq, prompt.as_deref(), *pictured)
             });
         let previous_summary = self.previous_summary(&bot)?;
         let mut plan = Self::span_plan(
@@ -3035,23 +3062,24 @@ impl Database {
         };
         let (_, before, depth_before, thinking_before) = walk.totals;
         let (_, _, max_bytes, max_items) = walk.bounds;
-        let (_, saved) = walk.elision;
+        let (elided, saved) = walk.elision;
         // Each row carries its child on the lineage, so cutting at a prompt
         // child needs no parent lookup: the span ends at this row. Only rows
         // inside the budget, the piece's oldest row, and, until the newest
         // prompt is found, prompts leave SQLite. The budget holds bytes as
         // the summarizer is sent them, without thinking.
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k,total_thinking) AS (
-                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1,total_thinking
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k,total_thinking,pictured) AS (
+                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1,total_thinking,
+                    CASE WHEN id<=?11 AND elided>0 THEN 0 ELSE pictured END
                 FROM nodes WHERE id=?1
                 UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?9),
-                    n.turn_seq,c.id,c.turn_seq,c.k+1,n.total_thinking
+                    n.turn_seq,c.id,c.turn_seq,c.k+1,n.total_thinking,CASE WHEN n.id<=?11 AND n.elided>0 THEN 0 ELSE n.pictured END
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
              SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
                 CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8 THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
-                     FROM nodes WHERE id=c.id) END,c.total_thinking
+                     FROM nodes WHERE id=c.id) END,c.total_thinking,c.pictured
              FROM chain c WHERE (c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8)
                 OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
@@ -3069,7 +3097,8 @@ impl Database {
             max_total,
             max_depth,
             saved,
-            walk.newest_prompt.is_none()
+            walk.newest_prompt.is_none(),
+            elided
         ])?;
         let mut last: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
         while let Some(r) = rows.next()? {
@@ -3086,6 +3115,7 @@ impl Database {
                     r.get(6)?,
                     r.get(7)?,
                     thinking,
+                    r.get(9)?,
                 ));
             }
             if seq.is_some() && walk.newest_prompt.is_none_or(|newest| depth > newest) {
@@ -3149,7 +3179,7 @@ impl Database {
         let newest_depth = newest_prompt.unwrap_or(depth_before);
         let fits = rows
             .iter()
-            .take_while(|(_, depth, total, .., thinking)| {
+            .take_while(|(_, depth, total, .., thinking, _)| {
                 let items = depth - depth_before;
                 items <= span_items
                     && total - thinking - (before - thinking_before) + items <= span_bytes
@@ -3201,10 +3231,10 @@ impl Database {
         let mut previous = before;
         let span = rows[..=end]
             .iter()
-            .map(|(id, _, total, seq, _, _, prompt, _)| {
+            .map(|(id, _, total, seq, _, _, prompt, _, pictured)| {
                 let size = total - previous;
                 previous = *total;
-                (*id, size, *seq, prompt.as_deref())
+                (*id, size, *seq, prompt.as_deref(), *pictured)
             });
         let mut plan = Self::span_plan(
             cut,
@@ -3265,20 +3295,23 @@ impl Database {
         })
     }
     /// A plan from the span's nodes, oldest first: id, own size, ordinal,
-    /// and the prompt's bounded text for prompt nodes.
+    /// the prompt's bounded text for prompt nodes, and what its pictures
+    /// add beyond their weight.
     fn span_plan<'a>(
         cut: i64,
-        span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>)>,
+        span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>, i64)>,
         previous_summary: Option<String>,
         catch_up: bool,
         summary_bytes: usize,
         elided: i64,
     ) -> CompactionPlan {
-        let (mut ids, mut sizes, mut prompts) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ids, mut sizes, mut pictured, mut prompts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut from, mut to) = (i64::MAX, 0);
-        for (id, size, seq, prompt) in span {
+        for (id, size, seq, prompt, pictures) in span {
             ids.push(id);
             sizes.push(size.clamp(0, u32::MAX as i64) as u32);
+            pictured.push(pictures.clamp(0, u32::MAX as i64) as u32);
             if let (Some(seq), Some(prompt)) = (seq, prompt) {
                 from = from.min(seq);
                 to = to.max(seq);
@@ -3291,6 +3324,7 @@ impl Database {
             pinned: None,
             ids,
             sizes,
+            pictured,
             prompts,
             covered: (from, to),
             previous_summary,
@@ -4547,11 +4581,10 @@ impl Database {
                 share_items.saturating_sub(used_items + reserved.items),
             )
         };
-        // Id, item, prompt bytes, and whether it was attached, which no
-        // pending count holds.
-        // Each steer's id, item, prompt size, whether it was attached, and
-        // its pictures' JSON.
-        type Steer = (i64, Vec<u8>, usize, bool, Option<String>);
+        // Each steer's id, item, prompt size, whether it was attached (which
+        // no pending count holds), its pictures' JSON, and what they add
+        // beyond their weight.
+        type Steer = (i64, Vec<u8>, usize, bool, Option<String>, usize);
         let mut steers: Vec<Steer> = Vec::new();
         let mut more = false;
         let mut capped = false;
@@ -4593,15 +4626,18 @@ impl Database {
                 }
                 bytes += size;
                 let images: Option<String> = row.get(5)?;
-                let item = family
-                    .user_item_with(&row.get::<_, String>(1)?, &images_from(images.as_deref())?)?;
-                if item.len() + 1 > room_bytes || room_items == 0 {
+                let pictures = images_from(images.as_deref())?;
+                let item = family.user_item_with(&row.get::<_, String>(1)?, &pictures)?;
+                // Its pictures count at their weight, as the node will.
+                let pictured = crate::codec::pictured(&pictures);
+                let weight = item.len() - pictured;
+                if weight + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
                 }
-                room_bytes -= item.len() + 1;
+                room_bytes -= weight + 1;
                 room_items -= 1;
-                steers.push((row.get(0)?, item, size, row.get(4)?, images));
+                steers.push((row.get(0)?, item, size, row.get(4)?, images, pictured));
             }
         }
         let mut absorbed = Absorbed {
@@ -4619,8 +4655,8 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, item, size, was_attached, images) in steers {
-            let id = node(&tx, head, &item)?;
+        for (steer, item, size, was_attached, images, pictured) in steers {
+            let id = node_with_turn(&tx, head, &item, None, pictured)?;
             head = Some(id);
             keep_once(&tx, steer, images.as_deref())?;
             if size >= PROMPT_SHARE_BYTES {
@@ -4953,18 +4989,20 @@ impl Database {
         // the result, eliding it later reads no output. A bot without the
         // read tool never elides, since the model could not follow a stub,
         // so it gets none.
+        // Pictures count at their weight, so a stub saves only what the
+        // result weighs over it.
         let next = next_node(&tx)?;
+        let pictured = crate::codec::pictured(&outcome.images);
+        let weight = item.len() - pictured;
         let stub = if !outcome.images.is_empty() {
-            super::context::picture_stub(family, call_id, &outcome.output, item.len())?
+            super::context::picture_stub(family, call_id, &outcome.output, weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
-            super::context::stub(family, call_id, &outcome.output, next, item.len())?
+            super::context::stub(family, call_id, &outcome.output, next, weight)?
         } else {
             None
         };
-        let elided = stub
-            .as_ref()
-            .map_or(0, |stub| (item.len() - stub.len()) as i64);
-        let head = insert_node(&tx, bot.head, &item, None, elided)?;
+        let elided = stub.as_ref().map_or(0, |stub| (weight - stub.len()) as i64);
+        let head = insert_node(&tx, bot.head, &item, None, elided, pictured)?;
         if head != next {
             return fail("storage_error");
         }
@@ -8209,10 +8247,10 @@ fn start_locked(
     let images: Option<String> = tx
         .prepare_cached("SELECT images FROM turns WHERE id=?")?
         .query_row([turn], |r| r.get(0))?;
-    let item = bot
-        .family()?
-        .user_item_with(prompt, &images_from(images.as_deref())?)?;
-    let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
+    let pictures = images_from(images.as_deref())?;
+    let item = bot.family()?.user_item_with(prompt, &pictures)?;
+    let pictured = crate::codec::pictured(&pictures);
+    let head = node_with_turn(tx, bot.head, &item, Some(turn), pictured)?;
     keep_once(tx, turn, images.as_deref())?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
@@ -8331,7 +8369,7 @@ fn turn_status_name(status: &str) -> &'static str {
     }
 }
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
-    node_with_turn(conn, parent, item, None)
+    node_with_turn(conn, parent, item, None, 0)
 }
 /// Bring an older versioned store forward to the current schema inside the
 /// caller's transaction. Each step converts stored data once; the runtime has
@@ -9045,6 +9083,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 53 -> 54: a prompt may come with pictures. None did.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN images TEXT;")?;
     }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='pictured')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 54 -> 55: a picture counts at its weight. Older nodes count theirs
+        // at its size, which `total_bytes` already holds.
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN pictured INTEGER NOT NULL DEFAULT 0;")?;
+    }
     Ok(())
 }
 /// Recover an omitted steer's effort from the turn its completion names.
@@ -9315,13 +9362,15 @@ fn previous_turn_seq(conn: &Connection, node: i64) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// `pictured`: what the item's pictures add beyond their weight.
 fn node_with_turn(
     conn: &Connection,
     parent: Option<i64>,
     item: &[u8],
     turn: Option<i64>,
+    pictured: usize,
 ) -> Result<i64> {
-    insert_node(conn, parent, item, turn, 0)
+    insert_node(conn, parent, item, turn, 0, pictured)
 }
 /// Whether a bot other than `name` sees the compaction version at `node`:
 /// bound to it, or through a later version made on it. A version made at
@@ -9354,12 +9403,16 @@ fn next_node(conn: &Connection) -> Result<i64> {
         .query_row([], |r| r.get(0))?)
 }
 /// `elided`: what a request saves by sending the item's stub instead.
+/// `pictured`: what the item's pictures add beyond their weight, which
+/// `total_bytes` leaves out: context accounting counts a picture at its
+/// token cost, and only a request's length counts its bytes.
 fn insert_node(
     conn: &Connection,
     parent: Option<i64>,
     item: &[u8],
     turn: Option<i64>,
     elided: i64,
+    pictured: usize,
 ) -> Result<i64> {
     let (bytes, depth, saved, thought): (i64, i64, i64, i64) = match parent {
         Some(id) => conn
@@ -9383,21 +9436,22 @@ fn insert_node(
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
         "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
-            total_thinking)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?
+            total_thinking,pictured)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
         parent,
         item,
-        bytes + item.len() as i64,
+        bytes + (item.len() - pictured) as i64,
         depth + 1,
         turn,
         turn_seq,
         thinking,
         elided,
         saved + elided,
-        thought + thinking
+        thought + thinking,
+        pictured as i64
     ])?;
     Ok(conn.last_insert_rowid())
 }
