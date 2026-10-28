@@ -1250,7 +1250,10 @@ impl Service {
         }
         let mut live = false;
         self.live = false;
-        self.resume = self.cursor.or(self.resume);
+        // From before the oldest news not told yet, as a restart would:
+        // a message whose check the dropped connection cut short is read
+        // again.
+        self.resume = self.floor().or(self.resume);
         let (done, mut results) = tokio::sync::mpsc::channel(64);
         // Checks a dropped connection left under way answer the old
         // channel, never this one: none is under way here yet.
@@ -1598,20 +1601,24 @@ impl Service {
 
     /// The newest event seen live, kept beside the store for the next
     /// lookout, written whole and moved in.
-    fn save_cursor(&mut self) {
-        // Up to just before the oldest news a lookout has not told: news
-        // only in memory is told again after a restart, not lost.
+    /// Up to just before the oldest news a lookout has not told, which a
+    /// restart or a reconnect takes up again: news only in memory, or a
+    /// check a dropped connection cut short, is told again, not lost.
+    fn floor(&mut self) -> Option<i64> {
         for lookout in self.lookouts.values_mut() {
             if !lookout.untold() {
                 lookout.from = None;
             }
         }
         let floor = self.lookouts.values().filter_map(|l| l.from).min();
-        let cursor = match (self.cursor, floor) {
+        match (self.cursor, floor) {
             (Some(at), Some(floor)) => Some(at.min(floor - 1)),
             (at, _) => at,
-        };
-        let Some(cursor) = cursor.filter(|at| Some(*at) != self.saved) else {
+        }
+    }
+
+    fn save_cursor(&mut self) {
+        let Some(cursor) = self.floor().filter(|at| Some(*at) != self.saved) else {
             return;
         };
         let path = cursor_path(&self.store);

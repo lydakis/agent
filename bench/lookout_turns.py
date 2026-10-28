@@ -229,6 +229,34 @@ def calls(items):
     return found
 
 
+def said(items):
+    """What the fork wrote in its turn, message by message."""
+    found = []
+    for item in items:
+        if item.get('role') != 'assistant':
+            continue
+        content = item.get('content')
+        if isinstance(content, str):
+            found.append(content)
+            continue
+        for block in content or []:
+            if isinstance(block, dict) and block.get('type') in ('output_text', 'text'):
+                found.append(block.get('text') or '')
+    return found
+
+
+def would(texts):
+    """Each `WOULD:` line, from any message of the turn, once."""
+    found = []
+    for text in texts:
+        for line in text.splitlines():
+            if line.strip().startswith('WOULD:'):
+                act = line.strip()[len('WOULD:'):].strip()
+                if act not in found:
+                    found.append(act)
+    return found
+
+
 def run_one(socket_path, row, arm, note, n):
     daemon = Daemon(socket_path)
     bot = f'lookout-eval.{arm}.{n}.{int(time.time() * 1000) % 100000}'
@@ -262,9 +290,11 @@ def run_one(socket_path, row, arm, note, n):
             out['failed'] = f"turn {out['status']}"
             return out
         text = outcome.get('text') or ''
-        out['would'] = [l[len('WOULD:'):].strip() for l in text.splitlines() if l.strip().startswith('WOULD:')]
+        items = turn_items(daemon, bot, submitted['turn'])
+        # A `WOULD:` line written before a later wait counts as well.
+        out['would'] = would(said(items) + [text])
         out['reply'] = '\n'.join(l for l in text.splitlines() if not l.strip().startswith('WOULD:')).strip()
-        out['calls'] = calls(turn_items(daemon, bot, submitted['turn']))
+        out['calls'] = calls(items)
         row = daemon.request('turns', bot=bot, after=submitted['turn'] - 1, limit=1)['turns'][0]
         out['usage'] = {k: row.get(k) for k in ('input_tokens', 'cached_input_tokens', 'output_tokens')}
     except Failed as e:
