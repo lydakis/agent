@@ -14,6 +14,7 @@ mod cache;
 mod calls;
 mod declared;
 mod diff;
+mod embed;
 mod errand;
 mod herdr;
 mod highlight;
@@ -1331,6 +1332,8 @@ struct App {
     pane: Option<pane::Pane>,
     pane_keys: bool,
     pane_mouse: bool,
+    /// A program in the pane drew something: the screen is drawn again.
+    woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -2000,6 +2003,7 @@ impl App {
             pane: None,
             pane_keys: false,
             pane_mouse: false,
+            woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
             move_to: None,
@@ -2153,6 +2157,7 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {}
+                _ = self.woken.notified() => {}
             }
             if self
                 .watch
@@ -4025,6 +4030,14 @@ impl App {
     fn full_screen(&mut self, event: &Event) -> bool {
         let key = match event {
             // A paste while finding is more to find.
+            // A paste in the pane's program is its own.
+            Event::Paste(text)
+                if self.pane_keys
+                    && let Some(program) = self.pane.as_ref().and_then(|p| p.program.as_ref()) =>
+            {
+                program.paste(text);
+                return true;
+            }
             Event::Paste(text) if let Some(query) = &mut self.finding => {
                 query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
                 self.screen.find(query);
@@ -4054,6 +4067,11 @@ impl App {
                             if let Err(error) = open(&url) {
                                 self.notice = Some(error);
                             }
+                            return true;
+                        }
+                        if let Some(program) = &pane.program {
+                            let (x, y) = pane.origin();
+                            program.mouse(*mouse, x, y);
                             return true;
                         }
                         pane.screen.mouse(*mouse)
@@ -4086,6 +4104,16 @@ impl App {
         if self.finding.is_none()
             && let Some(pane) = &mut self.pane
         {
+            // A program has every key but Shift+Tab, which comes back here.
+            if self.pane_keys
+                && let Some(program) = &pane.program
+            {
+                match key.code {
+                    KeyCode::BackTab => self.pane_keys = false,
+                    _ => program.key(*key),
+                }
+                return true;
+            }
             if self.pane_keys {
                 match key.code {
                     KeyCode::Esc => {
@@ -5051,6 +5079,32 @@ impl App {
         if let Some(model) = &self.turn_model {
             command.args(["--model", model]);
         }
+        // The full screen has it beside the conversation, on a terminal
+        // of its own.
+        if full() {
+            let mut program = portable_pty::CommandBuilder::new(command.get_program());
+            program.args(command.get_args());
+            if let Ok(here) = std::env::current_dir() {
+                program.cwd(here);
+            }
+            program.env("TERM", "xterm-256color");
+            let height = self.height.saturating_sub(2).max(2) as u16;
+            let width = match pane::width(self.full_width, PROSE as u16) {
+                0 => 80,
+                width => width,
+            };
+            let woken = self.woken.clone();
+            let drawn = move || woken.notify_one();
+            match embed::Embedded::spawn(program, height, width, term::light(), drawn) {
+                Ok(program) => {
+                    self.pane = Some(pane::Pane::program("side chat", program));
+                    self.pane_keys = true;
+                    self.screen.unselect();
+                }
+                Err(error) => self.notice = Some(format!("no side chat: {error}")),
+            }
+            return;
+        }
         // The key reader lets go before the side chat reads the keyboard.
         self.keys_paused
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5076,6 +5130,13 @@ impl App {
 
     /// Back from a side chat that has ended.
     fn side_closed(&mut self) {
+        if let Some(pane) = &mut self.pane
+            && let Some(program) = &mut pane.program
+            && program.ended()
+        {
+            self.pane = None;
+            self.pane_keys = false;
+        }
         if let Some(child) = &mut self.side
             && !matches!(child.try_wait(), Ok(None))
         {
@@ -5257,6 +5318,8 @@ impl App {
         }
         // The full screen's links, to be written again as hyperlinks.
         let mut linked = Vec::new();
+        // Where the pane's program has its cursor.
+        let mut pane_cursor = None;
         terminal.draw(|frame| {
             // The full screen: the conversation above the rows that move,
             // which sit right under it until it fills the screen, as inline.
@@ -5265,7 +5328,7 @@ impl App {
                     let (area, pane) = self.split(frame.area());
                     if let (Some(at), Some(open)) = (pane, &mut self.pane) {
                         let file = |word: &str| links::file_line(&workspace, word);
-                        open.render(at, frame.buffer_mut(), self.pane_keys, file);
+                        pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, file);
                         linked.extend(open.screen.link_cells(frame.buffer_mut()));
                         // The line between them, as a split's.
                         if area.width > 0 {
@@ -5277,6 +5340,9 @@ impl App {
                             let rule = vec![Line::from("│").dim(); line.height as usize];
                             frame.render_widget(Paragraph::new(rule), line);
                         }
+                    }
+                    if let Some(cursor) = pane_cursor.filter(|_| self.pane_keys) {
+                        frame.set_cursor_position(cursor);
                     }
                     if area.width == 0 {
                         return;

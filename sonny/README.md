@@ -138,10 +138,13 @@ off again never shows.
 `/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
-  window, taken where it is now, mid-turn included, on the alternate
-  screen. The copy answers from the agent's history and may call no tool;
-  follow-ups stay with it, and Esc goes back. The agent carries on
-  meanwhile, and what it said is waiting on the main screen. The daemon
+  window, taken where it is now, mid-turn included: in the pane beside
+  the conversation on the full screen, on the alternate screen inline.
+  The copy answers from the agent's history and may call no tool;
+  follow-ups stay with it, and Esc goes back. In the pane, every key goes
+  to the side chat but Shift+Tab, which goes back to the main composer
+  while the side chat stays open. The agent carries on meanwhile, in
+  view on the full screen, waiting on the main screen inline. The daemon
   deletes the copy once it has been idle 15 minutes (`fork --expires`), and
   no copy shows among the project's agents, in `/status`, or to the
   lookout.
@@ -324,5 +327,7 @@ the choice is kept with the other settings.
 ![README.md beside the chat, read as a reply: headings, a list, a table and a Python block in color](../docs/sonny/pane-markdown.png)
 
 ![/status beside the conversation, its times still counting](../docs/sonny/pane-status.png)
+
+![A side chat beside the conversation, answering a question about it](../docs/sonny/pane-side.png)
 
 `demo/` has the scripted model and folder the recordings use.

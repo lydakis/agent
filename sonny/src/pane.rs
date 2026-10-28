@@ -1,6 +1,6 @@
 //! The pane beside the conversation on the full screen, where what the
 //! person opens to look at goes instead of over the conversation: a file
-//! they clicked, as a preview, or `/status`. Its rows are a [`Screen`] of
+//! they clicked, as a preview, `/status`, or a side chat. Its rows are a [`Screen`] of
 //! their own, so they scroll, select, copy and follow links as the
 //! conversation's do.
 use std::path::{Path, PathBuf};
@@ -49,6 +49,8 @@ pub struct Pane {
     card: Option<Vec<Line<'static>>>,
     /// What the keys do here, after the title while they go to it.
     keys: &'static str,
+    /// A program drawn here instead of rows: a side chat's Sonny.
+    pub program: Option<crate::embed::Embedded>,
 }
 
 impl Pane {
@@ -71,6 +73,7 @@ impl Pane {
             area: Rect::default(),
             card: None,
             keys: "esc closes",
+            program: None,
         })
     }
 
@@ -84,7 +87,28 @@ impl Pane {
             area: Rect::default(),
             card: Some(Vec::new()),
             keys,
+            program: None,
         }
+    }
+
+    /// `program` drawn in the pane under `title`, every key going to it
+    /// but Shift+Tab, which goes back to the conversation.
+    pub fn program(title: &str, program: crate::embed::Embedded) -> Self {
+        Self {
+            title: title.to_owned(),
+            path: None,
+            screen: Screen::default(),
+            area: Rect::default(),
+            card: None,
+            keys: "shift+tab back",
+            program: Some(program),
+        }
+    }
+
+    /// Where what the pane holds starts, under its title: the program's
+    /// first cell.
+    pub fn origin(&self) -> (u16, u16) {
+        (self.area.x + 1, self.area.y + 2)
     }
 
     /// Whether this is a card, not a file.
@@ -115,17 +139,18 @@ impl Pane {
 
     /// The pane in `area`: its title over its rows, the title bright
     /// while keys go to the pane. `file` is where a word that may be a
-    /// path opens, as in the conversation.
+    /// path opens, as in the conversation. Where a program's cursor is,
+    /// when it shows one.
     pub fn render(
         &mut self,
         area: Rect,
         buf: &mut Buffer,
         focused: bool,
         file: impl Fn(&str) -> Option<String>,
-    ) {
+    ) -> Option<(u16, u16)> {
         self.area = area;
         if area.height == 0 {
-            return;
+            return None;
         }
         let keys = match focused {
             true => format!("  {} ", self.keys),
@@ -157,7 +182,21 @@ impl Pane {
             height: area.height.saturating_sub(2),
             ..area
         };
-        self.screen.render(rows, buf, file);
+        match &mut self.program {
+            // A column off the line between, as the title is.
+            Some(program) => {
+                let rows = Rect {
+                    x: rows.x + 1,
+                    width: rows.width.saturating_sub(1),
+                    ..rows
+                };
+                program.render(rows, buf)
+            }
+            None => {
+                self.screen.render(rows, buf, file);
+                None
+            }
+        }
     }
 }
 
