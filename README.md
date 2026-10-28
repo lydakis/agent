@@ -37,7 +37,7 @@ cargo install --locked --path .
 That puts `agent` in `~/.cargo/bin`. With [Homebrew](https://brew.sh),
 `brew install lydakis/agent/agent` builds the same from a release's source;
 `brew install lydakis/agent/sonny` adds [Sonny](#sonny), the terminal
-client, and pulls in `agent` with it. If Homebrew refuses the tap as
+client, and pulls in `agent` and `ripgrep` with it. If Homebrew refuses the tap as
 untrusted, run `brew trust lydakis/agent` first.
 
 On Linux without Homebrew (which does not run on ARM Linux), install Sonny
@@ -74,6 +74,9 @@ region holds the model (from any source region the profile supports), or `--prov
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
 `export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
 needs no flags.
+To keep them instead, put `provider = "bedrock"` and
+`model = "bedrock/global.anthropic.claude-sonnet-5"` in `~/.agent/config.toml`;
+the shell's variables come first.
 For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
 the daemon with `--provider chatgpt`; it signs in through OpenAI's
 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
@@ -200,9 +203,10 @@ sonny                                   # in your project's folder
 
 The first run asks how your agents reach a model (a ChatGPT plan, an
 Anthropic, OpenAI or OpenRouter key, or Bedrock with your AWS profile) and
-which model new projects use, and keeps both in `~/.agent/env`, readable
-only by you. Sonny applies that file to the daemon and everything else it
-starts, so nothing goes in your shell profile.
+which model new projects use. As Codex does, it keeps the settings in
+`~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
+which Sonny applies to the daemon and everything else it starts, so nothing
+goes in your shell profile.
 
 ## How fast is it?
 

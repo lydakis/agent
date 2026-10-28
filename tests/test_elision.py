@@ -119,7 +119,7 @@ class ElisionTests(ModelFixture):
         del self.model.note_text
         drain(self.model)
         turn = client.request('submit', bot='Bob', request_id='2',
-                              prompt='long:21x1,2x220,4x1')['result']['turn']
+                              prompt='long:20x1,2x220,4x1')['result']['turn']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -128,8 +128,8 @@ class ElisionTests(ModelFixture):
             '[carry-forward note') for i in r['input']) for r in requests))
         last = {i['call_id']: i['output'] for i in requests[-1]['input']
                 if i.get('type') == 'function_call_output'}
-        self.assertTrue(last['long-21'].startswith(STUB) and last['long-22'].startswith(STUB))
-        self.assertIn('round 21 line 150', last['long-read'])
+        self.assertTrue(last['long-20'].startswith(STUB) and last['long-21'].startswith(STUB))
+        self.assertIn('round 20 line 150', last['long-read'])
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual([e['data']['results'] for e in events if e['event'] == 'elided'], [2])
 

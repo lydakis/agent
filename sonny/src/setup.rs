@@ -1,8 +1,9 @@
 //! The first run. With no provider anywhere, Sonny asks which one to use
 //! before it starts the daemon, as Codex and Claude Code ask for a sign-in
 //! before their first turn; with no model, it asks for the default one.
-//! Both answers go to `~/.agent/env`, which Sonny applies to the daemon and
-//! everything else it starts, so no shell profile needs them.
+//! The answers are kept as Codex keeps them: settings in
+//! `~/.agent/config.toml`, and keys in `~/.agent/env`, which Sonny applies to
+//! the daemon and everything else it starts, so no shell profile needs them.
 use agent_client::Client;
 use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -28,12 +29,14 @@ const PROVIDERS: [&str; 5] = [
 /// to ChatGPT through `agent` at `bin` when that is the one.
 pub fn provider(bin: &std::path::Path) -> Result<(), String> {
     let file = agent_client::env_file::path().ok_or("set HOME")?;
+    let config = agent_client::config::path().ok_or("set HOME")?;
     println!("Welcome to Sonny. Choose how your agents reach a model:\n");
     for (index, provider) in PROVIDERS.iter().enumerate() {
         println!("  {}. {provider}", index + 1);
     }
     println!(
-        "\nYour choice is kept in {}, which only you can read.",
+        "\nSettings are kept in {}, and keys in {}, which only you can read.",
+        crate::tilde(&config.display().to_string()),
         crate::tilde(&file.display().to_string())
     );
     let choice = loop {
@@ -43,7 +46,8 @@ pub fn provider(bin: &std::path::Path) -> Result<(), String> {
             _ => continue,
         }
     };
-    let kept: Vec<(&str, String)> = match choice {
+    // The provider to name in the config, and what goes in the env file.
+    let (named, kept): (Option<&str>, Vec<(&str, String)>) = match choice {
         1 => {
             let mut command = crate::agent_command(bin)?;
             let status = command
@@ -53,7 +57,7 @@ pub fn provider(bin: &std::path::Path) -> Result<(), String> {
             if !status.success() {
                 return Err("signing in to ChatGPT did not finish; run sonny again".into());
             }
-            vec![("AGENT_PROVIDER", "chatgpt".into())]
+            (Some("chatgpt"), Vec::new())
         }
         2..=4 => {
             let (name, var) = [
@@ -67,7 +71,7 @@ pub fn provider(bin: &std::path::Path) -> Result<(), String> {
                     break key;
                 }
             };
-            vec![(var, key)]
+            (None, vec![(var, key)])
         }
         _ => {
             let current = std::env::var("AWS_PROFILE").unwrap_or_default();
@@ -78,22 +82,26 @@ pub fn provider(bin: &std::path::Path) -> Result<(), String> {
             let profile = Some(line(&asked)?)
                 .filter(|p| !p.is_empty())
                 .unwrap_or(current);
-            let mut kept = vec![("AGENT_PROVIDER", "bedrock".to_owned())];
-            if !profile.is_empty() {
-                kept.push(("AWS_PROFILE", profile));
-            }
-            kept
+            let kept = match profile.is_empty() {
+                true => Vec::new(),
+                false => vec![("AWS_PROFILE", profile)],
+            };
+            (Some("bedrock"), kept)
         }
     };
-    save(&file, kept)?;
+    if !kept.is_empty() {
+        let pairs: Vec<(&str, &str)> = kept.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        agent_client::env_file::set(&file, &pairs)?;
+    }
+    save(&config, named.map(|provider| ("provider", provider)))?;
     println!("Saved.\n");
     Ok(())
 }
 
 /// Asks for the default model of new projects from what the daemon's
-/// providers list, and keeps it as `AGENT_MODEL`.
+/// providers list, and keeps it as the config's `model`.
 pub async fn model(client: &Client) -> Result<String, String> {
-    let file = agent_client::env_file::path().ok_or("set HOME")?;
+    let file = agent_client::config::path().ok_or("set HOME")?;
     print!("Listing your providers' models... ");
     let _ = std::io::stdout().flush();
     let listing = client
@@ -131,7 +139,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
             None => filter = answer,
         }
     };
-    save(&file, vec![("AGENT_MODEL", model.clone())])?;
+    save(&file, Some(("model", &model)))?;
     println!(
         "Saved {model} as the default model in {}.\n",
         crate::tilde(&file.display().to_string())
@@ -139,23 +147,26 @@ pub async fn model(client: &Client) -> Result<String, String> {
     Ok(model)
 }
 
-/// Efforts a first run suggests, which the person may edit: written once,
-/// never over a value the file already has.
-const SUGGESTED: [(&str, &str); 2] = [
-    ("SONNY_LEAD_EFFORT", "medium"),
-    ("SONNY_TASK_EFFORT", "high"),
-];
-
-/// `kept` into the env file, with the suggested efforts it does not set yet.
-fn save(file: &std::path::Path, mut kept: Vec<(&str, String)>) -> Result<(), String> {
-    let present = agent_client::env_file::read(file)?;
-    for (key, value) in SUGGESTED {
-        if !present.iter().any(|(set, _)| set == key) {
-            kept.push((key, value.to_owned()));
-        }
+/// `chosen` into the config file at `file`, with the efforts a first run
+/// suggests where the file names none; the person may edit them after.
+fn save(file: &std::path::Path, chosen: Option<(&str, &str)>) -> Result<(), String> {
+    let sonny = agent_client::config::read(file)?.sonny;
+    let suggested = [
+        ("sonny.lead_effort", "medium", sonny.lead_effort),
+        ("sonny.task_effort", "high", sonny.task_effort),
+    ];
+    let pairs: Vec<(&str, &str)> = (chosen.into_iter())
+        .chain(
+            suggested
+                .iter()
+                .filter(|(.., set)| set.is_none())
+                .map(|(k, v, _)| (*k, *v)),
+        )
+        .collect();
+    match pairs.is_empty() {
+        true => Ok(()),
+        false => agent_client::config::set(file, &pairs),
     }
-    let pairs: Vec<(&str, &str)> = kept.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    agent_client::env_file::set(file, &pairs)
 }
 
 /// Models listed at once; typing narrows the rest.

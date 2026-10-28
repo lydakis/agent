@@ -10,6 +10,15 @@ every turn one synthetic `shell` call (`true`) and a reply. Arms:
 - `parked`: the same gate with an `approval_hold_ms` of 0; this client answers
   after `turn_waiting`, so every call parks and resumes.
 
+A client's own declared tool in place of `shell`, every turn one call to it:
+
+- `declared`: a fixed result, the baseline (run on `--before` too, when
+  given, to show answered tools cost a fixed one nothing).
+- `answered`: answered by this client as soon as `tool_started` names its
+  tag, within the hold, so the turn never parks.
+- `answered_parked`: the same with an `approval_hold_ms` of 0; this client
+  answers after `turn_waiting`, so every call parks and resumes.
+
 Over a Unix socket instead of stdio, with the approver a process of its own:
 
 - `socket`: the `held` arm with this client answering over the socket, the
@@ -117,7 +126,8 @@ def live_bytes(path):
 
 def run(binary, arm, *, bots, turns, fsync=False):
     server, url = start()
-    hold = 0 if arm == 'parked' else 2000
+    hold = 0 if arm in ('parked', 'answered_parked') else 2000
+    answered = arm in ('answered', 'answered_parked')
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / '.local') as temp:
         path = Path(temp)
         if fsync:
@@ -127,11 +137,17 @@ def run(binary, arm, *, bots, turns, fsync=False):
             wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
             binary = wrapper
         client = Client(binary, path / 'state.sqlite', url, 'shell',
-                        settings=None if arm == 'ungated' else {'approval_hold_ms': hold})
+                        settings=None if arm in ('ungated', 'declared') else {'approval_hold_ms': hold})
         try:
             process = psutil.Process(client.process.pid)
             names = [f'b{n}' for n in range(bots)]
-            gate = {} if arm == 'ungated' else {'approve': ['shell'], 'approver': 'probe'}
+            tool = {'name': 'start_task', 'description': 'Start a task.',
+                    'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}
+            gate = ({} if arm == 'ungated'
+                    else {'declare': [dict(tool, answered_by='bench') if answered else dict(tool, result='Started.')]}
+                    if arm in ('declared', 'answered', 'answered_parked')
+                    else {'approve': ['shell'], 'approver': 'probe'})
+            prompt = 'call:start_task' if 'declare' in gate else 'shell:true'
             for name in names:
                 assert 'result' in client.request('create', bot=name, workspace=str(path), **gate)
             before = client.request('stats')['result']['store']['operations']
@@ -144,7 +160,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
                 nonlocal approver_bytes
                 client.next_id += 1
                 line = json.dumps({'id': client.next_id, 'op': op, **params}) + '\n'
-                if op == 'answer':
+                if op in ('answer', 'tool_result'):
                     approver_bytes += len(line)
                 client.process.stdin.write(line)
                 client.process.stdin.flush()
@@ -153,7 +169,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
             def submit(name):
                 remaining[name] -= 1
                 pending_submits[send('submit', bot=name, request_id=f'{name}-{remaining[name]}',
-                                     prompt='shell:true')] = (name, time.monotonic())
+                                     prompt=prompt)] = (name, time.monotonic())
 
             def answer(message, calls):
                 for call in calls:
@@ -183,6 +199,13 @@ def run(binary, arm, *, bots, turns, fsync=False):
                         announced[message['turn']] = calls
                 elif message.get('event') == 'turn_waiting' and message['data'].get('approval'):
                     answer(message, announced.pop(message['turn']))
+                elif message.get('event') == 'tool_started' and message['data'].get('answered_by'):
+                    if arm == 'answered':
+                        send('tool_result', bot=message['bot'], turn=message['turn'],
+                             call_id=message['data']['call_id'], output='Started.')
+                elif message.get('event') == 'turn_waiting' and message['data'].get('answer'):
+                    send('tool_result', bot=message['bot'], turn=message['turn'],
+                         call_id=message['data']['call_id'], output='Started.')
                 elif message.get('event') == 'turn_finished':
                     assert message['data']['status'] == 'completed', message
                     name, at = started.pop(message['turn'])
@@ -378,7 +401,8 @@ def run_socket(binary, arm, *, bots, turns):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--after', type=Path, required=True, help='binary with approvals')
-    parser.add_argument('--before', type=Path, help='binary without approvals, for the ungated arm')
+    parser.add_argument('--before', type=Path,
+                        help='binary without approvals, for the ungated arm (and declared, when run)')
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--bots', type=int, default=1)
     parser.add_argument('--turns', type=int, default=200)
@@ -388,10 +412,11 @@ def main():
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     arms = [('after', arm) for arm in args.arms.split(',')]
-    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'decisions', 'judge')
+    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'decisions', 'judge',
+                                'declared', 'answered', 'answered_parked')
                         for _, arm in arms)
     if args.before:
-        arms.insert(0, ('before', 'ungated'))
+        arms.insert(0, ('before', 'declared' if ('after', 'declared') in arms else 'ungated'))
     binaries = {'after': args.after.resolve(), **({'before': args.before.resolve()} if args.before else {})}
     report = {'schema': 1, 'host': platform.platform(), 'cpus': os.cpu_count(),
               'binary_sha256': {k: file_hash(v) for k, v in binaries.items()},
@@ -406,7 +431,7 @@ def main():
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
             print(json.dumps(record), flush=True)
     if args.fsync:
-        for label, arm in [(label, arm) for label, arm in arms if arm in ('ungated', 'held', 'parked')]:
+        for label, arm in [(label, arm) for label, arm in arms if arm not in ('socket', 'decisions', 'judge')]:
             record = {'binary': label, **run(binaries[label], arm, bots=args.bots, turns=args.turns, fsync=True)}
             report['fsync'].append(record)
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')

@@ -114,10 +114,11 @@ identity is `bot_not_found`.
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `AGENT_JUDGE`, else `AGENT_MODEL`. OpenAI's Decisions
+  `[judge] model` in `~/.agent/config.toml`, else `AGENT_MODEL`. OpenAI's Decisions
   API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
   own API, at `--judge-url` when given; any other model runs through the
-  daemon, with a tag of at most 67 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  daemon, with a tag of at most 67 bytes, and `--effort` (default
+  `[judge] effort`) sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
@@ -270,12 +271,14 @@ fails the command with `daemon_configuration_mismatch` naming the difference.
 Comparison uses effective limits: `--idle-exit 0` means disabled, and positive
 context limits are clamped to at least 1,024 bytes and two items.
 With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
-separated by whitespace), else the providers whose key variable is set; a
+separated by whitespace), else `provider` in `~/.agent/config.toml` (the
+same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
 `run --model` names a new bot's model or an existing bot's turn model; the
-daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
-`AGENT_MODEL` is only a creation default. An existing bot uses its stored
+daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,
+or `model` in `~/.agent/config.toml`, in that order. Both are only creation
+defaults. An existing bot uses its stored
 model unless `--model` explicitly overrides it for this turn.
 `run --effort LEVEL` sets a new bot's effort: `low`,
 `medium`, `high` or `xhigh` on either family, and `max` on Anthropic's; any

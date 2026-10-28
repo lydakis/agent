@@ -5188,3 +5188,132 @@ half a creation. An unkeyed creation builds no stored request: an earlier
 build of this change that built it for every creation measured 10.81 ms
 unkeyed against 10.25 ms on main in a run of the same size, inside the same
 spread. macOS is not measured.
+
+## Answered declared tools
+
+A declared tool may wait for its client's answer (protocol 20). A call holds
+live for up to 250 ms and then parks like `wait`. This screen measures what
+an answered call costs a turn, compared with the same call to a tool whose
+result is fixed. It also checks that fixed declared tools and turns that
+call no tools cost what they did before.
+
+Method: [`bench.approval_overhead`](../bench/approval_overhead.py) with
+`--arms declared,answered,answered_parked --turns 200 --rounds 3`. One bot
+runs 200 turns. Each turn makes one call to a declared tool with no
+parameters, then replies. The arms are:
+
+- `declared`: the tool has a fixed result.
+- `answered`: this client answers as soon as `tool_started` names the tag,
+  so the call is answered within the hold.
+- `answered_parked`: the same, but with `approval_hold_ms` 0. The client
+  answers after `turn_waiting`.
+
+`--before` runs the `declared` arm on main (`cf8cf65`). `--fsync` makes a
+separate pass that counts fsync calls under strace. The completion and
+lifecycle screens run on the same two builds:
+
+- `bench.completion_burst --bots 32 --repeat 5`
+- `bench.lifecycle --agents 32 --mode echo --tools echo --repeat 5`
+
+Environment: Linux x86_64 container, 4 vCPUs, 2026-10-28.
+
+| Build and arm | Submit to finish p50 | p99 | Daemon CPU | Store time | Commits | fsync | Events |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main, `declared` | 10.20 ms | 15.29 ms | 7.55 ms | 7.22 ms | 11 | 6.26 | 1045 B |
+| this, `declared` | 9.83 ms | 16.15 ms | 7.60 ms | 7.30 ms | 11 | 6.26 | 1045 B |
+| this, `answered` | 10.43 ms | 19.71 ms | 8.10 ms | 7.72 ms | 14 | 6.27 | 1094 B |
+| this, `answered_parked` | 12.95 ms | 19.04 ms | 9.85 ms | 9.59 ms | 19 | 9.33 | 1310 B |
+
+All cells are per turn. Cells other than fsync are medians of three runs. The
+client sends a 98-byte `tool_result` per turn.
+
+A fixed declared tool costs the same as before. An answer within the hold
+adds 0.2–0.6 ms at p50 and no fsync. Its three extra commits are empty
+storage-worker rounds:
+
+- the first `answer_take`, which finds no answer;
+- the `tool_result`, which holds the answer in live state;
+- the second `answer_take`, which takes the answer.
+
+The answer is written with the call's result. A parked call adds about
+2.8 ms and three fsyncs: the park, the stored answer, and the resume.
+
+32-bot completion burst, release to terminal p50 (median of five runs, range
+in brackets):
+
+- main: 13.3 ms (12.2–15.0)
+- this change: 12.1 ms (11.8–16.4)
+
+32-bot echo lifecycle, medians of five runs:
+
+| Build | Turn p50 | Turn p99 | Restart ready | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| main | 578.3 ms | 589.3 ms | 245 ms | 22.6 MiB |
+| this change | 578.6 ms | 588.5 ms | 235 ms | 22.4 MiB |
+
+Both screens are within noise. A store at rest is 12 KiB larger: three pages
+for the `answers` table and its two indexes. In both builds the retained
+store bytes are bimodal, about 1.4 MiB or about 5.5 MiB, depending on
+whether the WAL had been checkpointed when the run ended. Answers that come
+from another process over the socket are not measured, and neither is
+macOS.
+
+## Re-measurement since September, and the statement cache
+
+George asked on 2026-10-28 that the daemon stay fast and light as features
+land. Four release builds ran the same screens alternately on one Linux
+x86_64 container that day, synthetic provider, no spend: `0a6f2b2` (0.1.3,
+Sep 29), `1424ca7` (Oct 11), `0fb51fc` (0.4.1) and `c16210c` (main).
+`bench.footprint` is new: one stdio daemon, 1000 bots created in pipelined
+batches of 64, then one text turn each, RSS read a second after each phase.
+
+| Measure | Sep 29 | Oct 11 | 0.4.1 | main |
+| --- | ---: | ---: | ---: | ---: |
+| Idle RSS, MiB | 16.81 | 17.23 | 17.22 | 17.36 |
+| Per idle bot, KiB | 1.12 | 1.05 | 1.13 | 1.06 |
+| RSS after 1000 turns, MiB | 24.75 | 25.33 | 26.65 | 25.82 |
+| CPU per text turn, ms | 1.53 | 1.59 | 1.75 | 1.61 |
+| 32-bot socket echo, peak RSS MiB | 21.75 | 22.70 | 23.12 | 23.05 |
+| 32-bot socket echo, CPU s | 1.275 | 1.38 | 1.37 | 1.54 |
+| 32-bot socket echo, turn p95 ms | 594 | 598 | 604 | 611 |
+| 32 lone submits, daemon CPU ms | 45.2 | 49.1 | 71.2 | 66.5 |
+| 32 lone submits, reply p50 ms | 1.59 | 1.63 | 2.15 | 1.96 |
+| 64 bots, 200 ms model, turns/s | 294 | 291 | 288 | 287 |
+| Store jobs per sustained turn | 8.57 | 8.55 | 8.60 | 8.64 |
+
+Medians of 3 (footprint), 6 (lifecycle) or 10 (admission) measured runs;
+sustained throughput is two 15 s runs. Memory and store work held; the lone
+submission lost a third of its speed between Oct 11 and 0.4.1.
+
+Cause, from callgrind over `bench.admission_burst` on `1424ca7` and
+`0fb51fc`: the extra instructions are in `Database::begin`, nearly all of
+them `sqlite3Prepare` under rusqlite's `StatementCache::get`. rusqlite keeps
+16 prepared statements per connection, and the store has 144
+`prepare_cached` sites. The profile shows an admission's statements parsed
+again each time, which is what the cache does once the statements in use
+between two admissions outnumber it. Each connection now keeps 256.
+
+Matched screen, `c16210c` against this branch with the cache, retry and
+classification changes, two alternating rounds:
+
+| Measure | main | branch |
+| --- | ---: | ---: |
+| 32 lone submits, daemon CPU ms | 72.6 | 49.0 |
+| 32 lone submits, reply p50 ms | 2.28 | 1.73 |
+| 32-bot socket echo, CPU s | 1.44 | 1.265 |
+| 32-bot socket echo, peak RSS MiB | 23.3 | 23.8 |
+| 32-bot socket echo, turn p95 ms | 604 | 596 |
+| Completion burst p99 ms | 19.7 | 18.9 |
+| CPU per text turn (footprint), ms | 1.68 | 1.49 |
+| Idle RSS (footprint), MiB | 17.7 | 17.9 |
+| RSS after 1000 turns, MiB | 26.5 | 26.6 |
+
+The cache costs about half a MiB at the echo screen's peak and nothing
+visible at idle. macOS is not measured.
+
+A partial-overload screen (`overload.py`, local: 64 bots, 200 ms replies,
+a fraction of calls refused with 529 and no `Retry-After`) shows what a
+pool closed on every refusal costs: at 5 % refused, both builds fall from
+about 285 to about 20 turns/s with p50 latency near 3 s. That is the pacer
+behaving as designed today; whether one refusal should close the pool is
+left to a pacer change.
