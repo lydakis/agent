@@ -3,7 +3,8 @@
 //! by where they stand, as a thread list is: what needs the person, what
 //! works, what waits for review, what sits idle, and, folded away, what the
 //! lead marked resolved. Each row says what the agent is doing, for how
-//! long, on which model, its latest step, and where it is in Rex.
+//! long, on which model, its latest step, where it is in Rex, and what
+//! runs for it in the background.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -22,6 +23,9 @@ pub struct Row {
     pub place: String,
     /// The pull request its last reply links, as `owner/repo#N`.
     pub pr: String,
+    /// What runs for it with no one typing, as `/background` counts it:
+    /// `↻ 2 triggers`, or empty.
+    pub background: String,
     pub group: Group,
 }
 
@@ -235,10 +239,15 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         Span::raw(""),
         Span::raw("   "),
     ));
-    let facts: Vec<&str> = [row.model.as_str(), row.place.as_str(), row.pr.as_str()]
-        .into_iter()
-        .filter(|f| !f.is_empty())
-        .collect();
+    let facts: Vec<&str> = [
+        row.model.as_str(),
+        row.place.as_str(),
+        row.pr.as_str(),
+        row.background.as_str(),
+    ]
+    .into_iter()
+    .filter(|f| !f.is_empty())
+    .collect();
     if !facts.is_empty() {
         let line = Line::from(facts.join(" · ")).dim();
         out.extend(crate::transcript::wrap(
@@ -326,6 +335,7 @@ mod tests {
             row("zero", "needs you", Group::NeedsYou),
             Row {
                 pr: "o/r#9".into(),
+                background: "↻ 1 trigger".into(),
                 ..row("equal", "done", Group::Review)
             },
             row("old", "done", Group::Resolved),
@@ -344,7 +354,10 @@ mod tests {
         assert_eq!(folded[5], " ◐ zero needs you · 42s");
         assert_eq!(folded[8], "Ready for review · 1");
         assert_eq!(folded[9], " ◆ equal done · 42s ago");
-        assert_eq!(folded[10], "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9");
+        assert_eq!(
+            folded[10],
+            "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9 · ↻ 1 trigger"
+        );
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
         let shown = text(true);
         assert_eq!(shown[shown.len() - 3], "Resolved · 1");

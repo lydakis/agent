@@ -173,7 +173,16 @@ off again never shows.
   **Resolved**, only counted until `r` shows them. The lead marks a task
   resolved with its `resolve_task` tool once nothing is left to do in it,
   such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it.
+  task's window closes. New work sent to the task reopens it. An agent
+  with triggers or lookout subscriptions of its own shows `↻ 2 triggers`
+  beside its model.
+- `/background` (or `/triggers`, `/lookout`) lists what runs for the
+  project's agents with no one typing: the triggers that wake them, with
+  when each fires, its message and what its last fire did, and the
+  lookout's subscriptions, with how many checks each asked for in the last
+  day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
+  removes it; the subscription Sonny keeps for a lead's tasks stays. The
+  footer says `↻ 2 in background` while the window's agent has any.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
@@ -270,7 +279,7 @@ as a stuck task or a result the person should hear, is flagged in the next
 note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
 own model, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
-name, questions of its own), and `/lookout` lists what it watches; see
+name, questions of its own), and `/background` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
