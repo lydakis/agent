@@ -786,6 +786,35 @@ fn append(text: &mut String, path: PathBuf, header: &str) -> Result<Option<Sourc
     }))
 }
 
+/// What heads an AGENTS.md file in a bot's instructions.
+fn agents_header(path: &Path) -> String {
+    format!("\n\n# Instructions from {}\n\n", path.display())
+}
+
+/// The AGENTS.md files that apply to `workspace` and that `instructions`, a
+/// bot's, hold whole as they read now, with their text: what the bot was
+/// given, unchanged since. A file edited since it was given is not among
+/// them, though one cut short at a paragraph still reads as given.
+pub fn given_agents_files(workspace: &Path, instructions: &str) -> Vec<(PathBuf, String)> {
+    let Ok(paths) = agents_files(workspace) else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let body = read_bounded(&path, MAX_INSTRUCTIONS).ok()??;
+            let body = body.trim().to_owned();
+            let block = format!("{}{body}", agents_header(&path));
+            // Whole: the next section, or the end, follows it.
+            let whole = instructions.match_indices(&block).any(|(at, _)| {
+                let rest = &instructions[at + block.len()..];
+                rest.is_empty() || rest.starts_with("\n\n")
+            });
+            (!body.is_empty() && whole).then_some((path, body))
+        })
+        .collect()
+}
+
 /// The full text for a new bot in `workspace`, in `role` when given, with
 /// the `memory` indexes the client keeps. Fails rather than truncates when
 /// the files do not fit: a silently shortened AGENTS.md is worse than none.
@@ -797,7 +826,7 @@ pub fn instructions(
     let mut text = preamble();
     let mut sources = Vec::new();
     for path in agents_files(workspace)? {
-        let header = format!("\n\n# Instructions from {}\n\n", path.display());
+        let header = agents_header(&path);
         sources.extend(append(&mut text, path, &header)?);
     }
     let mut lists = Vec::new();
@@ -915,6 +944,33 @@ mod tests {
         assert_eq!(composed.skills[0].summary, "Deploy");
         assert!(composed.text.contains("- deploy: Deploy ("));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bot_was_given_the_agents_files_that_read_as_they_did() {
+        let root = temp("given-agents");
+        let deep = root.join("repo");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "outer rule\n\nsecond paragraph").unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "inner rule").unwrap();
+        let given = instructions(&deep, None, &[]).unwrap().text;
+        let found = |text: &str| -> Vec<String> {
+            given_agents_files(&deep, text)
+                .into_iter()
+                .filter(|(path, _)| path.starts_with(&root))
+                .map(|(_, text)| text)
+                .collect()
+        };
+        assert_eq!(
+            found(&given),
+            ["outer rule\n\nsecond paragraph", "inner rule"]
+        );
+        // Edited since: not what the bot was given.
+        std::fs::write(deep.join("AGENTS.md"), "inner rule, and push freely").unwrap();
+        assert_eq!(found(&given), ["outer rule\n\nsecond paragraph"]);
+        // Nor one changed within a paragraph.
+        std::fs::write(root.join("AGENTS.md"), "outer rule\nsecond paragraph").unwrap();
+        assert!(found(&given).is_empty());
     }
 
     #[test]
