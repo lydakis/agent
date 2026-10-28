@@ -87,6 +87,11 @@ class ServedToolTests(ModelFixture):
         # It has the tools every agent has, not its lead's own.
         record = self.daemon.request('inspect', bot='calc.fix')['result']
         self.assertEqual([tool['name'] for tool in record['declared']], ['show_agent'])
+        # It works in a sandbox, reaching the network, and may commit to the
+        # repository its worktree shares.
+        self.assertEqual(record['settings']['sandbox'], 'workspace-write')
+        self.assertEqual(record['settings']['writable'], [str((repo / '.git').resolve())])
+        self.assertTrue(record['settings']['network'])
         # The brief names the task's copy, not the lead's folder.
         turns = self.daemon.request('turns', bot='calc.fix')['result']['turns']
         prompts = self.daemon.request('prompts', bot='calc.fix', turn=turns[0]['turn'])['result']['prompts']

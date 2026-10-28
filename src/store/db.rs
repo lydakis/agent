@@ -2244,6 +2244,45 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
+    /// Replace a bot's sandbox: its mode, the folders it may write besides
+    /// its own and whether it reaches the network. A bot another bot made
+    /// keeps no weaker a sandbox than its creator's, as when it was made.
+    /// Whether anything changed.
+    pub fn set_sandbox(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        sandbox: (Option<crate::sandbox::Mode>, Vec<String>, bool),
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let bot = self.inspect(name)?;
+        let mut settings = bot.settings;
+        (settings.sandbox, settings.writable, settings.network) = sandbox;
+        let creator = match bot.created_by_id {
+            Some(creator) => self
+                .conn
+                .query_row("SELECT settings FROM bots WHERE id=?", [creator], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .map(|text| match text {
+                    Some(text) => serde_json::from_str(&text),
+                    None => Ok(Settings::default()),
+                })
+                .transpose()?,
+            None => None,
+        };
+        if let Some(creator) = &creator {
+            settings = settings.under(creator);
+        }
+        settings.validate()?;
+        let stored = settings.stored()?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
+            params![stored, id, stored],
+        )?;
+        Ok(changed == 1)
+    }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's

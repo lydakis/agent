@@ -35,6 +35,11 @@ const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 /// would be run by git outside the sandbox, and a new `.agents` read as
 /// the project's own settings.
 const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
+/// In a git folder given as a root, so a bot may commit, what git runs
+/// stays read-only as it does under `.git`: its hooks, and the config that
+/// can name other hooks or programs. Missing hooks are kept from being
+/// made.
+const GIT_PROTECTED: [&str; 3] = ["hooks", "config", "config.worktree"];
 
 /// A folder the bot may write, and what inside it stays read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,20 +366,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             continue;
         }
         match std::fs::symlink_metadata(&kept) {
-            // A symlink the sandbox may replace can't be held read-only:
-            // whatever is mounted over its target, the link itself can be
-            // swapped for a folder of the command's own. Codex refuses it
-            // too.
-            Ok(found) if found.file_type().is_symlink() => {
-                return fail_with(
-                    "sandbox_unavailable",
-                    format!(
-                        "{} is a symlink in a folder the bot may write, so it can't be kept \
-                         read-only",
-                        kept.display()
-                    ),
-                );
-            }
+            Ok(found) if found.file_type().is_symlink() => return linked(&kept),
             Ok(found) => {
                 // A linked worktree's .git names its repository's folder for
                 // it, which stays read-only too when the root holds it.
@@ -389,6 +381,23 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             }
             Err(_) if PROTECTED_MISSING.contains(&name) => missing.push(kept),
             Err(_) => {}
+        }
+    }
+    if path.join("HEAD").is_file() {
+        for name in GIT_PROTECTED {
+            let kept = path.join(name);
+            if held(&kept) {
+                missing.push(kept);
+                continue;
+            }
+            match std::fs::symlink_metadata(&kept) {
+                Ok(found) if found.file_type().is_symlink() => return linked(&kept),
+                Ok(_) => read_only.push(kept),
+                // Only a repository's own folder runs hooks; a linked
+                // worktree's has none.
+                Err(_) if name == "hooks" && path.join("objects").is_dir() => missing.push(kept),
+                Err(_) => {}
+            }
         }
     }
     if let Some(store) = &daemon.store
@@ -413,6 +422,19 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         read_only,
         missing,
     })
+}
+
+/// A symlink the sandbox may replace can't be held read-only: whatever is
+/// mounted over its target, the link itself can be swapped for a folder of
+/// the command's own. Codex refuses it too.
+fn linked(kept: &Path) -> Result<Root> {
+    fail_with(
+        "sandbox_unavailable",
+        format!(
+            "{} is a symlink in a folder the bot may write, so it can't be kept read-only",
+            kept.display()
+        ),
+    )
 }
 
 /// The store and the files SQLite and the daemon keep beside it.
@@ -996,6 +1018,32 @@ mod tests {
             r#"{"path":"a.txt","content":""}"#,
             root
         ));
+    }
+
+    #[test]
+    fn a_git_folder_given_as_a_root_keeps_what_git_runs() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-git-{}", std::process::id()));
+        let git = base.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let git = base.join(".git");
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.can_write(&git.join("objects/ab/cdef")));
+        assert!(policy.can_write(&git.join("index.lock")));
+        assert!(!policy.can_write(&git.join("config")));
+        // Missing hooks may not be made.
+        assert!(!policy.can_write(&git.join("hooks/pre-commit")));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

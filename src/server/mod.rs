@@ -265,6 +265,12 @@ enum Command {
         /// The tools its client declares, replacing those it has; `[]`
         /// removes them.
         declare: Option<Vec<Declared>>,
+        /// Its command sandbox, replacing the one it has, as `create`'s
+        /// settings name it: with `writable` and `network`, which
+        /// otherwise go back to none and off.
+        sandbox: Option<agent_runtime::sandbox::Mode>,
+        writable: Option<Vec<String>>,
+        network: Option<bool>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -2667,10 +2673,39 @@ impl Service {
                 approver,
                 approve_expire_ms,
                 declare,
+                sandbox,
+                writable,
+                network,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
                 }
+                let sandbox = match sandbox {
+                    Some(mode) => {
+                        let mut settings = Settings {
+                            sandbox: Some(mode),
+                            writable: writable.unwrap_or_default(),
+                            network: network.unwrap_or(false),
+                            ..Settings::default()
+                        };
+                        settings.validate()?;
+                        // Checking for a sandbox and resolving folders touch
+                        // the filesystem: off the runtime thread.
+                        let settings = tokio::task::spawn_blocking(move || {
+                            confine(&mut settings).map(|()| settings)
+                        })
+                        .await
+                        .map_err(|_| Error::new("sandbox_unavailable"))??;
+                        Some((settings.sandbox, settings.writable, settings.network))
+                    }
+                    None if writable.is_some() || network.is_some() => {
+                        return fail_with(
+                            "invalid_setting",
+                            "writable and network go with sandbox",
+                        );
+                    }
+                    None => None,
+                };
                 let gate = match (&approve, &approver, approve_expire_ms) {
                     (None, None, None) => None,
                     (Some(tools), None, None) if tools.is_empty() => Some(None),
@@ -2756,6 +2791,11 @@ impl Service {
                             && db.set_declared(&bot, Some(id), declare)?
                         {
                             changed.push("declared");
+                        }
+                        if let Some(sandbox) = sandbox
+                            && db.set_sandbox(&bot, Some(id), sandbox)?
+                        {
+                            changed.push("sandbox");
                         }
 
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
