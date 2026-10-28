@@ -2,9 +2,9 @@
 //! runs them (`sonny tool NAME`), with a stand-in for the daemon's
 //! `agent`: a task gets a worktree by default and a sandfs copy when Sonny
 //! is set to, is started there with what the lead asked for, and a start
-//! that fails leaves no folder behind. The sandfs case mounts for real, so it needs what a
-//! mount needs: FUSE 3 on Linux, nothing on macOS.
-use std::os::unix::fs::PermissionsExt;
+//! that fails leaves no folder behind. Sandfs uses a cloned folder when
+//! supported, otherwise a real mount that needs FUSE 3 on Linux.
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -363,10 +363,15 @@ fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
     lab.git(&copy, &["commit", "-q", "--allow-empty", "-m", "loose"]);
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(!ok && err.contains("on HEAD"), "{err}");
-    // Left unmounted, as by a restart, it is mounted again to be checked.
+    // A real mount left unmounted, as by a restart, is mounted again to be
+    // checked. Sandfs may instead keep the copy as a cloned folder.
     let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
-    sandfs.unmount("demo.fix").unwrap();
-    assert!(!copy.join(".git").exists());
+    if std::fs::metadata(&copy).unwrap().dev()
+        != std::fs::metadata(copy.parent().unwrap()).unwrap().dev()
+    {
+        sandfs.unmount("demo.fix").unwrap();
+        assert!(!copy.join(".git").exists());
+    }
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(!ok && err.contains("on HEAD"), "{err}");
     // A tag keeps it too, as does a stash.
@@ -380,7 +385,7 @@ fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(!ok && err.contains("on stash@{0}"), "{err}");
     lab.git(&copy, &["stash", "drop", "-q"]);
-    // Unmounted, so the folder can go with the test.
+    // The clean copy can now go with the test.
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(ok, "{err}");
     assert!(sandfs.workspaces().unwrap().is_empty());
