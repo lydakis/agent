@@ -104,21 +104,18 @@ mod tests {
 
     #[test]
     fn a_shell_that_hangs_after_closing_its_output_is_stopped() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("sonny-login-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let shell = dir.join("shell");
-        std::fs::write(
+        crate::testing::script(
             &shell,
             "#!/bin/sh\nsh -c \"$4\"\nexec >/dev/null\nexec sleep 30\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let started = Instant::now();
         assert!(read(shell.as_os_str(), Duration::from_millis(300)).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
         // The same shell without the hang gives its environment.
-        std::fs::write(&shell, "#!/bin/sh\nKEY=v sh -c \"$4\"\n").unwrap();
+        crate::testing::script(&shell, "#!/bin/sh\nKEY=v sh -c \"$4\"\n");
         let environment = read(shell.as_os_str(), Duration::from_secs(10)).unwrap();
         assert!(environment.contains(&("KEY".into(), "v".into())));
         let _ = std::fs::remove_dir_all(&dir);

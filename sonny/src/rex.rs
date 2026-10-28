@@ -381,9 +381,7 @@ if out is not None:
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("rex");
-        std::fs::write(&bin, FAKE).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testing::script(&bin, FAKE);
         std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
         (bin, dir)
     }

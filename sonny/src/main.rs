@@ -43,6 +43,8 @@ mod status;
 mod table;
 mod task;
 mod term;
+#[cfg(test)]
+mod testing;
 mod transcript;
 mod trigger;
 mod user_shell;
@@ -432,10 +434,7 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
         .open(&log)
         .map_err(|e| e.to_string())?;
     let mut command = agent_command(&bin)?;
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     command
         .env("AGENT_MODEL", model)
         .arg("approver")
@@ -466,10 +465,7 @@ fn start_lookout(options: &Options) -> Result<(), String> {
     // The judge's settings and keys are in Agent's env file, as for the
     // approver.
     let mut command = agent_command(&me)?;
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    agent_client::own_session(&mut command);
     let mut child = command
         .arg("lookout")
         .arg("--store")
@@ -791,7 +787,7 @@ async fn run() -> Result<(), String> {
     // Task copies a restart unmounted are mounted again before any task
     // works in its folder.
     if project.is_some()
-        && let Some(error) = task::remount().pop()
+        && let Some(error) = task::remount(&app.options.socket).pop()
     {
         app.notice = Some(error);
     }
@@ -1142,7 +1138,7 @@ const COMMANDS: [(&str, &str); 15] = [
     ),
     (
         "/fullscreen",
-        "Sonny owns the screen (select, copy, scroll), or writes into the scrollback",
+        "full screen (the default), or inline in the terminal's scrollback",
     ),
     (
         "/copies",

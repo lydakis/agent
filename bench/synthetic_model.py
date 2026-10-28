@@ -3,7 +3,8 @@
 Replies to any prompt with a short message. `hold:` prompts block until the
 server's `release` event is set, which lets a screen park many bots on one
 anchor turn. `shell:` prompts return one shell tool call and then a reply; `wait:` prompts
-return one wait tool call on the given handles and then a reply; `delay:N`
+return one wait tool call on the given handles and then a reply; `call:NAME`
+prompts call the tool NAME with no arguments and then reply; `delay:N`
 prompts reply after N milliseconds so many turns overlap; `limited:` prompts
 are refused with 429 and a one-second Retry-After every time. A judge's
 round from `agent approver` gets every question answered 0.05.
@@ -67,6 +68,9 @@ class Model(http.server.BaseHTTPRequestHandler):
         if user.startswith('shell:') and last.get('type') != 'function_call_output':
             text, output = '', [{'type': 'function_call', 'name': 'shell', 'call_id': 'sh-1',
                                  'arguments': json.dumps({'command': user[6:], 'timeout_ms': 5000})}]
+        elif user.startswith('call:') and last.get('type') != 'function_call_output':
+            # A client's declared tool, called with no arguments.
+            text, output = '', [{'type': 'function_call', 'name': user[5:], 'call_id': 'c-1', 'arguments': '{}'}]
         elif user.startswith('bgwait:') and last.get('type') != 'function_call_output':
             # Start a background command, then park on its handle next round.
             text, output = '', [{'type': 'function_call', 'name': 'shell', 'call_id': 'bg-1',

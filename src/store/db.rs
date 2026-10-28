@@ -373,10 +373,11 @@ impl Bot {
             .facts(json!({"turn_budget_tokens":cap.tokens,"turn_tokens_used":spent})),
         )
     }
-    /// Whether a call of this tool waits for a verdict. A call the bot may
-    /// not make is refused, never announced.
+    /// Whether a call of this tool, the daemon's or a declared one, waits
+    /// for a verdict. A call the bot may not make is refused, never
+    /// announced.
     pub fn gated(&self, tool: &str) -> bool {
-        gated(&self.gates, tool) && self.callable().iter().any(|t| t == tool)
+        gated(&self.gates, tool) && self.may_call(tool)
     }
     /// The tools this bot may call: its allowed list, else its tools.
     pub fn callable(&self) -> &[String] {
@@ -602,6 +603,10 @@ pub struct Waiting {
     /// and has not started; `deadline_ms` is its gates' expiry, if any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approval: bool,
+    /// Parked on the answer to `call_id`, which has started, from the
+    /// client this tag names; `deadline_ms` is when the call stops waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
     /// What a paced summary copied of the bot's last call, so its retry
     /// sends the same request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -671,6 +676,25 @@ pub fn merge_gates<'a>(gates: impl IntoIterator<Item = &'a Gate>, tools: &[Strin
     }
     merged.retain(|g| !g.tools.is_empty());
     merged
+}
+/// The tools a gate may hold back: the daemon's a bot has and those its
+/// client declared.
+/// An answered call's result when nobody answered it in time.
+pub fn unserved(detail: String) -> Outcome {
+    Outcome {
+        output: json!({"error":"tool_unserved","detail":detail}).to_string(),
+        artifacts: Vec::new(),
+        images: Vec::new(),
+        note: None,
+        failed: true,
+    }
+}
+fn gateable(tools: &[String], declared: &[Declared]) -> Vec<String> {
+    tools
+        .iter()
+        .cloned()
+        .chain(declared.iter().map(|tool| tool.name.clone()))
+        .collect()
 }
 /// An item's top-level `type`, read without the rest of it.
 #[derive(serde::Deserialize)]
@@ -766,6 +790,10 @@ struct Live {
     /// that writes the verdicts deletes the entries, so a crash loses
     /// neither.
     answered: HashMap<i64, Vec<String>>,
+    /// Answers to the turn's answered calls, by call: the call's result,
+    /// which its `tool_finish` writes. A park writes none: it parks only
+    /// on a call with no answer held.
+    answers: HashMap<String, Outcome>,
 }
 /// One page of `approvals` as it fills.
 struct ApprovalPage {
@@ -826,6 +854,17 @@ pub enum Gated {
     Pending {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
+    },
+}
+/// What an answered call has, read on the storage worker.
+pub enum CallAnswer {
+    /// Its client's answer, or `tool_unserved` once its time ran out.
+    Given(Outcome),
+    /// Still waiting until `expires_ms`; `notify` fires when an answer is
+    /// held for the turn.
+    Pending {
+        notify: Arc<Notify>,
+        expires_ms: u64,
     },
 }
 /// A gate's decision on a call, from a client's `answer`.
@@ -1159,9 +1198,9 @@ const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
     t.cached_input_tokens,t.output_tokens,t.model_rounds,t.retries,t.paced_ms,t.started_ms,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
-    json_extract(t.waiting,'$.deadline_ms')";
+    json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer')";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 18;
+const TURN_VIEW_COLUMNS: usize = 19;
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -1189,7 +1228,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let status: String = r.get(4)?;
     let call_id: Option<String> = r.get(13)?;
     let deadline_ms: Option<i64> = r.get(17)?;
+    let answer: Option<String> = r.get(18)?;
     let waiting_on = match status.as_str() {
+        "waiting" if answer.is_some() => {
+            json!({"call_id":call_id,"answer":answer,"deadline_ms":deadline_ms})
+        }
         "waiting" if r.get::<_, Option<i64>>(14)? == Some(1) => {
             json!({"call_id":call_id,"approval":true,"deadline_ms":deadline_ms})
         }
@@ -1322,7 +1365,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 56;
+    pub const SCHEMA: i32 = 57;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1508,6 +1551,11 @@ impl Database {
             CREATE TABLE IF NOT EXISTS approval_tags(approval INTEGER NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
                 tag TEXT NOT NULL, turn INTEGER NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval,turn);
+            CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
+                call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
+                expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0);
+            CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
+            CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
@@ -2048,16 +2096,19 @@ impl Database {
     /// Replace a bot's gates, those it took from its creator or its source
     /// included: whoever configures it decides, as the person overriding a
     /// bot another bot made does. Whether anything changed.
+    /// `declared` is the set the same change declares, when it does.
     pub fn set_gate(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
         gate: Option<Gate>,
+        declared: Option<&[Declared]>,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
         if let Some(gate) = &gate {
-            not_in_tools(&gate.tools, &bot.tools)?;
+            let declared = declared.unwrap_or(&bot.declared);
+            not_in_tools(&gate.tools, &gateable(&bot.tools, declared))?;
         }
         let gates = stored_gates(gate.as_slice())?;
         let changed = self.conn.execute(
@@ -2242,22 +2293,29 @@ impl Database {
             }
             return Ok((bot, None));
         }
-        if let Some(gate) = binding.gate {
-            not_in_tools(&gate.tools, binding.tools)?;
-        }
         binding.settings.validate()?;
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
-        let inherited = Self::creator_gates(&tx, created_by_id)?;
-        let gates = stored_gates(&merge_gates(
-            inherited.iter().chain(binding.gate),
-            binding.tools,
-        ))?;
         let declared = match binding.declared {
             Some(declared) => stored_declared(declared)?,
             None => Self::creator_declared(&tx, created_by_id)?,
         };
+        // A gate may hold back the tools the bot is declared, its own or
+        // its creator's.
+        let tools = gateable(
+            binding.tools,
+            &declared
+                .as_deref()
+                .map(serde_json::from_str::<Vec<Declared>>)
+                .transpose()?
+                .unwrap_or_default(),
+        );
+        if let Some(gate) = binding.gate {
+            not_in_tools(&gate.tools, &tools)?;
+        }
+        let inherited = Self::creator_gates(&tx, created_by_id)?;
+        let gates = stored_gates(&merge_gates(inherited.iter().chain(binding.gate), &tools))?;
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
             params![
@@ -4993,7 +5051,8 @@ impl Database {
         {
             return fail("invalid_tool_state");
         }
-        let data = started(call);
+        let mut data = started(call);
+        ask(&tx, &bot, turn, call, &mut data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "tool_started", data.clone())?;
         tx.commit()?;
         Ok(entry(cursor, &bot.name, Some(turn), "tool_started", data))
@@ -5232,6 +5291,7 @@ impl Database {
             data["approvals"] = request.approvals();
             // The planning item, which holds the whole arguments.
             data["node"] = json!(node);
+            ask(&tx, &bot, turn, call, &mut data)?;
             event(&tx, &bot.name, Some(turn), "tool_started", data)?;
             tx.commit()?;
             Gated::Started
@@ -5332,6 +5392,7 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: true,
+            answer: None,
             copied: None,
             summary_retry_ms,
         };
@@ -5347,6 +5408,253 @@ impl Database {
         tx.commit()?;
         self.forget_live(turn);
         Ok(Some(deadline_ms))
+    }
+    /// An answered call's answer, held or stored, `tool_unserved` once its
+    /// time ran out, or how long it may still wait.
+    pub fn answer_take(&mut self, turn: i64, call_id: &str, now_ms: u64) -> Result<CallAnswer> {
+        if let Some(given) = self
+            .live_changed(turn)
+            .and_then(|live| live.answers.remove(call_id))
+        {
+            return Ok(CallAnswer::Given(given));
+        }
+        let (tag, expires_ms, output, failed): (String, i64, Option<String>, bool) = self
+            .conn
+            .prepare_cached(
+                "SELECT tag,expires_ms,output,failed FROM answers WHERE turn=? AND call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let expires_ms = expires_ms.max(0) as u64;
+        Ok(match output {
+            Some(output) => CallAnswer::Given(Outcome {
+                output,
+                artifacts: Vec::new(),
+                images: Vec::new(),
+                note: None,
+                failed,
+            }),
+            None if now_ms >= expires_ms => {
+                CallAnswer::Given(unserved(format!("no answer from {tag} in time")))
+            }
+            // A later call's gate that lapses ends the turn's wait, as
+            // it ends a gated call's.
+            None if self.next_lapse(turn)?.is_some_and(|at| now_ms >= at) => CallAnswer::Given(
+                unserved("a later call's gate lapsed before the answer".into()),
+            ),
+            None => CallAnswer::Pending {
+                notify: self.live.entry(turn).or_default().notify.clone(),
+                expires_ms,
+            },
+        })
+    }
+    /// Park a running turn on an answered call: its task ends and it holds
+    /// no slot. The verdicts the worker holds are written with the park.
+    /// An answer that landed as the hold ran out is taken instead: `None`
+    /// means the turn goes on. Otherwise, when to wake it: the call's
+    /// deadline, or a later gated call's lapse when that comes first.
+    pub fn suspend_answer(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        pending: &[ToolCall],
+        now_ms: u64,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<Option<u64>> {
+        let bot = self.active(turn)?;
+        if bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        if self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id))
+        {
+            return Ok(None);
+        }
+        let (tag, expires_ms): (String, i64) = self
+            .conn
+            .prepare_cached(
+                "SELECT tag,expires_ms FROM answers WHERE turn=? AND call_id=? AND output IS NULL",
+            )?
+            .query_row(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let deadline_ms = expires_ms.max(0) as u64;
+        let wake_at = self
+            .next_lapse(turn)?
+            .map_or(deadline_ms, |lapse| lapse.min(deadline_ms));
+        if now_ms >= wake_at {
+            return Ok(None);
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: call_id.to_owned(),
+            handles: Vec::new(),
+            deadline_ms: Some(deadline_ms),
+            any: false,
+            pending: pending.to_vec(),
+            paced_since_ms: None,
+            call_attempts: 0,
+            call_spent_ms: 0,
+            compaction: false,
+            route: route.map(str::to_owned),
+            approval: false,
+            answer: Some(tag.clone()),
+            copied: None,
+            summary_retry_ms,
+        };
+        let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
+        tx.execute(
+            "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":call_id,"answer":tag,"deadline_ms":deadline_ms});
+        event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+        tx.commit()?;
+        self.forget_live(turn);
+        Ok(Some(wake_at))
+    }
+    /// Record a client's answer to an answered call. A running turn's is
+    /// held by the worker and wakes its task, so its `tool_finish` is the
+    /// one commit; a parked turn's is committed now and resumes the turn.
+    pub fn answer_call(
+        &mut self,
+        bot: &str,
+        turn: i64,
+        call_id: &str,
+        outcome: Outcome,
+        now_ms: u64,
+    ) -> Result<Answered> {
+        let owner: Option<(String, String)> = self
+            .conn
+            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
+            return fail("turn_not_found");
+        };
+        let call: Option<(bool, Option<String>, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms FROM answers a
+                 LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
+                 WHERE a.turn=? AND a.call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((stored, tool, expires_ms)) = call else {
+            if !matches!(status.as_str(), "running" | "waiting") {
+                return Err(Error::with(
+                    "stale_turn",
+                    format!("turn {turn} is {status}"),
+                ));
+            }
+            return fail("no_pending_call");
+        };
+        let held = self
+            .live
+            .get(&turn)
+            .is_some_and(|live| live.answers.contains_key(call_id));
+        if stored || held {
+            return fail("call_already_answered");
+        }
+        if tool.as_deref() != Some("executing") {
+            return fail_with("no_pending_call", "the call ended unanswered");
+        }
+        // Out of time is unserved, whenever the turn gets to say so.
+        if now_ms >= expires_ms.max(0) as u64 {
+            return fail_with("no_pending_call", "the call ran out of time");
+        }
+        let reply = json!({"bot":bot,"turn":turn,"call_id":call_id});
+        match status.as_str() {
+            "running" => {
+                self.keep_live(turn);
+                let live = self.live.entry(turn).or_default();
+                live.answers.insert(call_id.to_owned(), outcome);
+                Ok(Answered {
+                    reply,
+                    notify: Some(live.notify.clone()),
+                    resume: false,
+                })
+            }
+            "waiting" => {
+                self.conn
+                    .prepare_cached(
+                        "UPDATE answers SET output=?,failed=? WHERE turn=? AND call_id=?",
+                    )?
+                    .execute(params![outcome.output, outcome.failed, turn, call_id])?;
+                let resume = self
+                    .waiting(turn)?
+                    .is_some_and(|w| w.answer.is_some() && w.call_id == call_id);
+                Ok(Answered {
+                    reply,
+                    notify: None,
+                    resume,
+                })
+            }
+            _ => Err(Error::with(
+                "stale_turn",
+                format!("turn {turn} is {status}"),
+            )),
+        }
+    }
+    /// Answered calls still waiting for the client `tag` names, oldest
+    /// first: at most `limit` and 256 KiB of them (or the one call, when it
+    /// alone is larger). `next_after` continues the listing.
+    pub fn tool_calls(&self, tag: &str, after: i64, limit: usize) -> Result<Value> {
+        if !(1..=256).contains(&limit) || after < 0 {
+            return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms FROM answers a
+             JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
+             WHERE a.tag=? AND a.id>? AND a.output IS NULL AND l.status='executing'
+               AND t.status IN ('running','waiting') ORDER BY a.id LIMIT ?",
+        )?;
+        let mut listed = Vec::new();
+        let (mut bytes, mut last, mut more, mut scanned) = (0, after, false, 0);
+        let mut rows = statement.query(params![tag, after, limit as i64 + 1])?;
+        while let Some(r) = rows.next()? {
+            scanned += 1;
+            let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
+            // An answer the worker holds is given already.
+            if self
+                .live
+                .get(&turn)
+                .is_some_and(|live| live.answers.contains_key(&call_id))
+            {
+                last = id;
+                continue;
+            }
+            let arguments: String = r.get(5)?;
+            let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+                "name":r.get::<_, String>(4)?,
+                "arguments":serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null),
+                "expires_ms":r.get::<_, i64>(6)?});
+            let size = crate::output::encoded_len(&entry)? + 1;
+            if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
+                more = true;
+                break;
+            }
+            bytes += size;
+            last = id;
+            listed.push(entry);
+        }
+        // Held answers skipped took rows the page did not fill: there may
+        // be more past the last one read.
+        more |= scanned > limit;
+        Ok(json!({"calls":listed,"next_after":more.then_some(last)}))
     }
     /// Record one gate's verdict on the current request of a planned call.
     /// A running turn's verdict is held by the worker and wakes its task;
@@ -6116,6 +6424,9 @@ impl Database {
             true => 0,
             false => tx.execute("DELETE FROM approvals WHERE turn=?", [turn])? as i64,
         };
+        if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
+            tx.execute("DELETE FROM answers WHERE turn=?", [turn])?;
+        }
         let code = error.map(|e| e.code.as_str());
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down around the turn, a daemon that died with it running, or a
@@ -6209,6 +6520,7 @@ impl Database {
             compaction: false,
             route: route.map(str::to_owned),
             approval: false,
+            answer: None,
             copied: None,
             summary_retry_ms,
         };
@@ -6262,6 +6574,7 @@ impl Database {
             compaction,
             route: route.map(str::to_owned),
             approval: false,
+            answer: None,
             copied,
             summary_retry_ms,
         };
@@ -6307,6 +6620,40 @@ impl Database {
     /// since the lapse ends the turn. Otherwise it answers when to look
     /// again: a partial verdict can move a call's lapse later.
     pub fn wake(&self, name: &str, turn: i64, due: bool) -> Result<Wake> {
+        let parked: Option<(Option<bool>, String, Option<String>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT json_extract(t.waiting,'$.approval'),b.status,json_extract(t.waiting,'$.call_id')
+                 FROM bots b JOIN turns t ON t.id=b.running_turn
+                 WHERE b.name=? AND b.status IN ('waiting','paced') AND b.running_turn=?
+                   AND json_extract(t.waiting,'$.answer') IS NOT NULL",
+            )?
+            .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let now = epoch_ms().max(0) as u64;
+        // Parked on an answer: the answer, its deadline, or a later gated
+        // call's lapse resumes it.
+        if let Some((_, _, Some(call_id))) = parked {
+            let answer: Option<(bool, i64)> = self
+                .conn
+                .prepare_cached(
+                    "SELECT output IS NOT NULL,expires_ms FROM answers WHERE turn=? AND call_id=?",
+                )?
+                .query_row(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((answered, expires_ms)) = answer else {
+                return Ok(Wake::Resume);
+            };
+            let at = self
+                .next_lapse(turn)?
+                .map_or(expires_ms.max(0) as u64, |lapse| {
+                    lapse.min(expires_ms.max(0) as u64)
+                });
+            return Ok(match answered || now >= at {
+                true => Wake::Resume,
+                false => Wake::Later(Some(at)),
+            });
+        }
         let parked: Option<(Option<bool>, String)> = self
             .conn
             .prepare_cached(
@@ -6315,7 +6662,6 @@ impl Database {
             )?
             .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let now = epoch_ms().max(0) as u64;
         Ok(match parked {
             None => Wake::Stale,
             // Parked on a verdict: an answer that decided the call, or the
@@ -6733,8 +7079,9 @@ impl Database {
         let parent = self.inspect(source)?;
         // A fork starts where its source is unless told otherwise.
         let workspace = workspace.or(parent.workspace.as_deref());
+        let tools = gateable(&parent.tools, &parent.declared);
         if let Some(gate) = gate {
-            not_in_tools(&gate.tools, &parent.tools)?;
+            not_in_tools(&gate.tools, &tools)?;
         }
         // A fork never widens what its source may call.
         let allowed = match allow {
@@ -6807,7 +7154,7 @@ impl Database {
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(
             parent.gates.iter().chain(&inherited).chain(gate),
-            &parent.tools,
+            &tools,
         ))?;
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -7879,6 +8226,36 @@ fn started(call: &ToolCall) -> Value {
     let preview: String = call.arguments.chars().take(2048).collect();
     json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
         "arguments_truncated":preview.len() < call.arguments.len()})
+}
+/// In an answered call's start, note it as waiting for its client, and
+/// name that client and the call's deadline in `tool_started`. A call
+/// whose arguments do not fit is refused at once, so it waits for none.
+fn ask(tx: &Connection, bot: &Bot, turn: i64, call: &ToolCall, data: &mut Value) -> Result<()> {
+    let Some(tool) = bot.declared(&call.name) else {
+        return Ok(());
+    };
+    let (Some(tag), Some(expires_ms)) =
+        (&tool.answered_by, tool.answer_by(epoch_ms().max(0) as u64))
+    else {
+        return Ok(());
+    };
+    if crate::tools::check_declared(tool, &call.arguments).is_err() {
+        return Ok(());
+    }
+    tx.prepare_cached(
+        "INSERT INTO answers(turn,call_id,tag,name,arguments,expires_ms) VALUES (?,?,?,?,?,?)",
+    )?
+    .execute(params![
+        turn,
+        call.call_id,
+        tag,
+        call.name,
+        call.arguments,
+        expires_ms as i64
+    ])?;
+    data["answered_by"] = json!(tag);
+    data["expires_ms"] = json!(expires_ms);
+    Ok(())
 }
 /// A denied call's result, in the one commit a finished call makes. The
 /// daemon writes the code; the reason is the approver's.
@@ -9125,12 +9502,14 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     if from < 54 {
         migrate_denial_windows(conn)?;
     }
+    // 54 -> 55: calls waiting for a client's answer, in a table the schema
+    // creates; no declared tool had a client that answers it.
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='images')",
         [],
         |r| r.get::<_, bool>(0),
     )? {
-        // 54 -> 55: a prompt may come with pictures. None did.
+        // 55 -> 56: a prompt may come with pictures. None did.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN images TEXT;")?;
     }
     if !conn.query_row(
@@ -9138,7 +9517,7 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         [],
         |r| r.get::<_, bool>(0),
     )? {
-        // 55 -> 56: a picture counts at its weight. Older nodes count theirs
+        // 56 -> 57: a picture counts at its weight. Older nodes count theirs
         // at its size, which `total_bytes` already holds.
         conn.execute_batch("ALTER TABLE nodes ADD COLUMN pictured INTEGER NOT NULL DEFAULT 0;")?;
     }

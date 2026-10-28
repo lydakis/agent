@@ -17,8 +17,8 @@ use agent_runtime::{
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     store::{
-        Bot, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip,
-        TURN_VIEW_ACCOUNTING, Waiting, Window,
+        Bot, CallAnswer, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip,
+        TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
@@ -380,6 +380,9 @@ enum Round {
     /// Parked on a verdict whose gate lapses at the given time.
     Lapses(u64),
 }
+/// How long an answered call holds its turn's slot for the answer before
+/// it parks, at most: the bot's approval hold, when that is shorter.
+const ANSWER_HOLD_MS: u64 = 250;
 /// Why a round's calls stopped before the last one ran: the turn parked,
 /// on handles or a verdict, and is resumed by the service.
 enum Stop {
@@ -1977,8 +1980,27 @@ impl Turn {
                 copied = waiting.copied.clone().filter(|_| waiting.compaction);
             } else {
                 // A verdict park resumes at its gated call, which has not
-                // started; a wait park first records the wait's result.
-                if !waiting.approval {
+                // started; an answer park first records the answer, and a
+                // wait park the wait's result.
+                if waiting.answer.is_some() {
+                    let id = waiting.call_id.clone();
+                    let outcome = match self
+                        .store
+                        .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
+                        .await?
+                    {
+                        CallAnswer::Given(outcome) => outcome,
+                        // Woken by a later gated call's lapse, which ends
+                        // the turn: the call ends unanswered.
+                        CallAnswer::Pending { .. } => {
+                            unserved("a later call's gate lapsed before the answer".into())
+                        }
+                    };
+                    let id = waiting.call_id.clone();
+                    self.store
+                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .await?;
+                } else if !waiting.approval {
                     // A later call's lapse can wake the wait before its
                     // handles resolve: those are reported pending, as the
                     // wait's own timeout reports them.
@@ -3323,8 +3345,19 @@ impl Turn {
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
             };
+            let answered = record
+                .declared(&call.name)
+                .is_some_and(|tool| tool.answered_by.is_some());
             let outcome = match prepared {
-                // A declared tool runs nothing: its meaning is its client's.
+                // A declared tool runs nothing: its meaning is its client's,
+                // and so is its answer, when its client gives one.
+                Ok(Prepared::Declared(_)) if answered => match self
+                    .await_answer(&call.call_id, &mut calls, route, summary_retry_ms)
+                    .await?
+                {
+                    ControlFlow::Continue(outcome) => outcome,
+                    ControlFlow::Break(stop) => return Ok(Some(stop)),
+                },
                 Ok(Prepared::Declared(result)) => Outcome::text(result),
                 Ok(Prepared::Wait {
                     handles,
@@ -3587,6 +3620,68 @@ impl Turn {
                 None => continue,
                 Some(Some(at)) => return Ok(Approval::Stop(Stop::Lapses(at))),
                 Some(None) => return Ok(Approval::Stop(Stop::Parked)),
+            }
+        }
+    }
+
+    /// Wait for an answered call's answer: live for the hold, then parked
+    /// like `wait`, holding no task and no slot, until the answer comes or
+    /// the call's time runs out. Answers wake the task through the worker,
+    /// so each check is one job and no commit.
+    async fn await_answer(
+        &self,
+        call_id: &str,
+        calls: &mut std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+        summary_retry_ms: Option<u64>,
+    ) -> Result<ControlFlow<Stop, Outcome>> {
+        let turn = self.turn;
+        // A client that answers is a program, near at hand: a short hold
+        // takes its answer live, and a slower one parks without the slot.
+        let hold = tokio::time::Instant::now()
+            + Duration::from_millis(self.settings().approval_hold_ms().min(ANSWER_HOLD_MS));
+        loop {
+            let id = call_id.to_owned();
+            let (notify, expires_ms) = match self
+                .store
+                .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
+                .await?
+            {
+                CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(outcome)),
+                CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
+            };
+            let lapse = tokio::time::Instant::now()
+                + Duration::from_millis(expires_ms.saturating_sub(now_ms()));
+            let wake = lapse.min(hold);
+            if tokio::time::Instant::now() < wake {
+                tokio::select! {
+                    () = notify.notified() => continue,
+                    () = tokio::time::sleep_until(wake) => {}
+                }
+            }
+            // A call out of time is answered by the next check.
+            if tokio::time::Instant::now() >= lapse {
+                continue;
+            }
+            let pending: Vec<ToolCall> = calls.as_slice().to_vec();
+            let (id, route) = (call_id.to_owned(), route.map(str::to_owned));
+            match self
+                .store
+                .op("suspend_answer", move |db| {
+                    db.suspend_answer(
+                        turn,
+                        &id,
+                        &pending,
+                        now_ms(),
+                        route.as_deref(),
+                        summary_retry_ms,
+                    )
+                })
+                .await?
+            {
+                // An answer landed as the hold ran out.
+                None => continue,
+                Some(at) => return Ok(ControlFlow::Break(Stop::Lapses(at))),
             }
         }
     }
