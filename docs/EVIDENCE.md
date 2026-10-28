@@ -133,11 +133,12 @@ more turns is not here, because its work changes with its speed; it is under
   Because every call should run, this says nothing about false allows.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
-  64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB
-  and 24.9 s, opencode 927 MiB and 14.4 s, Claude Code 6,494 MiB and 23.8 s.
-  Exploratory, not a ranking: the harnesses do unequal work. Linux VM,
-  `8ebbc44`, 2026-09-23, before group commit and before macOS full flushing;
-  not rerun since. [Record](HARNESS_MEASUREMENTS.md).
+  64 KiB: Agent 28.7 MiB peak and 0.69 s CPU, Pi 159 MiB and 1.9 s, Codex
+  246 MiB and 40.1 s, opencode 958 MiB and 24.7 s, Claude Code 6,490 MiB and
+  42.4 s. Exploratory, not a ranking: the harnesses do unequal work, and
+  Codex and Claude Code did not reach 32 concurrent streams on this host.
+  Linux VM, Agent 0.4.1 (main `3a9f7df`), 2026-10-28.
+  [Record](HARNESS_MEASUREMENTS.md).
 - **Pi Durable on the durable lifecycle.** 32 named conversations, three
   turns each, both engines syncing every commit (`synchronous=FULL`, which
   the adapter sets; Pi's default is NORMAL): text turns took Agent 22.1 MiB
