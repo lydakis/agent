@@ -1141,9 +1141,9 @@ struct Live {
 }
 
 impl Live {
-    fn new(gap: bool) -> Self {
+    fn new(gap: bool, workspace: &str) -> Self {
         Live {
-            markdown: Markdown::default(),
+            markdown: Markdown::in_folder(std::path::Path::new(workspace)),
             partial: String::new(),
             lines: 0,
             rows: Vec::new(),
@@ -3080,7 +3080,11 @@ impl App {
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let mut lines = transcript::reply(&reply, self.prose());
+                            let mut lines = transcript::reply(
+                                &reply,
+                                self.prose(),
+                                std::path::Path::new(&self.workspace),
+                            );
                             lines.extend(self.reacted_row(node));
                             said = Some(lines);
                             self.saw_reply(node, &reply);
@@ -3534,7 +3538,7 @@ impl App {
                         if let Some(closed) = closed {
                             self.write_words(closed, Words::Reply);
                         }
-                        Live::new(self.any_history)
+                        Live::new(self.any_history, &self.workspace)
                     }
                 };
                 live.partial.push_str(delta);
@@ -3587,8 +3591,12 @@ impl App {
                     self.close_live();
                 } else if let Some(item) = &item {
                     self.end_live(Words::Reply);
-                    let mut live = Live::new(self.any_history);
-                    let rows = transcript::reply(&text(item), self.prose());
+                    let mut live = Live::new(self.any_history, &self.workspace);
+                    let rows = transcript::reply(
+                        &text(item),
+                        self.prose(),
+                        std::path::Path::new(&self.workspace),
+                    );
                     self.live_rows(&mut live, rows);
                     live.closed = true;
                     self.live = Some(live);
@@ -4770,8 +4778,8 @@ impl App {
     fn follow(&mut self, link: &str) {
         if link.starts_with("file://") {
             let workspace = std::path::Path::new(&self.workspace);
-            let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
-            match pane::Pane::preview(link, workspace, width) {
+            let width = pane::width(self.full_width, PROSE as u16).clamp(20, PROSE as u16);
+            match pane::Pane::preview(link, workspace, width as usize) {
                 Ok(pane) => self.open_pane(pane),
                 Err(error) => self.notice = Some(error),
             }

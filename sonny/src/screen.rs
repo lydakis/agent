@@ -533,7 +533,10 @@ impl Screen {
         for (y, from, to, _) in &self.links {
             for x in *from..*to {
                 let cell = &mut buf[(x, *y)];
-                cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+                // A picture is not underlined: the line would cross it.
+                if !cell.symbol().starts_with(crate::image::PLACEHOLDER) {
+                    cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+                }
             }
         }
         if let Some(finding) = &self.finding
@@ -690,6 +693,21 @@ impl Screen {
             links.retain(|link| link.0 != y);
             if from < to {
                 links.push((y, drawn.x + from as u16, drawn.x + to as u16, url.clone()));
+            }
+        }
+        // A picture opens what it was drawn from, bigger, in the pane.
+        for row in top..bottom {
+            let y = drawn.y + (row - top) as u16;
+            let mut x = 0;
+            for span in &self.shown[row].line.spans {
+                let width = span.width();
+                if let Some(url) = crate::image::id(span).and_then(crate::image::source) {
+                    let to = (x + width).min(drawn.width as usize);
+                    if x < to {
+                        links.push((y, drawn.x + x as u16, drawn.x + to as u16, url));
+                    }
+                }
+                x += width;
             }
         }
         links
@@ -1008,6 +1026,24 @@ mod tests {
         (screen, buf)
     }
 
+    #[test]
+    fn a_click_on_a_picture_opens_what_it_was_drawn_from() {
+        let rows = crate::image::linked_rows(0x00FD_0001, 4, 2, "file:///w/a.mmd");
+        let (mut screen, mut buf) = screen(rows, 20, 4);
+        screen.render(Rect::new(0, 0, 20, 4), &mut buf, |_| None);
+        // Not underlined: a line would cross the picture.
+        assert!(!buf[(3, 0)].modifier.contains(Modifier::UNDERLINED));
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        let opened = screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 1));
+        assert_eq!(opened, Some(Action::Open("file:///w/a.mmd".into())));
+        // Its lead is no part of it.
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 1));
+        assert_eq!(
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 1)),
+            None
+        );
+    }
+
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
@@ -1036,6 +1072,7 @@ mod tests {
         let reply = crate::transcript::reply(
             "The stub answers after the 2s timeout, so the test reads an empty cart.",
             30,
+            std::path::Path::new("."),
         );
         let (mut screen, buf) = screen(reply, 30, 10);
         assert!(row(&buf, 1).starts_with("  "), "{:?}", row(&buf, 1));
@@ -1146,7 +1183,7 @@ mod tests {
     #[test]
     fn a_wider_screen_joins_the_rows_a_line_was_wrapped_onto() {
         let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
-        let reply = crate::transcript::reply(text, 30);
+        let reply = crate::transcript::reply(text, 30, std::path::Path::new("."));
         assert!(reply.len() > 2);
         let (screen, buf) = screen(reply, 80, 5);
         assert_eq!(screen.shown.len(), 1);
@@ -1212,7 +1249,7 @@ mod tests {
     #[test]
     fn a_reply_wrapped_again_copies_without_its_bullet() {
         let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
-        let reply = crate::transcript::reply(text, 80);
+        let reply = crate::transcript::reply(text, 80, std::path::Path::new("."));
         assert_eq!(reply.len(), 1);
         let (mut screen, _) = screen(reply, 30, 10);
         let last = screen.shown.len() as u16 - 1;
@@ -1311,7 +1348,7 @@ mod tests {
     #[test]
     fn find_reads_a_line_whole_over_its_rows() {
         let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
-        let reply = crate::transcript::reply(text, 80);
+        let reply = crate::transcript::reply(text, 80, std::path::Path::new("."));
         let (mut screen, _) = screen(reply, 30, 10);
         screen.find("test reads an");
         assert_eq!(screen.found(), Some((1, 1)));

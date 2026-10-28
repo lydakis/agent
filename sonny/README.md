@@ -429,7 +429,11 @@ wrapped over rows comes back as one line, without the bullets and indents
 Sonny drew around it. A click on a web link opens it in the browser, and
 a click on a file opens it in a pane beside the conversation: code in
 syntax colors with its line numbers, at the line the link names
-(`src/main.rs:120`), and Markdown as replies read. The pane scrolls,
+(`src/main.rs:120`), Markdown as replies read, with its pictures and
+the HTML a README is written with, and a picture, SVG, Mermaid file or
+HTML page drawn as it looks. A file reads at the 100 columns the
+conversation is written at. A click on a picture, diagram or page in the
+conversation opens it in the pane, bigger. The pane scrolls,
 selects and copies as the conversation does; a click on its name opens
 the file in the app the system opens it with, and Esc closes it. Links
 are the terminal's own links too, so its link click (Cmd+click, or
@@ -448,6 +452,16 @@ the choice is kept with the other settings.
 ![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)
 
 ![README.md beside the chat, read as a reply: headings, a list, a table and a Python block in color](../docs/sonny/pane-markdown.png)
+
+![A README beside the chat with its logo, a screenshot and a badge's words, from Markdown and HTML pictures](../docs/sonny/pane-readme-pictures.png)
+
+![The same README further down: its Mermaid diagram drawn, and a details block with its summary, code and keys](../docs/sonny/pane-readme-html.png)
+
+![A Mermaid diagram clicked in the conversation, drawn across the pane](../docs/sonny/pane-mermaid.png)
+
+![An HTML page clicked in the conversation, drawn in the pane](../docs/sonny/pane-html.png)
+
+![A screenshot the agent named in its reply, drawn in the conversation](../docs/sonny/chat-picture.png)
 
 ![/status beside the conversation, its times still counting](../docs/sonny/pane-status.png)
 

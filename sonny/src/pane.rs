@@ -221,6 +221,14 @@ impl Pane {
                 program.render(rows, buf)
             }
             None => {
+                // A file reads at the width the conversation is written at.
+                let rows = match self.link.is_some() {
+                    true => Rect {
+                        width: rows.width.min(crate::PROSE as u16),
+                        ..rows
+                    },
+                    false => rows,
+                };
                 self.screen.render(rows, buf, file);
                 None
             }
@@ -283,14 +291,29 @@ fn preview(
         return Ok(0);
     }
     let size = meta.len();
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        let shown = match crate::term::graphics() {
+            true => crate::image::file(path, width, crate::image::tall())
+                .and_then(|drawn| crate::image::show(&drawn)),
+            false => Err("this terminal draws no pictures (Kitty and Ghostty do)".into()),
+        };
+        match shown {
+            Ok(rows) => screen.push(rows),
+            Err(error) => screen.push(vec![note(&format!(
+                "a picture, {}: {error}; click its name to open it",
+                bytes_said(size)
+            ))]),
+        }
+        return Ok(0);
+    }
     let mut bytes = Vec::new();
     use std::io::Read;
     std::fs::File::open(path)
         .and_then(|f| f.take(MOST_BYTES).read_to_end(&mut bytes))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let extension = (path.extension().and_then(|e| e.to_str()))
-        .unwrap_or_default()
-        .to_lowercase();
     let text = match String::from_utf8(bytes) {
         Ok(text) if !text.contains('\0') => text,
         // Cut in the middle of a character at the end of what was read.
@@ -308,20 +331,45 @@ fn preview(
             return Ok(0);
         }
     };
-    // Drawn only where pictures can be; elsewhere, its source.
-    if extension == "svg"
-        && crate::term::graphics()
-        && let Ok(rows) = crate::image::render(&text, width).and_then(|d| crate::image::show(&d))
-    {
-        screen.push(rows);
-        return Ok(0);
+    // Drawn only where pictures can be, as tall as the pane; elsewhere,
+    // or when it cannot be drawn, its source, and why.
+    if line.is_none() && crate::term::graphics() {
+        let drawn =
+            match extension.as_str() {
+                "svg" => Some(crate::image::render_in(
+                    &text,
+                    width,
+                    crate::image::tall(),
+                    true,
+                )),
+                "mmd" | "mermaid" => Some(crate::mermaid::svg(&text).and_then(|svg| {
+                    crate::image::render_in(&svg, width, crate::image::tall(), true)
+                })),
+                "html" | "htm" => Some(
+                    crate::html::render(path, crate::image::page_width(width))
+                        .and_then(|png| crate::image::page_in(&png, width, crate::image::tall())),
+                ),
+                _ => None,
+            };
+        match drawn.map(|drawn| drawn.and_then(|drawn| crate::image::show(&drawn))) {
+            Some(Ok(rows)) => {
+                screen.push(rows);
+                return Ok(0);
+            }
+            Some(Err(error)) => screen.push(vec![
+                note(&format!("could not draw it: {error}")),
+                Line::default(),
+            ]),
+            None => {}
+        }
     }
     let lines: Vec<&str> = text.lines().collect();
     let shown = lines.len().min(MOST_LINES);
     let target = line.map(|line| line.saturating_sub(1).min(shown.saturating_sub(1)));
     let mut first_row = 0;
     if matches!(extension.as_str(), "md" | "markdown" | "mdx") && line.is_none() {
-        let mut markdown = crate::transcript::Markdown::default();
+        let folder = path.parent().unwrap_or(Path::new("/"));
+        let mut markdown = crate::transcript::Markdown::document(folder);
         let mut rows = Vec::new();
         for text in &lines[..shown] {
             rows.extend(markdown.feed(text, width, false));
@@ -570,6 +618,38 @@ mod tests {
         let shown = rows(&mut pane, 20, 4);
         assert_eq!(shown[2], " 1  one two three");
         assert_eq!(shown[3], "    four five six");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_reads_at_the_conversations_width_in_a_wide_pane() {
+        let dir = std::env::temp_dir().join(format!("sonny-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, format!("{}\n", "word ".repeat(60))).unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 100).unwrap();
+        let shown = rows(&mut pane, 150, 5);
+        // The title spans the pane; the file's rows stop at 100 columns.
+        assert!(shown[0].ends_with("esc closes"), "{shown:?}");
+        assert!(shown[2].width() <= crate::PROSE, "{}", shown[2].width());
+        assert!(shown[3].starts_with("    word"), "{shown:?}");
+        // A card is not a file, and keeps the pane's width.
+        let mut card = Pane::card("/status", "esc closes");
+        card.set_card(vec![Line::from("x".repeat(140))], "esc closes");
+        assert_eq!(rows(&mut card, 150, 3)[2].width(), 140);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_picture_file_says_what_it_is_where_none_are_drawn() {
+        let dir = std::env::temp_dir().join(format!("sonny-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shot.png");
+        image::RgbaImage::new(4, 4).save(&file).unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 60).unwrap();
+        let shown = rows(&mut pane, 60, 3);
+        assert!(shown[2].starts_with(" a picture, "), "{shown:?}");
+        assert!(shown[2].contains("draws no pictures"), "{shown:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

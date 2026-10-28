@@ -8,12 +8,13 @@ use ratatui::{
 };
 use resvg::{tiny_skia, usvg};
 use std::{
+    collections::HashMap,
     io::Write,
-    sync::{Arc, OnceLock, atomic::AtomicU32, atomic::Ordering},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicU32, atomic::Ordering},
 };
 
 /// The most rows a picture takes.
-const ROWS: u32 = 30;
+pub const ROWS: u32 = 30;
 /// A cell this tall or more is in a Retina screen's own pixels, and the
 /// image is drawn at its size; a shorter one (8×16 is what Rex answers
 /// before it lays a block out) is drawn at twice it, to stay sharp. A
@@ -21,8 +22,9 @@ const ROWS: u32 = 30;
 const RETINA_CELL: u32 = 24;
 
 /// The diacritics that number a placeholder's row and column, from the
-/// Kitty protocol's table (rowcolumn-diacritics.txt), first 64 of 297.
-const DIACRITICS: [char; 64] = [
+/// Kitty protocol's table (rowcolumn-diacritics.txt), first 128 of 297:
+/// a picture as wide as the conversation's prose, or a pane's.
+const DIACRITICS: [char; 128] = [
     '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
     '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
     '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
@@ -31,6 +33,14 @@ const DIACRITICS: [char; 64] = [
     '\u{0598}', '\u{0599}', '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}',
     '\u{05A8}', '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}', '\u{0610}', '\u{0611}',
     '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
+    '\u{0659}', '\u{065A}', '\u{065B}', '\u{065D}', '\u{065E}', '\u{06D6}', '\u{06D7}', '\u{06D8}',
+    '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}', '\u{06E0}', '\u{06E1}', '\u{06E2}',
+    '\u{06E4}', '\u{06E7}', '\u{06E8}', '\u{06EB}', '\u{06EC}', '\u{0730}', '\u{0732}', '\u{0733}',
+    '\u{0735}', '\u{0736}', '\u{073A}', '\u{073D}', '\u{073F}', '\u{0740}', '\u{0741}', '\u{0743}',
+    '\u{0745}', '\u{0747}', '\u{0749}', '\u{074A}', '\u{07EB}', '\u{07EC}', '\u{07ED}', '\u{07EE}',
+    '\u{07EF}', '\u{07F0}', '\u{07F1}', '\u{07F3}', '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}',
+    '\u{081B}', '\u{081C}', '\u{081D}', '\u{081E}', '\u{081F}', '\u{0820}', '\u{0821}', '\u{0822}',
+    '\u{0823}', '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082A}', '\u{082B}', '\u{082C}',
 ];
 
 pub const PLACEHOLDER: char = '\u{10EEEE}';
@@ -78,6 +88,122 @@ pub fn show(drawn: &Drawn) -> Result<Vec<Line<'static>>, String> {
     Ok(placeholders(id, drawn.cols, drawn.rows))
 }
 
+/// What a picture shown with [`show_linked`] opens, by its image id.
+static SOURCES: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
+
+/// [`show`], a click on the picture opening `url`: the file it was drawn
+/// from, shown bigger in the pane.
+pub fn show_linked(drawn: &Drawn, url: Option<String>) -> Result<Vec<Line<'static>>, String> {
+    let rows = show(drawn)?;
+    if let (Some(url), Some(id)) = (url, rows.first().and_then(|row| id(row.spans.get(1)?))) {
+        let mut sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+        sources.get_or_insert_with(HashMap::new).insert(id, url);
+    }
+    Ok(rows)
+}
+
+/// The image a span of placeholder cells shows, by the id its colour
+/// carries.
+pub fn id(span: &Span) -> Option<u32> {
+    match (span.content.starts_with(PLACEHOLDER), span.style.fg) {
+        (true, Some(Color::Rgb(r, g, b))) => Some(u32::from_be_bytes([0, r, g, b])),
+        _ => None,
+    }
+}
+
+/// The rows a picture `id` of `cols`×`rows` cells is shown in, opening
+/// `url`, as [`show_linked`] leaves them, nothing sent.
+#[cfg(test)]
+pub fn linked_rows(id: u32, cols: u32, rows: u32, url: &str) -> Vec<Line<'static>> {
+    let mut sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    sources
+        .get_or_insert_with(HashMap::new)
+        .insert(id, url.to_owned());
+    placeholders(id, cols, rows)
+}
+
+/// What a click on the picture `id` opens, if it was shown with one.
+pub fn source(id: u32) -> Option<String> {
+    let sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    sources.as_ref()?.get(&id).cloned()
+}
+
+/// The most rows a picture takes shown on its own in the pane: the
+/// window's height less the pane's title and a row or two around it.
+pub fn tall() -> u32 {
+    let rows = ratatui::crossterm::terminal::size().map_or(ROWS, |(_, rows)| rows as u32);
+    rows.saturating_sub(6).clamp(ROWS, DIACRITICS.len() as u32)
+}
+
+/// The most of a picture file read.
+const MOST_BYTES: u64 = 64 << 20;
+/// The most pixels a side of a picture file may have to be read.
+const MOST_SIDE: u32 = 16_384;
+
+/// A PNG, JPEG, GIF (its first frame) or WebP file drawn at its own size
+/// when it fits, else as wide as `width` allows and at most `most_rows`
+/// tall.
+pub fn file(path: &std::path::Path, width: usize, most_rows: u32) -> Result<Drawn, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MOST_BYTES).read_to_end(&mut bytes))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    raster(&bytes, width, most_rows)
+}
+
+/// [`file`], from the file's bytes.
+pub fn raster(bytes: &[u8], width: usize, most_rows: u32) -> Result<Drawn, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MOST_SIDE);
+    limits.max_image_height = Some(MOST_SIDE);
+    reader.limits(limits);
+    let picture = reader.decode().map_err(|e| e.to_string())?.into_rgba8();
+    let (w, h) = picture.dimensions();
+    if w == 0 || h == 0 {
+        return Err("an empty picture".into());
+    }
+    let (cell_w, cell_h) = crate::term::cell();
+    let (cols, rows) = fit_in(
+        w as f32,
+        h as f32,
+        (cell_w, cell_h),
+        now(width),
+        most_rows,
+        false,
+    );
+    // As many pixels as the cells hold at the scale they are drawn, and
+    // never more than the picture has.
+    let up = up(cell_h);
+    let (room_w, room_h) = (cols * cell_w * up, rows * cell_h * up);
+    let scale = (room_w as f32 / w as f32)
+        .min(room_h as f32 / h as f32)
+        .min(1.0);
+    let (to_w, to_h) = (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    );
+    let picture = match (to_w, to_h) == (w, h) {
+        true => picture,
+        false => {
+            image::imageops::resize(&picture, to_w, to_h, image::imageops::FilterType::Triangle)
+        }
+    };
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(picture)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(Drawn {
+        png,
+        cols,
+        rows,
+        cut: false,
+    })
+}
+
 /// The pane's width as it is now, should it have narrowed since `width`
 /// was read: a picture wider than its pane wraps into nonsense.
 pub fn now(width: usize) -> usize {
@@ -101,6 +227,11 @@ pub fn page_width(width: usize) -> u32 {
 /// and drawn at its own size: as wide as it is, and its top [`ROWS`] rows
 /// when it is longer. Says whether it was cut.
 pub fn page(png: &[u8], width: usize) -> Result<Drawn, String> {
+    page_in(png, width, ROWS)
+}
+
+/// [`page`], at most `most_rows` tall.
+pub fn page_in(png: &[u8], width: usize, most_rows: u32) -> Result<Drawn, String> {
     let width = now(width);
     let shot = tiny_skia::Pixmap::decode_png(png).map_err(|e| e.to_string())?;
     let (w, h) = trimmed(&shot);
@@ -111,8 +242,7 @@ pub fn page(png: &[u8], width: usize) -> Result<Drawn, String> {
     let scale = (cols * cw) as f32 / w as f32;
     let scale = scale.min(1.0);
     let tall = ((h as f32 * scale) as u32).div_ceil(ch).max(1);
-    let most_rows = ROWS.min(DIACRITICS.len() as u32);
-    let rows = tall.min(most_rows);
+    let rows = tall.min(most_rows.min(DIACRITICS.len() as u32));
     let mut canvas = tiny_skia::Pixmap::new(cols * cw, rows * ch).ok_or("image too large")?;
     canvas.draw_pixmap(
         0,
@@ -155,6 +285,12 @@ fn trimmed(shot: &tiny_skia::Pixmap) -> (u32, u32) {
 
 /// The SVG as a PNG that fills `cols`×`rows` cells.
 pub fn render(text: &str, width: usize) -> Result<Drawn, String> {
+    render_in(text, width, ROWS, false)
+}
+
+/// [`render`], at most `most_rows` tall; with `grow`, as large as that
+/// and `width` let it be, as a drawing is shown on its own in the pane.
+pub fn render_in(text: &str, width: usize, most_rows: u32, grow: bool) -> Result<Drawn, String> {
     let width = now(width);
     let mut options = usvg::Options {
         fontdb: fonts(),
@@ -164,7 +300,14 @@ pub fn render(text: &str, width: usize) -> Result<Drawn, String> {
     let tree = usvg::Tree::from_str(text, &options).map_err(|e| e.to_string())?;
     let size = tree.size();
     let (cell_w, cell_h) = crate::term::cell();
-    let (cols, rows) = fit(size.width(), size.height(), (cell_w, cell_h), width);
+    let (cols, rows) = fit_in(
+        size.width(),
+        size.height(),
+        (cell_w, cell_h),
+        width,
+        most_rows,
+        grow,
+    );
     let up = up(cell_h);
     let (px_w, px_h) = (cols * cell_w * up, rows * cell_h * up);
     let mut pixmap = tiny_skia::Pixmap::new(px_w, px_h).ok_or("image too large")?;
@@ -186,12 +329,29 @@ pub fn render(text: &str, width: usize) -> Result<Drawn, String> {
 
 /// Cells for a picture of `w`×`h` pixels: its own size when it fits, else
 /// as wide as the pane allows, and no more than [`ROWS`] tall.
-fn fit(w: f32, h: f32, (cell_w, cell_h): (u32, u32), width: usize) -> (u32, u32) {
-    let most_cols = (width.saturating_sub(4) as u32).clamp(1, DIACRITICS.len() as u32 * 4);
-    let most_cols = most_cols.min(DIACRITICS.len() as u32);
-    let mut cols = ((w / cell_w as f32).ceil() as u32).clamp(1, most_cols);
+#[cfg(test)]
+fn fit(w: f32, h: f32, cell: (u32, u32), width: usize) -> (u32, u32) {
+    fit_in(w, h, cell, width, ROWS, false)
+}
+
+/// [`fit`], at most `most_rows` tall.
+fn fit_in(
+    w: f32,
+    h: f32,
+    (cell_w, cell_h): (u32, u32),
+    width: usize,
+    most_rows: u32,
+    grow: bool,
+) -> (u32, u32) {
+    let most_cols = (width.saturating_sub(4) as u32).clamp(1, DIACRITICS.len() as u32);
+    let own = (w / cell_w as f32).ceil() as u32;
+    let mut cols = if grow {
+        most_cols
+    } else {
+        own.clamp(1, most_cols)
+    };
     let mut rows = ((cols * cell_w) as f32 * h / w / cell_h as f32).ceil() as u32;
-    let most_rows = ROWS.min(DIACRITICS.len() as u32);
+    let most_rows = most_rows.clamp(1, DIACRITICS.len() as u32);
     if rows > most_rows {
         rows = most_rows;
         cols = (((rows * cell_h) as f32 * w / h) / cell_w as f32).ceil() as u32;
@@ -265,6 +425,46 @@ mod tests {
         assert_eq!((cols, rows), (20, 5));
         assert!(png.starts_with(b"\x89PNG"));
         assert!(render("<svg", 80).is_err());
+    }
+
+    #[test]
+    fn a_picture_file_is_drawn_no_larger_than_it_is_and_fits_the_pane() {
+        let encoded = |w: u32, h: u32| {
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::new(w, h))
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            png
+        };
+        // 8×16 cells, drawn at twice that: 160×80 pixels is 20×5 cells.
+        let small = raster(&encoded(160, 80), 80, ROWS).unwrap();
+        assert_eq!((small.cols, small.rows), (20, 5));
+        let shot = image::load_from_memory(&small.png).unwrap();
+        assert_eq!((shot.width(), shot.height()), (160, 80));
+        // A wide one narrows to the pane, keeping its shape.
+        let wide = raster(&encoded(4000, 1000), 60, ROWS).unwrap();
+        assert_eq!((wide.cols, wide.rows), (56, 7));
+        // A tall one stops at the rows it may take.
+        let tall = raster(&encoded(100, 4000), 60, 40).unwrap();
+        assert_eq!(tall.rows, 40);
+        // A drawing shown on its own grows to the pane.
+        assert_eq!(fit_in(80.0, 32.0, (8, 16), 60, ROWS, true), (56, 12));
+        assert!(raster(b"not a picture", 60, ROWS).is_err());
+    }
+
+    #[test]
+    fn a_linked_picture_opens_what_it_was_drawn_from() {
+        let rows = placeholders(0x00FE_0102, 3, 2);
+        let id = id(&rows[0].spans[1]).unwrap();
+        assert_eq!(id, 0x00FE_0102);
+        assert_eq!(source(id), None);
+        SOURCES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(id, "file:///w/a.mmd".into());
+        assert_eq!(source(id).as_deref(), Some("file:///w/a.mmd"));
+        assert_eq!(super::id(&rows[0].spans[0]), None);
     }
 
     #[test]
