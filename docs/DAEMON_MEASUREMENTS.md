@@ -5352,6 +5352,6 @@ builds alternate round by round.
 Lifecycle and completion cells are medians of ten runs (two rounds of five);
 admission of 16 and footprint of 12 (four rounds). Every difference is inside
 the run-to-run range of either build: lone-submit CPU ran 41.7–58.0 ms on main
-and 46.1–59.1 ms on the branch. The store is 26 KB larger per 1000 turns, the
-new column's byte in each node record. Requests that carry pictures are not
+and 46.1–59.1 ms on the branch. The store is 26 KB (0.4 %) larger per 1000
+turns, from the new column. Requests that carry pictures are not
 screened; their cost is the picture bytes themselves.
