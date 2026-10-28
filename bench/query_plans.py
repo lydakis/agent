@@ -27,13 +27,14 @@ STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_ma
 
 
 def statements(source):
-    constants = dict(re.findall(r'const (COLUMNS|READING_ITEM|TURN_VIEW): &str = "([^"]*)";', source, re.S))
+    constants = dict(re.findall(r'const (COLUMNS|READING_ITEM|TURN_VIEW|PICTURELESS): &str = "([^"]*)";', source, re.S))
     literals = re.findall(r'r?#?"((?:[^"\\]|\\.)*)"#?', source, re.S)
     for literal in literals:
         text = re.sub(r'\s+', ' ', literal.replace('\\n', ' ')).strip()
         if not re.match(r'(WITH|SELECT|INSERT|UPDATE|DELETE)\b', text) or ';' in text:
             continue
         for placeholder, name in (('{READING_ITEM}', 'READING_ITEM'), ('{TURN_VIEW}', 'TURN_VIEW'),
+                                  ('{PICTURELESS}', 'PICTURELESS'),
                                   ('{}', 'COLUMNS')):
             if placeholder in text:
                 text = text.replace(placeholder, constants[name])

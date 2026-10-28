@@ -84,6 +84,7 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
+        images: Vec::new(),
         note: None,
         failed: false,
     }
@@ -160,6 +161,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -3365,6 +3367,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
+        images: Vec::new(),
         note: None,
         failed: false,
     };
@@ -3752,6 +3755,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -3881,6 +3885,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         from: None,
         origin: None,
         budget_tokens: None,
+        images: Vec::new(),
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -4712,6 +4717,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 from: None,
                 origin: None,
                 budget_tokens: None,
+                images: Vec::new(),
             },
             allow_provider,
         )
@@ -8404,6 +8410,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
+            images: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
         };
@@ -9439,20 +9446,168 @@ fn lines(tag: usize, count: usize) -> String {
         .collect()
 }
 /// A window's items as the runtime sends them, checked against the sizes
-/// the window counted for them.
+/// the window counted for them: each one's weight, and what its pictures
+/// add beyond it.
 fn sent(db: &Database, window: &agent_runtime::store::Window) -> Vec<Value> {
     let mut items = Vec::new();
-    for (id, size) in window.ids.iter().zip(&window.sizes) {
+    for ((id, size), pictured) in window.ids.iter().zip(&window.sizes).zip(&window.pictured) {
         let bytes = db.items_by_ids(&[*id], 0, window.elided).unwrap();
-        assert_eq!(bytes.len(), *size as usize, "node {id}");
+        assert_eq!(
+            bytes.len() as i64,
+            i64::from(*size) + i64::from(*pictured),
+            "node {id}"
+        );
         items.push(serde_json::from_slice(&bytes).unwrap());
     }
     let joined = db.items_by_ids(&window.ids, 0, window.elided).unwrap();
+    let pictured: i64 = window.pictured.iter().map(|&p| i64::from(p)).sum();
     assert_eq!(
         joined.len() as i64 + 1,
-        window.item_bytes + window.ids.len() as i64
+        window.item_bytes + pictured + window.ids.len() as i64
     );
     items
+}
+
+/// A picture of `side` × `side` pixels of noise: large for its size, as
+/// a photograph is.
+fn noise(side: u32) -> agent_runtime::codec::Image {
+    use base64::Engine;
+    let mut state = 0x2545_f491_u32;
+    let picture = image::RgbImage::from_fn(side, side, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        image::Rgb([state as u8, (state >> 8) as u8, (state >> 16) as u8])
+    });
+    let mut png = Vec::new();
+    picture
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    agent_runtime::codec::Image {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png),
+    }
+}
+
+#[test]
+fn a_picture_that_compresses_below_its_cost_counts_at_its_cost() {
+    use base64::Engine;
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // A blank 1568 × 1568 PNG is a few KB, and still 1600 tokens.
+    let mut png = Vec::new();
+    image::GrayImage::new(1568, 1568)
+        .write_with_encoder(image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Best,
+            image::codecs::png::FilterType::NoFilter,
+        ))
+        .unwrap();
+    let blank = agent_runtime::codec::Image {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png),
+    };
+    assert!(blank.data.len() < blank.weight());
+    db.begin(
+        "Bob",
+        "r1",
+        "look",
+        true,
+        &TurnOptions {
+            images: vec![blank.clone()],
+            ..TurnOptions::default()
+        },
+        allow_provider,
+    )
+    .unwrap();
+    let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert!(window.item_bytes > 6400, "{}", window.item_bytes);
+    assert!(window.pictured[0] < 0, "{:?}", window.pictured);
+    sent(&db, &window);
+}
+
+#[test]
+fn pictures_count_at_their_weight_and_go_whole() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // 300 × 300 is 120 tokens, which weigh 480 bytes; its PNG is 270 KB.
+    let shot = noise(300);
+    assert_eq!(shot.weight(), 480);
+    assert!(shot.data.len() > 300_000);
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "look",
+            true,
+            &TurnOptions {
+                images: vec![shot.clone()],
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A read of an image file: a result with a larger picture, whose 480
+    // tokens weigh enough for its stub to save something.
+    let photo = noise(600);
+    let call = ToolCall {
+        name: "read".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":"{}"});
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        std::slice::from_ref(&call),
+        None,
+    )
+    .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let read = Outcome {
+        images: vec![photo.clone()],
+        ..result("photo.png: a PNG image, 600×600; it follows")
+    };
+    db.tool_finish(turn, "c1", &read).unwrap();
+    db.append(turn, vec![assistant("noise")], &[], None)
+        .unwrap();
+    // Pictures of 360 KB and 1.4 MB fit a 64 KB budget, and go whole.
+    let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert_eq!(window.ids.len(), 4);
+    assert!(window.item_bytes < 8 << 10, "{}", window.item_bytes);
+    assert_eq!(
+        window.pictured.iter().filter(|&&p| p > 0).count(),
+        2,
+        "{:?}",
+        window.pictured
+    );
+    let items = sent(&db, &window);
+    let data =
+        |image: &agent_runtime::codec::Image| format!("data:image/png;base64,{}", image.data);
+    assert_eq!(items[0]["content"][1]["image_url"], data(&shot));
+    assert_eq!(items[2]["output"][1]["image_url"], data(&photo));
+    // A summary would send them whole too.
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    let raw = db.items_by_ids(&plan.ids, 0, plan.elided).unwrap();
+    let span: i64 = plan.sizes.iter().map(|&s| i64::from(s)).sum::<i64>()
+        + plan.pictured.iter().map(|&p| i64::from(p)).sum::<i64>();
+    assert_eq!(raw.len() as i64, span + plan.ids.len() as i64 - 1);
+    // Elided, the result goes as its text, and its picture no longer adds
+    // to what it sends.
+    let elision = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    db.elide("Bob", &elision).unwrap();
+    let elided = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+    assert_eq!(elided.pictured, [window.pictured[0], 0, 0, 0]);
+    let items = sent(&db, &elided);
+    assert!(
+        items[2]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("[tool result's picture elided")
+    );
 }
 
 #[test]
@@ -12020,4 +12175,63 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
     );
     db.process_finish(process, &json!({}), &[]).unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
+}
+
+#[test]
+fn steer_batches_bound_the_bytes_of_their_pictures() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin(
+            "Bob",
+            "first",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // Each picture is 3.2 MB of base64, so two fit a batch and the third
+    // waits for the next.
+    let shot = noise(900);
+    assert!(shot.data.len() > 3 << 20);
+    let mut submitted = Vec::new();
+    for n in 0..3 {
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            images: vec![shot.clone()],
+            ..TurnOptions::default()
+        };
+        submitted.push(
+            db.begin(
+                "Bob",
+                &n.to_string(),
+                "look",
+                true,
+                &options,
+                allow_provider,
+            )
+            .unwrap()
+            .turn,
+        );
+    }
+    let absorb = |db: &mut agent_runtime::store::Database, through| {
+        db.absorb(
+            first,
+            through,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap()
+    };
+    let absorbed = absorb(&mut db, None);
+    let seen: Vec<_> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
+    assert_eq!(seen, submitted[..2]);
+    let absorbed = absorb(&mut db, absorbed.next_through);
+    assert_eq!(absorbed.outcomes[0].0, submitted[2]);
+    assert!(absorbed.next_through.is_none());
 }
