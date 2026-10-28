@@ -1,0 +1,12 @@
+agent
+Copyright (c) 2026 George Lydakis
+
+This product includes software from OpenAI Codex
+(https://github.com/openai/codex), Copyright 2025 OpenAI, licensed under the
+Apache License, Version 2.0:
+
+- src/sandbox/seatbelt_base_policy.sbpl, src/sandbox/seatbelt_network_policy.sbpl
+  and src/sandbox/seatbelt_preferences_policy.sbpl, copied from
+  codex-rs/sandboxing/src.
+- The bubblewrap arguments and the Seatbelt profile that src/sandbox.rs builds,
+  ported from codex-rs/linux-sandbox and codex-rs/sandboxing.

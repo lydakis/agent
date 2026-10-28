@@ -12,6 +12,7 @@ mod approvals;
 mod asks;
 mod attach;
 mod background;
+mod banner;
 mod cache;
 mod calls;
 mod declared;
@@ -38,6 +39,7 @@ mod rex;
 mod screen;
 mod served;
 mod settings;
+mod setup;
 mod shell;
 mod skills;
 mod sound;
@@ -455,14 +457,62 @@ fn start_lookout(options: &Options) -> Result<(), String> {
 }
 
 /// The daemon, started the way the CLI starts it when it is not running.
+/// With no provider set anywhere, the person is asked for one first, and a
+/// first model list is written once it runs.
 async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events), String> {
     if let Ok(connected) = Client::connect(&options.socket).await {
         return Ok(connected);
     }
-    start_daemon(&options.store, &options.socket, false)?;
-    Client::connect(&options.socket)
+    match start_daemon(&options.store, &options.socket, false) {
+        Err(failed) if failed.code.as_deref() == Some("provider_required") => {
+            if !setup::interactive() {
+                return Err(format!("{failed}; run sonny in a terminal to choose one"));
+            }
+            let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+            setup::provider(&bin)?;
+            start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
+        }
+        started => started.map_err(|e| e.to_string())?,
+    }
+    let connected = Client::connect(&options.socket)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
+        tokio::spawn(first_models(connected.0.clone(), path));
+    }
+    Ok(connected)
+}
+
+/// `~/.agent/models`, the list agents read with `agent models`, written
+/// from the providers' listings when there is none yet, as `agent models
+/// --discover` writes it. A provider that will not list leaves it for the
+/// next start.
+async fn first_models(client: Arc<Client>, path: PathBuf) {
+    let Ok(listing) = client.request("provider_models", json!({})).await else {
+        return;
+    };
+    if let Ok(text) = agent_client::models::render(&listing, &[]) {
+        let _ = agent_client::models::install(&path, &text);
+    }
+}
+
+/// Why the daemon did not start: the CLI's error code when it named one,
+/// and what it said.
+pub struct NotStarted {
+    pub code: Option<String>,
+    reason: String,
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not start the daemon: {}", self.reason)
+    }
+}
+
+impl From<String> for NotStarted {
+    fn from(reason: String) -> Self {
+        NotStarted { code: None, reason }
+    }
 }
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
@@ -472,9 +522,9 @@ fn start_daemon(
     store: &std::path::Path,
     socket: &std::path::Path,
     login: bool,
-) -> Result<(), String> {
+) -> Result<(), NotStarted> {
     let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew, or set AGENT_BIN",
+        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
     let mut command = std::process::Command::new(&bin);
     if let Some(environment) = login.then(login::environment).flatten() {
@@ -492,13 +542,15 @@ fn start_daemon(
         .map_err(|e| format!("{}: {e}", bin.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let reason = stderr
+        let failure = stderr
             .lines()
             .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|failure| Some(failure["detail"].as_str()?.to_owned()))
-            .unwrap_or_else(|| stderr.trim().to_owned());
-        return Err(format!("could not start the daemon: {reason}"));
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
+        let field = |name: &str| Some(failure.as_ref()?[name].as_str()?.to_owned());
+        return Err(NotStarted {
+            code: field("error"),
+            reason: field("detail").unwrap_or_else(|| stderr.trim().to_owned()),
+        });
     }
     Ok(())
 }
@@ -808,6 +860,10 @@ async fn run() -> Result<(), String> {
         app.move_to = Some(app.workspace.clone());
     }
     app.project = project;
+    // A new project's lead has no history yet: Sonny says hello over it.
+    if fresh && options.side.is_none() {
+        app.welcome = Some(Vec::new());
+    }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
@@ -832,7 +888,13 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .model
         .clone()
         .or_else(|| std::env::var("AGENT_MODEL").ok())
-        .ok_or("--new needs --model PROVIDER/MODEL")?;
+        .map_or_else(
+            || agent_client::config::load().map(|c| c.model),
+            |m| Ok(Some(m)),
+        )?
+        .ok_or(
+            "--new needs --model PROVIDER/MODEL, AGENT_MODEL, or model in ~/.agent/config.toml",
+        )?;
     let workspace = match &options.workspace {
         Some(dir) => std::path::absolute(dir).map_err(|e| e.to_string())?,
         None => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -1195,6 +1257,9 @@ struct App {
     /// Lines let go while `/status` held the screen, past what is kept.
     skipped: usize,
     any_history: bool,
+    /// The welcome over a new project's empty transcript: asked for at
+    /// start, drawn once the width is known, and kept for a repaint.
+    welcome: Option<Vec<Line<'static>>>,
     width: usize,
     /// The terminal's rows, which bound how much of the bot's words is held.
     height: usize,
@@ -1749,6 +1814,10 @@ impl Fleet {
                 _ => None,
             };
             self.alerts.extend(alert);
+            // A task that waits needs little of its copy's memory.
+            if bot != self.lead && matches!(doing, "done" | "failed" | "needs you") {
+                task::trim(bot);
+            }
         }
     }
 
@@ -1914,6 +1983,7 @@ impl App {
             pending: Vec::new(),
             skipped: 0,
             any_history: false,
+            welcome: None,
             width: 80,
             height: 24,
             live: None,
@@ -2011,6 +2081,10 @@ impl App {
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.asks_file = self.reactions_key.as_deref().and_then(asks::file);
+        if let Some(welcome) = self.welcome.as_mut() {
+            *welcome = banner::welcome(&self.bot, &tilde(&self.workspace), &self.model, self.width);
+        }
+        self.draw_welcome();
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -2456,6 +2530,7 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        self.draw_welcome();
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
             Some(first) => self.history_since(first - 1, true).await,
@@ -2624,6 +2699,13 @@ impl App {
     }
 
     /// Commit a finished cell, a blank line apart from the one before.
+    /// The welcome, first in the transcript, when this window has one.
+    fn draw_welcome(&mut self) {
+        if let Some(welcome) = self.welcome.clone() {
+            self.commit(welcome);
+        }
+    }
+
     fn commit(&mut self, lines: Vec<Line<'static>>) {
         self.commit_after(lines, true);
     }

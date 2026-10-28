@@ -1439,6 +1439,19 @@ class ModelListTests(ModelFixture):
         self.assertIn('gone: provider_', refused.stderr)
         self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
 
+    def test_a_fresh_install_names_the_missing_provider_and_stats_starts_its_daemon(self):
+        refused = self.agent('stats', *self.store, check=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(json.loads(refused.stderr)['error'], 'provider_required')
+        self.assertFalse((self.path / 'state.sqlite').exists())
+        stats = json.loads(self.agent('stats', *self.store, '--provider', f'openai=responses,{self.url}').stdout)
+        self.assertEqual(stats['active_turns'], 0)
+        self.assertTrue((self.path / 'state.sqlite').exists())
+        # A command on a bot still never makes a store of its own.
+        other = ['--store', str(self.path / 'other.sqlite')]
+        missing = self.agent('inspect', *other, '--bot', 'Bob', check=False)
+        self.assertEqual(json.loads(missing.stderr)['error'], 'store_not_found')
+
     def test_discover_writes_nothing_when_rendering_discards_every_model(self):
         url = self.url.removesuffix('/v1') + '/invalid/v1'
         refused = self.agent('models', '--discover', *self.store,

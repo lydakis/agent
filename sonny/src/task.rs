@@ -5,9 +5,8 @@
 //! sandfs copy (experimental), made with the sandfs library built into
 //! Sonny so nothing needs installing, is the checkout as it is, uncommitted
 //! changes included, on a branch of its own; in a folder sandfs mounts, a
-//! fork of that workspace; in any other folder, the folder as it is now,
-//! or on another disk than sandfs's home, a workspace over the folder
-//! itself. A task that could not start leaves no folder behind, and the
+//! fork of that workspace; in any other folder, the folder as it is now.
+//! A task that could not start leaves no folder behind, and the
 //! `remove_task` tool takes away one that is done. `sonny task changes`
 //! lists, and applies here, what a sandfs copy of a plain folder changed.
 //!
@@ -606,6 +605,28 @@ fn sandfs() -> Result<Home, String> {
     Home::locate().map_err(|e| format!("{e:#}"))
 }
 
+/// Have the task `name`'s sandfs copy, when it has one mounted, give back
+/// the memory it can do without, now that the task waits. sandfs does so on
+/// its own once a mount has gone unused for a minute; this is sooner. It
+/// runs on its own thread, and a copy it can't trim stays as it was.
+pub fn trim(name: &str) {
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let (Ok(home), Ok(tasks)) = (Home::locate(), tasks()) else {
+            return;
+        };
+        let real = std::fs::canonicalize(&tasks).unwrap_or(tasks);
+        let ours = home.root().exists()
+            && home.workspaces().is_ok_and(|all| {
+                all.iter()
+                    .any(|ws| ws.name == name && ws.mounted.as_deref() == Some(&real.join(&name)))
+            });
+        if ours {
+            let _ = home.trim(Some(&name));
+        }
+    });
+}
+
 /// What the lead's folder is, and so what a sandfs copy of it is.
 enum Source {
     /// A folder in the sandfs workspace `name`, mounted at `root`.
@@ -695,10 +716,6 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         Source::Git { top } => (top.clone(), true),
         Source::Folder => (here.to_owned(), false),
     };
-    // A plain folder's copy clones its files into sandfs's home, which
-    // works only on one disk: one on another disk (an external volume) gets
-    // a workspace over the folder itself instead.
-    let over = matches!(source, Source::Folder) && !same_disk(&root, home.root());
     let undo = match exists {
         // The task's own copy, mounted or left unmounted by a restart.
         Some(ws) if ws.mounted.as_deref() == Some(dir.as_path()) => Undo::Nothing,
@@ -714,17 +731,6 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
                 "a sandfs workspace named {name} exists that is not this task's; pick another name"
             ));
         }
-        None if over => {
-            let options = MountOptions {
-                name: Some(name.to_owned()),
-                ..Default::default()
-            };
-            home.mount(&root.to_string_lossy(), &dir, &options)
-                .map_err(|e| format!("{e:#}"))?;
-            Undo::Sandfs {
-                name: name.to_owned(),
-            }
-        }
         None => {
             let from = match &source {
                 Source::Mount { name, .. } => name.clone(),
@@ -733,6 +739,9 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
             let options = ForkOptions {
                 name: Some(name.to_owned()),
                 branch: git_copy.then(|| branch.clone()),
+                // A plain folder on a disk that can't clone its files (ext4)
+                // is copied in full rather than refused.
+                allow_copy: matches!(source, Source::Folder),
                 ..Default::default()
             };
             home.fork(&from, Some(&dir), &options)
@@ -768,18 +777,8 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         )
     } else {
         let me = me();
-        let what = match over {
-            true => {
-                "a sandfs workspace over this folder, which is on another disk than sandfs's \
-                     home and so is not copied: the task's changes stay in the workspace, a file \
-                     it has looked at stays as it first saw it, and `--apply` writes over what \
-                     changed here meanwhile without asking"
-            }
-            false => {
-                "a sandfs copy of this folder as it is now, whose --apply refuses a file \
-                     changed here since unless given --force"
-            }
-        };
+        let what = "a sandfs copy of this folder as it is now, whose --apply refuses a file \
+                    changed here since unless given --force";
         let mut note = format!(
             "{name}: {what}; `{me} task changes {name}` lists what the task changed, and \
              `{me} task changes {name} --apply` writes it here. Copy nothing from its folder \
@@ -817,18 +816,6 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
 const GIT_OFF: &str = "gitdir: /dev/null/sonny: this linked worktree's repository is outside \
                        the task's copy, so git is off here; start a task in that repository's \
                        own folder to use git on it\n";
-
-/// Whether `folder` is on the disk sandfs's `home` is on, or will be made
-/// on.
-fn same_disk(folder: &Path, home: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let disk = |path: &Path| {
-        path.ancestors()
-            .find_map(|dir| std::fs::metadata(dir).ok())
-            .map(|found| found.dev())
-    };
-    disk(folder) == disk(home)
-}
 
 /// The folder in `copy` at `prefix`, without the trailing slash an empty
 /// one would add.
@@ -1635,14 +1622,6 @@ mod tests {
             .0,
             "--dir=/Users/g/.agent/tasks/t:/Users/g/.agent/tasks/t/b (see /Users/g/.agent/tasks/t)"
         );
-    }
-
-    #[test]
-    fn a_folder_on_another_disk_is_told_apart() {
-        let tmp = std::env::temp_dir();
-        assert!(same_disk(&tmp, &tmp.join("not/made/yet")));
-        // A device file system is never the one temporary files are on.
-        assert!(!same_disk(Path::new("/dev"), &tmp));
     }
 
     #[test]

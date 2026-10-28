@@ -436,7 +436,7 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
 }
 
 #[test]
-fn a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it() {
+fn a_plain_folder_on_another_disk_is_copied_on_that_disk() {
     // /dev/shm is a disk of its own on Linux; elsewhere there is no
     // second disk to try this on.
     let shm = Path::new("/dev/shm");
@@ -462,13 +462,17 @@ fn a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it() {
         finish(&lab);
         panic!("{said}");
     }
-    assert!(said.contains("another disk"), "{said}");
+    assert!(said.contains("as it is now"), "{said}");
     assert_eq!(lab.ran()[6], copy.to_string_lossy());
-    // The task's edit stays in its workspace until applied.
+    // A change to the folder after the copy was made is not the task's.
+    std::fs::write(folder.join("later.txt"), "later\n").unwrap();
+    let later = copy.join("later.txt").exists();
+    // The task's edit stays in its copy until applied.
     std::fs::write(copy.join("notes.txt"), "two\n").unwrap();
     let (_, listed, _) = lab.run(&folder, sonny, &["task", "changes", "demo.fix"], false);
     let source = std::fs::read_to_string(folder.join("notes.txt")).unwrap();
     finish(&lab);
+    assert!(!later);
     assert_eq!(listed, "M notes.txt");
     assert_eq!(source, "one\n");
 }
@@ -540,7 +544,6 @@ fn a_plain_folder_copy_turns_git_off_in_linked_worktrees_and_applies_what_it_lis
             said.contains("Git is off in its copy of 1 linked worktrees"),
             "{said}"
         );
-        assert!(said.contains("without asking"), "{said}");
         // Git stops in the copy's worktree, and works in the real one.
         // Which words git says it with depend on its version; the reason is
         // in the .git file it stops at.

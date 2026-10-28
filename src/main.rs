@@ -32,7 +32,8 @@ fn main() {
         Err(error) => {
             report(&error);
             std::process::exit(match error.code.as_str() {
-                "usage" => 2,
+                // A missing provider is a missing flag, as usage errors are.
+                "usage" | "provider_required" => 2,
                 "store_already_owned" | "socket_already_owned" => DAEMON_OWNERSHIP_CONFLICT,
                 _ => 1,
             });
@@ -93,6 +94,11 @@ fn run() -> Result<i32> {
         }
         Some("help") if args.len() <= 2 => {
             cli::help(args.get(1).map(String::as_str))?;
+            return Ok(0);
+        }
+        // A sandboxed bot's write, which the daemon runs in the sandbox.
+        Some(agent_runtime::sandbox::WRITE) if args.len() == 2 => {
+            agent_runtime::sandbox::write(std::path::Path::new(&args[1]))?;
             return Ok(0);
         }
         None => return fail_with("usage", "a command is required; use agent --help"),

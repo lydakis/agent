@@ -451,11 +451,13 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     let role = role(dir)?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
-    // the role's, AGENT_MODEL's, then the newest agent's, so a bare
-    // `sonny` needs no flag. Its effort: the config's `[sonny]
-    // lead_effort`, else AGENT_EFFORT with AGENT_MODEL's model, as the CLI
-    // takes them.
+    // the role's, AGENT_MODEL's, the config's `model`, then the newest
+    // agent's, so a bare `sonny` needs no flag. With none, the person picks
+    // one, kept as the config's `model` for later projects. Its effort: the
+    // config's `[sonny] lead_effort`, else AGENT_EFFORT with AGENT_MODEL's
+    // model, as the CLI takes them.
     let (mut effort, model) = (None, model.map(str::to_owned));
+    let config = agent_client::config::load()?;
     let model = match model
         .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
@@ -466,9 +468,14 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
                 effort = std::env::var("AGENT_EFFORT").ok();
                 model
             }
-            None => newest(client)
-                .await?
-                .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
+            None => match config.model.clone() {
+                Some(model) => model,
+                None => match newest(client).await? {
+                    Some(model) => model,
+                    None if crate::setup::interactive() => crate::setup::model(client).await?,
+                    None => return Err("model_required: no default model yet; set model in ~/.agent/config.toml or pass --model PROVIDER/MODEL once".into()),
+                },
+            },
         },
     };
     let picks = agent_client::project::Picks {

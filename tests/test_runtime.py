@@ -409,6 +409,12 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
                            'arguments': json.dumps({'command': user[6:], 'timeout_ms': 2000})}]
+            elif user.startswith('calls:'):
+                # Calls given whole, as [[name, arguments], ...], in one response.
+                text = ''
+                output = [{'type': 'function_call', 'name': name, 'call_id': f'{name}-{i + 1}',
+                           'arguments': json.dumps(arguments)}
+                          for i, (name, arguments) in enumerate(json.loads(user[6:]))]
             elif user.startswith('shellecho:'):
                 # A command, then an echo, in one response.
                 text = ''
@@ -1071,7 +1077,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
                        decision='allow', by='test')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
-    def test_an_overload_mid_stream_closes_the_pool_and_is_retried_when_it_reopens(self):
+    def test_a_lone_overload_mid_stream_backs_off_its_own_call(self):
         client, model, path = self.start()
         model.overloads = 1
         client.request('create', bot='Bob', workspace=str(path))
@@ -1080,10 +1086,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
         retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
         self.assertEqual([r['error'] for r in retried], ['provider_http_529'])
         self.assertEqual(retried[0]['detail'], 'Overloaded')
-        # The pool closes for a second, for every bot on the model, and the
-        # turn waits it out parked.
-        self.assertTrue(retried[0]['parked'])
-        self.assertGreaterEqual(retried[0]['delay_ms'], 500)
+        # One overload leaves the pool open for the other bots on the model:
+        # this call retries after half a second, as the providers' SDKs do.
+        self.assertFalse(retried[0]['parked'])
+        self.assertTrue(400 <= retried[0]['delay_ms'] <= 600, retried[0])
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()
