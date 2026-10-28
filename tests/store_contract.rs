@@ -3139,6 +3139,73 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
 }
 
 #[test]
+fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    let mut expires = 0;
+    for call in &calls {
+        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+            .as_u64()
+            .unwrap();
+    }
+    // The first two are answered and held by the worker: a page of one
+    // that reads only them still goes on to the third.
+    for id in ["c1", "c2"] {
+        db.answer_call("Lead", turn, id, result("started"), 0)
+            .unwrap();
+    }
+    let page = db.tool_calls("sonny", 0, 1).unwrap();
+    assert_eq!(page["calls"], json!([]));
+    let after = page["next_after"].as_i64().unwrap();
+    let page = db.tool_calls("sonny", after, 1).unwrap();
+    assert_eq!(page["calls"][0]["call_id"], "c3");
+    assert_eq!(page["next_after"], Value::Null);
+    // Out of time, an answer is refused, however late the turn learns it.
+    let Err(late) = db.answer_call("Lead", turn, "c3", result("late"), expires) else {
+        panic!("an answer out of time was taken");
+    };
+    assert_eq!(
+        (late.code.as_str(), late.detail.as_deref()),
+        ("no_pending_call", Some("the call ran out of time"))
+    );
+}
+
+#[test]
 fn schema_52_bots_declare_no_tools() {
     let path = std::env::temp_dir().join(format!("agent-declared-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -11626,19 +11693,19 @@ fn a_bot_changes_its_gate_even_one_another_bot_made() {
         tools: vec![tool.into()],
         expire_ms: Some(45_000),
     };
-    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     assert_eq!(db.inspect("Ann").unwrap().gates, [gate("read")]);
-    assert!(!db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(!db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     assert_eq!(
-        db.set_gate("Ann", None, Some(gate("shell")))
+        db.set_gate("Ann", None, Some(gate("shell")), None)
             .unwrap_err()
             .code,
         "approve_not_in_tools"
     );
-    assert!(db.set_gate("Ann", None, None).unwrap());
+    assert!(db.set_gate("Ann", None, None, None).unwrap());
     assert!(db.inspect("Ann").unwrap().gates.is_empty());
     // A bot Ann makes takes her gate, and the person can still lift it.
-    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     db.create(
         "Bob",
         None,
@@ -11650,7 +11717,7 @@ fn a_bot_changes_its_gate_even_one_another_bot_made() {
     )
     .unwrap();
     assert_eq!(db.inspect("Bob").unwrap().gates, [gate("read")]);
-    assert!(db.set_gate("Bob", None, None).unwrap());
+    assert!(db.set_gate("Bob", None, None, None).unwrap());
     assert!(db.inspect("Bob").unwrap().gates.is_empty());
 }
 

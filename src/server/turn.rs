@@ -18,7 +18,7 @@ use agent_runtime::{
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     store::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip,
-        TURN_VIEW_ACCOUNTING, Waiting, Window,
+        TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
@@ -1974,14 +1974,9 @@ impl Turn {
                         CallAnswer::Given(outcome) => outcome,
                         // Woken by a later gated call's lapse, which ends
                         // the turn: the call ends unanswered.
-                        CallAnswer::Pending { .. } => Outcome {
-                            output: json!({"error":"tool_unserved",
-                                "detail":"a later call's gate lapsed before the answer"})
-                            .to_string(),
-                            artifacts: Vec::new(),
-                            note: None,
-                            failed: true,
-                        },
+                        CallAnswer::Pending { .. } => {
+                            unserved("a later call's gate lapsed before the answer".into())
+                        }
                     };
                     let id = waiting.call_id.clone();
                     self.store

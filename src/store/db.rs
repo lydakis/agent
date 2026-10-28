@@ -674,6 +674,15 @@ pub fn merge_gates<'a>(gates: impl IntoIterator<Item = &'a Gate>, tools: &[Strin
 }
 /// The tools a gate may hold back: the daemon's a bot has and those its
 /// client declared.
+/// An answered call's result when nobody answered it in time.
+pub fn unserved(detail: String) -> Outcome {
+    Outcome {
+        output: json!({"error":"tool_unserved","detail":detail}).to_string(),
+        artifacts: Vec::new(),
+        note: None,
+        failed: true,
+    }
+}
 fn gateable(tools: &[String], declared: &[Declared]) -> Vec<String> {
     tools
         .iter()
@@ -2065,16 +2074,19 @@ impl Database {
     /// Replace a bot's gates, those it took from its creator or its source
     /// included: whoever configures it decides, as the person overriding a
     /// bot another bot made does. Whether anything changed.
+    /// `declared` is the set the same change declares, when it does.
     pub fn set_gate(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
         gate: Option<Gate>,
+        declared: Option<&[Declared]>,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
         if let Some(gate) = &gate {
-            not_in_tools(&gate.tools, &gateable(&bot.tools, &bot.declared))?;
+            let declared = declared.unwrap_or(&bot.declared);
+            not_in_tools(&gate.tools, &gateable(&bot.tools, declared))?;
         }
         let gates = stored_gates(gate.as_slice())?;
         let changed = self.conn.execute(
@@ -5330,14 +5342,14 @@ impl Database {
                 note: None,
                 failed,
             }),
-            None if now_ms >= expires_ms => CallAnswer::Given(Outcome {
-                output: json!({"error":"tool_unserved",
-                    "detail":format!("no answer from {tag} in time")})
-                .to_string(),
-                artifacts: Vec::new(),
-                note: None,
-                failed: true,
-            }),
+            None if now_ms >= expires_ms => {
+                CallAnswer::Given(unserved(format!("no answer from {tag} in time")))
+            }
+            // A later call's gate that lapses ends the turn's wait, as
+            // it ends a gated call's.
+            None if self.next_lapse(turn)?.is_some_and(|at| now_ms >= at) => CallAnswer::Given(
+                unserved("a later call's gate lapsed before the answer".into()),
+            ),
             None => CallAnswer::Pending {
                 notify: self.live.entry(turn).or_default().notify.clone(),
                 expires_ms,
@@ -5424,6 +5436,7 @@ impl Database {
         turn: i64,
         call_id: &str,
         outcome: Outcome,
+        now_ms: u64,
     ) -> Result<Answered> {
         let owner: Option<(String, String)> = self
             .conn
@@ -5434,16 +5447,18 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
             return fail("turn_not_found");
         };
-        let call: Option<(bool, Option<String>)> = self
+        let call: Option<(bool, Option<String>, i64)> = self
             .conn
             .prepare_cached(
-                "SELECT a.output IS NOT NULL,t.status FROM answers a
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms FROM answers a
                  LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
             )?
-            .query_row(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .optional()?;
-        let Some((stored, tool)) = call else {
+        let Some((stored, tool, expires_ms)) = call else {
             if !matches!(status.as_str(), "running" | "waiting") {
                 return Err(Error::with(
                     "stale_turn",
@@ -5461,6 +5476,10 @@ impl Database {
         }
         if tool.as_deref() != Some("executing") {
             return fail_with("no_pending_call", "the call ended unanswered");
+        }
+        // Out of time is unserved, whenever the turn gets to say so.
+        if now_ms >= expires_ms.max(0) as u64 {
+            return fail_with("no_pending_call", "the call ran out of time");
         }
         let reply = json!({"bot":bot,"turn":turn,"call_id":call_id});
         match status.as_str() {
@@ -5509,9 +5528,10 @@ impl Database {
                AND t.status IN ('running','waiting') ORDER BY a.id LIMIT ?",
         )?;
         let mut listed = Vec::new();
-        let (mut bytes, mut last, mut more) = (0, after, false);
+        let (mut bytes, mut last, mut more, mut scanned) = (0, after, false, 0);
         let mut rows = statement.query(params![tag, after, limit as i64 + 1])?;
         while let Some(r) = rows.next()? {
+            scanned += 1;
             let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
             // An answer the worker holds is given already.
             if self
@@ -5536,6 +5556,9 @@ impl Database {
             last = id;
             listed.push(entry);
         }
+        // Held answers skipped took rows the page did not fill: there may
+        // be more past the last one read.
+        more |= scanned > limit;
         Ok(json!({"calls":listed,"next_after":more.then_some(last)}))
     }
     /// Record one gate's verdict on the current request of a planned call.

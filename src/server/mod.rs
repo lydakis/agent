@@ -2395,7 +2395,7 @@ impl Service {
                         let mut changed = Vec::new();
                         // First: the one change that may be refused here.
                         if let Some(gate) = gate
-                            && db.set_gate(&bot, Some(id), gate)?
+                            && db.set_gate(&bot, Some(id), gate, declare.as_deref())?
                         {
                             changed.push("gates");
                         }
@@ -2672,7 +2672,7 @@ impl Service {
                 let name = bot.clone();
                 let answered = store
                     .op("tool_result", move |db| {
-                        db.answer_call(&name, turn, &call_id, outcome)
+                        db.answer_call(&name, turn, &call_id, outcome, now_ms())
                     })
                     .await?;
                 // Held by the worker or durable by now; only then does the

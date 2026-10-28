@@ -144,6 +144,28 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.output(client), 'allowed and started')
 
+    def test_a_later_calls_gate_that_lapses_ends_the_wait_for_an_answer(self):
+        client = self.client('echo,shell')
+        self.lead(client=client, tool=dict(START, expire_ms=30_000), approve=['shell'],
+                  approver='manual', approve_expire_ms=100)
+        self.model.call_script = [[('start_task', {'name': 'fix'}), ('shell', {'command': 'true'})]]
+        started = time.monotonic()
+        turn = self.submit(client)
+        # Ended by the lapse, as a turn waiting on a verdict is, long before
+        # the answered call's own time runs out.
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('interrupted', 'approval_expired'))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(json.loads(self.output(client)),
+                         {'error': 'tool_unserved', 'detail': "a later call's gate lapsed before the answer"})
+
+    def test_configure_may_gate_a_tool_it_declares_at_once(self):
+        client = self.client('echo')
+        client.request('create', bot='Lead', workspace=str(self.path))
+        configured = client.request('configure', bot='Lead', declare=[START],
+                                    approve=['start_task'], approver='manual')['result']
+        self.assertEqual(sorted(configured['changed']), ['declared', 'gates'])
+
     def test_a_call_that_does_not_fit_is_refused_and_waits_for_nothing(self):
         client = self.lead()
         self.model.call_script = [('start_task', {'name': 1})]

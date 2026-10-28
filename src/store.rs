@@ -19,7 +19,7 @@ pub use db::{
     CompactionView, CopiedCall, DENIAL_WINDOW, Database, Decision, Delivery, ElisionPlan, Fork,
     Gate, Gated, MAX_GATES, Planning, Publication, Served, Settings, Started, Strip,
     TURN_VIEW_ACCOUNTING, TurnBudget, TurnContext, TurnOptions, Waiting, Wake, Window, cache_hit,
-    merge_gates,
+    merge_gates, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
