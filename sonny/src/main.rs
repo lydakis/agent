@@ -1532,9 +1532,11 @@ struct App {
     /// out at; none while something else is drawn over it.
     composer_at: Option<(Rect, usize, usize)>,
     /// The mouse button went down on the composer's text, on what: a
-    /// spot, word or line a drag selects from. And the last press, to
-    /// count clicks.
-    composing: Option<std::ops::Range<usize>>,
+    /// spot, word or line a drag selects from, and where the text was
+    /// drawn then, kept while the button is down so a redraw that scrolls
+    /// the composer does not move the spot under the mouse. And the last
+    /// press, to count clicks.
+    composing: Option<(std::ops::Range<usize>, (Rect, usize, usize))>,
     composer_click: Option<(Instant, u16, u16, u8)>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
@@ -4882,17 +4884,22 @@ impl App {
     /// `mouse`.
     fn composer_mouse(&mut self, mouse: &event::MouseEvent) -> bool {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-        let Some((area, first, width)) = self.composer_at else {
-            self.composing = None;
-            return false;
-        };
-        let over = area.contains((mouse.column, mouse.row).into());
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if over => {}
+        let held = matches!(
+            mouse.kind,
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-                if self.composing.is_some() => {}
-            _ => return false,
-        }
+        );
+        let drawn = match &self.composing {
+            Some((_, drawn)) if held => *drawn,
+            _ => match (self.composer_at, mouse.kind) {
+                (Some(drawn), MouseEventKind::Down(MouseButton::Left))
+                    if drawn.0.contains((mouse.column, mouse.row).into()) =>
+                {
+                    drawn
+                }
+                _ => return false,
+            },
+        };
+        let (area, first, width) = drawn;
         let rows = self.input.layout(width);
         // Above the rows shown, the one before them; below, the last.
         let row = match mouse.row < area.y {
@@ -4922,10 +4929,10 @@ impl App {
                     _ => at..at,
                 };
                 self.input.select(origin.start, origin.end);
-                self.composing = Some(origin);
+                self.composing = Some((origin, drawn));
             }
             _ => {
-                let origin = self.composing.clone().unwrap_or(at..at);
+                let origin = self.composing.clone().map_or(at..at, |(origin, _)| origin);
                 match at < origin.start {
                     true => self.input.select(origin.end, at),
                     false => self.input.select(origin.start, at.max(origin.end)),
@@ -8249,6 +8256,22 @@ mod tests {
         assert_eq!(&*app.input, "one  x");
         // A press off the composer is not its own.
         assert!(!app.composer_mouse(&mouse(down, prompt::LEAD, 5)));
+        // A click whose press scrolled the composer still selects nothing:
+        // the release finds its spot where the press was drawn.
+        let lines: Vec<String> = (0..12).map(|n| format!("line {n}")).collect();
+        app.input.set(&lines.join("\n"));
+        app.composing = None;
+        app.composer_click = None;
+        app.composer_at = Some((Rect::new(0, 10, 40, 8), 0, 40));
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 1, 12)));
+        app.composer_at = Some((Rect::new(0, 10, 40, 8), 2, 40));
+        let up = MouseEventKind::Up(MouseButton::Left);
+        assert!(app.composer_mouse(&mouse(up, prompt::LEAD + 1, 12)));
+        assert_eq!(app.input.selection(), None);
+        assert_eq!(
+            app.input.cursor(&app.input.layout(40)),
+            (2, prompt::LEAD + 1)
+        );
     }
 
     #[tokio::test]
