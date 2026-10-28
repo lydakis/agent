@@ -1082,7 +1082,6 @@ fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
         })
 }
 
-#[cfg(test)]
 fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
     read_all(places).filter_map(|(_, r)| r.ok()).collect()
 }
@@ -1134,6 +1133,36 @@ pub fn list(places: &Places, after: Option<&str>) -> Value {
     let next = more.then(|| names.last().cloned()).flatten();
     let rows: Vec<_> = names.into_iter().map(|name| row(places, &name)).collect();
     json!({"triggers": rows, "next_after": next})
+}
+
+/// Every trigger there now that was made on the daemon whose store is
+/// `store_id`, in name order: its row, as `list` shows it, and the agents
+/// it is for: the one it messages, the one that added it to start that
+/// one, and the one its answers go to.
+pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
+    let mut found: Vec<(Value, Vec<String>)> = triggers(places)
+        .into_iter()
+        .filter(|(t, _)| t.store_id == store_id)
+        .map(|(t, _)| {
+            let mut row = t.json(&state(places, &t));
+            if t.at.is_some_and(|at| now() > at + SLACK) {
+                row["missed"] = json!(true);
+            }
+            let mut bots = vec![t.bot().to_owned()];
+            if let Target::Start {
+                by: Some((by, _)), ..
+            } = &t.target
+            {
+                bots.push(by.clone());
+            }
+            if let Some((to, _)) = &t.reply_to {
+                bots.push(to.clone());
+            }
+            (row, bots)
+        })
+        .collect();
+    found.sort_by(|a, b| a.0["name"].as_str().cmp(&b.0["name"].as_str()));
+    found
 }
 
 /// One trigger's row, as `list` shows it; none when no trigger of that
@@ -3422,6 +3451,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn a_store_s_triggers_name_every_agent_they_are_for() {
+        let w = World::new("on-store");
+        let started = Trigger {
+            name: "p.digest".into(),
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "openai/gpt".into(),
+                effort: None,
+                by: Some(("p.lead".into(), 7)),
+            },
+            reply_to: Some(("p.lead".into(), 7)),
+            ..trigger()
+        };
+        let elsewhere = Trigger {
+            name: "q.other".into(),
+            store_id: "another-store".into(),
+            ..trigger()
+        };
+        for t in [&trigger(), &started, &elsewhere] {
+            w.install(t).unwrap();
+        }
+        let found = on_store(&w.places, "00ab");
+        let named: Vec<(&str, &[String])> = found
+            .iter()
+            .map(|(row, bots)| (row["name"].as_str().unwrap(), bots.as_slice()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (
+                    "p.digest",
+                    &["p.digest".into(), "p.lead".into(), "p.lead".into()][..]
+                ),
+                ("p.fix-login", &["p.fix-login".into()][..]),
+            ]
+        );
+        assert_eq!(found[1].0["when"], "every 30m");
     }
 
     fn once() -> Trigger {
