@@ -93,6 +93,24 @@ class ImageTests(ModelFixture):
         self.assertEqual([pictures(user) for user in users],
                          [[f"data:image/png;base64,{shot['data']}"] for shot in shots])
 
+    def test_a_request_keeps_its_newest_pictures_and_older_ones_go_as_their_words(self):
+        # Six messages of 20 pictures: the sixth would send 120, past the
+        # 100 a request takes, so the oldest go until 50 at most remain.
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        shots = [image(png(4, 4))] * 20
+        for n in range(6):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'look {n}',
+                                  images=shots)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+        users = [i for i in request['input'] if i.get('role') == 'user']
+        self.assertEqual([len(pictures(user)) for user in users], [0, 0, 0, 0, 20, 20])
+        self.assertEqual(users[0]['content'], [{
+            'type': 'input_text',
+            'text': 'look 0\n[20 picture(s) sent with this message, elided from this request]'}])
+
     def test_read_sends_an_image_file_as_a_picture_scaled_to_fit(self):
         (self.path / 'shot.png').write_bytes(png(3000, 2000))
         client = self.client('read')
