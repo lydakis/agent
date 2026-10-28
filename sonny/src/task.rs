@@ -1082,65 +1082,83 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// What the repository at `repo` keeps that its origin lacks, by name:
+/// each branch, tag and stash, and HEAD, whose object origin does not
+/// have, with origin's URL. A tag is work as much as a branch, and a
+/// stash or a detached HEAD holds commits no branch does.
+fn unkept(repo: &Path) -> Result<(String, Vec<String>), String> {
+    let origin = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let refs = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(refname:short)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    let stashes = git(repo, &["stash", "list", "--format=%H commit %gd"])?;
+    let head = format!("{} commit HEAD", git(repo, &["rev-parse", "HEAD"])?);
+    let local = Path::new(&origin).is_dir();
+    let unkept = refs
+        .lines()
+        .chain(stashes.lines())
+        .chain([head.as_str()])
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            Some((parts.next()?, parts.next()?, parts.next()?))
+        })
+        .filter(|(object, kind, _)| match local {
+            // Any object origin has, it has with all it names.
+            true => git(Path::new(&origin), &["cat-file", "-e", object]).is_err(),
+            false if *kind == "commit" => git(repo, &["branch", "-r", "--contains", object])
+                .unwrap_or_default()
+                .is_empty(),
+            // A tag of a tree or blob, which no remote branch contains,
+            // can't be checked against a remote without asking it.
+            false => false,
+        })
+        .map(|(_, _, name)| name.to_owned())
+        .collect();
+    Ok((origin, unkept))
+}
+
 /// What of the task's work in its copy at `folder` is not in `here`, said
 /// in a few words, or nothing: a git copy's uncommitted changes and
 /// commits its origin lacks; any other copy's changes not applied here,
 /// but for git's own files and those git ignores.
 fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
     if folder.join(".git").exists() {
-        if !git(folder, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
-            return Ok("uncommitted changes in its copy".into());
-        }
-        // Every commit a name in the copy keeps, not only the one checked
-        // out: the copy goes with the commits that are only in it.
-        let origin = git(folder, &["remote", "get-url", "origin"]).unwrap_or_default();
-        // Branches and tags, a tag by the commit it names.
-        let refs = git(
+        // The copy's own repository, then each submodule checked out in it,
+        // which a push of the copy's branch does not push.
+        let subs = git(
             folder,
             &[
-                "for-each-ref",
-                "--format=%(objectname) %(*objectname) %(refname:short)",
-                "refs/heads",
-                "refs/tags",
+                "submodule",
+                "foreach",
+                "--quiet",
+                "--recursive",
+                "echo \"$displaypath\"",
             ],
         )?;
-        let mut tips: Vec<(String, String)> = refs
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.splitn(3, ' ');
-                let (tip, peeled, name) = (parts.next()?, parts.next()?, parts.next()?);
-                let tip = if peeled.is_empty() { tip } else { peeled };
-                Some((tip.to_owned(), name.to_owned()))
-            })
-            .collect();
-        // Every stash, and a detached HEAD's commits, which are on no branch.
-        let stashes = git(folder, &["stash", "list", "--format=%H %gd"])?;
-        tips.extend(
-            stashes
-                .lines()
-                .filter_map(|line| line.split_once(' '))
-                .map(|(tip, name)| (tip.to_owned(), name.to_owned())),
-        );
-        tips.push((git(folder, &["rev-parse", "HEAD"])?, "HEAD".into()));
-        let unpushed: Vec<&str> = tips
-            .iter()
-            .map(|(tip, name)| (tip.as_str(), name.as_str()))
-            .filter(|(tip, _)| match Path::new(&origin).is_dir() {
-                true => git(
-                    Path::new(&origin),
-                    &["cat-file", "-e", &format!("{tip}^{{commit}}")],
-                )
-                .is_err(),
-                false => git(folder, &["branch", "-r", "--contains", tip])
-                    .unwrap_or_default()
-                    .is_empty(),
-            })
-            .map(|(_, branch)| branch)
-            .collect();
-        return Ok(match unpushed.is_empty() {
-            true => String::new(),
-            false => format!("commits not pushed to {origin}, on {}", unpushed.join(", ")),
-        });
+        for sub in std::iter::once("").chain(subs.lines()) {
+            let repo = folder.join(sub);
+            let at = |what: &str| match sub {
+                "" => what.to_owned(),
+                sub => format!("{what} in its submodule {sub}"),
+            };
+            if !git(&repo, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+                return Ok(at("uncommitted changes in its copy"));
+            }
+            let (origin, unkept) = unkept(&repo)?;
+            if !unkept.is_empty() {
+                return Ok(at(&format!(
+                    "commits not pushed to {origin}, on {}",
+                    unkept.join(", ")
+                )));
+            }
+        }
+        return Ok(String::new());
     }
     let found = sandfs()?
         .changes(name, &ChangesOptions::default())
@@ -1200,10 +1218,13 @@ fn same_entry(a: &Path, b: &Path) -> bool {
     runs(a) == runs(b) && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
-/// The names of every agent the daemon has, or None when it can't say.
-fn agents(agent: &Path) -> Option<HashSet<String>> {
+/// The names of every agent the daemon on `socket` has, or None when it
+/// can't say.
+fn agents(agent: &Path, socket: &Path) -> Option<HashSet<String>> {
     let output = Command::new(agent)
         .arg("ls")
+        .arg("--socket")
+        .arg(socket)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -1220,9 +1241,10 @@ fn agents(agent: &Path) -> Option<HashSet<String>> {
 
 /// Mount again the task copies a restart unmounted, so a task never works
 /// in an empty folder: every workspace whose folder in `~/.agent/tasks`
-/// is there but not mounted, and whose task the daemon still has. Returns
+/// is there but not mounted, and whose task the daemon on `socket`, the
+/// one Sonny was opened on, still has. Returns
 /// what could not be mounted, after a word on copies whose task is gone.
-pub fn remount() -> Vec<String> {
+pub fn remount(socket: &Path) -> Vec<String> {
     let Ok(tasks) = tasks() else {
         return Vec::new();
     };
@@ -1237,7 +1259,7 @@ pub fn remount() -> Vec<String> {
     };
     // Unknown, as when the daemon can't be asked: mount them all rather
     // than leave a task in an empty folder.
-    let alive = crate::agent_bin().and_then(|agent| agents(&agent));
+    let alive = crate::agent_bin().and_then(|agent| agents(&agent, socket));
     let real = std::fs::canonicalize(&tasks).unwrap_or(tasks.clone());
     let mut said = Vec::new();
     let mut gone = Vec::new();
@@ -1402,6 +1424,69 @@ mod tests {
             .map(PathBuf::from)
             .to_vec()
         );
+    }
+
+    #[test]
+    fn a_git_copy_keeps_what_its_origin_lacks_in_its_submodules_too() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("sonny-unkept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "protocol.file.allow=always"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let (lib, top, copy) = (base.join("lib"), base.join("top"), base.join("copy"));
+        for repo in [&lib, &top] {
+            std::fs::create_dir_all(repo).unwrap();
+            run(repo, &["init", "-q", "-b", "main"]);
+            run(repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        }
+        run(
+            &top,
+            &["submodule", "add", "-q", &lib.to_string_lossy(), "lib"],
+        );
+        run(&top, &["commit", "-qm", "lib"]);
+        // A tag of a blob that origin has too is no work of the copy's.
+        let blob = run(&top, &["hash-object", "-w", ".gitmodules"]);
+        run(&top, &["tag", "blob", &blob]);
+        run(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--recurse-submodules",
+                &top.to_string_lossy(),
+                "copy",
+            ],
+        );
+        run(&copy, &["fetch", "-q", "origin", "refs/tags/*:refs/tags/*"]);
+        let left = |copy: &Path| not_here("demo", copy, &base).unwrap();
+        assert_eq!(left(&copy), "");
+        // A commit in the submodule that only the copy has, with the copy's
+        // own branch pushed.
+        let sub = copy.join("lib");
+        run(&sub, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        run(&copy, &["commit", "-qam", "lib two"]);
+        run(&copy, &["push", "-q", "origin", "main:task"]);
+        assert!(
+            left(&copy).starts_with("commits not pushed to ")
+                && left(&copy).ends_with(" in its submodule lib"),
+            "{}",
+            left(&copy)
+        );
+        run(&sub, &["push", "-q", "origin", "HEAD:refs/heads/task"]);
+        assert_eq!(left(&copy), "");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

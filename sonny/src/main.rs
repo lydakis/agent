@@ -789,7 +789,7 @@ async fn run() -> Result<(), String> {
     // Task copies a restart unmounted are mounted again before any task
     // works in its folder.
     if project.is_some()
-        && let Some(error) = task::remount().pop()
+        && let Some(error) = task::remount(&app.options.socket).pop()
     {
         app.notice = Some(error);
     }
