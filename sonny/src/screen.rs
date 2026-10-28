@@ -501,7 +501,8 @@ impl Screen {
     /// the punctuation around it.
     fn word(&self, (row, column): Spot, starts: bool) -> Spot {
         let row_cells = |r: usize| cells(&self.shown[r].line);
-        let word = |g: &String| !g.trim().is_empty();
+        // A wide character's second column is part of it.
+        let word = |g: &String| g.is_empty() || !g.trim().is_empty();
         // The word's cells, in order, and how many are before `column`.
         let mut before: Vec<(Spot, String)> = Vec::new();
         let (mut r, mut here) = (row, row_cells(row));
@@ -539,7 +540,10 @@ impl Screen {
             here = row_cells(r);
             c = self.shown[r].joins.unwrap_or(0);
         }
-        let is = |at: usize, set: &str| set.contains(cells[at].1.as_str());
+        let is = |at: usize, set: &str| {
+            let g = cells[at].1.as_str();
+            !g.is_empty() && set.contains(g)
+        };
         let (mut first, mut last) = (0, cells.len());
         while first < clicked && is(first, "(\"'[`<") {
             first += 1;
@@ -843,6 +847,17 @@ mod tests {
             screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 0));
         }
         assert_eq!(screen.selected().as_deref(), Some(word));
+    }
+
+    #[test]
+    fn a_double_click_takes_a_word_with_wide_characters() {
+        let lines = vec![Line::from("open src/你好.rs, then")];
+        let (mut screen, _) = screen(lines, 40, 3);
+        for _ in 0..2 {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0));
+        }
+        assert_eq!(screen.selected().as_deref(), Some("src/你好.rs"));
     }
 
     #[test]
