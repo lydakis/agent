@@ -1,11 +1,12 @@
 # Lookout
 
-`sonny lookout` wakes a bot when something it subscribed to needs it, and
-tells it what its tasks did. It is a Sonny feature and a client of the
-daemon like any other: it follows every bot, asks a cheap decision model a
-few yes-or-no questions about each event a subscription watches, and
-submits one short note to the subscriber. Neither the daemon nor the
-`agent` CLI knows of it.
+`sonny lookout` tells a bot what happened in the bots it subscribed to:
+every message someone else wrote in them and how each turn ended. It is a
+Sonny feature and a client of the daemon like any other: it follows every
+bot and submits one short note to the subscriber as soon as it rests,
+which decides itself what matters. A judge decides only what cannot wait
+for a busy subscriber's turn to end. Neither the daemon nor the `agent`
+CLI knows of it.
 
 The lookout knows no leads. Sonny subscribes each lead to its tasks when it
 opens the lead's project, and that subscription is what makes a lead hear
@@ -30,33 +31,37 @@ the next daemon starts the next lookout. Its own lines go to
 note it sends (`woke`) and each item it held and dropped because the lead
 read that turn itself first (`"skipped": "the lead read it"`).
 
+It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
+just before the oldest one whose news it has not told yet. A lookout that
+starts again, after a crash or a lost connection, takes what happened after
+that cursor as news, so a task that finished while no lookout ran, or whose
+news waited on a busy lead, still reaches its lead; news told already may
+be told again.
+
 ## What it checks
 
 What a lead's `tasks` subscription watches is every bot it or one of its
-tasks made, and every bot named `PROJECT.*`. Each of these is one check:
+tasks made, and every bot named `PROJECT.*`. Two events count:
 
-| Event | When | Questions |
-| --- | --- | --- |
-| Said | someone other than the lead writes in a task: the person, a program, another task | redirects, conflict, drifts (the person's words only) |
-| Ended | a task's turn ends, unless the lead is waiting on it | conflict, drifts, stuck, result (not on a turn the person asked for in the task) |
+| Event | When |
+| --- | --- |
+| Said | someone other than the lead writes in a task: the person, a program, another task |
+| Ended | a task's turn ends, unless the lead is waiting on it |
 
-`conflict` asks both whether the work collides with another task's and
-whether it holds something another task needs. An approval the person has
-not given and a turn that has printed nothing for 30 minutes need no
-judge: they are task updates. The judge
-reads the event's text, the lead's latest message to that task (its brief),
-the other tasks' briefs and latest lines, and the project's memory indexes.
-For `drifts` it also reads what passed in the task since the lead last
-wrote to it: the person's messages and the first line of each reply, the
-last 6. A yes asks the lead to settle what the person means and steer the
-task with that reading.
-
-A high answer (0.70 or more) to an urgent question (redirects, conflict)
-steers the lead at once with `--delivery steer`. Any other high answer
-goes in the next note, under "May need you", as soon as the lead rests,
-as task updates do. A middle one (0.35 or more)
-sends no note by itself and rides along with the next. The rest are only
-counted.
+Each is task updates (below), told unjudged once the lead rests. While the
+lead is in the middle of a turn, each is also one check, with one
+question, `interrupt`: can it not wait until that turn ends, because it
+changes what the lead or another task is doing right now, or the task is
+blocked on something only the lead or the person can give? The judge
+reads the event's text, the lead's latest message to that task (its
+brief), the other tasks' briefs and latest lines, and the project's memory
+indexes. A yes (0.70 or more) steers the lead at once with
+`--delivery steer`; anything else waits for the lead to rest, as all news
+does. A resting lead is never judged for: it hears everything anyway. A
+judge answers at most two checks at once for one subscriber, so many busy
+tasks never crowd the model pool they work in; up to 16 more wait their
+turn, one still waiting when the lead comes to rest is not asked, and
+past those the rest go unjudged, told once the lead rests.
 
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person
@@ -80,7 +85,7 @@ call answers with all of them:
 ```
 {"add": {"name": "deploys", "bots": ["ops.*"], "on": ["ended"],
   "look_for": [{"text": "a deploy finished or failed", "then": "tell the person which", "urgent": true}]}}
-{"add": {"name": "review", "tasks_of": ["review.lead"], "ask": ["conflict"], "context": "we own the parser"}}
+{"add": {"name": "review", "tasks_of": ["review.lead"], "ask": ["interrupt"], "context": "we own the parser"}}
 {}
 {"remove": "deploys"}
 ```
@@ -89,12 +94,12 @@ call answers with all of them:
   `bots` every bot its name matches, `*` matching any run of characters.
   A subscription needs one of them, and may have several.
 - `on` picks the events, `said` and `ended`; both by default.
-- `ask` asks only the built-in questions named; with no `ask`, a
-  subscription asks every one that fits the event, unless it looks for
-  something of its own, when it asks only that.
+- `ask: ["interrupt"]` asks the built-in question; with no `ask`, a
+  subscription asks it, unless it looks for something of its own, when it
+  asks only that.
 - `look_for` adds questions of the subscriber's own, each `text` with what
-  it does `then`: a high answer wakes it, steering when `urgent`, and a
-  middle one waits for the next note.
+  it does `then`, asked of every event it watches, busy or not; a yes
+  wakes it, steering when `urgent`.
 - `context` is a line every check of it reads.
 - `updates` adds the task updates below for the bots the subscriber made.
 
@@ -117,10 +122,13 @@ subscriptions, and how many checks each asked for in the last day.
 
 ## Task updates
 
-Some news needs no judge, and a subscriber whose subscription says
-`updates` gets it, with a judge or none, about the bots it made, less those
-with subscriptions of their own:
+A subscriber whose subscription says `updates` gets this news, with a
+judge or none, about the bots that subscription watches, less those with
+subscriptions of their own:
 
+- every message someone other than the subscriber writes in one: the
+  person's quoted, anyone else's named by who wrote it and the turn's
+  handle;
 - a turn the subscriber asked for and did not wait on, or another agent or a
   trigger asked for, once it ends;
 - an approval only the person can give, once it has waited 2 minutes;
@@ -146,21 +154,25 @@ the note until the next turn.
 One message, queued (or steered, for an urgent answer), with no origin:
 
 ```
-Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.
-May need you:
-- calc.docs: turn:calc.docs/3, the person wrote in it (redirects 0.97; pass it to every task it applies to): "Use tabs."
-Ended, waiting for an approval, or gone quiet:
+Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.
+- calc.docs: turn:calc.docs/3, the person wrote: "Use tabs."
+- calc.api: turn:calc.api/4, calc.fix wrote in it
 - calc.fix: turn:calc.fix/5 failed, asked by you
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
-4 other events checked; none needs you.
-A quoted message is the person's own words. Do what each line under "May need you" says where it holds; if nothing needs you, end with one line.
+A quoted message is the person's own words.
+Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 ```
+
+A note that steers a busy lead lists what was picked first, under "Picked
+by your lookout:", with why (`interrupt 0.90; it cannot wait for your turn
+to end`), and ends "Handle what cannot wait, then carry on with your turn."
 
 It quotes only the person's own words and names everything else by handle
 and status, so it reaches the approver as the person's and the lead can act
-on it without asking. A turn the judge picked is not listed again below.
-Sonny shows it folded, as `↳ Task updates`.
+on it without asking. Sonny shows it folded, as `↳ Task updates`, and a
+turn it started that ends with an empty reply stays there: no line under
+it and no sound. Anything the lead does write shows as any reply.
 
 ## The judge
 
