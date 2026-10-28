@@ -1476,12 +1476,22 @@ impl Service {
                         self.cursor = cursor;
                     }
                     // A lead opened in another folder moves there with its
-                    // next message, and so do the leads it hears and is heard by.
-                    if let (Some("accepted" | "queued"), Some(name), Some(at)) = (
+                    // next message, and so do the leads it hears and is heard
+                    // by. A steer's folder is for that message alone, so the
+                    // daemon's record says whether it moved. The replay's
+                    // records are listed as they are now.
+                    if let (true, Some("accepted" | "queued"), Some(name), Some(at)) = (
+                        live,
                         event["event"].as_str(),
                         event["bot"].as_str(),
                         event["data"]["workspace"].as_str(),
-                    ) && self.moved(name, at)
+                    ) && name.ends_with(".lead")
+                        && (self.records.get(name)).is_some_and(|r| r["workspace"].as_str() != Some(at))
+                        && let Ok(page) = client.request("bots", json!({"name": name, "limit": 1})).await
+                        && let Some(at) = (page["bots"].get(0))
+                            .filter(|bot| bot["name"] == name)
+                            .and_then(|bot| bot["workspace"].as_str())
+                        && self.moved(name, at)
                     {
                         for lookout in self.lookouts.values_mut() {
                             lookout.nest(&self.records);
@@ -1662,7 +1672,7 @@ impl Service {
         }
     }
 
-    /// Keeps a bot's folder as its latest message set it: whether a lead's
+    /// Keeps a lead's folder as the daemon lists it now: whether it
     /// changed, which changes which leads hear which.
     fn moved(&mut self, name: &str, at: &str) -> bool {
         let Some(record) = self.records.get_mut(name) else {
@@ -1675,7 +1685,7 @@ impl Service {
         if let Some(lookout) = self.lookouts.get_mut(name) {
             lookout.workspace = PathBuf::from(at);
         }
-        name.ends_with(".lead")
+        true
     }
 
     /// The subscriber's lookout, made once while its file lasts: whether it
