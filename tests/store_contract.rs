@@ -9600,8 +9600,15 @@ fn pictures_count_at_their_weight_and_go_whole() {
     let elision = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
     db.elide("Bob", &elision).unwrap();
     let elided = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
-    assert_eq!(elided.pictured, [window.pictured[0], 0, 0, 0]);
+    assert_eq!(elided.pictured, [0, 0, 0, 0]);
+    assert_eq!(elided.pictures, 0);
     let items = sent(&db, &elided);
+    // So does the prompt, with a line on its picture.
+    assert_eq!(
+        items[0]["content"],
+        json!([{"type":"input_text",
+            "text":"look\n[1 picture(s) sent with this message, elided from this request]"}])
+    );
     assert!(
         items[2]["output"]
             .as_str()
@@ -12234,4 +12241,61 @@ fn steer_batches_bound_the_bytes_of_their_pictures() {
     let absorbed = absorb(&mut db, absorbed.next_through);
     assert_eq!(absorbed.outcomes[0].0, submitted[2]);
     assert!(absorbed.next_through.is_none());
+}
+
+#[test]
+fn a_request_keeps_its_newest_pictures_and_older_ones_go_as_their_words() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let shot = noise(40);
+    for n in 0..6 {
+        let turn = db
+            .begin(
+                "Bob",
+                &n.to_string(),
+                &format!("look {n}"),
+                true,
+                &TurnOptions {
+                    images: vec![shot.clone(); 20],
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("seen")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let window = db.window("Bob", 8 << 20, 4096).unwrap().unwrap();
+    assert_eq!(window.pictures, 120);
+    sent(&db, &window);
+    // The newest 50 stay, so the floor goes through the fourth prompt from
+    // the end: two turns keep their pictures.
+    let plan = db
+        .picture_elision_plan("Bob", 50, i64::MAX)
+        .unwrap()
+        .unwrap();
+    db.elide("Bob", &plan).unwrap();
+    let window = db.window("Bob", 8 << 20, 4096).unwrap().unwrap();
+    assert_eq!(window.pictures, 40);
+    let items = sent(&db, &window);
+    assert_eq!(
+        items[0]["content"][0]["text"],
+        "look 0\n[20 picture(s) sent with this message, elided from this request]"
+    );
+    assert_eq!(items[8]["content"].as_array().unwrap().len(), 21);
+    // Their bytes beyond weight bound them too.
+    let extra = i64::from(window.pictured[10]);
+    assert!(extra > 0);
+    let plan = db.picture_elision_plan("Bob", 50, extra).unwrap().unwrap();
+    db.elide("Bob", &plan).unwrap();
+    let window = db.window("Bob", 8 << 20, 4096).unwrap().unwrap();
+    assert_eq!(window.pictures, 20);
+    sent(&db, &window);
+    // With nothing past the bound, the floor stays.
+    assert!(
+        db.picture_elision_plan("Bob", 50, i64::MAX)
+            .unwrap()
+            .is_none()
+    );
 }

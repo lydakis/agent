@@ -17,8 +17,8 @@ use agent_runtime::{
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     store::{
-        Bot, CallAnswer, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip,
-        TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Settings, Slot,
+        Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
@@ -903,13 +903,28 @@ impl Turn {
             (keep as i64, (budget / 16) as i64)
         };
         let bot = self.bot.clone();
-        let Some(plan) = self
-            .store
-            .read("elision_plan", move |db| {
-                db.elision_plan(&bot, keep, min_saving)
-            })
-            .await?
-        else {
+        self.elide_as(move |db| db.elision_plan(&bot, keep, min_saving))
+            .await
+    }
+
+    /// Elision for the pictures a request may take: past `MOST_PICTURES`
+    /// or `MOST_PICTURE_BYTES`, the oldest go as their stubs until half of
+    /// either remains, so the floor moves seldom. Like any elision, only
+    /// what the model has answered goes. Returns whether the floor moved.
+    async fn elide_pictures(&self) -> Result<bool> {
+        let bot = self.bot.clone();
+        self.elide_as(move |db| {
+            db.picture_elision_plan(&bot, MOST_PICTURES / 2, MOST_PICTURE_BYTES / 2)
+        })
+        .await
+    }
+
+    /// Move the elision floor as `plan` says, if it says to.
+    async fn elide_as(
+        &self,
+        plan: impl FnOnce(&Database) -> Result<Option<ElisionPlan>> + Send + 'static,
+    ) -> Result<bool> {
+        let Some(plan) = self.store.read("elision_plan", plan).await? else {
             return Ok(false);
         };
         let bot = self.bot.clone();
@@ -2186,6 +2201,22 @@ impl Turn {
                     .elide(context.prefix.bytes.len(), false, budget)
                     .await?
             {
+                made_room = true;
+                let elided = self
+                    .context(
+                        self.settings().context_bytes(),
+                        self.settings().context_items(),
+                        self.settings().context_bytes() * 2 / 3,
+                    )
+                    .await?;
+                let sent = std::mem::replace(&mut context, elided);
+                if std::mem::take(&mut inherited) && last.is_none() {
+                    last = LastCall::of(&sent, false);
+                }
+            }
+            // So do pictures past what a request takes, for any bot: their
+            // stubs name no tool.
+            if !resuming && context.overpictured() && self.elide_pictures().await? {
                 made_room = true;
                 let elided = self
                     .context(
@@ -4181,7 +4212,24 @@ impl Context {
             w.unsummarized.with_prefix(&self.prefix)
         })
     }
+    /// Whether the window sends more pictures than a request takes.
+    fn overpictured(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| {
+            w.pictures > MOST_PICTURES
+                || w.pictured
+                    .iter()
+                    .map(|&bytes| i64::from(bytes.max(0)))
+                    .sum::<i64>()
+                    > MOST_PICTURE_BYTES
+        })
+    }
 }
+
+/// The most pictures a request sends, and the most bytes they add beyond
+/// their weight, which the context budget does not bound: Anthropic takes
+/// 100 pictures and 32 MB in a request.
+const MOST_PICTURES: i64 = 100;
+const MOST_PICTURE_BYTES: i64 = 20 << 20;
 
 /// A bound on what a summary's request adds to what it summarizes: the
 /// request after a copy, or the frame of a request of its own.
