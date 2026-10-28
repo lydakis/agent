@@ -1,7 +1,8 @@
 //! The pane beside the conversation on the full screen, where what the
 //! person opens to look at goes instead of over the conversation: a file
-//! they clicked, as a preview. Its rows are a [`Screen`] of their own, so
-//! they scroll, select, copy and follow links as the conversation's do.
+//! they clicked, as a preview, or `/status`. Its rows are a [`Screen`] of
+//! their own, so they scroll, select, copy and follow links as the
+//! conversation's do.
 use std::path::{Path, PathBuf};
 
 use ratatui::{
@@ -39,10 +40,15 @@ pub struct Pane {
     /// What the pane shows, as its first row says it.
     title: String,
     /// The file, opened outside Sonny when the title is clicked.
-    path: PathBuf,
+    path: Option<PathBuf>,
     pub screen: Screen,
     /// Where it was drawn last: its title row and its rows.
     pub area: Rect,
+    /// A card's lines as last set, drawn anew from the app's own state
+    /// (`/status`), rather than a file read once.
+    card: Option<Vec<Line<'static>>>,
+    /// What the keys do here, after the title while they go to it.
+    keys: &'static str,
 }
 
 impl Pane {
@@ -60,15 +66,46 @@ impl Pane {
         screen.show_row(target.saturating_sub(ABOVE));
         Ok(Self {
             title,
-            path,
+            path: Some(path),
             screen,
             area: Rect::default(),
+            card: None,
+            keys: "esc closes",
         })
     }
 
-    /// The file's address, to open it outside.
-    pub fn url(&self) -> String {
-        format!("file://{}", self.path.display())
+    /// A card titled `title` whose lines the app sets as they change,
+    /// as `/status` counts on; `keys` says what the keys do on it.
+    pub fn card(title: &str, keys: &'static str) -> Self {
+        Self {
+            title: title.to_owned(),
+            path: None,
+            screen: Screen::default(),
+            area: Rect::default(),
+            card: Some(Vec::new()),
+            keys,
+        }
+    }
+
+    /// Whether this is a card, not a file.
+    pub fn is_card(&self) -> bool {
+        self.card.is_some()
+    }
+
+    /// A card's lines, put in only when they changed, so a selection in
+    /// them lasts while they do not, and the view stays where it was.
+    pub fn set_card(&mut self, lines: Vec<Line<'static>>, keys: &'static str) {
+        self.keys = keys;
+        if self.card.as_ref() != Some(&lines) {
+            self.screen.replace(lines.clone());
+            self.card = Some(lines);
+        }
+    }
+
+    /// The file's address, to open it outside, if it shows one.
+    pub fn url(&self) -> Option<String> {
+        let path = self.path.as_ref()?;
+        Some(format!("file://{}", path.display()))
     }
 
     /// Whether `(column, row)` is on the title, which opens the file.
@@ -90,10 +127,17 @@ impl Pane {
         if area.height == 0 {
             return;
         }
-        let keys = if focused { "  esc closes " } else { "  tab " };
+        let keys = match focused {
+            true => format!("  {} ", self.keys),
+            false => "  tab ".to_owned(),
+        };
         let room = (area.width as usize).saturating_sub(keys.width() + 1);
         let title = crate::transcript::cut(&self.title, room);
-        let mut style = Style::new().add_modifier(Modifier::UNDERLINED);
+        let mut style = Style::new();
+        // A file's name is a link to it.
+        if self.path.is_some() {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
         if !focused {
             style = style.add_modifier(Modifier::DIM);
         } else {

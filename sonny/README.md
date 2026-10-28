@@ -164,7 +164,8 @@ off again never shows.
   nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
   the gate it had; a pick reaches every agent the lead made too, one busy
   now once it is idle.
-- `/status` shows the project's agents, and its running Errand jobs. The
+- `/status` shows the project's agents, and its running Errand jobs, in
+  the pane beside the conversation on the full screen. The
   lead comes first; its tasks follow grouped by where they stand: **Needs
   you** (waiting on your approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
@@ -321,5 +322,7 @@ the choice is kept with the other settings.
 ![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)
 
 ![README.md beside the chat, read as a reply: headings, a list, a table and a Python block in color](../docs/sonny/pane-markdown.png)
+
+![/status beside the conversation, its times still counting](../docs/sonny/pane-status.png)
 
 `demo/` has the scripted model and folder the recordings use.

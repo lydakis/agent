@@ -1186,7 +1186,9 @@ struct Latest {
 /// `/status` on its own screen, its timers ticking and its rows read
 /// again every two seconds, until Esc.
 struct Watch {
-    screen: Tui,
+    /// Its own screen, inline; none on the full screen, where it is drawn
+    /// in the pane beside the conversation.
+    screen: Option<Tui>,
     project: String,
     rows: Vec<status::Row>,
     /// This project's active Errand jobs.
@@ -2173,8 +2175,7 @@ impl App {
                 self.older().await;
             }
             self.repaint |= term::switched();
-            if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
-            {
+            if self.repaint && self.running.is_none() && !self.watching() && self.side.is_none() {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
@@ -3604,7 +3605,22 @@ impl App {
             }
         };
         let jobs = errand::jobs(self.folder_name()).await;
-        // The full screen is the alternate screen already.
+        // The full screen shows it beside the conversation.
+        if full() {
+            self.watch = Some(Watch {
+                screen: None,
+                project,
+                rows,
+                jobs,
+                read: Instant::now(),
+                lookout: self.lookout_line(),
+                resolved: false,
+            });
+            self.pane = Some(pane::Pane::card("/status", STATUS_KEYS));
+            self.pane_keys = true;
+            self.screen.unselect();
+            return;
+        }
         if !full() {
             let _ = execute!(std::io::stdout(), EnterAlternateScreen);
         }
@@ -3615,7 +3631,7 @@ impl App {
                     let _ = screen.clear();
                 }
                 self.watch = Some(Watch {
-                    screen,
+                    screen: Some(screen),
                     project,
                     rows,
                     jobs,
@@ -4031,8 +4047,11 @@ impl App {
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
                         // A click on its name opens the file outside Sonny.
-                        if down && pane.on_title(mouse.column, mouse.row) {
-                            if let Err(error) = open(&pane.url()) {
+                        if down
+                            && pane.on_title(mouse.column, mouse.row)
+                            && let Some(url) = pane.url()
+                        {
+                            if let Err(error) = open(&url) {
                                 self.notice = Some(error);
                             }
                             return true;
@@ -4072,6 +4091,13 @@ impl App {
                     KeyCode::Esc => {
                         self.pane = None;
                         self.pane_keys = false;
+                    }
+                    // `/status` lists the resolved tasks, or only counts them.
+                    KeyCode::Char('r')
+                        if pane.is_card()
+                            && let Some(watch) = &mut self.watch =>
+                    {
+                        watch.resolved = !watch.resolved
                     }
                     KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
@@ -4158,6 +4184,11 @@ impl App {
         true
     }
 
+    /// `/status` has a screen of its own.
+    fn watching(&self) -> bool {
+        self.watch.as_ref().is_some_and(|w| w.screen.is_some())
+    }
+
     /// A link clicked on the full screen: a file is shown in the pane, as
     /// a preview, and anything else opened as the system opens it.
     fn follow(&mut self, link: &str) {
@@ -4238,10 +4269,12 @@ impl App {
             key.code = KeyCode::Backspace;
             key.modifiers = KeyModifiers::NONE;
         }
-        if full() && self.watch.is_none() && self.full_screen(&event) {
+        if full() && !self.watching() && self.full_screen(&event) {
             return;
         }
-        if let Some(watch) = &mut self.watch {
+        if let Some(watch) = &mut self.watch
+            && watch.screen.is_some()
+        {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
                 && key.code == KeyCode::Char('r')
@@ -5105,7 +5138,13 @@ impl App {
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
-        if self.watch.is_some() || self.side.is_some() {
+        // /status beside the conversation, gone once the pane is.
+        if self.watch.as_ref().is_some_and(|w| w.screen.is_none())
+            && !self.pane.as_ref().is_some_and(|p| p.is_card())
+        {
+            self.watch = None;
+        }
+        if self.watching() || self.side.is_some() {
             // History waits for the main screen, its newest lines kept.
             if let Some(over) = self.pending.len().checked_sub(KEPT_UNDER_STATUS)
                 && over > 0
@@ -5202,6 +5241,20 @@ impl App {
         }
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
+        if let (Some(watch), Some(pane)) = (&self.watch, &mut self.pane)
+            && pane.is_card()
+        {
+            let wide = match chat.width {
+                0 => size.width,
+                _ => pane::width(size.width, PROSE as u16),
+            };
+            let (lines, any_resolved) = watch_card(watch, wide.saturating_sub(2) as usize);
+            let keys = match any_resolved && watch.resolved {
+                true => "r hides resolved · esc closes",
+                false => STATUS_KEYS,
+            };
+            pane.set_card(lines, keys);
+        }
         // The full screen's links, to be written again as hyperlinks.
         let mut linked = Vec::new();
         terminal.draw(|frame| {
@@ -5625,44 +5678,25 @@ impl App {
 
 /// `/status` on its own screen: the card, its times counted on since it was
 /// read, and how to leave.
+/// What the pane's title row says the keys do on `/status`.
+const STATUS_KEYS: &str = "esc closes";
+
+/// `/status` on its own screen, inline.
 fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
-    let since = watch.read.elapsed().as_secs();
-    let rows: Vec<status::Row> = watch
-        .rows
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            row.seconds = row.seconds.map(|s| s + since);
-            row
-        })
-        .collect();
-    let jobs: Vec<status::Row> = watch
-        .jobs
-        .iter()
-        .cloned()
-        .map(|mut job| {
-            job.seconds = job.seconds.map(|s| s + since);
-            job
-        })
-        .collect();
-    let project = watch.project.clone();
-    let lookout = watch.lookout.clone();
+    let Some(screen) = &mut watch.screen else {
+        return Ok(());
+    };
+    screen.autoresize()?;
+    let width = screen.size()?.width.saturating_sub(2) as usize;
     let resolved = watch.resolved;
-    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    watch.screen.autoresize()?;
-    watch.screen.draw(|frame| {
+    let (card, any_resolved) = watch_card(watch, width);
+    let mut lines = vec![Line::default()];
+    lines.extend(card);
+    let Some(screen) = &mut watch.screen else {
+        return Ok(());
+    };
+    screen.draw(|frame| {
         let area = frame.area();
-        let width = area.width.saturating_sub(2) as usize;
-        let mut lines = vec![Line::default()];
-        let mut card = status::card(&project, &rows, &jobs, width, resolved);
-        if !lookout.is_empty() {
-            card.insert(1, Line::from(lookout.clone()).dim());
-        }
-        lines.extend(card.into_iter().map(|line| {
-            let mut spans = vec![Span::raw(" ")];
-            spans.extend(line.spans);
-            Line::from(spans).style(line.style)
-        }));
         // The card says r shows them; once shown, here how to hide them.
         let footer = match any_resolved && resolved {
             true => "  esc to close · r hides resolved",
@@ -5682,6 +5716,45 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         frame.render_widget(Paragraph::new(footer), foot);
     })?;
     Ok(())
+}
+
+/// `/status`'s card at `width`, each line after a space, its times
+/// counted on from when its rows were read; and whether any task in it
+/// is resolved.
+fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
+    let since = watch.read.elapsed().as_secs();
+    let rows: Vec<status::Row> = watch
+        .rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.seconds = row.seconds.map(|s| s + since);
+            row
+        })
+        .collect();
+    let jobs: Vec<status::Row> = watch
+        .jobs
+        .iter()
+        .cloned()
+        .map(|mut job| {
+            job.seconds = job.seconds.map(|s| s + since);
+            job
+        })
+        .collect();
+    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
+    let mut card = status::card(&watch.project, &rows, &jobs, width, watch.resolved);
+    if !watch.lookout.is_empty() {
+        card.insert(1, Line::from(watch.lookout.clone()).dim());
+    }
+    let lines = card
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect();
+    (lines, any_resolved)
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.

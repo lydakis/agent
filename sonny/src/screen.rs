@@ -178,6 +178,19 @@ impl Screen {
         });
     }
 
+    /// Its lines replaced by `lines`, the view kept as far down from the
+    /// first row as it was.
+    pub fn replace(&mut self, lines: Vec<Line<'static>>) {
+        let top = self.top;
+        *self = Self {
+            area: self.area,
+            clicks: self.clicks.take(),
+            ..Self::default()
+        };
+        self.push(lines);
+        self.go_to = Some(top);
+    }
+
     /// The view put with the line `row` of those pushed at its top.
     pub fn show_row(&mut self, row: usize) {
         self.go_to = Some(row);
