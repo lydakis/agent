@@ -73,6 +73,8 @@ struct Presence {
     /// The last report's number: Herdr drops one that is not above it,
     /// so a late report cannot undo a newer one.
     seq: AtomicU64,
+    /// Whether Herdr shows the bot by name: it keeps that until Sonny
+    /// releases the pane, so it is said once, not with every report.
     named: AtomicBool,
 }
 
@@ -181,11 +183,15 @@ impl Presence {
             }
             // Shown by name once Herdr holds the agent; a name another live
             // agent has is left to it.
+            if self.named.load(Ordering::Relaxed) {
+                return;
+            }
             let display: Vec<&str> = display.iter().map(String::as_str).collect();
-            run(&self.bin, &display, limit);
-            if let Some(name) = &self.name
-                && !self.named.swap(true, Ordering::Relaxed)
-            {
+            if !run(&self.bin, &display, limit) {
+                return;
+            }
+            self.named.store(true, Ordering::Relaxed);
+            if let Some(name) = &self.name {
                 run(&self.bin, &["agent", "rename", &self.pane, name], limit);
             }
         }))
@@ -924,9 +930,7 @@ if out is not None:
                 "report-metadata",
                 "rename",
                 "report-agent blocked",
-                "report-metadata",
                 "report-agent idle",
-                "report-metadata",
                 "release-agent",
             ]
         );
@@ -991,7 +995,6 @@ if out is not None:
                 call("report-metadata", false),
                 call("rename", false),
                 call("report-agent", false),
-                call("report-metadata", false),
             ]
         );
     }
