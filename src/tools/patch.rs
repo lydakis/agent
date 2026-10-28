@@ -546,8 +546,32 @@ const COMPARED: usize = 50_000_000;
 /// comparisons left.
 struct Haystack<'a> {
     lines: &'a [&'a str],
-    plain: Option<Vec<String>>,
+    plain: Option<Plain>,
     left: usize,
+}
+
+/// A file's lines trimmed with punctuation made plain, packed into one
+/// string so a file of many short lines is not one allocation a line.
+struct Plain {
+    text: String,
+    ends: Vec<usize>,
+}
+
+impl Plain {
+    fn of(lines: &[&str]) -> Self {
+        let mut text = String::new();
+        let mut ends = Vec::with_capacity(lines.len());
+        for line in lines {
+            text.extend(line.trim().chars().map(plain));
+            ends.push(text.len());
+        }
+        Self { text, ends }
+    }
+
+    fn line(&self, at: usize) -> &str {
+        let start = if at == 0 { 0 } else { self.ends[at - 1] };
+        &self.text[start..self.ends[at]]
+    }
 }
 
 impl Haystack<'_> {
@@ -558,7 +582,7 @@ impl Haystack<'_> {
             0 => line,
             1 => line.trim_end(),
             2 => line.trim(),
-            _ => &self.plain.as_ref().unwrap()[at],
+            _ => self.plain.as_ref().unwrap().line(at),
         }
     }
 }
@@ -597,12 +621,7 @@ fn seek(
     let from = if end_of_file { last.max(start) } else { start };
     for pass in 0..4 {
         if pass == 3 && hay.plain.is_none() {
-            hay.plain = Some(
-                hay.lines
-                    .iter()
-                    .map(|l| normal(3, l).into_owned())
-                    .collect(),
-            );
+            hay.plain = Some(Plain::of(hay.lines));
         }
         let wanted: Vec<_> = pattern.iter().map(|line| normal(pass, line)).collect();
         for at in (from..=last).chain(start..from.min(last + 1)) {
