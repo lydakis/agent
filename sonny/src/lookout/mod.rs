@@ -1475,6 +1475,18 @@ impl Service {
                     if live && cursor > self.cursor {
                         self.cursor = cursor;
                     }
+                    // A lead opened in another folder moves there with its
+                    // next message, and so do the leads it hears and is heard by.
+                    if let (Some("accepted" | "queued"), Some(name), Some(at)) = (
+                        event["event"].as_str(),
+                        event["bot"].as_str(),
+                        event["data"]["workspace"].as_str(),
+                    ) && self.moved(name, at)
+                    {
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.nest(&self.records);
+                        }
+                    }
                     if let (Some("created" | "forked"), Some(name)) =
                         (event["event"].as_str(), event["bot"].as_str())
                     {
@@ -1648,6 +1660,22 @@ impl Service {
                 lookout.wake(&client).await;
             }
         }
+    }
+
+    /// Keeps a bot's folder as its latest message set it: whether a lead's
+    /// changed, which changes which leads hear which.
+    fn moved(&mut self, name: &str, at: &str) -> bool {
+        let Some(record) = self.records.get_mut(name) else {
+            return false;
+        };
+        if record["workspace"].as_str() == Some(at) {
+            return false;
+        }
+        record["workspace"] = json!(at);
+        if let Some(lookout) = self.lookouts.get_mut(name) {
+            lookout.workspace = PathBuf::from(at);
+        }
+        name.ends_with(".lead")
     }
 
     /// The subscriber's lookout, made once while its file lasts: whether it
@@ -3524,6 +3552,49 @@ mod tests {
         assert!(nested("ui.lead", Path::new("/w/web/ui"), &records, None).is_empty());
         // The home folder's lead leads no others.
         assert!(nested("ws.lead", Path::new("/w"), &records, Some(Path::new("/w"))).is_empty());
+    }
+
+    #[test]
+    fn a_lead_that_moves_is_heard_by_its_new_folder_s_lead() {
+        let record =
+            |name: &str, at: &str| (name.to_owned(), json!({"name": name, "workspace": at}));
+        let mut service = Service {
+            store: PathBuf::new(),
+            records: [
+                record("a.lead", "/a"),
+                record("b.lead", "/b"),
+                record("web.lead", "/a/web"),
+            ]
+            .into(),
+            subscribers: HashMap::new(),
+            socket: PathBuf::new(),
+            judge: None,
+            lookouts: HashMap::new(),
+            judges: HashMap::new(),
+            log: PathBuf::new(),
+            seated: 0,
+            live: false,
+            cursor: None,
+            saved: None,
+            resume: None,
+        };
+        for (lead, at) in [("a.lead", "/a"), ("b.lead", "/b")] {
+            let mut lookout = Lookout::new(lead, PathBuf::from(at), None);
+            lookout.nest(&service.records);
+            service.lookouts.insert(lead.into(), lookout);
+        }
+        assert!(service.lookouts["a.lead"].inside.contains("web.lead"));
+        // Messages in the same folder move nothing.
+        assert!(!service.moved("web.lead", "/a/web"));
+        assert!(service.moved("web.lead", "/b/web"));
+        for lookout in service.lookouts.values_mut() {
+            lookout.nest(&service.records);
+        }
+        assert!(service.lookouts["a.lead"].inside.is_empty());
+        assert!(service.lookouts["b.lead"].inside.contains("web.lead"));
+        // A subscriber that moves reads its new folder.
+        assert!(service.moved("b.lead", "/c"));
+        assert_eq!(service.lookouts["b.lead"].workspace, PathBuf::from("/c"));
     }
 
     #[test]
