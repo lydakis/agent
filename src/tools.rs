@@ -150,9 +150,19 @@ pub struct Declared {
     /// What the model reads as the call's result.
     #[serde(default = "declared_result")]
     pub result: String,
+    /// Whether a bot this one creates takes the tool too; `false` keeps it
+    /// the declaring bot's own.
+    #[serde(default = "inherited", skip_serializing_if = "is_inherited")]
+    pub inherit: bool,
 }
 fn declared_result() -> String {
     "ok".into()
+}
+fn inherited() -> bool {
+    true
+}
+fn is_inherited(inherit: &bool) -> bool {
+    *inherit
 }
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 16;

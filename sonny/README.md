@@ -150,7 +150,16 @@ off again never shows.
   nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
   the gate it had; a pick reaches every agent the lead made too, one busy
   now once it is idle.
-- `/status` shows the project's agents, and its running Errand jobs.
+- `/status` shows the project's agents, and its running Errand jobs. The
+  lead comes first; its tasks follow grouped by where they stand: **Needs
+  you** (waiting on your approval, asking you a question, or failed),
+  **Working** (a turn running, queued, rate limited or waiting on other
+  tasks), **Ready for review** (finished, its last reply linking a pull
+  request), **Idle** (finished or stopped with nothing open), and
+  **Resolved**, only counted until `r` shows them. The lead marks a task
+  resolved with its `resolve_task` tool once nothing is left to do in it,
+  such as when its pull request merged or you dropped the work, and the
+  task's window closes. New work sent to the task reopens it.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
@@ -198,11 +207,16 @@ off again never shows.
 
 Sonny declares three tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask` and `plan` (the plan the
-person sees, as a checklist). The daemon shows them to the model and records
-each call without running anything; Sonny draws the calls, live and from
-history.
+person sees, as a checklist), and on a lead `resolve_task` too. The daemon
+shows them to the model and records each call without running anything;
+Sonny draws the calls, live and from history. The lead's Sonny keeps each
+task the lead resolved beside the store (`state.sqlite.resolved/`), with
+the task's newest turn finished by then: a turn of the task numbered after
+that one reopens it.
 
 ![A plan and a question set with the plan and ask tools](../docs/sonny/ask-and-plan.png)
+
+![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
 At each start Sonny writes what every agent leans on: the
