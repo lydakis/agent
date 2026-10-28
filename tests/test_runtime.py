@@ -319,6 +319,21 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'echo:' + json.dumps(outputs[-1])
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
+            elif user.startswith('para:'):
+                # `para:CMD|CMD|...`: every command in one response, then
+                # the results in the order they were recorded.
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                            and not i['content'][0]['text'].startswith('steer:'))
+                outputs = [i for i in request['input'][start:] if i.get('type') == 'function_call_output']
+                text = ''
+                if not outputs:
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'para-{n}',
+                               'arguments': json.dumps({'command': command, 'timeout_ms': 5000})}
+                              for n, command in enumerate(user[5:].split('|'), 1)]
+                else:
+                    text = 'echo:' + json.dumps([i['call_id'] for i in outputs])
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user.startswith('sayslow:'):
                 # An answer and a slow command in one response, then a word
                 # for whatever steered it.

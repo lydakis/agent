@@ -403,6 +403,46 @@ class WaitTests(ModelFixture):
         result = self.tool_output(client, 'Bob', 'wait-2')['results'][lifted['handle']]
         self.assertEqual((result['stdout'], result['exit_code']), ('done', 0))
 
+    def test_commands_in_one_response_run_together_and_record_in_order(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        # The first ends last: results still go in call order.
+        commands = ['sleep .9; printf 1'] + [f'sleep .6; printf {n}' for n in range(2, 7)]
+        started = time.monotonic()
+        submitted = client.request('submit', bot='Bob', request_id='p', prompt='para:' + '|'.join(commands))['result']
+        turn = submitted['turn']
+        finished = client.finished(turn)['data']
+        elapsed = time.monotonic() - started
+        self.assertEqual(finished['status'], 'completed')
+        # Four at a time: two waves, not six commands in a row.
+        self.assertGreater(elapsed, 1.2)
+        self.assertLess(elapsed, 3.0)
+        ids = [f'para-{n}' for n in range(1, 7)]
+        result = client.request('wait', handles=[submitted['handle']])['result']['results'][submitted['handle']]
+        self.assertEqual(result['text'], 'echo:' + json.dumps(ids))
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual([e['data']['call_id'] for e in events if e['event'] == 'tool_completed'], ids)
+        for n, call in enumerate(ids, 1):
+            self.assertEqual(self.tool_output(client, 'Bob', call)['stdout'], str(n))
+
+    def test_a_steer_moves_every_running_command_to_the_background(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='p',
+                              prompt='para:sleep 1.5; printf a|sleep 1.5; printf b|printf c')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
+                       and m['data']['call_id'] == 'para-3')
+        time.sleep(.2)
+        sent = time.monotonic()
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
+        done = client.finished(steer['turn'])['data']
+        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        self.assertLess(time.monotonic() - sent, 1.0)
+        for call in ('para-1', 'para-2'):
+            lifted = self.tool_output(client, 'Bob', call)
+            self.assertEqual((lifted['background'], lifted['steered']), (True, True))
+        self.assertEqual(self.tool_output(client, 'Bob', 'para-3')['stdout'], 'c')
+
     def test_a_command_that_ends_soon_after_a_steer_returns_as_usual(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
