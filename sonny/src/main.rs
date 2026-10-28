@@ -1297,7 +1297,7 @@ struct App {
     /// The full screen was scrolled past its first row: older items are
     /// read, and the view held where it was while all is drawn again.
     want_older: bool,
-    hold_back: Option<usize>,
+    hold_view: bool,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -1962,7 +1962,7 @@ impl App {
             first_node: None,
             older: None,
             want_older: false,
-            hold_back: None,
+            hold_view: false,
             verbose: false,
             instruct: None,
             move_to: None,
@@ -2388,8 +2388,9 @@ impl App {
             own_screen(!full());
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
+        let back = self.screen.back();
         self.screen.clear();
-        if let Some(back) = self.hold_back.take() {
+        if std::mem::take(&mut self.hold_view) {
             self.screen.hold(back);
         }
         if !full() {
@@ -2445,7 +2446,7 @@ impl App {
         };
         self.first_node = Some(oldest);
         self.older = page["next_from"].as_i64();
-        self.hold_back = Some(self.screen.back());
+        self.hold_view = true;
         self.repaint = true;
         if self.running.is_some() {
             self.notice = Some("older messages once this turn ends".into());
