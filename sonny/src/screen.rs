@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier},
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -91,7 +91,7 @@ pub struct Screen {
     /// How many rows the view is scrolled up from the newest.
     back: usize,
     /// Where the rows were drawn last, the first one drawn there, and
-    /// how many: the bottom one is a note while scrolled back.
+    /// how many.
     area: Rect,
     top: usize,
     drawn: usize,
@@ -161,12 +161,9 @@ impl Screen {
         self.back = self.back.saturating_add_signed(rows).min(most);
     }
 
-    /// How far back the view can go with `height` rows: to the first row,
-    /// with the note under the rows.
+    /// How far back the view can go with `height` rows: to the first row.
     fn most(&self, height: usize) -> usize {
-        (self.shown.len() + 1)
-            .saturating_sub(height)
-            .min(self.shown.len())
+        self.shown.len().saturating_sub(height)
     }
 
     /// A page up or down.
@@ -257,10 +254,8 @@ impl Screen {
         self.layout(area.width as usize);
         let height = area.height as usize;
         self.back = self.back.min(self.most(height));
-        // While scrolled back, the bottom row is the note, over no row.
-        let rows = height - usize::from(self.back > 0 && height > 1);
         let bottom = self.shown.len() - self.back;
-        let top = bottom.saturating_sub(rows);
+        let top = bottom.saturating_sub(height);
         self.area = area;
         self.top = top;
         self.drawn = bottom - top;
@@ -300,25 +295,6 @@ impl Screen {
                     cell.modifier = (cell.modifier - Modifier::DIM) | Modifier::REVERSED;
                 }
             }
-        }
-        if self.back > 0 && height > 0 {
-            let y = area.y + area.height - 1;
-            let note = Line::from(vec![
-                Span::raw(" ↓ "),
-                Span::raw(format!("{} newer rows", self.back)),
-                Span::raw(" · click, PgDn or Enter for the latest ").dim(),
-            ])
-            .style(Style::new().reversed());
-            let row = Rect {
-                y,
-                height: 1,
-                ..area
-            };
-            for x in row.left()..row.right() {
-                buf[(x, y)].reset();
-            }
-            buf.set_line(area.x, y, &note, area.width);
-            buf.set_style(row, Style::new().reversed());
         }
     }
 
@@ -392,12 +368,6 @@ impl Screen {
                 self.selection = None;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // The "newer rows" note is a button back to the latest.
-                if self.back > 0 && event.row + 1 == self.area.bottom() {
-                    self.back = 0;
-                    self.selection = None;
-                    return None;
-                }
                 let spot = self.spot(event.column, event.row)?;
                 let now = Instant::now();
                 let clicks = match self.clicks {
@@ -873,19 +843,6 @@ mod tests {
     }
 
     #[test]
-    fn the_note_over_the_bottom_row_is_not_selected() {
-        let lines: Vec<Line> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
-        let (mut screen, _) = screen(lines, 20, 5);
-        screen.mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
-        let area = Rect::new(0, 0, 20, 5);
-        screen.render(area, &mut Buffer::empty(area), |_| None);
-        assert_eq!(
-            drag(&mut screen, (0, 0), (19, 4)),
-            Some(Action::Copy("row 13\nrow 14\nrow 15\nrow 16".into()))
-        );
-    }
-
-    #[test]
     fn no_room_for_rows_draws_none() {
         let url = "https://example.com/a/very/long/path/to/a/page";
         let lines = crate::transcript::wrap(Line::from(url), 20, Span::raw(""), Span::raw(""));
@@ -936,14 +893,13 @@ mod tests {
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
-        assert_eq!(row(&buf, 0).trim_end(), "row 13");
-        assert!(row(&buf, 4).contains("3 newer rows"));
+        assert_eq!(row(&buf, 0).trim_end(), "row 12");
+        assert_eq!(row(&buf, 4).trim_end(), "row 16");
         screen.push(vec![Line::from("row 20")]);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
-        assert_eq!(row(&buf, 0).trim_end(), "row 13");
-        // The note is a way back.
-        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 4));
+        assert_eq!(row(&buf, 0).trim_end(), "row 12");
+        screen.latest();
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 4).trim_end(), "row 20");

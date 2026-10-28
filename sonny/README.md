@@ -265,18 +265,17 @@ opened). Commands, reads and edits are left out. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-`/fullscreen` lets Sonny own the whole screen instead, as Codex does by
-default, and is kept with the other settings (`/fullscreen` again goes back
-to inline). The conversation is Sonny's to draw, so it rewraps when the
-window changes size and the wheel scrolls it; rows that arrive while you
-have scrolled back leave the view still, under a note that a click, PgDn or
-Enter takes you back to the latest. Copying needs no key held: a drag
-selects and copies when you let go, a double click takes a word and a
-triple click its line, Ctrl+C copies a selection instead of
+Sonny owns the whole screen, as Codex does. The conversation is Sonny's
+to draw, so it rewraps when the window changes size and the wheel scrolls
+it; rows that arrive while you have scrolled back leave the view still,
+and PgDn or Enter takes you back to the latest. Copying needs no key held:
+a drag selects and copies when you let go, a double click takes a word and
+a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
-Sonny drew around it. A click on a link opens it. Full screen is new and
-off by default.
+Sonny drew around it. A click on a link opens it. `/fullscreen` switches
+to inline, where Sonny writes into the terminal's own scrollback, and back;
+the choice is kept with the other settings.
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
