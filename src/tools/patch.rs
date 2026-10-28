@@ -18,9 +18,10 @@
 //! *** End Patch
 //! ```
 use super::{FILE_BYTES, files};
-use crate::{Error, Result};
+use crate::{Error, Result, sandbox::Policy};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The Lark grammar OpenAI models are given for this tool, as Codex gives
 /// it. A model sends a patch that fits it as the call's raw input.
@@ -212,9 +213,9 @@ impl Patch {
     }
 
     /// Apply the patch under `workspace`: read and check every file first,
-    /// then write. The summary lists each file as added (A), modified (M)
-    /// or deleted (D).
-    pub async fn apply(&self, workspace: &Path) -> Result<String> {
+    /// then write, in `sandbox` when the bot has one. The summary lists each
+    /// file as added (A), modified (M) or deleted (D).
+    pub async fn apply(&self, workspace: &Path, sandbox: Option<Arc<Policy>>) -> Result<String> {
         enum Write {
             /// A file's new contents, and for a move the permissions of the
             /// file it came from.
@@ -294,14 +295,13 @@ impl Patch {
         for write in writes {
             match write {
                 Write::Put(target, contents, permissions) => {
-                    if let Some(parent) = target.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    files::write(&target, contents.as_bytes()).await?;
+                    files::write(&target, contents.as_bytes(), sandbox.clone()).await?;
                     if let Some(permissions) = permissions {
                         tokio::fs::set_permissions(&target, permissions).await?;
                     }
                 }
+                // The sandbox's helper only writes. A removal was checked
+                // against the bot's roots before anything ran.
                 Write::Remove(target) => tokio::fs::remove_file(&target).await?,
             }
         }
@@ -693,7 +693,7 @@ mod tests {
         let failing =
             patch("*** Add File: new.txt\n+n\n*** Update File: keep.txt\n-missing\n+b2\n");
         assert_eq!(
-            failing.apply(&dir).await.unwrap_err().code,
+            failing.apply(&dir, None).await.unwrap_err().code,
             "patch_context_not_found"
         );
         assert!(!dir.join("new.txt").exists());
@@ -704,7 +704,7 @@ mod tests {
                 "*** Update File: keep.txt\n-b\n+b2\n*** Add File: {target}\n+n\n"
             ));
             assert_eq!(
-                failing.apply(&dir).await.unwrap_err().code,
+                failing.apply(&dir, None).await.unwrap_err().code,
                 "file_not_regular"
             );
             assert_eq!(
@@ -718,7 +718,7 @@ mod tests {
              *** Delete File: gone.txt\n",
         );
         assert_eq!(
-            good.apply(&dir).await.unwrap(),
+            good.apply(&dir, None).await.unwrap(),
             "Success. Updated the following files:\nA sub/new.txt\nM moved.txt\nD gone.txt\n"
         );
         assert_eq!(

@@ -1243,7 +1243,14 @@ impl Registry {
                     path
                 )))
             }
-            Prepared::ApplyPatch(patch) => Ok(Outcome::text(patch.apply(workspace).await?)),
+            Prepared::ApplyPatch(patch) => {
+                for path in patch.paths() {
+                    writable(sandbox.clone(), &resolve(workspace, path), path).await?;
+                }
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = self.helper_slot(&sandbox).await?;
+                Ok(Outcome::text(patch.apply(workspace, sandbox).await?))
+            }
             Prepared::Edit {
                 path,
                 old,

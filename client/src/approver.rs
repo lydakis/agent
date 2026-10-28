@@ -140,7 +140,7 @@ macro_rules! policy {
 - If important context is missing and cannot be verified, lean conservative and explain the uncertainty in your rationale.
 
 # Execution environment
-- A sandboxed agent's commands, writes, and edits inside its sandbox run without review. What comes to you leaves it: a `shell` call with `sandbox_permissions` `require_escalated`, which runs unconfined, or a write or edit outside the folders it may write. An agent without a sandbox sends you every gated call.
+- A sandboxed agent's commands, writes, edits, and patches inside its sandbox run without review. What comes to you leaves it: a `shell` call with `sandbox_permissions` `require_escalated`, which runs unconfined, or a write, edit, or patch outside the folders it may write. An agent without a sandbox sends you every gated call.
 - A sandbox escalation, or a retry after a sandbox denial, is not suspicious in itself. Evaluate the risk of the unsandboxed action, not the escalation.
 - You share the agent's machine and start in its workspace. When you have `shell` and `read` tools, they only run read-only commands, with no network access. Do not provide `sandbox_permissions` for any reason: such commands are rejected. Without tools, judge from the state alone.
 

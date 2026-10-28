@@ -211,12 +211,12 @@ pub fn write(path: &Path) -> Result<()> {
 
 /// The tools a sandbox confines: what runs a command or writes a file.
 pub fn confinable(tool: &str) -> bool {
-    matches!(tool, "shell" | "write" | "edit")
+    matches!(tool, "shell" | "write" | "edit" | "apply_patch")
 }
 
 /// Whether a call by a bot in `mode` asks to run outside its sandbox: a
-/// command that asks to escalate, or a write or edit of a path outside
-/// every folder the bot may write. `root` is the bot's folder and `folder`
+/// command that asks to escalate, or a write, edit or patch of a path
+/// outside every folder the bot may write. `root` is the bot's folder and `folder`
 /// the turn's, against which a relative path is read. Decided from the call
 /// and the folders' names alone, never from the files as they are now, so
 /// the round that announces a call and the run that starts it agree; a
@@ -234,22 +234,40 @@ pub fn escapes(
     };
     match tool {
         "shell" => arguments["sandbox_permissions"] == "require_escalated",
-        "write" | "edit" => {
-            let Some(path) = arguments["path"].as_str() else {
-                return false;
-            };
-            let target = lexical(&folder.join(path));
-            let inside = |dir: &Path| target.starts_with(dir);
-            let temporary = temporary().iter().any(|(named, real)| {
-                mode == Mode::WorkspaceWrite && (inside(named) || inside(real))
-            });
-            !(temporary
-                || writable_paths(mode, root, writable)
-                    .iter()
-                    .any(|dir| inside(dir)))
-        }
+        "write" | "edit" => arguments["path"]
+            .as_str()
+            .is_some_and(|path| outside(mode, root, writable, folder, path)),
+        // A patch escapes when any file it changes would.
+        "apply_patch" => arguments["input"]
+            .as_str()
+            .and_then(|input| crate::tools::Patch::parse(input).ok())
+            .is_some_and(|patch| {
+                patch
+                    .paths()
+                    .any(|path| outside(mode, root, writable, folder, path))
+            }),
         _ => false,
     }
+}
+
+/// Whether `path`, read against `folder`, lies outside every folder a bot
+/// in `mode` may write.
+fn outside(
+    mode: Mode,
+    root: Option<&Path>,
+    writable: &[String],
+    folder: &Path,
+    path: &str,
+) -> bool {
+    let target = lexical(&folder.join(path));
+    let inside = |dir: &Path| target.starts_with(dir);
+    let temporary = temporary()
+        .iter()
+        .any(|(named, real)| mode == Mode::WorkspaceWrite && (inside(named) || inside(real)));
+    !(temporary
+        || writable_paths(mode, root, writable)
+            .iter()
+            .any(|dir| inside(dir)))
 }
 
 /// `path` with `.` dropped and `..` taken back, by name alone.
@@ -882,6 +900,20 @@ mod tests {
                 "{outside}"
             );
         }
+        let patch = |paths: &[&str]| {
+            let mut input = String::from("*** Begin Patch\n");
+            for path in paths {
+                input.push_str(&format!("*** Add File: {path}\n+x\n"));
+            }
+            input.push_str("*** End Patch");
+            serde_json::json!({ "input": input })
+        };
+        assert!(!escapes("apply_patch", patch(&["a.txt", "/work/shared/c"])));
+        assert!(escapes("apply_patch", patch(&["a.txt", "/etc/hosts"])));
+        assert!(!escapes(
+            "apply_patch",
+            serde_json::json!({"input":"not a patch"})
+        ));
         // Read-only writes nowhere, so every write asks.
         assert!(super::escapes(
             Mode::ReadOnly,

@@ -555,7 +555,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         .unwrap()
         .unwrap(),
     );
-    let tools = Registry::new("shell,write,edit").unwrap();
+    let tools = Registry::new("shell,write,edit,apply_patch").unwrap();
     let run = |command: String| {
         let tools = tools.clone();
         let (dir, policy) = (dir.clone(), policy.clone());
@@ -651,6 +651,37 @@ async fn a_sandboxed_command_writes_only_its_roots() {
         .unwrap_err();
     assert_eq!(error.code, "write_denied");
     assert!(!other.join("new").exists());
+    // So is a patch, every file it changes checked before any is written.
+    let patch = |paths: &[&str]| {
+        let mut input = String::from("*** Begin Patch\n");
+        for path in paths {
+            input.push_str(&format!("*** Add File: {path}\n+x\n"));
+        }
+        input.push_str("*** End Patch");
+        tools
+            .prepare("apply_patch", &json!({ "input": input }).to_string())
+            .unwrap()
+    };
+    let outside = other.join("b");
+    let error = tools
+        .execute(
+            patch(&["notes/b.md", outside.to_str().unwrap()]),
+            &dir,
+            &[],
+            Some(policy.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    assert!(!dir.join("notes/b.md").exists() && !outside.exists());
+    tools
+        .execute(patch(&["notes/b.md"]), &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes/b.md")).unwrap(),
+        "x\n"
+    );
     std::fs::remove_dir_all(base).unwrap();
 }
 

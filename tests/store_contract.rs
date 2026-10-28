@@ -861,6 +861,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
             name: name.into(),
             call_id: id.into(),
             arguments,
+            custom: false,
         };
         (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
     };
@@ -9738,6 +9739,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         name: "read".into(),
         call_id: "c1".into(),
         arguments: "{}".into(),
+        custom: false,
     };
     let item = json!({"type":"function_call","call_id":"c1","name":"read","arguments":"{}"});
     db.append(
@@ -11499,6 +11501,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
         name: "shell".into(),
         call_id: "c".into(),
         arguments: r#"{"command":"true"}"#.into(),
+        custom: false,
     };
     let folder = std::path::Path::new("/synthetic");
     assert!(db.inspect("Bob").unwrap().gated(&shell, folder));
