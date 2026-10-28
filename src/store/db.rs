@@ -1146,6 +1146,11 @@ pub struct TurnContext {
     /// first turn.
     pub previous_call: Option<(String, Option<String>)>,
 }
+/// Prepared statements each connection keeps. rusqlite keeps 16, fewer than
+/// one admission uses, so each `begin` evicted and parsed its statements
+/// again. Every `prepare_cached` site fits, at a few KiB of SQLite memory
+/// each for the ones in use.
+const STATEMENTS: usize = 256;
 pub struct Database {
     conn: Connection,
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
@@ -1369,6 +1374,7 @@ impl Database {
     /// checkpoint SQLite makes when the last connection closes, so it syncs
     /// checkpoints the way the writer does.
     pub fn reader(conn: Connection) -> Result<Self> {
+        conn.set_prepared_statement_cache_capacity(STATEMENTS);
         conn.execute_batch(
             "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
         )?;
@@ -1401,6 +1407,7 @@ impl Database {
         // created, written and deleted for every admission, and a write that
         // fails with SQLITE_FULL when the disk is. In memory it is freed
         // when the job ends, bounded by the pages one job changes.
+        conn.set_prepared_statement_cache_capacity(STATEMENTS);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;

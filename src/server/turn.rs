@@ -2940,13 +2940,13 @@ impl Turn {
             // and let the service retry when the block lifts. The retry is
             // announced now and counted only when dispatched. Its call-local
             // budget survives the park independently of cumulative totals.
-            let park = paced
+            let pool = paced
                 .then(|| provider.blocked_for(model))
                 .flatten()
                 .filter(|block| *block >= MIN_PARK);
             // Rate limits and overloads already hold the pool; other transient failures
             // back off exponentially with a little spread.
-            let delay = match park {
+            let delay = match pool {
                 Some(block) => block,
                 None if paced => std::time::Duration::ZERO,
                 None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
@@ -2955,14 +2955,23 @@ impl Turn {
                 }
                 None => backoff(attempt, turn as u64),
             };
+            // A backoff of a second or more parks too: an outage's retries
+            // are not this turn's to sleep through with a live task and an
+            // active slot. The backoff still counts toward the call's budget.
+            let park = pool.or((delay >= BACKOFF_PARK).then_some(delay));
             self.retried(
                 json!({"attempt":attempt,"error":error.code,"detail":error.detail,
                 "delay_ms":delay.as_millis() as u64,"parked":park.is_some()}),
             )
             .await?;
             if let Some(block) = park {
+                let backoff = if pool.is_some() {
+                    std::time::Duration::ZERO
+                } else {
+                    block
+                };
                 accounting.call_attempts = attempt;
-                accounting.call_spent_ms = spent.as_millis() as u64;
+                accounting.call_spent_ms = (spent + backoff).as_millis() as u64;
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
                 return Ok(None);
             }
@@ -4037,6 +4046,7 @@ fn retryable(code: &str) -> bool {
     matches!(
         code,
         "provider_rate_limited"
+            | "provider_overloaded"
             | "provider_server_error"
             | "provider_http_429"
             | "provider_stream_failed"
@@ -4055,6 +4065,9 @@ fn retryable(code: &str) -> bool {
 /// with the same context: its retries start at 2 s. An overload is the
 /// pool's to wait out, as a rate limit is.
 const STALL_START: u32 = 3;
+
+/// Retry backoffs at least this long park the turn instead of sleeping in it.
+const BACKOFF_PARK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 250 ms doubling to 30 s, spread by up to a fifth either way so several
 /// daemons on one key do not retry in step. Deterministic per turn and
@@ -4578,8 +4591,10 @@ mod tests {
             "provider_http_529",
             "provider_http_429",
             "provider_rate_limited",
+            "provider_overloaded",
         ] {
             assert!(agent_runtime::provider::paced(code), "{code}");
+            assert!(super::retryable(code), "{code}");
         }
         assert!(!agent_runtime::provider::paced("provider_stream_stalled"));
         let first = super::backoff(1 + super::STALL_START, 7).as_millis();

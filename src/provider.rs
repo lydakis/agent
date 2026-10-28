@@ -875,12 +875,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                let after = headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-                pace.limited(after);
+                pace.limited(retry_after(&headers));
             }
             reservation.settle(0);
             return Err(Error {
@@ -1118,12 +1113,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                let after = headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-                pace.limited(after);
+                pace.limited(retry_after(&headers));
             }
             reservation.settle(0);
             let code = if quota {
@@ -1506,22 +1496,35 @@ async fn login_refused(
 pub fn paced(code: &str) -> bool {
     matches!(
         code,
-        "provider_rate_limited" | "provider_http_429" | "provider_http_529"
+        "provider_rate_limited" | "provider_overloaded" | "provider_http_429" | "provider_http_529"
     )
 }
 
-/// Close the model's pool for a rate limit a socket reported: a 429 or 529
-/// status with its `retry-after`, as on HTTP, or an in-stream rate limit
-/// naming its delay.
-fn limit(pace: &pace::Pace, failure: &socket::Failure) {
-    if matches!(failure.status, Some(429 | 529)) || failure.error.code == "provider_rate_limited" {
-        let after = failure
-            .headers
-            .as_ref()
-            .and_then(|headers| headers.get("retry-after"))
+/// How long a response asks to be left alone: `retry-after-ms`, which
+/// OpenAI and Anthropic send beside `retry-after` and both SDKs read first,
+/// else `retry-after` in seconds.
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let number = |name: &str| {
+        headers
+            .get(name)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<f64>().ok())
-            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+    };
+    number("retry-after-ms")
+        .map(|ms| ms / 1000.0)
+        .or_else(|| number("retry-after"))
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+}
+
+/// Close the model's pool for a rate limit a socket reported: a 429 or 529
+/// status with its `retry-after`, as on HTTP, or an in-stream rate limit or
+/// overload naming its delay.
+fn limit(pace: &pace::Pace, failure: &socket::Failure) {
+    if matches!(failure.status, Some(429 | 529)) || paced(&failure.error.code) {
+        let after = failure
+            .headers
+            .as_deref()
+            .and_then(retry_after)
             .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
         pace.limited(after);
     }
@@ -1828,6 +1831,21 @@ mod tests {
         RawValue::from_string("[]".into()).unwrap()
     }
 
+    #[test]
+    fn retry_after_reads_milliseconds_first_then_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::retry_after(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("2"));
+        assert_eq!(super::retry_after(&headers), Some(Duration::from_secs(2)));
+        headers.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(
+            super::retry_after(&headers),
+            Some(Duration::from_millis(1500))
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("soon"));
+        assert_eq!(super::retry_after(&headers), Some(Duration::from_secs(2)));
+    }
     #[tokio::test]
     async fn an_unlisted_window_is_the_one_anthropic_publishes_else_200k() {
         let transport = Transport::new(64, 1).unwrap();
