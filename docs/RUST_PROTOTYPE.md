@@ -2304,7 +2304,7 @@ tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools but `read`, tagged `auto`, with a 105 s
 expiry (the approver's 90 s review budget plus margin), and
 starts `agent approver` detached if no session serves `auto`, logging to
-`STORE.approver.log`; its judge is `AGENT_JUDGE`, else the bot's own model, and a judge that
+`STORE.approver.log`; its judge is `[judge] model` in `~/.agent/config.toml`, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
 PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves

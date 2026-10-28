@@ -27,7 +27,8 @@ use tokio::sync::{Notify, Semaphore};
 pub struct Settings {
     pub socket: PathBuf,
     pub tag: String,
-    /// The judge `--judge` or `AGENT_JUDGE` names, if either does.
+    /// The judge `--judge` or the config's `[judge] model` names, if either
+    /// does.
     pub judge: Option<String>,
     /// The model the bots being judged run, `AGENT_MODEL`, when no judge
     /// is named: the last in the order a judge is picked in.
@@ -178,10 +179,7 @@ async fn serve(settings: Settings) -> Result<i32> {
         judge::pick(settings.judge.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
             Error::with(
                 "judge_required",
-                format!(
-                    "auto needs a judge: pass --judge PROVIDER/MODEL, or set {} or AGENT_MODEL",
-                    judge::VAR
-                ),
+                "auto needs a judge: pass --judge PROVIDER/MODEL, or set [judge] model in ~/.agent/config.toml or AGENT_MODEL",
             )
         })?;
     // An approver the daemon refuses the tag never replaces the base of
