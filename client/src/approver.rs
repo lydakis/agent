@@ -304,8 +304,10 @@ pub fn too_long(why: &str) -> Verdict {
 }
 
 /// A round the judge never assessed, after every attempt: denied, labeled
-/// so the model can tell an outage from a refusal.
+/// so the model can tell an outage from a refusal. A provider's detail is
+/// clipped like a rationale, so the reason stays within the daemon's limit.
 pub fn not_reviewed(why: &str) -> Verdict {
+    let why = clip(why, RATIONALE_BYTES);
     Verdict::Unreviewed(format!(
         "Automatic approval review failed: {why}.\nThe action was not executed. {FAILED}"
     ))
@@ -1057,6 +1059,11 @@ mod tests {
             )
         );
         assert!(failed.contains("not a determination that the action is unsafe"));
+        // A provider's long refusal still fits the daemon's 16 KiB reason.
+        let Verdict::Unreviewed(long) = not_reviewed(&"拒".repeat(6_000)) else {
+            panic!()
+        };
+        assert!(long.len() < RATIONALE_BYTES + 1024);
         assert!(matches!(timed_out(), Verdict::Unreviewed(r) if r.contains("You may retry once")));
         assert!(matches!(
             too_long("the call is too long to show"),
