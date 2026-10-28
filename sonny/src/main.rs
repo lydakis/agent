@@ -1781,6 +1781,10 @@ impl Fleet {
                 _ => None,
             };
             self.alerts.extend(alert);
+            // A task that waits needs little of its copy's memory.
+            if bot != self.lead && matches!(doing, "done" | "failed" | "needs you") {
+                task::trim(bot);
+            }
         }
     }
 
