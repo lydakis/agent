@@ -3391,8 +3391,11 @@ impl Turn {
                 Ok(prepared) if confined => {
                     // Reading the roots touches the filesystem: off the
                     // runtime thread.
-                    let (settings, daemon) =
-                        (record.settings.clone(), self.registry.daemon().clone());
+                    let (settings, daemon, bot) = (
+                        record.settings.clone(),
+                        self.registry.daemon().clone(),
+                        record.bot_id,
+                    );
                     let root = record
                         .workspace
                         .as_ref()
@@ -3401,13 +3404,21 @@ impl Turn {
                         // The probe for a sandbox runs once, here off the
                         // runtime thread, also for a bot from before a restart.
                         agent_runtime::sandbox::available()?;
-                        Policy::new(
+                        // The bot's own socket, so its commands may use the
+                        // daemon as far as a sandboxed bot may; opened first,
+                        // so its folder is there to be kept read-only.
+                        let capability = daemon.capability(bot)?;
+                        let policy = Policy::new(
                             settings.sandbox,
                             Some(&root),
                             &settings.writable,
                             settings.network,
                             &daemon,
-                        )
+                        )?;
+                        Ok(policy.map(|policy| Policy {
+                            capability,
+                            ..policy
+                        }))
                     })
                     .await
                     .map_err(|_| Error::new("sandbox_unavailable"))

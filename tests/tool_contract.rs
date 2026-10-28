@@ -537,8 +537,8 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     std::fs::write(dir.join("store"), "db").unwrap();
     let daemon = Daemon {
         store: Some(dir.join("store")),
-        socket: None,
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
+        ..Daemon::default()
     };
     let writable = [
         repo.to_str().unwrap().to_owned(),
@@ -704,7 +704,17 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         )
         .unwrap()
         .unwrap();
-        assert_ne!(run(Some(policy)).await, 0, "network {network}");
+        assert_ne!(run(Some(policy.clone())).await, 0, "network {network}");
+        // With the bot's own socket, the daemon's path reaches that one.
+        let own = base.join(format!("own-{network}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&own).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let policy = Policy {
+            capability: Some(own),
+            ..policy
+        };
+        assert_eq!(run(Some(policy)).await, 0, "network {network}");
+        assert!(listener.accept().is_ok());
     }
     std::fs::remove_dir_all(base).unwrap();
 }

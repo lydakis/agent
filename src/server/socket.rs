@@ -1,5 +1,5 @@
 //! Ownership of the rendezvous path is independent of database ownership.
-use agent_runtime::{Error, Result, fail};
+use agent_runtime::{Error, Result, fail, fail_with};
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
@@ -7,6 +7,95 @@ use std::{
     time::Duration,
 };
 use tokio::net::{UnixListener, UnixStream};
+
+/// The longest socket path every system takes: macOS holds 104 bytes with
+/// the terminating NUL, Linux 108.
+const SOCKET_PATH: usize = 103;
+
+/// Each sandboxed bot's own socket, in a folder beside the daemon's: opened
+/// the first time one of its commands runs, and kept while the daemon runs.
+/// A connection on it is a session answered as that bot. `None` when the
+/// folder's sockets wouldn't fit a socket path.
+pub fn capabilities(
+    socket: &Path,
+    sender: tokio::sync::mpsc::Sender<super::session::Inbound>,
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Option<agent_runtime::sandbox::Capabilities> {
+    let mut folder = socket.as_os_str().to_owned();
+    folder.push(".d");
+    let folder = PathBuf::from(folder);
+    if folder.as_os_str().len() + 1 + i64::MAX.to_string().len() > SOCKET_PATH {
+        return None;
+    }
+    let runtime = tokio::runtime::Handle::current();
+    // The folder is made ready by the first bot to need it, once the
+    // daemon owns its socket.
+    let opened = std::sync::Mutex::new(None::<std::collections::HashMap<i64, PathBuf>>);
+    let (place, own) = (folder.clone(), socket.to_owned());
+    Some(agent_runtime::sandbox::Capabilities {
+        folder,
+        open: std::sync::Arc::new(move |bot| {
+            let mut opened = opened.lock().unwrap_or_else(|e| e.into_inner());
+            if opened.is_none() {
+                prepare(&place, &own)?;
+            }
+            let opened = opened.get_or_insert_default();
+            if let Some(path) = opened.get(&bot) {
+                return Ok(path.clone());
+            }
+            let path = place.join(bot.to_string());
+            let listener = std::os::unix::net::UnixListener::bind(&path)
+                .map_err(|_| Error::new("socket_bind_failed"))?;
+            listener.set_nonblocking(true)?;
+            let listener = {
+                let _entered = runtime.enter();
+                UnixListener::from_std(listener)?
+            };
+            runtime.spawn(super::session::accept(
+                listener,
+                sender.clone(),
+                next.clone(),
+                Some(bot),
+            ));
+            opened.insert(bot, path.clone());
+            Ok(path)
+        }),
+    })
+}
+
+/// The bots' socket folder, the daemon user's alone (whoever owns the
+/// daemon's `socket`), with a previous daemon's sockets gone. Another user's
+/// folder could hand one bot another's socket, so it is refused.
+fn prepare(folder: &Path, socket: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::symlink_metadata(folder) {
+        Ok(found) => {
+            if !found.is_dir()
+                || found.uid() != std::fs::symlink_metadata(socket)?.uid()
+                || found.permissions().mode() & 0o077 != 0
+            {
+                return fail_with(
+                    "sandbox_unavailable",
+                    format!(
+                        "{} must be a folder only the daemon's user may use",
+                        folder.display()
+                    ),
+                );
+            }
+            for entry in std::fs::read_dir(folder)? {
+                let entry = entry?;
+                if entry.file_type()?.is_socket() {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::fs::DirBuilder::new().mode(0o700).create(folder)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 pub struct Owner {
     path: PathBuf,

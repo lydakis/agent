@@ -24,7 +24,7 @@ use handles::{Completion, Handles, Waiter, now_ms};
 use hub::{Hub, replay};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use session::{Inbound, socket_reader, stdio_reader};
+use session::{Inbound, stdio_reader};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -32,7 +32,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::BufReader,
     sync::{mpsc, watch},
     task::JoinSet,
 };
@@ -1200,7 +1199,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         ));
     }
     agent_runtime::sandbox::warm();
-    let daemon = agent_runtime::sandbox::Daemon {
+    let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
+    let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let mut daemon = agent_runtime::sandbox::Daemon {
         store: Some(std::fs::canonicalize(&config.store)?),
         // By its folder's real path, which is what Seatbelt matches.
         socket: config
@@ -1217,7 +1218,12 @@ pub async fn run(config: Configuration) -> Result<()> {
             .transpose()?,
         // Read once at start: what runs a confined write is this binary.
         helper: std::env::current_exe().ok(),
+        capabilities: None,
     };
+    daemon.capabilities = daemon
+        .socket
+        .as_deref()
+        .and_then(|socket| socket::capabilities(socket, sender.clone(), sessions_next.clone()));
     let registry = registry
         .with_credentials(credentials)
         .with_environment(environment)
@@ -1237,35 +1243,21 @@ pub async fn run(config: Configuration) -> Result<()> {
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "durability":"sqlite_full","partial_text_durable":false});
-    let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
     let mut sessions: HashMap<u64, Output> = HashMap::new();
+    // The sandboxed bot each session on a bot's own socket answers as.
+    let mut callers: HashMap<u64, i64> = HashMap::new();
     let (stdout, stdout_writer) = Output::stdout();
     let stdio_owner = config.socket.is_none();
     let mut socket_owner = None;
     if let Some(socket) = &config.socket {
         let (owner, listener) = socket::Owner::bind(socket).await?;
         socket_owner = Some(owner);
-        let accept_sender = sender.clone();
-        tokio::spawn(async move {
-            let mut next = 1u64;
-            while let Ok((stream, _)) = listener.accept().await {
-                let (read, write) = stream.into_split();
-                let output = Output::writer(write);
-                if accept_sender
-                    .send(Inbound::Open(next, output))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::spawn(socket_reader(
-                    next,
-                    BufReader::new(read),
-                    accept_sender.clone(),
-                ));
-                next += 1;
-            }
-        });
+        tokio::spawn(session::accept(
+            listener,
+            sender.clone(),
+            sessions_next.clone(),
+            None,
+        ));
         stdout.send(ready.clone()).await?;
     } else {
         sessions.insert(0, stdout.clone());
@@ -1452,13 +1444,15 @@ pub async fn run(config: Configuration) -> Result<()> {
                     let Some(message) = message else { break };
                     last_activity = std::time::Instant::now();
                     match message {
-                        Inbound::Open(id, output) => {
+                        Inbound::Open(id, output, caller) => {
                             let _ = output.try_send(ready.clone());
                             sessions.insert(id, output);
+                            if let Some(caller) = caller { callers.insert(id, caller); }
                             service.sessions = sessions.len();
                         }
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
+                            callers.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
@@ -1476,6 +1470,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                                     "id is a u64 or a string of at most 128 bytes",
                                 ),
                             });
+                            // A bot's own socket answers as that bot, held to
+                            // what it may do, before its reply is sized.
+                            let mut request = request;
+                            let refused = match (request.as_mut(), callers.get(&id)) {
+                                (Ok(request), Some(&caller)) => service.capped(caller, &mut request.command).await.err(),
+                                _ => None,
+                            };
                             let bound = request.as_ref().map_or(Bound::default(), |r| service.admission_sends(&r.command, &r.id, id));
                             // Everything but an admission with room waits for the
                             // admissions already queued, keeping request order.
@@ -1496,17 +1497,21 @@ pub async fn run(config: Configuration) -> Result<()> {
                             }
                             let (request_id, result, shutdown, serving) = match request {
                                 Ok(request) => {
+                                    let allowed = refused.is_none();
                                     let shutdown = match request.command {
-                                        Command::Shutdown { grace_ms } => Some(grace_ms),
+                                        Command::Shutdown { grace_ms } if allowed => Some(grace_ms),
                                         _ => None,
                                     };
                                     let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
-                                    let serves = matches!(request.command, Command::ServeApprovals { .. });
+                                    let serves = allowed && matches!(request.command, Command::ServeApprovals { .. });
                                     let answered = match &request.command {
-                                        Command::Answer { tag: Some(tag), lease: Some(lease), .. } => Some((tag.clone(), *lease)),
+                                        Command::Answer { tag: Some(tag), lease: Some(lease), .. } if allowed => Some((tag.clone(), *lease)),
                                         _ => None,
                                     };
-                                    let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
+                                    let result = match refused {
+                                        Some(error) => Err(error),
+                                        None => service.dispatch(request.command, id, &output, request.id.clone(), bound).await,
+                                    };
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
                                     if admission && !service.admissions.is_empty() {
@@ -1651,6 +1656,157 @@ fn validate_provider(
 }
 
 impl Service {
+    /// Hold a request that came in on sandboxed bot `caller`'s own socket to
+    /// what that bot may do: use and read bots, and make bots that inherit
+    /// its sandbox and stay inside the folders it may write. Never answer a
+    /// gate or a declared call, change a bot's gates or instructions, stop
+    /// the daemon, or remove what isn't its own: any of those would let a
+    /// confined command undo its confinement. A bot it makes is its own,
+    /// whatever the request names.
+    async fn capped(&self, caller: i64, command: &mut Command) -> Result<()> {
+        let refuse = |what: &str| -> Result<()> {
+            fail_with(
+                "not_permitted",
+                format!("a sandboxed bot's commands may not {what}"),
+            )
+        };
+        match command {
+            Command::Configure { .. } => return refuse("configure a bot"),
+            Command::Answer { .. } => return refuse("answer an approval"),
+            Command::ServeApprovals { .. } | Command::RenewApprovals { .. } => {
+                return refuse("serve approvals");
+            }
+            Command::ToolResult { .. } => return refuse("answer a declared tool call"),
+            Command::Shutdown { .. } => return refuse("stop the daemon"),
+            _ => {}
+        }
+        let me = self
+            .store
+            .op("inspect", move |db| db.inspect_id(caller))
+            .await?;
+        // A request may name only the caller as the creator of what it makes.
+        let claim = |created_by: &mut Option<String>, created_by_id: &mut Option<i64>| {
+            if created_by.as_ref().is_some_and(|name| *name != me.name)
+                || created_by_id.is_some_and(|id| id != me.bot_id)
+            {
+                return refuse("make a bot on another bot's behalf");
+            }
+            *created_by = Some(me.name.clone());
+            *created_by_id = Some(me.bot_id);
+            Ok(())
+        };
+        // The folders a request would give a bot, each of which the caller
+        // must be able to write itself.
+        let mut folders: Vec<String> = Vec::new();
+        match command {
+            Command::Create {
+                workspace,
+                settings,
+                created_by,
+                created_by_id,
+                ..
+            } => {
+                claim(created_by, created_by_id)?;
+                folders.extend(workspace.clone());
+                folders.extend(settings.writable.iter().cloned());
+            }
+            Command::Fork {
+                source,
+                workspace,
+                created_by,
+                created_by_id,
+                allow,
+                ..
+            } => {
+                claim(created_by, created_by_id)?;
+                // A fork that may call nothing touches nothing: an ask.
+                if !matches!(allow, Some(Some(tools)) if tools.is_empty()) {
+                    let source = source.clone();
+                    let source = self
+                        .store
+                        .op("inspect", move |db| db.inspect(&source))
+                        .await?;
+                    folders.extend(workspace.clone().or(source.workspace));
+                    folders.extend(source.settings.writable);
+                }
+            }
+            Command::Submit {
+                bot,
+                workspace,
+                from,
+                origin,
+                ..
+            } => {
+                // What it sends reads as the caller's, never a person's or
+                // another bot's.
+                if from.as_ref().is_some_and(|author| author.bot != me.name) {
+                    return refuse("send a message as another bot");
+                }
+                match (from.is_some(), me.running_turn) {
+                    (true, _) => *origin = None,
+                    (false, Some(turn)) => {
+                        *from = Some(Author {
+                            bot: me.name.clone(),
+                            turn,
+                        });
+                        *origin = None;
+                    }
+                    (false, None) => *origin = Some(me.name.clone()),
+                }
+                // A sandboxed bot with no folder of its own works in each
+                // turn's: one the caller gives it must be the caller's.
+                if let Some(workspace) = workspace {
+                    let bot = bot.clone();
+                    let target = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
+                    if target.sandboxed() && target.workspace.is_none() {
+                        folders.push(workspace.clone());
+                    }
+                }
+            }
+            Command::Delete { bot, .. }
+            | Command::Prune { bot, .. }
+            | Command::Compact { bot, .. }
+            | Command::Interrupt { bot, .. } => {
+                let bot = bot.clone();
+                let target = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
+                if target.bot_id != me.bot_id && target.created_by_id != Some(me.bot_id) {
+                    return refuse("change a bot it didn't make");
+                }
+            }
+            _ => {}
+        }
+        if folders.is_empty() || !me.sandboxed() {
+            return Ok(());
+        }
+        let daemon = agent_runtime::sandbox::Daemon {
+            capabilities: None,
+            ..self.registry.daemon().clone()
+        };
+        let outside = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let Some(policy) = agent_runtime::sandbox::Policy::new(
+                me.settings.sandbox,
+                me.workspace.as_deref().map(Path::new),
+                &me.settings.writable,
+                me.settings.network,
+                &daemon,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(folders
+                .into_iter()
+                .find(|folder| !policy.can_write(Path::new(folder))))
+        })
+        .await
+        .map_err(|_| Error::new("sandbox_unavailable"))??;
+        match outside {
+            Some(folder) => fail_with(
+                "not_permitted",
+                format!("{folder} is outside the folders this sandboxed bot may write"),
+            ),
+            None => Ok(()),
+        }
+    }
     fn has_capacity(&self) -> bool {
         !self.draining
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
@@ -3568,6 +3724,7 @@ mod tests {
     }
 
     use super::*;
+    use tokio::io::BufReader;
 
     #[test]
     fn the_first_cancel_cause_wins() {

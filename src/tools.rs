@@ -1729,6 +1729,10 @@ fn sh(
     for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
     }
+    // A sandboxed command reaches the daemon through its bot's own socket.
+    if let Some(own) = sandbox.and_then(|policy| policy.capability.as_ref()) {
+        process.env("AGENT_SOCKET", own);
+    }
     process.current_dir(workspace);
     Ok(process)
 }

@@ -12,7 +12,8 @@ use tokio::{
 // box for every request. Open/Closed messages are infrequent control traffic.
 #[allow(clippy::large_enum_variant)]
 pub enum Inbound {
-    Open(u64, Output),
+    /// A connection, and the sandboxed bot whose own socket it came in on.
+    Open(u64, Output, Option<i64>),
     Request(u64, Result<Request>),
     Closed(u64),
 }
@@ -64,6 +65,28 @@ pub fn stdio_reader(sender: mpsc::Sender<Inbound>) {
         }
         let _ = sender.blocking_send(Inbound::Closed(0));
     });
+}
+
+/// Accept connections on `listener` until the service stops, each a session
+/// numbered from `next`, every one on a bot's own socket answered as `caller`.
+pub async fn accept(
+    listener: tokio::net::UnixListener,
+    sender: mpsc::Sender<Inbound>,
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    caller: Option<i64>,
+) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (read, write) = stream.into_split();
+        if sender
+            .send(Inbound::Open(id, Output::writer(write), caller))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::spawn(socket_reader(id, BufReader::new(read), sender.clone()));
+    }
 }
 
 pub async fn socket_reader(

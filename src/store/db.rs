@@ -2132,6 +2132,17 @@ impl Database {
         declared.retain(|tool| tool.inherit);
         stored_declared(&declared)
     }
+    /// The bot holding identity `id`, whatever it is named.
+    pub fn inspect_id(&self, id: i64) -> Result<Bot> {
+        self.conn
+            .query_row(
+                &format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS),
+                [id],
+                Self::row,
+            )
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))
+    }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(

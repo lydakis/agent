@@ -53,8 +53,13 @@ pub struct Policy {
     /// Shallowest first: a deeper root decides for what is inside it.
     pub roots: Vec<Root>,
     pub network: bool,
-    /// The daemon's socket, which no command in the sandbox may reach.
+    /// The daemon's socket, which no command in the sandbox reaches
+    /// directly.
     pub socket: Option<PathBuf>,
+    /// The bot's own socket into the daemon, which answers it as that bot
+    /// and only as far as a sandboxed bot may go; in the daemon socket's
+    /// place, so the `agent` CLI finds it there too.
+    pub capability: Option<PathBuf>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
 }
@@ -86,6 +91,7 @@ impl Policy {
             roots,
             network: network && mode == Mode::WorkspaceWrite,
             socket: daemon.socket.clone(),
+            capability: None,
             helper: daemon.helper.clone(),
         }))
     }
@@ -277,6 +283,37 @@ pub struct Daemon {
     pub socket: Option<PathBuf>,
     /// The agent binary, which a confined write runs in.
     pub helper: Option<PathBuf>,
+    /// Where each sandboxed bot's own socket is opened, when the daemon
+    /// listens on one.
+    pub capabilities: Option<Capabilities>,
+}
+
+impl Daemon {
+    /// Bot `bot`'s own socket, opened on first use; `None` when the daemon
+    /// has no socket for a sandboxed command to use.
+    pub fn capability(&self, bot: i64) -> Result<Option<PathBuf>> {
+        self.capabilities
+            .as_ref()
+            .map(|capabilities| (capabilities.open)(bot))
+            .transpose()
+    }
+}
+
+/// The folder of the bots' own sockets, which stays read-only in every
+/// root, and what opens one: the daemon's, which knows who is calling.
+#[derive(Clone)]
+pub struct Capabilities {
+    pub folder: PathBuf,
+    #[allow(clippy::type_complexity)]
+    pub open: std::sync::Arc<dyn Fn(i64) -> Result<PathBuf> + Send + Sync>,
+}
+
+impl std::fmt::Debug for Capabilities {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Capabilities")
+            .field("folder", &self.folder)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The root at `path`, with what stays read-only inside it: the protected
@@ -328,12 +365,16 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
     // A socket the bot could rename or link would be reachable by its new
-    // name, past a rule that names the old one.
-    if let Some(socket) = &daemon.socket
-        && socket.starts_with(path)
-        && socket.exists()
+    // name, past a rule that names the old one; and one bot could put its
+    // own listener in place of another's.
+    for kept in daemon
+        .socket
+        .iter()
+        .chain(daemon.capabilities.as_ref().map(|c| &c.folder))
     {
-        read_only.push(socket.clone());
+        if kept.starts_with(path) && kept.exists() {
+            read_only.push(kept.clone());
+        }
     }
     Ok(Root {
         path: path.to_owned(),
@@ -563,10 +604,14 @@ mod linux {
                 ]);
             }
         }
-        // The daemon's socket is out of reach, as Codex keeps its own from
-        // a sandboxed command: nothing confined may drive the daemon.
+        // In the daemon's socket's place, the bot's own, which answers as
+        // that bot and only as far as a sandboxed bot may go; without one,
+        // nothing.
         if let Some(socket) = &policy.socket {
-            args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]);
+            match &policy.capability {
+                Some(own) => args.extend(["--bind".into(), path(own), path(socket)]),
+                None => args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]),
+            }
         }
         args.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"].map(String::from));
         if !policy.network {
@@ -825,12 +870,19 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
             "(allow network-outbound)\n(allow network-inbound)\n{SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}"
         ));
     }
-    // Never the daemon's socket, as Codex keeps its own from a sandboxed
-    // command: nothing confined may drive the daemon.
+    // Never the daemon's socket itself: the bot's own instead, which
+    // answers as that bot and only as far as a sandboxed bot may go.
     if let Some(socket) = &policy.socket {
         let key = param(socket);
         sections.push(format!(
             "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+        ));
+    }
+    if let Some(own) = &policy.capability {
+        let key = param(own);
+        sections.push(format!(
+            "(allow system-socket (socket-domain AF_UNIX))\n\
+             (allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
         ));
     }
     sections.push(SEATBELT_PREFERENCES.to_owned());
@@ -960,7 +1012,7 @@ mod tests {
         let daemon = Daemon {
             socket: Some(socket.clone()),
             store: Some(store),
-            helper: None,
+            ..Daemon::default()
         };
         for network in [false, true] {
             let policy = Policy::new(
@@ -1000,6 +1052,24 @@ mod tests {
                         && w[1] == "/dev/null"
                         && w[2] == socket.to_string_lossy())
             );
+            // With the bot's own socket, that one takes the daemon's place.
+            let own = Policy {
+                capability: Some(base.join("own.sock")),
+                ..policy.clone()
+            };
+            let (profile, params) = seatbelt(&own);
+            let own_key = params
+                .iter()
+                .find(|(_, path)| path == &base.join("own.sock"))
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            assert!(profile.contains(&format!(
+                "(allow network-outbound (remote unix-socket (subpath (param \"{own_key}\"))))"
+            )));
+            #[cfg(target_os = "linux")]
+            assert!(linux::args(&own, false).windows(3).any(|w| w[0] == "--bind"
+                && w[1] == base.join("own.sock").to_string_lossy()
+                && w[2] == socket.to_string_lossy()));
         }
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1024,6 +1094,7 @@ mod tests {
             roots,
             network: true,
             socket: Some(path.join("agent.sock")),
+            capability: None,
             helper: None,
         };
         let (profile, params) = seatbelt(&policy);
