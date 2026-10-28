@@ -440,8 +440,8 @@ mod tests {
         std::fs::write(dir.join("src/main.rs"), "").unwrap();
         std::fs::write(dir.join("a b.md"), "").unwrap();
         let main = format!("file://{}/src/main.rs", dir.display());
-        let opens = |text: &str| {
-            let (buf, cut) = markdown(text, 80);
+        let opens = |text: &str, width: usize| {
+            let (buf, cut) = markdown(text, width);
             cells(&buf, &cut, |word| file(&dir, word))
                 .iter()
                 .filter_map(|(x, _, cell)| {
@@ -451,15 +451,21 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // In code, with a line after it; and a markdown link's text.
-        assert_eq!(opens("In `src/main.rs:12:3`, done."), [(5, main.clone())]);
         assert_eq!(
-            opens("See [main](src/main.rs)."),
+            opens("In `src/main.rs:12:3`, done.", 80),
+            [(5, main.clone())]
+        );
+        assert_eq!(
+            opens("See [main](src/main.rs).", 80),
             [(6, main.clone()), (12, main.clone())]
         );
         let absolute = format!("{}/src/main.rs#L4", dir.display());
-        assert_eq!(opens(&absolute), [(2, main)]);
+        assert_eq!(opens(&absolute, absolute.len() + 2), [(2, main.clone())]);
+        let wrapped = opens(&absolute, 20);
+        assert!(wrapped.len() > 1, "the path wraps over several rows");
+        assert!(wrapped.iter().all(|(x, target)| *x == 2 && target == &main));
         // Not there, not a path, or only part of a word.
-        assert!(opens("src/gone.rs, e.g. 0.4.1 and .. or ./").is_empty());
+        assert!(opens("src/gone.rs, e.g. 0.4.1 and .. or ./", 80).is_empty());
         assert_eq!(
             file(&dir, "a b.md"),
             Some(format!("file://{}/a%20b.md", dir.display()))
