@@ -240,6 +240,16 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(json.loads(done.stdout)['results'][quick]['text'], 'reply:hi')
         mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout=0', slow, quick)
         self.assertEqual(json.loads(mixed.stdout)['pending'], [slow])
+        # A queued message taken back with --turn never runs, and the running
+        # turn goes on.
+        queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
+                                       '--delivery', 'queue', 'later').stdout)
+        taken = json.loads(self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow',
+                                      '--turn', str(queued['turn'])).stdout)
+        self.assertEqual((taken['handle'], taken['status'], taken['interrupt_requested']),
+                         (queued['handle'], 'interrupted', True))
+        still = json.loads(self.agent('wait', '--store', str(self.store), '--timeout=0', slow, check=False).stdout)
+        self.assertEqual(still['pending'], [slow])
         # interrupt prints the turn view, as it stood when asked.
         printed = self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow', '--pretty').stdout
         self.assertIn('\n  "handle"', printed)

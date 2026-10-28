@@ -116,7 +116,16 @@ enum Picked<'a> {
 }
 
 impl Judge {
-    async fn ask(&self, client: &Client, state: &Value, ids: &[&str], deadline: Instant) -> Judged {
+    /// The judge's answers for a round of a bot working in `workspace`,
+    /// where a model judge with tools starts to look.
+    async fn ask(
+        &self,
+        client: &Client,
+        state: &Value,
+        ids: &[&str],
+        workspace: Option<&str>,
+        deadline: Instant,
+    ) -> Judged {
         let answered = match &self.via {
             // One predicate a call, its probability read as an outcome.
             Via::Decisions(decisions) => {
@@ -135,8 +144,15 @@ impl Judge {
             }
             Via::Model(base) => {
                 let prompt = policy::model_prompt(state, ids);
-                base.ask_with(client, &prompt, ids, policy::assessments, deadline)
-                    .await
+                base.ask_with(
+                    client,
+                    &prompt,
+                    ids,
+                    policy::assessments,
+                    workspace,
+                    deadline,
+                )
+                .await
             }
         };
         match answered {
@@ -230,6 +246,12 @@ async fn serve(settings: Settings) -> Result<i32> {
                 model,
                 settings.effort.as_deref(),
                 policy::JUDGE_INSTRUCTIONS,
+                // It looks before it answers only where a sandbox keeps it
+                // read-only, as Codex's guardian does.
+                match agent_runtime::sandbox::available() {
+                    Ok(()) => &judge::LOOKING,
+                    Err(_) => &[],
+                },
             )
             .await?,
         ),
@@ -570,7 +592,13 @@ async fn judge(
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
     match shared
         .judge
-        .ask(&shared.client, &state, &ids, deadline)
+        .ask(
+            &shared.client,
+            &state,
+            &ids,
+            intent.workspace.as_deref(),
+            deadline,
+        )
         .await
     {
         Judged::Overloaded => Err(late()),
@@ -939,10 +967,22 @@ async fn intent(
         .filter_map(|call| call["call_id"].as_str())
         .collect();
     let transcript = transcript(client, &shared.redactor, bot, &judged).await?;
+    let inspected = client.request("inspect", json!({"bot":bot})).await?;
+    let settings = &inspected["settings"];
+    let sandbox = matches!(
+        settings["sandbox"].as_str(),
+        Some("read-only" | "workspace-write")
+    )
+    .then(|| {
+        json!({"mode":settings["sandbox"],"writable":settings["writable"],
+            "network":settings["network"]})
+    });
     let instructions = match &workspace {
         Some(workspace) => {
-            let bot = client.request("inspect", json!({"bot":bot})).await?;
-            let given = bot["instructions"].as_str().unwrap_or_default().to_owned();
+            let given = inspected["instructions"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
             let workspace = workspace.clone();
             tokio::task::spawn_blocking(move || {
                 agent_client::policy::given_agents_files(&workspace, &given)
@@ -958,6 +998,7 @@ async fn intent(
     Ok(Intent {
         note: shared.note.clone(),
         workspace: workspace.map(|w| w.to_string_lossy().into_owned()),
+        sandbox,
         request,
         planned,
         allowed,
