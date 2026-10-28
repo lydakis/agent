@@ -1259,6 +1259,8 @@ struct App {
     replies: Vec<(i64, String)>,
     /// `/react`'s list is open, at this reply from the newest.
     reacting: Option<usize>,
+    /// What Ctrl+F looks for on the full screen, while it does.
+    finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
     react_to: Option<(i64, String)>,
     /// The turn of the last reaction sent, whose attaching says nothing.
@@ -1938,6 +1940,7 @@ impl App {
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
             reacting: None,
+            finding: None,
             react_to: None,
             reaction_turn: None,
             declare: None,
@@ -3932,10 +3935,46 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return false,
         };
-        let copy = key.code == KeyCode::Char('c')
-            && (key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::SUPER));
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let copy =
+            key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        if let Some(query) = &mut self.finding {
+            match key.code {
+                KeyCode::Esc => self.finding = None,
+                _ if copy => self.finding = None,
+                KeyCode::Up | KeyCode::Enter => self.screen.find_next(true),
+                KeyCode::Char('f' | 'p') if ctrl => self.screen.find_next(true),
+                KeyCode::Down => self.screen.find_next(false),
+                KeyCode::Char('n') if ctrl => self.screen.find_next(false),
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.screen.find(query);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    query.push(c);
+                    self.screen.find(query);
+                }
+                KeyCode::PageUp => self.screen.page(true),
+                KeyCode::PageDown => self.screen.page(false),
+                _ => {}
+            }
+            if self.finding.is_none() {
+                self.screen.end_find();
+            }
+            return true;
+        }
         match key.code {
+            // Over the composer, not over a list open on it.
+            KeyCode::Char('f')
+                if ctrl
+                    && self.picker.is_none()
+                    && self.choosing.is_none()
+                    && self.reacting.is_none() =>
+            {
+                self.screen.unselect();
+                self.finding = Some(String::new());
+                self.screen.find("");
+            }
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
@@ -4988,6 +5027,22 @@ impl App {
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(Paragraph::new(rows), area);
             }
+            if let Some(query) = &self.finding {
+                let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
+                let place = match self.screen.found() {
+                    Some((_, 0)) if !query.is_empty() => "  not found · ".to_owned(),
+                    Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
+                    _ => "  ".to_owned(),
+                };
+                let keys = Line::from(vec![
+                    Span::raw(place),
+                    Span::raw("↑ or enter older · ↓ newer · esc").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(pick) = self.reacting {
                 // Newest at the bottom, nearest the composer, as they read.
                 let first = pick.saturating_sub(2);
@@ -5179,7 +5234,10 @@ impl App {
                 ])
             })
             .collect();
-        let keep = match self.choosing.is_some() || self.picker.is_some() || self.reacting.is_some()
+        let keep = match self.choosing.is_some()
+            || self.picker.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
         {
             true => 1,
             false => COMPOSER_ROWS,

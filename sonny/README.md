@@ -288,7 +288,9 @@ a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
-Sonny drew around it. A click on a link opens it. `/fullscreen` switches
+Sonny drew around it. A click on a link opens it. Ctrl+F finds text in
+the conversation, from the newest place back: ↑ or Enter steps older, ↓
+newer, and Esc stops where you are. `/fullscreen` switches
 to inline, where Sonny writes into the terminal's own scrollback, and back;
 the choice is kept with the other settings.
 
