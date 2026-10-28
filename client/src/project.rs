@@ -2,7 +2,8 @@
 //! `.agents/project.toml` in that folder, which holds mechanics only: the
 //! name, the coordinator's model and effort level, and its tasks' model and
 //! effort and whether they work in their own worktrees or the project
-//! folder. Clients read it, and write it when they make a project; the
+//! folder, and whether the folders below it are the project's too. Clients
+//! read it, and write it when they make a project; the
 //! daemon knows nothing of projects.
 use serde_json::{Value, json};
 use std::io::Read;
@@ -12,7 +13,7 @@ pub const FILE: &str = ".agents/project.toml";
 /// The largest project file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
-const KEYS: [&str; 7] = [
+const KEYS: [&str; 8] = [
     "name",
     "coordinator",
     "model",
@@ -20,10 +21,14 @@ const KEYS: [&str; 7] = [
     "threads_model",
     "threads_reasoning",
     "threads_in",
+    "subfolders",
 ];
 /// Where a project's threads work: each in its own worktree, or all in
 /// the project folder.
 pub const THREADS_IN: [&str; 2] = ["worktree", "project"];
+/// What a folder below the project's is when no project file of its own
+/// says otherwise: a project of its own, or this project's.
+pub const SUBFOLDERS: [&str; 2] = ["own", "project"];
 /// How a task that works apart from the project folder gets its own copy
 /// of it: a git worktree, or a sandfs copy (of the checkout as it is,
 /// uncommitted changes included, or of a folder outside git). The client's
@@ -94,7 +99,8 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
             "model": null, "reasoning": null, "threads_model": null,
-            "threads_reasoning": null, "threads_in": "worktree", "file": false,
+            "threads_reasoning": null, "threads_in": "worktree", "subfolders": "own",
+            "file": false,
         }));
     };
     let table: toml::Table = text
@@ -140,10 +146,15 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     if !THREADS_IN.contains(&threads_in.as_str()) {
         return Err(invalid("threads_in must be \"worktree\" or \"project\""));
     }
+    let subfolders = field("subfolders")?.unwrap_or_else(|| "own".into());
+    if !SUBFOLDERS.contains(&subfolders.as_str()) {
+        return Err(invalid("subfolders must be \"own\" or \"project\""));
+    }
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model,
         "reasoning": reasoning, "threads_model": threads_model,
-        "threads_reasoning": threads_reasoning, "threads_in": threads_in, "file": true,
+        "threads_reasoning": threads_reasoning, "threads_in": threads_in,
+        "subfolders": subfolders, "file": true,
     }))
 }
 
@@ -830,6 +841,7 @@ mod tests {
             "name = 7",
             "name = \"demo\"\ncoordinator = \"other.lead\"",
             "name = \"demo\"\nthreads_in = \"elsewhere\"",
+            "name = \"demo\"\nsubfolders = \"mine\"",
             "name = \"demo\"\nthreads_reasoning = \"low\"",
             "name = \"demo\"\nthreads_model = \"\"",
         ] {
@@ -837,6 +849,8 @@ mod tests {
             let error = read(&dir).unwrap_err();
             assert!(error.starts_with("project_invalid: "), "{error}");
         }
+        std::fs::write(dir.join(FILE), "name = \"demo\"\nsubfolders = \"project\"").unwrap();
+        assert_eq!(read(&dir).unwrap()["subfolders"], "project");
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

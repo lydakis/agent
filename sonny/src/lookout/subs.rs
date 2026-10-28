@@ -504,12 +504,11 @@ mod tests {
     #[test]
     fn a_subscription_asks_what_it_names() {
         let mut sub = Sub::lead("shop.lead", "shop");
-        assert_eq!(
-            sub.builtins(Kind::Said),
-            ["redirects", "conflict", "drifts"]
-        );
-        sub.ask = Some(vec!["result".into(), "stuck".into()]);
-        assert_eq!(sub.builtins(Kind::Ended), ["stuck", "result"]);
+        assert_eq!(sub.builtins(Kind::Said), ["interrupt"]);
+        sub.ask = Some(Vec::new());
+        assert!(sub.builtins(Kind::Ended).is_empty());
+        sub.ask = Some(vec!["interrupt".into()]);
+        assert_eq!(sub.builtins(Kind::Ended), ["interrupt"]);
         sub.on = vec![Kind::Ended];
         assert!(sub.builtins(Kind::Said).is_empty());
         // Looking for something of its own asks only that, unless --ask says more.
