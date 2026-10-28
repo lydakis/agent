@@ -10,3 +10,5 @@ Apache License, Version 2.0:
   codex-rs/sandboxing/src.
 - The bubblewrap arguments and the Seatbelt profile that src/sandbox.rs builds,
   ported from codex-rs/linux-sandbox and codex-rs/sandboxing.
+- src/tools/web_run.md and src/tools/web_run.json, the `web.run` tool's
+  description and schema, copied from codex-rs/ext/web-search.

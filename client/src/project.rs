@@ -288,6 +288,8 @@ pub struct Picks {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub threads: Option<ThreadPicks>,
+    /// The person's `web_search`, for a coordinator its role gives no tools.
+    pub web_search: crate::config::WebSearch,
 }
 
 #[derive(Debug, Default)]
@@ -393,7 +395,7 @@ pub async fn create(
         "instructions": instructions,
         "compaction_instructions": policy["compaction_instructions"],
         "tools": match &policy["tools"] {
-            Value::Null => json!(crate::default_tools(providers, model)),
+            Value::Null => json!(crate::default_tools(providers, model, picks.web_search)),
             tools => tools.clone(),
         },
     });
@@ -526,6 +528,7 @@ mod tests {
                 effort: Some("low".into()),
                 in_project: true,
             }),
+            web_search: Default::default(),
         };
         let made = make(&daemon, &dir, &policy, &picks).unwrap();
         assert_eq!(
@@ -707,6 +710,7 @@ mod tests {
             model: Some("gamma/three".into()),
             effort: Some("max".into()),
             threads: None,
+            web_search: Default::default(),
         };
         let made = make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();
         assert_eq!(

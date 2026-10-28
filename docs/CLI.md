@@ -297,7 +297,9 @@ on its creator's model thinks as hard as its creator; a bot given
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,
 default `shell,read,write,wait,history` with the file editor its model
-family is trained on: `apply_patch` for a Responses model, else `edit`. An
+family is trained on: `apply_patch` for a Responses model, else `edit`, and
+`web_search` where the provider offers it, unless `~/.agent/config.toml` sets
+`web_search = "disabled"`. An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 Other client commands require an already running daemon.

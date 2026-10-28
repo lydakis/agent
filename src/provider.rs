@@ -17,7 +17,9 @@ mod models;
 pub use models::Listed;
 pub mod pace;
 mod responses;
+mod search;
 mod socket;
+pub use search::{RUN_NAME, RUN_NAMESPACE, Search};
 
 pub use pace::Report;
 pub use socket::Sockets;
@@ -292,6 +294,9 @@ pub struct Completion {
     pub thinking_dropped: usize,
     /// Each model switch a provider-side fallback made, as (from, to).
     pub fallbacks: Vec<(Option<String>, String)>,
+    /// The provider paused a long run of its own tools (Anthropic's
+    /// `pause_turn`): sending the history again, reply included, resumes it.
+    pub paused: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
@@ -349,6 +354,8 @@ pub struct Request<'a> {
     pub tools: &'a RawValue,
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
+    /// Offer the provider's web search beside `tools`, as it declares it.
+    pub web_search: bool,
     /// Anthropic server-side fallbacks for a declined request; Bedrock has none.
     pub fallbacks: bool,
     /// Groups calls that share a prefix for the Responses prompt cache. All
@@ -720,7 +727,10 @@ impl Provider {
             #[serde(skip_serializing_if = "Option::is_none")]
             fallbacks: Option<&'static str>,
         }
-        let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
+        let search = request
+            .web_search
+            .then(|| self.search(request.model).entry(self.family))
+            .flatten();
         let max_tokens = self.anthropic_max_tokens(request.model);
         // Both markers take the same lifetime: a longer one may not follow
         // a shorter one.
@@ -730,18 +740,32 @@ impl Provider {
         };
         // The ChatGPT plan takes function tools only grouped in a namespace
         // (OpenAI's preview limitations, read 2026-10-20); a call comes back
-        // naming it, and its item is replayed as it came.
-        let grouped;
-        let tools = match self.login {
-            Some(_) if request.tools.get() != "[]" => {
-                grouped = RawValue::from_string(format!(
-                    r#"[{{"type":"namespace","name":"{PLAN_NAMESPACE}","description":"Tools","tools":{}}}]"#,
-                    request.tools.get()
-                ))?;
-                &*grouped
+        // naming it, and its item is replayed as it came. Search is its own
+        // namespace beside it.
+        let joined;
+        let tools = match (self.login.as_ref(), search) {
+            (None, None) => request.tools,
+            (login, search) => {
+                let mut grouped = match login {
+                    Some(_) if request.tools.get() != "[]" => format!(
+                        r#"[{{"type":"namespace","name":"{PLAN_NAMESPACE}","description":"Tools","tools":{}}}]"#,
+                        request.tools.get()
+                    ),
+                    _ => request.tools.get().to_owned(),
+                };
+                if let Some(entry) = search {
+                    grouped.pop();
+                    if grouped != "[" {
+                        grouped.push(',');
+                    }
+                    grouped.push_str(entry);
+                    grouped.push(']');
+                }
+                joined = RawValue::from_string(grouped)?;
+                &*joined
             }
-            _ => request.tools,
         };
+        let disable_tools = !request.allow_tool_calls && tools.get() != "[]";
         let (mut bytes, field) = match self.family {
             Family::Responses if warm => return fail("keep_warm_unsupported"),
             Family::Responses => (
@@ -776,7 +800,7 @@ impl Provider {
                     }),
                     stream: !warm,
                     cache_control: cache.clone(),
-                    tools: (request.tools.get() != "[]").then_some(request.tools),
+                    tools: (tools.get() != "[]").then_some(tools),
                     tool_choice: disable_tools.then_some(ToolChoice { r#type: "none" }),
                     // Current Claude models take adaptive thinking with an
                     // effort level and reject budgets; Haiku 4.5 and older
@@ -2021,6 +2045,7 @@ mod tests {
                 reasoning: Some("high"),
                 tools: &none(),
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
@@ -2052,6 +2077,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: true,
                 cache_key: Some("k"),
                 items: Items::empty(),
@@ -2075,6 +2101,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    web_search: false,
                     fallbacks: false,
                     cache_key: None,
                     items: Items::empty(),
@@ -2095,6 +2122,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: true,
                 cache_key: None,
                 items: Items::empty(),
@@ -2118,6 +2146,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
@@ -2144,6 +2173,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 cache_key: Some("k"),
                 items: Items::empty(),
@@ -2179,6 +2209,7 @@ mod tests {
                             reasoning: None,
                             tools,
                             allow_tool_calls: allow,
+                            web_search: false,
                             fallbacks: false,
                             cache_key: None,
                             items: Items::empty(),
@@ -2261,6 +2292,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    web_search: false,
                     fallbacks: false,
                     cache_key: None,
                     items: Items::empty(),
@@ -2360,6 +2392,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    web_search: false,
                     fallbacks: true,
                     cache_key: None,
                     items: Items::empty(),
@@ -2393,6 +2426,7 @@ mod tests {
             reasoning: Some("high"),
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -2435,6 +2469,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -2501,6 +2536,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
@@ -2716,6 +2752,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    web_search: false,
                     fallbacks: false,
                     cache_key: None,
                     items,
@@ -2806,6 +2843,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
@@ -2873,6 +2911,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
@@ -2941,6 +2980,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3014,6 +3054,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3122,6 +3163,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3209,6 +3251,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3260,6 +3303,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3310,6 +3354,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3364,6 +3409,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),
@@ -3416,6 +3462,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             items: Items::empty(),
             chain: None,
@@ -3483,6 +3530,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             items: Items::empty(),
             chain: None,
@@ -3532,6 +3580,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             items: Items::empty(),
             chain: None,
@@ -3577,6 +3626,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                web_search: false,
                 fallbacks: false,
                 items: Items::empty(),
                 chain: None,
@@ -3613,6 +3663,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             items: Items::empty(),
             chain: None,
@@ -3661,6 +3712,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            web_search: false,
             fallbacks: false,
             cache_key: None,
             items: Items::empty(),

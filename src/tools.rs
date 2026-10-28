@@ -58,6 +58,7 @@ enum Tool {
     Wait,
     History,
     Note,
+    WebSearch,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -71,6 +72,7 @@ impl Tool {
             "wait" => Tool::Wait,
             "history" => Tool::History,
             "note" => Tool::Note,
+            "web_search" => Tool::WebSearch,
             _ => return None,
         })
     }
@@ -85,6 +87,7 @@ impl Tool {
             Tool::Wait => "wait",
             Tool::History => "history",
             Tool::Note => "note",
+            Tool::WebSearch => "web_search",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -133,6 +136,12 @@ impl Tool {
                 "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes and must fit the current context budget; an oversized write preserves the previous note. Empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
                 json!({"type":"object","properties":{"text":{"type":"string","maxLength":8192}},
                 "required":["text"],"additionalProperties":false}),
+            ),
+            // What a model is shown is its provider's: Codex's `web.run`,
+            // or the provider's own hosted tool (see provider::Search).
+            Tool::WebSearch => (
+                include_str!("tools/web_run.md"),
+                serde_json::from_str(include_str!("tools/web_run.json")).expect("web.run schema"),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
@@ -633,6 +642,9 @@ pub enum Prepared {
         timeout_ms: Option<u64>,
         any: bool,
     },
+    /// A `web.run` call's commands, which the bot's provider answers.
+    /// Resolved by the runtime, never by the registry.
+    WebSearch(String),
     /// A client's declared tool, whose call that fits gets this result.
     /// Resolved by the runtime, never by the registry.
     Declared(String),
@@ -743,9 +755,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,note"
+            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search"
         } else {
-            "echo,read,write,edit,apply_patch,wait,history,note"
+            "echo,read,write,edit,apply_patch,wait,history,note,web_search"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -809,7 +821,8 @@ impl Registry {
         let schemas: Vec<ToolSchema> = names
             .iter()
             .filter_map(|name| Tool::parse(name))
-            .filter(|tool| self.tools.contains(tool))
+            // Search is declared by the provider, as it offers it.
+            .filter(|tool| self.tools.contains(tool) && *tool != Tool::WebSearch)
             .map(Tool::schema)
             .map(|mut schema| {
                 if sandboxed && schema.name == "shell" {
@@ -1079,6 +1092,13 @@ impl Registry {
                     limit,
                 }
             }
+            Tool::WebSearch => {
+                let commands: serde_json::Value = serde_json::from_str(args).map_err(invalid)?;
+                if !commands.is_object() {
+                    return fail("invalid_tool_arguments");
+                }
+                Prepared::WebSearch(args.to_owned())
+            }
             Tool::Note => {
                 #[derive(serde::Deserialize)]
                 struct Note {
@@ -1184,6 +1204,7 @@ impl Registry {
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
+            Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
             Prepared::Shell {
                 command,
                 timeout_ms,

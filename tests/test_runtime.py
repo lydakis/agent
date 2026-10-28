@@ -621,7 +621,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert [t['name'] for t in request['tools']][:2] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
-            assert last['role'] == 'user'
+            # Only a turn paused after a hosted search ends with the answer.
+            assert last['role'] == 'user' or last['content'][1]['type'] == 'server_tool_use'
             if summary and getattr(self.server, 'compaction_refusals', 0):
                 # As on Responses: a rate limit whose last wait parks the turn.
                 self.server.compaction_refusals -= 1
@@ -738,6 +739,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 else:
                     blocks.append({'type': 'text', 'text': f'done after {calls} rounds'})
                     stop = 'end_turn'
+            elif last['role'] == 'assistant':
+                # A paused turn, resent as it stood: finish the answer.
+                blocks.append({'type': 'text', 'text': 'resumed'})
+                stop = 'end_turn'
             elif last['content'][0]['type'] == 'tool_result':
                 # A result that says 'silent' is answered with nothing at all,
                 # as a reply after a reaction with nothing to add.
@@ -760,6 +765,16 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'shell',
                                    'input': {'command': user[6:]}})
                     stop = 'tool_use'
+                elif user.startswith('search:'):
+                    # The hosted search runs here, and the server pauses the
+                    # turn after it, as a long search does.
+                    blocks += [{'type': 'server_tool_use', 'id': 'srvtoolu_1', 'name': 'web_search',
+                                'input': {'query': user[7:]}},
+                               {'type': 'web_search_tool_result', 'tool_use_id': 'srvtoolu_1',
+                                'content': [{'type': 'web_search_result', 'url': 'https://example.test',
+                                             'title': 'Example', 'encrypted_content': 'opaque'}]},
+                               {'type': 'text', 'text': 'found'}]
+                    stop = 'pause_turn'
                 elif user.startswith('fallback:'):
                     # A classifier declines mid-output and another model
                     # finishes: the declined partial stays in the stream.
@@ -781,8 +796,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                                                   for _ in range(self.server.report_drops)]
             events = [('message_start', {'message': start})]
             for index, block in enumerate(blocks):
-                if block['type'] == 'fallback':
+                if block['type'] == 'fallback' or block['type'].endswith('_tool_result'):
                     events.append(('content_block_start', {'index': index, 'content_block': block}))
+                    events.append(('content_block_stop', {'index': index}))
                     continue
                 start = {**block, 'thinking': ''} if block['type'] == 'thinking' else (
                     {**block, 'text': ''} if block['type'] == 'text' else {**block, 'input': {}})
@@ -1066,6 +1082,31 @@ class AnthropicRuntimeTests(unittest.TestCase):
             {'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': 'kept'}}])
         self.assertEqual(second['messages'][2]['content'],
                          [{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'kept'}])
+
+    def test_a_hosted_search_is_declared_kept_and_its_paused_turn_resumed(self):
+        client, model, path = self.start()
+        self.assertTrue(client.ready['providers']['anthropic']['web_search'])
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       tools=['echo', 'shell', 'web_search'])
+        turn = client.request('submit', bot='Bob', request_id='s1', prompt='search:rust')['result']['turn']
+        finished = client.finished(turn)
+        self.assertEqual(finished['data']['status'], 'completed')
+        first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
+        self.assertTrue(model.requests.empty())
+        self.assertEqual([t.get('name') for t in first['tools']], ['echo', 'shell', 'web_search'])
+        self.assertTrue(first['tools'][2]['type'].startswith('web_search_'))
+        # The pause resends the history as it stood, with no new message:
+        # the search and its results as the server sent them.
+        self.assertEqual(len(second['messages']), 2)
+        kept = second['messages'][1]
+        self.assertEqual(kept['role'], 'assistant')
+        self.assertEqual([b['type'] for b in kept['content']],
+                         ['thinking', 'server_tool_use', 'web_search_tool_result', 'text'])
+        self.assertEqual(kept['content'][1]['input'], {'query': 'rust'})
+        self.assertEqual(kept['content'][2]['content'][0]['encrypted_content'], 'opaque')
+        # Nothing ran here, and the search needed no approval.
+        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+        self.assertFalse([e for e in events if e['event'].startswith('tool_')])
 
     def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_fails_one_to_a_prompt(self):
         client, model, path = self.start()
