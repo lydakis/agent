@@ -218,6 +218,12 @@ pub fn file(workspace: &Path, word: &str) -> Option<String> {
     if !full.is_absolute() || !full.exists() {
         return None;
     }
+    file_url(&full)
+}
+
+/// The `file://` address of the absolute path `full`, every byte but
+/// the plainest escaped, so a space, `#` or `%` in it stays the file's.
+pub fn file_url(full: &Path) -> Option<String> {
     let mut url = String::from("file://");
     for byte in full.to_str()?.bytes() {
         if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {

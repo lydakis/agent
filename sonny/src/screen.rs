@@ -43,6 +43,8 @@ pub enum Action {
 /// one that did not fit the width.
 struct Shown {
     line: Line<'static>,
+    /// Where its text opens, when its line said so rather than its words.
+    link: Option<String>,
     /// The columns of the row's lead, when it goes on with the row above.
     joins: Option<usize>,
     /// The columns of its lead (a bullet, an indent) otherwise.
@@ -57,6 +59,8 @@ struct Row {
     line: Line<'static>,
     /// The lead the rows it goes on to start with, as it was written.
     rest: Option<Line<'static>>,
+    /// Where its text opens, whatever its words are.
+    link: Option<String>,
 }
 
 /// A place in the rows shown: a row and a column.
@@ -109,7 +113,7 @@ pub struct Screen {
     laid: usize,
     /// A line to show at the top once the rows are laid out; or a row,
     /// as they were drawn.
-    go_to: Option<usize>,
+    go_to: Option<(usize, usize)>,
     top_row: Option<usize>,
 }
 
@@ -149,7 +153,11 @@ impl Screen {
         for line in lines {
             let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty())
             else {
-                self.rows.push(Row { line, rest: None });
+                self.rows.push(Row {
+                    line,
+                    rest: None,
+                    link: None,
+                });
                 continue;
             };
             // A row the line above was wrapped onto joins it again.
@@ -177,6 +185,17 @@ impl Screen {
         self.rows.push(Row {
             line,
             rest: Some(rest),
+            link: None,
+        });
+    }
+
+    /// A line whose text opens `url`, a name that may hold spaces or
+    /// anything else a link read from words would stop at.
+    pub fn push_linked(&mut self, line: Line<'static>, url: String) {
+        self.rows.push(Row {
+            line,
+            rest: None,
+            link: Some(url),
         });
     }
 
@@ -193,9 +212,10 @@ impl Screen {
         self.top_row = Some(top);
     }
 
-    /// The view put with the line `row` of those pushed at its top.
-    pub fn show_row(&mut self, row: usize) {
-        self.go_to = Some(row);
+    /// The view put with the line `row` of those pushed `above` drawn
+    /// rows under its top.
+    pub fn show_row(&mut self, row: usize, above: usize) {
+        self.go_to = Some((row, above));
     }
 
     /// The last line's rows taken off the screen, to be wrapped again.
@@ -291,6 +311,7 @@ impl Screen {
                 span.content.starts_with(crate::image::PLACEHOLDER)
                     || span.content.contains(['▀', '▄'])
             });
+            let link = row.link.clone();
             let rows = match line.width() <= width || picture {
                 true => vec![line],
                 false => {
@@ -304,6 +325,7 @@ impl Screen {
                 let first = at == 0;
                 self.shown.push(Shown {
                     line,
+                    link: link.clone(),
                     joins,
                     opens,
                     first,
@@ -453,11 +475,12 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
-        if let Some(row) = self.go_to.take() {
+        if let Some((row, above)) = self.go_to.take() {
             let at = (self.shown.iter().enumerate())
                 .filter(|(_, shown)| shown.first)
                 .nth(row)
-                .map_or(0, |(at, _)| at);
+                .map_or(0, |(at, _)| at)
+                .saturating_sub(above);
             self.back = self.shown.len().saturating_sub(at + height);
         }
         if let Some(top) = self.top_row.take() {
@@ -614,6 +637,23 @@ impl Screen {
                 && last.0 == y
             {
                 last.2 = x + 1;
+            }
+        }
+        // A row its line links opens there across its text, whatever was
+        // read from its words.
+        for row in top..bottom {
+            let Some(url) = &self.shown[row].link else {
+                continue;
+            };
+            let y = drawn.y + (row - top) as u16;
+            let text: String = (self.shown[row].line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+            let from = text.width() - text.trim_start().width();
+            let to = text.trim_end().width().min(drawn.width as usize);
+            links.retain(|link| link.0 != y);
+            if from < to {
+                links.push((y, drawn.x + from as u16, drawn.x + to as u16, url.clone()));
             }
         }
         links
@@ -1268,7 +1308,7 @@ mod tests {
         let mut lines = vec![Line::from("one two three four five six seven")];
         lines.extend((0..20).map(|i| Line::from(format!("row {i}"))));
         let (mut screen, _) = screen(lines.clone(), 10, 5);
-        screen.show_row(0);
+        screen.show_row(0, 0);
         let area = Rect::new(0, 0, 10, 5);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);

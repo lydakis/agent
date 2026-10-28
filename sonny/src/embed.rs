@@ -439,7 +439,9 @@ fn key_bytes(key: KeyEvent, application: bool) -> Option<Vec<u8>> {
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
         // As the kitty keyboard protocol sends it, which tells it apart.
-        KeyCode::Enter if shift => b"\x1b[13;2u".to_vec(),
+        KeyCode::Enter if shift => {
+            return Some(format!("\x1b[13;{}u", if alt { 4 } else { 2 }).into_bytes());
+        }
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -458,7 +460,7 @@ fn key_bytes(key: KeyEvent, application: bool) -> Option<Vec<u8>> {
         _ => return None,
     };
     // Alt sends Esc first, before the key.
-    if alt && !matches!(key.code, KeyCode::Enter | KeyCode::BackTab) {
+    if alt && key.code != KeyCode::BackTab {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
@@ -538,6 +540,8 @@ mod tests {
         assert_eq!(key(KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
         assert_eq!(key(KeyCode::Left, KeyModifiers::ALT), b"\x1b[1;3D");
         assert_eq!(key(KeyCode::Enter, KeyModifiers::SHIFT), b"\x1b[13;2u");
+        // Alt+Enter is a new line in Sonny's composer, as Shift+Enter is.
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::ALT), b"\x1b\r");
         assert_eq!(key(KeyCode::PageUp, KeyModifiers::NONE), b"\x1b[5~");
         assert_eq!(
             key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), true).unwrap(),

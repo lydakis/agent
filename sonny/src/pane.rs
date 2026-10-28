@@ -68,7 +68,7 @@ impl Pane {
         };
         let mut screen = Screen::default();
         let target = preview(&path, width, line, &mut screen)?;
-        screen.show_row(target.saturating_sub(ABOVE));
+        screen.show_row(target, ABOVE);
         // Its escapes kept, as the path read back may hold `#` or `%`;
         // the line left off.
         let link = url.split('#').next().unwrap_or(url);
@@ -255,7 +255,12 @@ fn preview(
 ) -> Result<usize, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
-        screen.push(folder(path)?);
+        for (line, url) in folder(path)? {
+            match url {
+                Some(url) => screen.push_linked(line, url),
+                None => screen.push(vec![line]),
+            }
+        }
         return Ok(0);
     }
     let size = meta.len();
@@ -333,8 +338,8 @@ fn preview(
     Ok(first_row)
 }
 
-/// A folder's entries, folders first, each as a path that opens.
-fn folder(path: &Path) -> Result<Vec<Line<'static>>, String> {
+/// A folder's entries, folders first, each with the address it opens.
+fn folder(path: &Path) -> Result<Vec<(Line<'static>, Option<String>)>, String> {
     let mut entries: Vec<(bool, String)> = std::fs::read_dir(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .filter_map(|entry| {
@@ -345,16 +350,19 @@ fn folder(path: &Path) -> Result<Vec<Line<'static>>, String> {
         .collect();
     entries.sort();
     if entries.is_empty() {
-        return Ok(vec![note("an empty folder")]);
+        return Ok(vec![(note("an empty folder"), None)]);
     }
     Ok(entries
         .into_iter()
         .map(|(file, name)| {
-            let full = path.join(&name).display().to_string();
-            match file {
+            let full = path.join(&name);
+            let url = crate::links::file_url(&full);
+            let full = full.display().to_string();
+            let line = match file {
                 true => Line::from(format!(" {full}")),
                 false => Line::from(vec![Span::raw(format!(" {full}")), Span::raw("/").dim()]),
-            }
+            };
+            (line, url)
         })
         .collect())
 }
@@ -433,6 +441,50 @@ mod tests {
         // Three rows above the line linked to, so it reads in place.
         assert_eq!(shown[2], " 17  let x17 = 17;");
         assert_eq!(shown[5], " 20  let x20 = 20;");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_line_asked_for_shows_under_a_long_line_above() {
+        let dir = std::env::temp_dir().join(format!("sonny-above-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        let long = "word ".repeat(40);
+        let source: String = (1..=30)
+            .map(|n| match n {
+                19 => format!("{long}\n"),
+                n => format!("line {n}\n"),
+            })
+            .collect();
+        std::fs::write(&file, source).unwrap();
+        let url = format!("file://{}#L20", file.display());
+        let mut pane = Pane::preview(&url, &dir, 30).unwrap();
+        let shown = rows(&mut pane, 30, 8);
+        // Three drawn rows above it, however many lines they are.
+        assert_eq!(shown[5], " 20  line 20", "{shown:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folders_entries_open_whatever_their_names() {
+        let dir = std::env::temp_dir().join(format!("sonny-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a b.rs"), "x\n").unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", dir.display()), &dir, 80).unwrap();
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buf = Buffer::empty(area);
+        pane.render(area, &mut buf, true, |_| None);
+        let cells = pane.screen.link_cells(&buf);
+        let url = format!("file://{}/a%20b.rs", dir.display());
+        // One link, over the whole name, spaces and all.
+        assert!(cells.iter().all(|(_, y, _)| *y == 2));
+        assert!(
+            cells[0].2.symbol().contains(&url),
+            "{:?}",
+            cells[0].2.symbol()
+        );
+        let row: String = (0..80).map(|x| buf[(x, 2)].symbol()).collect();
+        assert_eq!(cells.len(), row.trim().width());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
