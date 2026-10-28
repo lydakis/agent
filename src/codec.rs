@@ -113,6 +113,12 @@ impl Family {
     /// `claude-sonnet-5-20260401`. Anything else is its own pool; a shared
     /// quota the provider does not name is still corrected by every
     /// response's headers, bounded by what is in flight.
+    /// Whether the provider's input limits count prompt-cache reads.
+    /// Anthropic counts only uncached input and cache writes for its current
+    /// models; OpenAI does not say it leaves cache reads out.
+    pub fn counts_cache_reads(self) -> bool {
+        matches!(self, Family::Responses)
+    }
     pub fn pool_key(self, model: &str) -> String {
         let stripped = match self {
             Family::Responses => model

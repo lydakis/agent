@@ -5472,3 +5472,54 @@ the output-reservation change against this one.
 | Lone submit CPU, ms per 32 | 51.9 (44.4–58.9) | 52.8 (40.0–61.0) |
 
 Every difference is inside the run-to-run range.
+
+## Anthropic input reservations leave out cache reads
+
+Anthropic leaves cache reads out of its input limit for its current models;
+uncached input and cache writes count. A Messages call reserved its whole
+prompt against the input limit and settled by its whole input, and a call
+whose prompt was larger than the learned limit failed with
+`provider_pacing_limit` before it was sent, even when the provider would
+have read nearly all of it from the cache. A call now reserves the 90th
+percentile of the share of input its model's latest 32 calls counted (all
+of it until eight have reported), at most the limit, and settles by input
+less cache reads. Shares are kept in parts per million and rounded up, so
+a few uncached tokens beside a long cached prompt still reserve their part
+(50 of 200,050 reserves 51). OpenAI does not say it leaves cache reads out,
+so Responses calls are paced as before.
+
+Screen, 2026-10-28, Linux x86_64 container (`itpm.py`): Anthropic bots with
+60 KB instructions (about 15,000 tokens) resubmitting as each turn ends, a
+local fixture answering after 200 ms that reads 15,000 tokens of each prompt
+from the cache, counts 200 against a continuously refilled input bucket,
+refuses with 429 and `retry-after` while the bucket is spent, and publishes
+`anthropic-ratelimit-input-tokens-*`. 5 s warmup, 20 s measured, one run
+each. Pacer 3/5's head against this change.
+
+| Case | Provider allows | Before: turns/s | 429s | failed | After: turns/s | 429s | failed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 bots, 150k/min | 12.5 | 12.5 | 0 | 0 | 12.9 | 20 | 0 |
+| 16 bots, 12k/min (prompt over the limit) | 1.0 | 0 | 0 | every turn | 0.95 | 20 | 0 |
+
+Where the prompt fits, both reach the provider's limit: headers arrive
+quickly and release the larger reservation, so it cost little. The smaller
+reservation admits a few calls the provider then refuses, about one a
+second, without lowering throughput. Where the cached prompt is larger than
+the limit, every turn failed before; now they run at the provider's rate.
+
+Hot-path screen, in the same alternating run: the previous pacer change against this one.
+
+| Measure | Before | This change |
+| --- | ---: | ---: |
+| Idle RSS, MiB | 18.73 (18.54–18.80) | 18.70 (18.42–18.74) |
+| Per idle bot, KiB | 1.03 (1.02–1.29) | 1.03 (1.03–1.13) |
+| After one turn each, MiB | 27.38 (27.17–27.49) | 27.46 (26.61–27.54) |
+| CPU per turn, one each, ms | 1.46 (1.40–1.63) | 1.49 (1.36–1.51) |
+| Lifecycle CPU, s | 1.29 (1.25–1.53) | 1.34 (1.26–1.45) |
+| Lifecycle p95 turn, ms | 593 (587–602) | 592 (584–638) |
+| Lifecycle peak RSS, MiB | 24.39 (23.88–24.50) | 24.51 (24.46–24.62) |
+| Completion burst p99, ms | 16.9 (14.8–25.0) | 16.8 (13.9–20.2) |
+| Admission burst, last submit reply, ms | 7.7 (6.6–11.7) | 8.2 (6.8–12.8) |
+| Lone submit CPU, ms per 32 | 52.8 (40.0–61.0) | 50.3 (42.7–79.4) |
+
+Every difference is inside the run-to-run range.

@@ -845,7 +845,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix_for(&request, true)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.weight) / 4) as u64,
+            input: self.input_estimate(&pace, prefix.len() + request.items.weight, 0),
             output: 0,
         };
         let mut park_for = None;
@@ -918,9 +918,21 @@ impl Provider {
         let message: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
         let usage = anthropic::message_usage(&message, self.cache_hour);
-        reservation.settle_refresh(&usage);
+        reservation.settle_refresh(&usage, self.family);
         pace.accepted();
         Ok((usage, sent_at))
+    }
+
+    /// The input a request of `bytes` reserves beside `output`: about a
+    /// token per four bytes, or for a provider that leaves cache reads out
+    /// of its limits, the share of that its model's calls have been counting.
+    fn input_estimate(&self, pace: &pace::Pace, bytes: usize, output: u64) -> u64 {
+        let input = (bytes / 4) as u64;
+        if self.family.counts_cache_reads() {
+            input
+        } else {
+            pace.input_estimate(input, output)
+        }
     }
 
     /// Version, betas, and key for an Anthropic request.
@@ -1005,20 +1017,19 @@ impl Provider {
         }
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
-        let input = ((prefix.len() + request.items.weight) / 4) as u64;
+        // Anthropic counts output as it is written, not the cap a request
+        // asks for: reserve what this model's calls have been writing.
+        // OpenAI counts the cap, so it is reserved whole.
+        let output = match self.family {
+            Family::Anthropic => pace.output_estimate(
+                u64::from(self.max_output_tokens.unwrap_or(512)),
+                u64::from(self.anthropic_max_tokens(request.model)),
+            ),
+            Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
+        };
         let estimate = pace::Cost {
-            input,
-            // Anthropic counts output as it is written, not the cap a
-            // request asks for: reserve what this model's calls have been
-            // writing. OpenAI counts the cap, so it is reserved whole.
-            output: match self.family {
-                Family::Anthropic => pace.output_estimate(
-                    u64::from(self.max_output_tokens.unwrap_or(512)),
-                    u64::from(self.anthropic_max_tokens(request.model)),
-                    input,
-                ),
-                Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
-            },
+            input: self.input_estimate(&pace, prefix.len() + request.items.weight, output),
+            output,
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
@@ -1281,7 +1292,7 @@ impl Provider {
             result
         };
         report.usage = parser.usage();
-        reservation.settle_usage(report.usage.as_ref(), estimate);
+        reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
         // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
         if let Err(error) = &result
@@ -1473,7 +1484,7 @@ impl Provider {
         let completed = match outcome {
             Ok(()) => {
                 session.completed(parser.id(), key, ids);
-                reservation.settle_usage(report.usage.as_ref(), estimate);
+                reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
                 parser.finish().inspect(|_| pace.accepted())
             }
             Err(failure) => {
@@ -1487,7 +1498,7 @@ impl Provider {
                 if failure.refused && report.usage.is_none() {
                     reservation.settle(0);
                 } else {
-                    reservation.settle_usage(report.usage.as_ref(), estimate);
+                    reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
                 }
                 match (failure.status, &self.login, login) {
                     // The connection presents the refused login; a retry
