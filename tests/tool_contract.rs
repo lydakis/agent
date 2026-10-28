@@ -30,7 +30,7 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
     let prepared = tools
         .prepare(
             "shell",
-            &json!({"command":"printf '%s %s %s %s %s' \"$TERM\" \"$NO_COLOR\" \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\""})
+            &json!({"command":"printf '%s %s %s %s %s %s' \"$TERM\" \"$NO_COLOR\" \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\" \"$AI_AGENT\""})
                 .to_string(),
         )
         .unwrap();
@@ -43,7 +43,7 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
             .output,
     )
     .unwrap();
-    assert_eq!(output["stdout"], "dumb 1 less cat cat");
+    assert_eq!(output["stdout"], "dumb 1 less cat cat agent");
     assert!(
         Registry::new("echo")
             .unwrap()
@@ -849,4 +849,105 @@ async fn a_read_only_sandbox_writes_nothing() {
     let reported: Value = serde_json::from_slice(&written.stderr).unwrap();
     assert_eq!(reported["error"], "write_denied", "{reported}");
     assert!(!target.exists());
+}
+
+/// Serve each connection one canned response, by the path asked for.
+async fn page_server(pages: Vec<(&'static str, &'static str, Vec<u8>)>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            let (status, kind, body) = pages
+                .iter()
+                .find(|(page, _, _)| page.split(' ').next() == Some(path.as_str()))
+                .map(|(page, kind, body)| (page.split_once(' ').unwrap().1, *kind, body.clone()))
+                .unwrap_or(("404 Not Found", "text/plain", b"missing".to_vec()));
+            let head = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn web_fetch_reads_a_page_as_markdown_and_keeps_a_long_one() {
+    let long = format!("<p>{}</p><p>the end</p>", "word ".repeat(30_000));
+    let base = page_server(vec![
+        (
+            "/page 200 OK",
+            "text/html; charset=utf-8",
+            b"<html><head><title>Hello</title></head><body><h1>Hi</h1><a href=\"/next\">next</a></body></html>".to_vec(),
+        ),
+        ("/long 200 OK", "text/html", long.into_bytes()),
+        ("/picture 200 OK", "image/png", b"\x89PNG".to_vec()),
+    ])
+    .await;
+    let tools = Registry::new("web_fetch").unwrap();
+    let cwd = std::env::temp_dir();
+    let fetch = |path: &str| {
+        tools
+            .prepare(
+                "web_fetch",
+                &json!({"url":format!("{base}{path}")}).to_string(),
+            )
+            .unwrap()
+    };
+    let outcome = tools
+        .execute(fetch("/page"), &cwd, &[], None)
+        .await
+        .unwrap();
+    let output: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert!(!outcome.failed);
+    assert_eq!(output["status"], 200);
+    assert_eq!(output["title"], "Hello");
+    assert_eq!(output["text"], format!("# Hi\n\n[next]({base}/next)\n"));
+    assert_eq!(output["url"], format!("{base}/page"));
+    // A long page shows its start and end and keeps the whole to read.
+    let outcome = tools
+        .execute(fetch("/long"), &cwd, &[], None)
+        .await
+        .unwrap();
+    let output: Value = serde_json::from_str(&outcome.output).unwrap();
+    let text = output["text"].as_str().unwrap();
+    assert!(
+        text.len() < 70_000 && text.ends_with("the end\n"),
+        "{}",
+        text.len()
+    );
+    assert_eq!(outcome.artifacts.len(), 1);
+    assert_eq!(outcome.artifacts[0].0, "text");
+    assert!(outcome.artifacts[0].1.len() > 140_000);
+    // A missing page is a failed result with what the server said.
+    let outcome = tools
+        .execute(fetch("/gone"), &cwd, &[], None)
+        .await
+        .unwrap();
+    assert!(outcome.failed);
+    assert_eq!(
+        serde_json::from_str::<Value>(&outcome.output).unwrap()["text"],
+        "missing"
+    );
+    let error = tools
+        .execute(fetch("/picture"), &cwd, &[], None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "web_fetch_not_text");
+    assert_eq!(
+        tools
+            .prepare("web_fetch", r#"{"url":"file:///etc/passwd"}"#)
+            .err()
+            .unwrap()
+            .code,
+        "invalid_url"
+    );
 }
