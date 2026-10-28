@@ -178,7 +178,9 @@ impl Patch {
     /// or deleted (D).
     pub async fn apply(&self, workspace: &Path) -> Result<String> {
         enum Write {
-            Put(PathBuf, String),
+            /// A file's new contents, and for a move the permissions of the
+            /// file it came from.
+            Put(PathBuf, String, Option<std::fs::Permissions>),
             Remove(PathBuf),
         }
         let mut writes = Vec::new();
@@ -186,7 +188,7 @@ impl Patch {
         for change in &self.changes {
             match change {
                 Change::Add { path, contents } => {
-                    writes.push(Write::Put(workspace.join(path), contents.clone()));
+                    writes.push(Write::Put(workspace.join(path), contents.clone(), None));
                     summary.push_str(&format!("A {path}\n"));
                 }
                 Change::Delete { path } => {
@@ -215,12 +217,14 @@ impl Patch {
                     }
                     match move_to {
                         Some(to) => {
-                            writes.push(Write::Put(workspace.join(to), updated));
+                            // A moved script stays executable.
+                            let permissions = tokio::fs::metadata(&source).await?.permissions();
+                            writes.push(Write::Put(workspace.join(to), updated, Some(permissions)));
                             writes.push(Write::Remove(source));
                             summary.push_str(&format!("M {to}\n"));
                         }
                         None => {
-                            writes.push(Write::Put(source, updated));
+                            writes.push(Write::Put(source, updated, None));
                             summary.push_str(&format!("M {path}\n"));
                         }
                     }
@@ -229,11 +233,14 @@ impl Patch {
         }
         for write in writes {
             match write {
-                Write::Put(target, contents) => {
+                Write::Put(target, contents, permissions) => {
                     if let Some(parent) = target.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
                     files::write(&target, contents.as_bytes()).await?;
+                    if let Some(permissions) = permissions {
+                        tokio::fs::set_permissions(&target, permissions).await?;
+                    }
                 }
                 Write::Remove(target) => tokio::fs::remove_file(&target).await?,
             }
@@ -368,9 +375,18 @@ fn update(text: &str, chunks: &[Chunk], path: &str) -> Result<String> {
         replacements.push((at, old.len(), new));
         cursor = at + old.len();
     }
+    // An insertion with no context goes at the end of the file, so it can
+    // come before chunks that are found earlier in it.
+    replacements.sort_by_key(|&(at, _, _)| at);
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     let mut next = 0;
     for (at, removed, added) in replacements {
+        if at < next {
+            return Err(Error::with(
+                "patch_context_not_found",
+                format!("{path}: two chunks change the same lines"),
+            ));
+        }
         out.extend(&lines[next..at]);
         out.extend(added.iter().map(String::as_str));
         next = at + removed;
@@ -514,6 +530,16 @@ mod tests {
         let error = update("other\n", chunks, "f").unwrap_err();
         assert_eq!(error.code, "patch_context_not_found");
         assert!(error.detail.unwrap().contains("say(\"hi\")"));
+        // An insertion with no context lands at the end even when a later
+        // chunk changes an earlier line.
+        let parsed = patch("*** Update File: f\n@@\n+tail\n@@\n-first\n+changed\n");
+        let Change::Update { chunks, .. } = &parsed.changes[0] else {
+            panic!()
+        };
+        assert_eq!(
+            update("first\nsecond\n", chunks, "f").unwrap(),
+            "changed\nsecond\ntail\n"
+        );
     }
 
     #[tokio::test]
@@ -523,6 +549,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("keep.txt"), "a\nb\n").unwrap();
         std::fs::write(dir.join("gone.txt"), "x\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("keep.txt"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
         let failing =
             patch("*** Add File: new.txt\n+n\n*** Update File: keep.txt\n-missing\n+b2\n");
         assert_eq!(
@@ -547,6 +579,15 @@ mod tests {
             "a\nb2\n"
         );
         assert!(!dir.join("keep.txt").exists() && !dir.join("gone.txt").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("moved.txt"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "a move keeps the file's mode");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

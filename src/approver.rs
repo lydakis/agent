@@ -665,7 +665,8 @@ fn changes_files(tool: &str) -> bool {
 }
 
 /// The files a call changes: a write's or edit's `path`, or every file a
-/// patch adds, deletes, updates or moves to.
+/// patch adds, deletes, updates or moves to, or the `paths` read from a
+/// cut patch.
 fn changed_paths(tool: &str, arguments: &Value) -> Vec<String> {
     match tool {
         "write" | "edit" => arguments["path"]
@@ -673,7 +674,14 @@ fn changed_paths(tool: &str, arguments: &Value) -> Vec<String> {
             .map(str::to_owned)
             .into_iter()
             .collect(),
-        "apply_patch" => patch_paths(arguments["input"].as_str().unwrap_or_default()),
+        "apply_patch" => match arguments["paths"].as_array() {
+            Some(paths) => paths
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            None => patch_paths(arguments["input"].as_str().unwrap_or_default()),
+        },
         _ => Vec::new(),
     }
 }
@@ -1394,6 +1402,11 @@ mod tests {
             Some(json!({"paths":["a.rs"]}))
         );
         assert!(cut_change("apply_patch", r#"{"input":"*** Begin Pa"#).is_err());
+        // What a cut preview yields still names its files.
+        assert_eq!(
+            changed_paths("apply_patch", &json!({"paths":["a.rs", "b.rs"]})),
+            ["a.rs", "b.rs"]
+        );
         assert_eq!(changed_paths("edit", &json!({"path": "x"})), ["x"]);
         assert!(changed_paths("shell", &json!({"command": "*** Add File: x"})).is_empty());
     }
