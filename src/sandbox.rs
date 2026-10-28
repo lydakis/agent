@@ -80,7 +80,7 @@ impl Policy {
         paths.dedup();
         let mut roots = Vec::new();
         for path in paths {
-            roots.push(root(&path, &daemon.store)?);
+            roots.push(root(&path, daemon)?);
         }
         Ok(Some(Policy {
             roots,
@@ -281,8 +281,8 @@ pub struct Daemon {
 
 /// The root at `path`, with what stays read-only inside it: the protected
 /// folders at its top, a worktree's own git folder when it is inside the
-/// root, and the daemon's store.
-fn root(path: &Path, store: &Option<PathBuf>) -> Result<Root> {
+/// root, and the daemon's store and socket.
+fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     let mut read_only = Vec::new();
     let mut missing = Vec::new();
     for name in PROTECTED {
@@ -322,10 +322,18 @@ fn root(path: &Path, store: &Option<PathBuf>) -> Result<Root> {
             Err(_) => {}
         }
     }
-    if let Some(store) = store
+    if let Some(store) = &daemon.store
         && store.starts_with(path)
     {
         read_only.extend(store_files(store).filter(|file| file.exists()));
+    }
+    // A socket the bot could rename or link would be reachable by its new
+    // name, past a rule that names the old one.
+    if let Some(socket) = &daemon.socket
+        && socket.starts_with(path)
+        && socket.exists()
+    {
+        read_only.push(socket.clone());
     }
     Ok(Root {
         path: path.to_owned(),
@@ -725,41 +733,75 @@ const SEATBELT_PREFERENCES: &str = include_str!("sandbox/seatbelt_preferences_po
 const SEATBELT_TLS_TRUST: &str =
     "(allow mach-lookup (global-name \"com.apple.TrustEvaluationAgent\"))\n";
 
+/// A rule that keeps the folder `key` names from being renamed or removed.
+fn anchor(key: &str) -> String {
+    format!(
+        "(deny file-write-unlink (require-all (literal (param \"{key}\")) (vnode-type DIRECTORY)))"
+    )
+}
+
 /// The Seatbelt profile for `policy` and the parameters it names, as Codex
 /// writes it: everything denied but what its base allows, reading open,
 /// writing each root but the paths it keeps, and network only when on.
 /// Paths go in as parameters, never into the profile's text.
 pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
     let mut params: Vec<(String, PathBuf)> = Vec::new();
+    // One parameter per path, however many rules name it.
+    let mut param = |path: &Path| -> String {
+        if let Some((key, _)) = params.iter().find(|(_, named)| named == path) {
+            return key.clone();
+        }
+        let key = format!("PATH_{}", params.len());
+        params.push((key.clone(), path.to_owned()));
+        key
+    };
     let mut allows = Vec::new();
     let mut anchors = Vec::new();
     for (index, root) in policy.roots.iter().enumerate() {
-        let key = format!("WRITABLE_ROOT_{index}");
-        params.push((key.clone(), root.path.clone()));
+        let key = param(&root.path);
         // The root itself can't be renamed away from under its own rules.
-        anchors.push(format!(
-            "(deny file-write-unlink (require-all (literal (param \"{key}\")) (vnode-type DIRECTORY)))"
-        ));
-        // What this root keeps, and what each deeper root inside it keeps:
-        // the deepest root decides, as bubblewrap's mounts do.
-        let kept: Vec<&PathBuf> = policy.roots[index..]
-            .iter()
-            .filter(|inner| inner.path.starts_with(&root.path))
-            .flat_map(|inner| inner.read_only.iter().chain(&inner.missing))
-            .collect();
+        anchors.push(anchor(&key));
+        // What this root keeps, and the deeper roots just inside it, which
+        // decide for themselves: the deepest root decides, as bubblewrap's
+        // mounts do, and each rule names only what is its own.
+        let inner = policy.roots[index + 1..].iter().filter(|inner| {
+            inner.path.starts_with(&root.path)
+                && !policy.roots[index + 1..].iter().any(|between| {
+                    between.path != inner.path
+                        && between.path.starts_with(&root.path)
+                        && inner.path.starts_with(&between.path)
+                })
+        });
         let mut parts = vec![format!("(subpath (param \"{key}\"))")];
-        for (kept_index, kept) in kept.into_iter().enumerate() {
-            let kept_key = format!("{key}_EXCLUDED_{kept_index}");
-            params.push((kept_key.clone(), kept.clone()));
+        for kept in root.read_only.iter().chain(&root.missing) {
+            let kept_key = param(kept);
             // Both the path and what is under it: `subpath` alone would let
             // the folder itself be made.
             parts.push(format!("(require-not (literal (param \"{kept_key}\")))"));
             parts.push(format!("(require-not (subpath (param \"{kept_key}\")))"));
         }
+        for inner in inner {
+            let inner_key = param(&inner.path);
+            parts.push(format!("(require-not (subpath (param \"{inner_key}\")))"));
+        }
         allows.push(match parts.len() {
             1 => parts.remove(0),
             _ => format!("(require-all {} )", parts.join(" ")),
         });
+    }
+    // Nor can the folders between a root and the daemon's socket, which
+    // would take the socket to a name its rule doesn't cover.
+    if let Some(socket) = &policy.socket {
+        for folder in socket.ancestors().skip(1) {
+            if policy
+                .roots
+                .iter()
+                .any(|root| folder.starts_with(&root.path))
+                && !policy.roots.iter().any(|root| root.path == folder)
+            {
+                anchors.push(anchor(&param(folder)));
+            }
+        }
     }
     let mut sections = vec![
         SEATBELT_BASE.to_owned(),
@@ -778,11 +820,10 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
     // Never the daemon's socket, as Codex keeps its own from a sandboxed
     // command: nothing confined may drive the daemon.
     if let Some(socket) = &policy.socket {
-        params.push(("DAEMON_SOCKET".to_owned(), socket.clone()));
-        sections.push(
-            "(deny network-outbound (remote unix-socket (subpath (param \"DAEMON_SOCKET\"))))"
-                .to_owned(),
-        );
+        let key = param(socket);
+        sections.push(format!(
+            "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+        ));
     }
     sections.push(SEATBELT_PREFERENCES.to_owned());
     sections.push("(deny mach-lookup (xpc-service-name-prefix \"\"))".to_owned());
@@ -872,44 +913,113 @@ mod tests {
         let (profile, params) = seatbelt(&policy);
         assert!(profile.contains("(allow file-read*)"));
         assert!(!profile.contains("(allow network-outbound)"));
-        // The outer root keeps the inner root's `.git` too.
-        let outer = params
-            .iter()
-            .position(|(_, path)| path == &base)
-            .map(|index| params[index].0.clone())
-            .unwrap();
-        let kept: Vec<&PathBuf> = params
-            .iter()
-            .filter(|(key, _)| key.starts_with(&format!("{outer}_EXCLUDED_")))
-            .map(|(_, path)| path)
-            .collect();
-        assert!(kept.contains(&&inner.join(".git")));
+        let key = |path: &Path| {
+            params
+                .iter()
+                .find(|(_, named)| named == path)
+                .map(|(key, _)| key.clone())
+                .unwrap()
+        };
+        // The outer root leaves the inner root to its own rule, which keeps
+        // the inner `.git`.
+        let (outer, inner_key, inner_git) = (key(&base), key(&inner), key(&inner.join(".git")));
+        let rule = |root: &str| {
+            profile
+                .split(&format!("(require-all (subpath (param \"{root}\"))"))
+                .nth(1)
+                .unwrap()
+                .split(" )")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(rule(&outer).contains(&format!("(require-not (subpath (param \"{inner_key}\")))")));
+        assert!(!rule(&outer).contains(&format!("\"{inner_git}\"")));
+        assert!(
+            rule(&inner_key).contains(&format!("(require-not (subpath (param \"{inner_git}\")))"))
+        );
         // Paths go in as parameters, never into the profile's text.
         assert!(!profile.contains(base.to_str().unwrap()));
-        // The daemon's socket is denied, network on or off.
+        // The daemon's socket is denied, network on or off; inside a root
+        // it stays read-only and the folders above it stay put, so it can't
+        // be renamed or linked past its rule.
+        let socket = inner.join("run/agent.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, "").unwrap();
+        let daemon = Daemon {
+            socket: Some(socket.clone()),
+            ..Daemon::default()
+        };
         for network in [false, true] {
-            let socket = Policy {
+            let policy = Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&base),
+                &[inner.to_str().unwrap().to_owned()],
                 network,
-                socket: Some(base.join("agent.sock")),
-                ..policy.clone()
-            };
-            let (profile, params) = seatbelt(&socket);
-            assert!(profile.contains(
-                "(deny network-outbound (remote unix-socket (subpath (param \"DAEMON_SOCKET\"))))"
-            ));
-            assert!(
+                &daemon,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!policy.can_write(&socket));
+            let (profile, params) = seatbelt(&policy);
+            let key = |path: &Path| {
                 params
                     .iter()
-                    .any(|(key, path)| key == "DAEMON_SOCKET" && path == &base.join("agent.sock"))
-            );
+                    .find(|(_, named)| named == path)
+                    .map(|(key, _)| key.clone())
+                    .unwrap()
+            };
+            assert!(profile.contains(&format!(
+                "(deny network-outbound (remote unix-socket (subpath (param \"{}\"))))",
+                key(&socket)
+            )));
+            assert!(profile.contains(&format!(
+                "(require-not (literal (param \"{}\")))",
+                key(&socket)
+            )));
+            assert!(profile.contains(&anchor(&key(&inner.join("run")))));
             #[cfg(target_os = "linux")]
             assert!(
-                linux::args(&socket, false)
+                linux::args(&policy, false)
                     .windows(3)
-                    .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null")
+                    .any(|w| w[0] == "--ro-bind"
+                        && w[1] == "/dev/null"
+                        && w[2] == socket.to_string_lossy())
             );
         }
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn many_nested_roots_still_fit_one_invocation() {
+        // 64 nested roots with long names, about the settings' limit: each
+        // rule names only its own, so the profile and its parameters grow
+        // with the roots, not with their square.
+        let mut path = PathBuf::from("/");
+        let roots: Vec<Root> = (0..64)
+            .map(|index| {
+                path.push(format!("{index:0>12}"));
+                Root {
+                    read_only: PROTECTED.iter().map(|name| path.join(name)).collect(),
+                    missing: Vec::new(),
+                    path: path.clone(),
+                }
+            })
+            .collect();
+        let policy = Policy {
+            roots,
+            network: true,
+            socket: Some(path.join("agent.sock")),
+            helper: None,
+        };
+        let (profile, params) = seatbelt(&policy);
+        let size = profile.len()
+            + params
+                .iter()
+                .map(|(key, path)| key.len() + path.as_os_str().len() + 4)
+                .sum::<usize>();
+        assert!(size < 1 << 20, "{size}");
+        assert_eq!(params.len(), 64 * 5 + 1);
     }
 
     #[test]
