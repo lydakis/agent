@@ -109,6 +109,16 @@ pub struct Screen {
     laid: usize,
 }
 
+/// The place found is to be picked again, the rows having been drawn anew.
+const AGAIN: usize = usize::MAX;
+
+/// The newest of `hits` that starts above `bottom`, else the newest.
+fn nearest(hits: &[(Spot, Spot)], bottom: usize) -> usize {
+    (hits.iter())
+        .rposition(|(start, _)| start.0 < bottom)
+        .unwrap_or(hits.len().saturating_sub(1))
+}
+
 /// Text looked for in the rows (Ctrl+F): each place it is, from the
 /// oldest, as the rows it starts and ends on, and the one shown.
 struct Finding {
@@ -120,8 +130,15 @@ struct Finding {
 
 impl Screen {
     /// The conversation drawn again from the start, as a repaint does.
+    /// What is being found stays, looked for again in the rows drawn anew.
     pub fn clear(&mut self) {
+        let finding = self.finding.take().map(|finding| Finding {
+            at: AGAIN,
+            laid: usize::MAX,
+            ..finding
+        });
         *self = Self::default();
+        self.finding = finding;
     }
 
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
@@ -291,9 +308,7 @@ impl Screen {
     pub fn find(&mut self, query: &str) {
         let bottom = self.shown.len() - self.back.min(self.shown.len());
         let hits = self.hits(query);
-        let at = (hits.iter())
-            .rposition(|(start, _)| start.0 < bottom)
-            .unwrap_or(hits.len().saturating_sub(1));
+        let at = nearest(&hits, bottom);
         self.finding = Some(Finding {
             query: query.to_owned(),
             hits,
@@ -436,7 +451,10 @@ impl Screen {
             let (query, at) = (finding.query.clone(), finding.at);
             let hits = self.hits(&query);
             self.finding = Some(Finding {
-                at: at.min(hits.len().saturating_sub(1)),
+                at: match at {
+                    AGAIN => nearest(&hits, bottom),
+                    at => at.min(hits.len().saturating_sub(1)),
+                },
                 query,
                 hits,
                 laid: self.laid,
@@ -1130,6 +1148,19 @@ mod tests {
         screen.find_next(true);
         screen.find_next(true);
         assert_eq!(screen.found(), Some((3, 3)));
+    }
+
+    #[test]
+    fn find_goes_on_in_the_rows_drawn_again() {
+        let lines = |from| (from..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines(10), 20, 5);
+        screen.find("row 1");
+        assert_eq!(screen.found(), Some((10, 10)));
+        screen.clear();
+        screen.push(lines(0));
+        let area = Rect::new(0, 0, 20, 5);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert_eq!(screen.found(), Some((11, 11)));
     }
 
     #[test]

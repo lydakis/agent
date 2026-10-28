@@ -3969,6 +3969,12 @@ impl App {
     /// the selection, and the keys that scroll. Whether it took `event`.
     fn full_screen(&mut self, event: &Event) -> bool {
         let key = match event {
+            // A paste while finding is more to find.
+            Event::Paste(text) if let Some(query) = &mut self.finding => {
+                query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
+                self.screen.find(query);
+                return true;
+            }
             Event::Mouse(mouse) => {
                 let up = mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp;
                 if up && self.screen.at_top() && self.older.is_some() {
