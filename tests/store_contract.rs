@@ -5816,6 +5816,31 @@ fn history_search_follows_the_lineage_of_a_fork() {
         .map(|m| m["turn"].as_i64().unwrap())
         .collect();
     assert_eq!(turns, vec![2, 1]);
+    // A multiline item is searched as history reads show it, compacted.
+    let turn = db
+        .begin(
+            "branch",
+            "k3",
+            "multiline",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let item = "{\n  \"type\": \"message\",\n  \"role\": \"assistant\",\n  \"content\": [{\"type\": \"output_text\", \"text\": \"spaced\"}]\n}";
+    db.append(turn, vec![Bytes::from(item)], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let found = db
+        .history_search("branch", r#""role":"assistant","content""#, None, false)
+        .unwrap();
+    assert_eq!(found["matches"][0]["turn"], 3);
+    assert!(
+        found["matches"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("spaced")
+    );
     let source = db.history_search("Bob", "branch", None, false).unwrap();
     assert!(source["matches"].as_array().unwrap().is_empty());
     assert_eq!(

@@ -4395,9 +4395,12 @@ impl Database {
                 FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
              SELECT id,turn_seq,size FROM chain",
         )?;
-        // SQLite's lower() folds ASCII only, as to_ascii_lowercase does.
+        // SQLite's lower() folds ASCII only, as to_ascii_lowercase does. A
+        // multiline item reads with its whitespace compacted, so text the
+        // view has may not be in the item as stored: the view decides.
         let mut contains = self.conn.prepare_cached(
-            "SELECT instr(lower(CAST(item AS TEXT)),?2)>0 FROM nodes WHERE id=?1",
+            "SELECT instr(item,x'0a')>0 OR instr(item,x'0d')>0
+                OR instr(lower(CAST(item AS TEXT)),?2)>0 FROM nodes WHERE id=?1",
         )?;
         // The raw item may match only in what the view leaves out, such as
         // a picture's bytes, so a match counts once the view has it too.
