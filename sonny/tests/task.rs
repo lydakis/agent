@@ -155,6 +155,30 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
 }
 
 #[test]
+fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
+    let lab = Lab::new("brief");
+    // A link in the home to the repository, as `~/workplace` is to
+    // `/Volumes/workplace`.
+    std::os::unix::fs::symlink(&lab.repo, lab.home.join("link")).unwrap();
+    let repo = lab.repo.to_string_lossy();
+    let brief = format!("edit {repo}/src/lib.rs and ~/link/src, keep {repo}2/x");
+    let (ok, _, said) = lab.run(
+        &lab.repo.join("src"),
+        env!("CARGO_BIN_EXE_sonny"),
+        &["task", "demo.fix", "--", &brief],
+        false,
+    );
+    assert!(ok, "{said}");
+    let copy = lab.home.join(".agent/worktrees/demo.fix");
+    let copy = copy.to_string_lossy();
+    assert_eq!(
+        lab.ran().last().unwrap(),
+        &format!("edit {copy}/src/lib.rs and {copy}/src, keep {repo}2/x")
+    );
+    assert!(said.contains("2 times"), "{said}");
+}
+
+#[test]
 fn a_task_that_does_not_start_leaves_no_worktree_or_branch() {
     let lab = Lab::new("worktree-fails");
     let (ok, said) = lab.task(true, &[]);

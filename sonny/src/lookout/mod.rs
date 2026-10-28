@@ -27,10 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// An answer below this is a no; at or above `HIGH`, a yes. The approver's
-/// bands, so one reading of a judge's probabilities holds everywhere.
-const LOW: f64 = agent_client::approver::LOW;
-const HIGH: f64 = agent_client::approver::HIGH;
+/// An answer below this is a no; at or above `HIGH`, a yes.
+const LOW: f64 = 0.35;
+const HIGH: f64 = 0.70;
 /// How long a check may take before it counts as failed.
 const DEADLINE: Duration = Duration::from_secs(10);
 /// How long after a note is refused the next may go, even a steer.

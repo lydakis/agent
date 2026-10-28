@@ -92,7 +92,7 @@ identity is `bot_not_found`.
   plus `~/.agents/AGENTS.md`, and indexes of the skills in
   `.agents/skills/NAME/SKILL.md` and the profiles in `.agents/agents/ROLE.md`,
   and the memory indexes in `~/.agents/memory` ([CLIENT.md](CLIENT.md)). It is
-  opt-in on the CLI, the default in the app, and exclusive with
+  opt-in on the CLI, what Sonny composes for its agents, and exclusive with
   `--instructions`. `--profile ROLE` composes the same text with that role
   last, and takes the role's `model` and `tools` unless `--model` or
   `--tools` names them; a missing role is `profile_not_found`. `fork` takes
@@ -106,7 +106,8 @@ identity is `bot_not_found`.
   judge model decide each call. For `auto`, and whenever `run` continues or
   `fork` copies a bot an `auto` gate answers, the CLI starts `agent
   approver` detached when no session serves the `auto` tag, and gives a
-  call 45 s before its gate lapses.
+  call 105 s before its gate lapses (the approver's 90 s review budget,
+  plus margin).
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`, and in `auto` `read` too. A fork keeps its source's gates and a created bot its

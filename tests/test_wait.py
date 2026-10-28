@@ -740,14 +740,17 @@ class WaitTests(ModelFixture):
             while not (self.path / 'marker').exists():
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
-            time.sleep(.2)
+            # Time for the result to queue, then for the daemon to read every
+            # admission behind it; both stay well inside SQLite's 5 s busy
+            # timeout, so the lock alone decides the order.
+            time.sleep(.5)
             lines = [{'id': f'create-{n}', 'op': 'create', 'bot': f'New{n}', 'workspace': str(self.path),
                       'model': client.model, 'instructions': client.instructions, 'tools': client.tools}
                      for n in range(31)]
             lines.append({'id': 'submit', 'op': 'submit', 'bot': 'Carol', 'request_id': 'late', 'prompt': 'hi'})
             client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
             client.process.stdin.flush()
-            time.sleep(.2)
+            time.sleep(1)
         finally:
             lock.execute('ROLLBACK')
             lock.close()
