@@ -301,6 +301,28 @@ class ApprovalTests(ModelFixture):
         self.assertIn('result', daemon.request('delete', bot='Carl'))
         self.assertFalse(own.exists())
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bots_commands_run_together_in_its_sandbox(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.client('shell', settings={'sandbox': 'workspace-write'})
+        client.request('create', bot='Bob', workspace=str(self.path))
+        calls = [['shell', {'command': 'sleep .6; touch a'}],
+                 ['shell', {'command': f'sleep .6; touch b; touch {outside}/x'}],
+                 ['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}]]
+        started = time.monotonic()
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The two confined commands ran at once, each in the sandbox.
+        self.assertLess(time.monotonic() - started, 1.1)
+        self.assertTrue((self.path / 'a').exists() and (self.path / 'b').exists())
+        self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
+        # The one that asks to leave it still runs alone, and is refused.
+        self.assertEqual(self.tool_output(client, 'shell-3')[1]['error'], 'escalation_refused')
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:touch ran')['result']['turn']

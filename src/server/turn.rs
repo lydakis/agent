@@ -247,10 +247,13 @@ impl Lift {
     }
 }
 const LIFT_GRACE: Duration = Duration::from_millis(250);
+/// The most of one round's calls a bot runs at once. Each command also
+/// waits for the daemon's process budget, so this is a bot's share of it.
+const PARALLEL_CALLS: usize = 4;
 
 /// A tool's result, or the command a steer moved to the background.
-enum Ran<F> {
-    Done(Result<Outcome>),
+enum Ran<F, T = Outcome> {
+    Done(Result<T>),
     Lifted(std::pin::Pin<Box<F>>),
 }
 
@@ -3162,14 +3165,14 @@ impl Turn {
     /// the run to the background instead, handed back unfinished, once the
     /// paired signal says it is running: a command still waiting for a
     /// process slot stays in line in the foreground.
-    async fn run_tool<F: Future<Output = Result<Outcome>>>(
+    async fn run_tool<T, F: Future<Output = Result<T>>>(
         &self,
         run: F,
         lift: Option<(&Lift, oneshot::Receiver<()>)>,
         warm: Option<&mut Warm<'_>>,
-    ) -> Result<Ran<F>> {
-        enum Next {
-            Ran(Result<Outcome>),
+    ) -> Result<Ran<F, T>> {
+        enum Next<T> {
+            Ran(Result<T>),
             Lifted,
             Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
         }
@@ -3378,6 +3381,26 @@ impl Turn {
         let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
+            // Calls in a row that only read or run commands, none of them
+            // gated, run together, as Codex runs them.
+            if let Some(first) = self.parallel(record, &call, workspace)
+                && calls
+                    .as_slice()
+                    .first()
+                    .is_some_and(|next| self.parallel(record, next, workspace).is_some())
+            {
+                let mut batch = vec![(call, first)];
+                while let Some(prepared) = calls
+                    .as_slice()
+                    .first()
+                    .and_then(|next| self.parallel(record, next, workspace))
+                {
+                    batch.push((calls.next().expect("a next call"), prepared));
+                }
+                self.execute_parallel(batch, record, workspace, environment, warm.as_deref_mut())
+                    .await?;
+                continue;
+            }
             // An escape from a sandbox runs unconfined only once a gate
             // allowed it.
             let approved = record.gated(&call, workspace);
@@ -3432,46 +3455,10 @@ impl Turn {
                          run it without sandbox_permissions",
                     ))
                 }
-                Ok(prepared) if confined => {
-                    // Reading the roots touches the filesystem: off the
-                    // runtime thread.
-                    let (settings, daemon, bot) = (
-                        record.settings.clone(),
-                        self.registry.daemon().clone(),
-                        record.bot_id,
-                    );
-                    let root = record
-                        .workspace
-                        .as_ref()
-                        .map_or_else(|| workspace.to_owned(), PathBuf::from);
-                    tokio::task::spawn_blocking(move || {
-                        // The probe for a sandbox runs once, here off the
-                        // runtime thread, also for a bot from before a restart.
-                        agent_runtime::sandbox::available()?;
-                        // The bot's own socket, so its commands may use the
-                        // daemon as far as a sandboxed bot may; opened first,
-                        // so its folder is there to be kept read-only.
-                        let capability = daemon.capability(bot)?;
-                        let policy = Policy::new(
-                            settings.sandbox,
-                            Some(&root),
-                            &settings.writable,
-                            settings.network,
-                            &daemon,
-                        )?;
-                        Ok(policy.map(|policy| Policy {
-                            capability,
-                            ..policy
-                        }))
-                    })
-                    .await
-                    .map_err(|_| Error::new("sandbox_unavailable"))
-                    .flatten()
-                    .map(|policy| {
-                        sandbox = policy.map(Arc::new);
-                        prepared
-                    })
-                }
+                Ok(prepared) if confined => self.sandbox(record, workspace).await.map(|policy| {
+                    sandbox = policy;
+                    prepared
+                }),
                 other => other,
             };
             let answered = record
@@ -3668,6 +3655,228 @@ impl Turn {
                 .await?;
         }
         Ok(None)
+    }
+
+    /// The call prepared, when it may run beside others: an ungated
+    /// command in the foreground or a file read, which the bot may call. Codex
+    /// runs these together too; a change to a file runs alone, in order.
+    /// A sandboxed bot's command runs beside others only inside its
+    /// sandbox; one that asks to leave it goes the lone way, to be refused.
+    fn parallel(
+        &self,
+        record: &Bot,
+        call: &ToolCall,
+        workspace: &std::path::Path,
+    ) -> Option<Prepared> {
+        if !matches!(call.name.as_str(), "shell" | "read")
+            || record.gated(call, workspace)
+            || record.declared(&call.name).is_some()
+            || !record.callable().iter().any(|name| name == &call.name)
+            || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
+        {
+            return None;
+        }
+        match self.registry.prepare(&call.name, &call.arguments) {
+            // A stored stream or result is paged to fit the context left,
+            // which a read beside it would spend too: it runs alone.
+            Ok(
+                prepared @ (Prepared::Shell {
+                    background: false, ..
+                }
+                | Prepared::Read {
+                    source: ReadSource::Path(_),
+                    ..
+                }),
+            ) => Some(prepared),
+            _ => None,
+        }
+    }
+
+    /// Run a batch of calls [`Self::parallel`] admits together, up to
+    /// [`PARALLEL_CALLS`] at a time and no more than half the process
+    /// budget: all started in one commit, each result recorded in call
+    /// order as soon as it and those before it are done. A steer moves every command still running to the
+    /// background, as it does a lone one.
+    async fn execute_parallel(
+        &self,
+        batch: Vec<(ToolCall, Prepared)>,
+        record: &Bot,
+        workspace: &std::path::Path,
+        environment: &[(String, String)],
+        warm: Option<&mut Warm<'_>>,
+    ) -> Result<()> {
+        let turn = self.turn;
+        let starting: Vec<ToolCall> = batch.iter().map(|(call, _)| call.clone()).collect();
+        self.store
+            .op("tool_start", move |db| {
+                starting
+                    .iter()
+                    .try_for_each(|call| db.tool_start(turn, call).map(drop))
+            })
+            .await?;
+        // A sandboxed bot's commands all run in its one sandbox; when it
+        // can't be had, each command fails with why.
+        let shells = batch
+            .iter()
+            .any(|(_, prepared)| matches!(prepared, Prepared::Shell { .. }));
+        let sandbox = match shells && record.sandboxed() {
+            true => self.sandbox(record, workspace).await,
+            false => Ok(None),
+        };
+        let runs = batch.into_iter().map(|(call, prepared)| {
+            let sandbox = match (&prepared, &sandbox) {
+                (Prepared::Shell { .. }, Err(error)) => Err(error.clone()),
+                (_, sandbox) => Ok(sandbox.clone().unwrap_or_default()),
+            };
+            self.run_parallel(call.call_id, prepared, workspace, environment, sandbox)
+        });
+        let record = async {
+            // Results go to the store in call order as they come, each
+            // queued without waiting on the one before, so results done
+            // together share a commit. Waiting for room on the store's
+            // queue happens beside the calls still running, which go on
+            // being polled; meanwhile the channel holds at most one result
+            // per call in the batch.
+            let (done, mut recorded) = tokio::sync::mpsc::unbounded_channel();
+            let run = async move {
+                let mut results = stream::iter(runs).buffered(self.registry.wide(PARALLEL_CALLS));
+                while let Some((id, outcome)) = results.next().await {
+                    let _ = done.send((id, outcome?));
+                }
+                Ok::<_, Error>(())
+            };
+            // Each write's acknowledgement carries its result: dropped as
+            // it comes, so committed results aren't held for the batch.
+            let write = async {
+                let mut written = stream::FuturesOrdered::new();
+                loop {
+                    tokio::select! {
+                        Some(answer) = written.next(), if !written.is_empty() => drop(answer?),
+                        next = recorded.recv() => match next {
+                            Some((id, outcome)) => written.push_back(
+                                self.store.slot().await?.op("tool_finish", move |db| {
+                                    db.tool_finish(turn, &id, &outcome)
+                                }),
+                            ),
+                            None => break,
+                        },
+                    }
+                }
+                while let Some(answer) = written.next().await {
+                    answer?;
+                }
+                Ok::<_, Error>(())
+            };
+            let (ran, wrote) = tokio::join!(run, write);
+            ran.and(wrote)
+        };
+        match self.run_tool(record, None, warm).await? {
+            Ran::Done(result) => result,
+            Ran::Lifted(_) => unreachable!("a batch is not lifted whole"),
+        }
+    }
+
+    /// One call of a batch, run to its outcome: an error only when the
+    /// scheduler closed.
+    async fn run_parallel(
+        &self,
+        call_id: String,
+        prepared: Prepared,
+        workspace: &std::path::Path,
+        environment: &[(String, String)],
+        sandbox: Result<Option<Arc<Policy>>>,
+    ) -> (String, Result<Outcome>) {
+        let sandbox = match sandbox {
+            Ok(sandbox) => sandbox,
+            Err(error) => return (call_id, Ok(failure(error))),
+        };
+        let ran = match prepared {
+            Prepared::Shell {
+                command,
+                timeout_ms,
+                background: false,
+            } => {
+                let (started, running) = oneshot::channel();
+                let mut run = Box::pin(self.registry.foreground(
+                    command,
+                    workspace.to_path_buf(),
+                    timeout_ms,
+                    environment.to_vec(),
+                    sandbox,
+                    started,
+                ));
+                let lifted = async {
+                    // A run that ends before it starts wins the race below.
+                    match running.await {
+                        Ok(()) => self.lift.lifted().await,
+                        Err(_) => std::future::pending().await,
+                    }
+                };
+                let finished = tokio::select! {
+                    biased;
+                    result = &mut run => Some(result),
+                    () = lifted => None,
+                };
+                match finished {
+                    Some(result) => result,
+                    None => return (call_id.clone(), self.lift_shell(&call_id, run).await),
+                }
+            }
+            prepared => {
+                self.registry
+                    .execute(prepared, workspace, environment, sandbox)
+                    .await
+            }
+        };
+        let outcome = match ran {
+            Ok(outcome) => Ok(annotate(outcome, self.turn, &call_id)),
+            Err(error) if error.code == "tool_scheduler_closed" => Err(error),
+            Err(error) => Ok(failure(error)),
+        };
+        (call_id, outcome)
+    }
+
+    /// The bot's sandbox, built from its settings. Reading its roots
+    /// touches the filesystem, so it runs off the runtime thread; it fails
+    /// rather than leave a call that must be confined unconfined.
+    async fn sandbox(
+        &self,
+        record: &Bot,
+        workspace: &std::path::Path,
+    ) -> Result<Option<Arc<Policy>>> {
+        let (settings, daemon, bot) = (
+            record.settings.clone(),
+            self.registry.daemon().clone(),
+            record.bot_id,
+        );
+        let root = record
+            .workspace
+            .as_ref()
+            .map_or_else(|| workspace.to_owned(), PathBuf::from);
+        tokio::task::spawn_blocking(move || {
+            // The probe for a sandbox runs once, here off the runtime
+            // thread, also for a bot from before a restart.
+            agent_runtime::sandbox::available()?;
+            // The bot's own socket, so its commands may use the daemon as
+            // far as a sandboxed bot may; opened first, so its folder is
+            // there to be kept read-only.
+            let capability = daemon.capability(bot)?;
+            let policy = Policy::new(
+                settings.sandbox,
+                Some(&root),
+                &settings.writable,
+                settings.network,
+                &daemon,
+            )?;
+            Ok(policy.map(|policy| Policy {
+                capability,
+                ..policy
+            }))
+        })
+        .await
+        .map_err(|_| Error::new("sandbox_unavailable"))
+        .flatten()
+        .map(|policy| policy.map(Arc::new))
     }
 
     /// Wait for a gated call's verdict: live for the hold, then parked like

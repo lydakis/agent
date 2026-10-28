@@ -5644,3 +5644,28 @@ Hot-path screen, in the same alternating run: the previous pacer change against 
 Every range overlaps the other build's. The medians for completion p99 and
 lifecycle CPU are a little higher; neither bench waits on a learned limit,
 so the new path costs one look at an empty list of bookings per call.
+
+## Calls in a row run together (#291)
+
+The Perf workflow's matched screen, base main 93e57b8 against the PR head
+78c5a4d, on the GitHub runner (2026-10-28):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 38.914 | 38.556 | -0.9% |
+| admission | burst submit p99, ms | 6.025 | 5.86 | -2.7% |
+| completion | release to terminal p99, ms | 13.442 | 13.297 | -1.1% |
+| footprint | idle RSS, MiB | 17.418 | 17.51 | +0.5% |
+| footprint | per idle bot, KiB | 1.578 | 1.61 | +2.0% |
+| footprint | RSS after a turn each, MiB | 26.357 | 26.639 | +1.1% |
+| footprint | CPU per turn, ms | 1.284 | 1.268 | -1.2% |
+| lifecycle | CPU, s | 1.225 | 1.165 | -4.9% |
+| lifecycle | p95 turn, ms | 583.266 | 581.296 | -0.3% |
+| lifecycle | peak RSS, MiB | 23.912 | 24.0 | +0.4% |
+
+Store jobs per turn did not change. Every change is within the gate's 15%.
+These benches make one call per round, so they show the lone path unchanged.
+The batch path's gain is wall time: in `tests/test_wait.py`, two commands
+that each sleep 0.6 s finish in under 1.1 s. Results of a batch are queued
+to the store in call order without waiting on each other, so calls that
+finish together share a commit.
