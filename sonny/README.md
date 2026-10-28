@@ -13,7 +13,12 @@ Linux), so nothing is signed; Sonny starts the `agent` formula's daemon by its
 `opt` path. On Linux, each release also has
 `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 and aarch64): static builds of
 Sonny in `bin/` and its daemon in `libexec/`. Unpack it anywhere and run
-`bin/sonny`. With `cargo install`, build both (`--path .` for `agent` and
+`bin/sonny`, or let [install.sh](../install.sh) fetch, check and link the
+latest one into `~/.local`:
+
+    curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
+
+With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
 the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
@@ -29,7 +34,43 @@ skills it writes name `"…/sonny" agent` wherever they would say
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
 Sonny in its `lead` role, with the folder's
-`.agents/project.toml` written when it had none.
+`.agents/project.toml` written when it had none. Every folder can have a
+lead: outside git, the folder Sonny opens in is its own project, whatever
+project holds the folder above it. In a git repository, Sonny opens the
+nearest project in that repository, else makes the repository's top one,
+so `src` reaches the repository's lead and a task's worktree its main
+checkout's; a subfolder of a repository is its own project once it has a
+file (`sonny project add DIR`). A project whose file says
+`subfolders = "project"` keeps the folders below it: Sonny opened in any of
+them that has no project file of its own, a repository among them, opens
+that project's lead (the nearest project above decides; the home folder's
+file never does). A lead made below another project's folder says which
+lead holds the folder above. Sonny refuses to make a lead in a task's own
+folder under `~/.agent`.
+
+`~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
+keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
+the daemon, the approver and the lookout. Settings go in
+`~/.agent/config.toml`, as Codex keeps them: `provider` (the daemon's
+`--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
+agent's when none is named) and the efforts below. When no provider is named
+and no key is set, the first `sonny` in a terminal asks for one, as Codex and
+Claude Code ask for a sign-in: a ChatGPT plan (signed in with `agent login
+chatgpt`), an Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS
+profile. A new project's model is `--model`, else the project file's or the
+role's, else `AGENT_MODEL`, else the config's `model`, else the newest
+agent's; with none, Sonny lists what the providers offer and keeps the pick
+as `model`. Either step also suggests efforts, `[sonny] lead_effort =
+"medium"` and `task_effort = "high"`, unless the config already sets them.
+Outside a terminal both fail, naming what to set. The first start also writes
+`~/.agent/models`, the list agents read with `agent models`, when there is
+none, as `agent models --discover` does.
+
+A new project's empty transcript opens with a welcome: Sonny, the robot
+the client is named for, drawn in half blocks, as a portrait the first
+time Sonny ever runs (noted in `~/.agent/sonny/welcomed`) and as a small
+icon for each project after that. A folder that already has a lead opens
+on its history, with no welcome over it.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -43,8 +84,30 @@ since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
 and a file that no longer matches, or one Sonny never wrote, is the
 person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
 first. How the lead starts a task with `sonny task`, which names this
-Sonny, and the task settings from `.agents/project.toml` are composed
-after the lead's role, not kept in the file.
+Sonny, and where the project's tasks work are composed after the lead's
+role, not kept in the file.
+
+#### Effort for leads and tasks
+
+Each agent's effort is the daemon's to keep; Sonny only picks what a new
+one starts with, and imposes nothing. With nothing set, a new lead starts
+at its model's own effort (`AGENT_EFFORT` when its model is
+`AGENT_MODEL`'s), and each task at its lead's. Defaults go in
+`~/.agent/config.toml` (`agent_client::config`), and a project's
+`.agents/project.toml` overrides them for that project:
+
+| What | `~/.agent/config.toml` | `.agents/project.toml` |
+| --- | --- | --- |
+| A new lead's effort | `[sonny] lead_effort` | `effort` |
+| Each new task's model | (the lead's) | `threads_model` |
+| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
+| The approver's and lookout's judge | `[judge] model`, `effort` | |
+
+`sonny task` applies them in code, so the lead's prompt says nothing about
+effort; the lead names `--model` or `--effort` only for one the person asks
+for. A task on its lead's model with neither set takes the lead's effort,
+as before; one on another model takes that model's own. `/model` changes a
+lead's effort after it is made.
 
 A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
@@ -101,7 +164,21 @@ The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits.
+pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
+Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
+keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
+Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
+character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
+Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
+last of those took.
+
+Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
+Codex and Claude Code (terminals paste only text), and an image file
+dropped on the terminal, or its path pasted, is attached rather than typed.
+Each shows as `[Image #N]` where it goes in the message; a PNG longer than
+1568 pixels on a side is scaled down first. Web addresses, a link's text and
+paths of files that are there open on a click (Cmd-click in most terminals,
+Ctrl-click in Herdr).
 
 `!COMMAND` runs a command of your own with your shell, in the agent's
 folder, in any agent's window: the lead's or a task's. You see what it
@@ -165,7 +242,17 @@ off again never shows.
   **Resolved**, only counted until `r` shows them. The lead marks a task
   resolved with its `resolve_task` tool once nothing is left to do in it,
   such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it.
+  task's window closes. New work sent to the task reopens it. Each agent's
+  time is how long its running turn has been at it, or how long its last
+  turn took. An agent with triggers or lookout subscriptions of its own
+  shows `↻ 2 triggers` beside its model.
+- `/background` (or `/triggers`, `/lookout`) lists what runs for the
+  project's agents with no one typing: the triggers that wake them, with
+  when each fires, its message and what its last fire did, and the
+  lookout's subscriptions, with how many checks each asked for in the last
+  day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
+  removes it; the subscription Sonny keeps for a lead's tasks stays. The
+  footer says `↻ 2 in background` while the window's agent has any.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
@@ -190,12 +277,11 @@ off again never shows.
   inside a plain folder stay in its copy, and in the copy of a linked
   worktree, whose `.git` names its repository outside the copy, git is
   turned off, so it can't change that repository while the files stay
-  behind. A plain folder on another disk than sandfs's home
-  (`~/.local/share/sandfs`), such as an external volume, can't be copied,
-  so its task gets a sandfs workspace over the folder itself: the task's
-  changes still stay in the workspace, but a file it has looked at stays
-  as it first saw it, and `--apply` writes over what changed in the folder
-  meanwhile without asking. `sonny task rm NAME [--discard]` removes a
+  behind. A plain folder on another disk than sandfs's home, such as an
+  external volume, is copied on its own disk, in a `.sandfs` folder at
+  that disk's top; on a disk that can't clone files (ext4) its files are
+  copied in full. A task that is done, fails or needs the person has its
+  copy give back the memory it can do without. `sonny task rm NAME [--discard]` removes a
   task that is done and the folder Sonny made it, refusing while its work
   isn't back yet: changes not applied, uncommitted or not pushed. A
   worktree's branch is kept unless it is merged. `sonny task` also works
@@ -254,15 +340,17 @@ PEER`, and in Rex opens a window following each detached job.
 
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. It tells a lead what its tasks
-did in one "Task updates" note, by the handles its wait tool reads them
-with, and steers it at once only for a message that redirects other tasks
-or work that collides with another task's; what else the judge picks, such
-as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
-own model, and with the judge `off` sends the task updates alone. Any agent can
+subscribes each lead to its tasks. As soon as the lead rests, it tells it
+every message someone else wrote in its tasks and how each turn ended, in
+one "Task updates" note, by the handles its wait tool reads them with; the
+lead decides what matters. While the lead is mid-turn, a judge asks of each
+event only whether it cannot wait, and steers the lead at once if so. A
+turn a note started that ends with nothing to say stays folded under the
+note, with no sound. It judges with the config's `[judge] model`, the
+approver's setting, else the lead's own model, at `[judge] effort` when
+set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
-name, questions of its own), and `/lookout` lists what it watches; see
+name, questions of its own), and `/background` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
@@ -282,13 +370,16 @@ settings; `/verbose` again goes back to clean.
 
 Sonny owns the whole screen, as Codex does. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
-it; rows that arrive while you have scrolled back leave the view still,
-and PgDn or Enter takes you back to the latest. Copying needs no key held:
+it, older messages loading as you go past the first; rows that arrive
+while you have scrolled back leave the view still, and PgDn or Enter
+takes you back to the latest. Copying needs no key held:
 a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
-Sonny drew around it. A click on a link opens it. `/fullscreen` switches
+Sonny drew around it. A click on a link opens it. Ctrl+F finds text in
+the conversation, from the newest place back: ↑ or Enter steps older, ↓
+newer, and Esc stops where you are. `/fullscreen` switches
 to inline, where Sonny writes into the terminal's own scrollback, and back;
 the choice is kept with the other settings.
 

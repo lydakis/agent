@@ -5,8 +5,7 @@
 //! the sandfs library built into Sonny so nothing needs installing, is the
 //! checkout as it is, uncommitted changes included, on a branch of its own;
 //! in a folder sandfs mounts, a fork of that workspace; in any other
-//! folder, the folder as it is now, or on another disk than sandfs's home,
-//! a workspace over the folder itself. A task that could not start leaves
+//! folder, the folder as it is now. A task that could not start leaves
 //! no folder behind, and `sonny task rm` takes away one that is done.
 //!
 //! sandfs mounts are served by Sonny run again as `sonny sandfs daemon`,
@@ -72,6 +71,7 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     // With the provider keys the app keeps, should this start the daemon;
     // read before the folder is made, so a bad env file leaves nothing.
     let mut command = crate::agent_command(&agent)?;
+    let config = agent_client::config::load()?;
 
     let info = agent_client::project::read(here)?;
     let place = if info["threads_in"] == "project" {
@@ -103,6 +103,12 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             return failed(&place, false, format!("{} failed", script.display()));
         }
     }
+    let lead = (
+        std::env::var("AGENT_MODEL").ok(),
+        std::env::var("AGENT_EFFORT").ok(),
+    );
+    let flags = with_defaults(&info, &flags, lead, config.sonny.task_effort);
+    let flags: Vec<&String> = flags.iter().collect();
     let flags = match told(&place.dir, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
@@ -140,6 +146,56 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The run flags with the task's model and effort, unless they name their
+/// own: the project's `threads_model`, else the lead's (`lead`, its
+/// AGENT_MODEL and AGENT_EFFORT), so a role (--profile) never swaps it;
+/// and the project's `threads_effort`, else `task_effort`
+/// (the config's `[sonny] task_effort`), else the lead's own when the task
+/// runs its model.
+fn with_defaults(
+    info: &Value,
+    flags: &[&String],
+    lead: (Option<String>, Option<String>),
+    task_effort: Option<String>,
+) -> Vec<String> {
+    let mut flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+    // A value flag is --flag VALUE or --flag=VALUE.
+    let value = |flags: &[String], name: &str| -> Option<Option<String>> {
+        let at = flags.iter().position(|flag| {
+            flag == name || flag.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+        })?;
+        Some(match flags[at].split_once('=') {
+            Some((_, value)) => Some(value.to_owned()),
+            None => flags.get(at + 1).cloned(),
+        })
+    };
+    let (lead_model, lead_effort) = lead;
+    let model = match value(&flags, "--model") {
+        Some(model) => model,
+        None => {
+            let model = info["threads_model"]
+                .as_str()
+                .map(str::to_owned)
+                .or(lead_model.clone());
+            if let Some(model) = &model {
+                flags.extend(["--model".to_owned(), model.clone()]);
+            }
+            model
+        }
+    };
+    if value(&flags, "--effort").is_none() {
+        let effort = info["threads_effort"]
+            .as_str()
+            .map(str::to_owned)
+            .or(task_effort)
+            .or(lead_effort.filter(|_| model.is_some() && model == lead_model));
+        if let Some(effort) = effort {
+            flags.extend(["--effort".to_owned(), effort]);
+        }
+    }
+    flags
 }
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
@@ -480,6 +536,28 @@ fn sandfs() -> Result<Home, String> {
     Home::locate().map_err(|e| format!("{e:#}"))
 }
 
+/// Have the task `name`'s sandfs copy, when it has one mounted, give back
+/// the memory it can do without, now that the task waits. sandfs does so on
+/// its own once a mount has gone unused for a minute; this is sooner. It
+/// runs on its own thread, and a copy it can't trim stays as it was.
+pub fn trim(name: &str) {
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let (Ok(home), Ok(tasks)) = (Home::locate(), tasks()) else {
+            return;
+        };
+        let real = std::fs::canonicalize(&tasks).unwrap_or(tasks);
+        let ours = home.root().exists()
+            && home.workspaces().is_ok_and(|all| {
+                all.iter()
+                    .any(|ws| ws.name == name && ws.mounted.as_deref() == Some(&real.join(&name)))
+            });
+        if ours {
+            let _ = home.trim(Some(&name));
+        }
+    });
+}
+
 /// What the lead's folder is, and so what a sandfs copy of it is.
 enum Source {
     /// A folder in the sandfs workspace `name`, mounted at `root`.
@@ -569,10 +647,6 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         Source::Git { top } => (top.clone(), true),
         Source::Folder => (here.to_owned(), false),
     };
-    // A plain folder's copy clones its files into sandfs's home, which
-    // works only on one disk: one on another disk (an external volume) gets
-    // a workspace over the folder itself instead.
-    let over = matches!(source, Source::Folder) && !same_disk(&root, home.root());
     let undo = match exists {
         // The task's own copy, mounted or left unmounted by a restart.
         Some(ws) if ws.mounted.as_deref() == Some(dir.as_path()) => Undo::Nothing,
@@ -588,17 +662,6 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
                 "a sandfs workspace named {name} exists that is not this task's; pick another NAME"
             ));
         }
-        None if over => {
-            let options = MountOptions {
-                name: Some(name.to_owned()),
-                ..Default::default()
-            };
-            home.mount(&root.to_string_lossy(), &dir, &options)
-                .map_err(|e| format!("{e:#}"))?;
-            Undo::Sandfs {
-                name: name.to_owned(),
-            }
-        }
         None => {
             let from = match &source {
                 Source::Mount { name, .. } => name.clone(),
@@ -607,6 +670,9 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
             let options = ForkOptions {
                 name: Some(name.to_owned()),
                 branch: git_copy.then(|| branch.clone()),
+                // A plain folder on a disk that can't clone its files (ext4)
+                // is copied in full rather than refused.
+                allow_copy: matches!(source, Source::Folder),
                 ..Default::default()
             };
             home.fork(&from, Some(&dir), &options)
@@ -642,18 +708,8 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         )
     } else {
         let me = me();
-        let what = match over {
-            true => {
-                "a sandfs workspace over this folder, which is on another disk than sandfs's \
-                     home and so is not copied: the task's changes stay in the workspace, a file \
-                     it has looked at stays as it first saw it, and `--apply` writes over what \
-                     changed here meanwhile without asking"
-            }
-            false => {
-                "a sandfs copy of this folder as it is now, whose --apply refuses a file \
-                     changed here since unless given --force"
-            }
-        };
+        let what = "a sandfs copy of this folder as it is now, whose --apply refuses a file \
+                    changed here since unless given --force";
         let mut note = format!(
             "{name}: {what}; `{me} task changes {name}` lists what the task changed, and \
              `{me} task changes {name} --apply` writes it here. Copy nothing from its folder \
@@ -691,18 +747,6 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
 const GIT_OFF: &str = "gitdir: /dev/null/sonny: this linked worktree's repository is outside \
                        the task's copy, so git is off here; start a task in that repository's \
                        own folder to use git on it\n";
-
-/// Whether `folder` is on the disk sandfs's `home` is on, or will be made
-/// on.
-fn same_disk(folder: &Path, home: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let disk = |path: &Path| {
-        path.ancestors()
-            .find_map(|dir| std::fs::metadata(dir).ok())
-            .map(|found| found.dev())
-    };
-    disk(folder) == disk(home)
-}
 
 /// The folder in `copy` at `prefix`, without the trailing slash an empty
 /// one would add.
@@ -1427,11 +1471,54 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_on_another_disk_is_told_apart() {
-        let tmp = std::env::temp_dir();
-        assert!(same_disk(&tmp, &tmp.join("not/made/yet")));
-        // A device file system is never the one temporary files are on.
-        assert!(!same_disk(Path::new("/dev"), &tmp));
+    fn a_task_runs_as_the_person_set_tasks_up() {
+        let run = |info: Value, flags: &[&str], task: Option<&str>| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let lead = (Some("a/lead".to_owned()), Some("high".to_owned()));
+            with_defaults(
+                &info,
+                &flags.iter().collect::<Vec<_>>(),
+                lead,
+                task.map(str::to_owned),
+            )
+        };
+        let none = serde_json::json!({});
+        // Nothing set: the lead's own model and effort, as before.
+        assert_eq!(
+            run(none.clone(), &["--agents"], None),
+            ["--agents", "--model", "a/lead", "--effort", "high"]
+        );
+        // The config's task effort over the lead's effort.
+        assert_eq!(
+            run(none.clone(), &[], Some("xhigh")),
+            ["--model", "a/lead", "--effort", "xhigh"]
+        );
+        // The project's file over both.
+        let file = serde_json::json!({"threads_effort": "medium"});
+        assert_eq!(
+            run(file, &[], Some("xhigh")),
+            ["--model", "a/lead", "--effort", "medium"]
+        );
+        // Another model leaves the lead's effort, which was set for its own.
+        let file = serde_json::json!({"threads_model": "b/other"});
+        assert_eq!(run(file.clone(), &[], None), ["--model", "b/other"]);
+        assert_eq!(
+            run(file, &[], Some("low")),
+            ["--model", "b/other", "--effort", "low"]
+        );
+        // What the lead names is kept.
+        assert_eq!(
+            run(
+                none.clone(),
+                &["--model=c/d", "--effort", "max"],
+                Some("low")
+            ),
+            ["--model=c/d", "--effort", "max"]
+        );
+        assert_eq!(
+            run(none, &["--model", "a/lead"], None),
+            ["--model", "a/lead", "--effort", "high"]
+        );
     }
 
     #[test]

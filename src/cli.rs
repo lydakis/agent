@@ -20,8 +20,8 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl",
+        flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network",
         startup: true,
     },
     Command {
@@ -267,7 +267,7 @@ fn print_flags(flags: &str) {
             ),
             "--effort" => (
                 "LEVEL",
-                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn; the approver's judge's (default [judge] effort in ~/.agent/config.toml)",
             ),
             "--request-id" => (
                 "ID",
@@ -281,6 +281,10 @@ fn print_flags(flags: &str) {
             "--turn-budget-tokens" => (
                 "N",
                 "This turn's input + output token cap, beside the bot's own budget",
+            ),
+            "--image" => (
+                "PATH",
+                "Send this PNG, JPEG, GIF or WebP with the prompt; repeat for more",
             ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),
@@ -363,6 +367,15 @@ fn print_flags(flags: &str) {
                 "A new bot's summarizer; default: its own model",
             ),
             "--no-compaction" => ("", "Create the bot without compaction"),
+            "--sandbox" => (
+                "MODE",
+                "A new bot's command sandbox: read-only, workspace-write or danger-full-access; default none",
+            ),
+            "--writable" => (
+                "PATH",
+                "Another folder a workspace-write bot may change; repeat for more",
+            ),
+            "--network" => ("", "A workspace-write bot's commands may use the network"),
             "--fallbacks" => (
                 "",
                 "A new bot's declined Anthropic requests rerun on the recommended model",
@@ -399,7 +412,7 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: openai-decisions/MODEL or any model the daemon serves; default AGENT_JUDGE, else AGENT_MODEL",
+                "Who judges: openai-decisions/MODEL or any model the daemon serves; default [judge] model in ~/.agent/config.toml, else AGENT_MODEL",
             ),
             "--judge-url" => (
                 "URL",
@@ -529,7 +542,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if !allowed {
             return fail_with("usage", format!("{} does not accept {flag}", c.name));
         }
-        if flags.iter().any(|f| f == flag) && flag != "--provider" {
+        if flags.iter().any(|f| f == flag)
+            && !matches!(flag, "--provider" | "--image" | "--writable")
+        {
             return fail_with("usage", format!("{flag} may only be specified once"));
         }
         flags.push(flag.to_owned());
@@ -548,6 +563,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--fallbacks"
+                | "--network"
                 | "--discover"
         ) {
             if inline.is_some() {
@@ -673,6 +689,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--profile",
             "--budget-tokens",
             "--fallbacks",
+            "--sandbox",
+            "--writable",
+            "--network",
             "--approval",
             "--approve",
         ]
@@ -681,7 +700,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, budget, and approval are creation options; use --new",
+            "instructions, budget, approval and sandbox are creation options; use --new",
         );
     }
     Ok(Some(out))

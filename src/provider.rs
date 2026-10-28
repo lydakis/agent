@@ -307,12 +307,24 @@ pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<B
 pub struct Items {
     /// Exact byte length every stream yields.
     pub bytes: usize,
+    /// What the items weigh as input: their length, with pictures counted
+    /// at their token cost rather than their size.
+    pub weight: usize,
     open: Box<dyn Fn() -> ItemStream + Send + Sync>,
 }
 impl Items {
     pub fn new(bytes: usize, open: impl Fn() -> ItemStream + Send + Sync + 'static) -> Items {
+        Items::weighing(bytes, bytes, open)
+    }
+    /// Items of `bytes` that weigh `weight`.
+    pub fn weighing(
+        bytes: usize,
+        weight: usize,
+        open: impl Fn() -> ItemStream + Send + Sync + 'static,
+    ) -> Items {
         Items {
             bytes,
+            weight,
             open: Box::new(open),
         }
     }
@@ -833,7 +845,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix_for(&request, true)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            input: ((prefix.len() + request.items.weight) / 4) as u64,
             output: 0,
         };
         let mut park_for = None;
@@ -875,7 +887,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                pace.limited(retry_after(&headers));
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             return Err(Error {
@@ -991,7 +1003,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            input: ((prefix.len() + request.items.weight) / 4) as u64,
             output: u64::from(self.max_output_tokens.unwrap_or(512)),
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
@@ -1113,7 +1125,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                pace.limited(retry_after(&headers));
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             let code = if quota {
@@ -1253,12 +1265,16 @@ impl Provider {
         };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
-        // An overload or rate limit inside the stream closes the pool as
+        // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
         if let Err(error) = &result
             && paced(&error.code)
         {
-            pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+            refused(
+                &pace,
+                overload(&error.code),
+                error.detail.as_deref().and_then(pace::named_delay),
+            );
         }
         result?;
         // Only a completed stream ends a refusal streak: a 200 can still end
@@ -1268,7 +1284,11 @@ impl Provider {
             .inspect(|_| pace.accepted())
             .inspect_err(|error| {
                 if paced(&error.code) {
-                    pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+                    refused(
+                        &pace,
+                        overload(&error.code),
+                        error.detail.as_deref().and_then(pace::named_delay),
+                    );
                 }
             })
     }
@@ -1500,6 +1520,21 @@ pub fn paced(code: &str) -> bool {
     )
 }
 
+/// Whether a paced refusal is an overload rather than a rate limit.
+pub fn overload(code: &str) -> bool {
+    matches!(code, "provider_overloaded" | "provider_http_529")
+}
+
+/// Tell the model's pool a call was refused: an overload, which closes it
+/// only when it names a delay or overloads cluster, or a rate limit.
+fn refused(pace: &pace::Pace, overload: bool, after: Option<Duration>) {
+    if overload {
+        pace.overloaded(after);
+    } else {
+        pace.limited(after);
+    }
+}
+
 /// How long a response asks to be left alone: `retry-after-ms`, which
 /// OpenAI and Anthropic send beside `retry-after` and both SDKs read first,
 /// else `retry-after` in seconds.
@@ -1516,9 +1551,9 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
-/// Close the model's pool for a rate limit a socket reported: a 429 or 529
+/// Tell the model's pool of a refusal a socket reported: a 429 or 529
 /// status with its `retry-after`, as on HTTP, or an in-stream rate limit or
-/// overload naming its delay.
+/// overload with the delay it names.
 fn limit(pace: &pace::Pace, failure: &socket::Failure) {
     if matches!(failure.status, Some(429 | 529)) || paced(&failure.error.code) {
         let after = failure
@@ -1526,7 +1561,9 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
             .as_deref()
             .and_then(retry_after)
             .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
-        pace.limited(after);
+        let overload = failure.status == Some(529)
+            || (failure.status != Some(429) && overload(&failure.error.code));
+        refused(pace, overload, after);
     }
 }
 
@@ -2067,7 +2104,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[])
+                .encoded(family, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {

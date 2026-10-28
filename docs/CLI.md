@@ -76,6 +76,9 @@ identity is `bot_not_found`.
   `turn_budget_exhausted` before a call once it has spent N; the cap is
   the turn's own, so the next turn starts from zero. A steer joins a turn
   that already has its cap, so `steer` with the flag is `invalid_delivery`.
+- `run --image PATH` sends a PNG, JPEG, GIF or WebP with the prompt, after
+  its words; repeat it for more (up to 20, 5 MiB together). It goes with a
+  steer or a turn of its own alike.
 - `run --workspace DIR` chooses the folder. A new bot starts in it, or in
   the directory `run` was invoked from. A bot keeps its folder: a later
   `run` without the flag runs there wherever it is invoked, and one with it
@@ -114,10 +117,11 @@ identity is `bot_not_found`.
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `AGENT_JUDGE`, else `AGENT_MODEL`. OpenAI's Decisions
+  `[judge] model` in `~/.agent/config.toml`, else `AGENT_MODEL`. OpenAI's Decisions
   API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
   own API, at `--judge-url` when given; any other model runs through the
-  daemon, with a tag of at most 67 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  daemon, with a tag of at most 67 bytes, and `--effort` (default
+  `[judge] effort`) sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
@@ -156,8 +160,9 @@ identity is `bot_not_found`.
   setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
-  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, and
-  `--cache-ttl`; they are not daemon options, and an existing bot
+  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
+  `--sandbox`, `--writable` (repeatable, made absolute from the current
+  folder) and `--network`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope
@@ -260,9 +265,9 @@ forwards that path. A socket path that is not UTF-8, which the ready line
 cannot carry, is refused before anything starts (`socket_path_unsupported`). When the daemon holding the socket speaks another
 protocol, `start` still prints its ready line and then fails with
 `daemon_protocol_mismatch`, so a caller can tell an older daemon from a newer
-one. `stats`,
+one. `stats` starts it as `start` does, so it answers on a fresh install;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
-existing store. These commands accept the startup
+existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match
@@ -270,11 +275,14 @@ fails the command with `daemon_configuration_mismatch` naming the difference.
 Comparison uses effective limits: `--idle-exit 0` means disabled, and positive
 context limits are clamped to at least 1,024 bytes and two items.
 With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
-separated by whitespace), else the providers whose key variable is set; a
-running daemon is not checked against either.
+separated by whitespace), else `provider` in `~/.agent/config.toml` (the
+same), else the providers whose key variable is set; a
+running daemon is not checked against either. With none of them, starting
+fails with `provider_required`.
 `run --model` names a new bot's model or an existing bot's turn model; the
-daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
-`AGENT_MODEL` is only a creation default. An existing bot uses its stored
+daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,
+or `model` in `~/.agent/config.toml`, in that order. Both are only creation
+defaults. An existing bot uses its stored
 model unless `--model` explicitly overrides it for this turn.
 `run --effort LEVEL` sets a new bot's effort: `low`,
 `medium`, `high` or `xhigh` on either family, and `max` on Anthropic's; any

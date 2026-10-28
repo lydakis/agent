@@ -81,6 +81,41 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
     })
 }
 
+/// Writes a first list at `path`, whole beside it and then linked into
+/// place: a failed write leaves no partial list, and a list made meanwhile
+/// is not replaced but refused with `models_file_exists`.
+pub fn install(path: &Path, text: &str) -> Result<(), Error> {
+    use std::io::Write;
+    let failed = |error: std::io::Error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => {
+            Error::with("models_file_exists", &path.display().to_string())
+        }
+        _ => Error::with("models_unwritable", &format!("{}: {error}", path.display())),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(failed)?;
+    }
+    let staged = path.with_file_name(format!(".models.{}", std::process::id()));
+    let installed = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::hard_link(&staged, path)
+    })();
+    let _ = std::fs::remove_file(&staged);
+    installed.map_err(failed)?;
+    // The new name is durable only once its directory is.
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(failed)?;
+    }
+    Ok(())
+}
+
 fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
     let mut models: Vec<Model> = Vec::new();
     let mut seen = std::collections::HashSet::new();

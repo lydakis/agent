@@ -16,6 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
+    sandbox::Policy,
     store::{
         Bot, CallAnswer, ContextPrefix, ContextUsage, Gated, Settings, Slot, Store, Strip,
         TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
@@ -63,13 +64,15 @@ const UNBOUNDED: i64 = i64::MAX / 4;
 const WINDOW_BATCH: usize = 64;
 const WINDOW_BATCH_BYTES: u64 = 256 * 1024;
 
-/// Stored items to stream: ids with their sizes as sent, the bytes each
-/// loses without thinking, and the elision floor the sizes count stubs to.
+/// Stored items to stream: ids with their weights as sent, the bytes each
+/// loses without thinking, what each one's pictures add beyond their
+/// weight, and the elision floor the sizes count stubs to.
 #[derive(Clone, Copy)]
 struct Span<'a> {
     ids: &'a [i64],
     sizes: &'a [u32],
     thinking: &'a [u32],
+    pictured: &'a [i32],
     elided: i64,
 }
 impl Span<'_> {
@@ -77,6 +80,7 @@ impl Span<'_> {
         ids: &[],
         sizes: &[],
         thinking: &[],
+        pictured: &[],
         elided: 0,
     };
 }
@@ -104,11 +108,14 @@ fn fingerprint(prefix: &[u8], first: i64, url: &str, model: &str) -> i64 {
 }
 
 /// Split window items into read-ahead batches by count and by bytes.
-fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
+fn batches(ids: &[i64], sizes: &[u32], pictured: &[i32]) -> Vec<Vec<i64>> {
     let mut out: Vec<Vec<i64>> = Vec::with_capacity(ids.len().div_ceil(WINDOW_BATCH));
     let mut bytes = 0u64;
     for (index, id) in ids.iter().enumerate() {
-        let size = u64::from(sizes.get(index).copied().unwrap_or(0));
+        // Read as stored: with its pictures' bytes.
+        let size = (i64::from(sizes.get(index).copied().unwrap_or(0))
+            + i64::from(pictured.get(index).copied().unwrap_or(0)))
+        .max(0) as u64;
         let full = out
             .last()
             .is_some_and(|b| b.len() >= WINDOW_BATCH || bytes + size > WINDOW_BATCH_BYTES);
@@ -692,6 +699,7 @@ impl Turn {
                     ids: &w.ids,
                     sizes: &w.sizes,
                     thinking: &w.thinking,
+                    pictured: &w.pictured,
                     elided: w.elided,
                 },
                 strip,
@@ -789,6 +797,7 @@ impl Turn {
             ids: &window.ids[..len],
             sizes: &window.sizes[..len],
             thinking: &window.thinking[..len],
+            pictured: &window.pictured[..len],
             elided: window.elided,
         };
         self.framed_items(
@@ -806,6 +815,7 @@ impl Turn {
             ids,
             sizes,
             thinking,
+            pictured,
             elided,
         } = span;
         let stripped: usize = ids
@@ -814,13 +824,15 @@ impl Turn {
             .filter(|(id, _)| strip.strips(**id))
             .map(|(_, &bytes)| bytes as usize)
             .sum();
-        let total = (prefix.len()
+        let weight = (prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
             + ids.len().saturating_sub(1)
             + tail.len())
         .saturating_sub(stripped);
-        let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
-        Items::new(total, move || {
+        let pictures: i64 = pictured.iter().map(|&bytes| i64::from(bytes)).sum();
+        let (store, chunks): (_, Arc<[_]>) =
+            (self.store.clone(), batches(ids, sizes, pictured).into());
+        Items::weighing((weight as i64 + pictures) as usize, weight, move || {
             let items = stream::iter([Ok(prefix.clone())]).chain(item_chunks(
                 store.clone(),
                 chunks.clone(),
@@ -1456,7 +1468,9 @@ impl Turn {
                 None => match summarizer.family() {
                     agent_runtime::codec::Family::Anthropic => (Body::Span(&plan, stripped), tools),
                     agent_runtime::codec::Family::Responses => {
-                        empty = self.registry.encoded(summarizer.family(), &[], &[])?;
+                        empty = self
+                            .registry
+                            .encoded(summarizer.family(), &[], &[], false)?;
                         (Body::Span(&plan, stripped), &*empty)
                     }
                 },
@@ -1830,7 +1844,7 @@ impl Turn {
             + match family {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
                 agent_runtime::codec::Family::Responses => {
-                    self.registry.encoded(family, &[], &[])?.get().len()
+                    self.registry.encoded(family, &[], &[], false)?.get().len()
                 }
             })
     }
@@ -1873,21 +1887,28 @@ impl Turn {
             return fail("compaction_input_limit");
         }
         let (head, tail) = (Bytes::from(head), Bytes::from(tail));
-        let (store, chunks): (_, Arc<[_]>) =
-            (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
+        let (store, chunks): (_, Arc<[_]>) = (
+            self.store.clone(),
+            batches(&plan.ids, &plan.sizes, &plan.pictured).into(),
+        );
+        let pictures: i64 = plan.pictured.iter().map(|&bytes| i64::from(bytes)).sum();
         // Elided results go as the stubs the model last saw.
         let elided = plan.elided;
-        Ok(Items::new(total, move || {
-            stream::iter([Ok(head.clone())])
-                .chain(item_chunks(
-                    store.clone(),
-                    chunks.clone(),
-                    Strip::from(i64::MAX),
-                    elided,
-                ))
-                .chain(stream::iter([Ok(tail.clone())]))
-                .boxed()
-        }))
+        Ok(Items::weighing(
+            (total as i64 + pictures) as usize,
+            total,
+            move || {
+                stream::iter([Ok(head.clone())])
+                    .chain(item_chunks(
+                        store.clone(),
+                        chunks.clone(),
+                        Strip::from(i64::MAX),
+                        elided,
+                    ))
+                    .chain(stream::iter([Ok(tail.clone())]))
+                    .boxed()
+            },
+        ))
     }
 
     async fn rounds(
@@ -1897,7 +1918,7 @@ impl Turn {
     ) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
-        self.settings.get_or_init(|| record.settings);
+        self.settings.get_or_init(|| record.settings.clone());
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
@@ -2049,9 +2070,12 @@ impl Turn {
         let mut model_rounds = context.model_rounds;
         let called = context.model.as_str();
         // This bot's tools, encoded once per distinct selection and shared.
-        let tools = self
-            .registry
-            .encoded(provider.family(), &record.tools, &record.declared)?;
+        let tools = self.registry.encoded(
+            provider.family(),
+            &record.tools,
+            &record.declared,
+            record.sandboxed(),
+        )?;
         // A stub names the `read` call that returns its result, so only a
         // bot that has the tool elides.
         let elides = record.tools.iter().any(|tool| tool == "read");
@@ -2396,7 +2420,7 @@ impl Turn {
                 });
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
-            let gated = calls.iter().any(|call| record.gated(&call.name));
+            let gated = calls.iter().any(|call| record.gated(call, &workspace));
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
@@ -2944,10 +2968,15 @@ impl Turn {
                 .then(|| provider.blocked_for(model))
                 .flatten()
                 .filter(|block| *block >= MIN_PARK);
-            // Rate limits and overloads already hold the pool; other transient failures
-            // back off exponentially with a little spread.
+            // A rate limit holds the pool, as do clustered overloads; a lone
+            // overload backs off from half a second as the providers' SDKs
+            // do, and other transient failures from a quarter, with a little
+            // spread.
             let delay = match pool {
                 Some(block) => block,
+                None if paced && agent_runtime::provider::overload(&error.code) => {
+                    backoff(attempt + 1, turn as u64)
+                }
                 None if paced => std::time::Duration::ZERO,
                 None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
                 None if error.code == "provider_stream_stalled" => {
@@ -2997,6 +3026,7 @@ impl Turn {
                         ids: &window.ids[skip..],
                         sizes: &window.sizes[skip..],
                         thinking: &window.thinking[skip..],
+                        pictured: &window.pictured[skip..],
                         elided: window.elided,
                     };
                     self.window_items(Bytes::new(), span, *thinking)
@@ -3304,13 +3334,17 @@ impl Turn {
         let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
-            if record.gated(&call.name) {
+            // An escape from a sandbox runs unconfined only once a gate
+            // allowed it.
+            let approved = record.gated(&call, workspace);
+            if approved {
                 match self
                     .approve(
                         &call,
                         &mut calls,
                         announced.take(),
                         record,
+                        workspace,
                         route,
                         summary_retry_ms,
                     )
@@ -3336,6 +3370,54 @@ impl Turn {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
+            };
+            // A call its sandbox confines runs in it; one that can't be
+            // confined fails rather than run unconfined. An escape no gate
+            // approved is refused, as Codex refuses one under a policy that
+            // never asks: a command, or a write or edit held to the sandbox.
+            let mut sandbox = None;
+            let confined =
+                record.sandboxed() && agent_runtime::sandbox::confinable(&call.name) && !approved;
+            let prepared = match prepared {
+                Ok(Prepared::Shell { .. } | Prepared::Detach(_))
+                    if confined && !record.confines(&call, workspace) =>
+                {
+                    Err(Error::with(
+                        "escalation_refused",
+                        "no approval lets this bot run a command outside its sandbox; \
+                         run it without sandbox_permissions",
+                    ))
+                }
+                Ok(prepared) if confined => {
+                    // Reading the roots touches the filesystem: off the
+                    // runtime thread.
+                    let (settings, daemon) =
+                        (record.settings.clone(), self.registry.daemon().clone());
+                    let root = record
+                        .workspace
+                        .as_ref()
+                        .map_or_else(|| workspace.to_owned(), PathBuf::from);
+                    tokio::task::spawn_blocking(move || {
+                        // The probe for a sandbox runs once, here off the
+                        // runtime thread, also for a bot from before a restart.
+                        agent_runtime::sandbox::available()?;
+                        Policy::new(
+                            settings.sandbox,
+                            Some(&root),
+                            &settings.writable,
+                            settings.network,
+                            &daemon,
+                        )
+                    })
+                    .await
+                    .map_err(|_| Error::new("sandbox_unavailable"))
+                    .flatten()
+                    .map(|policy| {
+                        sandbox = policy.map(Arc::new);
+                        prepared
+                    })
+                }
+                other => other,
             };
             let answered = record
                 .declared(&call.name)
@@ -3386,6 +3468,7 @@ impl Turn {
                             workspace.to_path_buf(),
                             timeout_ms,
                             environment.to_vec(),
+                            sandbox,
                         )
                         .await
                     {
@@ -3440,6 +3523,7 @@ impl Turn {
                     let outcome = Outcome {
                         output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
                         artifacts: Vec::new(),
+                        images: Vec::new(),
                         note: Some(text),
                         failed: false,
                     };
@@ -3474,6 +3558,7 @@ impl Turn {
                         workspace.to_path_buf(),
                         timeout_ms,
                         environment.to_vec(),
+                        sandbox,
                         started,
                     );
                     match self
@@ -3490,7 +3575,8 @@ impl Turn {
                 }
                 Ok(prepared) => match self
                     .run_tool(
-                        self.registry.execute(prepared, workspace, environment),
+                        self.registry
+                            .execute(prepared, workspace, environment, sandbox),
                         None,
                         warm.as_deref_mut(),
                     )
@@ -3516,12 +3602,14 @@ impl Turn {
     /// Wait for a gated call's verdict: live for the hold, then parked like
     /// `wait`, holding no task and no slot. Answers wake the task through
     /// the worker, so each check is one job and no commit.
+    #[allow(clippy::too_many_arguments)]
     async fn approve(
         &self,
         call: &ToolCall,
         calls: &mut std::vec::IntoIter<ToolCall>,
         announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         record: &Bot,
+        workspace: &std::path::Path,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Approval> {
@@ -3541,7 +3629,7 @@ impl Turn {
                 .filter(|gate| {
                     round
                         .clone()
-                        .any(|c| record.gated(&c.name) && gate.tools.contains(&c.name))
+                        .any(|c| record.gated(c, workspace) && gate.tools.contains(&c.name))
                 })
                 .filter_map(|gate| gate.expire_ms)
                 .min();
@@ -3902,6 +3990,7 @@ impl Turn {
         workspace: PathBuf,
         timeout_ms: u64,
         environment: Vec<(String, String)>,
+        sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
         // The place in line is taken before anything durable is written.
         let queued = self.registry.queue()?;
@@ -3911,8 +4000,15 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
-        self.registry
-            .background(command, workspace, timeout_ms, environment, queued, sender);
+        self.registry.background(
+            command,
+            workspace,
+            timeout_ms,
+            environment,
+            sandbox,
+            queued,
+            sender,
+        );
         self.collect(id, call_id, receiver);
         Ok(Outcome::text(
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
@@ -4062,8 +4158,7 @@ fn retryable(code: &str) -> bool {
 }
 
 /// A stream that stalled on this request stalls again when resent at once
-/// with the same context: its retries start at 2 s. An overload is the
-/// pool's to wait out, as a rate limit is.
+/// with the same context: its retries start at 2 s.
 const STALL_START: u32 = 3;
 
 /// Retry backoffs at least this long park the turn instead of sleeping in it.
@@ -4544,6 +4639,7 @@ fn failure(error: Error) -> Outcome {
     Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
+        images: Vec::new(),
         note: None,
         failed: true,
     }
@@ -4872,16 +4968,19 @@ mod tests {
     fn read_ahead_batches_stop_at_either_bound() {
         let ids: Vec<i64> = (1..=200).collect();
         let small = vec![10u32; 200];
-        let by_count = batches(&ids, &small);
+        let by_count = batches(&ids, &small, &[]);
         assert_eq!(
             by_count.iter().map(Vec::len).collect::<Vec<_>>(),
             [64, 64, 64, 8]
         );
         // Three 100 KiB items fill a batch; a 1 MiB item travels alone.
         let sizes = [100 << 10, 100 << 10, 100 << 10, 1 << 20, 10, 10];
-        let by_bytes = batches(&ids[..6], &sizes);
+        let by_bytes = batches(&ids[..6], &sizes, &[]);
         assert_eq!(by_bytes, [vec![1, 2], vec![3], vec![4], vec![5, 6]]);
-        assert!(batches(&[], &[]).is_empty());
+        // A picture's bytes count as read, though it weighs little.
+        let pictured = batches(&ids[..3], &[10, 10, 10], &[1 << 20, 0, 0]);
+        assert_eq!(pictured, [vec![1], vec![2, 3]]);
+        assert!(batches(&[], &[], &[]).is_empty());
     }
 
     /// A window of four 4000-byte items whose span is the first two, sent

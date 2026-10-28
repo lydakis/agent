@@ -1,10 +1,11 @@
 //! Registered tools share an execution budget; no per-bot worker or shell exists.
-//! Tools run with the caller's OS permissions inside the bot workspace path;
-//! nothing here is a sandbox.
+//! Tools run with the caller's OS permissions inside the bot workspace path,
+//! confined by the bot's sandbox when it has one (see `sandbox`).
 use crate::{
     Error, Result,
     codec::{Family, ToolSchema},
     fail, fail_with,
+    sandbox::{Daemon, Policy},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,6 +22,7 @@ use tokio::{
 };
 
 mod files;
+mod picture;
 use files::read_bounded;
 
 /// Model-facing text per tool result stream.
@@ -95,7 +97,7 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers (an image or other binary file is refused, naming its kind): a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers, or see a picture: a PNG, JPEG, GIF or WebP file comes back as the image itself, scaled down when large (any other binary file is refused, naming its kind). A file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -338,6 +340,8 @@ pub struct Registry {
     detached_budget: usize,
     credentials: Credentials,
     environment: Arc<Vec<(String, String)>>,
+    /// What the daemon keeps that a sandbox leaves alone or lets through.
+    daemon: Arc<Daemon>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
 }
@@ -691,6 +695,8 @@ impl ReadSource {
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
+    /// Pictures that go to the model after the text: an image file read.
+    pub images: Vec<crate::codec::Image>,
     /// A carry-forward note to record with this result; empty text clears.
     pub note: Option<String>,
     /// The call failed: an error, or a command that did not succeed. Set by
@@ -702,10 +708,22 @@ impl Outcome {
         Self {
             output,
             artifacts: Vec::new(),
+            images: Vec::new(),
             note: None,
             failed: false,
         }
     }
+}
+
+/// The shell's fields for leaving the sandbox, as Codex describes them,
+/// shown only to a bot that has one.
+fn escalation(parameters: &mut serde_json::Value) {
+    let properties = &mut parameters["properties"];
+    properties["sandbox_permissions"] = json!({"type":"string",
+        "enum":["use_default","require_escalated"],
+        "description":"Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."});
+    properties["justification"] = json!({"type":"string",
+        "description":"Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'"});
 }
 
 impl Registry {
@@ -739,6 +757,7 @@ impl Registry {
             detached_budget: DEFAULT_DETACHED_BUDGET,
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
+            daemon: Arc::default(),
             encodings: Arc::default(),
         })
     }
@@ -762,8 +781,12 @@ impl Registry {
         family: Family,
         names: &[String],
         declared: &[Declared],
+        sandboxed: bool,
     ) -> Result<Arc<RawValue>> {
         let mut key = (family, names.join(","));
+        if sandboxed {
+            key.1.push_str("\0sandboxed");
+        }
         if !declared.is_empty() {
             key.1.push('\0');
             key.1.push_str(&serde_json::to_string(declared)?);
@@ -776,6 +799,12 @@ impl Registry {
             .filter_map(|name| Tool::parse(name))
             .filter(|tool| self.tools.contains(tool))
             .map(Tool::schema)
+            .map(|mut schema| {
+                if sandboxed && schema.name == "shell" {
+                    escalation(&mut schema.parameters);
+                }
+                schema
+            })
             .chain(declared.iter().map(|tool| ToolSchema {
                 name: tool.name.clone().into(),
                 description: tool.description.clone().into(),
@@ -852,6 +881,15 @@ impl Registry {
         self.credentials = credentials;
         self
     }
+    /// The daemon's store and socket, which its bots' sandboxes keep
+    /// read-only and reachable.
+    pub fn with_daemon(mut self, daemon: Daemon) -> Self {
+        self.daemon = Arc::new(daemon);
+        self
+    }
+    pub fn daemon(&self) -> &Daemon {
+        &self.daemon
+    }
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()
     }
@@ -884,6 +922,10 @@ impl Registry {
             background: bool,
             #[serde(default)]
             detach: bool,
+            /// Whether a sandboxed bot's command asks to leave its sandbox;
+            /// decided before the call runs, through its gate.
+            sandbox_permissions: Option<String>,
+            justification: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -969,6 +1011,19 @@ impl Registry {
                     ))
                 } else if args.detach && args.background {
                     Some("detach and background cannot both be set".to_owned())
+                } else if args
+                    .sandbox_permissions
+                    .as_deref()
+                    .is_some_and(|value| !matches!(value, "use_default" | "require_escalated"))
+                {
+                    Some("sandbox_permissions is use_default or require_escalated".to_owned())
+                } else if args.justification.is_some()
+                    && args.sandbox_permissions.as_deref() != Some("require_escalated")
+                {
+                    Some(
+                        "justification is only for sandbox_permissions require_escalated"
+                            .to_owned(),
+                    )
                 } else {
                     None
                 };
@@ -1079,19 +1134,23 @@ impl Registry {
     }
 
     /// `environment` is what the running turn adds for its children, such
-    /// as its own model for peers it delegates to.
+    /// as its own model for peers it delegates to. `sandbox` confines a
+    /// command, a write or an edit; `None` runs it unconfined.
     pub async fn execute(
         &self,
         tool: Prepared,
         workspace: &Path,
         environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
         match tool {
             Prepared::Echo(text) => Ok(Outcome::text(self.redact(text))),
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
-            Prepared::Detach(command) => detach(&command, workspace, self, environment),
+            Prepared::Detach(command) => {
+                detach(&command, workspace, self, environment, sandbox).await
+            }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
@@ -1106,6 +1165,7 @@ impl Registry {
                     workspace.to_path_buf(),
                     timeout_ms,
                     environment.to_vec(),
+                    sandbox,
                     tokio::sync::oneshot::channel().0,
                 )
                 .await
@@ -1119,7 +1179,18 @@ impl Registry {
                 offset,
                 limit,
             } => {
-                let bytes = read_bounded(&resolve(workspace, &path)).await?;
+                let file = resolve(workspace, &path);
+                // A picture goes to the model as one, after a line on it.
+                // Its header says so; the file is read only in its turn.
+                if picture::kind(&files::read_head(&file, picture::HEAD).await?).is_some()
+                    && let Some((image, line)) = picture::read_apart(read_bounded(&file)).await?
+                {
+                    return Ok(Outcome {
+                        images: vec![image],
+                        ..Outcome::text(format!("{path}: {line}"))
+                    });
+                }
+                let bytes = read_bounded(&file).await?;
                 if let Some(kind) = binary(&bytes) {
                     return fail_with(
                         "file_not_text",
@@ -1133,10 +1204,10 @@ impl Registry {
             }
             Prepared::Write { path, content } => {
                 let target = resolve(workspace, &path);
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                files::write(&target, content.as_bytes()).await?;
+                writable(sandbox.clone(), &target, &path).await?;
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = self.helper_slot(&sandbox).await?;
+                files::write(&target, content.as_bytes(), sandbox).await?;
                 Ok(Outcome::text(format!(
                     "wrote {} bytes to {}",
                     content.len(),
@@ -1150,6 +1221,7 @@ impl Registry {
                 replace_all,
             } => {
                 let target = resolve(workspace, &path);
+                writable(sandbox.clone(), &target, &path).await?;
                 let bytes = read_bounded(&target).await?;
                 let text = String::from_utf8(bytes).map_err(|_| Error::new("file_not_utf8"))?;
                 let count = text.matches(&old).count();
@@ -1175,7 +1247,9 @@ impl Registry {
                     text.replacen(&old, &new, 1)
                 };
                 debug_assert_eq!(updated.len(), expanded);
-                files::write(&target, updated.as_bytes()).await?;
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+                let _slot = self.helper_slot(&sandbox).await?;
+                files::write(&target, updated.as_bytes(), sandbox).await?;
                 Ok(Outcome::text(format!(
                     "replaced {count} occurrence{} in {path}",
                     if count == 1 { "" } else { "s" }
@@ -1229,6 +1303,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
+            images: Vec::new(),
             note: None,
             failed: !success,
         }
@@ -1238,16 +1313,37 @@ impl Registry {
     /// can be moved to a task of its own. Dropping it kills the command.
     /// `started` fires once it holds a process slot: only then is it
     /// running, and only then may it move.
+    /// A process slot for a confined write, which runs as a process of
+    /// its own and so waits its turn as a command does.
+    async fn helper_slot(
+        &self,
+        sandbox: &Option<Arc<Policy>>,
+    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>> {
+        match sandbox {
+            Some(_) => Ok(Some(
+                self.slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::new("tool_scheduler_closed"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     pub fn foreground(
         &self,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
         environment: Vec<(String, String)>,
+        sandbox: Option<Arc<Policy>>,
         started: tokio::sync::oneshot::Sender<()>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
+            // Held until the command and the sandbox around it are gone,
+            // and taken before the slot, so no slot waits on it.
+            let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
             let _slot = registry
                 .slots
                 .acquire()
@@ -1260,6 +1356,7 @@ impl Registry {
                 Duration::from_millis(timeout_ms),
                 &registry,
                 &environment,
+                sandbox.as_deref(),
             )
             .await?;
             Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
@@ -1272,12 +1369,14 @@ impl Registry {
     /// command, or the error a foreground command would have returned.
     /// `timeout_ms` bounds the command's running time; the place in line is
     /// bounded by `queue`, not by the clock.
+    #[allow(clippy::too_many_arguments)]
     pub fn background(
         &self,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
         environment: Vec<(String, String)>,
+        sandbox: Option<Arc<Policy>>,
         queued: Queued,
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
     ) {
@@ -1291,12 +1390,14 @@ impl Registry {
                 };
                 drop(queued);
                 let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let (stdout, stderr, exit, elapsed) = shell(
                     &command,
                     &workspace,
                     Duration::from_millis(timeout_ms),
                     &registry,
                     &environment,
+                    sandbox.as_deref(),
                 )
                 .await?;
                 Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
@@ -1417,6 +1518,29 @@ impl Registry {
 
 fn resolve(workspace: &Path, path: &str) -> PathBuf {
     workspace.join(path)
+}
+
+/// Refuse a confined write or edit of what its sandbox keeps, as a
+/// command in it would be refused. Resolving the target reads the
+/// filesystem, so it runs off the runtime thread.
+async fn writable(sandbox: Option<Arc<Policy>>, target: &Path, path: &str) -> Result<()> {
+    let Some(policy) = sandbox else {
+        return Ok(());
+    };
+    let target = target.to_owned();
+    let allowed = tokio::task::spawn_blocking(move || policy.can_write(&target))
+        .await
+        .unwrap_or(false);
+    match allowed {
+        false => fail_with(
+            "write_denied",
+            format!(
+                "{path} is outside the folders this bot may write, or kept read-only in one; \
+                 ask to escalate to write it"
+            ),
+        ),
+        true => Ok(()),
+    }
 }
 
 fn boundary(text: &str, mut index: usize) -> usize {
@@ -1554,8 +1678,17 @@ fn sh(
     workspace: &Path,
     registry: &Registry,
     environment: &[(String, String)],
-) -> tokio::process::Command {
-    let mut process = tokio::process::Command::new(shell_path());
+    sandbox: Option<&Policy>,
+    detached: bool,
+) -> Result<tokio::process::Command> {
+    let mut process = match sandbox {
+        Some(policy) => crate::sandbox::command(policy, shell_path(), &["-c", command], detached)?,
+        None => {
+            let mut process = tokio::process::Command::new(shell_path());
+            process.arg("-c").arg(command);
+            process
+        }
+    };
     for name in registry.credentials.names() {
         process.env_remove(name);
     }
@@ -1596,8 +1729,8 @@ fn sh(
     for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
     }
-    process.arg("-c").arg(command).current_dir(workspace);
-    process
+    process.current_dir(workspace);
+    Ok(process)
 }
 
 /// Start a command in a new session for a service that must outlive the
@@ -1606,14 +1739,22 @@ fn sh(
 /// No process slot, group kill, or handle applies to it. An async waiter
 /// reaps it on exit and releases its detached slot.
 #[cfg(unix)]
-fn detach(
+async fn detach(
     command: &str,
     workspace: &Path,
     registry: &Registry,
     environment: &[(String, String)],
+    sandbox: Option<Arc<Policy>>,
 ) -> Result<Outcome> {
     use std::process::Stdio;
-    let mut process = sh(command, workspace, registry, environment);
+    let mut process = sh(
+        command,
+        workspace,
+        registry,
+        environment,
+        sandbox.as_deref(),
+        true,
+    )?;
     process
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1643,11 +1784,14 @@ fn detach(
             )
         })?)
     };
+    // What the sandbox holds in place stays held while the command runs.
+    let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     tokio::spawn(async move {
         let _permit = permit;
         let _ = child.wait().await;
+        drop(held);
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
@@ -1655,7 +1799,13 @@ fn detach(
 }
 
 #[cfg(not(unix))]
-fn detach(_: &str, _: &Path, _: &Registry, _: &[(String, String)]) -> Result<Outcome> {
+async fn detach(
+    _: &str,
+    _: &Path,
+    _: &Registry,
+    _: &[(String, String)],
+    _: Option<Arc<Policy>>,
+) -> Result<Outcome> {
     fail("shell_platform_unsupported")
 }
 
@@ -1666,6 +1816,7 @@ async fn shell(
     timeout: Duration,
     registry: &Registry,
     environment: &[(String, String)],
+    sandbox: Option<&Policy>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     use std::process::Stdio;
     use tokio::process::Child;
@@ -1685,7 +1836,7 @@ async fn shell(
             }
         }
     }
-    let child = sh(command, workspace, registry, environment)
+    let child = sh(command, workspace, registry, environment, sandbox, false)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1751,6 +1902,7 @@ async fn shell(
     _: Duration,
     _: &Registry,
     _: &[(String, String)],
+    _: Option<&Policy>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     fail("shell_platform_unsupported")
 }
@@ -1767,17 +1919,37 @@ mod tests {
         assert_eq!(binary(b""), None);
     }
     #[tokio::test]
-    async fn read_refuses_an_image_by_its_kind() {
+    async fn read_shows_a_picture_and_refuses_other_binaries_by_kind() {
         let dir = std::env::temp_dir().join(format!("agent-read-image-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\nIHDR").unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(4, 3)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.join("shot.png"), &png).unwrap();
+        std::fs::write(dir.join("doc.pdf"), b"%PDF-1.7 and more").unwrap();
         let registry = Registry::new("read").unwrap();
-        let prepared = registry.prepare("read", r#"{"path":"shot.png"}"#).unwrap();
-        let error = registry.execute(prepared, &dir, &[]).await.unwrap_err();
+        let read = |path: &str| {
+            let prepared = registry
+                .prepare("read", &json!({"path": path}).to_string())
+                .unwrap();
+            registry.execute(prepared, &dir, &[], None)
+        };
+        let outcome = read("shot.png").await.unwrap();
+        assert_eq!(
+            outcome.output,
+            format!(
+                "shot.png: a PNG image, 4×3, {} bytes; it follows",
+                png.len()
+            )
+        );
+        assert_eq!(outcome.images.len(), 1);
+        assert_eq!(outcome.images[0].media_type, "image/png");
+        let error = read("doc.pdf").await.unwrap_err();
         assert_eq!(error.code, "file_not_text");
         assert_eq!(
             error.detail.as_deref(),
-            Some("a PNG image of 12 bytes; read returns text")
+            Some("a PDF of 17 bytes; read returns text")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

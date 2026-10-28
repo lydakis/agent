@@ -13,8 +13,8 @@ use agent_runtime::{
     output::{self, Output},
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Settings,
-        Started, Store, TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
+        Settings, Started, Store, TurnOptions, Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -112,6 +112,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             compaction_instructions,
             compaction_model,
             declare,
+            settings,
             ..
         } => (
             // A bot that takes its creator's declared tools shows them too,
@@ -135,7 +136,14 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            if workspace.is_some() { PATH_JSON } else { 0 },
+            // The workspace and the writable folders, canonical, which the
+            // reply's settings repeat; a bot a sandboxed bot makes can take
+            // its creator's.
+            usize::from(workspace.is_some()) * PATH_JSON
+                + match created_by {
+                    Some(_) => FOLDERS_JSON,
+                    None => (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON),
+                },
             // Both the bot and its event carry its gates, most of them
             // inherited from its creator, so the command does not show
             // them. Each gate keeps only the bot's tools, which it lists.
@@ -340,6 +348,9 @@ enum Command {
         /// The most input plus output tokens this turn may spend, beside
         /// the bot's own budget; absent leaves only that.
         budget_tokens: Option<u64>,
+        /// Pictures sent with the prompt, each a media type and base64;
+        /// absent or null is none.
+        images: Option<Vec<agent_runtime::codec::Image>>,
     },
     Interrupt {
         bot: String,
@@ -714,6 +725,56 @@ fn name(field: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+/// The most bytes a prompt's pictures may have together, decoded: what
+/// Anthropic takes for one image, so one alone always fits.
+const IMAGES_BYTES: usize = 5 << 20;
+/// The most pictures one prompt may carry.
+const IMAGES: usize = 20;
+
+/// Pictures a provider takes: a media type both families know, base64 of
+/// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
+fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
+    use base64::Engine;
+    if images.len() > IMAGES {
+        return fail_with(
+            "image_limit",
+            format!("a prompt may carry up to {IMAGES} images"),
+        );
+    }
+    let mut bytes = 0;
+    for (at, image) in images.iter().enumerate() {
+        let invalid = |why: &str| {
+            Error::with("invalid_image", format!("images[{at}] {why}"))
+                .facts(json!({"field":"images","index":at}))
+        };
+        if !agent_runtime::codec::IMAGE_TYPES.contains(&image.media_type.as_str()) {
+            return Err(invalid(&format!(
+                "media_type must be one of {}",
+                agent_runtime::codec::IMAGE_TYPES.join(", ")
+            )));
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .map_err(|_| invalid("data must be standard base64"))?;
+        let signature = match image.media_type.as_str() {
+            "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => data.starts_with(b"\xff\xd8\xff"),
+            "image/gif" => data.starts_with(b"GIF8"),
+            _ => data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP"),
+        };
+        if !signature {
+            return Err(invalid(&format!("data is not {}", image.media_type)));
+        }
+        bytes += data.len();
+    }
+    if bytes > IMAGES_BYTES {
+        return fail_with(
+            "image_limit",
+            format!("a prompt's images may be up to {IMAGES_BYTES} bytes together, decoded"),
+        );
+    }
+    Ok(())
+}
 fn workspace(path: &str) -> Result<String> {
     if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
         return fail("workspace_must_exist_and_be_absolute");
@@ -722,6 +783,29 @@ fn workspace(path: &str) -> Result<String> {
         .to_str()
         .ok_or(Error::new("workspace_not_utf8"))?
         .into())
+}
+/// A new bot's sandbox, made ready to keep: refused where none can run, so
+/// a bot that asked for one never runs unconfined, and each folder it may
+/// write named by its real path, as the sandbox sees it.
+fn confine(settings: &mut Settings) -> Result<()> {
+    use agent_runtime::sandbox::Mode;
+    if matches!(
+        settings.sandbox,
+        Some(Mode::ReadOnly | Mode::WorkspaceWrite)
+    ) {
+        agent_runtime::sandbox::available()?;
+    }
+    for path in &mut settings.writable {
+        let real = std::fs::canonicalize(&*path)
+            .map_err(|_| Error::with("path_not_found", path.clone()))?;
+        *path = real
+            .to_str()
+            .ok_or(Error::with("path_not_utf8", path.clone()))?
+            .to_owned();
+    }
+    settings.writable.sort();
+    settings.writable.dedup();
+    Ok(())
 }
 /// A field given as `null` deserializes to `Some(None)`, apart from one
 /// left out, which `default` makes `None`.
@@ -1115,9 +1199,29 @@ pub async fn run(config: Configuration) -> Result<()> {
             std::path::absolute(path)?.to_string_lossy().into_owned(),
         ));
     }
+    agent_runtime::sandbox::warm();
+    let daemon = agent_runtime::sandbox::Daemon {
+        store: Some(std::fs::canonicalize(&config.store)?),
+        // By its folder's real path, which is what Seatbelt matches.
+        socket: config
+            .socket
+            .as_deref()
+            .map(|socket| -> Result<std::path::PathBuf> {
+                let socket = std::path::absolute(socket)?;
+                Ok(match (socket.parent(), socket.file_name()) {
+                    (Some(folder), Some(name)) => std::fs::canonicalize(folder)
+                        .map_or_else(|_| socket.clone(), |folder| folder.join(name)),
+                    _ => socket,
+                })
+            })
+            .transpose()?,
+        // Read once at start: what runs a confined write is this binary.
+        helper: std::env::current_exe().ok(),
+    };
     let registry = registry
         .with_credentials(credentials)
         .with_environment(environment)
+        .with_daemon(daemon)
         .with_process_budget(limits.processes)
         .with_detached_budget(limits.detached);
     let hub = Hub::default();
@@ -2119,7 +2223,7 @@ impl Service {
                 approve,
                 approver,
                 approve_expire_ms,
-                settings,
+                mut settings,
                 declare,
                 request_id,
             } => {
@@ -2153,6 +2257,12 @@ impl Service {
                 // with no room for thinking, is refused before the bot exists.
                 settings.validate()?;
                 turn::shaped(served, &settings)?;
+                // Checking for a sandbox and resolving folders touch the
+                // filesystem: off the runtime thread.
+                let settings =
+                    tokio::task::spawn_blocking(move || confine(&mut settings).map(|()| settings))
+                        .await
+                        .map_err(|_| Error::new("sandbox_unavailable"))??;
                 if let Some(level) = &effort {
                     family.check_effort(level)?;
                 }
@@ -2673,6 +2783,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
+                            images: Vec::new(),
                             note: None,
                             failed: true,
                         }
@@ -2991,8 +3102,11 @@ impl Service {
                 from,
                 origin,
                 budget_tokens,
+                images,
             } => {
                 name("request_id", &request_id)?;
+                let images = images.unwrap_or_default();
+                check_images(&images)?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }
@@ -3048,6 +3162,7 @@ impl Service {
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
                     budget_tokens,
+                    images,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -4229,6 +4344,7 @@ mod tests {
             from: None,
             origin: None,
             budget_tokens: None,
+            images: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins

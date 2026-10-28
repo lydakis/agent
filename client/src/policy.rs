@@ -549,6 +549,27 @@ fn project_from(dir: &Path, home: Option<&Path>) -> Result<Option<(String, PathB
     Ok(None)
 }
 
+/// The top of the git checkout `dir` is in, as the main checkout's when it
+/// is a linked worktree, looking no higher than the home folder (the home
+/// folder's own only for the home folder itself), as [`project`] looks.
+pub fn checkout(dir: &Path) -> Option<PathBuf> {
+    checkout_from(dir, home().as_deref())
+}
+
+fn checkout_from(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let home = home.map(|h| h.canonicalize().unwrap_or_else(|_| h.to_path_buf()));
+    for at in dir.ancestors() {
+        if home.as_deref() == Some(at) && at != dir.as_path() {
+            return None;
+        }
+        if std::fs::symlink_metadata(at.join(".git")).is_ok() {
+            return Some(main_checkout(at).unwrap_or_else(|| at.to_path_buf()));
+        }
+    }
+    None
+}
+
 fn project_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
@@ -797,6 +818,63 @@ fn append(text: &mut String, path: PathBuf, header: &str) -> Result<Option<Sourc
     }))
 }
 
+/// What heads an AGENTS.md file, and a role, in a bot's instructions.
+const AGENTS_HEADING: &str = "\n\n# Instructions from ";
+const ROLE_HEADING: &str = "\n\n# Role: ";
+
+fn agents_header(path: &Path) -> String {
+    format!("{AGENTS_HEADING}{}\n\n", path.display())
+}
+
+/// The AGENTS.md files that apply to `workspace`, with their text, when
+/// `instructions`, a bot's, hold them all as they read now: what the bot
+/// was given, unchanged since. The files must be the whole of what it was
+/// given, with no file before them and, right after the last, the end or
+/// a heading only composing writes, so a file cut short, added, or removed
+/// since reads as changed, and then none is returned. Memory never marks
+/// that end: agents write it, so an index could be made to read as the
+/// paragraphs cut from a file. Where memory is all that follows, none is
+/// returned.
+pub fn given_agents_files(workspace: &Path, instructions: &str) -> Vec<(PathBuf, String)> {
+    let Ok(paths) = agents_files(workspace) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    let mut blocks = String::new();
+    for path in paths {
+        let Ok(Some(body)) = read_bounded(&path, MAX_INSTRUCTIONS) else {
+            return Vec::new();
+        };
+        let body = body.trim();
+        // An empty file is given no section.
+        if body.is_empty() {
+            continue;
+        }
+        blocks.push_str(&agents_header(&path));
+        blocks.push_str(body);
+        files.push((path, body.to_owned()));
+    }
+    if files.is_empty() {
+        return files;
+    }
+    // What the instructions compose after the files: the skills or
+    // profiles list, or the role, which comes last, so no list follows it.
+    let lists = [Kind::Skills.header(), Kind::Profiles.header()];
+    let follows = |rest: &str| {
+        rest.is_empty()
+            || lists.iter().any(|header| rest.starts_with(header.as_str()))
+            || (rest.starts_with(ROLE_HEADING)
+                && !lists.iter().any(|header| rest.contains(header.as_str())))
+    };
+    let given = instructions.match_indices(&blocks).any(|(at, _)| {
+        !instructions[..at].contains(AGENTS_HEADING) && follows(&instructions[at + blocks.len()..])
+    });
+    match given {
+        true => files,
+        false => Vec::new(),
+    }
+}
+
 /// The full text for a new bot in `workspace`, in `role` when given, with
 /// the `memory` indexes the client keeps. Fails rather than truncates when
 /// the files do not fit: a silently shortened AGENTS.md is worse than none.
@@ -808,7 +886,7 @@ pub fn instructions(
     let mut text = preamble();
     let mut sources = Vec::new();
     for path in agents_files(workspace)? {
-        let header = format!("\n\n# Instructions from {}\n\n", path.display());
+        let header = agents_header(&path);
         sources.extend(append(&mut text, path, &header)?);
     }
     let mut lists = Vec::new();
@@ -845,7 +923,7 @@ pub fn instructions(
     }
     // The role comes last: the most specific text a bot is given.
     if let Some(role) = role.filter(|r| !r.body.is_empty()) {
-        let block = format!("\n\n# Role: {}\n\n{}", role.name, with_cli(&role.body));
+        let block = format!("{ROLE_HEADING}{}\n\n{}", role.name, with_cli(&role.body));
         if text.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
                 path: role
@@ -939,6 +1017,64 @@ mod tests {
         assert_eq!(composed.skills[0].summary, "Deploy");
         assert!(composed.text.contains("- deploy: Deploy ("));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bot_was_given_the_agents_files_that_read_as_they_did() {
+        let root = temp("given-agents");
+        let deep = root.join("repo");
+        std::fs::create_dir_all(&deep).unwrap();
+        let outer = "Push when finished.\n\nOnly push to staging; never to production.";
+        std::fs::write(root.join("AGENTS.md"), outer).unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "inner rule").unwrap();
+        let given = instructions(&deep, None, &[]).unwrap().text;
+        let found = || -> Vec<String> {
+            given_agents_files(&deep, &given)
+                .into_iter()
+                .filter(|(path, _)| path.starts_with(&root))
+                .map(|(_, text)| text)
+                .collect()
+        };
+        assert_eq!(found(), [outer, "inner rule"]);
+        // A role after them is a section composed after them.
+        let role = Profile::parse("reviewer", None, "Review.");
+        let with_role = instructions(&deep, Some(&role), &[]).unwrap().text;
+        assert_eq!(given_agents_files(&deep, &with_role).len(), found().len());
+        // Edited since: none is what the bot was given.
+        std::fs::write(deep.join("AGENTS.md"), "inner rule, and push freely").unwrap();
+        assert!(found().is_empty());
+        std::fs::write(deep.join("AGENTS.md"), "inner rule").unwrap();
+        // Nor when one is cut short at a paragraph, dropping its restriction.
+        std::fs::write(root.join("AGENTS.md"), "Push when finished.").unwrap();
+        assert!(found().is_empty());
+        // Nor when memory, which agents write, is what follows them: an
+        // index made to read as the cut paragraph would pass for it.
+        let cut = "Act freely.\n\nNever push.";
+        std::fs::write(root.join("AGENTS.md"), cut).unwrap();
+        let cut_given = instructions(&deep, None, &[]).unwrap().text;
+        std::fs::write(root.join("AGENTS.md"), "Act freely.").unwrap();
+        assert!(given_agents_files(&deep, &cut_given).is_empty());
+        // Nor when the cut leaves a role-like heading of the file's own
+        // before a list: the role comes last.
+        let headed = "Act freely.\n\n# Role: careful\n\nNever push.";
+        std::fs::write(root.join("AGENTS.md"), headed).unwrap();
+        std::fs::create_dir_all(deep.join(".agents/skills/deploy")).unwrap();
+        std::fs::write(
+            deep.join(".agents/skills/deploy/SKILL.md"),
+            "# Deploy\n\nShip.",
+        )
+        .unwrap();
+        let headed_given = instructions(&deep, None, &[]).unwrap().text;
+        std::fs::write(root.join("AGENTS.md"), "Act freely.").unwrap();
+        assert!(given_agents_files(&deep, &headed_given).is_empty());
+        std::fs::write(root.join("AGENTS.md"), headed).unwrap();
+        assert!(!given_agents_files(&deep, &headed_given).is_empty());
+        std::fs::remove_dir_all(deep.join(".agents")).unwrap();
+        // Nor when one is removed.
+        std::fs::write(root.join("AGENTS.md"), outer).unwrap();
+        assert_eq!(found().len(), 2);
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        assert!(found().is_empty());
     }
 
     #[test]
@@ -1195,10 +1331,21 @@ mod tests {
             memory_indexes_from(&repo, None).unwrap(),
             Vec::<PathBuf>::new()
         );
+        // A worktree's checkout is the main one.
+        let top = repo.canonicalize().unwrap();
+        assert_eq!(
+            checkout_from(&worktree.join("web"), Some(&home)),
+            Some(top.clone())
+        );
+        assert_eq!(checkout_from(&repo.join("web"), Some(&home)), Some(top));
         // A project above a repository, or the home folder's, is not its.
         let nested = repo.join("web/inner");
         std::fs::create_dir_all(nested.join(".git")).unwrap();
         assert_eq!(project(&nested).unwrap(), None);
+        assert_eq!(
+            checkout_from(&nested, Some(&home)),
+            Some(nested.canonicalize().unwrap())
+        );
         std::fs::create_dir_all(home.join(".agents")).unwrap();
         std::fs::create_dir_all(home.join("Developer/plain")).unwrap();
         std::fs::write(home.join(".agents/project.toml"), "name = \"me\"\n").unwrap();
@@ -1210,6 +1357,17 @@ mod tests {
             project_from(&home, Some(&home)).unwrap(),
             Some(("me".into(), home.canonicalize().unwrap()))
         );
+        // Nor is a home folder that is a repository a folder's checkout.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        assert_eq!(
+            checkout_from(&home.join("Developer/plain"), Some(&home)),
+            None
+        );
+        assert_eq!(
+            checkout_from(&home, Some(&home)),
+            Some(home.canonicalize().unwrap())
+        );
+        std::fs::remove_dir_all(home.join(".git")).unwrap();
         std::fs::write(repo.join("web/.agents/project.toml"), "name = \"../up\"\n").unwrap();
         let error = project(&repo.join("web")).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");

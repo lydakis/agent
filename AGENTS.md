@@ -59,9 +59,11 @@ it keeps these, and says in its PR how:
 - The pacer learns from everything a provider says (rate-limit headers,
   `retry-after-ms` and `retry-after`, named delays, usage) and estimates what
   the provider counts. It invents no caps and refuses only what can never fit.
-- Every provider error has a class: pace (429, 529, overloaded, slow down)
-  closes the pool and parks; transient (5xx, stalls, connections) backs off
-  and parks; the rest are final. A new error code gets a class and a test.
+- Every provider error has a class: a rate limit (429, slow down) closes the
+  pool and parks; an overload (529, overloaded) backs off its own call and
+  closes the pool only when it names a delay or overloads cluster; transient
+  (5xx, stalls, connections) backs off and parks; the rest are final. A new
+  error code gets a class and a test.
 - A change on a hot path carries a matched before/after screen against main,
   recorded in docs/DAEMON_MEASUREMENTS.md: `bench.lifecycle` (32-bot socket
   echo), `bench.completion_burst`, `bench.admission_burst`, and

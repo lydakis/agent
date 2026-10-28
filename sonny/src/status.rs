@@ -3,7 +3,8 @@
 //! by where they stand, as a thread list is: what needs the person, what
 //! works, what waits for review, what sits idle, and, folded away, what the
 //! lead marked resolved. Each row says what the agent is doing, for how
-//! long, on which model, its latest step, and where it is in Rex.
+//! long, on which model, its latest step, where it is in Rex, and what
+//! runs for it in the background.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -14,14 +15,22 @@ pub struct Row {
     /// The agent's name in its project: `lead`, or the task's.
     pub name: String,
     pub state: String,
-    /// Seconds it has been at it, or since it finished.
+    /// Whether a turn of its runs.
+    pub running: bool,
+    /// Seconds its running turn has been at it, or its last turn took.
     pub seconds: Option<u64>,
+    /// When its running turn started or its last turn ended (ms), which
+    /// orders the rows.
+    pub at: Option<u64>,
     pub model: String,
     pub latest: String,
     /// Where it is in Rex: `tab 2`, `tab 1, split`, or empty.
     pub place: String,
     /// The pull request its last reply links, as `owner/repo#N`.
     pub pr: String,
+    /// What runs for it with no one typing, as `/background` counts it:
+    /// `↻ 2 triggers`, or empty.
+    pub background: String,
     pub group: Group,
 }
 
@@ -207,12 +216,10 @@ pub fn card(
 /// pull request; its latest step.
 fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    // A time running on is how long it has been at it; else since it ended.
+    // How long the running turn has been at it, or the last one took.
     let time = match row.seconds {
-        Some(s) if row.group == Group::Working || row.state == "needs you" => {
-            crate::transcript::elapsed(s)
-        }
-        Some(s) => format!("{} ago", crate::transcript::elapsed(s)),
+        Some(s) if row.running => crate::transcript::elapsed(s),
+        Some(s) => format!("took {}", crate::transcript::elapsed(s)),
         None => String::new(),
     };
     let mark = match row.group {
@@ -235,10 +242,15 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         Span::raw(""),
         Span::raw("   "),
     ));
-    let facts: Vec<&str> = [row.model.as_str(), row.place.as_str(), row.pr.as_str()]
-        .into_iter()
-        .filter(|f| !f.is_empty())
-        .collect();
+    let facts: Vec<&str> = [
+        row.model.as_str(),
+        row.place.as_str(),
+        row.pr.as_str(),
+        row.background.as_str(),
+    ]
+    .into_iter()
+    .filter(|f| !f.is_empty())
+    .collect();
     if !facts.is_empty() {
         let line = Line::from(facts.join(" · ")).dim();
         out.extend(crate::transcript::wrap(
@@ -315,6 +327,7 @@ mod tests {
         let row = |name: &str, state: &str, group: Group| Row {
             name: name.into(),
             state: state.into(),
+            running: matches!(group, Group::Working | Group::NeedsYou),
             seconds: Some(42),
             model: "chatgpt/gpt-6.1-sol".into(),
             place: "tab 1".into(),
@@ -326,6 +339,7 @@ mod tests {
             row("zero", "needs you", Group::NeedsYou),
             Row {
                 pr: "o/r#9".into(),
+                background: "↻ 1 trigger".into(),
                 ..row("equal", "done", Group::Review)
             },
             row("old", "done", Group::Resolved),
@@ -343,11 +357,14 @@ mod tests {
         assert_eq!(folded[4], "Needs you · 1");
         assert_eq!(folded[5], " ◐ zero needs you · 42s");
         assert_eq!(folded[8], "Ready for review · 1");
-        assert_eq!(folded[9], " ◆ equal done · 42s ago");
-        assert_eq!(folded[10], "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9");
+        assert_eq!(folded[9], " ◆ equal done · took 42s");
+        assert_eq!(
+            folded[10],
+            "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9 · ↻ 1 trigger"
+        );
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
         let shown = text(true);
         assert_eq!(shown[shown.len() - 3], "Resolved · 1");
-        assert_eq!(shown[shown.len() - 2], " ✓ old done · 42s ago");
+        assert_eq!(shown[shown.len() - 2], " ✓ old done · took 42s");
     }
 }
