@@ -705,8 +705,11 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
         .unwrap()
         .unwrap();
         assert_ne!(run(Some(policy.clone())).await, 0, "network {network}");
-        // With the bot's own socket, the daemon's path reaches that one.
-        let own = base.join(format!("own-{network}.sock"));
+        // With the bot's own socket, laid out as the daemon lays them out,
+        // the daemon's path reaches that one.
+        let folder = base.join(format!("agent.sock.d-{network}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let own = folder.join("1");
         let listener = std::os::unix::net::UnixListener::bind(&own).unwrap();
         listener.set_nonblocking(true).unwrap();
         let policy = Policy {

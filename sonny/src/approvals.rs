@@ -67,6 +67,21 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
     }
 }
 
+/// What a bot's gate may hold back: its own `tools`, and of the tools its
+/// client declared, those Sonny gates (`served::GATED`).
+pub fn gateable(tools: &[String], declared: &Value) -> Vec<String> {
+    let mut gateable = tools.to_vec();
+    for tool in declared.as_array().into_iter().flatten() {
+        if let Some(name) = tool["name"].as_str()
+            && crate::served::GATED.contains(&name)
+            && !gateable.iter().any(|have| have == name)
+        {
+            gateable.push(name.to_owned());
+        }
+    }
+    gateable
+}
+
 /// The agents `lead` made, and those they made, from a `bots` listing:
 /// by the maker's identity, so a reused name's children are strangers.
 pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
@@ -95,7 +110,8 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
 
 /// The `configure` fields that give a bot `mode`, or `None` when its gate
 /// is already the one `gate` makes: the same approver over the same tools,
-/// with no expiry.
+/// with no expiry. `record` is the bot as `inspect` gives it, with the
+/// tools its client declared.
 pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
     let tools: Vec<String> = record["tools"]
         .as_array()
@@ -104,7 +120,7 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    let fields = gate(mode, &tools);
+    let fields = gate(mode, &gateable(&tools, &record["declared"]));
     let wanted = match fields.get("approver") {
         Some(tag) => vec![json!({"tag": tag, "tools": fields["approve"]})],
         None => Vec::new(),
@@ -208,5 +224,21 @@ mod tests {
         let lapsing = json!({"tools": ["shell", "read"],
             "gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
         assert!(regate(&lapsing, "auto").is_some());
+        // Of the tools its client declared, those that can drop work, run
+        // something outside the sandbox or send words elsewhere wait for
+        // the verdict too.
+        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(true),
+            "gates": [{"tag": "auto", "tools": ["shell"]}]});
+        assert_eq!(
+            regate(&panes, "auto").unwrap()["approve"],
+            json!([
+                "shell",
+                "start_task",
+                "remove_task",
+                "new_project",
+                "subscriptions",
+                "run_in_pane"
+            ])
+        );
     }
 }
