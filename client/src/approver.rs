@@ -478,7 +478,15 @@ pub fn entries(item: &Value, judged: &[&str], redactor: &Redactor) -> Vec<Entry>
             let arguments = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
             call(&item["call_id"], &item["name"], &arguments);
         }
-        Some("function_call_output") => found.push(Entry {
+        // A custom tool's call is its input, read as the daemon reads it.
+        Some("custom_tool_call") => {
+            call(
+                &item["call_id"],
+                &item["name"],
+                &json!({"input": item["input"]}),
+            );
+        }
+        Some("function_call_output" | "custom_tool_call_output") => found.push(Entry {
             said: Said::Output,
             call: item["call_id"].as_str().map(str::to_owned),
             text: output_text(&item["output"], redactor),
@@ -1447,6 +1455,8 @@ mod tests {
             json!({"type":"function_call","call_id":"a","name":"shell","arguments":"{\"command\":\"ls\"}"}),
             json!({"type":"function_call_output","call_id":"a","output":"README.md"}),
             json!({"type":"function_call","call_id":"judged","name":"shell","arguments":"{}"}),
+            json!({"type":"custom_tool_call","call_id":"p","name":"apply_patch","input":"*** Begin Patch"}),
+            json!({"type":"custom_tool_call_output","call_id":"p","output":"Success."}),
         ];
         let found: Vec<Entry> = responses
             .iter()
@@ -1470,6 +1480,16 @@ mod tests {
                     said: Said::Output,
                     call: call("a"),
                     text: "README.md".into()
+                },
+                Entry {
+                    said: Said::Call,
+                    call: call("p"),
+                    text: "apply_patch {\"input\":\"*** Begin Patch\"}".into()
+                },
+                Entry {
+                    said: Said::Output,
+                    call: call("p"),
+                    text: "Success.".into()
                 },
             ]
         );
