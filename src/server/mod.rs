@@ -330,6 +330,22 @@ enum Command {
         #[serde(default)]
         newest: bool,
     },
+    /// The tokens bots' turns spent: in all, by bot, by model, and over
+    /// time. A read.
+    Usage {
+        /// A GLOB of bot names, as `bots` takes it; absent is every bot.
+        name: Option<String>,
+        /// Only turns started at or after this, in milliseconds since the
+        /// Unix epoch; absent is all of them.
+        #[serde(default)]
+        since_ms: i64,
+        /// Sum `series` in buckets this wide from `since_ms`; absent
+        /// leaves the series out.
+        bucket_ms: Option<i64>,
+        /// The most bots listed by what they spent, the rest summed as
+        /// `other_bots`; 64 when absent.
+        limit: Option<usize>,
+    },
     Submit {
         bot: String,
         /// The identity `bot` had when this request was first made; a retry
@@ -2591,6 +2607,18 @@ impl Service {
                 store
                     .read("turns", move |db| {
                         db.turns(&bot, after, before, limit.unwrap_or(64), newest)
+                    })
+                    .await
+            }
+            Command::Usage {
+                name,
+                since_ms,
+                bucket_ms,
+                limit,
+            } => {
+                store
+                    .read("usage", move |db| {
+                        db.usage(name.as_deref(), since_ms, bucket_ms, limit.unwrap_or(64))
                     })
                     .await
             }

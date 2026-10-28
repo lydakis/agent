@@ -277,6 +277,15 @@ off again never shows.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+- `/usage` shows, in the pane beside the conversation on the full screen,
+  the tokens the project's agents spent in the last 24 hours: in all, as
+  stacked bars over time (output, input read fresh, and input read from the
+  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  day, week or month, `a` every agent in the store, by project, and `c`
+  hides the cached reads, so what the provider charges most for stands out.
+  A turn counts where it started. It reads again every 15 seconds.
+
+  ![/usage in the pane](../docs/sonny/usage.gif)
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which

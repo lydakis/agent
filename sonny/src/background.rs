@@ -166,7 +166,7 @@ impl Scope {
         lookout::subs::matches(&self.glob, bot)
     }
     /// A bot's name in the project: `lead`, or the rest after `project.`.
-    fn short(&self, bot: &str) -> String {
+    pub fn short(&self, bot: &str) -> String {
         if bot == self.lead {
             return "lead".into();
         }

@@ -55,6 +55,7 @@ mod term;
 mod testing;
 mod transcript;
 mod trigger;
+mod usage;
 mod user_shell;
 
 use agent_client::{Client, Events};
@@ -1263,7 +1264,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
 /// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 16] = [
+const COMMANDS: [(&str, &str); 17] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1284,6 +1285,7 @@ const COMMANDS: [(&str, &str); 16] = [
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
     ),
+    ("/usage", "the tokens the agents spent, over time"),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/verbose",
@@ -1362,6 +1364,8 @@ struct Watch {
     resolved: bool,
     /// `/background` holds the screen instead of the card.
     background: Option<background::View>,
+    /// `/usage` holds it instead.
+    usage: Option<usage::View>,
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
@@ -2375,11 +2379,10 @@ impl App {
                 _ = tick.tick() => {}
                 _ = self.woken.notified() => {}
             }
-            if self
-                .watch
-                .as_ref()
-                .is_some_and(|w| w.read.elapsed() > Duration::from_secs(2))
-            {
+            if self.watch.as_ref().is_some_and(|w| {
+                w.read.elapsed() > Duration::from_secs(2)
+                    || w.usage.as_ref().is_some_and(usage::View::due)
+            }) {
                 self.reread().await;
             }
             if self.retry.is_some_and(|at| at <= Instant::now()) {
@@ -3933,12 +3936,13 @@ impl App {
                 lookout: self.lookout_line(),
                 resolved: false,
                 background: None,
+                usage: None,
                 picked: None,
             });
             self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
             return;
         }
-        self.watch(project, rows, jobs, None);
+        self.watch(project, rows, jobs, None, None);
     }
 
     /// What runs for the project's agents with no one typing. Open
@@ -3963,12 +3967,50 @@ impl App {
                 lookout: String::new(),
                 resolved: false,
                 background: Some(view),
+                usage: None,
                 picked: None,
             });
             self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
             return;
         }
-        self.watch(project, Vec::new(), Vec::new(), Some(view));
+        self.watch(project, Vec::new(), Vec::new(), Some(view), None);
+    }
+
+    /// The tokens the project's agents spent, or every agent's, over
+    /// time. Open `/usage`: its own screen, as `/status` has, until Esc.
+    async fn usage(&mut self) {
+        let scope = self.scope();
+        let project = scope.project.clone();
+        let mut view = usage::View::new(scope);
+        self.read_usage(&mut view).await;
+        if full() {
+            self.watch = Some(Watch {
+                screen: None,
+                project,
+                rows: Vec::new(),
+                jobs: Vec::new(),
+                read: Instant::now(),
+                lookout: String::new(),
+                resolved: false,
+                background: None,
+                usage: Some(view),
+                picked: None,
+            });
+            self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
+            return;
+        }
+        self.watch(project, Vec::new(), Vec::new(), None, Some(view));
+    }
+
+    /// `view` read from the daemon again.
+    async fn read_usage(&self, view: &mut usage::View) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let (query, window) = view.query(now);
+        let read = self.client.request("usage", query).await;
+        view.loaded(window, read.map_err(|error| error.to_string()));
     }
 
     /// Give `/status`, or `/background`, the screen.
@@ -3978,6 +4020,7 @@ impl App {
         rows: Vec<status::Row>,
         jobs: Vec<status::Row>,
         background: Option<background::View>,
+        usage: Option<usage::View>,
     ) {
         // The full screen is the alternate screen already.
         if !full() {
@@ -3998,6 +4041,7 @@ impl App {
                     lookout: self.lookout_line(),
                     resolved: false,
                     background,
+                    usage,
                     picked: None,
                 })
             }
@@ -4016,6 +4060,16 @@ impl App {
         {
             view.reload();
             watch.read = Instant::now();
+            return;
+        }
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.usage.take()) {
+            if view.due() {
+                self.read_usage(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.usage = Some(view);
+                watch.read = Instant::now();
+            }
             return;
         }
         let jobs = errand::jobs(self.folder_name()).await;
@@ -4651,6 +4705,32 @@ impl App {
                 }
                 return true;
             }
+            // `/usage` takes its own keys: the period, whose, cached reads.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.usage.as_mut())
+            {
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Up => pane.screen.scroll(1),
+                    KeyCode::Down => pane.screen.scroll(-1),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => {
+                        if view.key(*key) == usage::Key::Close {
+                            self.pane = None;
+                            self.pane_keys = false;
+                        }
+                    }
+                }
+                return true;
+            }
             if self.pane_keys {
                 match key.code {
                     KeyCode::Esc => {
@@ -4857,6 +4937,19 @@ impl App {
                 if let Event::Key(key) = event
                     && key.kind != KeyEventKind::Release
                     && view.key(key) == background::Key::Close
+                {
+                    self.watch = None;
+                    if !full() {
+                        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                    }
+                    self.redraw = true;
+                }
+                return;
+            }
+            if let Some(view) = &mut watch.usage {
+                if let Event::Key(key) = event
+                    && key.kind != KeyEventKind::Release
+                    && view.key(key) == usage::Key::Close
                 {
                     self.watch = None;
                     if !full() {
@@ -5217,6 +5310,15 @@ impl App {
                 self.notice = Some("/status is for the agent itself, not a side chat".into());
             } else {
                 self.status().await;
+            }
+            return;
+        }
+        if prompt == "/usage" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/usage is for the agent itself, not a side chat".into());
+            } else {
+                self.usage().await;
             }
             return;
         }
@@ -6031,6 +6133,18 @@ impl App {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
+            } else if let Some(view) = &watch.usage {
+                let lines = view
+                    .card(width)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, STATUS_KEYS);
+                pane.foot = Some(view.footer());
             } else {
                 let (lines, any_resolved) = watch_card(watch, width);
                 let keys = match any_resolved && watch.resolved {
@@ -6549,6 +6663,9 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
     if watch.background.is_some() {
         return draw_background(watch);
     }
+    if watch.usage.is_some() {
+        return draw_usage(watch);
+    }
     let Some(screen) = &mut watch.screen else {
         return Ok(());
     };
@@ -6641,6 +6758,36 @@ fn draw_background(watch: &mut Watch) -> std::io::Result<()> {
         let skip = (at + 3).saturating_sub(height);
         let mut lines = vec![Line::default()];
         lines.extend(card.into_iter().skip(skip).map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
+        let body = ratatui::layout::Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let foot = ratatui::layout::Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(lines), body);
+        frame.render_widget(Paragraph::new(view.footer()), foot);
+    })?;
+    Ok(())
+}
+
+/// `/usage` on its own screen: its card and the keys it takes.
+fn draw_usage(watch: &mut Watch) -> std::io::Result<()> {
+    let (Some(view), Some(screen)) = (&watch.usage, &mut watch.screen) else {
+        return Ok(());
+    };
+    screen.autoresize()?;
+    screen.draw(|frame| {
+        let area = frame.area();
+        let width = area.width.saturating_sub(2) as usize;
+        let mut lines = vec![Line::default()];
+        lines.extend(view.card(width).into_iter().map(|line| {
             let mut spans = vec![Span::raw(" ")];
             spans.extend(line.spans);
             Line::from(spans).style(line.style)

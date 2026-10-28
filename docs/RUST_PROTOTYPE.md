@@ -1016,6 +1016,7 @@ own path from the turn. Example requests:
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
 {"id":23,"op":"turns","bot":"Bob","newest":true,"limit":3}
+{"id":30,"op":"usage","name":"project.*","since_ms":1793000000000,"bucket_ms":21600000,"limit":64}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":29,"op":"compact","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
@@ -1214,6 +1215,21 @@ prefix, and `active: true` keeps those with a turn running, read from a partial
 index of only them (`bots_running`). Filtered pages page and bound like any
 other. `bots` and `turns` run on the store's reader connection, so a listing
 never waits behind, or holds up, the writer.
+
+Protocol 22 adds `usage`, what bots' turns spent, also a read on the reader
+connection: one grouped statement over `turns`, so one snapshot. `name` keeps
+the bots a `bots` GLOB would (absent is every bot), and `since_ms` the turns
+started at or after it (absent or 0 is all of them); a turn counts wholly where
+it started, compaction and keep-warm calls included, since they are recorded on
+it. The answer has the totals (`turns`, `input_tokens`, `cached_input_tokens`,
+`output_tokens`; cached is part of input), `bots` with the `limit` (1 to 256,
+default 64) that spent most input plus output first and `other_bots` summing
+the rest with how many (`null` when none), and `models`, the turn's model as
+`turns` reports it. With `bucket_ms` it adds `series`, one row for each bucket
+of that width from `since_ms` that has turns, at its `at_ms`; it needs a
+`since_ms` and fewer than 1024 buckets to now (`invalid_usage_window`). Usage
+is read from `turns`, so a deleted bot's turns, and the judge's own copies once
+deleted, no longer count. Sonny's `/usage` draws it.
 
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure
