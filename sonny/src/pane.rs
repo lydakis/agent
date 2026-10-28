@@ -511,6 +511,26 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_name_is_written_again_a_character_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("sonny-wide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("日本.rs"), "x\n").unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", dir.display()), &dir, 80).unwrap();
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buf = Buffer::empty(area);
+        pane.render(area, &mut buf, true, |_| None);
+        let cells = pane.screen.link_cells(&buf);
+        // No cell a wide character goes on into is written over.
+        for (x, y, _) in &cells {
+            assert_ne!(buf[(*x, *y)].symbol(), " ", "column {x}");
+        }
+        let text: String = cells.iter().map(|(_, _, c)| c.symbol()).collect();
+        assert!(text.contains("日") && text.contains("本"));
+        assert!(text.ends_with("s\x1b]8;;\x1b\\"), "{text:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_long_code_line_wraps_under_its_code() {
         let dir = std::env::temp_dir().join(format!("sonny-wrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

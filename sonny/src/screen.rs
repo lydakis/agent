@@ -580,13 +580,22 @@ impl Screen {
                 true => url.split('#').next().unwrap_or(url),
                 false => url,
             };
-            for x in *from..*to {
+            // The cells a character starts in: the column a wide one
+            // goes on into is drawn by it, and written over would cut it.
+            let mut glyphs = Vec::new();
+            let mut x = *from;
+            while x < *to {
+                glyphs.push(x);
+                x += buf[(x, *y)].symbol().width().max(1) as u16;
+            }
+            let last = glyphs.len().saturating_sub(1);
+            for (at, x) in glyphs.into_iter().enumerate() {
                 let mut cell = buf[(x, *y)].clone();
                 let mut symbol = cell.symbol().to_owned();
-                if x == *from {
+                if at == 0 {
                     symbol = format!("\x1b]8;;{url}\x1b\\{symbol}");
                 }
-                if x + 1 == *to {
+                if at == last {
                     symbol.push_str("\x1b]8;;\x1b\\");
                 }
                 cell.set_symbol(&symbol);
