@@ -2831,9 +2831,13 @@ impl App {
                         if let Some((name, arguments)) =
                             calls.remove(id).or_else(|| self.calls.remove(id))
                         {
-                            let (output, failed) = output(&item);
+                            let (output, mut failed) = output(&item);
                             match denial(&item) {
-                                Some(reason) => self.commit_denied(&name, &arguments, &reason),
+                                Some(reason) => {
+                                    // It never ran: nothing it would have done follows.
+                                    failed = true;
+                                    self.commit_denied(&name, &arguments, &reason);
+                                }
                                 None => self.commit_call(&name, &arguments, &output, failed),
                             }
                             if name == resolved::TOOL && !failed && !reactions::refused(&item) {
@@ -3398,6 +3402,8 @@ impl App {
                 }
                 self.reviewing.remove(id);
                 if data["denied"] == true {
+                    // It never ran: nothing it would have done follows.
+                    shown.1 = true;
                     self.commit_denied(&name, &arguments, &reason);
                     // The approver's, not the person's: `/approve` may
                     // retry it once.
@@ -3437,7 +3443,11 @@ impl App {
                 }
                 self.approvals.retain(|call| call["call_id"] != id);
                 if let Some(running) = &mut self.running {
-                    running.phase = "Working".into();
+                    // The judge may still be reviewing the round's others.
+                    running.phase = match self.approvals.is_empty() && !self.reviewing.is_empty() {
+                        true => reviewing(self.reviewing.len()),
+                        false => "Working".into(),
+                    };
                 }
             }
             "approval_requested" | "approval_asked" => self.approvals_for(turn).await,
@@ -6032,7 +6042,8 @@ mod tests {
                 json!({"items": read})
             }
             Some("approvals") => json!({"approvals": [
-                {"turn": 4, "call_id": "c1", "gates": ["auto"], "asked": null}]}),
+                {"turn": 4, "call_id": "c1", "gates": ["auto"], "asked": null},
+                {"turn": 4, "call_id": "c2", "gates": ["auto"], "asked": null}]}),
             _ => json!({}),
         })
         .await;
@@ -6044,7 +6055,7 @@ mod tests {
         // While the approver reviews, the status row says so.
         assert_eq!(
             app.running.as_ref().unwrap().phase,
-            "Reviewing approval request"
+            "Reviewing 2 approval requests"
         );
         app.daemon(turn_event(
             "tool_completed",
@@ -6053,7 +6064,30 @@ mod tests {
                 "approvals": [{"tag": "auto", "by": "approver", "allow": false}]}),
         ))
         .await;
-        assert!(app.reviewing.is_empty());
+        // The other is still under review.
+        assert_eq!(app.reviewing.len(), 1);
+        assert_eq!(
+            app.running.as_ref().unwrap().phase,
+            "Reviewing approval request"
+        );
+        // A question denied was never asked.
+        let question = json!({"question": "Merge?"}).to_string();
+        app.daemon(turn_event(
+            "tool_started",
+            4,
+            json!({"call_id": "c2", "name": "ask", "arguments": question}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            4,
+            json!({"call_id": "c2", "denied": true,
+                "approvals": [{"tag": "auto", "by": "approver", "allow": false}]}),
+        ))
+        .await;
+        assert!(app.reviewing.is_empty() && app.asks.is_empty());
+        assert_eq!(app.running.as_ref().unwrap().phase, "Working");
+        app.denials.retain(|denial| denial.call_id == "c1");
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.contains(&"✗ Request denied for git push --force origin main".to_owned()),
