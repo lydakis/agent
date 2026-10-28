@@ -5531,10 +5531,13 @@ pool's gate, up to a minute at a time, holding its built request. When no
 refund from a call in flight could shorten the wait and it is 250 ms or
 more, the call now parks as a rate limit's does. It books its share of the
 allowance as it parks, so the next call parks behind it rather than at the
-same moment, and the first call to arrive once the booking is due spends it.
-A booking no call spends returns to the allowance five seconds after it was
-due. Waits a refund could shorten stay in the gate, where headers and usage
-wake them.
+same moment, and the first call to arrive once the booking is due spends it,
+if the allowance has refilled enough to pay for it with every other booking
+still owed; a larger call, or a booking whose wait counted on a refund that
+did not come, parks again for the rest. Headers count bookings as spent,
+since the provider has not seen them. A booking no call spends returns to
+the allowance five seconds after it was due. Waits a refund could shorten
+stay in the gate, where headers and usage wake them.
 
 Screen, 2026-10-28, Linux x86_64 container, pacer 4/5's head against this
 change. RAM (`waitram.py`): Anthropic bots with 58 KB prompts and an input
