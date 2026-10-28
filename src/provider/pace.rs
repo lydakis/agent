@@ -98,7 +98,14 @@ struct State {
     reserved_requests: u64,
     /// Calls answered and overloads refused since the window began.
     overloads: Overloads,
+    /// Output tokens the pool's latest calls reported, oldest first.
+    outputs: std::collections::VecDeque<u32>,
 }
+
+/// The output estimate follows this many of the latest calls, once it has
+/// `OUTPUT_KNOWN` of them.
+const OUTPUT_SAMPLES: usize = 32;
+const OUTPUT_KNOWN: usize = 8;
 
 /// Overload refusals that name no delay close the pool only when they
 /// cluster: this many within one window, a quarter or more of its answers.
@@ -159,6 +166,15 @@ impl Reservation<'_> {
     }
     /// Final accounting by what the provider reported billing.
     pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost) {
+        if let Some(usage) = usage {
+            let mut state = self.pace.state.lock().unwrap();
+            if state.outputs.len() == OUTPUT_SAMPLES {
+                state.outputs.pop_front();
+            }
+            state
+                .outputs
+                .push_back(u32::try_from(usage.output_tokens).unwrap_or(u32::MAX));
+        }
         self.settle_cost(usage.map_or(estimate, |u| Cost {
             input: u.input_tokens,
             output: u.output_tokens,
@@ -383,6 +399,21 @@ impl Pace {
         // Wake the FIFO head even when it was waiting for allowance refill.
         // It parks and releases the gate; queued callers then observe the block.
         self.changed.notify_one();
+    }
+    /// What a call of this pool is likely to write, for a provider that
+    /// counts output as it is written: the 90th percentile of the latest
+    /// calls' output, at most `cap`, or `unknown` until enough have
+    /// reported. A call that writes more is charged the rest when it settles.
+    pub fn output_estimate(&self, unknown: u64, cap: u64) -> u64 {
+        let state = self.state.lock().unwrap();
+        if state.outputs.len() < OUTPUT_KNOWN {
+            return unknown;
+        }
+        let mut seen: Vec<u32> = state.outputs.iter().copied().collect();
+        drop(state);
+        let at = (seen.len() * 9).div_ceil(10) - 1;
+        let (_, p90, _) = seen.select_nth_unstable(at);
+        u64::from(*p90).min(cap)
     }
     /// A call completed: the next unnamed refusal starts again at a second.
     pub fn accepted(&self) {
@@ -633,6 +664,38 @@ mod tests {
         .expect("unknown capacity must not impose an admission cap");
         assert!(held.iter().all(|r| r.waited.is_zero()));
         assert_eq!(pace.state.lock().unwrap().reserved_requests, 128);
+    }
+
+    #[tokio::test]
+    async fn the_output_estimate_follows_what_calls_wrote() {
+        async fn wrote(pace: &Pace, calls: usize, output: u64) {
+            for _ in 0..calls {
+                let usage = Usage {
+                    input_tokens: 1,
+                    output_tokens: output,
+                    ..Usage::default()
+                };
+                sent(pace, 2)
+                    .await
+                    .unwrap()
+                    .settle_usage(Some(&usage), Cost::default());
+            }
+        }
+        let pace = Pace::default();
+        // Until eight calls report, a call reserves what it did before.
+        wrote(&pace, 7, 100).await;
+        assert_eq!(pace.output_estimate(512, 4096), 512);
+        wrote(&pace, 1, 100).await;
+        assert_eq!(pace.output_estimate(512, 4096), 100);
+        // The 90th percentile of the latest 32: three long replies in 32
+        // still leave it at the short ones; a fourth moves it.
+        wrote(&pace, 21, 100).await;
+        wrote(&pace, 3, 3000).await;
+        assert_eq!(pace.output_estimate(512, 4096), 100);
+        wrote(&pace, 1, 3000).await;
+        assert_eq!(pace.output_estimate(512, 4096), 3000);
+        // Never above the cap the call asks for.
+        assert_eq!(pace.output_estimate(512, 1000), 1000);
     }
 
     #[tokio::test(start_paused = true)]

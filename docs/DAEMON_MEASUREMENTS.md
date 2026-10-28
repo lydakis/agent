@@ -5362,3 +5362,50 @@ five. Medians, ranges in brackets.
 
 Every difference is inside the run-to-run range: three integers more in a
 pool's state, updated under its existing lock, cost nothing measurable.
+
+## Anthropic output reservations follow what calls wrote
+
+Anthropic counts output tokens as they are written; `max_tokens` does not
+count. A Messages call reserved `--max-output-tokens` (or 512 when unset)
+against the output limit whatever its model's calls wrote, so a large cap
+throttled the pool far below the provider's limit. A call now reserves the
+90th percentile of the output its model's latest 32 calls wrote, at most the
+`max_tokens` it sends, once eight have reported. OpenAI counts the cap, so
+Responses calls reserve it as before.
+
+Screen, 2026-10-28, Linux x86_64 container (`otpm.py`): 64 Anthropic bots
+resubmitting as each turn ends, a local fixture answering after 200 ms that
+keeps a continuously refilled output bucket, counts each reply's tokens when
+written, refuses with 429 and `retry-after` while the bucket is spent, and
+publishes `anthropic-ratelimit-output-tokens-*`. 5 s warmup, measured window
+as listed. Pacer 1/5's head (`669233a`) against this change.
+
+| Case | Window | Before: turns/s | 429s | After: turns/s | 429s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 60-token replies, 60k/min, no cap set (two runs) | 30 s | 15.3, 15.3 | 19, 12 | 15.7, 15.2 | 21, 21 |
+| 60-token replies, 60k/min, cap 16,000 | 15 s | 4.5 | 0 | 19.3 | 1 |
+| 2,000-token replies, 600k/min, no cap set | 30 s | 4.3 | 5 | 4.3 | 4 |
+
+The provider allows 16.7 and 5 turns/s in these cases. With a cap set, the
+old reservation held the pool to about a quarter of that; now it reaches the
+limit. Without one, 512 was already close enough, and settling each call
+by its usage corrects a long reply either way. No turn failed.
+
+Hot-path screen, in the same alternating run as the overload change's:
+that change (`main` with it) against this one.
+
+| Measure | Before | This change |
+| --- | ---: | ---: |
+| Idle RSS, MiB | 18.65 (18.61–18.77) | 18.50 (18.44–18.76) |
+| Per idle bot, KiB | 1.14 (1.02–1.15) | 1.18 (1.03–1.21) |
+| After one turn each, MiB | 27.73 (27.57–27.89) | 27.13 (26.62–27.89) |
+| CPU per turn, one each, ms | 1.55 (1.48–1.67) | 1.44 (1.35–1.65) |
+| Lifecycle CPU, s | 1.38 (1.35–1.43) | 1.29 (1.26–1.38) |
+| Lifecycle p95 turn, ms | 595 (589–603) | 593 (586–605) |
+| Lifecycle peak RSS, MiB | 24.49 (24.37–24.67) | 24.45 (24.02–24.58) |
+| Completion burst p99, ms | 15.2 (13.5–18.8) | 17.2 (15.1–20.3) |
+| Admission burst, last submit reply, ms | 9.5 (6.8–13.2) | 7.9 (6.9–10.9) |
+| Lone submit CPU, ms per 32 | 49.6 (44.0–60.8) | 51.9 (44.4–58.9) |
+
+Every difference is inside the run-to-run range; the estimate is one
+selection over 32 samples a call.

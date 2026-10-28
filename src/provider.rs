@@ -1004,7 +1004,16 @@ impl Provider {
         let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
             input: ((prefix.len() + request.items.weight) / 4) as u64,
-            output: u64::from(self.max_output_tokens.unwrap_or(512)),
+            // Anthropic counts output as it is written, not the cap a
+            // request asks for: reserve what this model's calls have been
+            // writing. OpenAI counts the cap, so it is reserved whole.
+            output: match self.family {
+                Family::Anthropic => pace.output_estimate(
+                    u64::from(self.max_output_tokens.unwrap_or(512)),
+                    u64::from(self.anthropic_max_tokens(request.model)),
+                ),
+                Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
+            },
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
