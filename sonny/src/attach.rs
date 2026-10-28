@@ -38,6 +38,20 @@ fn media_type(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// `pictures` as `submit` takes them; nothing for none.
+pub fn submitted(pictures: &[Picture]) -> Option<serde_json::Value> {
+    use base64::Engine;
+    (!pictures.is_empty()).then(|| {
+        pictures
+            .iter()
+            .map(|picture| {
+                serde_json::json!({"media_type": picture.media_type,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&picture.data)})
+            })
+            .collect()
+    })
+}
+
 /// The image files a paste names, when every word of it is one that is
 /// there: what a terminal pastes for files dropped on it, with spaces
 /// escaped or quoted, or as `file://` addresses.

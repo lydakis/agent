@@ -1,6 +1,7 @@
 """Pictures sent with a prompt: validated on submit, after the words in the user item."""
 import base64
 import os
+import sqlite3
 import struct
 import unittest
 import zlib
@@ -55,6 +56,13 @@ class ImageTests(ModelFixture):
         read = node_item(client, 'Bob', node)['result']
         self.assertEqual(read['content'][1], {'type': 'input_image', 'image_url': 'data:image/png;base64,',
                                               'omitted_bytes': len(shot['data'])})
+        # The node keeps the pictures; the turns keep only their digest,
+        # which a retry with the same ones matches.
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            kept = [row[0] for row in db.execute('SELECT images FROM turns WHERE id IN (?,?)', (first, steer))]
+        self.assertTrue(all(len(digest) == 64 and not digest.startswith('[') for digest in kept), kept)
+        again = client.request('submit', bot='Bob', request_id='a', prompt='slow', images=[shot])
+        self.assertEqual(again['result']['turn'], first)
         # A retry must carry the same pictures.
         retried = client.request('submit', bot='Bob', request_id='a', prompt='slow', images=[])
         self.assertEqual(retried['error'], 'idempotency_conflict')

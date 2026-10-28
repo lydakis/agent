@@ -3883,6 +3883,7 @@ impl Database {
         // Compact provider whitespace in this view only: each item must occupy
         // one JSONL record even when its original response spans multiple lines.
         // Already single-line items need no rewrite (escaped newlines are fine).
+        // Pictures go without their bytes, as other history reads return them.
         const READING_ITEM: &str = "CASE
             WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
              AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
@@ -3890,12 +3891,10 @@ impl Database {
             WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
             ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length(CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user'
-                THEN {PICTURELESS} ELSE {READING_ITEM} END) FROM nodes WHERE id=?"
+            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr(CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user'
-                THEN {PICTURELESS} ELSE {READING_ITEM} END,?,?) FROM nodes WHERE id=?"
+            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -4030,7 +4029,15 @@ impl Database {
         if deleting {
             return fail_with("bot_not_found", format!("{name} is being deleted"));
         }
-        let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
+        type Prior = (
+            i64,
+            String,
+            String,
+            TurnOptions,
+            Option<i64>,
+            Option<String>,
+        );
+        let prior: Option<Prior> = self
             .conn
             .query_row(
                 "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images
@@ -4053,14 +4060,16 @@ impl Database {
                             },
                             origin: r.get(10)?,
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
-                            images: images_from(r.get(13)?)?,
+                            // Checked by their digest below.
+                            images: Vec::new(),
                         },
                         r.get(7)?,
+                        r.get(13)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((turn, mut saved, status, saved_options, prompt_node)) = prior {
+        if let Some((turn, mut saved, status, saved_options, prompt_node, saved_images)) = prior {
             if let Some(node) = prompt_node {
                 saved = self.conn.prepare_cached(
                     "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
@@ -4085,8 +4094,9 @@ impl Database {
                 from,
                 origin,
                 budget_tokens,
-                images,
+                images: _,
             } = &saved_options;
+            let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
                 ("prompt", saved != prompt),
                 ("workspace", *workspace != same.workspace),
@@ -4097,7 +4107,10 @@ impl Database {
                 ("from", *from != same.from),
                 ("origin", *origin != same.origin),
                 ("budget_tokens", *budget_tokens != same.budget_tokens),
-                ("images", *images != same.images),
+                (
+                    "images",
+                    images != stored_images(&same.images)?.map(|json| pictures_digest(&json)),
+                ),
             ]
             .into_iter()
             .find_map(|(field, differs)| differs.then_some(field));
@@ -4271,7 +4284,7 @@ impl Database {
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64),
-                (!options.images.is_empty()).then(|| serde_json::to_string(&options.images)).transpose()?],
+                stored_images(&options.images)?],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -4536,7 +4549,10 @@ impl Database {
         };
         // Id, item, prompt bytes, and whether it was attached, which no
         // pending count holds.
-        let mut steers: Vec<(i64, Vec<u8>, usize, bool)> = Vec::new();
+        // Each steer's id, item, prompt size, whether it was attached, and
+        // its pictures' JSON.
+        type Steer = (i64, Vec<u8>, usize, bool, Option<String>);
+        let mut steers: Vec<Steer> = Vec::new();
         let mut more = false;
         let mut capped = false;
         {
@@ -4576,15 +4592,16 @@ impl Database {
                     break;
                 }
                 bytes += size;
-                let item =
-                    family.user_item_with(&row.get::<_, String>(1)?, &images_from(row.get(5)?)?)?;
+                let images: Option<String> = row.get(5)?;
+                let item = family
+                    .user_item_with(&row.get::<_, String>(1)?, &images_from(images.as_deref())?)?;
                 if item.len() + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
                 }
                 room_bytes -= item.len() + 1;
                 room_items -= 1;
-                steers.push((row.get(0)?, item, size, row.get(4)?));
+                steers.push((row.get(0)?, item, size, row.get(4)?, images));
             }
         }
         let mut absorbed = Absorbed {
@@ -4602,9 +4619,10 @@ impl Database {
         let mut steered = Vec::with_capacity(steers.len());
         // Preserve the submitted effort for exact retries; only omitted effort
         // needs a separate execution value when the running turn overrides it.
-        for (steer, item, size, was_attached) in steers {
+        for (steer, item, size, was_attached, images) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
+            keep_once(&tx, steer, images.as_deref())?;
             if size >= PROMPT_SHARE_BYTES {
                 tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
                     (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
@@ -7384,13 +7402,12 @@ impl Database {
         let maximum = crate::output::MAX_EVENT - 1024;
         // Check the encoded blob length in SQLite before allocating it. An
         // unrenderable item gets its own error; adjacent items remain readable.
-        // A prompt another bot's turn or a named client sent says so. A
-        // person's prompt is read whole, bounded by what submit takes, as
-        // its pictures are left out below.
+        // A prompt another bot's turn or a named client sent says so. The
+        // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
-            "SELECT CASE WHEN length(item)<=?2 OR json_extract(CAST(item AS TEXT),'$.role')='user'
-                THEN {PICTURELESS} END,s.bot,s.turn,s.bot_id,s.origin
-             FROM nodes n LEFT JOIN senders s ON s.node=n.id WHERE n.id=?1"
+            "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
+             FROM (SELECT id,{PICTURELESS} AS item FROM nodes WHERE id=?1) n
+             LEFT JOIN senders s ON s.node=n.id"
         ))?;
         for &node in wanted {
             type Row = (
@@ -8192,8 +8209,9 @@ fn start_locked(
         .query_row([turn], |r| r.get(0))?;
     let item = bot
         .family()?
-        .user_item_with(prompt, &images_from(images)?)?;
+        .user_item_with(prompt, &images_from(images.as_deref())?)?;
     let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
+    keep_once(tx, turn, images.as_deref())?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
     if prompt.len() >= PROMPT_SHARE_BYTES {
@@ -8216,12 +8234,37 @@ fn start_locked(
 }
 /// The pictures a turn's prompt was sent with, as its `images` column
 /// keeps them.
-fn images_from(json: Option<String>) -> rusqlite::Result<Vec<crate::codec::Image>> {
+fn images_from(json: Option<&str>) -> rusqlite::Result<Vec<crate::codec::Image>> {
     json.map_or(Ok(Vec::new()), |json| {
-        serde_json::from_str(&json).map_err(|e| {
+        serde_json::from_str(json).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })
     })
+}
+/// The `images` column for a turn's pictures: their JSON, or nothing for
+/// none.
+fn stored_images(images: &[crate::codec::Image]) -> Result<Option<String>> {
+    Ok((!images.is_empty())
+        .then(|| serde_json::to_string(images))
+        .transpose()?)
+}
+/// What a retry's pictures are checked against: the SHA-256 of their JSON,
+/// as `keep_once` leaves it in place of the JSON.
+fn pictures_digest(kept: &str) -> String {
+    if !kept.starts_with('[') {
+        return kept.to_owned();
+    }
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, kept.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+/// Once a turn's prompt is a node, its pictures live there: the turn keeps
+/// only their digest, for a retry to be checked against.
+fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
+    if let Some(json) = images.filter(|json| json.starts_with('[')) {
+        tx.prepare_cached("UPDATE turns SET images=? WHERE id=?")?
+            .execute(params![pictures_digest(json), turn])?;
+    }
+    Ok(())
 }
 /// SQL for `item`, a node's item, as history reads return it: a user
 /// item's pictures without their bytes, each counted in `omitted_bytes`

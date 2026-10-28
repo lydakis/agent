@@ -3817,7 +3817,7 @@ impl App {
                         if self.input.is_empty() {
                             self.quit = true;
                         } else {
-                            self.input.clear();
+                            self.discard();
                         }
                     }
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
@@ -3892,7 +3892,7 @@ impl App {
                             if self.input.is_empty() {
                                 self.quit = true;
                             } else {
-                                self.input.clear();
+                                self.discard();
                             }
                         } else if !self.asks.is_empty() {
                             self.chatting = !self.chatting;
@@ -4137,8 +4137,10 @@ impl App {
             .strip_prefix("/side")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
+            let pictures = self.placed(question);
             self.input.clear();
-            self.side(question.trim().to_owned()).await;
+            self.pictures.clear();
+            self.side(question.trim().to_owned(), &pictures).await;
             return;
         }
         // What is typed answers the lead's first open question, and goes
@@ -4171,11 +4173,7 @@ impl App {
             self.unsent.remove(0);
             join = true;
         }
-        // The pictures whose placeholders are still in the message go with it.
-        let pictures: Vec<attach::Picture> = (self.pictures.iter().enumerate())
-            .filter(|(at, _)| prompt.contains(&attach::placeholder(at + 1)))
-            .map(|(_, picture)| picture.clone())
-            .collect();
+        let pictures = self.placed(&prompt);
         match self.send(prompt, None, join, &pictures).await {
             Ok(()) => {
                 self.input.clear();
@@ -4193,6 +4191,21 @@ impl App {
             }
             Err(error) => self.notice = Some(error),
         }
+    }
+
+    /// Drop what is being written, with the pictures it was given.
+    fn discard(&mut self) {
+        self.input.clear();
+        self.pictures.clear();
+    }
+
+    /// The pictures whose placeholders are still in `prompt`, which go
+    /// with it.
+    fn placed(&self, prompt: &str) -> Vec<attach::Picture> {
+        (self.pictures.iter().enumerate())
+            .filter(|(at, _)| prompt.contains(&attach::placeholder(at + 1)))
+            .map(|(_, picture)| picture.clone())
+            .collect()
     }
 
     /// Send `prompt`: a turn of its own, or a steer of the running one (or
@@ -4214,21 +4227,13 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = delivery.is_none().then(|| self.move_to.clone()).flatten();
-        use base64::Engine;
-        let images: Vec<Value> = pictures
-            .iter()
-            .map(|picture| {
-                json!({"media_type": picture.media_type,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&picture.data)})
-            })
-            .collect();
         let reply = self
             .client
             .request(
                 "submit",
                 json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
                     "delivery": delivery, "model": model, "workspace": workspace,
-                    "origin": origin, "images": (!images.is_empty()).then_some(images)}),
+                    "origin": origin, "images": attach::submitted(pictures)}),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -4412,7 +4417,7 @@ impl App {
     /// screen. The copy may call no tool, so it answers from what the bot
     /// knows; the daemon deletes it once it has been idle a quarter hour.
     /// This bot carries on, and its lines wait for the main screen.
-    async fn side(&mut self, question: String) {
+    async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
@@ -4444,7 +4449,8 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "model": self.turn_model}),
+                        "prompt": question, "model": self.turn_model,
+                        "images": attach::submitted(pictures)}),
                 )
                 .await
         {
@@ -6194,6 +6200,31 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn pictures_go_with_their_placeholders_and_a_discarded_draft_drops_them() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let picture = |n| attach::Picture {
+            media_type: "image/png",
+            data: vec![n],
+        };
+        app.attach(Ok(picture(1)));
+        app.key(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert!(app.input.is_empty() && app.pictures.is_empty());
+        app.attach(Ok(picture(1)));
+        app.attach(Ok(picture(2)));
+        app.input.set("only [Image #2] now");
+        assert_eq!(app.placed(&app.input), [picture(2)]);
+        assert_eq!(
+            attach::submitted(&app.placed(&app.input)),
+            Some(json!([{"media_type": "image/png", "data": "Ag=="}]))
+        );
+        assert_eq!(attach::submitted(&[]), None);
     }
 
     #[tokio::test]
