@@ -266,6 +266,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
             &Outcome {
                 output: "preview".into(),
                 artifacts: vec![("stdout", data.as_bytes().to_vec())],
+                images: Vec::new(),
                 note: None,
                 failed: false,
             },

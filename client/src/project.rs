@@ -17,9 +17,9 @@ const KEYS: [&str; 8] = [
     "name",
     "coordinator",
     "model",
-    "reasoning",
+    "effort",
     "threads_model",
-    "threads_reasoning",
+    "threads_effort",
     "threads_in",
     "subfolders",
 ];
@@ -98,8 +98,8 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         let name = default_name(dir);
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
-            "model": null, "reasoning": null, "threads_model": null,
-            "threads_reasoning": null, "threads_in": "worktree", "subfolders": "own",
+            "model": null, "effort": null, "threads_model": null,
+            "threads_effort": null, "threads_in": "worktree", "subfolders": "own",
             "file": false,
         }));
     };
@@ -107,7 +107,13 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         .parse()
         .map_err(|e: toml::de::Error| invalid(e.message()))?;
     if let Some(key) = table.keys().find(|key| !KEYS.contains(&key.as_str())) {
-        return Err(invalid(&format!("unknown key {key}")));
+        return Err(invalid(&match key.as_str() {
+            "reasoning" => "unknown key reasoning: it is called effort now".to_owned(),
+            "threads_reasoning" => {
+                "unknown key threads_reasoning: it is called threads_effort now".to_owned()
+            }
+            _ => format!("unknown key {key}"),
+        }));
     }
     let field = |key: &str| match table.get(key) {
         None => Ok(None),
@@ -134,14 +140,11 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         }
         Ok(value)
     };
-    let (reasoning, threads_model, threads_reasoning) = (
-        said("reasoning")?,
+    let (effort, threads_model, threads_effort) = (
+        said("effort")?,
         said("threads_model")?,
-        said("threads_reasoning")?,
+        said("threads_effort")?,
     );
-    if threads_reasoning.is_some() && threads_model.is_none() {
-        return Err(invalid("threads_reasoning goes with threads_model"));
-    }
     let threads_in = field("threads_in")?.unwrap_or_else(|| "worktree".into());
     if !THREADS_IN.contains(&threads_in.as_str()) {
         return Err(invalid("threads_in must be \"worktree\" or \"project\""));
@@ -152,34 +155,17 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     }
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model,
-        "reasoning": reasoning, "threads_model": threads_model,
-        "threads_reasoning": threads_reasoning, "threads_in": threads_in,
+        "effort": effort, "threads_model": threads_model,
+        "threads_effort": threads_effort, "threads_in": threads_in,
         "subfolders": subfolders, "file": true,
     }))
 }
 
-/// A project's task settings, said to its coordinator as the flags its
-/// starts take. The model is always named, so a role a task starts in
-/// (--profile) cannot swap it: the one picked, else the lead's own, which
-/// its shell holds as AGENT_MODEL (and its effort as AGENT_EFFORT). A
-/// picked model goes in quoted, since a model id may hold characters a
-/// shell would act on. `copies` is one of `COPIES`.
-pub fn tasks_rule(
-    model: Option<&str>,
-    effort: Option<&str>,
-    in_project: bool,
-    copies: &str,
-) -> String {
-    let quote = |v: &str| format!("'{}'", v.replace('\'', r"'\''"));
-    let flags = match model {
-        Some(model) => format!(
-            "--model {}{}",
-            quote(model),
-            effort.map_or(String::new(), |e| format!(" --effort {}", quote(e)))
-        ),
-        None => r#"--model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}"#.into(),
-    };
-    let place = match (in_project, copies) {
+/// Where a project's tasks work, as its coordinator is told it; the client
+/// that starts them picks their model and effort from the file. `copies` is
+/// one of `COPIES`.
+pub fn tasks_rule(in_project: bool, copies: &str) -> String {
+    match (in_project, copies) {
         (true, _) => "Every task works in this folder, with no worktree of its own.",
         (false, "sandfs") => {
             "Every task works in its own sandfs copy, git repository or not, so tasks do not collide: only you work in this folder."
@@ -187,28 +173,21 @@ pub fn tasks_rule(
         (false, _) => {
             "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."
         }
-    };
-    format!(
-        "This project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with {flags}. {place}"
-    )
+    }
+    .to_owned()
 }
 
 /// The task rule a project's file sets, with the client's `copies`, as
 /// its coordinator is told it.
 pub fn rule(info: &Value, copies: &str) -> String {
-    tasks_rule(
-        info["threads_model"].as_str(),
-        info["threads_reasoning"].as_str(),
-        info["threads_in"] == "project",
-        copies,
-    )
+    tasks_rule(info["threads_in"] == "project", copies)
 }
 
 /// What a new project's threads run on and where they work.
 #[derive(Debug, Default)]
 pub struct Threads<'a> {
     pub model: Option<&'a str>,
-    pub reasoning: Option<&'a str>,
+    pub effort: Option<&'a str>,
     pub in_project: bool,
 }
 
@@ -218,7 +197,7 @@ pub fn write(
     dir: &Path,
     name: &str,
     model: &str,
-    reasoning: Option<&str>,
+    effort: Option<&str>,
     threads: &Threads,
 ) -> Result<(), String> {
     if !valid_name(name) {
@@ -235,14 +214,14 @@ pub fn write(
     fn some(value: Option<&str>) -> Option<&str> {
         value.filter(|v| !v.is_empty())
     }
-    if let Some(level) = some(reasoning) {
-        text.push_str(&format!("reasoning = {}\n", quote(level)));
+    if let Some(level) = some(effort) {
+        text.push_str(&format!("effort = {}\n", quote(level)));
     }
     if let Some(model) = some(threads.model) {
         text.push_str(&format!("threads_model = {}\n", quote(model)));
-        if let Some(level) = some(threads.reasoning) {
-            text.push_str(&format!("threads_reasoning = {}\n", quote(level)));
-        }
+    }
+    if let Some(level) = some(threads.effort) {
+        text.push_str(&format!("threads_effort = {}\n", quote(level)));
     }
     text.push_str(&format!(
         "threads_in = {}\n",
@@ -300,9 +279,10 @@ fn place_new(
 }
 
 /// What a project's creator asked for: the coordinator's model and effort,
-/// and its threads' picks (none: the coordinator picks their model, and
-/// they get worktrees). A folder whose file names a model keeps the file's
-/// settings instead, and the picks are not used.
+/// and its threads' picks (none: they run as the client starting them
+/// says, in worktrees). A folder whose file names a model keeps the file's
+/// settings instead, and the picks are not used, except an effort the file
+/// does not name.
 #[derive(Debug, Default)]
 pub struct Picks {
     pub model: Option<String>,
@@ -390,21 +370,14 @@ pub async fn create(
         picks.model.as_deref().or(policy["model"].as_str())
     }
     .ok_or("model_required: choose a model")?;
-    let effort = if kept {
-        info["reasoning"].as_str()
-    } else {
-        picks.effort.as_deref()
+    // A kept file that names no effort takes the picked one.
+    let effort = match kept {
+        true => info["effort"].as_str().or(picks.effort.as_deref()),
+        false => picks.effort.as_deref(),
     };
-    let rule = if file {
-        rule(&info, copies)
-    } else {
-        let t = picks.threads.as_ref();
-        tasks_rule(
-            t.and_then(|t| t.model.as_deref()),
-            t.and_then(|t| t.effort.as_deref()),
-            t.is_some_and(|t| t.in_project),
-            copies,
-        )
+    let rule = match file {
+        true => rule(&info, copies),
+        false => tasks_rule(picks.threads.as_ref().is_some_and(|t| t.in_project), copies),
     };
     let mut instructions = format!(
         "{}\n\n{rule}",
@@ -447,7 +420,7 @@ pub async fn create(
             effort,
             &Threads {
                 model: t.and_then(|t| t.model.as_deref()),
-                reasoning: t.and_then(|t| t.effort.as_deref()),
+                effort: t.and_then(|t| t.effort.as_deref()),
                 in_project: t.is_some_and(|t| t.in_project),
             },
         )?;
@@ -466,8 +439,7 @@ mod tests {
 
     #[test]
     fn the_rule_says_how_tasks_get_their_copies() {
-        let info =
-            json!({"threads_model": null, "threads_reasoning": null, "threads_in": "worktree"});
+        let info = json!({"threads_in": "worktree"});
         assert!(
             rule(&info, "worktree")
                 .ends_with("every task works in its own worktree, so tasks do not collide: only you work in this folder.")
@@ -475,8 +447,7 @@ mod tests {
         assert!(rule(&info, "sandfs").ends_with(
             "Every task works in its own sandfs copy, git repository or not, so tasks do not collide: only you work in this folder."
         ));
-        let shared =
-            json!({"threads_model": null, "threads_reasoning": null, "threads_in": "project"});
+        let shared = json!({"threads_in": "project"});
         assert!(
             rule(&shared, "sandfs")
                 .ends_with("Every task works in this folder, with no worktree of its own.")
@@ -583,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             create["instructions"],
-            "rules\n\nThis project's tasks, as the person set them up: start every new task, in a role (--profile) or not, with --model 'beta/it'\\''s' --effort 'low'. Every task works in this folder, with no worktree of its own."
+            "rules\n\nEvery task works in this folder, with no worktree of its own."
         );
         assert_eq!(
             (&create["tools"], &create["compaction_instructions"]),
@@ -593,14 +564,16 @@ mod tests {
         assert_eq!(
             (
                 &file["model"],
-                &file["reasoning"],
+                &file["effort"],
                 &file["threads_model"],
+                &file["threads_effort"],
                 &file["threads_in"]
             ),
             (
                 &json!("alpha/one"),
                 &json!("high"),
                 &json!("beta/it's"),
+                &json!("low"),
                 &json!("project")
             )
         );
@@ -683,7 +656,7 @@ mod tests {
             !dir.join(FILE).exists(),
             "a model the daemon refuses is not saved"
         );
-        // The role's model, when nothing is picked; its threads: the lead's own, in worktrees.
+        // The role's model, when nothing is picked; its threads in worktrees.
         let made = make(
             &daemon,
             &dir,
@@ -703,7 +676,7 @@ mod tests {
             create.get("effort").is_none(),
             "no effort picked sends none"
         );
-        assert!(create["instructions"].as_str().unwrap().ends_with(r#"with --model "$AGENT_MODEL" ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"}. When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."#));
+        assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."));
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -717,7 +690,7 @@ mod tests {
             Some("low"),
             &Threads {
                 model: Some("beta/two"),
-                reasoning: None,
+                effort: None,
                 in_project: false,
             },
         )
@@ -739,11 +712,15 @@ mod tests {
             (&create["bot"], &create["model"], &create["effort"]),
             (&json!("demo.lead"), &json!("alpha/one"), &json!("low"))
         );
-        assert!(
-            create["instructions"]
-                .as_str()
-                .unwrap()
-                .contains("with --model 'beta/two'. When this folder")
+        // A kept file that names no effort takes the picked one.
+        let dir = root("kept-effort");
+        write(&dir, "plain", "alpha/one", None, &Threads::default()).unwrap();
+        let daemon = Fake::default();
+        make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();
+        let calls = daemon.calls.lock().unwrap().clone();
+        assert_eq!(
+            (&calls[1].1["model"], &calls[1].1["effort"]),
+            (&json!("alpha/one"), &json!("max"))
         );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
@@ -763,7 +740,7 @@ mod tests {
         let dir = root("write");
         let threads = Threads {
             model: Some("beta/two"),
-            reasoning: Some("low"),
+            effort: Some("low"),
             in_project: true,
         };
         write(&dir, "demo", "alpha/one", Some("high"), &threads).unwrap();
@@ -774,11 +751,11 @@ mod tests {
         assert_eq!(project["name"], "demo");
         assert_eq!(project["coordinator"], "demo.lead");
         assert_eq!(project["model"], "alpha/one");
-        assert_eq!(project["reasoning"], "high");
+        assert_eq!(project["effort"], "high");
         assert_eq!(
             (
                 &project["threads_model"],
-                &project["threads_reasoning"],
+                &project["threads_effort"],
                 &project["threads_in"]
             ),
             (&json!("beta/two"), &json!("low"), &json!("project"))
@@ -800,9 +777,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "synthetic disk full");
         assert!(!path.exists(), "no partial project file");
-        // No threads' model: the coordinator picks, and they get worktrees.
+        // A threads' effort needs no threads' model: theirs is the lead's.
         let alone = Threads {
-            reasoning: Some("high"),
+            effort: Some("high"),
             ..Threads::default()
         };
         write(&dir, "demo", "alpha/one", None, &alone).unwrap();
@@ -810,16 +787,16 @@ mod tests {
         assert_eq!(
             (
                 &project["name"],
-                &project["reasoning"],
+                &project["effort"],
                 &project["threads_model"],
-                &project["threads_reasoning"],
+                &project["threads_effort"],
                 &project["threads_in"]
             ),
             (
                 &json!("demo"),
                 &Value::Null,
                 &Value::Null,
-                &Value::Null,
+                &json!("high"),
                 &json!("worktree")
             )
         );
@@ -841,8 +818,8 @@ mod tests {
             "name = 7",
             "name = \"demo\"\ncoordinator = \"other.lead\"",
             "name = \"demo\"\nthreads_in = \"elsewhere\"",
+            "name = \"demo\"\nthreads_effort = \"\"",
             "name = \"demo\"\nsubfolders = \"mine\"",
-            "name = \"demo\"\nthreads_reasoning = \"low\"",
             "name = \"demo\"\nthreads_model = \"\"",
         ] {
             std::fs::write(dir.join(FILE), text).unwrap();
@@ -864,11 +841,18 @@ mod tests {
         assert!(error.ends_with("unknown key role"), "{error}");
         std::fs::write(dir.join(FILE), "name = \"demo\"\nmodel = \"\"\n").unwrap();
         assert!(read(&dir).unwrap_err().ends_with("model must not be empty"));
-        std::fs::write(dir.join(FILE), "name = \"demo\"\nreasoning = \"\"\n").unwrap();
+        std::fs::write(dir.join(FILE), "name = \"demo\"\neffort = \"\"\n").unwrap();
         assert!(
             read(&dir)
                 .unwrap_err()
-                .ends_with("reasoning must not be empty")
+                .ends_with("effort must not be empty")
+        );
+        // The key effort had before says its new name.
+        std::fs::write(dir.join(FILE), "name = \"demo\"\nreasoning = \"high\"\n").unwrap();
+        assert!(
+            read(&dir)
+                .unwrap_err()
+                .ends_with("unknown key reasoning: it is called effort now")
         );
         std::fs::write(
             dir.join(FILE),

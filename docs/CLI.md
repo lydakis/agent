@@ -76,6 +76,9 @@ identity is `bot_not_found`.
   `turn_budget_exhausted` before a call once it has spent N; the cap is
   the turn's own, so the next turn starts from zero. A steer joins a turn
   that already has its cap, so `steer` with the flag is `invalid_delivery`.
+- `run --image PATH` sends a PNG, JPEG, GIF or WebP with the prompt, after
+  its words; repeat it for more (up to 20, 5 MiB together). It goes with a
+  steer or a turn of its own alike.
 - `run --workspace DIR` chooses the folder. A new bot starts in it, or in
   the directory `run` was invoked from. A bot keeps its folder: a later
   `run` without the flag runs there wherever it is invoked, and one with it
@@ -114,10 +117,11 @@ identity is `bot_not_found`.
   [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `AGENT_JUDGE`, else `AGENT_MODEL`. OpenAI's Decisions
+  `[judge] model` in `~/.agent/config.toml`, else `AGENT_MODEL`. OpenAI's Decisions
   API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
   own API, at `--judge-url` when given; any other model runs through the
-  daemon, with a tag of at most 67 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  daemon, with a tag of at most 67 bytes, and `--effort` (default
+  `[judge] effort`) sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.

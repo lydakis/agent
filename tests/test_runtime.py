@@ -324,7 +324,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
                            'arguments': '{"text":"ok"}'}]
             elif last.get('type') == 'function_call_output':
-                text = 'echo:' + last['output']
+                # A result with pictures is a list of parts: its text echoes.
+                result = last['output']
+                text = 'echo:' + (result if isinstance(result, str) else
+                                  ''.join(part.get('text', '') for part in result))
                 output = [{'id': 'msg_echo', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
             elif user.startswith('bg:') or user.startswith('bgwait:'):
@@ -346,6 +349,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                     arguments.update(offset=int(offset), limit=int(limit))
                 output = [{'type': 'function_call', 'name': 'read', 'call_id': 'readart-1',
                            'arguments': json.dumps(arguments)}]
+            elif user.startswith('readpic:') and last.get('type') != 'function_call_output':
+                text = ''
+                output = [{'type': 'function_call', 'name': 'read', 'call_id': 'readpic-1',
+                           'arguments': json.dumps({'path': user[8:]})}]
             elif user.startswith('history:') and last.get('type') != 'function_call_output':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'history', 'call_id': 'history-1',
