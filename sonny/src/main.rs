@@ -6079,10 +6079,13 @@ impl App {
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
         // The first of the text's rows shown, for the mouse to find its spot.
-        let first_row = (!self.input.is_empty()).then(|| {
-            let layout = self.input.layout(width.min(PROSE));
-            self.input.cursor(&layout).0 - cursor_row
-        });
+        let first_row = match &self.composing {
+            Some((_, (_, first, _))) => Some(*first),
+            None => (!self.input.is_empty()).then(|| {
+                let layout = self.input.layout(width.min(PROSE));
+                self.input.cursor(&layout).0 - cursor_row
+            }),
+        };
         let mut composer_at = None;
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
@@ -6580,7 +6583,16 @@ impl App {
             true => 1,
             false => COMPOSER_ROWS,
         };
-        let (rows, row) = window(rows, row, keep);
+        let (rows, row) = match &self.composing {
+            // While the mouse button is down the rows stay where the press
+            // found them, so the text under the mouse is what it selects.
+            Some((_, (_, first, _))) => {
+                let first = (*first).min(rows.len() - 1);
+                let row = row.saturating_sub(first).min(keep - 1);
+                (rows.into_iter().skip(first).take(keep).collect(), row)
+            }
+            None => window(rows, row, keep),
+        };
         (rows, (row, col))
     }
 
@@ -8272,6 +8284,20 @@ mod tests {
             app.input.cursor(&app.input.layout(40)),
             (2, prompt::LEAD + 1)
         );
+        // While dragging, the rows stay where the press found them.
+        app.composing = None;
+        app.composer_click = None;
+        app.input.home();
+        for _ in 0..2 {
+            app.input.up(40);
+        }
+        app.composer_at = Some((Rect::new(0, 10, 40, 8), 0, 40));
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD, 12)));
+        let (rows, _) = app.composer(40);
+        assert!(rows[0].to_string().ends_with("line 0"), "{}", rows[0]);
+        assert!(app.composer_mouse(&mouse(drag, prompt::LEAD + 6, 13)));
+        let line = |n: usize| lines[..n].iter().map(|l| l.len() + 1).sum::<usize>();
+        assert_eq!(app.input.selection(), Some(line(2)..line(3) + 6));
     }
 
     #[tokio::test]
