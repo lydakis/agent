@@ -29,7 +29,15 @@ skills it writes name `"…/sonny" agent` wherever they would say
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
 Sonny in its `lead` role, with the folder's
-`.agents/project.toml` written when it had none.
+`.agents/project.toml` written when it had none. Every folder can have a
+lead: outside git, the folder Sonny opens in is its own project, whatever
+project holds the folder above it. In a git repository, Sonny opens the
+nearest project in that repository, else makes the repository's top one,
+so `src` reaches the repository's lead and a task's worktree its main
+checkout's; a subfolder of a repository is its own project once it has a
+file (`sonny project add DIR`). A lead made below another project's folder
+says which lead holds the folder above. Sonny refuses to make a lead in a
+task's own folder under `~/.agent`.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`

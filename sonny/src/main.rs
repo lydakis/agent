@@ -691,6 +691,8 @@ async fn run() -> Result<(), String> {
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
     let mut moving = None;
+    // A lead made below another project's folder, and that project's lead.
+    let mut above = None;
     let (name, project) = match &options.bot {
         Some(bot) => {
             if options.new {
@@ -712,6 +714,7 @@ async fn run() -> Result<(), String> {
             let lead = project::open(&client, &dir, options.model.as_deref()).await?;
             fresh = lead.new;
             moving = lead.moving;
+            above = lead.above;
             (lead.bot, Some(lead.project))
         }
     };
@@ -781,6 +784,13 @@ async fn run() -> Result<(), String> {
         if let Some(fleet) = &app.fleet {
             app.notice = fleet.note.clone();
         }
+    }
+    if let Some(above) = above
+        && app.notice.is_none()
+    {
+        app.notice = Some(format!(
+            "a new lead for this folder; {above} leads the folder above: sonny --bot {above}"
+        ));
     }
     app.lead = project::lead(&app.options.socket, &bot);
     // Task copies a restart unmounted are mounted again before any task
@@ -868,6 +878,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
+    if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
+        asked["settings"] = json!({"cache_ttl": ttl});
+    }
     let tools = DEFAULT_TOOLS.map(String::from);
     if let Value::Object(fields) = &mut asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));

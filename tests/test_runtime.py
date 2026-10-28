@@ -160,16 +160,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             if ((user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1)
+                    or (user.startswith('outage:') and attempt <= int(user.split(':')[1]))
                     or user.startswith('limited-forever:') or (user == 'tool:limited' and attempt == 2)):
                 # Transport-level refusals: a 503 or a CDN's 520 the next
                 # attempt clears, a 429 with Retry-After (for tool:limited, on
                 # the call after the tool), or a 429 that never lifts.
                 body = json.dumps({'error': {'message': 'try later'}}).encode()
                 self.send_response(520 if user.startswith('origin:') else
-                                   503 if user.startswith(('flaky:', 'waitretry:')) else 429)
+                                   503 if user.startswith(('flaky:', 'waitretry:', 'outage:')) else 429)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
-                if not user.startswith(('flaky:', 'origin:', 'waitretry:')):
+                if not user.startswith(('flaky:', 'origin:', 'waitretry:', 'outage:')):
                     delays = getattr(self.server, 'retry_delays', ['0.05'])
                     self.send_header('Retry-After', delays[min(attempt - 1, len(delays) - 1)])
                 self.end_headers()

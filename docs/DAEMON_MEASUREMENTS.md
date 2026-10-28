@@ -5257,3 +5257,63 @@ store bytes are bimodal, about 1.4 MiB or about 5.5 MiB, depending on
 whether the WAL had been checkpointed when the run ended. Answers that come
 from another process over the socket are not measured, and neither is
 macOS.
+
+## Re-measurement since September, and the statement cache
+
+George asked on 2026-10-28 that the daemon stay fast and light as features
+land. Four release builds ran the same screens alternately on one Linux
+x86_64 container that day, synthetic provider, no spend: `0a6f2b2` (0.1.3,
+Sep 29), `1424ca7` (Oct 11), `0fb51fc` (0.4.1) and `c16210c` (main).
+`bench.footprint` is new: one stdio daemon, 1000 bots created in pipelined
+batches of 64, then one text turn each, RSS read a second after each phase.
+
+| Measure | Sep 29 | Oct 11 | 0.4.1 | main |
+| --- | ---: | ---: | ---: | ---: |
+| Idle RSS, MiB | 16.81 | 17.23 | 17.22 | 17.36 |
+| Per idle bot, KiB | 1.12 | 1.05 | 1.13 | 1.06 |
+| RSS after 1000 turns, MiB | 24.75 | 25.33 | 26.65 | 25.82 |
+| CPU per text turn, ms | 1.53 | 1.59 | 1.75 | 1.61 |
+| 32-bot socket echo, peak RSS MiB | 21.75 | 22.70 | 23.12 | 23.05 |
+| 32-bot socket echo, CPU s | 1.275 | 1.38 | 1.37 | 1.54 |
+| 32-bot socket echo, turn p95 ms | 594 | 598 | 604 | 611 |
+| 32 lone submits, daemon CPU ms | 45.2 | 49.1 | 71.2 | 66.5 |
+| 32 lone submits, reply p50 ms | 1.59 | 1.63 | 2.15 | 1.96 |
+| 64 bots, 200 ms model, turns/s | 294 | 291 | 288 | 287 |
+| Store jobs per sustained turn | 8.57 | 8.55 | 8.60 | 8.64 |
+
+Medians of 3 (footprint), 6 (lifecycle) or 10 (admission) measured runs;
+sustained throughput is two 15 s runs. Memory and store work held; the lone
+submission lost a third of its speed between Oct 11 and 0.4.1.
+
+Cause, from callgrind over `bench.admission_burst` on `1424ca7` and
+`0fb51fc`: the extra instructions are in `Database::begin`, nearly all of
+them `sqlite3Prepare` under rusqlite's `StatementCache::get`. rusqlite keeps
+16 prepared statements per connection, and the store has 144
+`prepare_cached` sites. The profile shows an admission's statements parsed
+again each time, which is what the cache does once the statements in use
+between two admissions outnumber it. Each connection now keeps 256.
+
+Matched screen, `c16210c` against this branch with the cache, retry and
+classification changes, two alternating rounds:
+
+| Measure | main | branch |
+| --- | ---: | ---: |
+| 32 lone submits, daemon CPU ms | 72.6 | 49.0 |
+| 32 lone submits, reply p50 ms | 2.28 | 1.73 |
+| 32-bot socket echo, CPU s | 1.44 | 1.265 |
+| 32-bot socket echo, peak RSS MiB | 23.3 | 23.8 |
+| 32-bot socket echo, turn p95 ms | 604 | 596 |
+| Completion burst p99 ms | 19.7 | 18.9 |
+| CPU per text turn (footprint), ms | 1.68 | 1.49 |
+| Idle RSS (footprint), MiB | 17.7 | 17.9 |
+| RSS after 1000 turns, MiB | 26.5 | 26.6 |
+
+The cache costs about half a MiB at the echo screen's peak and nothing
+visible at idle. macOS is not measured.
+
+A partial-overload screen (`overload.py`, local: 64 bots, 200 ms replies,
+a fraction of calls refused with 529 and no `Retry-After`) shows what a
+pool closed on every refusal costs: at 5 % refused, both builds fall from
+about 285 to about 20 turns/s with p50 latency near 3 s. That is the pacer
+behaving as designed today; whether one refusal should close the pool is
+left to a pacer change.

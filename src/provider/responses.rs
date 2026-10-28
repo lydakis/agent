@@ -122,12 +122,20 @@ impl State {
                         .iter()
                         .any(|error| error["code"].as_str().is_some_and(test))
                 };
+                // An overload or a server failure after the stream began is
+                // the provider's, not the request's, and is retried as Codex
+                // retries it (openai/codex e8e6a92, sse/responses_error.rs):
+                // `slow_down` as a rate limit, an overload holding the pool.
                 let code = if named(super::quota) {
                     "provider_quota_exhausted"
                 } else if named(super::plan_unavailable) {
                     "provider_plan_unavailable"
-                } else if rate_limited {
+                } else if rate_limited || named(|code| code == "slow_down") {
                     "provider_rate_limited"
+                } else if named(|code| code == "server_is_overloaded") {
+                    "provider_overloaded"
+                } else if named(|code| code == "server_error") {
+                    "provider_server_error"
                 } else {
                     "provider_incomplete"
                 };
@@ -401,5 +409,33 @@ mod tests {
             .frame(br#"{"type":"error","code":"invalid_request_error","message":"Invalid input."}"#)
             .unwrap_err();
         assert_eq!(error.code, "provider_incomplete");
+    }
+    #[test]
+    fn overloads_and_server_errors_inside_the_stream_are_the_providers() {
+        for (frame, code) in [
+            (
+                r#"{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"busy"}}}"#,
+                "provider_overloaded",
+            ),
+            (
+                r#"{"type":"error","error":{"code":"server_is_overloaded","message":"busy"}}"#,
+                "provider_overloaded",
+            ),
+            (
+                r#"{"type":"response.failed","response":{"error":{"code":"slow_down","message":"busy"}}}"#,
+                "provider_rate_limited",
+            ),
+            (
+                r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"busy"}}}"#,
+                "provider_server_error",
+            ),
+            (
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+                "provider_incomplete",
+            ),
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, code, "{frame}");
+        }
     }
 }

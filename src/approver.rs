@@ -9,7 +9,8 @@
 use agent_client::{
     Client,
     approver::{
-        self as policy, Allowed, By, Intent, Planned, Redactor, Refused, State, Verdict, Words,
+        self as policy, Allowed, By, Intent, Planned, Redactor, Refused, State, Transcript,
+        Verdict, Words,
     },
     judge::{self, Failed, Usage},
 };
@@ -59,6 +60,11 @@ const DELEGATING: usize = 64;
 /// shown: a larger one only by its size, and the call is not allowed on the
 /// judge's word alone.
 const FILE_BYTES: u64 = 48 * 1024;
+/// The most history nodes read for the transcript, newest first, and how
+/// many bodies one read asks for. Codex reads the whole conversation; past
+/// this the rest is left out, and the judge is told.
+const HISTORY_NODES: usize = 2_000;
+const HISTORY_PAGE: usize = 50;
 /// A judge fork is `approver.TAG` and the fork's suffix, and every bot
 /// name fits 128 bytes.
 const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - judge::FORK_SUFFIX;
@@ -928,6 +934,27 @@ async fn intent(
             refused: refused(&prompt["refused"]),
         })
         .collect();
+    let judged: Vec<&str> = calls
+        .iter()
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    let transcript = transcript(client, &shared.redactor, bot, &judged).await?;
+    let instructions = match &workspace {
+        Some(workspace) => {
+            let bot = client.request("inspect", json!({"bot":bot})).await?;
+            let given = bot["instructions"].as_str().unwrap_or_default().to_owned();
+            let workspace = workspace.clone();
+            tokio::task::spawn_blocking(move || {
+                agent_client::policy::given_agents_files(&workspace, &given)
+            })
+            .await
+            .map_err(|_| Unjudged::Failed)?
+            .into_iter()
+            .map(|(path, text)| (path.to_string_lossy().into_owned(), text))
+            .collect()
+        }
+        None => Vec::new(),
+    };
     Ok(Intent {
         note: shared.note.clone(),
         workspace: workspace.map(|w| w.to_string_lossy().into_owned()),
@@ -938,7 +965,72 @@ async fn intent(
         request_cut: left_out.any || left_out.newest,
         newest_cut: left_out.newest,
         earlier,
+        transcript,
+        instructions,
     })
+}
+
+/// The bot's own history the judge is shown, read newest first until the
+/// transcript is full: its messages, calls, and their outputs. The calls
+/// being judged are left to the state's own entries.
+async fn transcript(
+    client: &Client,
+    redactor: &Redactor,
+    bot: &str,
+    judged: &[&str],
+) -> std::result::Result<Transcript, Unjudged> {
+    let mut transcript = Transcript::default();
+    let mut from = Value::Null;
+    let mut read = 0;
+    'read: while read < HISTORY_NODES {
+        let page = client
+            .request(
+                "history_nodes",
+                json!({"bot":bot,"from":from,"limit":(HISTORY_NODES - read).min(400)}),
+            )
+            .await?;
+        let nodes: Vec<i64> = page["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        read += nodes.len();
+        let mut next = 0;
+        while next < nodes.len() {
+            let wanted = &nodes[next..(next + HISTORY_PAGE).min(nodes.len())];
+            let items = client
+                .request("history_items", json!({"bot":bot,"nodes":wanted}))
+                .await?;
+            let items = items["items"].as_array().cloned().unwrap_or_default();
+            // A read returns at least one item; fewer than asked when large.
+            if items.is_empty() {
+                return Err(Unjudged::Failed);
+            }
+            next += items.len();
+            for entry in &items {
+                if entry.get("error").is_some() {
+                    transcript.cut = true;
+                    continue;
+                }
+                // An item's entries newest first, as the transcript is read.
+                for said in policy::entries(&entry["item"], judged, redactor)
+                    .into_iter()
+                    .rev()
+                {
+                    if !transcript.offer(said, redactor) {
+                        break 'read;
+                    }
+                }
+            }
+        }
+        from = page["next_from"].clone();
+        if from.is_null() {
+            return Ok(transcript.finish());
+        }
+    }
+    transcript.cut = true;
+    Ok(transcript.finish())
 }
 
 /// A `prompts` read's words with the bot's message before each, its
