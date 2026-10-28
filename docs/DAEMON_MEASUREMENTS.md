@@ -5523,3 +5523,53 @@ Hot-path screen, in the same alternating run: the previous pacer change against 
 | Lone submit CPU, ms per 32 | 52.8 (40.0–61.0) | 50.3 (42.7–79.4) |
 
 Every difference is inside the run-to-run range.
+
+## Allowance refill waits park
+
+A call that had to wait for its pool's allowance to refill slept in the
+pool's gate, up to a minute at a time, holding its built request. When no
+refund from a call in flight could shorten the wait and it is 250 ms or
+more, the call now parks as a rate limit's does. It books its share of the
+allowance as it parks, so the next call parks behind it rather than at the
+same moment, and the first call to arrive once the booking is due spends it.
+A booking no call spends returns to the allowance five seconds after it was
+due. Waits a refund could shorten stay in the gate, where headers and usage
+wake them.
+
+Screen, 2026-10-28, Linux x86_64 container, pacer 4/5's head against this
+change. RAM (`waitram.py`): Anthropic bots with 58 KB prompts and an input
+allowance spent by one call, so every other bot waits for it to refill;
+daemon RSS 6 s after submitting. Throughput and CPU (`otpm.py`, as above):
+64 bots, 60-token replies, 60k output tokens a minute, 30 s measured, two
+runs each.
+
+| Case | Before | After |
+| --- | ---: | ---: |
+| RSS growth, 63 bots waiting | +13.5 MiB | +0.3 MiB |
+| RSS growth, 255 bots waiting | +54.9 MiB | +0.2 MiB |
+| Turns/s at the output limit | 15.6, 15.5 | 15.8, 15.2 |
+| Daemon CPU per turn | 5.3, 5.5 ms | 5.6, 5.6 ms |
+
+A waiting call held about 3.6 times its prompt; a parked one holds its
+durable row. Throughput stays at the provider's limit (16.7 turns/s) and CPU
+per turn within noise. The 2,000-token, 600k/min case also held at 4.3
+turns/s.
+
+Hot-path screen, in the same alternating run: the previous pacer change against this one.
+
+| Measure | Before | This change |
+| --- | ---: | ---: |
+| Idle RSS, MiB | 18.70 (18.42–18.74) | 18.64 (17.71–18.73) |
+| Per idle bot, KiB | 1.03 (1.03–1.13) | 1.15 (1.08–1.28) |
+| After one turn each, MiB | 27.46 (26.61–27.54) | 27.23 (27.15–29.01) |
+| CPU per turn, one each, ms | 1.49 (1.36–1.51) | 1.55 (1.50–1.57) |
+| Lifecycle CPU, s | 1.34 (1.26–1.45) | 1.42 (1.39–1.50) |
+| Lifecycle p95 turn, ms | 592 (584–638) | 594 (586–596) |
+| Lifecycle peak RSS, MiB | 24.51 (24.46–24.62) | 24.30 (24.15–24.51) |
+| Completion burst p99, ms | 16.8 (13.9–20.2) | 20.6 (15.9–21.4) |
+| Admission burst, last submit reply, ms | 8.2 (6.8–12.8) | 8.4 (7.0–12.8) |
+| Lone submit CPU, ms per 32 | 50.3 (42.7–79.4) | 53.7 (46.7–68.9) |
+
+Every range overlaps the other build's. The medians for completion p99 and
+lifecycle CPU are a little higher; neither bench waits on a learned limit,
+so the new path costs one look at an empty list of bookings per call.

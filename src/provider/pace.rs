@@ -103,10 +103,22 @@ struct State {
     /// Parts per million of each latest call's input that counted against the
     /// limit, oldest first, for a provider that leaves cache reads out.
     counted: std::collections::VecDeque<u32>,
+    /// Allowance set aside for calls parked until it refills.
+    booked: Vec<Booking>,
 }
 
 /// The scale of a counted-input share: parts per million.
 const SHARE: u64 = 1_000_000;
+
+/// A parked call's share of the allowance, taken when it parked so each
+/// later call parks behind it, and spent by the first call to arrive once it
+/// is due. One no call spends returns to the allowance after `BOOKING_GRACE`.
+#[derive(Debug)]
+struct Booking {
+    due: Instant,
+    costs: [u64; DIMS],
+}
+const BOOKING_GRACE: Duration = Duration::from_secs(5);
 
 /// The output and counted-input estimates follow this many of the latest
 /// calls, once they have `OUTPUT_KNOWN` of them.
@@ -144,6 +156,23 @@ fn sample(samples: &mut std::collections::VecDeque<u32>, value: u64) {
 /// cluster: this many within one window, a quarter or more of its answers.
 const OVERLOAD_CLUSTER: u32 = 3;
 const OVERLOAD_WINDOW: Duration = Duration::from_secs(2);
+
+impl State {
+    /// Return to the allowance what parked calls booked and none spent.
+    fn unbook_expired(&mut self, now: Instant) {
+        let (requests, tokens) = (&mut self.requests, &mut self.tokens);
+        self.booked.retain(|booking| {
+            let keep = booking.due + BOOKING_GRACE > now;
+            if !keep {
+                requests.give(1.0);
+                for (dim, cost) in tokens.iter_mut().zip(booking.costs) {
+                    dim.bucket.give(cost as f64);
+                }
+            }
+            keep
+        });
+    }
+}
 
 #[derive(Debug, Default)]
 struct Overloads {
@@ -307,6 +336,11 @@ impl Bucket {
             self.available -= cost;
         }
     }
+    fn give(&mut self, cost: f64) {
+        if let Some(limit) = self.per_minute {
+            self.available = (self.available + cost).min(limit);
+        }
+    }
 }
 
 /// Writes elapsed pacing even when cancellation drops the acquire future.
@@ -386,15 +420,69 @@ impl Pace {
                     _ => {
                         state.blocked_until = None;
                         state.requests.refill(now);
-                        let mut wait = state.requests.shortfall(1.0);
-                        for (dim, cost) in state.tokens.iter_mut().zip(costs) {
+                        for dim in state.tokens.iter_mut() {
                             dim.bucket.refill(now);
-                            wait = wait.max(dim.bucket.shortfall(cost as f64));
                         }
+                        state.unbook_expired(now);
+                        // A booking due now pays for this call, which takes
+                        // only what its estimate grew by since.
+                        let due = state.booked.iter().position(|b| b.due <= now + MIN_PARK);
+                        let booked =
+                            due.map(|at| state.booked[at].due.saturating_duration_since(now));
+                        let wait = match booked {
+                            Some(left) if !left.is_zero() => left,
+                            Some(_) => {
+                                let booking = state.booked.swap_remove(due.unwrap());
+                                for ((dim, cost), held) in
+                                    state.tokens.iter_mut().zip(costs).zip(booking.costs)
+                                {
+                                    dim.bucket.take(cost as f64 - held as f64);
+                                }
+                                Duration::ZERO
+                            }
+                            None => {
+                                let mut wait = state.requests.shortfall(1.0);
+                                for (dim, cost) in state.tokens.iter().zip(costs) {
+                                    wait = wait.max(dim.bucket.shortfall(cost as f64));
+                                }
+                                // Calls in flight return what their estimates
+                                // overstated when headers or usage arrive, and
+                                // wake this one; only the wait that no refund
+                                // could shorten parks.
+                                let mut refill = state
+                                    .requests
+                                    .shortfall(1.0 - state.reserved_requests as f64);
+                                for (dim, cost) in state.tokens.iter().zip(costs) {
+                                    refill = refill.max(
+                                        dim.bucket.shortfall(cost as f64 - dim.reserved as f64),
+                                    );
+                                }
+                                if refill >= MIN_PARK {
+                                    // Park until the allowance refills, booking
+                                    // it so the next call parks behind this one.
+                                    let wait = refill;
+                                    state.requests.take(1.0);
+                                    for (dim, cost) in state.tokens.iter_mut().zip(costs) {
+                                        dim.bucket.take(cost as f64);
+                                    }
+                                    state.booked.push(Booking {
+                                        due: now + wait,
+                                        costs,
+                                    });
+                                    *park_for = Some(wait);
+                                    return Err(crate::Error::new("provider_paced"));
+                                }
+                                if wait.is_zero() {
+                                    state.requests.take(1.0);
+                                    for (dim, cost) in state.tokens.iter_mut().zip(costs) {
+                                        dim.bucket.take(cost as f64);
+                                    }
+                                }
+                                wait
+                            }
+                        };
                         if wait.is_zero() {
-                            state.requests.take(1.0);
                             for (dim, cost) in state.tokens.iter_mut().zip(costs) {
-                                dim.bucket.take(cost as f64);
                                 dim.reserved += cost;
                             }
                             state.reserved_requests += 1;
@@ -715,9 +803,28 @@ mod tests {
     }
 
     async fn sent(pace: &Pace, tokens: u64) -> crate::Result<Reservation<'_>> {
-        let mut call = pace.acquire(tokens, &mut None).await?;
+        let mut call = admitted(pace, tokens).await?;
         call.dispatch();
         Ok(call)
+    }
+
+    /// A call admitted as a turn is: parked until its allowance refills and
+    /// resumed then, waiting the whole time.
+    async fn admitted(pace: &Pace, tokens: u64) -> crate::Result<Reservation<'_>> {
+        let started = Instant::now();
+        loop {
+            let mut park_for = None;
+            match pace.acquire(tokens, &mut park_for).await {
+                Err(error) if error.code == "provider_paced" => {
+                    tokio::time::sleep(park_for.unwrap()).await;
+                }
+                result => {
+                    let mut call = result?;
+                    call.waited = started.elapsed();
+                    return Ok(call);
+                }
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -864,6 +971,52 @@ mod tests {
         let pace = Pace::default();
         read(&pace, 8, 10_000, 9_500, crate::codec::Family::Responses).await;
         assert_eq!(pace.input_estimate(100_000, 0), 100_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refill_waits_park_one_behind_another_and_spend_their_booking() {
+        let pace = Pace::default();
+        // 600 tokens a minute, 10 a second, none left.
+        pace.learn(
+            &headers(&[
+                ("x-ratelimit-limit-tokens", "600"),
+                ("x-ratelimit-remaining-tokens", "0"),
+            ]),
+            crate::codec::Family::Responses,
+            [0; DIMS],
+            0,
+        );
+        async fn park(pace: &Pace) -> Duration {
+            let mut park_for = None;
+            let parked = pace.acquire(10, &mut park_for).await;
+            assert_eq!(parked.err().unwrap().code, "provider_paced");
+            park_for.unwrap()
+        }
+        // Each call parks behind the ones before it.
+        let mut parks = Vec::new();
+        for _ in 0..3 {
+            parks.push(park(&pace).await);
+        }
+        assert_eq!(
+            parks,
+            [1, 2, 3].map(Duration::from_secs).to_vec(),
+            "{parks:?}"
+        );
+        // Resumed when due, the first spends its booking and goes at once,
+        // and the allowance it refilled is not spent twice.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first = pace.acquire(10, &mut None).await.unwrap();
+        assert!(first.waited.is_zero());
+        drop(first);
+        assert_eq!(pace.state.lock().unwrap().booked.len(), 2);
+        // A booking no call spends returns once its grace has passed.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let late = pace.acquire(10, &mut None).await.unwrap();
+        assert!(late.waited.is_zero());
+        drop(late);
+        assert!(pace.state.lock().unwrap().booked.is_empty());
+        // Eleven seconds refilled 110; nothing booked or unsent is held.
+        assert_eq!(pace.split_snapshot()[TOTAL].1, 110.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1126,21 +1279,21 @@ mod tests {
         drop(newer);
         drop(older);
         assert_eq!(pace.snapshot().1, 2.0);
-        let unsent = pace.acquire(0, &mut None).await.unwrap();
+        let unsent = admitted(&pace, 0).await.unwrap();
         let mut reporting = sent(&pace, 0).await.unwrap();
         // Another client spent the rest of the provider's allowance.
         reporting.learn(&request_headers("0"), family);
         drop(reporting);
         drop(unsent);
         assert_eq!(pace.snapshot().1, 0.0);
-        let next = pace.acquire(0, &mut None).await.unwrap();
+        let next = admitted(&pace, 0).await.unwrap();
         assert!(next.waited >= Duration::from_secs(1));
         drop(next);
         // No headers: a dispatched call still consumes one request.
         let mut no_headers = sent(&pace, 0).await.unwrap();
         no_headers.learn(&HeaderMap::new(), family);
         drop(no_headers);
-        assert!(pace.acquire(0, &mut None).await.unwrap().waited >= Duration::from_millis(990));
+        assert!(admitted(&pace, 0).await.unwrap().waited >= Duration::from_millis(990));
     }
 
     #[test]
