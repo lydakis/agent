@@ -424,6 +424,11 @@ fn key_bytes(key: KeyEvent, application: bool) -> Option<Vec<u8>> {
         m => format!("\x1b[{n};{m}~").into_bytes(),
     };
     let mut bytes = match key.code {
+        // Cmd (Super) has no xterm form; as the kitty keyboard protocol
+        // sends it, so Cmd+C still copies there.
+        KeyCode::Char(c) if mods.contains(KeyModifiers::SUPER) => {
+            return Some(format!("\x1b[{};{}u", c as u32, modifier + 8).into_bytes());
+        }
         KeyCode::Char(c) if ctrl => {
             let byte = match c.to_ascii_lowercase() {
                 c @ 'a'..='z' => c as u8 - b'a' + 1,
@@ -548,6 +553,7 @@ mod tests {
             b"\x1b[127;5u"
         );
         assert_eq!(key(KeyCode::Backspace, KeyModifiers::ALT), b"\x1b\x7f");
+        assert_eq!(key(KeyCode::Char('c'), KeyModifiers::SUPER), b"\x1b[99;9u");
         // Alt+Enter is a new line in Sonny's composer, as Shift+Enter is.
         assert_eq!(key(KeyCode::Enter, KeyModifiers::ALT), b"\x1b\r");
         assert_eq!(key(KeyCode::PageUp, KeyModifiers::NONE), b"\x1b[5~");
