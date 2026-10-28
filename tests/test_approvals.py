@@ -186,6 +186,7 @@ class ApprovalTests(ModelFixture):
             dict(op='fork', source='Dave', bot='Tooled'),
             dict(op='submit', bot='Bob', request_id='away', prompt='echo:hi', workspace=str(outside),
                  delivery='queue'),
+            dict(op='delete', bot='Kid'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
@@ -221,7 +222,7 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand, tooled, away) = probed['answers']
+         ask, hand, tooled, away, again) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
         for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away):
             self.assertEqual(refused['error'], 'not_permitted', refused)
@@ -229,6 +230,8 @@ class ApprovalTests(ModelFixture):
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),
                          ('Bob', 'workspace-write'))
         self.assertIn('result', delete_kid)
+        # A delete resent for a bot already gone reaches the daemon's answer.
+        self.assertEqual(again['error'], 'bot_not_found', again)
         # A fork that may call nothing only answers.
         self.assertEqual(ask['result']['created_by'], 'Bob')
         self.assertEqual(list(outside.iterdir()), [])

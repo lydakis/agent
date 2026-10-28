@@ -1714,6 +1714,7 @@ impl Service {
         // The folders a request would give a bot, each of which the caller
         // must be able to write itself.
         let mut folders: Vec<String> = Vec::new();
+        let deleting = matches!(command, Command::Delete { .. });
         match command {
             Command::Create {
                 workspace,
@@ -1761,7 +1762,10 @@ impl Service {
                     // call are the caller's to pass on.
                     let callable = |tool: &&agent_runtime::tools::Declared| match allow {
                         Some(Some(names)) => names.contains(&tool.name),
-                        _ => true,
+                        _ => source
+                            .allowed
+                            .as_ref()
+                            .is_none_or(|allowed| allowed.contains(&tool.name)),
                     };
                     if source
                         .declared
@@ -1808,9 +1812,18 @@ impl Service {
             | Command::Compact { bot, .. }
             | Command::Interrupt { bot, .. } => {
                 let bot = bot.clone();
-                let target = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
-                if target.bot_id != me.bot_id && target.created_by_id != Some(me.bot_id) {
-                    return refuse("change a bot it didn't make");
+                match self.store.op("inspect", move |db| db.inspect(&bot)).await {
+                    Ok(target)
+                        if target.bot_id != me.bot_id
+                            && target.created_by_id != Some(me.bot_id) =>
+                    {
+                        return refuse("change a bot it didn't make");
+                    }
+                    Ok(_) => {}
+                    // A resent delete of a bot already gone answers as a
+                    // duplicate; nothing is there to change.
+                    Err(error) if deleting && error.code == "bot_not_found" => {}
+                    Err(error) => return Err(error),
                 }
             }
             _ => {}
