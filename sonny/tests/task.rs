@@ -456,12 +456,13 @@ fn a_plain_folder_copy_turns_git_off_in_linked_worktrees_and_applies_what_it_lis
         );
         assert!(err.contains("without asking"), "{err}");
         // Git stops in the copy's worktree, and works in the real one.
-        let (ok, _, said) = lab.run(&copy.join("shop/.worktrees/wt"), "git", &["status"], false);
-        assert!(
-            !ok && (said.contains("git is off here")
-                || said.contains("gitfile does not point to a valid repository")),
-            "{said}"
-        );
+        // Which words git says it with depend on its version; the reason is
+        // in the .git file it stops at.
+        let wt = copy.join("shop/.worktrees/wt");
+        let (ok, _, said) = lab.run(&wt, "git", &["status"], false);
+        assert!(!ok, "{said}");
+        let reason = std::fs::read_to_string(wt.join(".git")).unwrap();
+        assert!(reason.contains("git is off here"), "{reason}");
         lab.git(&shop.join(".worktrees/wt"), &["status"]);
 
         std::fs::write(copy.join("notes.txt"), "two\n").unwrap();
