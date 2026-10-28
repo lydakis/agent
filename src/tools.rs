@@ -1108,16 +1108,18 @@ impl Registry {
                 offset,
                 limit,
             } => {
-                let bytes = read_bounded(&resolve(workspace, &path)).await?;
+                let file = resolve(workspace, &path);
                 // A picture goes to the model as one, after a line on it.
-                if binary(&bytes).is_some()
-                    && let Some((image, line)) = picture::read_apart(bytes.clone()).await?
+                // Its header says so; the file is read only in its turn.
+                if picture::kind(&files::read_head(&file, picture::HEAD).await?).is_some()
+                    && let Some((image, line)) = picture::read_apart(read_bounded(&file)).await?
                 {
                     return Ok(Outcome {
                         images: vec![image],
                         ..Outcome::text(format!("{path}: {line}"))
                     });
                 }
+                let bytes = read_bounded(&file).await?;
                 if let Some(kind) = binary(&bytes) {
                     return fail_with(
                         "file_not_text",

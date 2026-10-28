@@ -18,16 +18,24 @@ const MOST_BYTES: usize = 1024 * 1024;
 /// four bytes a pixel, and a small file can hold a large picture.
 const MOST_PIXELS: u64 = 64 << 20;
 
-/// `read`, in a blocking worker and one picture at a time: decoding and
-/// scaling are CPU work that would hold up every bot on the daemon's thread,
-/// and each one can take hundreds of megabytes while it runs. The worker
-/// holds the turn until it is done, even when its caller is interrupted.
-pub async fn read_apart(bytes: Vec<u8>) -> Result<Option<(Image, String)>> {
+/// The bytes [`kind`] needs to tell a picture.
+pub const HEAD: u64 = 12;
+
+/// `read` of the file `load` reads, in a blocking worker and one picture at
+/// a time: decoding and scaling are CPU work that would hold up every bot on
+/// the daemon's thread, and each one can take hundreds of megabytes while it
+/// runs. The file is loaded only in its turn, so a read that waits holds no
+/// copy of it, and the worker holds the turn until it is done, even when its
+/// caller is interrupted.
+pub async fn read_apart(
+    load: impl Future<Output = Result<Vec<u8>>>,
+) -> Result<Option<(Image, String)>> {
     static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let turn = ONE
         .acquire()
         .await
         .map_err(|_| Error::new("invalid_image"))?;
+    let bytes = load.await?;
     tokio::task::spawn_blocking(move || {
         let _turn = turn;
         read(&bytes)
@@ -36,10 +44,10 @@ pub async fn read_apart(bytes: Vec<u8>) -> Result<Option<(Image, String)>> {
     .map_err(|_| Error::new("invalid_image"))?
 }
 
-/// The picture an image file holds, with a line for the model on what it
-/// is; `None` for a file that is not one of the four kinds providers take.
-fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
-    let (format, media_type, kind) = match bytes {
+/// The format, media type and name of a picture of one of the four kinds
+/// providers take, from its first [`HEAD`] bytes.
+pub fn kind(bytes: &[u8]) -> Option<(ImageFormat, &'static str, &'static str)> {
+    Some(match bytes {
         [0x89, b'P', b'N', b'G', ..] => (ImageFormat::Png, "image/png", "PNG"),
         [0xff, 0xd8, 0xff, ..] => (ImageFormat::Jpeg, "image/jpeg", "JPEG"),
         [b'G', b'I', b'F', b'8', ..] => (ImageFormat::Gif, "image/gif", "GIF"),
@@ -58,7 +66,15 @@ fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
             b'P',
             ..,
         ] => (ImageFormat::WebP, "image/webp", "WebP"),
-        _ => return Ok(None),
+        _ => return None,
+    })
+}
+
+/// The picture an image file holds, with a line for the model on what it
+/// is; `None` for a file that is not one of the four kinds providers take.
+fn read(bytes: &[u8]) -> Result<Option<(Image, String)>> {
+    let Some((format, media_type, kind)) = kind(bytes) else {
+        return Ok(None);
     };
     let unreadable = |e: image::ImageError| {
         Error::with(
