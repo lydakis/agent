@@ -915,7 +915,7 @@ impl Provider {
         let message: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
         let usage = anthropic::message_usage(&message, self.cache_hour);
-        reservation.settle_usage(Some(&usage), estimate);
+        reservation.settle_refresh(&usage);
         pace.accepted();
         Ok((usage, sent_at))
     }

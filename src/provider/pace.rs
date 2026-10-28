@@ -164,7 +164,8 @@ impl Reservation<'_> {
             output: 0,
         });
     }
-    /// Final accounting by what the provider reported billing.
+    /// Final accounting by what the provider reported billing, for a call
+    /// whose output tells what the pool's calls write.
     pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost) {
         if let Some(usage) = usage {
             let mut state = self.pace.state.lock().unwrap();
@@ -179,6 +180,14 @@ impl Reservation<'_> {
             input: u.input_tokens,
             output: u.output_tokens,
         }));
+    }
+    /// Final accounting for a call that asked for no output, such as a
+    /// cache refresh, which says nothing of what the pool's calls write.
+    pub fn settle_refresh(self, usage: &Usage) {
+        self.settle_cost(Cost {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+        });
     }
     fn settle_cost(mut self, actual: Cost) {
         debug_assert!(self.dispatched);
@@ -404,16 +413,25 @@ impl Pace {
     /// counts output as it is written: the 90th percentile of the latest
     /// calls' output, at most `cap`, or `unknown` until enough have
     /// reported. A call that writes more is charged the rest when it settles.
+    /// Output is written over time, so a reply longer than the limit can
+    /// still be served: the estimate waits for a full allowance at most,
+    /// and is never refused.
     pub fn output_estimate(&self, unknown: u64, cap: u64) -> u64 {
         let state = self.state.lock().unwrap();
-        if state.outputs.len() < OUTPUT_KNOWN {
-            return unknown;
+        let mut estimate = match state.outputs.len() < OUTPUT_KNOWN {
+            true => unknown,
+            false => {
+                let mut seen: Vec<u32> = state.outputs.iter().copied().collect();
+                let at = (seen.len() * 9).div_ceil(10) - 1;
+                u64::from(*seen.select_nth_unstable(at).1).min(cap)
+            }
+        };
+        for dim in [OUTPUT, TOTAL] {
+            if let Some(limit) = state.tokens[dim].bucket.per_minute {
+                estimate = estimate.min(limit as u64);
+            }
         }
-        let mut seen: Vec<u32> = state.outputs.iter().copied().collect();
-        drop(state);
-        let at = (seen.len() * 9).div_ceil(10) - 1;
-        let (_, p90, _) = seen.select_nth_unstable(at);
-        u64::from(*p90).min(cap)
+        estimate
     }
     /// A call completed: the next unnamed refusal starts again at a second.
     pub fn accepted(&self) {
@@ -696,6 +714,25 @@ mod tests {
         assert_eq!(pace.output_estimate(512, 4096), 3000);
         // Never above the cap the call asks for.
         assert_eq!(pace.output_estimate(512, 1000), 1000);
+        // Nor above the limit, which a reply written over time can pass.
+        pace.seed(
+            &headers(&[
+                ("anthropic-ratelimit-output-tokens-limit", "2000"),
+                ("anthropic-ratelimit-output-tokens-remaining", "2000"),
+            ]),
+            crate::codec::Family::Anthropic,
+        );
+        assert_eq!(pace.output_estimate(512, 4096), 2000);
+        assert!(sent(&pace, 0).await.is_ok());
+        // A cache refresh writes nothing and says nothing of what calls
+        // write.
+        for _ in 0..32 {
+            sent(&pace, 1)
+                .await
+                .unwrap()
+                .settle_refresh(&Usage::default());
+        }
+        assert_eq!(pace.output_estimate(512, 4096), 2000);
     }
 
     #[tokio::test(start_paused = true)]
