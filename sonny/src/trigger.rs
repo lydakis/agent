@@ -2547,10 +2547,11 @@ async fn deliver(
 ) -> Value {
     // An ask keeps the request sent for it, before it goes: a fire cut
     // short, or the trigger that replaced this one, sends it again as it
-    // was, which the daemon takes once.
-    if let Some(sent) = ask.and_then(|ask| sent_for(ask, trigger)) {
+    // was, and its answer to where it was to go under the same request id,
+    // which the daemon takes once.
+    if let Some((sent, sender)) = ask.and_then(|ask| sent_for(ask, trigger)) {
         let bot = sent["bot"].as_str().unwrap_or_default().to_owned();
-        return submit(client, trigger, &bot, sent, false, ask).await;
+        return submit(client, &sender, &bot, sent, false, ask).await;
     }
     let prompt = format!(
         "[trigger {} · {} · {why}]\n{}",
@@ -2583,22 +2584,32 @@ async fn deliver(
         "prompt": prompt, "delivery": delivery, "origin": "trigger",
         "budget_tokens": trigger.turn_budget_tokens});
     if let Some(ask) = ask {
-        let sent = json!({"store_id": trigger.store_id, "submit": asking});
+        let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
+            "reply_to": trigger.reply_to, "submit": asking});
         let _ = std::fs::write(&ask.path, sent.to_string());
     }
     submit(client, trigger, bot, asking, started, ask).await
 }
 
-/// The request an ask sent before, to send again: only to the store it
-/// went to, since one that replaced its trigger on another store sends its
-/// own.
-fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<Value> {
-    std::fs::read(&ask.path)
+/// The request an ask sent before, to send again, and the trigger that sent
+/// it, whose generation and `--reply-to` its answer goes under: only to the
+/// store it went to, since one that replaced its trigger on another store
+/// sends its own.
+fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger)> {
+    let sent = std::fs::read(&ask.path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(|sent| sent["store_id"] == trigger.store_id.as_str())
-        .map(|sent| sent["submit"].clone())
-        .filter(|submit| submit["request_id"].is_string() && submit["bot"].is_string())
+        .filter(|sent| sent["store_id"] == trigger.store_id.as_str())?;
+    let submit = &sent["submit"];
+    if !submit["request_id"].is_string() || !submit["bot"].is_string() {
+        return None;
+    }
+    let sender = Trigger {
+        generation: sent["generation"].as_str()?.to_owned(),
+        reply_to: serde_json::from_value(sent["reply_to"].clone()).ok()?,
+        ..trigger.clone()
+    };
+    Some((submit.clone(), sender))
 }
 
 /// Send a fire's turn, and its answer on to `--reply-to`.
