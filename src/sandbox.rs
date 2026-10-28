@@ -53,7 +53,7 @@ pub struct Root {
     pub read_only: Vec<PathBuf>,
     /// Paths inside the root that don't exist and may not be made.
     pub missing: Vec<PathBuf>,
-    /// Paths inside the root that don't exist and may not be left made:
+    /// Paths right under the root that don't exist and may not be left made:
     /// files git reads whenever they are there, so an empty folder held in
     /// their place would stop git. On Linux, removed when the command ends;
     /// elsewhere they are `missing`.
@@ -417,7 +417,10 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             }
         }
         // Each linked worktree's folder names the repository's folder for
-        // it the same way.
+        // it the same way. One without it was made since, and serves only a
+        // checkout the bot made to name it. Nothing this deep is removed
+        // after a command, as the root's own `commondir` is: its folder
+        // could be swapped for a link elsewhere before the removal follows.
         for entry in std::fs::read_dir(path.join("worktrees"))
             .into_iter()
             .flatten()
@@ -432,8 +435,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             match std::fs::symlink_metadata(&kept) {
                 Ok(found) if found.file_type().is_symlink() => return linked(&kept),
                 Ok(_) => read_only.push(kept),
-                Err(_) if cfg!(target_os = "linux") => left.push(kept),
-                Err(_) => missing.push(kept),
+                Err(_) => {}
             }
         }
     }
