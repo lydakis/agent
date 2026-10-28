@@ -852,7 +852,9 @@ impl Drop for Hold {
             return;
         }
         // Off the runtime thread, and with no lock held: no sandbox takes
-        // one up while it is marked as being removed.
+        // one up while it is marked as being removed. On a thread of its
+        // own, since a runtime shutting down drops blocking work not yet
+        // started, which would leave them in place.
         let remove = move || {
             // Git never makes these in a repository's own folder: one there
             // now is the command's.
@@ -869,9 +871,21 @@ impl Drop for Hold {
                 .retain(|held| !(held.removing && released.contains(&held.path)));
             REMOVED.notify_waiters();
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
-            Err(_) => remove(),
+        type Job = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
+        let run = |job: &Job| {
+            if let Some(remove) = job.lock().unwrap().take() {
+                remove();
+            }
+        };
+        let job: std::sync::Arc<Job> =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(remove))));
+        let theirs = job.clone();
+        if std::thread::Builder::new()
+            .name("sandbox-placeholders".into())
+            .spawn(move || run(&theirs))
+            .is_err()
+        {
+            run(&job);
         }
     }
 }
