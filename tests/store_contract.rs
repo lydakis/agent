@@ -12299,3 +12299,58 @@ fn a_request_keeps_its_newest_pictures_and_older_ones_go_as_their_words() {
             .is_none()
     );
 }
+
+#[test]
+fn a_pinned_prompt_under_the_floor_counts_as_its_stub() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions {
+                images: vec![noise(40); 20],
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    for n in 0..6 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let plan = db
+        .picture_elision_plan("Bob", 0, i64::MAX)
+        .unwrap()
+        .unwrap();
+    db.elide("Bob", &plan).unwrap();
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.pinned, Some(prompt));
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    db.compact("Bob", &plan, "summary", None, 0, limit, Value::Null)
+        .unwrap();
+    // The prompt goes ahead of the tail as its words, and the turn counts
+    // it that way.
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.ids[0], prompt);
+    assert_eq!(window.pictures, 0);
+    let items = sent(&db, &window);
+    assert_eq!(
+        items[0]["content"][0]["text"],
+        "long task\n[20 picture(s) sent with this message, elided from this request]"
+    );
+    let (_, bytes, _) = db.turn_usage("Bob", turn).unwrap();
+    assert_eq!(bytes as i64, window.item_bytes);
+}

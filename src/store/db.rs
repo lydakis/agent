@@ -3694,10 +3694,14 @@ impl Database {
             )?;
         let mut in_turn = 0;
         if let Some(prompt) = pinned {
+            // Under the floor, a prompt with a stub goes as it.
             let (size, seq, depth): (i64, i64, i64) = self.conn.query_row(
-                "SELECT n.total_bytes-COALESCE(p.total_bytes,0),n.turn_seq,n.depth
-                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent WHERE n.id=?",
-                [prompt],
+                "SELECT n.total_bytes-COALESCE(p.total_bytes,0)
+                    -CASE WHEN n.id<=COALESCE(e.through,0) AND n.elided>0 THEN n.elided ELSE 0 END,
+                    n.turn_seq,n.depth
+                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent
+                 LEFT JOIN elisions e ON e.node=?2 WHERE n.id=?1",
+                params![prompt, bot.elision],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             bytes += size;
@@ -3905,7 +3909,8 @@ impl Database {
                         -CASE WHEN c.node IS NULL
                             THEN COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0)
                             ELSE cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,0))
-                                -s.total_bytes+COALESCE(p.total_bytes,0) END,
+                                -s.total_bytes+COALESCE(p.total_bytes,0)
+                                +CASE WHEN s.id<=COALESCE(e.through,0) AND s.elided>0 THEN s.elided ELSE 0 END END,
                     h.depth-CASE WHEN c.node IS NULL THEN COALESCE(p.depth,0) ELSE cp.depth-1 END
              FROM bots b JOIN nodes h ON h.id=b.head JOIN nodes s ON s.turn=?2
              LEFT JOIN nodes p ON p.id=s.parent LEFT JOIN elisions e ON e.node=b.elision
