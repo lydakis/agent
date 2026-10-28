@@ -237,9 +237,12 @@ impl Screen {
         self.laid += usize::from(self.wrapped < self.rows.len());
         for row in &self.rows[self.wrapped..] {
             let line = row.line.clone();
-            // A picture's row is cut at the edge, not wrapped into pieces.
-            let picture =
-                (line.spans.iter()).any(|span| span.content.starts_with(crate::image::PLACEHOLDER));
+            // A picture's row is cut at the edge, not wrapped into pieces:
+            // Kitty's placeholders, or one drawn in half blocks.
+            let picture = (line.spans.iter()).any(|span| {
+                span.content.starts_with(crate::image::PLACEHOLDER)
+                    || span.content.contains(['▀', '▄'])
+            });
             let rows = match line.width() <= width || picture {
                 true => vec![line],
                 false => {
@@ -1163,8 +1166,11 @@ mod tests {
     fn a_pictures_rows_are_cut_at_the_edge_not_wrapped() {
         let cells: String = std::iter::repeat_n(crate::image::PLACEHOLDER, 30).collect();
         let picture = Line::from(vec![Span::raw("  "), Span::raw(cells)]);
-        let (mut screen, _) = screen(vec![picture.clone(), picture], 20, 5);
-        assert_eq!(screen.height(20), 2);
+        let (mut kitty, _) = screen(vec![picture.clone(), picture], 20, 5);
+        assert_eq!(kitty.height(20), 2);
+        let blocks = Line::from("  ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄");
+        let (mut banner, _) = screen(vec![blocks], 20, 5);
+        assert_eq!(banner.height(20), 1);
     }
 
     #[test]
