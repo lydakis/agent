@@ -325,7 +325,15 @@ fn told(dir: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, Stri
         Some(name) => Some(crate::project::profile(dir, name)?),
         None => None,
     };
-    let told_after = |role: &&agent_client::policy::Profile| role.name.eq_ignore_ascii_case(&task);
+    // The same profile when it is the same file (a case-insensitive
+    // filesystem gives `Worker` and `worker` one), or the same built-in.
+    let told_after = |role: &&agent_client::policy::Profile| match &role.path {
+        None => role.name == task,
+        Some(path) => crate::project::profile(dir, &task).is_ok_and(|task| {
+            let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            task.path.is_some_and(|other| real(&other) == real(path))
+        }),
+    };
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(dir, role.as_ref().filter(|r| !told_after(r)), &memory)
@@ -2017,9 +2025,21 @@ mod tests {
         let flags = told(&["--profile", "worker"]).unwrap();
         assert_eq!(flags[..2], ["--tools", "read"]);
         assert_eq!(flags.last().unwrap().matches("Ship small.").count(), 1);
-        // `task` is then a role like any other.
+        // `task` is then a role like any other, as is another file whose
+        // name differs only in case, where the filesystem tells them apart.
         let flags = told(&["--profile", "task"]).unwrap();
         assert!(flags.last().unwrap().contains("# Role: task\n\n"));
+        std::fs::write(dir.join(".agents/agents/Worker.md"), "Ship big.\n").unwrap();
+        if std::fs::read_to_string(dir.join(".agents/agents/worker.md")).unwrap() != "Ship big.\n" {
+            let flags = told(&["--profile", "Worker"]).unwrap();
+            assert!(
+                flags
+                    .last()
+                    .unwrap()
+                    .contains("# Role: Worker\n\nShip big.")
+            );
+        }
+        std::fs::remove_file(dir.join(".agents/agents/Worker.md")).unwrap();
         *project.borrow_mut() = serde_json::json!({"threads_profile": "nobody"});
         assert!(
             told(&["--agents"])
