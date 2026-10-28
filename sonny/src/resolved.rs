@@ -28,7 +28,9 @@ pub fn tool() -> Value {
             "required": ["task"],
             "additionalProperties": false
         },
-        "result": "Resolved."
+        "result": "Resolved.",
+        // The lead's alone: a task it starts does not take it.
+        "inherit": false
     })
 }
 

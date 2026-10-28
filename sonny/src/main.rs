@@ -2472,12 +2472,17 @@ impl App {
 
     /// [`App::items`], each with the node it is kept at.
     async fn items_at(&self, nodes: &[i64]) -> Vec<(i64, Value)> {
+        self.items_of(&self.bot, nodes).await
+    }
+
+    /// [`App::items_at`] for any bot.
+    async fn items_of(&self, bot: &str, nodes: &[i64]) -> Vec<(i64, Value)> {
         let mut items = Vec::new();
         let mut rest = nodes;
         while !rest.is_empty() {
             let Ok(read) = self
                 .client
-                .request("history_items", json!({"bot": self.bot, "nodes": rest}))
+                .request("history_items", json!({"bot": bot, "nodes": rest}))
                 .await
             else {
                 break;
@@ -3544,8 +3549,8 @@ impl App {
             // A question stays open until its answer lands, past work that
             // does not wait on it and messages that answer something else:
             // an idle agent's recent history is read once per turn it
-            // ended. While a turn runs, its last items, or what was read
-            // before it, say.
+            // ended. A running turn shows its work, as its last items say;
+            // a question still open shows again once it ends.
             let ask = match turn["turn"].as_i64() {
                 Some(last) if !running => match self.asks_seen.get(name) {
                     Some((seen, ask)) if *seen == last => ask.clone(),
@@ -3555,7 +3560,7 @@ impl App {
                         ask
                     }
                 },
-                _ => ask.or_else(|| self.asks_seen.get(name).and_then(|(_, ask)| ask.clone())),
+                _ => ask,
             };
             if let Some(question) = &ask {
                 step = format!("asks: {}", first_line(question));
@@ -3618,13 +3623,15 @@ impl App {
             .collect();
         let mut items = Vec::new();
         for chunk in nodes.chunks(100) {
-            let read = self
-                .client
-                .request("history_items", json!({"bot": bot, "nodes": chunk}))
-                .await
-                .ok()?;
-            for entry in read["items"].as_array().into_iter().flatten() {
-                items.extend(responses(&entry["item"]).into_iter().rev());
+            // Newest first, as the nodes were asked for; each node's items
+            // newest first too.
+            let mut read = self.items_of(bot, chunk).await.into_iter().peekable();
+            while let Some((node, item)) = read.next() {
+                let mut kept = vec![item];
+                while let Some((_, item)) = read.next_if(|(next, _)| *next == node) {
+                    kept.push(item);
+                }
+                items.extend(kept.into_iter().rev());
             }
         }
         asks::open(&items)

@@ -2076,6 +2076,12 @@ narrows them as it does the daemon's. Changing them changes the request's
 tool definitions, so a fork keys its own prompt cache from then on, as for
 instructions.
 
+Protocol version 20 adds `inherit` to a declared tool, default `true` and
+reported only when `false`: a tool declared with `"inherit": false` stays
+the declaring bot's own, so a bot it creates does not take it with the
+rest. A fork still keeps it. A lead's client uses it for a tool only the
+lead should call.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client

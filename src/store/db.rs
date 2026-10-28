@@ -1920,12 +1920,20 @@ impl Database {
         })
     }
     /// The tools the creating bot's client declared, which a bot it
-    /// creates takes unless its own client declares others.
+    /// creates takes unless its own client declares others: all but those
+    /// declared as the creator's own.
     fn creator_declared(conn: &Connection, creator: Option<i64>) -> Result<Option<String>> {
         let Some(id) = creator else {
             return Ok(None);
         };
-        Ok(conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?)
+        let stored: Option<String> =
+            conn.query_row("SELECT declared FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let mut declared: Vec<Declared> = serde_json::from_str(&stored)?;
+        declared.retain(|tool| tool.inherit);
+        stored_declared(&declared)
     }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
