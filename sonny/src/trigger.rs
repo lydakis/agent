@@ -2577,16 +2577,19 @@ async fn deliver(
         "budget_tokens": trigger.turn_budget_tokens});
     // An ask keeps the request sent for it, before it goes: a fire cut
     // short, or the trigger that replaced this one, sends it again as it
-    // was, which the daemon takes once.
+    // was, which the daemon takes once. Only to the store it went to: one
+    // that replaced it on another store sends its own.
     if let Some(ask) = ask {
         match std::fs::read(&ask.path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .filter(|sent| sent["request_id"].is_string())
+            .filter(|sent| sent["store_id"] == trigger.store_id.as_str())
+            .filter(|sent| sent["submit"]["request_id"].is_string())
         {
-            Some(sent) => asking = sent,
+            Some(sent) => asking = sent["submit"].clone(),
             None => {
-                let _ = std::fs::write(&ask.path, asking.to_string());
+                let sent = json!({"store_id": trigger.store_id, "submit": asking});
+                let _ = std::fs::write(&ask.path, sent.to_string());
             }
         }
     }

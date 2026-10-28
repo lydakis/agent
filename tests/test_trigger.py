@@ -256,13 +256,20 @@ class TriggerFireTests(ModelFixture):
         # The fire was cut short once its turn went, and another definition
         # took the name: the ask it left sends what went, which the daemon
         # takes once, not the new message under the new generation.
-        (taking / '100.1.1').write_text(json.dumps({
-            'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'], 'prompt': prompt,
-            'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}))
+        submit = {'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'],
+                  'prompt': prompt, 'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}
+        (taking / '100.1.1').write_text(json.dumps({'store_id': self.store_identity(), 'submit': submit}))
         again = self.fire('p.task', 'second', generation='g2')
         self.assertEqual((again['last']['outcome'], again['last']['turn']), ('sent', turn['turn']), again)
         self.assertEqual(len(self.turns('p.task')), 2)
         self.assertFalse((taking / '100.1.1').exists())
+        # What went to another store is that store's: this one sends its own.
+        (taking / '100.1.2').write_text(json.dumps({'store_id': 'another-store', 'submit': submit}))
+        own = self.fire('p.task', 'third', generation='g3')
+        self.assertEqual(own['last']['outcome'], 'sent', own)
+        self.settle('p.task')
+        self.assertEqual(len(self.turns('p.task')), 3)
+        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], LINE.format('p.task', 'fired') + 'third$')
 
     def test_a_start_trigger_makes_its_agent_once_and_messages_it_after(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
