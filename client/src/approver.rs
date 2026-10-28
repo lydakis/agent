@@ -36,12 +36,13 @@ pub const ATTEMPTS: u32 = 3;
 /// the turn ends: the approver's own deadline, plus margin.
 pub const AUTO_EXPIRE_MS: u64 = DEADLINE_MS + 15_000;
 /// Tools the approval modes never gate: they touch only the bot's own
-/// store records.
-pub const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
+/// store records, or, for web search, ask its provider as its model does
+/// (Codex never gates search, and a provider-hosted one can't be).
+pub const UNGATED: [&str; 5] = ["history", "wait", "note", "echo", "web_search"];
 /// Tools `auto` also leaves to run unjudged. A read's result goes to the
 /// model provider, so reading a key sends it off the machine, but judging
 /// every read cost a round each for what is nearly always allowed.
-pub const AUTO_UNGATED: [&str; 5] = ["history", "wait", "note", "echo", "read"];
+pub const AUTO_UNGATED: [&str; 6] = ["history", "wait", "note", "echo", "web_search", "read"];
 /// The breaker, as Codex sets it: denials in a row, or among the turn's
 /// last `WINDOW` judged calls.
 pub const IN_ROW: u64 = 3;

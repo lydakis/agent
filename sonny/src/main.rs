@@ -915,7 +915,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
     let instructions = project::as_task(&workspace, &composed.text)?;
     let declare = json!(declared::tools(false));
-    let tools = agent_client::default_tools(client.providers(), &model);
+    let search = agent_client::config::load()?.web_search;
+    let tools = agent_client::default_tools(client.providers(), &model, search);
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": tools, "declare": declare,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
@@ -923,7 +924,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
         asked["settings"] = json!({"cache_ttl": ttl});
     }
-    let tools = approvals::gateable(&tools.map(String::from), &declare);
+    let tools: Vec<String> = tools.into_iter().map(String::from).collect();
+    let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = &mut asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
     }

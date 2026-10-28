@@ -78,7 +78,8 @@ and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
 `--tools` or `shell,read,write,wait,history` with `apply_patch` for a
-Responses model and `edit` otherwise before it asks. A bot's
+Responses model and `edit` otherwise, plus `web_search` where the provider
+offers it unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
 other tool is answered with a `tool_not_available` result, whatever the
 model was told. Tool definitions live once in the daemon and their request
@@ -109,7 +110,8 @@ of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
 daemon. Default tools are `shell,read,write,wait,history` and the file editor
-the model's family is trained on, `apply_patch` (Responses) or `edit`; `note`, the
+the model's family is trained on, `apply_patch` (Responses) or `edit`, and
+`web_search` where the provider offers it; `note`, the
 carry-forward note, is in the universe and chosen per bot.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
@@ -477,7 +479,8 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 binding and waited on at most three seconds. Keys the CLI cannot resolve
 by then (no login yet, an expired SSO session, a stalled CLI) do not stop
 the daemon: the binding's `ready.providers` entry (its `family`, `url`,
-`transport` and the `efforts` its family takes) carries `unresolved` with
+`transport`, the `efforts` its family takes and whether it offers
+`web_search`) carries `unresolved` with
 the reason (its detail clipped to 200 bytes), and its next call resolves
 again, so `aws sso login` fixes it without a restart.
 A call with no usable keys fails before it is paced, admitted or its body
@@ -2032,7 +2035,7 @@ which is future work, or deleting the bot.
 ## Tools and validation scope
 
 The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
-`wait`, `history` and `note`; each bot is created with the subset it may call (`run --tools`),
+`wait`, `history`, `note` and `web_search`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -2820,6 +2823,21 @@ Known pipes, devices, and other special files return `file_not_regular`. Opens
 are nonblocking and the opened descriptor is checked before reading or
 truncating, so replacing a checked path with a FIFO cannot block a filesystem
 worker or daemon shutdown. Use the shell tool for special-file operations.
+
+`web_search` searches the web the way the bot's provider offers it, as Codex
+does. On OpenAI's API with a key it is Codex's `web.run` function in the `web`
+namespace, which the daemon answers by posting the call's commands to the
+provider's `alpha/search` (bounded at 1 MiB and two minutes) and returning its
+`output`. Searches are paced in a pool of their own and their failures classed
+as a model call's: a rate limit closes the pool, a server or connection failure
+backs off, and both retry within the two minutes before the model hears of them. Bedrock's GPT models get the hosted `web_search` tool over indexed
+results, and Anthropic's API gets its hosted server tool, `web_search_20260209`
+for Claude 4.6 and later but Haiku, `web_search_20250305` otherwise; the
+provider runs both, its blocks and citations are kept in the history as sent,
+and a `pause_turn` stop asks again without a new message. A ChatGPT plan login,
+Claude on Bedrock and any other gateway offer none: `create` refuses the tool
+there with `web_search_unavailable`, and `ready` says per provider whether it
+searches (`web_search`). It runs without approval, as Codex's does.
 
 Shell children inherit the service environment except the provider key
 variables, plus the CLI location/context variables described above. Exact occurrences of provider key

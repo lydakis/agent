@@ -1156,11 +1156,13 @@ pub async fn run(config: Configuration) -> Result<()> {
             provider = provider.with_socket()?;
         }
         let provider = provider.with_stall_timeout(stall_timeout)?;
+        let searches = provider.searches();
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
-            "transport":spec.transport(),"efforts":spec.family.efforts()});
+            "transport":spec.transport(),"efforts":spec.family.efforts(),
+            "web_search":searches});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
         }
@@ -2494,6 +2496,16 @@ impl Service {
                 }
                 let tools = tools.ok_or(Error::new("tools_required"))?;
                 self.registry.validate(&tools)?;
+                // Search is the provider's to offer; one that offers none
+                // says so rather than leave the bot without it unawares.
+                if tools.iter().any(|tool| tool == "web_search")
+                    && served.search(model) == agent_runtime::provider::Search::None
+                {
+                    return fail_with(
+                        "web_search_unavailable",
+                        format!("{provider} offers no web search"),
+                    );
+                }
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
                 }

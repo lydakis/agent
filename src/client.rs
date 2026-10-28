@@ -1379,9 +1379,11 @@ fn run(options: &Options) -> Result<i32> {
         let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
             Some(tools) if !options.tools_explicit => tools,
             _ if !options.tools_explicit => {
-                agent_client::default_tools(&connection.ready["providers"], &model)
+                let search = config()?.web_search;
+                agent_client::default_tools(&connection.ready["providers"], &model, search)
+                    .into_iter()
                     .map(str::to_owned)
-                    .to_vec()
+                    .collect()
             }
             _ => options
                 .tools

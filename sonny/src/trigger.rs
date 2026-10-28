@@ -2600,13 +2600,14 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
     let instructions = crate::project::plain(dir)?;
+    let search = agent_client::config::load()?.web_search;
     let made = client
         .request(
             "create",
             json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
                 "instructions": instructions,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-                "tools": agent_client::default_tools(client.providers(), model),
+                "tools": agent_client::default_tools(client.providers(), model, search),
                 "created_by": by.as_ref().map(|(bot, _)| bot),
                 "created_by_id": by.as_ref().map(|(_, id)| id),
                 "settings": agent_client::policy::cache_ttl(model)

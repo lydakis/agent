@@ -6,6 +6,7 @@
 //! ```toml
 //! model = "anthropic/claude-opus-5-5"  # a new agent's, with none named
 //! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER
+//! web_search = "disabled"       # "live", the default, lets new agents search
 //!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
@@ -29,8 +30,22 @@ pub struct Config {
     pub model: Option<String>,
     /// The daemon's `--provider` specs, as AGENT_PROVIDER takes them.
     pub provider: Option<String>,
+    /// Whether a new agent gets web search where its provider offers it,
+    /// as Codex's `web_search` key says: `"live"`, the default, or
+    /// `"disabled"`.
+    pub web_search: WebSearch,
     pub judge: Judge,
     pub sonny: Sonny,
+}
+
+/// Codex's `web_search` modes this runtime serves. Codex's `cached`, an
+/// index without the live web, is not one: Anthropic's search has no such
+/// mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WebSearch {
+    #[default]
+    Live,
+    Disabled,
 }
 
 /// The judge `agent approver` and Sonny's lookout ask.
@@ -91,6 +106,14 @@ fn parse(text: &str) -> Result<Config, String> {
         .map_err(|e: toml::de::Error| e.message().to_owned())?;
     let mut config = Config::default();
     for (name, value) in &table {
+        if name == "web_search" {
+            config.web_search = match string(name, value)?.as_str() {
+                "live" => WebSearch::Live,
+                "disabled" => WebSearch::Disabled,
+                other => return Err(format!("web_search is live or disabled, not {other}")),
+            };
+            continue;
+        }
         if let Some(top) = match name.as_str() {
             "model" => Some(&mut config.model),
             "provider" => Some(&mut config.provider),
@@ -226,7 +249,15 @@ mod tests {
         assert_eq!(config.judge.effort, None);
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
+        assert_eq!(config.web_search, WebSearch::Live);
+        let off = parse("web_search = \"disabled\"").unwrap();
+        assert_eq!(off.web_search, WebSearch::Disabled);
         for (text, error) in [
+            (
+                "web_search = \"cached\"",
+                "web_search is live or disabled, not cached",
+            ),
+            ("web_search = false", "web_search must be a string"),
             ("colour = \"red\"", "unknown key colour"),
             ("model = 3", "model must be a string"),
             ("[web]\nsearch = true", "unknown table [web]"),

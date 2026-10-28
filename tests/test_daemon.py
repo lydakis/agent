@@ -78,6 +78,13 @@ class DaemonTests(ModelFixture):
                 model.server_close()
                 worker.join(timeout=2)
 
+    def test_a_provider_without_search_says_so_and_refuses_the_tool(self):
+        client = self.client()
+        self.assertIs(client.ready['providers']['openai']['web_search'], False)
+        refused = client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'web_search'])
+        self.assertEqual(refused['error'], 'web_search_unavailable')
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['echo']))
+
     def test_a_patch_is_a_custom_tool_call_answered_in_kind(self):
         patch = ('*** Begin Patch\n*** Add File: notes.md\n+# Notes\n'
                  '*** Update File: calc.py\n@@\n-x = 1\n+x = 2\n*** End Patch')
