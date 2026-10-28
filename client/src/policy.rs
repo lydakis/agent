@@ -70,13 +70,23 @@ not to report results.";
 /// on Anthropic's API and on Bedrock, where a lead or monitor that rests past
 /// five minutes would otherwise send its whole context again uncached. An
 /// hour's writes cost twice the input rate instead of 1.25 times, and a read
-/// a tenth. Bedrock refuses the hour for Claude 3 models (its prompt-caching
-/// guide, read 2026-10-27), which keep five minutes; Responses providers have
-/// no such setting.
+/// a tenth. Bedrock takes the hour only from Claude 4.5 on (its prompt-caching
+/// guide, read 2026-10-28) and may refuse a request that asks older Claude for
+/// it, so those keep five minutes; the daemon uses the setting only for Claude,
+/// and Responses providers have no such setting.
 pub fn cache_ttl(model: &str) -> Option<&'static str> {
-    let claude = model.starts_with("anthropic/")
-        || (model.starts_with("bedrock/") && !model.contains("claude-3"));
-    claude.then_some("1h")
+    const FIVE_MINUTES_ON_BEDROCK: [&str; 4] = [
+        "claude-3",
+        "claude-opus-4-2025",
+        "claude-opus-4-1-",
+        "claude-sonnet-4-2025",
+    ];
+    let hour = model.starts_with("anthropic/")
+        || (model.starts_with("bedrock/")
+            && !FIVE_MINUTES_ON_BEDROCK
+                .iter()
+                .any(|old| model.contains(old)));
+    hour.then_some("1h")
 }
 
 /// What human-facing clients tell a new bot's summarizer at compaction. The daemon has
@@ -879,11 +889,17 @@ mod tests {
         for model in [
             "anthropic/claude-opus-5-5",
             "bedrock/us.anthropic.claude-opus-5-5-v1:0",
+            "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "bedrock/anthropic.claude-opus-4-8",
         ] {
             assert_eq!(cache_ttl(model), Some("1h"), "{model}");
         }
         for model in [
             "bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "bedrock/us.anthropic.claude-opus-4-20250514-v1:0",
+            "bedrock/us.anthropic.claude-opus-4-1-20250805-v1:0",
+            "bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
             "openai/gpt-6",
             "chatgpt/gpt-6-sol",
         ] {
