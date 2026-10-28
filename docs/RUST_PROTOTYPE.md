@@ -1794,7 +1794,14 @@ continues its source's. The `history` tool returns one turn's prompt, replies,
 tool calls, and results as provider JSONL with only the top-level
 `encrypted_content` field removed from reasoning items. Reasoning records and
 readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `history_items` reads, forks, and provider replay remain unchanged. The reading
+items, raw `history_items` reads, forks, and provider replay remain unchanged.
+With `bot`, it reads another agent's turn the same way, numbered along that
+agent's lineage and as it stands, a running turn included; with `bot` and no
+`turn`, it lists that agent's newest 20 turns, newest first, each with its
+number, handle, status and its prompt's first 200 characters, so an agent can
+see what another is doing without reading the store. A bot's own turns are
+read by number only. Any agent of the daemon can be read: the daemon holds
+one person's agents. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
