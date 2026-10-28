@@ -35,9 +35,13 @@ project holds the folder above it. In a git repository, Sonny opens the
 nearest project in that repository, else makes the repository's top one,
 so `src` reaches the repository's lead and a task's worktree its main
 checkout's; a subfolder of a repository is its own project once it has a
-file (`sonny project add DIR`). A lead made below another project's folder
-says which lead holds the folder above. Sonny refuses to make a lead in a
-task's own folder under `~/.agent`.
+file (`sonny project add DIR`). A project whose file says
+`subfolders = "project"` keeps the folders below it: Sonny opened in any of
+them that has no project file of its own, a repository among them, opens
+that project's lead (the nearest project above decides; the home folder's
+file never does). A lead made below another project's folder says which
+lead holds the folder above. Sonny refuses to make a lead in a task's own
+folder under `~/.agent`.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -51,8 +55,30 @@ since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
 and a file that no longer matches, or one Sonny never wrote, is the
 person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
 first. How the lead starts a task with `sonny task`, which names this
-Sonny, and the task settings from `.agents/project.toml` are composed
-after the lead's role, not kept in the file.
+Sonny, and where the project's tasks work are composed after the lead's
+role, not kept in the file.
+
+#### Effort for leads and tasks
+
+Each agent's effort is the daemon's to keep; Sonny only picks what a new
+one starts with, and imposes nothing. With nothing set, a new lead starts
+at its model's own effort (`AGENT_EFFORT` when its model is
+`AGENT_MODEL`'s), and each task at its lead's. Defaults go in
+`~/.agent/config.toml` (`agent_client::config`), and a project's
+`.agents/project.toml` overrides them for that project:
+
+| What | `~/.agent/config.toml` | `.agents/project.toml` |
+| --- | --- | --- |
+| A new lead's effort | `[sonny] lead_effort` | `effort` |
+| Each new task's model | (the lead's) | `threads_model` |
+| Each new task's effort | `[sonny] task_effort` | `threads_effort` |
+| The approver's and lookout's judge | `[judge] model`, `effort` | |
+
+`sonny task` applies them in code, so the lead's prompt says nothing about
+effort; the lead names `--model` or `--effort` only for one the person asks
+for. A task on its lead's model with neither set takes the lead's effort,
+as before; one on another model takes that model's own. `/model` changes a
+lead's effort after it is made.
 
 A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
@@ -173,9 +199,10 @@ off again never shows.
   **Resolved**, only counted until `r` shows them. The lead marks a task
   resolved with its `resolve_task` tool once nothing is left to do in it,
   such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it. An agent
-  with triggers or lookout subscriptions of its own shows `↻ 2 triggers`
-  beside its model.
+  task's window closes. New work sent to the task reopens it. Each agent's
+  time is how long its running turn has been at it, or how long its last
+  turn took. An agent with triggers or lookout subscriptions of its own
+  shows `↻ 2 triggers` beside its model.
 - `/background` (or `/triggers`, `/lookout`) lists what runs for the
   project's agents with no one typing: the triggers that wake them, with
   when each fires, its message and what its last fire did, and the
@@ -271,13 +298,15 @@ PEER`, and in Rex opens a window following each detached job.
 
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. It tells a lead what its tasks
-did in one "Task updates" note, by the handles its wait tool reads them
-with, and steers it at once only for a message that redirects other tasks
-or work that collides with another task's; what else the judge picks, such
-as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
-own model, and with the judge `off` sends the task updates alone. Any agent can
+subscribes each lead to its tasks. As soon as the lead rests, it tells it
+every message someone else wrote in its tasks and how each turn ended, in
+one "Task updates" note, by the handles its wait tool reads them with; the
+lead decides what matters. While the lead is mid-turn, a judge asks of each
+event only whether it cannot wait, and steers the lead at once if so. A
+turn a note started that ends with nothing to say stays folded under the
+note, with no sound. It judges with the config's `[judge] model`, the
+approver's setting, else the lead's own model, at `[judge] effort` when
+set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/background` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).

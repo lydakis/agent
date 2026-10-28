@@ -189,9 +189,7 @@ fn parse(args: &[String]) -> Result<Options> {
         tag: None,
         reason: None,
         note: std::env::var_os("AGENT_APPROVER_NOTE").map(PathBuf::from),
-        judge: std::env::var("AGENT_JUDGE")
-            .ok()
-            .filter(|judge| !judge.is_empty()),
+        judge: None,
         judge_url: None,
         daemon_flags: Vec::new(),
         settings: serde_json::Map::new(),
@@ -1811,12 +1809,17 @@ fn note(path: &Path) -> Result<String> {
 fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let note = options.note.as_deref().map(note).transpose()?;
+    // The flags over the person's `[judge]` in ~/.agent/config.toml.
+    let config = agent_client::config::load().map_err(|error| match error.split_once(": ") {
+        Some((code, detail)) => Error::with(code, detail),
+        None => Error::with("config_invalid", error),
+    })?;
     crate::approver::main(crate::approver::Settings {
         socket: options.socket.clone(),
         tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
-        judge: options.judge.clone(),
+        judge: (options.judge.clone()).or(config.judge.model),
         caller: env("AGENT_MODEL"),
-        effort: options.effort.clone(),
+        effort: (options.effort.clone()).or(config.judge.effort),
         url: options.judge_url.clone(),
         key: env(DECISIONS_KEY),
         note,

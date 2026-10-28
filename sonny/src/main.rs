@@ -756,6 +756,7 @@ async fn run() -> Result<(), String> {
     }
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
+    app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
         app.notice = Some(format!(
@@ -1109,6 +1110,14 @@ struct Running {
     started: Instant,
     /// What the status row says the bot is doing.
     phase: String,
+    /// The lookout's note started it: it ends quietly unless the bot
+    /// says something.
+    note: bool,
+}
+
+/// Whether the lookout sent the turn: its note, by its request ID.
+fn from_lookout(data: &Value) -> bool {
+    (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
 }
 
 /// The most of the person's refused commands kept for their next
@@ -1756,9 +1765,9 @@ impl Fleet {
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
-                "done" if bot == self.lead => {
-                    Some((sound::Alert::LeadDone, format!("{short} is done")))
-                }
+                // The lead's view rings for its own ends: only it knows
+                // whether a turn the lookout started said anything.
+                "done" if bot == self.lead => None,
                 "done" => Some((sound::Alert::TaskDone, format!("{short} is done"))),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
                 "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
@@ -1938,6 +1947,7 @@ impl App {
                 turn,
                 started: Instant::now(),
                 phase: "Working".into(),
+                note: false,
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
@@ -2561,7 +2571,9 @@ impl App {
                     turn,
                     started: Instant::now(),
                     phase: "Working".into(),
+                    note: false,
                 });
+                self.turn_began().await;
                 status_report("working", &self.bot);
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
@@ -3165,6 +3177,7 @@ impl App {
                     turn: turn.unwrap_or(0),
                     started: Instant::now(),
                     phase: "Working".into(),
+                    note: from_lookout(data),
                 });
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
@@ -3459,28 +3472,32 @@ impl App {
                 }
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
-                let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
+                let running = self.running.take();
+                let note = running.as_ref().is_some_and(|r| r.note);
+                let seconds = running.map(|r| r.started.elapsed().as_secs());
                 let line = transcript::finished(status, detail, seconds, self.width);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
-                let words = self.live.as_ref().is_some_and(|live| !live.rows.is_empty());
+                // Rows already drawn above, as a long reply spills, count.
+                let words =
+                    (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
+                let ended = matches!(status, "completed" | "steered");
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
                     && self.answering.as_ref().map(|(_, at)| *at) == Some(self.rows_drawn);
                 if only_reacted {
                     self.draw_bot_reactions();
                 }
+                // A turn the lookout's note started that ended with nothing
+                // to say stays under its task updates: no line, no sound.
+                let quiet = note && !words && ended;
                 // A turn that ended well puts its reply under the line, apart
                 // from the steps above; one written as it came, or one
                 // that failed, keeps the line under it.
                 match self.live.take() {
-                    _ if only_reacted && matches!(status, "completed" | "steered") => {}
-                    Some(live)
-                        if !live.spilled
-                            && !live.rows.is_empty()
-                            && matches!(status, "completed" | "steered") =>
-                    {
+                    _ if (only_reacted || quiet) && ended => {}
+                    Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
                         self.commit(vec![line]);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
                     }
@@ -3496,6 +3513,7 @@ impl App {
                 self.notice = None;
                 status_report(
                     match status {
+                        _ if quiet => "idle",
                         "completed" | "steered" => "done",
                         "interrupted" => "idle",
                         _ => "error",
@@ -3503,18 +3521,21 @@ impl App {
                     &self.bot,
                 );
                 self.configure().await;
-                if self.fleet.is_none() {
-                    match status {
-                        "completed" | "steered" => {
-                            let what = format!("{} is done", self.bot);
-                            self.sounds.alert(sound::Alert::LeadDone, &what)
-                        }
-                        "interrupted" => {}
-                        _ => {
-                            let what = format!("{} failed", self.bot);
-                            self.sounds.alert(sound::Alert::Failed, &what)
-                        }
+                // Only this view knows whether the turn said anything, so it
+                // rings for the end of every turn of its own; the project's
+                // other ends ring from the fleet.
+                match status {
+                    _ if quiet => {}
+                    "completed" | "steered" => {
+                        let what = format!("{} is done", self.bot);
+                        self.sounds.alert(sound::Alert::LeadDone, &what)
                     }
+                    "interrupted" => {}
+                    _ if self.fleet.is_none() => {
+                        let what = format!("{} failed", self.bot);
+                        self.sounds.alert(sound::Alert::Failed, &what)
+                    }
+                    _ => {}
                 }
             }
             "deleted" => {
@@ -3754,15 +3775,25 @@ impl App {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
-            let turn = self
+            let turns = self
                 .client
-                .request("turns", json!({"bot": name, "newest": true, "limit": 1}))
+                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
                 .await
                 .ok()
-                .and_then(|page| page["turns"].get(0).cloned())
-                .unwrap_or(Value::Null);
+                .and_then(|page| page["turns"].as_array().cloned())
+                .unwrap_or_default();
+            let turn = turns.first().cloned().unwrap_or(Value::Null);
+            // A message steered into a running turn is recorded as a turn
+            // of its own that never ran: the time is the one it joined.
+            let ran = turns
+                .iter()
+                .find(|turn| turn["status"] != "steered")
+                .unwrap_or(&Value::Null);
             let running = !bot["running_turn"].is_null();
-            let state = match (running, turn["status"].as_str()) {
+            let state = match (
+                running,
+                if running { &turn } else { ran }["status"].as_str(),
+            ) {
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
                 }
@@ -3785,10 +3816,18 @@ impl App {
                 (false, Some(other)) => other.to_owned(),
                 (false, None) => "idle".into(),
             };
-            let at = if running {
-                turn["started_ms"].as_u64()
-            } else {
-                turn["finished_ms"].as_u64()
+            // A running turn counts on from its start; one that ended
+            // shows how long it took.
+            let started = ran["started_ms"].as_u64();
+            let finished = ran["finished_ms"].as_u64();
+            let (at, seconds) = match running {
+                true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
+                false => (
+                    finished,
+                    started
+                        .zip(finished)
+                        .map(|(began, ended)| ended.saturating_sub(began) / 1000),
+                ),
             };
             let resolved =
                 resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
@@ -3836,7 +3875,9 @@ impl App {
             rows.push(status::Row {
                 name: short(name, &project, &lead),
                 state,
-                seconds: at.map(|at| now.saturating_sub(at) / 1000),
+                running,
+                seconds,
+                at,
                 model,
                 latest: step,
                 place,
@@ -3850,10 +3891,45 @@ impl App {
             (
                 row.name != "lead",
                 row.group,
-                row.seconds.unwrap_or(u64::MAX),
+                std::cmp::Reverse(row.at.unwrap_or(0)),
             )
         });
         Ok((project, rows))
+    }
+
+    /// Count the running turn's time from when the daemon started it, not
+    /// from when this window first saw it run.
+    async fn turn_began(&mut self) {
+        let Some(turn) = self.running.as_ref().map(|r| r.turn) else {
+            return;
+        };
+        let Ok(page) = self
+            .client
+            .request(
+                "turns",
+                json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
+            )
+            .await
+        else {
+            return;
+        };
+        let Some(started) = page["turns"]
+            .get(0)
+            .filter(|row| row["turn"] == turn)
+            .and_then(|row| row["started_ms"].as_u64())
+        else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ago = Duration::from_millis(now.saturating_sub(started));
+        if let Some(running) = &mut self.running
+            && let Some(began) = Instant::now().checked_sub(ago)
+        {
+            running.started = began;
+        }
     }
 
     /// The oldest question `bot` asked and has no answer to, read from its
@@ -5529,8 +5605,8 @@ impl App {
     }
 }
 
-/// `/status` on its own screen: the card, its times counted on since it was
-/// read, and how to leave.
+/// `/status` on its own screen: the card, running turns' times counted on
+/// since it was read, and how to leave.
 fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
     if watch.background.is_some() {
         return draw_background(watch);
@@ -5541,7 +5617,9 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
         .iter()
         .cloned()
         .map(|mut row| {
-            row.seconds = row.seconds.map(|s| s + since);
+            if row.running {
+                row.seconds = row.seconds.map(|s| s + since);
+            }
             row
         })
         .collect();
@@ -6423,6 +6501,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_the_lookout_started_ends_quietly_unless_it_speaks() {
+        let client = daemon_answering(|_| {
+            json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Docs are blocked."}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        let lines = |app: &App| -> Vec<String> {
+            app.pending.iter().map(|line| line.to_string()).collect()
+        };
+        let note = json!({"request_id": "lookout-ab12"});
+        // Read what came in, nothing to say: no line under it.
+        app.daemon(turn_event("accepted", 1, note.clone())).await;
+        assert!(app.running.as_ref().is_some_and(|r| r.note));
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(!lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        // One that says something ends as any other turn.
+        app.daemon(turn_event("accepted", 2, note)).await;
+        app.daemon(
+            json!({"event": "text_delta", "bot": "b", "turn": 2, "text": "Docs are blocked."}),
+        )
+        .await;
+        app.daemon(turn_event("message", 2, json!({"node": 4})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let rows = lines(&app);
+        assert!(rows.iter().any(|row| row.starts_with("─ Worked")));
+        assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
+        // A reply long enough to spill above as it streams still speaks.
+        app.pending.clear();
+        app.height = 8;
+        app.daemon(turn_event(
+            "accepted",
+            4,
+            json!({"request_id": "lookout-cd34"}),
+        ))
+        .await;
+        let long: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 4, "text": long}))
+            .await;
+        assert!(app.live.as_ref().is_some_and(|live| live.spilled));
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        // The person's own turn, with nothing said, still ends with its line.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+    }
+
+    #[tokio::test]
     async fn an_emoji_reacts_to_a_reply_without_a_turn_and_again_takes_it_off() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -6628,6 +6778,7 @@ mod tests {
             turn: 1,
             started: Instant::now(),
             phase: "Working".into(),
+            note: false,
         });
         assert!(!app.configure().await);
         assert!(asked.lock().unwrap().is_empty());

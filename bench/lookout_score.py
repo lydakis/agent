@@ -5,9 +5,10 @@ LABELS has one label per check: whether the lead should have been told about
 that event at all (`tell`), keyed by the check's `n`, or by its `task`, `turn`
 and `kind` as `bench/lookout_cases` writes them, with an optional `cat`. A
 judge's Wake and Hold both tell the lead (Hold later); Drop does not. The
-baseline is the digest, which tells the lead about every turn a task ends.
-Task updates are that digest, so each judge is also scored with every Ended
-check counted as told: what reaches the lead at all, judged or not.
+baseline is the task updates, which tell the lead of every turn a task ends
+and every message someone else writes in one, so each judge is also scored
+with every Ended and Said check counted as told: what reaches the lead at
+all, judged or not. The judge then decides only what steers it at once.
 
 With a `lead` judge in the run, each other judge is also scored as the first
 stage of a two-stage judge: a check whose highest answer reaches the
@@ -71,7 +72,7 @@ def report(name, told_set, woke_set, answered, failed, ms, tokens, cached, extra
     tp_w, tp_t = len(woke_set & tell), len(told_set & tell)
     print(f"  wake now {len(woke_set)} (precision {ratio(tp_w, len(woke_set))}, recall {ratio(tp_w, len(tell))})")
     print(f"  told at all {len(told_set)} (precision {ratio(tp_t, len(told_set))}, recall {ratio(tp_t, len(tell))})")
-    updated = told_set | ended
+    updated = told_set | news
     tp_u = len(updated & tell)
     print(f"  told with task updates {len(updated)} (precision {ratio(tp_u, len(updated))}, "
           f"recall {ratio(tp_u, len(tell))}); missed: {sorted(tell - updated, key=str)}")
@@ -90,8 +91,9 @@ def report(name, told_set, woke_set, answered, failed, ms, tokens, cached, extra
 
 
 print(f"{len(checks)} labelled checks, {len(tell)} the lead should hear about")
-ended = {k for k in checks for judge in rows.values() if k in judge and judge[k]["kind"] == "Ended"}
-print(f"digest baseline: tells {len(ended)}, of them {len(ended & tell)} right; misses {len(tell - ended)}")
+news = {k for k in checks for judge in rows.values()
+        if k in judge and judge[k]["kind"] in ("Ended", "Said")}
+print(f"task updates baseline: tells {len(news)}, of them {len(news & tell)} right; misses {len(tell - news)}")
 
 outcomes = {}
 for judge, mine in rows.items():
