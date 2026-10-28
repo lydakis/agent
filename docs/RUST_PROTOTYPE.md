@@ -18,9 +18,14 @@ CARGO_HOME=.local/cargo cargo build --release --locked
 CARGO_HOME=.local/cargo cargo test --locked
 CARGO_HOME=.local/cargo cargo clippy --locked --all-targets -- -D warnings
 AGENT_TEST_RUNTIME=1 AGENT_BENCH_TEST_ENGINES=1 .local/venv/bin/python -m unittest discover -s tests -v
+AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m tests.run --jobs 4   # the same modules side by side
 .local/venv/bin/python -m bench run --engine rust --out .local/bench/rust
 .local/venv/bin/python -m bench.matrix --out .local/bench/three-engines
 ```
+
+Every pull request and push to main runs the format, Clippy and Rust test
+checks and, after a release build of the daemon and Sonny, the runtime suite
+with `tests.run` on Linux ([test.yml](../.github/workflows/test.yml)).
 
 The same checks run on Linux amd64 through Errand, with the build tree and
 the Python venv kept as named runner caches so a job pays for a build once
