@@ -76,6 +76,9 @@ identity is `bot_not_found`.
   `turn_budget_exhausted` before a call once it has spent N; the cap is
   the turn's own, so the next turn starts from zero. A steer joins a turn
   that already has its cap, so `steer` with the flag is `invalid_delivery`.
+- `run --image PATH` sends a PNG, JPEG, GIF or WebP with the prompt, after
+  its words; repeat it for more (up to 20, 5 MiB together). It goes with a
+  steer or a turn of its own alike.
 - `run --workspace DIR` chooses the folder. A new bot starts in it, or in
   the directory `run` was invoked from. A bot keeps its folder: a later
   `run` without the flag runs there wherever it is invoked, and one with it

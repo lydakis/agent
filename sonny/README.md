@@ -164,7 +164,21 @@ The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits.
+pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
+Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
+keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
+Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
+character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
+Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
+last of those took.
+
+Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
+Codex and Claude Code (terminals paste only text), and an image file
+dropped on the terminal, or its path pasted, is attached rather than typed.
+Each shows as `[Image #N]` where it goes in the message; a PNG longer than
+1568 pixels on a side is scaled down first. Web addresses, a link's text and
+paths of files that are there open on a click (Cmd-click in most terminals,
+Ctrl-click in Herdr).
 
 `!COMMAND` runs a command of your own with your shell, in the agent's
 folder, in any agent's window: the lead's or a task's. You see what it
@@ -228,7 +242,9 @@ off again never shows.
   **Resolved**, only counted until `r` shows them. The lead marks a task
   resolved with its `resolve_task` tool once nothing is left to do in it,
   such as when its pull request merged or you dropped the work, and the
-  task's window closes. New work sent to the task reopens it.
+  task's window closes. New work sent to the task reopens it. Each agent's
+  time is how long its running turn has been at it, or how long its last
+  turn took.
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
