@@ -88,7 +88,10 @@ pub fn sandbox(mode: &str, lead: bool, workspace: &std::path::Path) -> Map<Strin
 }
 
 /// The git folder of the repository `dir` is in, which its linked
-/// worktrees share, by its real path as the daemon keeps it.
+/// worktrees share, by its real path as the daemon keeps it. Only one
+/// named as the daemon knows a git folder, `.git` or `NAME.git`: in one
+/// named otherwise, such as a separate git folder, its hooks and config
+/// would not be kept, so a commit there asks instead.
 pub fn repository(dir: &std::path::Path) -> Option<String> {
     let found = crate::task::git(
         dir,
@@ -97,7 +100,9 @@ pub fn repository(dir: &std::path::Path) -> Option<String> {
     .ok()
     .filter(|path| !path.is_empty())?;
     let real = std::fs::canonicalize(found).ok()?;
-    real.to_str().map(str::to_owned)
+    real.to_str()
+        .filter(|path| path.ends_with(".git"))
+        .map(str::to_owned)
 }
 
 /// Whether `record`'s sandbox is the one `fields` give it: its mode, its
@@ -223,10 +228,21 @@ mod tests {
         let moved = json!({"settings": {"sandbox": "workspace-write", "writable": ["/gone/.git"],
             "network": true}});
         assert!(!sandboxed_as(&moved, &auto));
-        std::fs::remove_dir_all(&dir).unwrap();
-        // Outside a repository, only its own folder.
+        // Outside a repository, only its own folder; with a git folder
+        // named otherwise, whose hooks the daemon wouldn't know to keep,
+        // commits ask.
         let plain = std::env::temp_dir();
         assert_eq!(sandbox("ask", true, &plain)["writable"], json!([]));
+        let apart = dir.join("apart");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        crate::task::git(
+            &tree,
+            &["init", "-q", "--separate-git-dir", apart.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(sandbox("ask", true, &tree)["writable"], json!([]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
