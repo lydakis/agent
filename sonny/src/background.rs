@@ -187,7 +187,8 @@ pub struct View {
     items: Vec<Item>,
     lookout: String,
     selected: usize,
-    confirm: Option<String>,
+    /// The item the first `d` picked, by kind, agent and name.
+    confirm: Option<(Kind, String, String)>,
     notice: Option<String>,
 }
 
@@ -228,6 +229,10 @@ impl View {
             .and_then(|k| self.items.iter().position(|i| key_of(i) == k))
             .unwrap_or(self.selected)
             .min(self.items.len().saturating_sub(1));
+        // A removal waits only on the row it was asked for, still picked.
+        if self.confirm.is_some() && self.items.get(self.selected).map(key_of) != self.confirm {
+            self.confirm = None;
+        }
         self.lookout = lookout::status(&self.store, &self.bot);
     }
 
@@ -272,10 +277,10 @@ impl View {
                         "Sonny keeps the lead's tasks subscription; the lookout watches its tasks with it"
                             .into(),
                     );
-                } else if confirm.as_deref() == Some(item.name.as_str()) {
+                } else if confirm == Some(key_of(&item)) {
                     self.remove(&item);
                 } else {
-                    self.confirm = Some(item.name);
+                    self.confirm = Some(key_of(&item));
                 }
             }
             _ => {}
@@ -422,7 +427,7 @@ impl View {
         if let Some(notice) = &self.notice {
             return Line::from(format!("  {notice}")).fg(Color::Yellow);
         }
-        if let Some(name) = &self.confirm {
+        if let Some((_, _, name)) = &self.confirm {
             return Line::from(vec![
                 Span::raw("  d again removes ").fg(Color::Yellow),
                 Span::raw(name.clone()).bold().fg(Color::Yellow),
@@ -575,7 +580,18 @@ mod tests {
         assert_eq!(lines[9], " ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         assert_eq!(press(&mut view, KeyCode::Char('d')), Key::Stay);
-        assert_eq!(view.confirm.as_deref(), Some("nightly"));
+        assert_eq!(
+            view.confirm,
+            Some((Kind::Trigger, "calc.lead".into(), "nightly".into()))
+        );
+        // A reload that no longer finds it there forgets it.
+        view.reload();
+        assert_eq!(view.confirm, None);
+        view.items = vec![
+            item(Kind::Trigger, "nightly", &["calc.lead"], false),
+            item(Kind::Subscription, "tasks", &["calc.lead"], true),
+        ];
+        press(&mut view, KeyCode::Char('d'));
         // Any other key keeps it; esc then only cancels.
         assert_eq!(press(&mut view, KeyCode::Esc), Key::Stay);
         assert_eq!(view.confirm, None);
