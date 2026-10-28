@@ -318,17 +318,20 @@ fn told(dir: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, Stri
     if named("--instructions") || named("--instructions-file") {
         return Err("--agents and --profile compose instructions; --instructions sets them".into());
     }
-    // What every task is told comes after any role, so it is never the role too.
+    // What every task is told comes after any role, so its body is never
+    // the role's too; its model and tools still apply when it is named.
     let task = crate::project::task_profile(info)?;
-    let role = match profile
-        .filter(|name| !name.eq_ignore_ascii_case("task") && !name.eq_ignore_ascii_case(&task))
-    {
+    let role = match profile {
         Some(name) => Some(crate::project::profile(dir, name)?),
         None => None,
     };
+    let told_after = |role: &&agent_client::policy::Profile| {
+        role.name.eq_ignore_ascii_case("task") || role.name.eq_ignore_ascii_case(&task)
+    };
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
-    let composed = agent_client::policy::instructions(dir, role.as_ref(), &memory)
-        .map_err(|e| format!("{}: {e}", e.code()))?;
+    let composed =
+        agent_client::policy::instructions(dir, role.as_ref().filter(|r| !told_after(r)), &memory)
+            .map_err(|e| format!("{}: {e}", e.code()))?;
     let mut added = Vec::new();
     if let Some(role) = &role {
         if let Some(model) = role.model.as_ref().filter(|_| !named("--model")) {
@@ -2008,7 +2011,13 @@ mod tests {
             text.ends_with("helping them well is the care.\n\nShip small."),
             "{text}"
         );
+        std::fs::write(
+            dir.join(".agents/agents/worker.md"),
+            "---\nextends: task\ntools: [read]\n---\nShip small.\n",
+        )
+        .unwrap();
         let flags = told(&["--profile", "worker"]).unwrap();
+        assert_eq!(flags[..2], ["--tools", "read"]);
         assert_eq!(flags.last().unwrap().matches("Ship small.").count(), 1);
         *project.borrow_mut() = serde_json::json!({"threads_profile": "nobody"});
         assert!(

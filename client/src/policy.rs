@@ -687,6 +687,8 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
     // Profiles that build on a client role: that role's variants, set as
     // a lead's or task's role, not roles to start a peer in.
     let mut hidden = std::collections::BTreeSet::<String>::new();
+    // What each indexed profile extends, to hide variants of variants.
+    let mut bases = std::collections::BTreeMap::<String, String>::new();
     let mut used = 0usize;
     let mut visited = 0usize;
     for dir in dirs {
@@ -760,6 +762,9 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                 hidden.insert(entry.name);
                 continue;
             }
+            if let Some(base) = front.extends.filter(|b| *b != entry.name) {
+                bases.insert(entry.name.clone(), base);
+            }
             let summary = front.description.filter(|d| !d.is_empty()).or_else(|| {
                 body.lines()
                     .map(|l| l.trim().trim_start_matches('#').trim())
@@ -774,6 +779,20 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                 return Err(too_long(used));
             }
             found.insert(entry.name.clone(), entry);
+        }
+    }
+    // A profile that extends a hidden one is a client role's variant too.
+    loop {
+        let more: Vec<String> = (bases.iter())
+            .filter(|(name, base)| found.contains_key(*name) && hidden.contains(*base))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for name in more {
+            found.remove(&name);
+            hidden.insert(name);
         }
     }
     Ok(found.into_values().collect())
@@ -845,6 +864,9 @@ pub fn profile_with(
     layers.push(None);
     let mut chain: Vec<(Profile, Front)> = Vec::new();
     let mut seen: Vec<(String, usize)> = Vec::new();
+    // What the role's files hold so far: none is read past what could
+    // still fit in a bot's instructions.
+    let mut used = 0usize;
     let (mut want, mut from) = (name.to_owned(), 0);
     loop {
         if !profile_name(&want) {
@@ -858,7 +880,8 @@ pub fn profile_with(
                 ),
             });
         }
-        let Some((layer, profile, front)) = find(&layers, &want, from, builtins)? else {
+        let room = MAX_INSTRUCTIONS.saturating_sub(used);
+        let Some((layer, profile, front)) = find(&layers, &want, from, builtins, room)? else {
             if chain.is_empty() {
                 return Ok(None);
             }
@@ -879,6 +902,7 @@ pub fn profile_with(
             });
         }
         seen.push((want.clone(), layer));
+        used += profile.body.len();
         let base = front.extends.clone().filter(|b| !b.is_empty());
         chain.push((profile, front));
         match base {
@@ -908,10 +932,9 @@ pub fn profile_with(
         }
     }
     for skill in &skills {
-        bodies.push(format!(
-            "## Skill: {skill}\n\n{}",
-            skill_text(workspace, skill)?
-        ));
+        let text = skill_text(workspace, skill, MAX_INSTRUCTIONS.saturating_sub(used))?;
+        used += text.len();
+        bodies.push(format!("## Skill: {skill}\n\n{text}"));
     }
     role.body = bodies.join("\n\n");
     Ok(Some(role))
@@ -924,6 +947,7 @@ fn find(
     name: &str,
     from: usize,
     builtins: &[(&str, &str)],
+    room: usize,
 ) -> Result<Option<(usize, Profile, Front)>, Failure> {
     for (at, layer) in layers.iter().enumerate().skip(from) {
         let Some(dir) = layer else {
@@ -940,31 +964,36 @@ fn find(
         if !is_file(&path)? {
             continue;
         }
-        let Some(text) = read_bounded(&path, MAX_INSTRUCTIONS)? else {
-            return Err(Failure::TooLong {
-                total: std::fs::metadata(&path).map_or(MAX_INSTRUCTIONS + 1, |m| m.len() as usize),
-                path,
-            });
-        };
-        // An unclosed head would read the whole role as front matter and
-        // start the bot without it.
-        if (text.starts_with("---\n") || text.starts_with("---\r\n"))
-            && !text[3..].contains("\n---")
-        {
-            return Err(Failure::Unreadable {
-                path,
-                reason: "front matter opened with --- is not closed".into(),
-            });
-        }
+        let text = role_file(&path, room)?;
         let front = front_matter(&text).0;
         return Ok(Some((at, Profile::parse(name, Some(path), &text), front)));
     }
     Ok(None)
 }
 
-/// The body of the skill `name` a profile carries: the workspace's, else
-/// the user's.
-fn skill_text(workspace: &Path, name: &str) -> Result<String, Failure> {
+/// A profile's or skill's whole file, if it fits in `room`. An unclosed
+/// head would read the whole file as front matter and start the bot
+/// without its text.
+fn role_file(path: &Path, room: usize) -> Result<String, Failure> {
+    let Some(text) = read_bounded(path, room)? else {
+        return Err(Failure::TooLong {
+            total: MAX_INSTRUCTIONS - room
+                + std::fs::metadata(path).map_or(room + 1, |m| m.len() as usize),
+            path: path.to_path_buf(),
+        });
+    };
+    if (text.starts_with("---\n") || text.starts_with("---\r\n")) && !text[3..].contains("\n---") {
+        return Err(Failure::Unreadable {
+            path: path.to_path_buf(),
+            reason: "front matter opened with --- is not closed".into(),
+        });
+    }
+    Ok(text)
+}
+
+/// The body of the skill `name` a profile carries, if it fits in `room`:
+/// the workspace's, else the user's.
+fn skill_text(workspace: &Path, name: &str, room: usize) -> Result<String, Failure> {
     if !profile_name(name) {
         return Err(Failure::Invalid {
             path: name.into(),
@@ -976,12 +1005,7 @@ fn skill_text(workspace: &Path, name: &str) -> Result<String, Failure> {
         if !is_file(&path)? {
             continue;
         }
-        let Some(text) = read_bounded(&path, MAX_INSTRUCTIONS)? else {
-            return Err(Failure::TooLong {
-                total: std::fs::metadata(&path).map_or(MAX_INSTRUCTIONS + 1, |m| m.len() as usize),
-                path,
-            });
-        };
+        let text = role_file(&path, room)?;
         return Ok(front_matter(&text).1.trim().to_owned());
     }
     Err(Failure::Missing {
@@ -1718,6 +1742,19 @@ mod tests {
         std::fs::write(
             agents.join("careful.md"),
             "---\ntools: [read]\n---\nBe careful.",
+        )
+        .unwrap();
+        let names: Vec<_> = instructions(&root, None, &[])
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["careful", "reviewer"]);
+        // So is a variant of a variant.
+        std::fs::write(
+            agents.join("area-lead.md"),
+            "---\nextends: super-lead\n---\nOne area.",
         )
         .unwrap();
         let names: Vec<_> = instructions(&root, None, &[])
