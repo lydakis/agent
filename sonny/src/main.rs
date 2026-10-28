@@ -17,8 +17,10 @@ mod cache;
 mod calls;
 mod declared;
 mod diff;
+mod embed;
 mod errand;
 mod herdr;
+mod highlight;
 mod html;
 mod image;
 mod js;
@@ -29,6 +31,7 @@ mod math;
 mod mermaid;
 mod models;
 mod mux;
+mod pane;
 mod place;
 mod plan;
 mod project;
@@ -68,7 +71,7 @@ use ratatui::{
             enable_raw_mode,
         },
     },
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
@@ -100,6 +103,12 @@ const QUOTED: usize = 72;
 const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// The widest the conversation is written, however wide the window: a
+/// reply reads as a column, not a band across the screen. Prose reads
+/// best at 45 to 90 characters a line, but replies carry code, paths and
+/// tables too, which most style guides keep within 100 (rustfmt's own
+/// width), so they stay whole at 100 and prose stays near the measure.
+const PROSE: usize = 100;
 /// How long a side chat's copy stays once idle.
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
@@ -705,6 +714,8 @@ async fn run() -> Result<(), String> {
     trigger::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
+    // So are the syntaxes, before the first code is colored.
+    std::thread::spawn(highlight::preload);
     let (client, mut events) = connect(&options).await?;
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
@@ -1287,7 +1298,9 @@ struct Latest {
 /// `/status` on its own screen, its timers ticking and its rows read
 /// again every two seconds, until Esc.
 struct Watch {
-    screen: Tui,
+    /// Its own screen, inline; none on the full screen, where it is drawn
+    /// in the pane beside the conversation.
+    screen: Option<Tui>,
     project: String,
     rows: Vec<status::Row>,
     /// This project's active Errand jobs.
@@ -1430,6 +1443,16 @@ struct App {
     /// read, and the view held where it was while all is drawn again.
     want_older: bool,
     hold_view: bool,
+    /// The window's width, the pane's included.
+    full_width: u16,
+    /// The pane beside the conversation on the full screen, with what the
+    /// person opened to look at; whether keys go to it; and whether the
+    /// mouse button went down in it, so a drag stays in it.
+    pane: Option<pane::Pane>,
+    pane_keys: bool,
+    pane_mouse: bool,
+    /// A program in the pane drew something: the screen is drawn again.
+    woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -2118,6 +2141,11 @@ impl App {
             older: None,
             want_older: false,
             hold_view: false,
+            full_width: 0,
+            pane: None,
+            pane_keys: false,
+            pane_mouse: false,
+            woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
             move_to: None,
@@ -2279,6 +2307,7 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {}
+                _ = self.woken.notified() => {}
             }
             if self
                 .watch
@@ -2293,6 +2322,13 @@ impl App {
             if self.spread.is_some_and(|(_, at)| at <= Instant::now()) {
                 self.spread().await;
             }
+            // What the side chat copied goes on the clipboard, as the
+            // terminal Sonny runs in would have put it.
+            if let Some(program) = self.pane.as_ref().and_then(|p| p.program.as_ref()) {
+                for text in program.copied() {
+                    term::copy(&text);
+                }
+            }
             self.side_closed();
             self.shell_ran().await;
             self.listed();
@@ -2302,8 +2338,7 @@ impl App {
                 self.older().await;
             }
             self.repaint |= term::switched();
-            if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
-            {
+            if self.repaint && self.running.is_none() && !self.watching() && self.side.is_none() {
                 self.repaint = false;
                 self.repaint(terminal).await?;
             }
@@ -2317,7 +2352,7 @@ impl App {
     async fn shell_ran(&mut self) {
         if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
             let ran = self.shell.take().unwrap().ran().await;
-            self.shown.extend(user_shell::lines(&ran, self.width));
+            self.shown.extend(user_shell::lines(&ran, self.prose()));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
             match self.send(record.clone(), Some(SHELL), false, &[]).await {
@@ -2779,7 +2814,7 @@ impl App {
             Some(output),
             failed,
             &self.workspace,
-            self.width,
+            self.prose(),
         );
         self.commit(transcript::quiet(lines));
     }
@@ -2966,14 +3001,15 @@ impl App {
                         self.draw_bot_reactions();
                         asks::close(&mut self.asks, &text(&item));
                         // What the person ran is shown as it was when it ran.
-                        let lines = landed(&text(&item), &mut self.ran_here, self.width);
+                        let prose = self.prose();
+                        let lines = landed(&text(&item), &mut self.ran_here, prose);
                         self.commit(lines);
                         self.answering = Some((first_words(&text(&item)), self.rows_drawn));
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let mut lines = transcript::reply(&reply, self.width);
+                            let mut lines = transcript::reply(&reply, self.prose());
                             lines.extend(self.reacted_row(node));
                             said = Some(lines);
                             self.saw_reply(node, &reply);
@@ -3215,7 +3251,7 @@ impl App {
                         self.live_line(&mut live, line);
                     }
                 }
-                let held = live.markdown.end(self.width, live.lines == 0);
+                let held = live.markdown.end(self.prose(), live.lines == 0);
                 self.live_rows(&mut live, held);
                 live.closed = true;
             }
@@ -3247,7 +3283,7 @@ impl App {
     }
 
     fn live_line(&mut self, live: &mut Live, line: &str) {
-        let rows = live.markdown.feed(line, self.width, live.lines == 0);
+        let rows = live.markdown.feed(line, self.prose(), live.lines == 0);
         self.live_rows(live, rows);
     }
 
@@ -3363,7 +3399,8 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                     && !reactions::is_reaction(&text(item))
                 {
-                    let lines = landed(&text(item), &mut self.ran_here, self.width);
+                    let prose = self.prose();
+                    let lines = landed(&text(item), &mut self.ran_here, prose);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
                     self.answered(&text(item));
@@ -3381,7 +3418,8 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    let lines = landed(&text(item), &mut self.ran_here, self.width);
+                    let prose = self.prose();
+                    let lines = landed(&text(item), &mut self.ran_here, prose);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
                     self.answered(&text(item));
@@ -3479,7 +3517,7 @@ impl App {
                 } else if let Some(item) = &item {
                     self.end_live(Words::Reply);
                     let mut live = Live::new(self.any_history);
-                    let rows = transcript::reply(&text(item), self.width);
+                    let rows = transcript::reply(&text(item), self.prose());
                     self.live_rows(&mut live, rows);
                     live.closed = true;
                     self.live = Some(live);
@@ -3676,7 +3714,7 @@ impl App {
                 let running = self.running.take();
                 let note = running.as_ref().is_some_and(|r| r.note);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
-                let line = transcript::finished(status, detail, seconds, self.width);
+                let line = transcript::finished(status, detail, seconds, self.prose());
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -3813,6 +3851,21 @@ impl App {
             }
         };
         let jobs = errand::jobs(self.folder_name()).await;
+        // The full screen shows it beside the conversation.
+        if full() {
+            self.watch = Some(Watch {
+                screen: None,
+                project,
+                rows,
+                jobs,
+                read: Instant::now(),
+                lookout: self.lookout_line(),
+                resolved: false,
+                background: None,
+            });
+            self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+            return;
+        }
         self.watch(project, rows, jobs, None);
     }
 
@@ -3849,7 +3902,7 @@ impl App {
                     let _ = screen.clear();
                 }
                 self.watch = Some(Watch {
-                    screen,
+                    screen: Some(screen),
                     project,
                     rows,
                     jobs,
@@ -4363,23 +4416,77 @@ impl App {
     fn full_screen(&mut self, event: &Event) -> bool {
         let key = match event {
             // A paste while finding is more to find.
+            // A paste in the pane's program is its own.
+            Event::Paste(text)
+                if self.pane_keys
+                    && let Some(program) = self.pane.as_ref().and_then(|p| p.program.as_ref()) =>
+            {
+                program.paste(text);
+                return true;
+            }
+            // A paste over a preview or `/status` is for the composer,
+            // which comes back into view to show it.
+            Event::Paste(_) if self.pane_keys && self.finding.is_none() => {
+                self.pane_keys = false;
+                return false;
+            }
             Event::Paste(text) if let Some(query) = &mut self.finding => {
                 query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
                 self.screen.find(query);
                 return true;
             }
             Event::Mouse(mouse) => {
-                let up = mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp;
-                if up && self.screen.at_top() && self.older.is_some() {
-                    self.want_older = true;
-                }
-                match self.screen.mouse(*mouse) {
-                    Some(screen::Action::Copy(text)) => self.copied(&text),
-                    Some(screen::Action::Open(link)) => {
-                        if let Err(error) = open(&link) {
-                            self.notice = Some(error);
-                        }
+                use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+                let at = (mouse.column, mouse.row).into();
+                let over_pane = self.pane.as_ref().is_some_and(|p| p.area.contains(at));
+                let down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                if down {
+                    self.pane_mouse = over_pane;
+                    self.pane_keys = over_pane;
+                    // The keys go to the pane: the conversation's find ends.
+                    if over_pane && self.finding.take().is_some() {
+                        self.screen.end_find();
                     }
+                }
+                let held = matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                );
+                let in_pane = if held { self.pane_mouse } else { over_pane };
+                let action = match &mut self.pane {
+                    Some(pane) if in_pane => {
+                        // A click on its name opens the file outside Sonny.
+                        if down
+                            && pane.on_title(mouse.column, mouse.row)
+                            && let Some(url) = pane.url()
+                        {
+                            if let Err(error) = open(&url) {
+                                self.notice = Some(error);
+                            }
+                            return true;
+                        }
+                        if let Some(program) = &pane.program {
+                            let (x, y) = pane.origin();
+                            program.mouse(*mouse, x, y);
+                            return true;
+                        }
+                        pane.screen.mouse(*mouse)
+                    }
+                    _ => {
+                        let up = mouse.kind == MouseEventKind::ScrollUp;
+                        if up && self.screen.at_top() && self.older.is_some() {
+                            self.want_older = true;
+                        }
+                        // A press here lets go of what was selected there.
+                        if down && let Some(pane) = &mut self.pane {
+                            pane.screen.unselect();
+                        }
+                        self.screen.mouse(*mouse)
+                    }
+                };
+                match action {
+                    Some(screen::Action::Copy(text)) => self.copied(&text),
+                    Some(screen::Action::Open(link)) => self.follow(&link),
                     None => {}
                 }
                 return true;
@@ -4390,6 +4497,63 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        if self.finding.is_none()
+            && let Some(pane) = &mut self.pane
+        {
+            // A program has every key but Shift+Tab, which comes back here.
+            if self.pane_keys
+                && let Some(program) = &pane.program
+            {
+                match key.code {
+                    KeyCode::BackTab => self.pane_keys = false,
+                    _ => program.key(*key),
+                }
+                return true;
+            }
+            if self.pane_keys {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.pane = None;
+                        self.pane_keys = false;
+                    }
+                    // `/status` lists the resolved tasks, or only counts them.
+                    KeyCode::Char('r')
+                        if pane.is_card()
+                            && let Some(watch) = &mut self.watch =>
+                    {
+                        watch.resolved = !watch.resolved
+                    }
+                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Up => pane.screen.scroll(1),
+                    KeyCode::Down => pane.screen.scroll(-1),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    // Anything else is for the composer, as it was typed.
+                    _ => {
+                        self.pane_keys = false;
+                        return false;
+                    }
+                }
+                return true;
+            }
+            // Tab, with nothing typed, puts the keys in the pane.
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+                && self.input.is_empty()
+                && self.picker.is_none()
+                && self.choosing.is_none()
+                && self.reacting.is_none()
+            {
+                pane.screen.unselect();
+                self.pane_keys = true;
+                return true;
+            }
+        }
         if let Some(query) = &mut self.finding {
             match key.code {
                 KeyCode::Esc => self.finding = None,
@@ -4444,12 +4608,76 @@ impl App {
         true
     }
 
+    /// `pane` beside the conversation, with the keys; what was selected
+    /// or being found in the conversation let go.
+    fn open_pane(&mut self, pane: pane::Pane) {
+        self.pane = Some(pane);
+        self.pane_keys = true;
+        self.screen.unselect();
+        if self.finding.take().is_some() {
+            self.screen.end_find();
+        }
+    }
+
+    /// `/status` has a screen of its own.
+    fn watching(&self) -> bool {
+        self.watch.as_ref().is_some_and(|w| w.screen.is_some())
+    }
+
+    /// A link clicked on the full screen: a file is shown in the pane, as
+    /// a preview, and anything else opened as the system opens it.
+    fn follow(&mut self, link: &str) {
+        if link.starts_with("file://") {
+            let workspace = std::path::Path::new(&self.workspace);
+            let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+            match pane::Pane::preview(link, workspace, width) {
+                Ok(pane) => self.open_pane(pane),
+                Err(error) => self.notice = Some(error),
+            }
+            return;
+        }
+        if let Err(error) = open(link) {
+            self.notice = Some(error);
+        }
+    }
+
+    /// Where the conversation and the pane go in `area`, the conversation
+    /// none when the pane takes the whole of a narrow window, and the
+    /// pane none when it is closed or the conversation is shown instead.
+    fn split(&self, area: Rect) -> (Rect, Option<Rect>) {
+        if self.pane.is_none() || !full() {
+            return (area, None);
+        }
+        let pane = pane::width(area.width, PROSE as u16);
+        if pane == area.width {
+            return match self.pane_keys {
+                true => (Rect { width: 0, ..area }, Some(area)),
+                false => (area, None),
+            };
+        }
+        let chat = Rect {
+            width: area.width - pane - 1,
+            ..area
+        };
+        let pane = Rect {
+            x: area.right() - pane,
+            width: pane,
+            ..area
+        };
+        (chat, Some(pane))
+    }
+
     /// A page up the full screen, or the page before its first row.
     fn page_up(&mut self) {
         if self.screen.at_top() && self.older.is_some() {
             self.want_older = true;
         }
         self.screen.page(true);
+    }
+
+    /// The width the conversation is written at.
+    fn prose(&self) -> usize {
+        self.width.min(PROSE)
     }
 
     /// `text` put on the clipboard, and said so.
@@ -4478,10 +4706,12 @@ impl App {
             key.code = code;
             key.modifiers -= KeyModifiers::CONTROL;
         }
-        if full() && self.watch.is_none() && self.full_screen(&event) {
+        if full() && !self.watching() && self.full_screen(&event) {
             return;
         }
-        if let Some(watch) = &mut self.watch {
+        if let Some(watch) = &mut self.watch
+            && watch.screen.is_some()
+        {
             if let Some(view) = &mut watch.background {
                 if let Event::Key(key) = event
                     && key.kind != KeyEventKind::Release
@@ -4777,10 +5007,10 @@ impl App {
                     KeyCode::Home => self.input.home(),
                     KeyCode::End => self.input.end(),
                     KeyCode::Up => {
-                        self.input.up(self.width);
+                        self.input.up(self.prose());
                     }
                     KeyCode::Down => {
-                        self.input.down(self.width);
+                        self.input.down(self.prose());
                     }
                     // Alt-Enter too, for terminals that send Shift-Enter
                     // as a plain Enter.
@@ -5267,7 +5497,7 @@ impl App {
                 };
                 let rows = transcript::wrap(
                     Line::from(what),
-                    self.width,
+                    self.prose(),
                     Span::raw("  "),
                     Span::raw("    "),
                 );
@@ -5341,7 +5571,7 @@ impl App {
         };
         let rows = transcript::wrap(
             Line::from(what),
-            self.width,
+            self.prose(),
             Span::raw("  "),
             Span::raw("    "),
         );
@@ -5410,6 +5640,28 @@ impl App {
         if let Some(model) = &self.turn_model {
             command.args(["--model", model]);
         }
+        // The full screen has it beside the conversation, on a terminal
+        // of its own.
+        if full() {
+            let mut program = portable_pty::CommandBuilder::new(command.get_program());
+            program.args(command.get_args());
+            if let Ok(here) = std::env::current_dir() {
+                program.cwd(here);
+            }
+            program.env("TERM", "xterm-256color");
+            let height = self.height.saturating_sub(2).max(2) as u16;
+            let width = match pane::width(self.full_width, PROSE as u16) {
+                0 => 80,
+                width => width,
+            };
+            let woken = self.woken.clone();
+            let drawn = move || woken.notify_one();
+            match embed::Embedded::spawn(program, height, width, term::light(), drawn) {
+                Ok(program) => self.open_pane(pane::Pane::program("side chat", program)),
+                Err(error) => self.notice = Some(format!("no side chat: {error}")),
+            }
+            return;
+        }
         // The key reader lets go before the side chat reads the keyboard.
         self.keys_paused
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5435,6 +5687,13 @@ impl App {
 
     /// Back from a side chat that has ended.
     fn side_closed(&mut self) {
+        if let Some(pane) = &mut self.pane
+            && let Some(program) = &mut pane.program
+            && program.ended()
+        {
+            self.pane = None;
+            self.pane_keys = false;
+        }
         if let Some(child) = &mut self.side
             && !matches!(child.try_wait(), Ok(None))
         {
@@ -5497,7 +5756,13 @@ impl App {
         // The pane may have changed size since these lines were wrapped:
         // the viewport takes the new size first, and a line still too wide
         // is cut into rows rather than losing its end.
-        if self.watch.is_some() || self.side.is_some() {
+        // /status beside the conversation, gone once the pane is.
+        if self.watch.as_ref().is_some_and(|w| w.screen.is_none())
+            && !self.pane.as_ref().is_some_and(|p| p.is_card())
+        {
+            self.watch = None;
+        }
+        if self.watching() || self.side.is_some() {
             // History waits for the main screen, its newest lines kept.
             if let Some(over) = self.pending.len().checked_sub(KEPT_UNDER_STATUS)
                 && over > 0
@@ -5521,16 +5786,30 @@ impl App {
             terminal.clear()?;
         }
         terminal.autoresize()?;
-        let width = terminal.size()?.width as usize;
+        // The conversation's width, the pane's taken off: the window's
+        // while the pane has all of a narrow one, as it gets back after.
+        let size = terminal.size()?;
+        self.full_width = size.width;
+        let (chat, shown) = self.split(Rect::new(0, 0, size.width, size.height));
+        // A pane a narrow window hides takes no clicks.
+        if shown.is_none()
+            && let Some(pane) = &mut self.pane
+        {
+            pane.area = Rect::default();
+        }
+        let width = match chat.width {
+            0 => size.width,
+            chat => chat,
+        } as usize;
         self.width = width;
         self.height = terminal.size()?.height as usize;
-        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width);
+        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(PROSE));
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
-        let mut open_rows = self.open_rows(width);
+        let mut open_rows = self.open_rows(width.min(PROSE));
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
@@ -5584,22 +5863,72 @@ impl App {
         }
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
+        if let (Some(watch), Some(pane)) = (&self.watch, &mut self.pane)
+            && pane.is_card()
+        {
+            let wide = match chat.width {
+                0 => size.width,
+                _ => pane::width(size.width, PROSE as u16),
+            };
+            let (lines, any_resolved) = watch_card(watch, wide.saturating_sub(2) as usize);
+            let keys = match any_resolved && watch.resolved {
+                true => "r hides resolved · esc closes",
+                false => STATUS_KEYS,
+            };
+            pane.set_card(lines, keys);
+        }
+        // The full screen's links, to be written again as hyperlinks.
+        let mut linked = Vec::new();
+        // Where the pane's program has its cursor.
+        let mut pane_cursor = None;
         terminal.draw(|frame| {
             // The full screen: the conversation above the rows that move,
             // which sit right under it until it fills the screen, as inline.
             let view = match full() {
                 true => {
-                    let area = frame.area();
+                    let (area, pane) = self.split(frame.area());
+                    if let (Some(at), Some(open)) = (pane, &mut self.pane) {
+                        // Paths in a file are read from its folder first.
+                        let base = open.folder().unwrap_or(&workspace).to_owned();
+                        let file = |word: &str| {
+                            links::file_line(&base, word)
+                                .or_else(|| links::file_line(&workspace, word))
+                        };
+                        pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, file);
+                        linked.extend(open.screen.link_cells(frame.buffer_mut()));
+                        // The line between them, as a split's.
+                        if area.width > 0 {
+                            let line = Rect {
+                                x: area.right(),
+                                width: 1,
+                                ..at
+                            };
+                            let rule = vec![Line::from("│").dim(); line.height as usize];
+                            frame.render_widget(Paragraph::new(rule), line);
+                        }
+                    }
+                    if let Some(cursor) = pane_cursor.filter(|_| self.pane_keys) {
+                        frame.set_cursor_position(cursor);
+                    }
+                    if area.width == 0 {
+                        return;
+                    }
                     let room = area.height.saturating_sub(below);
-                    let rows = self.screen.height(area.width as usize).min(room as usize);
+                    let column = area.width.min(PROSE as u16);
+                    let rows = self.screen.height(column as usize).min(room as usize);
                     let [history, view, _] = Layout::vertical([
                         Constraint::Length(rows as u16),
                         Constraint::Length(below),
                         Constraint::Min(0),
                     ])
                     .areas(area);
-                    let file = |word: &str| links::file(&workspace, word);
+                    let file = |word: &str| links::file_line(&workspace, word);
+                    let history = ratatui::layout::Rect {
+                        width: column,
+                        ..history
+                    };
                     self.screen.render(history, frame.buffer_mut(), file);
+                    linked.extend(self.screen.link_cells(frame.buffer_mut()));
                     view
                 }
                 false => frame.area(),
@@ -5853,12 +6182,29 @@ impl App {
                 return;
             }
             frame.render_widget(Paragraph::new(composer_rows), composer);
-            frame.set_cursor_position((
-                composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
-                composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
-            ));
+            // Keys in the pane: no cursor where they do not go.
+            if !self.pane_keys {
+                frame.set_cursor_position((
+                    composer.x + (cursor_col as u16).min(composer.width.saturating_sub(1)),
+                    composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
+                ));
+            }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
+        // Over themselves, the cursor kept where the frame left it.
+        if !linked.is_empty() {
+            execute!(
+                terminal.backend_mut(),
+                ratatui::crossterm::cursor::SavePosition
+            )?;
+            terminal
+                .backend_mut()
+                .draw(linked.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+            execute!(
+                terminal.backend_mut(),
+                ratatui::crossterm::cursor::RestorePosition
+            )?;
+        }
         Ok(())
     }
 
@@ -6032,51 +6378,28 @@ impl App {
     }
 }
 
-/// `/status` on its own screen: the card, running turns' times counted on
-/// since it was read, and how to leave.
+/// What the pane's title row says the keys do on `/status`.
+const STATUS_KEYS: &str = "esc closes";
+
+/// `/status` on its own screen, inline.
 fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
     if watch.background.is_some() {
         return draw_background(watch);
     }
-    let since = watch.read.elapsed().as_secs();
-    let rows: Vec<status::Row> = watch
-        .rows
-        .iter()
-        .cloned()
-        .map(|mut row| {
-            if row.running {
-                row.seconds = row.seconds.map(|s| s + since);
-            }
-            row
-        })
-        .collect();
-    let jobs: Vec<status::Row> = watch
-        .jobs
-        .iter()
-        .cloned()
-        .map(|mut job| {
-            job.seconds = job.seconds.map(|s| s + since);
-            job
-        })
-        .collect();
-    let project = watch.project.clone();
-    let lookout = watch.lookout.clone();
+    let Some(screen) = &mut watch.screen else {
+        return Ok(());
+    };
+    screen.autoresize()?;
+    let width = screen.size()?.width.saturating_sub(2) as usize;
     let resolved = watch.resolved;
-    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    watch.screen.autoresize()?;
-    watch.screen.draw(|frame| {
+    let (card, any_resolved) = watch_card(watch, width);
+    let mut lines = vec![Line::default()];
+    lines.extend(card);
+    let Some(screen) = &mut watch.screen else {
+        return Ok(());
+    };
+    screen.draw(|frame| {
         let area = frame.area();
-        let width = area.width.saturating_sub(2) as usize;
-        let mut lines = vec![Line::default()];
-        let mut card = status::card(&project, &rows, &jobs, width, resolved);
-        if !lookout.is_empty() {
-            card.insert(1, Line::from(lookout.clone()).dim());
-        }
-        lines.extend(card.into_iter().map(|line| {
-            let mut spans = vec![Span::raw(" ")];
-            spans.extend(line.spans);
-            Line::from(spans).style(line.style)
-        }));
         // The card says r shows them; once shown, here how to hide them.
         let footer = match any_resolved && resolved {
             true => "  esc to close · r hides resolved",
@@ -6098,14 +6421,55 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `/status`'s card at `width`, each line after a space, its times
+/// running turns counted on from when its rows were read; and whether any task in it
+/// is resolved.
+fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
+    let since = watch.read.elapsed().as_secs();
+    let rows: Vec<status::Row> = watch
+        .rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            if row.running {
+                row.seconds = row.seconds.map(|s| s + since);
+            }
+            row
+        })
+        .collect();
+    let jobs: Vec<status::Row> = watch
+        .jobs
+        .iter()
+        .cloned()
+        .map(|mut job| {
+            job.seconds = job.seconds.map(|s| s + since);
+            job
+        })
+        .collect();
+    let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
+    let mut card = status::card(&watch.project, &rows, &jobs, width, watch.resolved);
+    if !watch.lookout.is_empty() {
+        card.insert(1, Line::from(watch.lookout.clone()).dim());
+    }
+    let lines = card
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect();
+    (lines, any_resolved)
+}
+
 /// `/background` on its own screen: its card, scrolled to keep the picked
 /// row in sight, and the keys it takes.
 fn draw_background(watch: &mut Watch) -> std::io::Result<()> {
-    let Some(view) = &watch.background else {
+    let (Some(view), Some(screen)) = (&watch.background, &mut watch.screen) else {
         return Ok(());
     };
-    watch.screen.autoresize()?;
-    watch.screen.draw(|frame| {
+    screen.autoresize()?;
+    screen.draw(|frame| {
         let area = frame.area();
         let width = area.width.saturating_sub(2) as usize;
         let (card, at) = view.card(width);
