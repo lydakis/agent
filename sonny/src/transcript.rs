@@ -813,7 +813,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 25] = [
+const KEPT: [&str; 29] = [
     "Started",
     "Messaged",
     "Steered",
@@ -834,6 +834,10 @@ const KEPT: [&str; 25] = [
     "Fired the trigger",
     "Added the project",
     "Moved",
+    "Opened",
+    "Removed, dropping its work,",
+    "Subscribed to",
+    "Unsubscribed from",
     "Opened a tab",
     "Opened a split",
     "Stopped Errand job",
@@ -1614,12 +1618,13 @@ mod tests {
             r#"{"bot":"calc.fix","handle":"turn:calc.fix/2","turn":2}"#,
         );
         assert_eq!(started[0], "• Started calc.fix · turn 2");
-        // How a lead in Sonny starts a task, and the note it prints after.
-        let task = shell(
-            r#""/Applications/Sonny/sonny" task calc.fix --agents --setup --model "$AGENT_MODEL" -- 'Fix the tests.'"#,
-            "{\"bot\":\"calc.fix\",\"handle\":\"turn:calc.fix/3\",\"turn\":3}\nIts work comes back on branch agent/calc.fix.",
+        // How a lead in Sonny starts a task.
+        let task = clean(
+            "start_task",
+            serde_json::json!({"name": "fix", "brief": "Fix the tests.", "setup": true}),
+            "Started calc.fix: {\"handle\":\"turn:calc.fix/3\"}",
         );
-        assert_eq!(task, ["• Started calc.fix · turn 3", "  └ Fix the tests."]);
+        assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
         assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
         assert_eq!(
             shell(r#"sonny task changes calc.fix --apply"#, ""),
@@ -1676,10 +1681,7 @@ mod real_calls {
         );
         for row in rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(
-                !text.contains("AGENT_BIN") && !text.contains("sonny show"),
-                "{command}\n  drew: {text}"
-            );
+            assert!(!text.contains("AGENT_BIN"), "{command}\n  drew: {text}");
         }
     }
 
@@ -1719,15 +1721,15 @@ mod real_calls {
             false,
         );
         show(
-            r#""$AGENT_BIN" --help; "$HOME/.agent/project" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
+            r#""$AGENT_BIN" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
             "Usage: agent COMMAND [OPTIONS]\n",
             false,
         );
         show(
             &format!(
-                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'; "/Users/x/sonny" show calc.single-negative --split right"#
+                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'"#
             ),
-            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}\n{\"bot\":\"calc.single-negative\",\"session\":\"calc\"}",
+            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}",
             false,
         );
     }

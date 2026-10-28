@@ -77,23 +77,11 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "$REX" | "${REX}" | "rex" => rex(args, printed, failed),
         "memory" if program.contains(".agent/memory") => Some(memory(args, printed, failed)),
         "trigger" if program.contains(".agent/trigger") => trigger(args, printed, failed),
-        "project" if program.contains(".agent/project") => Some(Said {
-            verb: match args.first().map(String::as_str) {
-                Some("add") => "Added the project".into(),
-                _ => "Read the help for the project script".into(),
-            },
-            what: args.get(1).cloned().unwrap_or_default(),
-            under: Vec::new(),
-            failed,
-            output: None,
-        }),
         "sonny" if args.first().is_some_and(|a| a == "agent") => {
             agent(&args[1..], stdin, printed, failed)
         }
-        "sonny" if args.first().is_some_and(|a| a == "show") => sonny_show(&args[1..], failed),
-        "sonny" if args.first().is_some_and(|a| a == "run") => sonny_run(&args[1..], failed),
         "sonny" if args.first().is_some_and(|a| a == "task") => {
-            sonny_task(&args[1..], stdin, printed, failed)
+            sonny_task(&args[1..], printed, failed)
         }
         _ => None,
     }?;
@@ -745,89 +733,93 @@ fn errand(words: &[String], output: &str, failed: bool) -> Option<Said> {
     Some(said)
 }
 
-/// `sonny show`, as where the agent's window went.
-fn sonny_show(words: &[String], failed: bool) -> Option<Said> {
-    let (bot, rest) = words.split_first()?;
-    let args = Args::new(rest);
-    let (verb, what) = match args.value(&["--split"]) {
-        Some(side) => {
-            let beside = args.value(&["--beside"]).unwrap_or("you");
-            let side = match side {
-                "right" => "right of",
-                "left" => "left of",
-                other => other,
-            };
-            ("Moved", format!("{bot} to a split {side} {beside}"))
-        }
-        None => ("Moved", format!("{bot} to a tab of its own")),
+/// `sonny task changes`, as the changes of a sandfs copy, listed or
+/// applied.
+fn sonny_task(words: &[String], output: &str, failed: bool) -> Option<Said> {
+    let [changes, name, rest @ ..] = words else {
+        return None;
     };
+    if changes != "changes" {
+        return None;
+    }
+    let apply = rest.iter().any(|w| w == "--apply");
     Some(Said {
-        verb: verb.into(),
-        what,
-        under: Vec::new(),
-        failed,
-        output: None,
-    })
-}
-
-/// `sonny run`, as the block it opened for the agent.
-fn sonny_run(words: &[String], failed: bool) -> Option<Said> {
-    let (name, rest) = words.split_first()?;
-    let args = Args::new(rest);
-    let mut said = Said {
-        verb: match args.value(&["--split"]) {
-            Some(_) => "Opened a split",
-            None => "Opened a tab",
+        verb: match apply {
+            true => "Applied the changes of",
+            false => "Listed the changes of",
         }
         .into(),
         what: name.clone(),
         under: Vec::new(),
         failed,
-        output: None,
-    };
-    if let Some(command) = args.rest.as_ref() {
-        said.under.push(dim(format!("$ {}", first_line(command))));
-    }
-    Some(said)
-}
-
-/// `sonny task`, as the task it started, said as `agent run --detach
-/// --new` is, which it runs; or as the changes of a sandfs copy, listed
-/// or applied.
-fn sonny_task(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> Option<Said> {
-    if let [changes, name, rest @ ..] = words
-        && changes == "changes"
-    {
-        let apply = rest.iter().any(|w| w == "--apply");
-        return Some(Said {
-            verb: match apply {
-                true => "Applied the changes of",
-                false => "Listed the changes of",
-            }
-            .into(),
-            what: name.clone(),
-            under: Vec::new(),
-            failed,
-            output: (!apply).then(|| output.to_owned()),
-        });
-    }
-    let (name, rest) = words.split_first()?;
-    let mut run: Vec<String> = ["run", "--detach", "--new", "--bot", name]
-        .map(String::from)
-        .to_vec();
-    run.extend(rest.iter().filter(|w| *w != "--setup").cloned());
-    // What `agent run` printed, apart from the note on how the work comes back.
-    let started = output
-        .lines()
-        .find(|line| serde_json::from_str::<Value>(line.trim()).is_ok_and(|v| v.is_object()))
-        .unwrap_or(output);
-    agent(&run, stdin, started, failed)
+        output: (!apply).then(|| output.to_owned()),
+    })
 }
 
 /// A call of a tool Sonny declares, said as what it does: a question to
-/// the person with its choices, the plan it sets, or the task it resolved.
+/// the person with its choices, the plan it sets, a task it started,
+/// removed or resolved, where a window or pane went, the project it made,
+/// or the subscription it changed.
 pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
+    let field = |key: &str| arguments[key].as_str().map(str::trim);
+    let said = |verb: &str, what: &str| Said {
+        verb: verb.into(),
+        what: what.to_owned(),
+        under: Vec::new(),
+        failed,
+        output: None,
+    };
     match name {
+        crate::served::START => {
+            let mut said = said("Started", field("name")?);
+            if let Some(brief) = field("brief") {
+                said.under
+                    .push(Line::from(first_line(brief)).italic().dim());
+            }
+            Some(said)
+        }
+        crate::served::REMOVE => Some(said(
+            match arguments["discard"] == true {
+                true => "Removed, dropping its work,",
+                false => "Removed",
+            },
+            field("task")?,
+        )),
+        crate::served::SHOW => {
+            let agent = field("agent")?;
+            Some(match field("split") {
+                Some(side) => {
+                    let side = match side {
+                        "right" => "right of",
+                        "left" => "left of",
+                        other => other,
+                    };
+                    let beside = field("beside").unwrap_or("you");
+                    said("Moved", &format!("{agent} to a split {side} {beside}"))
+                }
+                None if agent.ends_with(".lead") => said("Opened", agent),
+                None => said("Moved", &format!("{agent} to a tab of its own")),
+            })
+        }
+        crate::served::RUN => {
+            let verb = match field("split") {
+                Some(_) => "Opened a split",
+                None => "Opened a tab",
+            };
+            let mut said = said(verb, field("name")?);
+            if let Some(command) = field("command") {
+                said.under.push(dim(format!("$ {}", first_line(command))));
+            }
+            Some(said)
+        }
+        crate::served::PROJECT => Some(said("Added the project", field("folder")?)),
+        crate::served::SUBSCRIPTIONS => {
+            Some(match (arguments["add"]["name"].as_str(), field("remove")) {
+                (Some(added), _) => said("Subscribed to", added),
+                (None, Some(removed)) => said("Unsubscribed from", removed),
+                (None, None) => said("Listed subscriptions", ""),
+            })
+        }
         crate::asks::TOOL => {
             let ask = crate::asks::call("", arguments)?;
             let mut said = Said {
@@ -1017,23 +1009,70 @@ Keep the rest.'"#,
         );
         assert_eq!(said.what, "…abcdef");
         assert_eq!(said.under.len(), 4);
-        let said = said_or_none(
-            r#""/opt/homebrew/bin/sonny" run tests -- cargo test --workspace"#,
-            r#"{"block":"block:01","label":"shop.fix/tests","session":"shop"}"#,
-        );
+        let said = declared(
+            "run_in_pane",
+            &serde_json::json!({"name": "tests", "command": "cargo test --workspace"}),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             (said.verb.as_str(), said.what.as_str()),
             ("Opened a tab", "tests")
         );
         assert_eq!(text(&said.under[0]), "$ cargo test --workspace");
-        let said = said_or_none(
-            r#""/opt/homebrew/bin/sonny" run server --split right -- npm run dev"#,
-            r#"{"block":"block:02","label":"shop.lead/server","session":"shop"}"#,
-        );
+        let said = declared(
+            "run_in_pane",
+            &serde_json::json!({"name": "server", "split": "right", "command": "npm run dev"}),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             (said.verb.as_str(), said.what.as_str()),
             ("Opened a split", "server")
         );
+    }
+
+    #[test]
+    fn sonny_s_answered_tools_say_what_they_did() {
+        let call = |name: &str, arguments: serde_json::Value| {
+            let said = declared(name, &arguments, false).unwrap();
+            format!("{} {}", said.verb, said.what)
+        };
+        assert_eq!(
+            call(
+                "start_task",
+                serde_json::json!({"name": "fix", "brief": "Fix it.\nThen test."})
+            ),
+            "Started fix"
+        );
+        assert_eq!(
+            call("remove_task", serde_json::json!({"task": "fix"})),
+            "Removed fix"
+        );
+        assert_eq!(
+            call(
+                "show_agent",
+                serde_json::json!({"agent": "shop.fix", "split": "right"})
+            ),
+            "Moved shop.fix to a split right of you"
+        );
+        assert_eq!(
+            call("show_agent", serde_json::json!({"agent": "web.lead"})),
+            "Opened web.lead"
+        );
+        assert_eq!(
+            call("new_project", serde_json::json!({"folder": "/src/web"})),
+            "Added the project /src/web"
+        );
+        assert_eq!(
+            call(
+                "subscriptions",
+                serde_json::json!({"add": {"name": "prs", "bots": ["a"]}})
+            ),
+            "Subscribed to prs"
+        );
+        // An agent that runs no Sonny tool is said some other way.
+        assert!(declared("start_task", &serde_json::json!({}), false).is_none());
     }
 
     #[test]

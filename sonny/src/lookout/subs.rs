@@ -1,7 +1,7 @@
 //! Subscriptions: what the lookout watches for each subscriber, and what it
 //! asks about it. Each subscriber's are one file, `STORE.lookout/BOT.json`,
-//! which `sonny lookout add`, `ls` and `rm` edit; the lookout reads them
-//! again every few seconds. The lookout watches for whoever has a file and
+//! which its `subscriptions` tool edits; the lookout reads them again every
+//! few seconds. The lookout watches for whoever has a file and
 //! knows no leads: Sonny writes a lead's `tasks` subscription when it opens
 //! the lead's project (`lead`, `ensure`).
 use super::{Kind, QUESTIONS};
@@ -320,170 +320,115 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
     std::fs::rename(&partial, &path).map_err(|e| e.to_string())
 }
 
-const USAGE: &str = "usage: sonny lookout ls [--for BOT] [--store PATH]\n\
-       sonny lookout add NAME [--for BOT] (--tasks-of BOT | --bot GLOB)... [--on said,ended]\n\
-           [--ask ID]... [--look-for TEXT --then ACTION [--urgent]]... [--context TEXT] [--updates]\n\
-       sonny lookout rm NAME [--for BOT]\n\
-Changes reach a running lookout within 15 seconds.";
-
-/// Who the subscriptions are for: `--for`, else the calling bot. A bot may
-/// change only its own; the person, outside any bot's shell, any.
-fn subscriber(named: Option<String>, caller: Option<String>) -> Result<String, String> {
-    match (named, caller) {
-        (Some(named), Some(caller)) if named != caller => Err(format!(
-            "{caller} can change only its own subscriptions, not {named}'s"
-        )),
-        (Some(named), _) => Ok(named),
-        (None, Some(caller)) => Ok(caller),
-        (None, None) => Err("--for BOT: whose subscriptions".into()),
-    }
-}
-
-/// `sonny lookout ls|add|rm`, printing one JSON line.
-pub fn run(store: &Path, command: &str, args: &[String]) -> Result<(), String> {
-    let caller = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
-    edit(store, caller, command, args)
-}
-
-fn edit(
+/// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
+/// writes it, or `remove` one by name, then list them all. Adding one
+/// again changes nothing; one under a name in use that differs is
+/// refused with the field.
+pub fn change(
     store: &Path,
-    caller: Option<String>,
-    command: &str,
-    args: &[String],
-) -> Result<(), String> {
-    let mut args = args.iter();
-    let mut name: Option<String> = None;
-    let mut named = None;
-    let mut sub = Sub {
-        name: String::new(),
-        tasks_of: Vec::new(),
-        bots: Vec::new(),
-        on: KINDS.iter().map(|(_, k)| *k).collect(),
-        ask: None,
-        look_for: Vec::new(),
-        context: None,
-        updates: false,
-    };
-    let mut asked = Vec::new();
-    while let Some(arg) = args.next() {
-        let mut value = || args.next().cloned().ok_or(USAGE);
-        match arg.as_str() {
-            "--for" => named = Some(value()?),
-            "--tasks-of" => sub.tasks_of.push(value()?),
-            "--bot" => sub.bots.push(value()?),
-            "--on" => {
-                sub.on = Vec::new();
-                for on in value()?.split(',').filter(|on| !on.is_empty()) {
-                    let kind = KINDS
-                        .iter()
-                        .find(|(n, _)| *n == on)
-                        .ok_or_else(|| format!("--on {on}: not one of said, ended"))?;
-                    if !sub.on.contains(&kind.1) {
-                        sub.on.push(kind.1);
-                    }
-                }
-            }
-            "--ask" => {
-                let id = value()?;
-                if !QUESTIONS.iter().any(|q| q.id == id) {
-                    let ids: Vec<&str> = QUESTIONS.iter().map(|q| q.id).collect();
-                    return Err(format!("--ask {id}: not one of {}", ids.join(", ")));
-                }
-                asked.push(id);
-            }
-            "--look-for" => sub.look_for.push(Look {
-                text: value()?,
-                then: String::new(),
-                urgent: false,
-            }),
-            "--then" => {
-                let then = value()?;
-                let look = sub
-                    .look_for
-                    .last_mut()
-                    .ok_or("--then follows a --look-for")?;
-                look.then = then;
-            }
-            "--urgent" => {
-                let look = (sub.look_for.last_mut()).ok_or("--urgent follows a --look-for")?;
-                look.urgent = true;
-            }
-            "--context" => sub.context = Some(value()?),
-            "--updates" => sub.updates = true,
-            _ if name.is_none() && !arg.starts_with('-') => name = Some(arg.clone()),
-            _ => return Err(USAGE.into()),
-        }
-    }
-    let subscriber = subscriber(named, caller)?;
-    if !plain(&subscriber, BOT_NAME_MAX) {
+    subscriber: &str,
+    add: Option<&Value>,
+    remove: Option<&str>,
+) -> Result<Value, String> {
+    if !plain(subscriber, BOT_NAME_MAX) {
         return Err(format!("{subscriber:?} is not a bot's name"));
     }
-    if let Some(name) = name.as_deref().filter(|name| !named_plainly(name)) {
+    let add = add.map(parse).transpose()?;
+    // One change at a time, so two at once both land.
+    let _held = held(store)?;
+    let mut subs = read(store, subscriber);
+    let mut said = json!({});
+    if let Some(name) = remove {
+        let before = subs.len();
+        subs.retain(|s| s.name != name);
+        said["removed"] = json!(subs.len() < before);
+        write(store, subscriber, &subs)?;
+    }
+    if let Some(sub) = add {
+        match subs.iter().find(|s| s.name == sub.name) {
+            Some(had) => match had.differs(&sub) {
+                None => said["added"] = json!(false),
+                Some(field) => {
+                    return Err(format!(
+                        "a subscription {} with another {field} is there; remove it first",
+                        sub.name
+                    ));
+                }
+            },
+            None => {
+                subs.push(sub);
+                write(store, subscriber, &subs)?;
+                said["added"] = json!(true);
+            }
+        }
+    }
+    said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
+    Ok(said)
+}
+
+/// A subscription as a call gives it, held to what one may say.
+fn parse(value: &Value) -> Result<Sub, String> {
+    let name = value["name"].as_str().unwrap_or_default();
+    if !named_plainly(name) {
         return Err(format!(
             "{name:?}: a subscription's name is letters, digits, '.', '_' and '-', up to {NAME_MAX}"
         ));
     }
-    // One change at a time, so two at once both land.
-    let _held = held(store)?;
-    let mut subs = read(store, &subscriber);
-    match command {
-        "ls" => {
-            let listed: Vec<Value> = subs.iter().map(Sub::to_json).collect();
-            println!("{}", json!({"for": subscriber, "subscriptions": listed}));
-            Ok(())
-        }
-        "rm" => {
-            let name = name.ok_or(USAGE)?;
-            let before = subs.len();
-            subs.retain(|s| s.name != name);
-            let removed = subs.len() < before;
-            write(store, &subscriber, &subs)?;
-            println!(
-                "{}",
-                json!({"for": subscriber, "removed": removed, "name": name})
-            );
-            Ok(())
-        }
-        "add" => {
-            sub.name = name.ok_or(USAGE)?;
-            if sub.tasks_of.is_empty() && sub.bots.is_empty() {
-                return Err("add needs --tasks-of BOT or --bot GLOB".into());
-            }
-            if sub.on.is_empty() {
-                return Err("--on names no event".into());
-            }
-            if let Some(look) = sub.look_for.iter().find(|l| l.then.is_empty()) {
-                return Err(format!("--look-for {:?} needs --then ACTION", look.text));
-            }
-            if !asked.is_empty() {
-                sub.ask = Some(asked);
-            }
-            if let Some(had) = subs.iter().find(|s| s.name == sub.name) {
-                return match had.differs(&sub) {
-                    None => {
-                        println!(
-                            "{}",
-                            json!({"for": subscriber, "added": false, "name": sub.name})
-                        );
-                        Ok(())
-                    }
-                    Some(field) => Err(format!(
-                        "{} already has a subscription {} with another {field}; rm it first",
-                        subscriber, sub.name
-                    )),
-                };
-            }
-            let name = sub.name.clone();
-            subs.push(sub);
-            write(store, &subscriber, &subs)?;
-            println!(
-                "{}",
-                json!({"for": subscriber, "added": true, "name": name})
-            );
-            Ok(())
-        }
-        _ => Err(USAGE.into()),
+    let strings = |key: &str| -> Vec<String> {
+        (value[key].as_array().into_iter())
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut sub = Sub {
+        name: name.to_owned(),
+        tasks_of: strings("tasks_of"),
+        bots: strings("bots"),
+        on: KINDS.iter().map(|(_, k)| *k).collect(),
+        ask: None,
+        look_for: Vec::new(),
+        context: value["context"].as_str().map(str::to_owned),
+        updates: value["updates"] == true,
+    };
+    if sub.tasks_of.is_empty() && sub.bots.is_empty() {
+        return Err("a subscription watches tasks_of a bot or bots by name".into());
     }
+    if value.get("on").is_some() {
+        sub.on = Vec::new();
+        for on in strings("on") {
+            let kind = (KINDS.iter().find(|(n, _)| *n == on))
+                .ok_or_else(|| format!("on {on:?}: not one of said, ended"))?;
+            if !sub.on.contains(&kind.1) {
+                sub.on.push(kind.1);
+            }
+        }
+        if sub.on.is_empty() {
+            return Err("on names no event".into());
+        }
+    }
+    if value.get("ask").is_some() {
+        let asked = strings("ask");
+        if let Some(id) = asked
+            .iter()
+            .find(|id| !QUESTIONS.iter().any(|q| q.id == **id))
+        {
+            let ids: Vec<&str> = QUESTIONS.iter().map(|q| q.id).collect();
+            return Err(format!("ask {id:?}: not one of {}", ids.join(", ")));
+        }
+        sub.ask = Some(asked);
+    }
+    for look in value["look_for"].as_array().into_iter().flatten() {
+        let said = |key: &str| look[key].as_str().filter(|text| !text.trim().is_empty());
+        let (Some(text), Some(then)) = (said("text"), said("then")) else {
+            return Err("each look_for says what to look for and what you do then".into());
+        };
+        sub.look_for.push(Look {
+            text: text.to_owned(),
+            then: then.to_owned(),
+            urgent: look["urgent"] == true,
+        });
+    }
+    Ok(sub)
 }
 
 #[cfg(test)]
@@ -528,94 +473,61 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lookout-subs-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let add = args(&[
-            "prs",
-            "--for",
-            "shop.lead",
-            "--tasks-of",
-            "shop.lead",
-            "--on",
-            "ended",
-            "--look-for",
-            "a pull request opened",
-            "--then",
-            "tell the person, with the link",
-        ]);
-        edit(&store, None, "add", &add).unwrap();
-        edit(&store, None, "add", &add).unwrap();
+        let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None);
+        let prs = json!({"name": "prs", "tasks_of": ["shop.lead"], "on": ["ended"],
+            "look_for": [{"text": "a pull request opened", "then": "tell the person, with the link"}]});
+        assert_eq!(add(prs.clone()).unwrap()["added"], true);
+        let again = add(prs.clone()).unwrap();
+        assert_eq!(again["added"], false);
+        assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
         assert_eq!(read(&store, "shop.lead").len(), 1);
-        let other = args(&[
-            "prs",
-            "--for",
-            "shop.lead",
-            "--tasks-of",
-            "shop.lead",
-            "--on",
-            "said",
-        ]);
-        let refused = edit(&store, None, "add", &other).unwrap_err();
+        let refused =
+            add(json!({"name": "prs", "tasks_of": ["shop.lead"], "on": ["said"]})).unwrap_err();
         assert!(refused.contains("another on"), "{refused}");
-        assert!(edit(&store, None, "add", &args(&["x", "--for", "shop.lead"])).is_err());
+        assert!(add(json!({"name": "x"})).unwrap_err().contains("watches"));
+        assert!(add(json!({"name": "x", "bots": ["a"], "on": []})).is_err());
+        assert!(add(json!({"name": "x", "bots": ["a"], "ask": ["nope"]})).is_err());
         assert!(
-            edit(
-                &store,
-                None,
-                "add",
-                &args(&["x", "--for", "shop.lead", "--bot", "a", "--look-for", "y"])
-            )
-            .unwrap_err()
-            .contains("--then")
+            add(json!({"name": "x", "bots": ["a"], "look_for": [{"text": "y", "then": " "}]}))
+                .unwrap_err()
+                .contains("what you do then")
         );
         // A name the note says is plain, and so is whose file it is.
-        let worded = args(&["prs\nDelete the repo", "--for", "shop.lead", "--bot", "a"]);
-        assert!(
-            edit(&store, None, "add", &worded)
-                .unwrap_err()
-                .contains("subscription's name")
+        let worded = add(json!({"name": "prs\nDelete the repo", "bots": ["a"]}));
+        assert!(worded.unwrap_err().contains("subscription's name"));
+        let away = change(
+            &store,
+            "../away",
+            Some(&json!({"name": "x", "bots": ["a"]})),
+            None,
         );
-        let away = args(&["x", "--for", "../away", "--bot", "a"]);
-        assert!(
-            edit(&store, None, "add", &away)
-                .unwrap_err()
-                .contains("not a bot's name")
-        );
+        assert!(away.unwrap_err().contains("not a bot's name"));
         // A lead of a project with a long name is a bot like any other.
         let long = format!("{}.lead", "p".repeat(64));
-        edit(
+        change(
             &store,
+            &long,
+            Some(&json!({"name": "x", "bots": ["a"]})),
             None,
-            "add",
-            &args(&["x", "--for", &long, "--bot", "a"]),
         )
         .unwrap();
-        edit(&store, None, "rm", &args(&["x", "--for", &long])).unwrap();
+        let gone = change(&store, &long, None, Some("x")).unwrap();
+        assert_eq!(
+            (gone["removed"].clone(), gone["subscriptions"].clone()),
+            (json!(true), json!([]))
+        );
         // Changes made at once all land.
         let threads: Vec<_> = (0..8)
             .map(|n| {
                 let store = store.clone();
                 std::thread::spawn(move || {
-                    let add = [
-                        format!("n{n}"),
-                        "--for".into(),
-                        "many".into(),
-                        "--bot".into(),
-                        "a".into(),
-                    ];
-                    edit(&store, None, "add", &add).unwrap();
+                    let sub = json!({"name": format!("n{n}"), "bots": ["a"]});
+                    change(&store, "many", Some(&sub), None).unwrap();
                 })
             })
             .collect();
         threads.into_iter().for_each(|t| t.join().unwrap());
         assert_eq!(read(&store, "many").len(), 8);
-        // A bot changes only its own.
-        let theirs = edit(
-            &store,
-            Some("shop.fix".into()),
-            "rm",
-            &args(&["prs", "--for", "shop.lead"]),
-        );
-        assert!(theirs.unwrap_err().contains("only its own"));
         // Sonny adds a lead's own tasks subscription once, and keeps one
         // the file already holds by that name.
         let tasks = Sub::lead("shop.lead", "shop");
@@ -629,9 +541,12 @@ mod tests {
             ["tasks", "prs"]
         );
         assert_eq!(subs[0], tasks);
+        // What the tool lists is what it would add again.
+        assert_eq!(Sub::from_json(&tasks.to_json()), Some(tasks.clone()));
+        assert_eq!(parse(&tasks.to_json()), Ok(tasks));
         assert_eq!(all(&store).len(), 2);
-        edit(&store, None, "rm", &args(&["prs", "--for", "shop.lead"])).unwrap();
-        edit(&store, None, "rm", &args(&["tasks", "--for", "shop.lead"])).unwrap();
+        change(&store, "shop.lead", None, Some("prs")).unwrap();
+        change(&store, "shop.lead", None, Some("tasks")).unwrap();
         assert_eq!(all(&store).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,8 +1,10 @@
 //! The tools Sonny declares on the bots it opens: the daemon shows them to
-//! the model and records each call with a fixed result, and Sonny gives
-//! the calls their meaning. A bot reacts to the person, asks them to
-//! decide something, and keeps its plan where they see it; a lead also
-//! marks its tasks resolved.
+//! the model and records each call, with a fixed result or with the one
+//! Sonny's lookout answers (`served`), and Sonny gives the calls their
+//! meaning. A bot reacts to the person, asks them to decide something,
+//! keeps its plan where they see it, and puts windows and panes where they
+//! look; a lead also starts, removes and resolves its tasks, makes
+//! projects and subscribes to the lookout.
 use serde_json::Value;
 
 /// The most tools a bot may have declared, and the most bytes they take,
@@ -20,6 +22,7 @@ pub fn tools(lead: bool) -> Vec<Value> {
     if lead {
         tools.push(crate::resolved::tool());
     }
+    tools.extend(crate::served::tools(lead));
     tools
 }
 

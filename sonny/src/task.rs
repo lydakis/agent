@@ -1,13 +1,15 @@
-//! `sonny task`: start one of the lead's tasks in a folder of its own, made
-//! the way Sonny's `copies` setting says, then started there with the
-//! daemon's `agent run`. A git worktree (the default) starts at the last
-//! commit on a branch of its own. A sandfs copy (experimental), made with
-//! the sandfs library built into Sonny so nothing needs installing, is the
-//! checkout as it is, uncommitted changes included, on a branch of its own;
-//! in a folder sandfs mounts, a fork of that workspace; in any other
-//! folder, the folder as it is now, or on another disk than sandfs's home,
-//! a workspace over the folder itself. A task that could not start leaves
-//! no folder behind, and `sonny task rm` takes away one that is done.
+//! A lead's tasks, each in a folder of its own: the `start_task` tool Sonny
+//! answers makes the folder the way Sonny's `copies` setting says, then
+//! starts the task there with the daemon's `agent run`. A git worktree
+//! (the default) starts at the last commit on a branch of its own. A
+//! sandfs copy (experimental), made with the sandfs library built into
+//! Sonny so nothing needs installing, is the checkout as it is, uncommitted
+//! changes included, on a branch of its own; in a folder sandfs mounts, a
+//! fork of that workspace; in any other folder, the folder as it is now,
+//! or on another disk than sandfs's home, a workspace over the folder
+//! itself. A task that could not start leaves no folder behind, and the
+//! `remove_task` tool takes away one that is done. `sonny task changes`
+//! lists, and applies here, what a sandfs copy of a plain folder changed.
 //!
 //! sandfs mounts are served by Sonny run again as `sonny sandfs daemon`,
 //! which outlives the command that asked for them and shares sandfs's home
@@ -18,9 +20,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "usage: sonny task NAME [--setup] [RUN FLAGS...] -- BRIEF\n\
-                     \x20      sonny task changes NAME [--all] [--apply [--force] [--only PATH...]]\n\
-                     \x20      sonny task rm NAME [--discard]";
+const USAGE: &str = "usage: sonny task changes NAME [--all] [--apply [--force] [--only PATH...]]";
 
 /// The task's folder, how its work comes back, and what undoes it.
 struct Place {
@@ -45,27 +45,43 @@ enum Undo {
     },
 }
 
-/// `sonny task ...`, from the lead's shell.
+/// `sonny task changes ...`, from the lead's shell or a terminal.
 pub fn run(args: &[String]) -> Result<(), String> {
     let here = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .map_err(|e| e.to_string())?;
     match args {
         [changes, name, rest @ ..] if changes == "changes" => list(&here, name, rest),
-        [rm, name, rest @ ..] if rm == "rm" => remove(&here, name, rest),
-        [name, rest @ ..] if !name.starts_with('-') => start(&here, name, rest),
         _ => Err(USAGE.into()),
     }
 }
 
-fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
-    let split = rest.iter().position(|arg| arg == "--").ok_or(USAGE)?;
-    let (flags, brief) = (&rest[..split], &rest[split + 1..]);
-    if brief.is_empty() {
-        return Err(USAGE.into());
+/// A `start_task` call.
+pub struct Start {
+    pub name: String,
+    pub brief: String,
+    pub profile: Option<String>,
+    pub setup: bool,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Start the task `start` asks for of the lead `lead`, whose folder is
+/// `here`, and say what started and how its work comes back.
+pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
+    let project = lead.strip_suffix(".lead").unwrap_or(lead);
+    let short = start.name.trim();
+    let name = match short.strip_prefix(&format!("{project}.")) {
+        Some(_) => short.to_owned(),
+        None => format!("{project}.{short}"),
+    };
+    let name = name.as_str();
+    if short.is_empty() || !branch_name(name) {
+        return Err(format!("{short:?} is not a name a git branch can have"));
     }
-    let setup = flags.iter().any(|flag| flag == "--setup");
-    let flags: Vec<&String> = flags.iter().filter(|flag| *flag != "--setup").collect();
+    if start.brief.trim().is_empty() {
+        return Err("a task starts with a brief".into());
+    }
     // The daemon's binary in an agent's shell; in a terminal, the one
     // Sonny would start.
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
@@ -74,6 +90,26 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     let mut command = crate::agent_command(&agent)?;
 
     let info = agent_client::project::read(here)?;
+    // The model asked for, else the project's task rule's, else the role's,
+    // else the lead's own, which `agent run` takes from its shell.
+    let (model, effort) = match (&start.model, info["threads_model"].as_str()) {
+        (Some(model), _) => (Some(model.clone()), start.effort.clone()),
+        (None, Some(model)) => (
+            Some(model.to_owned()),
+            info["threads_reasoning"].as_str().map(str::to_owned),
+        ),
+        (None, None) => (None, None),
+    };
+    let mut flags = match &start.profile {
+        Some(role) => vec!["--profile".to_owned(), role.clone()],
+        None => vec!["--agents".to_owned()],
+    };
+    if let Some(model) = model.filter(|m| !m.is_empty()) {
+        flags.extend(["--model".to_owned(), model]);
+    }
+    if let Some(effort) = effort.filter(|e| !e.is_empty()) {
+        flags.extend(["--effort".to_owned(), effort]);
+    }
     let place = if info["threads_in"] == "project" {
         in_place(here)
     } else {
@@ -93,53 +129,85 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     // The folder's setup script, run in the task's own folder, as for a
     // worktree; a task in the lead's folder has nothing to set up.
     let script = here.join(".agents/setup");
-    if setup && place.dir != here && script.exists() {
-        let status = Command::new(&script)
+    if start.setup && place.dir != here && script.exists() {
+        let ran = Command::new(&script)
             .current_dir(&place.dir)
             .env("AGENT_SOURCE", here)
             .stdin(Stdio::null())
-            .status();
-        if !status.is_ok_and(|status| status.success()) {
-            return failed(&place, false, format!("{} failed", script.display()));
+            .output();
+        match ran {
+            Ok(ran) if ran.status.success() => {}
+            Ok(ran) => {
+                let said = String::from_utf8_lossy(&ran.stderr);
+                let tail: Vec<&str> = said.trim().lines().rev().take(20).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                let error = format!("{} failed:\n{}", script.display(), tail.join("\n"));
+                return failed(&place, false, error);
+            }
+            Err(e) => return failed(&place, false, format!("{}: {e}", script.display())),
         }
     }
+    let flags: Vec<&String> = flags.iter().collect();
     let flags = match told(&place.dir, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
+    let brief = vec![start.brief.clone()];
     let (brief, moved) = match &place.copy {
-        Some((from, to)) => in_copy(brief, from, to),
-        None => (brief.to_vec(), 0),
+        Some((from, to)) => in_copy(&brief, from, to),
+        None => (brief, 0),
     };
-    let status = command
+    let output = command
         .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
         .arg("--")
         .args(&brief)
         .stdin(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(_) => return failed(&place, true, format!("{name} did not start")),
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let said = String::from_utf8_lossy(&output.stderr);
+            return failed(
+                &place,
+                true,
+                format!("{name} did not start: {}", said.trim()),
+            );
+        }
         Err(e) => {
             return failed(&place, false, format!("running {}: {e}", agent.display()));
         }
-    }
-    if let Some(note) = &place.note {
-        eprintln!("{note}");
-    }
+    };
+    let mut said = vec![format!(
+        "Started {name}: {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    )];
+    said.extend(place.note.clone());
     if let (Some((from, to)), 1..) = (&place.copy, moved) {
-        eprintln!(
-            "{name}: the brief named {} {moved} time{}; it names the task's copy {} instead",
+        said.push(format!(
+            "The brief named {} {moved} time{}; it names the task's copy {} instead.",
             shell_quote(from),
             if moved == 1 { "" } else { "s" },
             shell_quote(to)
-        );
+        ));
     }
-    Ok(())
+    Ok(said.join("\n"))
+}
+
+/// Whether git would take `name` for the branch `agent/NAME`.
+fn branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && Command::new("git")
+            .args(["check-ref-format", "--branch", &format!("agent/{name}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
@@ -428,7 +496,7 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
         // worktree of this repository on the task's branch.
         if !ours(here, &path, &branch) {
             return Err(format!(
-                "{} exists and is not this repository's worktree on {branch}; pick another NAME",
+                "{} exists and is not this repository's worktree on {branch}; pick another name",
                 path.display()
             ));
         }
@@ -585,7 +653,7 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         // workspace something else made.
         Some(_) => {
             return Err(format!(
-                "a sandfs workspace named {name} exists that is not this task's; pick another NAME"
+                "a sandfs workspace named {name} exists that is not this task's; pick another name"
             ));
         }
         None if over => {
@@ -977,17 +1045,13 @@ fn list(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `sonny task rm NAME [--discard]`: remove the task and the folder Sonny
-/// made it, once its work is here: a sandfs copy's changes applied, or for
-/// a git copy, committed and pushed; a worktree's changes committed, its
-/// branch kept unless merged. `--discard` removes them anyway. An agent
-/// still working is not removed, and then neither is anything else.
-fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
-    let discard = match args {
-        [] => false,
-        [flag] if flag == "--discard" => true,
-        _ => return Err(USAGE.into()),
-    };
+/// A `remove_task` call: remove the task and the folder Sonny made it,
+/// once its work is here: a sandfs copy's changes applied, or for a git
+/// copy, committed and pushed; a worktree's changes committed, its branch
+/// kept unless merged. `discard` removes them anyway. An agent still
+/// working is not removed, and then neither is anything else. Says what
+/// was removed and what was kept.
+pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> {
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     let folder = tasks()?.join(name);
     let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
@@ -1040,7 +1104,7 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
             let left = not_here(name, &folder, here)?;
             if !left.is_empty() {
                 return Err(format!(
-                    "{name} has work that is not here: {left}; pass --discard to remove it anyway"
+                    "{name} has work that is not here: {left}; with discard, it is removed anyway"
                 ));
             }
         }
@@ -1048,8 +1112,8 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
             && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
         {
             return Err(format!(
-                "{name}'s worktree has uncommitted changes; commit them, or pass --discard to \
-                 remove it anyway"
+                "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
+                 removed anyway"
             ));
         }
         Ok(())
@@ -1082,14 +1146,13 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
         git(here, &args)?;
         let delete = if discard { "-D" } else { "-d" };
         if git(here, &["branch", delete, &branch]).is_err() {
-            eprintln!(
-                "{branch} is kept, since it has commits not merged here; `git branch -D {branch}` \
-                 deletes it"
-            );
+            return Ok(format!(
+                "Removed {name}. {branch} is kept, since it has commits not merged here; \
+                 `git branch -D {branch}` deletes it."
+            ));
         }
     }
-    eprintln!("{name}: removed");
-    Ok(())
+    Ok(format!("Removed {name}."))
 }
 
 /// What the repository at `repo` keeps that its origin lacks, by name:
@@ -1368,10 +1431,9 @@ pub fn remount(socket: &Path) -> Vec<String> {
         said.insert(
             0,
             format!(
-                "task copies whose task is gone: {}; `{} task rm NAME` in the folder one came \
-                 from removes it",
-                gone.join(", "),
-                me()
+                "task copies whose task is gone: {}; ask its lead to remove one, which it does \
+                 with remove_task",
+                gone.join(", ")
             ),
         );
     }
