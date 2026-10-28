@@ -169,6 +169,22 @@ impl Screen {
         self.back = 0;
     }
 
+    /// How many rows the view is up from the newest.
+    pub fn back(&self) -> usize {
+        self.back
+    }
+
+    /// The view `back` rows up from the newest, as it was before the rows
+    /// were drawn again.
+    pub fn hold(&mut self, back: usize) {
+        self.back = back;
+    }
+
+    /// The view is at the first row, and there is room for older ones.
+    pub fn at_top(&self) -> bool {
+        self.back >= self.most(self.area.height as usize) && self.rows.len() < KEEP
+    }
+
     /// Up (`rows` > 0) or down the conversation.
     pub fn scroll(&mut self, rows: isize) {
         let most = self.most(self.area.height as usize);
@@ -1074,7 +1090,12 @@ mod tests {
     #[test]
     fn find_shows_the_newest_place_and_steps_older() {
         let lines: Vec<Line> = (0..30)
-            .map(|i| Line::from(format!("row {i}{}", if i % 10 == 3 { " Needle" } else { "" })))
+            .map(|i| {
+                Line::from(format!(
+                    "row {i}{}",
+                    if i % 10 == 3 { " Needle" } else { "" }
+                ))
+            })
             .collect();
         let (mut screen, _) = screen(lines, 20, 5);
         let area = Rect::new(0, 0, 20, 5);
@@ -1087,7 +1108,9 @@ mod tests {
         assert_eq!(screen.found(), Some((2, 3)));
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
-        let y = (0..5).find(|y| row(&buf, *y).trim_end() == "row 13 Needle").unwrap();
+        let y = (0..5)
+            .find(|y| row(&buf, *y).trim_end() == "row 13 Needle")
+            .unwrap();
         assert_eq!(buf[(7, y)].bg, Color::Yellow);
         // Typing on looks from where the view is.
         screen.find("needle");
@@ -1113,6 +1136,24 @@ mod tests {
         let (start, end) = screen.finding.as_ref().unwrap().hits[0];
         assert!(end.0 > start.0);
         assert_eq!(screen.text(start, end), "test reads an");
+    }
+
+    #[test]
+    fn the_view_holds_while_older_rows_are_drawn_above() {
+        let lines: Vec<Line> = (10..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 20, 5);
+        screen.page(true);
+        screen.page(true);
+        assert!(screen.at_top());
+        let back = screen.back();
+        screen.clear();
+        screen.hold(back);
+        screen.push((0..20).map(|i| Line::from(format!("row {i}"))).collect());
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "row 10");
+        assert!(!screen.at_top());
     }
 
     #[test]

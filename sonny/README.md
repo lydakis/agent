@@ -282,8 +282,9 @@ settings; `/verbose` again goes back to clean.
 
 Sonny owns the whole screen, as Codex does. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
-it; rows that arrive while you have scrolled back leave the view still,
-and PgDn or Enter takes you back to the latest. Copying needs no key held:
+it, older messages loading as you go past the first; rows that arrive
+while you have scrolled back leave the view still, and PgDn or Enter
+takes you back to the latest. Copying needs no key held:
 a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line

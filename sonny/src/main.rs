@@ -1292,6 +1292,12 @@ struct App {
     repaint: bool,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
+    /// The node before it, while the bot has older ones.
+    older: Option<i64>,
+    /// The full screen was scrolled past its first row: older items are
+    /// read, and the view held where it was while all is drawn again.
+    want_older: bool,
+    hold_back: Option<usize>,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -1954,6 +1960,9 @@ impl App {
             down: false,
             repaint: false,
             first_node: None,
+            older: None,
+            want_older: false,
+            hold_back: None,
             verbose: false,
             instruct: None,
             move_to: None,
@@ -2125,6 +2134,9 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
+            if std::mem::take(&mut self.want_older) {
+                self.older().await;
+            }
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
             {
@@ -2377,6 +2389,9 @@ impl App {
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
+        if let Some(back) = self.hold_back.take() {
+            self.screen.hold(back);
+        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2405,6 +2420,36 @@ impl App {
             None => self.history().await,
         }
         Ok(())
+    }
+
+    /// The page of items before the oldest drawn, read by drawing the
+    /// conversation again from there once idle.
+    async fn older(&mut self) {
+        let Some(from) = self.older else {
+            return;
+        };
+        let asked = json!({"bot": self.bot, "from": from, "limit": HISTORY_ITEMS});
+        let page = match self.client.request("history_nodes", asked).await {
+            Ok(page) => page,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(oldest) = (page["nodes"].as_array())
+            .and_then(|nodes| nodes.last())
+            .and_then(|node| node["node"].as_i64())
+        else {
+            self.older = None;
+            return;
+        };
+        self.first_node = Some(oldest);
+        self.older = page["next_from"].as_i64();
+        self.hold_back = Some(self.screen.back());
+        self.repaint = true;
+        if self.running.is_some() {
+            self.notice = Some("older messages once this turn ends".into());
+        }
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -2649,6 +2694,10 @@ impl App {
             let Ok(page) = self.client.request("history_nodes", asked.clone()).await else {
                 return;
             };
+            // On attach, where older items start.
+            if !every {
+                self.older = page["next_from"].as_i64();
+            }
             for n in page["nodes"].as_array().into_iter().flatten() {
                 let Some(node) = n["node"].as_i64().filter(|node| *node > after) else {
                     continue;
@@ -3921,6 +3970,10 @@ impl App {
     fn full_screen(&mut self, event: &Event) -> bool {
         let key = match event {
             Event::Mouse(mouse) => {
+                let up = mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp;
+                if up && self.screen.at_top() && self.older.is_some() {
+                    self.want_older = true;
+                }
                 match self.screen.mouse(*mouse) {
                     Some(screen::Action::Copy(text)) => self.copied(&text),
                     Some(screen::Action::Open(link)) => {
@@ -3954,7 +4007,7 @@ impl App {
                     query.push(c);
                     self.screen.find(query);
                 }
-                KeyCode::PageUp => self.screen.page(true),
+                KeyCode::PageUp => self.page_up(),
                 KeyCode::PageDown => self.screen.page(false),
                 _ => {}
             }
@@ -3980,7 +4033,7 @@ impl App {
                 self.screen.unselect();
             }
             KeyCode::Esc if self.screen.unselect() => {}
-            KeyCode::PageUp => self.screen.page(true),
+            KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.screen.page(false),
             // Sending goes back to the newest rows, where its answer comes.
             KeyCode::Enter => {
@@ -3990,6 +4043,14 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A page up the full screen, or the page before its first row.
+    fn page_up(&mut self) {
+        if self.screen.at_top() && self.older.is_some() {
+            self.want_older = true;
+        }
+        self.screen.page(true);
     }
 
     /// `text` put on the clipboard, and said so.
