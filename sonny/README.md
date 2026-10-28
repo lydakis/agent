@@ -277,12 +277,11 @@ off again never shows.
   inside a plain folder stay in its copy, and in the copy of a linked
   worktree, whose `.git` names its repository outside the copy, git is
   turned off, so it can't change that repository while the files stay
-  behind. A plain folder on another disk than sandfs's home
-  (`~/.local/share/sandfs`), such as an external volume, can't be copied,
-  so its task gets a sandfs workspace over the folder itself: the task's
-  changes still stay in the workspace, but a file it has looked at stays
-  as it first saw it, and `--apply` writes over what changed in the folder
-  meanwhile without asking. `sonny task rm NAME [--discard]` removes a
+  behind. A plain folder on another disk than sandfs's home, such as an
+  external volume, is copied on its own disk, in a `.sandfs` folder at
+  that disk's top; on a disk that can't clone files (ext4) its files are
+  copied in full. A task that is done, fails or needs the person has its
+  copy give back the memory it can do without. `sonny task rm NAME [--discard]` removes a
   task that is done and the folder Sonny made it, refusing while its work
   isn't back yet: changes not applied, uncommitted or not pushed. A
   worktree's branch is kept unless it is merged. `sonny task` also works
