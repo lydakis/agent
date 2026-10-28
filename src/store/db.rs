@@ -323,16 +323,32 @@ impl Settings {
                 .iter()
                 .any(|folder| std::path::Path::new(path).starts_with(folder))
         };
+        // A root the creator's own `within` keeps read-only is none of its
+        // roots: one inside a protected folder at the top of the deepest
+        // folder that holds it.
+        let allowed = |root: &String| {
+            let Some(within) = &creator.within else {
+                return true;
+            };
+            let root = std::path::Path::new(root);
+            within
+                .iter()
+                .map(std::path::Path::new)
+                .filter(|ceiling| root.starts_with(ceiling))
+                .max_by_key(|ceiling| ceiling.components().count())
+                .is_some_and(|ceiling| {
+                    let first = root
+                        .strip_prefix(ceiling)
+                        .ok()
+                        .and_then(|rest| rest.iter().next());
+                    !first.is_some_and(crate::sandbox::protected)
+                })
+        };
         let roots: Vec<String> = folder
             .into_iter()
             .map(str::to_owned)
             .chain(creator.writable.iter().cloned())
-            .filter(|root| {
-                creator
-                    .within
-                    .as_ref()
-                    .is_none_or(|within| inside(root, within))
-            })
+            .filter(allowed)
             .collect();
         self.within = Some(match self.within.take() {
             None => roots,

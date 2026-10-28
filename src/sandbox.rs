@@ -36,6 +36,12 @@ const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 /// the project's own settings.
 const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
 
+/// Whether `name`, at the top of a root, is a folder the root keeps
+/// read-only.
+pub fn protected(name: &std::ffi::OsStr) -> bool {
+    PROTECTED.iter().any(|kept| name == *kept)
+}
+
 /// A folder the bot may write, and what inside it stays read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Root {

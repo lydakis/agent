@@ -3393,6 +3393,9 @@ impl Turn {
                         .as_ref()
                         .map_or_else(|| workspace.to_owned(), PathBuf::from);
                     tokio::task::spawn_blocking(move || {
+                        // The probe for a sandbox runs once, here off the
+                        // runtime thread, also for a bot from before a restart.
+                        agent_runtime::sandbox::available()?;
                         Policy::new(
                             settings.sandbox,
                             Some(&root),

@@ -827,6 +827,10 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     );
     let outside = Settings::default().under(&bob.settings, Some("/elsewhere"));
     assert_eq!(outside.within, Some(vec!["/shared".into()]));
+    // A bot in a folder its creator keeps read-only passes none of it on.
+    let git = Settings::default().under(&bob.settings, Some("/work/.git"));
+    let below = Settings::default().under(&git, Some("/work/.git"));
+    assert_eq!(below.within, Some(vec!["/shared".into()]));
     // An unconfined creator imposes nothing.
     let free = Settings::default().under(&Settings::default(), Some("/work"));
     assert_eq!(free, Settings::default());
