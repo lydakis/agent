@@ -115,6 +115,8 @@ pub struct Screen {
     /// as they were drawn.
     go_to: Option<(usize, usize)>,
     top_row: Option<usize>,
+    /// A line to scroll to, as little as it takes, with rows under it.
+    keep: Option<(usize, usize)>,
 }
 
 /// The place found is to be picked again, the rows having been drawn anew.
@@ -216,6 +218,13 @@ impl Screen {
     /// rows under its top.
     pub fn show_row(&mut self, row: usize, above: usize) {
         self.go_to = Some((row, above));
+    }
+
+    /// The view scrolled as little as it takes to show the line `row` of
+    /// those pushed and `below` drawn rows under it, or to the top when
+    /// that shows it: a picked row in a list.
+    pub fn keep_in_view(&mut self, row: usize, below: usize) {
+        self.keep = Some((row, below));
     }
 
     /// The last line's rows taken off the screen, to be wrapped again.
@@ -335,7 +344,8 @@ impl Screen {
         self.wrapped = self.rows.len();
         let relaid = std::mem::take(&mut self.relaid);
         if self.back > 0 && before > 0 {
-            self.back = (self.back + self.shown.len() - before).saturating_sub(relaid);
+            self.back =
+                (self.back.saturating_add(self.shown.len() - before)).saturating_sub(relaid);
         }
         // The oldest rows go, a batch at a time.
         if self.rows.len() > KEEP + KEEP / 4 {
@@ -485,6 +495,23 @@ impl Screen {
         }
         if let Some(top) = self.top_row.take() {
             self.back = self.shown.len().saturating_sub(top + height);
+        }
+        if let Some((row, below)) = self.keep.take() {
+            let at = (self.shown.iter().enumerate())
+                .filter(|(_, shown)| shown.first)
+                .nth(row)
+                .map_or(0, |(at, _)| at);
+            let bottom = self.shown.len() - self.back.min(self.shown.len());
+            let top = bottom.saturating_sub(height);
+            let end = (at + below + 1).min(self.shown.len());
+            // Near the top it goes all the way, the heading above it shown.
+            if at < top && end <= height {
+                self.back = self.most(height);
+            } else if at < top {
+                self.back = self.shown.len().saturating_sub(at + height);
+            } else if end > bottom {
+                self.back = self.shown.len() - end;
+            }
         }
         self.back = self.back.min(self.most(height));
         let bottom = self.shown.len() - self.back;
@@ -1309,6 +1336,31 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0).trim_end(), "row 10");
         assert!(!screen.at_top());
+    }
+
+    #[test]
+    fn a_picked_line_is_kept_in_view_with_rows_under_it() {
+        let lines: Vec<_> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 10, 5);
+        let area = Rect::new(0, 0, 10, 5);
+        let mut buf = Buffer::empty(area);
+        let mut keep = |screen: &mut Screen, line, below| {
+            screen.keep_in_view(line, below);
+            screen.render(area, &mut buf, |_| None);
+            (
+                row(&buf, 0).trim_end().to_owned(),
+                row(&buf, 4).trim_end().to_owned(),
+            )
+        };
+        // Down from the top: no scroll while it shows, then as little as it takes.
+        screen.hold(usize::MAX);
+        assert_eq!(keep(&mut screen, 2, 2).0, "row 0");
+        assert_eq!(keep(&mut screen, 8, 2).1, "row 10");
+        // Already in view: it stays put.
+        assert_eq!(keep(&mut screen, 7, 2).1, "row 10");
+        // Up: the line at the top, and near the top the whole way up.
+        assert_eq!(keep(&mut screen, 4, 2).0, "row 4");
+        assert_eq!(keep(&mut screen, 1, 2).0, "row 0");
     }
 
     #[test]

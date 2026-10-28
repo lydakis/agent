@@ -1313,6 +1313,9 @@ struct Watch {
     resolved: bool,
     /// `/background` holds the screen instead of the card.
     background: Option<background::View>,
+    /// The row of `/background`'s picked item as the pane last drew it,
+    /// so a new pick scrolls to it and scrolling otherwise stays put.
+    picked: Option<usize>,
 }
 
 struct App {
@@ -3862,6 +3865,7 @@ impl App {
                 lookout: self.lookout_line(),
                 resolved: false,
                 background: None,
+                picked: None,
             });
             self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
             return;
@@ -3880,6 +3884,22 @@ impl App {
             self.client.store().map(str::to_owned),
             self.bot.clone(),
         );
+        // The full screen shows it beside the conversation, as `/status`.
+        if full() {
+            self.watch = Some(Watch {
+                screen: None,
+                project,
+                rows: Vec::new(),
+                jobs: Vec::new(),
+                read: Instant::now(),
+                lookout: String::new(),
+                resolved: false,
+                background: Some(view),
+                picked: None,
+            });
+            self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
+            return;
+        }
         self.watch(project, Vec::new(), Vec::new(), Some(view));
     }
 
@@ -3910,6 +3930,7 @@ impl App {
                     lookout: self.lookout_line(),
                     resolved: false,
                     background,
+                    picked: None,
                 })
             }
             Err(error) => {
@@ -4507,6 +4528,30 @@ impl App {
                 match key.code {
                     KeyCode::BackTab => self.pane_keys = false,
                     _ => program.key(*key),
+                }
+                return true;
+            }
+            // `/background` takes its own keys: picking, firing, removing.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut())
+            {
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => {
+                        if view.key(*key) == background::Key::Close {
+                            self.pane = None;
+                            self.pane_keys = false;
+                        }
+                    }
                 }
                 return true;
             }
@@ -5863,19 +5908,41 @@ impl App {
         }
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
-        if let (Some(watch), Some(pane)) = (&self.watch, &mut self.pane)
+        if let (Some(watch), Some(pane)) = (&mut self.watch, &mut self.pane)
             && pane.is_card()
         {
             let wide = match chat.width {
                 0 => size.width,
                 _ => pane::width(size.width, PROSE as u16),
             };
-            let (lines, any_resolved) = watch_card(watch, wide.saturating_sub(2) as usize);
-            let keys = match any_resolved && watch.resolved {
-                true => "r hides resolved · esc closes",
-                false => STATUS_KEYS,
-            };
-            pane.set_card(lines, keys);
+            let width = wide.saturating_sub(2) as usize;
+            if let Some(view) = &watch.background {
+                // Its card, then what was done or the keys the pick takes.
+                let (card, at) = view.card(width);
+                let mut lines: Vec<Line<'static>> = card
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                lines.push(Line::default());
+                lines.push(view.footer());
+                pane.set_card(lines, STATUS_KEYS);
+                // A new pick is scrolled to, with the two rows under it.
+                if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    pane.screen.keep_in_view(at, 2);
+                }
+            } else {
+                let (lines, any_resolved) = watch_card(watch, width);
+                let keys = match any_resolved && watch.resolved {
+                    true => "r hides resolved · esc closes",
+                    false => STATUS_KEYS,
+                };
+                pane.set_card(lines, keys);
+            }
         }
         // The full screen's links, to be written again as hyperlinks.
         let mut linked = Vec::new();

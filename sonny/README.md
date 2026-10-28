@@ -256,13 +256,16 @@ off again never shows.
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
   shows `↻ 2 triggers` beside its model.
-- `/background` (or `/triggers`, `/lookout`) lists what runs for the
-  project's agents with no one typing: the triggers that wake them, with
+- `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
+  conversation on the full screen, what runs for the project's agents with
+  no one typing: the triggers that wake them, with
   when each fires, its message and what its last fire did, and the
   lookout's subscriptions, with how many checks each asked for in the last
   day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
   removes it; the subscription Sonny keeps for a lead's tasks stays. The
   footer says `↻ 2 in background` while the window's agent has any.
+
+  ![/background in the pane](../docs/sonny/pane-background.png)
 - `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
   their own copy of the folder: git worktrees (the default), or
   [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
