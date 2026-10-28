@@ -1695,13 +1695,20 @@ impl Service {
             *created_by_id = Some(me.bot_id);
             Ok(())
         };
-        // A tool a client answers is one the caller may pass on: one it has
-        // and gives the bots it makes, answered by the same client. Another
-        // could get a client to act for it.
+        // A tool a client answers is one the caller may pass on: one it has,
+        // may call, and gives the bots it makes, answered by the same client.
+        // Another could get a client to act for it.
+        let callable = |own: &agent_runtime::tools::Declared| {
+            own.inherit
+                && me
+                    .allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(&own.name))
+        };
         let passes = |tool: &agent_runtime::tools::Declared| {
             tool.answered_by.is_none()
                 || me.declared.iter().any(|own| {
-                    own.inherit && own.name == tool.name && own.answered_by == tool.answered_by
+                    callable(own) && own.name == tool.name && own.answered_by == tool.answered_by
                 })
         };
         // The folders a request would give a bot, each of which the caller
@@ -1719,6 +1726,17 @@ impl Service {
                 claim(created_by, created_by_id)?;
                 if declare.iter().flatten().any(|tool| !passes(tool)) {
                     return refuse("declare a tool a client answers that it can't pass on");
+                }
+                // Without its own list, a bot takes the tools its creator
+                // passes on: none a client answers that the caller may not call.
+                if declare.is_none() && me.declared.iter().any(|own| own.inherit && !passes(own)) {
+                    *declare = Some(
+                        me.declared
+                            .iter()
+                            .filter(|own| own.inherit && passes(own))
+                            .cloned()
+                            .collect(),
+                    );
                 }
                 folders.extend(workspace.clone());
                 folders.extend(settings.writable.iter().cloned());
@@ -1769,17 +1787,12 @@ impl Service {
                 if from.as_ref().is_some_and(|author| author.bot != me.name) {
                     return refuse("send a message as another bot");
                 }
-                match (from.is_some(), me.running_turn) {
-                    (true, _) => *origin = None,
-                    (false, Some(turn)) => {
-                        *from = Some(Author {
-                            bot: me.name.clone(),
-                            turn,
-                        });
-                        *origin = None;
-                    }
-                    (false, None) => *origin = Some(me.name.clone()),
-                }
+                // Named once, as the request names it, so a retry of the
+                // same request is the same request.
+                *origin = match from {
+                    Some(_) => None,
+                    None => Some(me.name.clone()),
+                };
                 // A turn's folder is the sandboxed bot's to write, and stays
                 // its folder: one the caller gives it must be the caller's.
                 if let Some(workspace) = workspace {
