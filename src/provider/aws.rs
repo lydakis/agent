@@ -957,26 +957,40 @@ echo '{{"Version":1,"AccessKeyId":"LATE","SecretAccessKey":"S"}}'"#,
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Write `text` to `path` as an executable script, from a child process.
+    /// A file this process held open for writing would pass to any child
+    /// another test forks meanwhile, until that child execs, and running the
+    /// script then fails with "Text file busy".
+    #[cfg(unix)]
+    fn script(path: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut sh = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$0" && chmod 755 "$0""#])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        assert!(sh.wait().unwrap().success());
+    }
+
     /// AWS CLI version 1 has no credential export and answers with its usage
     /// text; the reason says which CLI it is and what it takes instead.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cli_without_the_export_is_named_not_quoted() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("agent-aws-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let aws = dir.join("aws");
         // What aws-cli 1.x prints, trimmed of its list of choices.
-        std::fs::write(
+        script(
             &aws,
             r#"#!/bin/sh
 if [ "$1" = --version ]; then echo 'aws-cli/1.22.34 Python/3.9.6 Darwin/23.6.0 botocore/1.24.0'; exit 0; fi
 printf 'usage: \rNote: AWS CLI version 2, the latest major version of the AWS CLI, is now stable and recommended for general use.\n\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\naws: error: argument subcommand: Invalid choice, valid choices are:\n\nadd-model | get\n' >&2
 exit 252
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&aws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut argv = AWS_CLI.map(str::to_owned);
         argv[0] = aws.display().to_string();
         let error = resolve(&argv).await.unwrap_err();
@@ -992,7 +1006,7 @@ exit 252
         let current = std::fs::read_to_string(&aws)
             .unwrap()
             .replace("1.22.34", "2.31.4");
-        std::fs::write(&aws, current).unwrap();
+        script(&aws, &current);
         let error = resolve(&argv).await.unwrap_err();
         assert!(error.detail.unwrap().starts_with("usage: "));
         for (version, old) in [

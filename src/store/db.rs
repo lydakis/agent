@@ -3907,6 +3907,40 @@ impl Database {
     /// provider replay remain unchanged.
     /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
     /// their text before decoding; no content is replaced with previews.
+    /// A bot's newest `limit` conversation turns, newest first, as its
+    /// history numbers them: each one's number, handle, status and the
+    /// start of its prompt. Its own turns and those it took from a source.
+    pub fn history_turns(&self, name: &str, limit: usize) -> Result<Value> {
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        // Walk back only as far as the `limit`th turn start.
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,turn,turn_seq,seen) AS (
+                SELECT id,parent,turn,turn_seq,turn_seq IS NOT NULL FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.turn,n.turn_seq,c.seen+(n.turn_seq IS NOT NULL)
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.seen<?2)
+             SELECT c.turn_seq,t.bot,c.turn,t.status,
+                    substr(json_extract(CAST(n.item AS TEXT),'$.content[0].text'),1,200),
+                    length(json_extract(CAST(n.item AS TEXT),'$.content[0].text'))
+             FROM chain c JOIN nodes n ON n.id=c.id LEFT JOIN turns t ON t.id=c.turn
+             WHERE c.turn_seq IS NOT NULL ORDER BY c.turn_seq DESC",
+        )?;
+        let mut rows = statement.query(params![head, limit as i64])?;
+        let mut turns = Vec::new();
+        while let Some(r) = rows.next()? {
+            let (owner, id): (Option<String>, Option<i64>) = (r.get(1)?, r.get(2)?);
+            turns.push(json!({"turn":r.get::<_, i64>(0)?,
+                "handle":owner.zip(id).map(|(owner, id)| format!("turn:{owner}/{id}")),
+                "status":r.get::<_, Option<String>>(3)?,
+                "prompt":r.get::<_, Option<String>>(4)?,
+                "prompt_bytes":r.get::<_, Option<i64>>(5)?}));
+        }
+        Ok(json!({"bot":name,"turns":turns}))
+    }
     pub fn history_read(
         &self,
         name: &str,
