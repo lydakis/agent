@@ -3883,23 +3883,19 @@ impl Database {
         // Compact provider whitespace in this view only: each item must occupy
         // one JSONL record even when its original response spans multiple lines.
         // Already single-line items need no rewrite (escaped newlines are fine).
-        // A person's pictures go without their bytes, as other history
-        // reads return them.
-        let reading_item = format!(
-            "CASE
+        const READING_ITEM: &str = "CASE
             WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
              AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
             THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
-            WHEN json_extract(CAST(item AS TEXT),'$.role')='user' THEN {}
             WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
-            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END",
-            without_pictures("item")
-        );
+            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length({reading_item}) FROM nodes WHERE id=?"
+            "SELECT length(CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user'
+                THEN {PICTURELESS} ELSE {READING_ITEM} END) FROM nodes WHERE id=?"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr({reading_item},?,?) FROM nodes WHERE id=?"
+            "SELECT substr(CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user'
+                THEN {PICTURELESS} ELSE {READING_ITEM} END,?,?) FROM nodes WHERE id=?"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -7392,10 +7388,9 @@ impl Database {
         // person's prompt is read whole, bounded by what submit takes, as
         // its pictures are left out below.
         let mut query = self.conn.prepare_cached(&format!(
-            "SELECT CASE WHEN length(n.item)<=?2 OR json_extract(CAST(n.item AS TEXT),'$.role')='user'
-                THEN {} END,s.bot,s.turn,s.bot_id,s.origin
-             FROM nodes n LEFT JOIN senders s ON s.node=n.id WHERE n.id=?1",
-            without_pictures("n.item")
+            "SELECT CASE WHEN length(item)<=?2 OR json_extract(CAST(item AS TEXT),'$.role')='user'
+                THEN {PICTURELESS} END,s.bot,s.turn,s.bot_id,s.origin
+             FROM nodes n LEFT JOIN senders s ON s.node=n.id WHERE n.id=?1"
         ))?;
         for &node in wanted {
             type Row = (
@@ -8231,28 +8226,25 @@ fn images_from(json: Option<String>) -> rusqlite::Result<Vec<crate::codec::Image
 /// SQL for `item`, a node's item, as history reads return it: a user
 /// item's pictures without their bytes, each counted in `omitted_bytes`
 /// (a data URL keeps its media type). The model is sent them whole.
-fn without_pictures(item: &str) -> String {
-    let url = "json_extract(value,'$.image_url')";
-    format!(
-        "CASE WHEN instr(CAST({item} AS TEXT),'\"input_image\"')>0
-                OR instr(CAST({item} AS TEXT),'\"type\":\"image\"')>0
-            THEN CASE WHEN json_extract(CAST({item} AS TEXT),'$.role')='user'
-                AND json_type(CAST({item} AS TEXT),'$.content')='array'
-            THEN CAST(json_set(CAST({item} AS TEXT),'$.content',(
-                SELECT json_group_array(CASE
-                    WHEN json_extract(value,'$.type')='input_image' AND {url} LIKE 'data:%'
-                    THEN json_set(value,'$.image_url',substr({url},1,instr({url},',')),
-                        '$.omitted_bytes',length({url})-instr({url},','))
-                    WHEN json_extract(value,'$.type')='image'
-                        AND json_extract(value,'$.source.type')='base64'
-                    THEN json_set(value,'$.source.data','',
-                        '$.omitted_bytes',length(json_extract(value,'$.source.data')))
-                    ELSE json(value) END)
-                FROM json_each(CAST({item} AS TEXT),'$.content'))) AS BLOB)
-            ELSE {item} END
-        ELSE {item} END"
-    )
-}
+const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
+    THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user'
+        AND json_type(CAST(item AS TEXT),'$.content')='array'
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',(
+        SELECT json_group_array(CASE
+            WHEN json_extract(value,'$.type')='input_image'
+                AND json_extract(value,'$.image_url') LIKE 'data:%'
+            THEN json_set(value,'$.image_url',
+                substr(json_extract(value,'$.image_url'),1,instr(json_extract(value,'$.image_url'),',')),
+                '$.omitted_bytes',length(json_extract(value,'$.image_url'))
+                    -instr(json_extract(value,'$.image_url'),','))
+            WHEN json_extract(value,'$.type')='image'
+                AND json_extract(value,'$.source.type')='base64'
+            THEN json_set(value,'$.source.data','',
+                '$.omitted_bytes',length(json_extract(value,'$.source.data')))
+            ELSE json(value) END)
+        FROM json_each(CAST(item AS TEXT),'$.content'))) AS BLOB)
+    ELSE item END
+ELSE item END";
 /// The bot's oldest queued turn now waits only for a slot. True when that
 /// turn was a steer, for the queued-steer count.
 fn promote(tx: &Connection, bot: &str) -> Result<bool> {
