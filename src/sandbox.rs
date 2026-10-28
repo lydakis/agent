@@ -789,19 +789,27 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
             _ => format!("(require-all {} )", parts.join(" ")),
         });
     }
-    // Nor can the folders between a root and the daemon's socket, which
-    // would take the socket to a name its rule doesn't cover.
-    if let Some(socket) = &policy.socket {
-        for folder in socket.ancestors().skip(1) {
-            if policy
+    // Nor can the folders between a root and what stays out of reach (a
+    // kept path, the daemon's socket): renamed, they would take it to a
+    // name its rule doesn't cover.
+    let mut folders: Vec<&Path> = policy
+        .roots
+        .iter()
+        .flat_map(|root| root.read_only.iter().chain(&root.missing))
+        .chain(&policy.socket)
+        .flat_map(|kept| kept.ancestors().skip(1))
+        .filter(|folder| {
+            policy
                 .roots
                 .iter()
                 .any(|root| folder.starts_with(&root.path))
-                && !policy.roots.iter().any(|root| root.path == folder)
-            {
-                anchors.push(anchor(&param(folder)));
-            }
-        }
+                && !policy.roots.iter().any(|root| root.path == *folder)
+        })
+        .collect();
+    folders.sort();
+    folders.dedup();
+    for folder in folders {
+        anchors.push(anchor(&param(folder)));
     }
     let mut sections = vec![
         SEATBELT_BASE.to_owned(),
@@ -946,9 +954,13 @@ mod tests {
         let socket = inner.join("run/agent.sock");
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         std::fs::write(&socket, "").unwrap();
+        let store = inner.join("state/state.sqlite");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, "").unwrap();
         let daemon = Daemon {
             socket: Some(socket.clone()),
-            ..Daemon::default()
+            store: Some(store),
+            helper: None,
         };
         for network in [false, true] {
             let policy = Policy::new(
@@ -978,6 +990,8 @@ mod tests {
                 key(&socket)
             )));
             assert!(profile.contains(&anchor(&key(&inner.join("run")))));
+            // So does the folder above a protected store.
+            assert!(profile.contains(&anchor(&key(&inner.join("state")))));
             #[cfg(target_os = "linux")]
             assert!(
                 linux::args(&policy, false)

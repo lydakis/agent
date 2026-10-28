@@ -2106,8 +2106,9 @@ off unless `network` is set. The daemon's socket is out of reach either way,
 as Codex keeps its own from a sandboxed command: nothing confined may drive
 the daemon, so a sandboxed bot delegates through tools its client declares,
 not through `agent` in its shell. A socket inside a writable folder stays
-read-only, and on macOS the folders between it and that folder can't be
-renamed, so it can't be moved or linked to a name the rule doesn't cover. `danger-full-access`, or no `sandbox`, runs
+read-only. On macOS the folders between a writable folder and anything kept
+inside it (the socket, the store, a worktree's git folder) can't be renamed,
+so nothing kept can be moved to a name its rule doesn't cover. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 
 Creating a sandboxed bot checks that sandboxes run here and refuses with
