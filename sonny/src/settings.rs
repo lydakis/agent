@@ -14,6 +14,10 @@ pub struct Settings {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// Whether Sonny owns the whole screen, keeping the conversation to
+    /// scroll and select itself, or writes it into the terminal's
+    /// scrollback (inline, the default).
+    pub fullscreen: bool,
 }
 
 impl Default for Settings {
@@ -22,6 +26,7 @@ impl Default for Settings {
             chime: true,
             copies: "worktree".into(),
             verbose: false,
+            fullscreen: false,
         }
     }
 }
@@ -47,6 +52,7 @@ impl Settings {
                 .filter(|c| agent_client::project::COPIES.contains(c))
                 .map_or(defaults.copies, str::to_owned),
             verbose: saved["verbose"].as_bool().unwrap_or(defaults.verbose),
+            fullscreen: (saved["fullscreen"].as_bool()).unwrap_or(defaults.fullscreen),
         }
     }
 
@@ -59,6 +65,7 @@ impl Settings {
             "chime": self.chime,
             "copies": self.copies,
             "verbose": self.verbose,
+            "fullscreen": self.fullscreen,
         }))
         .map_err(|e| e.to_string())?;
         std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
@@ -76,6 +83,7 @@ mod tests {
         assert!(Settings::from(&json!({"chime": "no"})).chime);
         assert!(Settings::from(&json!({"verbose": true})).verbose);
         assert!(!Settings::from(&json!({"verbose": "yes"})).verbose);
+        assert!(Settings::from(&json!({"fullscreen": true})).fullscreen);
         assert_eq!(
             Settings::from(&json!({"copies": "sandfs"})).copies,
             "sandfs"
