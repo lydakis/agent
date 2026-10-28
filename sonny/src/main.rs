@@ -3640,9 +3640,7 @@ impl App {
                 lookout: self.lookout_line(),
                 resolved: false,
             });
-            self.pane = Some(pane::Pane::card("/status", STATUS_KEYS));
-            self.pane_keys = true;
-            self.screen.unselect();
+            self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
             return;
         }
         if !full() {
@@ -4076,6 +4074,10 @@ impl App {
                 if down {
                     self.pane_mouse = over_pane;
                     self.pane_keys = over_pane;
+                    // The keys go to the pane: the conversation's find ends.
+                    if over_pane && self.finding.take().is_some() {
+                        self.screen.end_find();
+                    }
                 }
                 let held = matches!(
                     mouse.kind,
@@ -4237,6 +4239,17 @@ impl App {
         true
     }
 
+    /// `pane` beside the conversation, with the keys; what was selected
+    /// or being found in the conversation let go.
+    fn open_pane(&mut self, pane: pane::Pane) {
+        self.pane = Some(pane);
+        self.pane_keys = true;
+        self.screen.unselect();
+        if self.finding.take().is_some() {
+            self.screen.end_find();
+        }
+    }
+
     /// `/status` has a screen of its own.
     fn watching(&self) -> bool {
         self.watch.as_ref().is_some_and(|w| w.screen.is_some())
@@ -4249,11 +4262,7 @@ impl App {
             let workspace = std::path::Path::new(&self.workspace);
             let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
             match pane::Pane::preview(link, workspace, width) {
-                Ok(pane) => {
-                    self.pane = Some(pane);
-                    self.pane_keys = true;
-                    self.screen.unselect();
-                }
+                Ok(pane) => self.open_pane(pane),
                 Err(error) => self.notice = Some(error),
             }
             return;
@@ -5121,11 +5130,7 @@ impl App {
             let woken = self.woken.clone();
             let drawn = move || woken.notify_one();
             match embed::Embedded::spawn(program, height, width, term::light(), drawn) {
-                Ok(program) => {
-                    self.pane = Some(pane::Pane::program("side chat", program));
-                    self.pane_keys = true;
-                    self.screen.unselect();
-                }
+                Ok(program) => self.open_pane(pane::Pane::program("side chat", program)),
                 Err(error) => self.notice = Some(format!("no side chat: {error}")),
             }
             return;
@@ -5358,7 +5363,12 @@ impl App {
                 true => {
                     let (area, pane) = self.split(frame.area());
                     if let (Some(at), Some(open)) = (pane, &mut self.pane) {
-                        let file = |word: &str| links::file_line(&workspace, word);
+                        // Paths in a file are read from its folder first.
+                        let base = open.folder().unwrap_or(&workspace).to_owned();
+                        let file = |word: &str| {
+                            links::file_line(&base, word)
+                                .or_else(|| links::file_line(&workspace, word))
+                        };
                         pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, file);
                         linked.extend(open.screen.link_cells(frame.buffer_mut()));
                         // The line between them, as a split's.

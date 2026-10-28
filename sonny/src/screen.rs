@@ -107,8 +107,10 @@ pub struct Screen {
     /// Counts each change to the rows shown, so what was found in them is
     /// looked for again.
     laid: usize,
-    /// A row to show at the top once the rows are laid out.
+    /// A line to show at the top once the rows are laid out; or a row,
+    /// as they were drawn.
     go_to: Option<usize>,
+    top_row: Option<usize>,
 }
 
 /// The place found is to be picked again, the rows having been drawn anew.
@@ -188,7 +190,7 @@ impl Screen {
             ..Self::default()
         };
         self.push(lines);
-        self.go_to = Some(top);
+        self.top_row = Some(top);
     }
 
     /// The view put with the line `row` of those pushed at its top.
@@ -457,6 +459,9 @@ impl Screen {
                 .nth(row)
                 .map_or(0, |(at, _)| at);
             self.back = self.shown.len().saturating_sub(at + height);
+        }
+        if let Some(top) = self.top_row.take() {
+            self.back = self.shown.len().saturating_sub(top + height);
         }
         self.back = self.back.min(self.most(height));
         let bottom = self.shown.len() - self.back;
@@ -1255,6 +1260,26 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0).trim_end(), "row 10");
         assert!(!screen.at_top());
+    }
+
+    #[test]
+    fn a_card_put_in_anew_keeps_the_rows_scrolled_to() {
+        // A long line wraps over rows above where the view is.
+        let mut lines = vec![Line::from("one two three four five six seven")];
+        lines.extend((0..20).map(|i| Line::from(format!("row {i}"))));
+        let (mut screen, _) = screen(lines.clone(), 10, 5);
+        screen.show_row(0);
+        let area = Rect::new(0, 0, 10, 5);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        screen.scroll(-6);
+        screen.render(area, &mut buf, |_| None);
+        let before = row(&buf, 0);
+        for _ in 0..3 {
+            screen.replace(lines.clone());
+            screen.render(area, &mut buf, |_| None);
+            assert_eq!(row(&buf, 0), before);
+        }
     }
 
     #[test]

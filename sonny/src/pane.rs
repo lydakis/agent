@@ -42,6 +42,8 @@ pub struct Pane {
     /// The file's address, as its link held it, opened outside Sonny
     /// when the title is clicked.
     link: Option<String>,
+    /// The folder the file is in, which paths in it are read from.
+    folder: Option<PathBuf>,
     pub screen: Screen,
     /// Where it was drawn last: its title row and its rows.
     pub area: Rect,
@@ -73,6 +75,10 @@ impl Pane {
         Ok(Self {
             title,
             link: Some(link.to_owned()),
+            folder: match path.is_dir() {
+                true => Some(path.clone()),
+                false => path.parent().map(Path::to_path_buf),
+            },
             screen,
             area: Rect::default(),
             card: None,
@@ -87,6 +93,7 @@ impl Pane {
         Self {
             title: title.to_owned(),
             link: None,
+            folder: None,
             screen: Screen::default(),
             area: Rect::default(),
             card: Some(Vec::new()),
@@ -101,6 +108,7 @@ impl Pane {
         Self {
             title: title.to_owned(),
             link: None,
+            folder: None,
             screen: Screen::default(),
             area: Rect::default(),
             card: None,
@@ -128,6 +136,11 @@ impl Pane {
             self.screen.replace(lines.clone());
             self.card = Some(lines);
         }
+    }
+
+    /// The folder of the file shown, if a file is.
+    pub fn folder(&self) -> Option<&Path> {
+        self.folder.as_deref()
     }
 
     /// The file's address, to open it outside, if it shows one.
@@ -271,7 +284,9 @@ fn preview(
             return Ok(0);
         }
     };
+    // Drawn only where pictures can be; elsewhere, its source.
     if extension == "svg"
+        && crate::term::graphics()
         && let Ok(rows) = crate::image::render(&text, width).and_then(|d| crate::image::show(&d))
     {
         screen.push(rows);
