@@ -15,6 +15,7 @@ mod background;
 mod banner;
 mod cache;
 mod calls;
+mod cmux;
 mod declared;
 mod diff;
 mod embed;
@@ -751,6 +752,7 @@ async fn run() -> Result<(), String> {
     // A side chat borrows its agent's pane, and Herdr keeps the agent.
     if options.side.is_none() {
         herdr::announce(&name, reopen());
+        cmux::announce(&name, reopen());
     }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
@@ -1050,8 +1052,8 @@ fn unique(prefix: &str) -> String {
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
-/// (Ghostty, Rex) can mark this pane working, blocked or done; and the
-/// same to Herdr, which takes it from its own CLI instead.
+/// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
+/// the same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
@@ -1060,6 +1062,9 @@ fn status_report(state: &str, bot: &str) {
         return;
     }
     herdr::report(state);
+    if state == "clear" {
+        cmux::release();
+    }
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
