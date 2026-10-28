@@ -871,6 +871,9 @@ async fn intent(
         }
     }
     let mut planned = Vec::with_capacity(calls.len());
+    // The files each call changes, read before its contents are clipped
+    // for showing, which can leave out a patch's file lines.
+    let mut changes = Vec::with_capacity(calls.len());
     // Past this the state is too long to judge anyway: stop reading.
     let mut size = 0;
     for (index, call) in calls.iter().enumerate() {
@@ -887,6 +890,7 @@ async fn intent(
         };
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
         let mut unseen = false;
+        changes.push(changed_paths(&tool, &arguments));
         if changes_files(&tool) {
             (arguments, unseen) = policy::shown_change(&arguments, &shared.redactor);
         }
@@ -993,7 +997,7 @@ async fn intent(
     // call will find it, so it points to that call instead.
     let workspace = read["workspace"].as_str().map(PathBuf::from);
     let mut changing: Vec<(String, String)> = Vec::new();
-    for call in &mut planned {
+    for (call, changed) in planned.iter_mut().zip(changes) {
         call.unseen |= written_cut;
         let mut text = String::new();
         strings(&call.arguments, &mut text);
@@ -1031,7 +1035,7 @@ async fn intent(
                 None => {}
             }
         }
-        for path in changed_paths(&call.tool, &call.arguments) {
+        for path in changed {
             changing.push((path, call.id.clone()));
         }
     }
