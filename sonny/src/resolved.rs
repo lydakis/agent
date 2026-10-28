@@ -2,10 +2,10 @@
 //! declares on it once nothing is left to do in a task, such as when its
 //! pull request merged or the work was dropped, and `/status` files the
 //! task out of the way. The lead's Sonny keeps each mark beside the store,
-//! read from the lead's history as the calls land, by the lead's turn that
-//! made it: turns are numbered across the store, so a task turn numbered
-//! after it, new work for the task or another bot under its name, reopens
-//! the task without anyone taking the mark off.
+//! read from the lead's history as the calls land: the task's newest turn
+//! finished by then, so one still running is not resolved. Turns are numbered across the store, so a task turn
+//! numbered after it, new work for the task or another bot under its name,
+//! reopens the task without anyone taking the mark off.
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -52,20 +52,35 @@ fn file(store: &Path, task: &str) -> PathBuf {
     PathBuf::from(dir).join(format!("{task}.json"))
 }
 
-/// The lead's turn that resolved `task`, if one did.
+/// The newest turn of `task` its resolving covered, if it was resolved.
 pub fn read(store: &Path, task: &str) -> Option<i64> {
     let value: Value = serde_json::from_slice(&std::fs::read(file(store, task)).ok()?).ok()?;
     value["turn"].as_i64()
 }
 
-/// Whether a task resolved in the lead's turn `mark` still is: none of its
+/// Whether a task resolved up to its turn `mark` still is: none of its
 /// turns, newest `newest`, came after, and none runs.
 pub fn holds(mark: Option<i64>, newest: Option<i64>, running: bool) -> bool {
-    mark.is_some_and(|mark| !running && newest.is_none_or(|turn| turn < mark))
+    mark.is_some_and(|mark| !running && newest.is_none_or(|turn| turn <= mark))
 }
 
-/// Note `task` resolved in the lead's turn `turn`, unless a later turn of
-/// the lead's resolved it already.
+/// The newest of a task's `turns`, as the daemon lists them, finished by
+/// `at` (ms): what resolving it then covers. A task with none covers 0.
+pub fn upto(turns: &[Value], at: i64) -> i64 {
+    turns
+        .iter()
+        .filter(|turn| {
+            turn["finished_ms"]
+                .as_i64()
+                .is_some_and(|ended| ended <= at)
+        })
+        .filter_map(|turn| turn["turn"].as_i64())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Note `task` resolved up to its turn `turn`, unless it was resolved past
+/// that already.
 pub fn keep(store: &Path, task: &str, turn: i64) -> Result<(), String> {
     if read(store, task).is_some_and(|kept| kept >= turn) {
         return Ok(());
@@ -97,12 +112,27 @@ mod tests {
 
     #[test]
     fn a_mark_holds_until_the_task_has_a_turn_after_it() {
-        assert!(holds(Some(10), Some(7), false));
-        assert!(holds(Some(10), None, false));
+        assert!(holds(Some(10), Some(10), false));
+        assert!(holds(Some(0), None, false));
         // New work since, running or ended.
         assert!(!holds(Some(10), Some(12), false));
-        assert!(!holds(Some(10), Some(7), true));
+        assert!(!holds(Some(10), Some(10), true));
         assert!(!holds(None, Some(7), false));
+    }
+
+    #[test]
+    fn resolving_covers_the_turns_finished_by_then() {
+        // Newest first; a task the lead waited on in the resolving turn
+        // has a turn numbered after the lead's, finished before the call.
+        let turns = [
+            json!({"turn": 16, "finished_ms": null}),
+            json!({"turn": 14, "finished_ms": 900}),
+            json!({"turn": 9, "finished_ms": 500}),
+        ];
+        assert_eq!(upto(&turns, 950), 14);
+        assert_eq!(upto(&turns, 600), 9);
+        assert_eq!(upto(&turns, 100), 0);
+        assert_eq!(upto(&[], 100), 0);
     }
 
     #[test]

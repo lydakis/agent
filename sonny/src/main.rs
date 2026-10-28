@@ -1181,6 +1181,9 @@ struct App {
     /// The slash command picked in the menu.
     pick: usize,
     watch: Option<Watch>,
+    /// What `/status` read of each idle agent's last turn: the turn, and
+    /// the question it left open.
+    asks_seen: HashMap<String, (i64, Option<String>)>,
     /// The live area is drawn afresh: the main screen is back from `/status`.
     redraw: bool,
     sounds: sound::Sounds,
@@ -1855,6 +1858,7 @@ impl App {
             turn_model: None,
             pick: 0,
             watch: None,
+            asks_seen: HashMap::new(),
             redraw: false,
             sounds: sound::Sounds::new(false),
             said: String::new(),
@@ -2670,7 +2674,8 @@ impl App {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
                             if name == resolved::TOOL && !failed && !reactions::refused(&item) {
-                                self.resolve(&arguments, turns.get(&node).copied(), false);
+                                self.resolve(&arguments, turns.get(&node).copied(), false)
+                                    .await;
                             }
                             if name == asks::TOOL
                                 && !failed
@@ -3236,7 +3241,7 @@ impl App {
                     && !shown.1
                     && !reactions::refused(&json!({"output": shown.0}))
                 {
-                    self.resolve(&arguments, turn, true);
+                    self.resolve(&arguments, turn, true).await;
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
@@ -3353,16 +3358,43 @@ impl App {
     }
 
     /// Note the task a lead's `resolve_task` call in `turn` names as
-    /// resolved; `now`, as it happens rather than replayed, its window
-    /// closes too.
-    fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
+    /// resolved, up to its newest turn finished by then: `now`, as it
+    /// happens, when its window closes too; replayed, by the time the
+    /// lead's turn ended.
+    async fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
         let Some(project) = &self.project else {
             return;
         };
         let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
             return;
         };
-        if let Err(error) = resolved::keep(&self.store(), &task, turn) {
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let at = match now {
+            true => clock,
+            false => self
+                .client
+                .request(
+                    "turns",
+                    json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
+                )
+                .await
+                .ok()
+                .and_then(|page| page["turns"][0]["finished_ms"].as_i64())
+                .unwrap_or(clock),
+        };
+        // A task that is gone has nothing to resolve.
+        let Ok(page) = self
+            .client
+            .request("turns", json!({"bot": task, "newest": true, "limit": 16}))
+            .await
+        else {
+            return;
+        };
+        let upto = resolved::upto(page["turns"].as_array().map_or(&[][..], Vec::as_slice), at);
+        if let Err(error) = resolved::keep(&self.store(), &task, upto) {
             self.notice = Some(error);
         }
         if now && let Some(fleet) = &mut self.fleet {
@@ -3431,7 +3463,7 @@ impl App {
     }
 
     /// The project's agents, as `/status` shows them.
-    async fn status_rows(&self) -> Result<(String, Vec<status::Row>), String> {
+    async fn status_rows(&mut self) -> Result<(String, Vec<status::Row>), String> {
         let (project, lead) = match &self.project {
             Some(project) => (project.clone(), format!("{project}.lead")),
             None => (
@@ -3506,6 +3538,20 @@ impl App {
             let resolved =
                 resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
             let Latest { mut step, pr, ask } = self.latest(name).await;
+            // Asking ends a turn, but work that does not wait on the
+            // answer may come first: an idle agent's whole last turn is
+            // read, once.
+            let ask = match (running, turn["turn"].as_i64()) {
+                (false, Some(last)) => match self.asks_seen.get(name) {
+                    Some((seen, ask)) if *seen == last => ask.clone(),
+                    _ => {
+                        let ask = self.asked_in(name, last).await;
+                        self.asks_seen.insert(name.to_owned(), (last, ask.clone()));
+                        ask
+                    }
+                },
+                _ => ask,
+            };
             if let Some(question) = &ask {
                 step = format!("asks: {}", first_line(question));
             }
@@ -3550,6 +3596,34 @@ impl App {
             )
         });
         Ok((project, rows))
+    }
+
+    /// The question `bot` asked in its turn `turn` and has no answer to,
+    /// read from that turn's items, newest first.
+    async fn asked_in(&self, bot: &str, turn: i64) -> Option<String> {
+        let page = self
+            .client
+            .request("history_nodes", json!({"bot": bot, "limit": 400}))
+            .await
+            .ok()?;
+        let nodes: Vec<i64> = page["nodes"]
+            .as_array()?
+            .iter()
+            .take_while(|n| n["turn"].as_i64().is_none_or(|t| t == turn))
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        let mut items = Vec::new();
+        for chunk in nodes.chunks(100) {
+            let read = self
+                .client
+                .request("history_items", json!({"bot": bot, "nodes": chunk}))
+                .await
+                .ok()?;
+            for entry in read["items"].as_array().into_iter().flatten() {
+                items.extend(responses(&entry["item"]).into_iter().rev());
+            }
+        }
+        asks::open(&items)
     }
 
     /// An agent's latest step, as a line; the pull request its latest

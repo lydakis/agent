@@ -185,8 +185,8 @@ person sees, as a checklist), and on a lead `resolve_task` too. The daemon
 shows them to the model and records each call without running anything;
 Sonny draws the calls, live and from history. The lead's Sonny keeps each
 task the lead resolved beside the store (`state.sqlite.resolved/`), with
-the lead's turn that resolved it: a turn of the task numbered after that
-one reopens it.
+the task's newest turn finished by then: a turn of the task numbered after
+that one reopens it.
 
 ![A plan and a question set with the plan and ask tools](../docs/sonny/ask-and-plan.png)
 
