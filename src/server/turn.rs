@@ -377,6 +377,8 @@ enum Round {
 /// How long an answered call holds its turn's slot for the answer before
 /// it parks, at most: the bot's approval hold, when that is shorter.
 const ANSWER_HOLD_MS: u64 = 250;
+/// How many turns `history` lists of another agent.
+const HISTORY_TURNS: usize = 20;
 /// Why a round's calls stopped before the last one ran: the turn parked,
 /// on handles or a verdict, and is resumed by the service.
 enum Stop {
@@ -3414,10 +3416,12 @@ impl Turn {
                     Err(error) => failure(error),
                 },
                 Ok(Prepared::History {
+                    bot,
                     turn: wanted,
                     offset,
                     limit,
-                }) => match Box::pin(self.history(&call.call_id, wanted, offset, limit)).await {
+                }) => match Box::pin(self.history(&call.call_id, bot, wanted, offset, limit)).await
+                {
                     Ok(outcome) => outcome,
                     Err(error) => failure(error),
                 },
@@ -3736,15 +3740,31 @@ impl Turn {
         }
     }
 
+    /// A page of a conversation turn, the bot's own or another's, or with
+    /// no turn the other's newest turns.
     async fn history(
         &self,
         call_id: &str,
-        wanted: i64,
+        bot: Option<String>,
+        wanted: Option<i64>,
         offset: u64,
         limit: usize,
     ) -> Result<Outcome> {
         let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
-        let bot = self.bot.clone();
+        let bot = bot.unwrap_or_else(|| self.bot.clone());
+        let Some(wanted) = wanted else {
+            let listed = self
+                .store
+                .read("history_turns", move |db| {
+                    db.history_turns(&bot, HISTORY_TURNS)
+                })
+                .await?;
+            let output = self.registry.redact_text(listed.to_string());
+            if family.tool_result_item(call_id, &output)?.len() > budget {
+                return fail("history_context_exhausted");
+            }
+            return Ok(Outcome::text(output));
+        };
         let mut page = self
             .store
             .read("history_read", move |db| {
