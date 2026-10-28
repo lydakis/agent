@@ -7,18 +7,20 @@
 //! in a folder sandfs mounts, a fork of that workspace; in any other
 //! folder, the folder as it is now, or on another disk than sandfs's home,
 //! a workspace over the folder itself. A task that could not start leaves
-//! no folder behind.
+//! no folder behind, and `sonny task rm` takes away one that is done.
 //!
 //! sandfs mounts are served by Sonny run again as `sonny sandfs daemon`,
 //! which outlives the command that asked for them and shares sandfs's home
 //! with the `sandfs` command.
-use sandfs::{ChangeKind, ChangesOptions, ForkOptions, Home, MountOptions};
+use sandfs::{Change, ChangeKind, ChangesOptions, ForkOptions, Home, MountOptions};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const USAGE: &str = "usage: sonny task NAME [--setup] [RUN FLAGS...] -- BRIEF\n\
-                     \x20      sonny task changes NAME [--apply]";
+                     \x20      sonny task changes NAME [--all] [--apply [--force] [--only PATH...]]\n\
+                     \x20      sonny task rm NAME [--discard]";
 
 /// The task's folder, how its work comes back, and what undoes it.
 struct Place {
@@ -49,10 +51,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .and_then(std::fs::canonicalize)
         .map_err(|e| e.to_string())?;
     match args {
-        [changes, name] if changes == "changes" => list(name, None),
-        [changes, name, apply] if changes == "changes" && apply == "--apply" => {
-            list(name, Some(here))
-        }
+        [changes, name, rest @ ..] if changes == "changes" => list(&here, name, rest),
+        [rm, name, rest @ ..] if rm == "rm" => remove(&here, name, rest),
         [name, rest @ ..] if !name.starts_with('-') => start(&here, name, rest),
         _ => Err(USAGE.into()),
     }
@@ -671,6 +671,23 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
             }
         }
     };
+    // A linked worktree in a plain folder names its repository by an
+    // absolute path, outside the copy: git there would change the real
+    // repository while the files changed stay in the copy. Git is turned
+    // off there instead, in the copy only.
+    let mut stubbed = Vec::new();
+    let mut looked_all = true;
+    if !git_copy && matches!(undo, Undo::Sandfs { .. }) {
+        let complete;
+        (stubbed, complete) = linked_worktrees(&root);
+        looked_all = complete;
+        for worktree in &stubbed {
+            if let Err(e) = std::fs::write(dir.join(worktree).join(".git"), GIT_OFF) {
+                self::undo(&undo);
+                return Err(format!("turning git off in {}: {e}", worktree.display()));
+            }
+        }
+    }
     let note = if git_copy {
         let origin = git(&dir, &["remote", "get-url", "origin"]).unwrap_or_default();
         format!(
@@ -687,12 +704,33 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
                      it has looked at stays as it first saw it, and `--apply` writes over what \
                      changed here meanwhile without asking"
             }
-            false => "a sandfs copy of this folder as it is now",
+            false => {
+                "a sandfs copy of this folder as it is now, whose --apply refuses a file \
+                     changed here since unless given --force"
+            }
         };
-        format!(
+        let mut note = format!(
             "{name}: {what}; `{me} task changes {name}` lists what the task changed, and \
-             `{me} task changes {name} --apply` writes it here"
-        )
+             `{me} task changes {name} --apply` writes it here. Copy nothing from its folder \
+             onto this one yourself. Commits it makes in a repository in this folder stay in \
+             its copy, so a task that commits starts in that repository's own folder"
+        );
+        if !stubbed.is_empty() {
+            let named: Vec<String> = stubbed.iter().map(|path| shell_quote(path)).collect();
+            note.push_str(&format!(
+                ". Git is off in its copy of {} linked worktrees, whose .git points outside \
+                 the copy: {}",
+                stubbed.len(),
+                named.join(", ")
+            ));
+        }
+        if !looked_all {
+            note.push_str(
+                ". This folder is too big or deep to look for every linked worktree in, so git \
+                 in one it missed still changes the repository it belongs to",
+            );
+        }
+        note
     };
     let prefix = here.strip_prefix(&root).unwrap_or(Path::new(""));
     Ok(Place {
@@ -702,6 +740,12 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         copy: Some((root, dir)),
     })
 }
+
+/// What a linked worktree's `.git` holds in a plain folder's copy, so git
+/// stops there with this as its reason.
+const GIT_OFF: &str = "gitdir: /dev/null/sonny: this linked worktree's repository is outside \
+                       the task's copy, so git is off here; start a task in that repository's \
+                       own folder to use git on it\n";
 
 /// Whether `folder` is on the disk sandfs's `home` is on, or will be made
 /// on.
@@ -724,26 +768,231 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
     }
 }
 
-/// This program, as the lead's shell runs it.
+/// This program, by the path that outlives an upgrade.
 fn me() -> String {
-    std::env::current_exe().map_or("sonny".into(), |me| shell_quote(&me))
+    crate::skills::sonny_path().map_or("sonny".into(), |me| shell_quote(&me))
 }
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
-/// `sonny task changes NAME [--apply]`: what the task's sandfs copy added,
-/// changed and deleted, and with `--apply`, written into this folder.
-fn list(name: &str, to: Option<PathBuf>) -> Result<(), String> {
+/// The linked worktrees in the plain folder `root`, relative to it: each
+/// folder whose `.git` file names its repository by an absolute path or a
+/// path out of `root`, which a copy of `root` still reaches; and whether
+/// every folder was looked in. Found at most `DEEP` folders down, and in
+/// at most `LOOKED` folders, so a start stays quick in a folder of
+/// thousands of projects; repositories' own lists name their linked
+/// worktrees wherever in `root` they are.
+fn linked_worktrees(root: &Path) -> (Vec<PathBuf>, bool) {
+    const LOOKED: usize = 50_000;
+    const DEEP: usize = 6;
+    let outbound = |dir: &Path| {
+        let Ok(text) = std::fs::read_to_string(dir.join(".git")) else {
+            return false;
+        };
+        let Some(gitdir) = text.trim().strip_prefix("gitdir:").map(str::trim) else {
+            return false;
+        };
+        let gitdir = Path::new(gitdir);
+        gitdir.is_absolute()
+            || std::fs::canonicalize(dir.join(gitdir)).is_ok_and(|real| !real.starts_with(root))
+    };
+    let mut found = Vec::new();
+    let mut looked = 0;
+    let mut looked_all = true;
+    let mut next = vec![(root.to_owned(), 0)];
+    while let Some((dir, depth)) = next.pop() {
+        looked += 1;
+        if looked > LOOKED {
+            return (tidy(root, found), false);
+        }
+        let git = dir.join(".git");
+        if git.is_file() && outbound(&dir) {
+            found.push(dir.clone());
+        }
+        if git.is_dir() {
+            // A repository's linked worktrees, wherever in `root` they are.
+            let listed = std::fs::read_dir(git.join("worktrees"))
+                .into_iter()
+                .flatten();
+            for entry in listed.flatten() {
+                let Ok(file) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+                    continue;
+                };
+                if let Some(worktree) = Path::new(file.trim()).parent()
+                    && worktree.starts_with(root)
+                    && outbound(worktree)
+                {
+                    found.push(worktree.to_owned());
+                }
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // Inside repositories and worktrees too: one may hold another
+        // repository's worktree, which its own list doesn't name.
+        for entry in entries.flatten() {
+            let skip = matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "node_modules" | "target" | "__pycache__")
+            );
+            if !skip && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                match depth == DEEP {
+                    true => looked_all = false,
+                    false => next.push((entry.path(), depth + 1)),
+                }
+            }
+        }
+    }
+    (tidy(root, found), looked_all)
+}
+
+/// `found`, relative to `root`, sorted and once each.
+fn tidy(root: &Path, found: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = found
+        .into_iter()
+        .filter_map(|dir| dir.strip_prefix(root).ok().map(Path::to_owned))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Whether `path` is git's own, in a `.git` folder or a worktree's `.git`
+/// file: never written into the lead's folder, since git runs what such
+/// files name and a copy's commits come back by push instead.
+fn in_git(path: &str) -> bool {
+    path.split('/').any(|part| part == ".git")
+}
+
+/// Which of `paths`, relative to `here`, git ignores: each asked of the
+/// innermost repository in `here` that holds it, such as a project's
+/// `__pycache__` in a folder of projects.
+fn ignored(here: &Path, paths: &[&str]) -> HashSet<String> {
+    let mut by_repo: BTreeMap<PathBuf, Vec<(&str, String)>> = BTreeMap::new();
+    for path in paths {
+        let repo = Path::new(path)
+            .ancestors()
+            .skip(1)
+            .find(|dir| here.join(dir).join(".git").exists());
+        if let Some(repo) = repo {
+            let inside = Path::new(path)
+                .strip_prefix(repo)
+                .unwrap_or(Path::new(path));
+            by_repo
+                .entry(here.join(repo))
+                .or_default()
+                .push((path, inside.to_string_lossy().into_owned()));
+        }
+    }
+    let mut found = HashSet::new();
+    for (repo, paths) in by_repo {
+        let mut asked = Command::new("git");
+        asked
+            .arg("-C")
+            .arg(&repo)
+            .args(["check-ignore", "-z", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let Ok(mut child) = asked.spawn() else {
+            continue;
+        };
+        // Fed while its answer is read, so neither waits on a full pipe.
+        let list: Vec<u8> = paths
+            .iter()
+            .flat_map(|(_, inside)| inside.bytes().chain([0]))
+            .collect();
+        let feeding = child.stdin.take().map(|mut input| {
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = input.write_all(&list);
+            })
+        });
+        // Exit 1 means none is ignored; any failure leaves them all shown.
+        let output = child.wait_with_output();
+        if let Some(feeding) = feeding {
+            let _ = feeding.join();
+        }
+        let Ok(output) = output else {
+            continue;
+        };
+        let said: HashSet<&[u8]> = output.stdout.split(|b| *b == 0).collect();
+        found.extend(
+            paths
+                .iter()
+                .filter(|(_, inside)| said.contains(inside.as_bytes()))
+                .map(|(path, _)| path.to_string()),
+        );
+    }
+    found
+}
+
+/// `sonny task changes NAME [--all] [--apply [--force] [--only PATH...]]`:
+/// what the task's sandfs copy added, changed and deleted, and with
+/// `--apply`, written into this folder: what is listed, or the `--only`
+/// paths, and never git's own files. Files git ignores are left out unless
+/// `--all` or `--only` asks for them.
+fn list(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
+    let (mut apply, mut force, mut all, mut only) = (false, false, false, Vec::new());
+    let mut words = args.iter().peekable();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--apply" => apply = true,
+            "--force" => force = true,
+            "--all" => all = true,
+            "--only" => {
+                while let Some(path) = words.next_if(|word| !word.starts_with("--")) {
+                    only.push(path.trim_end_matches('/').to_owned());
+                }
+                if only.is_empty() {
+                    return Err(USAGE.into());
+                }
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if (force || !only.is_empty()) && !apply {
+        return Err(USAGE.into());
+    }
+    let home = sandfs()?;
     let options = ChangesOptions {
-        copy_to: to,
+        paths: only.clone(),
         ..Default::default()
     };
-    let found = sandfs()?
-        .changes(name, &options)
-        .map_err(|e| format!("{e:#}"))?;
-    for change in &found.changes {
+    let found = home.changes(name, &options).map_err(|e| format!("{e:#}"))?;
+    let (git_own, rest): (Vec<&Change>, Vec<&Change>) = found
+        .changes
+        .iter()
+        .partition(|change| in_git(&change.path));
+    let skipped = match all || !only.is_empty() {
+        true => HashSet::new(),
+        false => ignored(
+            here,
+            &rest.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+        ),
+    };
+    let shown: Vec<&Change> = rest
+        .into_iter()
+        .filter(|change| !skipped.contains(&change.path))
+        .collect();
+    let mut held_back = found.held_back;
+    let mut git_settings = found.git_settings.clone();
+    if apply && !shown.is_empty() {
+        // Exactly what is listed, so nothing the lead did not see is written.
+        let options = ChangesOptions {
+            paths: shown.iter().map(|change| change.path.clone()).collect(),
+            copy_to: Some(here.to_owned()),
+            force,
+            ..Default::default()
+        };
+        let applied = home.changes(name, &options).map_err(|e| format!("{e:#}"))?;
+        held_back = applied.held_back;
+        git_settings = applied.git_settings;
+    }
+    for change in &shown {
         let kind = match change.kind {
             ChangeKind::Added => 'A',
             ChangeKind::Modified => 'M',
@@ -751,22 +1000,387 @@ fn list(name: &str, to: Option<PathBuf>) -> Result<(), String> {
         };
         println!("{kind} {}", change.path);
     }
-    if found.held_back > 0 {
+    let left = if apply {
+        "listed or written here"
+    } else {
+        "listed"
+    };
+    if apply && shown.is_empty() {
+        eprintln!("nothing to apply");
+    }
+    if !git_own.is_empty() {
         eprintln!(
-            "{} changes in .git left out: git runs what is named there, so copy those by hand",
-            found.held_back
+            "{} changes in git's own files not {left}: commits made in the task's copy come \
+             back only by push",
+            git_own.len()
         );
     }
-    for setting in &found.git_settings {
+    if !skipped.is_empty() {
+        eprintln!(
+            "{} files git ignores not {left}; --all lists them",
+            skipped.len()
+        );
+    }
+    if held_back > 0 {
+        eprintln!(
+            "{held_back} changes in .git left out: git runs what is named there, so copy those by hand"
+        );
+    }
+    for setting in &git_settings {
         eprintln!("the copy changed git's {setting}");
     }
     Ok(())
 }
 
+/// `sonny task rm NAME [--discard]`: remove the task and the folder Sonny
+/// made it, once its work is here: a sandfs copy's changes applied, or for
+/// a git copy, committed and pushed; a worktree's changes committed, its
+/// branch kept unless merged. `--discard` removes them anyway. An agent
+/// still working is not removed, and then neither is anything else.
+fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
+    let discard = match args {
+        [] => false,
+        [flag] if flag == "--discard" => true,
+        _ => return Err(USAGE.into()),
+    };
+    let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let folder = tasks()?.join(name);
+    let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
+    let copy = match Home::locate().is_ok_and(|home| home.root().exists()) {
+        true => sandfs()?
+            .workspaces()
+            .map_err(|e| format!("{e:#}"))?
+            .into_iter()
+            .find(|ws| ws.name == name),
+        false => None,
+    };
+    if let Some(ws) = &copy
+        && !(ws.mounted.as_deref() == Some(folder.as_path())
+            || ws.mounted.is_none() && folder.is_dir())
+    {
+        return Err(format!(
+            "the sandfs workspace {name} is not this task's copy, so it was left alone"
+        ));
+    }
+    let branch = format!("agent/{name}");
+    let worktree = home_dir()?.join(".agent/worktrees").join(name);
+    let worktree = match worktree.exists() {
+        true if ours(here, &worktree, &branch) => Some(worktree),
+        true => {
+            return Err(format!(
+                "{} is not this repository's worktree on {branch}; run this in the repository \
+                 the task was started from",
+                worktree.display()
+            ));
+        }
+        false => None,
+    };
+    // Left unmounted by a restart: its folder is empty until it is mounted
+    // again, and an empty folder would pass for no work.
+    if !discard
+        && let Some(ws) = &copy
+        && ws.mounted.is_none()
+    {
+        sandfs()?
+            .mount(name, &folder, &MountOptions::default())
+            .map_err(|e| format!("{name}'s copy could not be mounted to check it: {e:#}"))?;
+    }
+    // What would be lost, checked while the task can still be kept, and again
+    // once it is gone and can write no more.
+    let kept = || -> Result<(), String> {
+        if discard {
+            return Ok(());
+        }
+        if copy.is_some() {
+            let left = not_here(name, &folder, here)?;
+            if !left.is_empty() {
+                return Err(format!(
+                    "{name} has work that is not here: {left}; pass --discard to remove it anyway"
+                ));
+            }
+        }
+        if let Some(path) = &worktree
+            && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
+        {
+            return Err(format!(
+                "{name}'s worktree has uncommitted changes; commit them, or pass --discard to \
+                 remove it anyway"
+            ));
+        }
+        Ok(())
+    };
+    kept()?;
+    if listed(&agent, name) {
+        let output = crate::agent_command(&agent)?
+            .args(["rm", "--bot", name])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("running {}: {e}", agent.display()))?;
+        if !output.status.success() {
+            let said = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("{name} was not removed: {}", said.trim()));
+        }
+        kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
+    }
+    if copy.is_some() {
+        sandfs()?.remove(name, true).map_err(|e| format!("{e:#}"))?;
+    }
+    // The empty folder a mount was on.
+    let _ = std::fs::remove_dir(&folder);
+    if let Some(path) = &worktree {
+        let path = path.to_string_lossy();
+        let mut args = vec!["worktree", "remove"];
+        if discard {
+            args.push("--force");
+        }
+        args.push(&path);
+        git(here, &args)?;
+        let delete = if discard { "-D" } else { "-d" };
+        if git(here, &["branch", delete, &branch]).is_err() {
+            eprintln!(
+                "{branch} is kept, since it has commits not merged here; `git branch -D {branch}` \
+                 deletes it"
+            );
+        }
+    }
+    eprintln!("{name}: removed");
+    Ok(())
+}
+
+/// What the repository at `repo` keeps that its origin lacks, by name:
+/// each branch, tag and stash, and HEAD, whose object origin does not
+/// have, with origin's URL. A tag is work as much as a branch, and a
+/// stash or a detached HEAD holds commits no branch does.
+fn unkept(repo: &Path) -> Result<(String, Vec<String>), String> {
+    let origin = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let refs = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname:short)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    // As `git stash list` says them, which needs a work tree that a
+    // deinitialized submodule's repository has not.
+    let stashes = git(
+        repo,
+        &[
+            "log",
+            "--walk-reflogs",
+            "--ignore-missing",
+            "--format=%H commit   %gd",
+            "refs/stash",
+            "--",
+        ],
+    )?;
+    let head = format!("{} commit   HEAD", git(repo, &["rev-parse", "HEAD"])?);
+    let local = Path::new(&origin).is_dir();
+    let unkept = refs
+        .lines()
+        .chain(stashes.lines())
+        .chain([head.as_str()])
+        .filter_map(|line| {
+            let mut parts = line.splitn(5, ' ');
+            let (object, kind) = (parts.next()?, parts.next()?);
+            // An annotated tag, and what it names.
+            let (named, named_kind) = (parts.next()?, parts.next()?);
+            let (named, named_kind) = match named.is_empty() {
+                true => (object, kind),
+                false => (named, named_kind),
+            };
+            Some((object, named, named_kind, parts.next()?))
+        })
+        .filter(|(object, named, kind, _)| match local {
+            // Any object origin has, it has with all it names.
+            true => git(Path::new(&origin), &["cat-file", "-e", object]).is_err(),
+            false if *kind == "commit" => git(repo, &["branch", "-r", "--contains", named])
+                .unwrap_or_default()
+                .is_empty(),
+            // A tag of a tree or blob, which no remote branch contains,
+            // can't be checked against a remote without asking it.
+            false => false,
+        })
+        .map(|(_, _, _, name)| name.to_owned())
+        .collect();
+    Ok((origin, unkept))
+}
+
+/// The submodule repositories git keeps in `modules`, a repository's
+/// `modules` folder, and theirs in turn, each with its name.
+fn repositories(modules: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    let mut next = vec![modules.to_owned()];
+    while let Some(dir) = next.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            if path.join("HEAD").is_file() && path.join("objects").is_dir() {
+                let name = path.strip_prefix(modules).unwrap_or(&path);
+                found.push((
+                    name.to_string_lossy().replace("/modules/", "/"),
+                    path.clone(),
+                ));
+                next.push(path.join("modules"));
+            } else {
+                // A submodule named with a slash.
+                next.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// What of the task's work in its copy at `folder` is not in `here`, said
+/// in a few words, or nothing: a git copy's uncommitted changes and
+/// commits its origin lacks; any other copy's changes not applied here,
+/// but for git's own files and those git ignores.
+fn not_here(name: &str, folder: &Path, here: &Path) -> Result<String, String> {
+    if folder.join(".git").exists() {
+        // Each submodule checked out in it first, whose changes its own
+        // status names, then the copy's own: a push of the copy's branch
+        // pushes neither a submodule's changes nor its commits.
+        let subs = git(
+            folder,
+            &[
+                "submodule",
+                "foreach",
+                "--quiet",
+                "--recursive",
+                "echo \"$displaypath\"",
+            ],
+        )?;
+        for sub in subs.lines() {
+            if !git(
+                &folder.join(sub),
+                &["status", "--porcelain", "--untracked-files=all"],
+            )?
+            .is_empty()
+            {
+                return Ok(format!(
+                    "uncommitted changes in its copy, in its submodule {sub}"
+                ));
+            }
+        }
+        if !git(folder, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+            return Ok("uncommitted changes in its copy".into());
+        }
+        // Every submodule's repository, checked out or not: one deinitialized
+        // keeps its commits, and its repository, all the same.
+        let common = git(
+            folder,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let modules = Path::new(common.trim()).join("modules");
+        for (sub, repo) in
+            std::iter::once((String::new(), folder.to_owned())).chain(repositories(&modules))
+        {
+            let (origin, unkept) = unkept(&repo)?;
+            if !unkept.is_empty() {
+                let at = match sub.is_empty() {
+                    true => String::new(),
+                    false => format!(" in its submodule {sub}"),
+                };
+                return Ok(format!(
+                    "commits not pushed to {origin}, on {}{at}",
+                    unkept.join(", ")
+                ));
+            }
+        }
+        return Ok(String::new());
+    }
+    let found = sandfs()?
+        .changes(name, &ChangesOptions::default())
+        .map_err(|e| format!("{e:#}"))?;
+    let mine: Vec<&Change> = found.changes.iter().filter(|c| !in_git(&c.path)).collect();
+    // What --apply leaves out by default is no work to keep.
+    let skipped = ignored(
+        here,
+        &mine.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+    );
+    let missing: Vec<String> = mine
+        .into_iter()
+        .filter(|change| !skipped.contains(&change.path))
+        .filter(|change| {
+            let there = here.join(&change.path);
+            match change.kind {
+                ChangeKind::Deleted => there.symlink_metadata().is_ok(),
+                _ => !same_entry(&there, &folder.join(&change.path)),
+            }
+        })
+        .map(|change| change.path.clone())
+        .collect();
+    Ok(match missing.len() {
+        0 => String::new(),
+        n => format!(
+            "{n} changes not applied here ({}{}); `{} task changes {name} --apply` here writes them",
+            missing[..n.min(3)].join(", "),
+            if n > 3 { ", ..." } else { "" },
+            me()
+        ),
+    })
+}
+
+/// Whether `a` and `b` are the same kind of entry with the same contents:
+/// for a symlink, its target, not what it leads to. Anything that can't be
+/// read is not the same, since then that can't be told.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    let (Ok(kind_a), Ok(kind_b)) = (a.symlink_metadata(), b.symlink_metadata()) else {
+        return false;
+    };
+    let (kind_a, kind_b) = (kind_a.file_type(), kind_b.file_type());
+    if kind_a.is_symlink() || kind_b.is_symlink() {
+        return kind_a.is_symlink()
+            && kind_b.is_symlink()
+            && matches!((std::fs::read_link(a), std::fs::read_link(b)), (Ok(x), Ok(y)) if x == y);
+    }
+    if kind_a.is_dir() || kind_b.is_dir() {
+        return kind_a.is_dir() && kind_b.is_dir();
+    }
+    // Whether it runs, as --apply keeps it.
+    use std::os::unix::fs::PermissionsExt;
+    let runs = |path: &Path| {
+        path.symlink_metadata()
+            .map(|found| found.permissions().mode() & 0o111 != 0)
+            .ok()
+    };
+    runs(a) == runs(b) && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// The names of every agent the daemon on `socket` has, or None when it
+/// can't say.
+fn agents(agent: &Path, socket: &Path) -> Option<HashSet<String>> {
+    let output = Command::new(agent)
+        .arg("ls")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    match serde_json::from_slice::<Value>(&output.stdout).ok()? {
+        Value::Array(bots) => Some(
+            bots.iter()
+                .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Mount again the task copies a restart unmounted, so a task never works
 /// in an empty folder: every workspace whose folder in `~/.agent/tasks`
-/// is there but not mounted. Returns what could not be mounted.
-pub fn remount() -> Vec<String> {
+/// is there but not mounted, and whose task the daemon on `socket`, the
+/// one Sonny was opened on, still has. Returns
+/// what could not be mounted, after a word on copies whose task is gone.
+pub fn remount(socket: &Path) -> Vec<String> {
     let Ok(tasks) = tasks() else {
         return Vec::new();
     };
@@ -779,15 +1393,44 @@ pub fn remount() -> Vec<String> {
     let Ok(workspaces) = home.workspaces() else {
         return Vec::new();
     };
-    workspaces
-        .into_iter()
-        .filter(|ws| ws.mounted.is_none() && tasks.join(&ws.name).is_dir())
-        .filter_map(|ws| {
-            home.mount(&ws.name, &tasks.join(&ws.name), &MountOptions::default())
-                .err()
-                .map(|e| format!("task copy {}: {e:#}", ws.name))
-        })
-        .collect()
+    // Unknown, as when the daemon can't be asked: mount them all rather
+    // than leave a task in an empty folder.
+    let alive = crate::agent_bin().and_then(|agent| agents(&agent, socket));
+    let real = std::fs::canonicalize(&tasks).unwrap_or(tasks.clone());
+    let mut said = Vec::new();
+    let mut gone = Vec::new();
+    for ws in workspaces {
+        // Only Sonny's task copies: the home is shared with the sandfs command.
+        let ours = match &ws.mounted {
+            Some(at) => *at == real.join(&ws.name),
+            None => tasks.join(&ws.name).is_dir(),
+        };
+        if !ours {
+            continue;
+        }
+        if alive
+            .as_ref()
+            .is_some_and(|alive| !alive.contains(&ws.name))
+        {
+            gone.push(ws.name);
+        } else if ws.mounted.is_none()
+            && let Err(e) = home.mount(&ws.name, &tasks.join(&ws.name), &MountOptions::default())
+        {
+            said.push(format!("task copy {}: {e:#}", ws.name));
+        }
+    }
+    if !gone.is_empty() {
+        said.insert(
+            0,
+            format!(
+                "task copies whose task is gone: {}; `{} task rm NAME` in the folder one came \
+                 from removes it",
+                gone.join(", "),
+                me()
+            ),
+        );
+    }
+    said
 }
 
 #[cfg(test)]
@@ -895,6 +1538,259 @@ mod tests {
             run(none, &["--model", "a/lead"], None),
             ["--model", "a/lead", "--effort", "high"]
         );
+    }
+
+    #[test]
+    fn linked_worktrees_in_a_plain_folder_are_found() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("sonny-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("folder");
+        let repo = root.join("src/shop");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        // One inside the repository, one beside it, both of the repository
+        // in the folder; one of a repository outside it.
+        run(&repo, &["worktree", "add", "-q", ".worktrees/a", "-b", "a"]);
+        run(&repo, &["worktree", "add", "-q", "../shop-b", "-b", "b"]);
+        let outside = base.join("elsewhere/repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        run(&outside, &["init", "-q"]);
+        run(&outside, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let far = root.join("deep/c");
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        run(
+            &outside,
+            &["worktree", "add", "-q", &far.to_string_lossy(), "-b", "c"],
+        );
+        // A submodule's .git names a folder inside the copy, which stays in it.
+        std::fs::create_dir_all(root.join("sub/.git-modules/x")).unwrap();
+        std::fs::create_dir_all(root.join("sub/lib")).unwrap();
+        std::fs::write(root.join("sub/lib/.git"), "gitdir: ../.git-modules/x\n").unwrap();
+        // Another repository's worktree inside a repository in the folder,
+        // which that repository's own list doesn't name.
+        let nested = repo.join("vendor/d");
+        std::fs::create_dir_all(repo.join("vendor")).unwrap();
+        run(
+            &outside,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &nested.to_string_lossy(),
+                "-b",
+                "d",
+            ],
+        );
+        let (found, all) = linked_worktrees(&root);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(all);
+        assert_eq!(
+            found,
+            [
+                "deep/c",
+                "src/shop/.worktrees/a",
+                "src/shop/vendor/d",
+                "src/shop-b"
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn a_folder_deeper_than_worktrees_are_looked_for_says_so() {
+        let root = std::env::temp_dir().join(format!("sonny-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("1/2/3/4/5/6")).unwrap();
+        assert_eq!(linked_worktrees(&root), (Vec::new(), true));
+        std::fs::create_dir_all(root.join("1/2/3/4/5/6/7")).unwrap();
+        let found = linked_worktrees(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, (Vec::new(), false));
+    }
+
+    #[test]
+    fn a_git_copy_keeps_what_its_origin_lacks_in_its_submodules_too() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("sonny-unkept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "protocol.file.allow=always"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let (lib, top, copy) = (base.join("lib"), base.join("top"), base.join("copy"));
+        for repo in [&lib, &top] {
+            std::fs::create_dir_all(repo).unwrap();
+            run(repo, &["init", "-q", "-b", "main"]);
+            run(repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        }
+        run(
+            &top,
+            &["submodule", "add", "-q", &lib.to_string_lossy(), "lib"],
+        );
+        run(&top, &["commit", "-qm", "lib"]);
+        // A tag of a blob that origin has too is no work of the copy's.
+        let blob = run(&top, &["hash-object", "-w", ".gitmodules"]);
+        run(&top, &["tag", "blob", &blob]);
+        run(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--recurse-submodules",
+                &top.to_string_lossy(),
+                "copy",
+            ],
+        );
+        run(&copy, &["fetch", "-q", "origin", "refs/tags/*:refs/tags/*"]);
+        let left = |copy: &Path| not_here("demo", copy, &base).unwrap();
+        assert_eq!(left(&copy), "");
+        // A commit in the submodule that only the copy has, with the copy's
+        // own branch pushed.
+        let sub = copy.join("lib");
+        run(&sub, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        run(&copy, &["commit", "-qam", "lib two"]);
+        run(&copy, &["push", "-q", "origin", "main:task"]);
+        assert!(
+            left(&copy).starts_with("commits not pushed to ")
+                && left(&copy).ends_with(" in its submodule lib"),
+            "{}",
+            left(&copy)
+        );
+        run(&sub, &["push", "-q", "origin", "HEAD:refs/heads/task"]);
+        assert_eq!(left(&copy), "");
+        // And once the submodule is deinitialized, whose repository keeps
+        // its commits.
+        run(&sub, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        run(&copy, &["commit", "-qam", "lib three"]);
+        run(&copy, &["push", "-q", "origin", "main:task"]);
+        run(&copy, &["submodule", "deinit", "-q", "-f", "lib"]);
+        assert!(
+            left(&copy).ends_with(" in its submodule lib"),
+            "{}",
+            left(&copy)
+        );
+        let kept = copy.join(".git/modules/lib");
+        run(&kept, &["push", "-q", "origin", "HEAD:refs/heads/task"]);
+        assert_eq!(left(&copy), "");
+        // With an origin by URL, a commit only an annotated tag keeps.
+        let url = format!("file://{}", top.display());
+        run(&copy, &["remote", "set-url", "origin", &url]);
+        run(&copy, &["fetch", "-q", "origin"]);
+        assert_eq!(left(&copy), "");
+        run(&copy, &["checkout", "-q", "--detach"]);
+        run(&copy, &["commit", "-q", "--allow-empty", "-m", "private"]);
+        run(&copy, &["tag", "-a", "-m", "kept", "kept"]);
+        run(&copy, &["switch", "-q", "main"]);
+        assert_eq!(left(&copy), format!("commits not pushed to {url}, on kept"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn git_off_stops_git_with_its_reason() {
+        let base = std::env::temp_dir().join(format!("sonny-git-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("wt")).unwrap();
+        std::fs::write(base.join("wt/.git"), GIT_OFF).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(base.join("wt"))
+            .arg("status")
+            .env("GIT_CEILING_DIRECTORIES", &base)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        // Git stops, in words that depend on its version: some say the
+        // reason, others name the .git file that holds it.
+        assert!(
+            !output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn ignored_files_are_asked_of_the_repository_holding_them() {
+        let base = std::env::temp_dir().join(format!("sonny-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("shop")).unwrap();
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(base.join("shop"))
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        std::fs::write(base.join("shop/.gitignore"), "__pycache__/\n").unwrap();
+        let found = ignored(
+            &base,
+            &[
+                "shop/__pycache__/a.pyc",
+                "shop/a.py",
+                "notes.md",
+                "__pycache__/b.pyc",
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(found, HashSet::from(["shop/__pycache__/a.pyc".to_owned()]));
+        assert!(in_git("shop/.git/index") && in_git("wt/.git") && !in_git("a.github/x"));
+    }
+
+    #[test]
+    fn entries_are_the_same_only_when_they_can_be_told_apart_from_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("sonny-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let at = |name: &str| base.join(name);
+        std::fs::write(at("a"), "x").unwrap();
+        std::fs::write(at("b"), "x").unwrap();
+        std::fs::write(at("c"), "y").unwrap();
+        std::os::unix::fs::symlink("nowhere", at("link")).unwrap();
+        std::os::unix::fs::symlink("a", at("to-a")).unwrap();
+        std::os::unix::fs::symlink("b", at("to-b")).unwrap();
+        std::fs::write(at("run"), "x").unwrap();
+        std::fs::set_permissions(at("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let said = [
+            same_entry(&at("a"), &at("b")),
+            // The same bytes, but one runs and the other doesn't.
+            same_entry(&at("a"), &at("run")),
+            same_entry(&at("a"), &at("c")),
+            // A dangling link is not the same as nothing there.
+            same_entry(&at("missing"), &at("link")),
+            // Links to the same contents by other targets differ.
+            same_entry(&at("to-a"), &at("to-b")),
+            same_entry(&at("to-a"), &at("a")),
+        ];
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(said, [true, false, false, false, false, false]);
     }
 
     #[test]

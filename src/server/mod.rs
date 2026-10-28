@@ -16,7 +16,9 @@ use agent_runtime::{
         Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Settings,
         Started, Store, TurnOptions, Waiting, Wake,
     },
-    tools::{DECLARED_BYTES, Declared, MAX_DECLARED, Registry, validate_declared},
+    tools::{
+        ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
+    },
 };
 use handles::{Completion, Handles, Waiter, now_ms};
 use hub::{Hub, replay};
@@ -174,6 +176,14 @@ pub struct Request {
     id: Value,
     #[serde(flatten)]
     command: Command,
+}
+/// A client's refusal of an answered call, which the model reads as the
+/// call's error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolError {
+    code: String,
+    detail: Option<String>,
 }
 /// Who wrote a submitted prompt: a bot's turn. Declared by the submitter.
 #[derive(Deserialize)]
@@ -403,6 +413,22 @@ enum Command {
         /// The lease of the session serving `tag`: an answer under a lease
         /// that ended is refused. Without one, the answer is an override.
         lease: Option<u64>,
+    },
+    /// A client's answer to a call of a declared tool it answers: the
+    /// output the model reads, or a typed error.
+    ToolResult {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        output: Option<String>,
+        error: Option<ToolError>,
+    },
+    /// Calls still waiting for the client `tag` names, oldest first.
+    ToolCalls {
+        tag: String,
+        #[serde(default)]
+        after: i64,
+        limit: Option<usize>,
     },
     /// Planned calls waiting on a gate, in announcement order.
     Approvals {
@@ -706,10 +732,11 @@ where
 {
     T::deserialize(deserializer).map(Some)
 }
-/// A client's own gate: tools whose calls wait for a verdict, and the tag
-/// of the approver that answers. Both or neither; the daemon never reads
-/// the tag. A list longer than the `known` tools is refused before it is
-/// sorted, so its cost is bounded by the registry, not the request.
+/// A client's own gate: tools whose calls wait for a verdict, the daemon's
+/// or declared ones, and the tag of the approver that answers. Both or
+/// neither; the daemon never reads the tag. A list longer than the `known`
+/// tools is refused before it is sorted, so its cost is bounded by the
+/// registry and the declared tools' cap, not the request.
 fn gate(
     approve: Option<Vec<String>>,
     approver: Option<String>,
@@ -1151,7 +1178,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             db.waiting_turns()?
                 .into_iter()
                 .map(|w| {
-                    let own = !w.approval && w.paced_since_ms.is_none();
+                    let own = !w.approval && w.answer.is_none() && w.paced_since_ms.is_none();
                     let lapse = own.then(|| lapses.get(&w.turn).copied()).flatten();
                     // A steer sent while the daemon was down wakes the wait.
                     let steered = match own {
@@ -1171,7 +1198,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         // A verdict park wakes on an answer, which may have committed
         // before the restart, or when a gate lapses: check now as an answer
         // would, and keep the lapse unless it has already passed.
-        if waiting.approval {
+        if waiting.approval || waiting.answer.is_some() {
             if let Some(at) = waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 wakes.set(at, waiting.bot.clone(), waiting.turn);
             }
@@ -2094,7 +2121,7 @@ impl Service {
                     approve,
                     approver,
                     approve_expire_ms,
-                    self.registry.tool_count(),
+                    self.registry.tool_count() + MAX_DECLARED,
                 )?;
                 name("bot", &bot)?;
                 if let Some(creator) = &created_by {
@@ -2308,7 +2335,7 @@ impl Service {
                         approve,
                         approver,
                         approve_expire_ms,
-                        self.registry.tool_count(),
+                        self.registry.tool_count() + MAX_DECLARED,
                     )?),
                 };
                 if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
@@ -2368,7 +2395,7 @@ impl Service {
                         let mut changed = Vec::new();
                         // First: the one change that may be refused here.
                         if let Some(gate) = gate
-                            && db.set_gate(&bot, Some(id), gate)?
+                            && db.set_gate(&bot, Some(id), gate, declare.as_deref())?
                         {
                             changed.push("gates");
                         }
@@ -2597,6 +2624,74 @@ impl Service {
                 }
                 Ok(answered.reply)
             }
+            Command::ToolResult {
+                bot,
+                turn,
+                call_id,
+                output,
+                error,
+            } => {
+                let outcome = match (output, error) {
+                    (Some(output), None) if output.len() > ANSWER_BYTES => {
+                        return fail_with(
+                            "tool_output_limit",
+                            format!("output may be up to {ANSWER_BYTES} bytes"),
+                        );
+                    }
+                    (Some(output), None) => Outcome::text(self.registry.redact_text(output)),
+                    (None, Some(ToolError { code, detail })) => {
+                        let coded = !code.is_empty()
+                            && code.len() <= 64
+                            && code
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                        if !coded {
+                            return fail_with(
+                                "invalid_tool_result",
+                                "an error's code is 1 to 64 lowercase letters, digits or _",
+                            );
+                        }
+                        if detail.as_ref().is_some_and(|d| d.len() > ANSWER_BYTES) {
+                            return fail_with(
+                                "tool_output_limit",
+                                format!("detail may be up to {ANSWER_BYTES} bytes"),
+                            );
+                        }
+                        let detail = detail.map(|d| self.registry.redact_text(d));
+                        Outcome {
+                            output: json!({"error":code,"detail":detail}).to_string(),
+                            artifacts: Vec::new(),
+                            note: None,
+                            failed: true,
+                        }
+                    }
+                    _ => {
+                        return fail_with("invalid_tool_result", "give output or error, not both");
+                    }
+                };
+                let name = bot.clone();
+                let answered = store
+                    .op("tool_result", move |db| {
+                        db.answer_call(&name, turn, &call_id, outcome, now_ms())
+                    })
+                    .await?;
+                // Held by the worker or durable by now; only then does the
+                // turn look for it.
+                if let Some(notify) = answered.notify {
+                    notify.notify_one();
+                }
+                if answered.resume {
+                    self.handles.wake(bot, turn);
+                }
+                Ok(answered.reply)
+            }
+            Command::ToolCalls { tag, after, limit } => {
+                store
+                    .op("tool_calls", move |db| {
+                        db.tool_calls(&tag, after, limit.unwrap_or(64))
+                    })
+                    .await
+            }
             Command::Approvals {
                 bot,
                 tag,
@@ -2766,7 +2861,7 @@ impl Service {
                     approve,
                     approver,
                     approve_expire_ms,
-                    self.registry.tool_count(),
+                    self.registry.tool_count() + MAX_DECLARED,
                 )?;
                 name("bot", &bot)?;
                 if let Some(creator) = &created_by {

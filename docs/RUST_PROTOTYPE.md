@@ -1794,7 +1794,14 @@ continues its source's. The `history` tool returns one turn's prompt, replies,
 tool calls, and results as provider JSONL with only the top-level
 `encrypted_content` field removed from reasoning items. Reasoning records and
 readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `history_items` reads, forks, and provider replay remain unchanged. The reading
+items, raw `history_items` reads, forks, and provider replay remain unchanged.
+With `bot`, it reads another agent's turn the same way, numbered along that
+agent's lineage and as it stands, a running turn included; with `bot` and no
+`turn`, it lists that agent's newest 20 turns, newest first, each with its
+number, handle, status and its prompt's first 200 characters, so an agent can
+see what another is doing without reading the store. A bot's own turns are
+read by number only. Any agent of the daemon can be read: the daemon holds
+one person's agents. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
@@ -2081,6 +2088,50 @@ narrows them as it does the daemon's. Changing them changes the request's
 tool definitions, so a fork keys its own prompt cache from then on, as for
 instructions.
 
+Protocol version 20 adds `inherit` to a declared tool, default `true` and
+reported only when `false`: a tool declared with `"inherit": false` stays
+the declaring bot's own, so a bot it creates does not take it with the
+rest. A fork still keeps it. A lead's client uses it for a tool only the
+lead should call.
+
+Protocol version 21 lets a client answer its own declared tools. A tool
+declared with `answered_by`, a tag of 1 to 64 letters, digits, `_`, `-` or
+`.` that the daemon never reads, takes no `result`: a call that fits its
+`parameters` starts, and waits for the answer of whichever client acts for
+that tag. Its `tool_started` names `answered_by` and `expires_ms`, when it
+stops waiting: `expire_ms` after it started (1 to 3,600,000, default
+60,000). A client finds such calls by following the bot, or every bot with
+`*`, and lists those still waiting with
+`{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
+`bot`, `turn`, `call_id`, `name`, `arguments` and `expires_ms`, at most
+`limit` (1 to 256, default 64) and 256 KiB a page, continued from
+`next_after`. It answers with
+`{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
+reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
+the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
+lowercase letters, digits or `_`; output and detail each up to 64 KiB,
+redacted as command output is; anything else is `invalid_tool_result` or
+`tool_output_limit`). The first answer counts: another is
+`call_already_answered`, one for a call that ended or ran out of time is
+`no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
+to serve.
+
+The call waits as a gated call waits for its verdict. Its turn holds live
+for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that
+time is held by the storage worker and written with the call's result, so
+the call costs one commit. Past the hold the turn parks like `wait`: one
+commit, `turn_waiting` with `{call_id, answer: TAG, deadline_ms}` (also its
+view's `waiting_on`), no task, no active slot, and it survives restart. An
+answer to a parked call is committed on arrival and resumes the turn. A
+call still unanswered at `expires_ms` ends with
+`{"error":"tool_unserved","detail":...}` and the turn goes on, since the
+model can act on it; the service wakes a parked one then from its own
+schedule, so a waiting call costs a row and no timer. A later call's gate that
+lapses first ends the wait as `tool_unserved` and the turn as it ends one
+waiting on a verdict. An interrupt ends the call as cancelled, like any
+running call. A call that does not fit its
+parameters is refused at once and waits for no answer.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client
@@ -2088,8 +2139,10 @@ created or forked, can have all its gates replaced later with `configure`,
 its source's included): `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
-`approve` may name no more tools than the daemon registers (`invalid_gate`
-otherwise); a gate's tools must be among the new bot's own
+`approve` may name no more tools than the daemon registers and a bot may
+declare (`invalid_gate` otherwise); a gate's tools must be among the new
+bot's own, the daemon's and those its client declared or it takes from its
+creator or source
 (`approve_not_in_tools`). Without them none of this runs and nothing is paid. `fork` takes the same
 fields. A bot keeps every gate it descends from: a fork keeps its source's,
 and a `create` or `fork` whose `created_by` names a bot adds that bot's.
