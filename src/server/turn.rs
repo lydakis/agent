@@ -3857,7 +3857,7 @@ impl Turn {
             // all count: shrink the page by what the item overshoots until
             // the item itself fits.
             let output = self.registry.redact_text(page);
-            let item = family.tool_result_item(call_id, &output)?.len();
+            let item = family.tool_result_item(call_id, false, &output)?.len();
             if item <= budget {
                 return Ok(Outcome::text(output));
             }
@@ -3888,7 +3888,7 @@ impl Turn {
                 })
                 .await?;
             let output = self.registry.redact_text(listed.to_string());
-            if family.tool_result_item(call_id, &output)?.len() > budget {
+            if family.tool_result_item(call_id, false, &output)?.len() > budget {
                 return fail("history_context_exhausted");
             }
             return Ok(Outcome::text(output));
@@ -3904,7 +3904,7 @@ impl Turn {
             // Page metadata, JSON escaping, redaction, and the provider's tool
             // result envelope all count. Shrink in memory, without rereading
             // history, until the actual encoded item fits the reserved budget.
-            if family.tool_result_item(call_id, &output)?.len() <= budget {
+            if family.tool_result_item(call_id, false, &output)?.len() <= budget {
                 return Ok(Outcome::text(output));
             }
             let text = page["text"].as_str().unwrap();

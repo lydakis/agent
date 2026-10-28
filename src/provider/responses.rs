@@ -231,8 +231,25 @@ fn parse_completion_with_usage(
                     }
                 }
             }
-            Some("function_call") => {
-                let call: ToolCall = serde_json::from_value(item)?;
+            Some(kind @ ("function_call" | "custom_tool_call")) => {
+                let call = match kind {
+                    "function_call" => serde_json::from_value(item)?,
+                    _ => {
+                        #[derive(Deserialize)]
+                        struct Custom {
+                            name: String,
+                            call_id: String,
+                            input: String,
+                        }
+                        let custom: Custom = serde_json::from_value(item)?;
+                        ToolCall {
+                            name: custom.name,
+                            call_id: custom.call_id,
+                            arguments: serde_json::json!({"input":custom.input}).to_string(),
+                            custom: true,
+                        }
+                    }
+                };
                 if calls.iter().any(|c: &ToolCall| c.call_id == call.call_id)
                     || !valid_call_id(&call.call_id)
                 {
@@ -285,6 +302,23 @@ mod tests {
 
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
+    }
+    #[test]
+    fn a_custom_tool_call_reads_as_its_input() {
+        let raw = r#"{"status":"completed","output":[{"type":"custom_tool_call","id":"ctc_1","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}]}"#;
+        let completion = parse_completion(&RawValue::from_string(raw.into()).unwrap(), "").unwrap();
+        assert_eq!(
+            completion.calls,
+            [ToolCall {
+                name: "apply_patch".into(),
+                call_id: "c1".into(),
+                arguments: json!({"input":"*** Begin Patch\n*** End Patch"}).to_string(),
+                custom: true,
+            }]
+        );
+        // Stored as the provider sent it, so it replays unchanged.
+        let item = &raw[raw.find("[{").unwrap() + 1..raw.len() - 2];
+        assert_eq!(completion.items[0], item.as_bytes());
     }
     #[test]
     fn a_call_id_over_the_bound_fails_by_its_encoded_size() {

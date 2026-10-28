@@ -303,7 +303,7 @@ fn print_flags(flags: &str) {
             ),
             "--tools" => (
                 "LIST",
-                "A new bot's tools; default shell,read,write,edit,wait,history",
+                "A new bot's tools; default shell,read,write,wait,history and apply_patch for a Responses model, else edit",
             ),
             "--allow" => (
                 "LIST",

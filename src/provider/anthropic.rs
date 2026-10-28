@@ -404,6 +404,7 @@ impl State {
                         return fail("invalid_tool_call_id");
                     }
                     calls.push(ToolCall {
+                        custom: false,
                         name: name.clone(),
                         call_id: id.clone(),
                         arguments,

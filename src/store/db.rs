@@ -981,7 +981,7 @@ pub struct Answered {
     pub resume: bool,
 }
 /// The fields of a stored item that say which calls it plans, in either
-/// encoding: a Responses `function_call`, or an Anthropic message's
+/// encoding: a Responses `function_call` or `custom_tool_call`, or an Anthropic message's
 /// `tool_use` blocks. Everything else is skipped.
 #[derive(serde::Deserialize)]
 struct Plans<'a> {
@@ -1005,7 +1005,10 @@ fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
     let Ok(item) = serde_json::from_slice::<Plans>(item) else {
         return Vec::new();
     };
-    if item.kind.as_deref() == Some("function_call") {
+    if matches!(
+        item.kind.as_deref(),
+        Some("function_call" | "custom_tool_call")
+    ) {
         return item.call_id.into_iter().collect();
     }
     item.content
@@ -1465,7 +1468,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 58;
+    pub const SCHEMA: i32 = 59;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1646,7 +1649,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
+                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT);
@@ -4066,7 +4069,10 @@ impl Database {
             outcome.note.clone().ok_or(Error::new("missing_note"))?,
         );
         let (family, mut used) = self.minimum_context_usage(name, turn, Some(&note))?;
-        used.bytes += family.tool_result_item(call_id, &outcome.output)?.len() + 1;
+        used.bytes += family
+            .tool_result_item(call_id, false, &outcome.output)?
+            .len()
+            + 1;
         used.items += 1;
         if !used.fits(limit) {
             return crate::fail_with(
@@ -5086,8 +5092,11 @@ impl Database {
         // the same way, and the round commits nothing.
         for call in calls {
             let planned = tx
-                .prepare_cached("INSERT INTO tools VALUES (?,?,'planned') ON CONFLICT DO NOTHING")?
-                .execute(params![turn, call.call_id])?;
+                .prepare_cached(
+                    "INSERT INTO tools(turn,call_id,status,custom) VALUES (?,?,'planned',?)
+                     ON CONFLICT DO NOTHING",
+                )?
+                .execute(params![turn, call.call_id, call.custom])?;
             if planned == 0 {
                 return Err(Error::new("invalid_tool_call_id"));
             }
@@ -5296,7 +5305,17 @@ impl Database {
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
         let family = bot.family()?;
-        let item = family.tool_result_item_with(call_id, &outcome.output, &outcome.images)?;
+        let custom: bool = self
+            .conn
+            .query_row(
+                "SELECT custom FROM tools WHERE turn=? AND call_id=?",
+                params![turn, call_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        let item =
+            family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.images)?;
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -5328,7 +5347,7 @@ impl Database {
         let stub = if !outcome.images.is_empty() {
             super::context::picture_stub(family, call_id, &outcome.output, weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
-            super::context::stub(family, call_id, &outcome.output, next, weight)?
+            super::context::stub(family, call_id, custom, &outcome.output, next, weight)?
         } else {
             None
         };
@@ -6618,12 +6637,12 @@ impl Database {
             |r| r.get(0),
         )?;
         if pending {
-            let unanswered: Vec<(String, String)> = tx
-                .prepare("SELECT call_id,status FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
-                .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let unanswered: Vec<(String, String, bool)> = tx
+                .prepare("SELECT call_id,status,custom FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
+                .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             let family = bot.family()?;
-            for (call_id, status) in unanswered {
+            for (call_id, status, custom) in unanswered {
                 let unknown = status == "executing" && waiting.is_none();
                 let detail = if unknown {
                     "turn ended before this tool's result was recorded; it may have had effects and may still be running. Inspect the current state before retrying"
@@ -6633,7 +6652,7 @@ impl Database {
                     "turn ended before this call ran"
                 };
                 let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },"detail":detail}).to_string();
-                let item = family.tool_result_item(&call_id, &output)?;
+                let item = family.tool_result_item(&call_id, custom, &output)?;
                 let id = node(&tx, head, &item)?;
                 head = Some(id);
                 tx.execute(
@@ -7244,12 +7263,12 @@ impl Database {
             };
             let item: Value = serde_json::from_slice(&raw)?;
             match item["type"].as_str() {
-                Some("function_call") => {
+                Some("function_call" | "custom_tool_call") => {
                     if !answered.remove(item["call_id"].as_str().unwrap_or("")) {
                         return fail("fork_point_has_open_tool_calls");
                     }
                 }
-                Some("function_call_output") => {
+                Some("function_call_output" | "custom_tool_call_output") => {
                     answered.insert(item["call_id"].as_str().unwrap_or("").to_owned());
                 }
                 _ => {
@@ -8288,7 +8307,8 @@ impl Database {
                  SELECT 1 FROM chain c JOIN nodes n ON n.id=c.id
                  WHERE c.id>(SELECT id FROM chain WHERE turn=?2)
                    AND c.id<COALESCE((SELECT MIN(id) FROM chain WHERE turn>?2),9223372036854775807)
-                   AND ((json_extract(CAST(n.item AS TEXT),'$.type')='function_call_output'
+                   AND ((json_extract(CAST(n.item AS TEXT),'$.type')
+                            IN ('function_call_output','custom_tool_call_output')
                          AND json_extract(CAST(n.item AS TEXT),'$.call_id')=?3)
                      OR EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content')
                         WHERE json_extract(value,'$.type')='tool_result'
@@ -8506,7 +8526,9 @@ fn deny(
 ) -> Result<()> {
     let call_id = call.call_id.as_str();
     let output = json!({"error":"approval_denied","detail":reason}).to_string();
-    let item = bot.family()?.tool_result_item(call_id, &output)?;
+    let item = bot
+        .family()?
+        .tool_result_item(call_id, call.custom, &output)?;
     if tx.execute(
         "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='planned'",
         params![turn, call_id],
@@ -9764,6 +9786,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 57 -> 58: how many pictures a node has, which a request bounds.
         // Those older nodes that have any count none and keep them.
         conn.execute_batch("ALTER TABLE nodes ADD COLUMN pictures INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tools')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('tools') WHERE name='custom')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 58 -> 59: a Responses custom tool's call is answered in its own
+        // kind of item. No custom tool was declared before.
+        conn.execute_batch("ALTER TABLE tools ADD COLUMN custom INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }

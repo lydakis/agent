@@ -77,7 +77,8 @@ It supplies no agent behavior: `create` names the bot's model, instructions,
 and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
-`--tools` or `shell,read,write,edit,wait,history` before it asks. A bot's
+`--tools` or `shell,read,write,wait,history` with `apply_patch` for a
+Responses model and `edit` otherwise before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
 other tool is answered with a `tool_not_available` result, whatever the
 model was told. Tool definitions live once in the daemon and their request
@@ -107,7 +108,8 @@ of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
 for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,read,write,edit,wait,history`; `note`, the
+daemon. Default tools are `shell,read,write,wait,history` and the file editor
+the model's family is trained on, `apply_patch` (Responses) or `edit`; `note`, the
 carry-forward note, is in the universe and chosen per bot.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
@@ -2029,8 +2031,8 @@ which is future work, or deleting the bot.
 
 ## Tools and validation scope
 
-The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
-`history`; each bot is created with the subset it may call (`run --tools`),
+The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
+`wait`, `history` and `note`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -2778,7 +2780,14 @@ but has more than 64 megapixels is `image_limit`, refused before it is
 decoded; scaling runs off the daemon's thread, one picture at a time. `write` creates parent
 directories and writes up to
 1 MiB. `edit` replaces an exact string that must occur once unless `replace_all`
-is set. Paths are relative to the workspace unless absolute; nothing confines a
+is set. `apply_patch` takes Codex's patch format: one patch adds, deletes,
+updates and moves any number of files, every change checked before any file is
+written, so a patch that does not apply changes nothing. Its context lines
+match exactly, then ignoring trailing and surrounding whitespace, then with
+typographic punctuation read as ASCII. On Responses it is a custom tool whose
+call is the patch itself, constrained by its Lark grammar, and its result a
+`custom_tool_call_output`; on Anthropic, a function taking the patch as
+`input`. Paths are relative to the workspace unless absolute; nothing confines a
 tool to the workspace, and tools run with the service's OS permissions.
 Native file tools accept regular files, including symlinks to regular files.
 Known pipes, devices, and other special files return `file_not_regular`. Opens

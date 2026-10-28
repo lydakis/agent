@@ -87,7 +87,6 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
-const DEFAULT_TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
 /// Rows kept at the bottom: the reply's unfinished line, the status, a gap,
 /// the composer and the footer.
 const VIEWPORT: u16 = 5;
@@ -915,14 +914,15 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
     let instructions = project::as_task(&workspace, &composed.text)?;
     let declare = json!(declared::tools(false));
+    let tools = agent_client::default_tools(client.providers(), &model);
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
-        "instructions": instructions, "tools": DEFAULT_TOOLS, "declare": declare,
+        "instructions": instructions, "tools": tools, "declare": declare,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
         asked["settings"] = json!({"cache_ttl": ttl});
     }
-    let tools = approvals::gateable(&DEFAULT_TOOLS.map(String::from), &declare);
+    let tools = approvals::gateable(&tools.map(String::from), &declare);
     if let Value::Object(fields) = &mut asked {
         fields.extend(approvals::gate(approvals::MODES[0].0, &tools));
     }
@@ -6689,8 +6689,22 @@ fn output(item: &Value) -> (String, bool) {
 
 /// An item as the Responses family shapes it, which the transcript reads.
 /// An Anthropic message's `tool_use` blocks become function calls after
-/// its text, and a user message's `tool_result` blocks their outputs.
+/// its text, and a user message's `tool_result` blocks their outputs. A
+/// custom tool's call reads as a function's, its input as `{"input": ...}`
+/// as the daemon runs it, and its output as a function's.
 fn responses(item: &Value) -> Vec<Value> {
+    match item["type"].as_str() {
+        Some("custom_tool_call") => {
+            return vec![json!({"type": "function_call", "call_id": item["call_id"],
+                "name": item["name"], "arguments": json!({"input": item["input"]}).to_string()})];
+        }
+        Some("custom_tool_call_output") => {
+            let mut output = item.clone();
+            output["type"] = json!("function_call_output");
+            return vec![output];
+        }
+        _ => {}
+    }
     let Some(parts) = item["content"].as_array() else {
         return Vec::from_iter((!item.is_null()).then(|| item.clone()));
     };
@@ -8110,5 +8124,16 @@ mod tests {
         let call = json!({"type": "function_call", "call_id": "c"});
         assert_eq!(responses(&call), [call]);
         assert!(responses(&Value::Null).is_empty());
+        // A custom tool's call and output read as a function's.
+        let patch = json!({"type": "custom_tool_call", "call_id": "p", "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch"});
+        let items = responses(&patch);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(
+            serde_json::from_str::<Value>(items[0]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"input": "*** Begin Patch\n*** End Patch"})
+        );
+        let done = json!({"type": "custom_tool_call_output", "call_id": "p", "output": "Success."});
+        assert_eq!(output(&responses(&done)[0]), ("Success.".into(), false));
     }
 }

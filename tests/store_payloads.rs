@@ -253,6 +253,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
             .unwrap()
             .turn;
         let call = ToolCall {
+            custom: false,
             name: "shell".into(),
             call_id: "call".into(),
             arguments: "{}".into(),

@@ -75,6 +75,10 @@ pub struct ToolSchema {
     pub name: std::borrow::Cow<'static, str>,
     pub description: std::borrow::Cow<'static, str>,
     pub parameters: Value,
+    /// A Lark grammar its input follows. On Responses such a tool is a
+    /// custom tool whose call is the free-form text itself; elsewhere a
+    /// function taking that text as `input`.
+    pub grammar: Option<&'static str>,
 }
 
 impl Family {
@@ -157,14 +161,16 @@ impl Family {
             &json!({"role":"user","content":content}),
         )?)
     }
-    pub fn tool_result_item(self, call_id: &str, output: &str) -> Result<Vec<u8>> {
-        self.tool_result_item_with(call_id, output, &[])
+    /// The item answering a call; `custom` for a Responses custom tool's.
+    pub fn tool_result_item(self, call_id: &str, custom: bool, output: &str) -> Result<Vec<u8>> {
+        self.tool_result_item_with(call_id, custom, output, &[])
     }
     /// A tool's result with pictures after its text, as both families take
     /// them in a result: a list of parts in place of the text alone.
     pub fn tool_result_item_with(
         self,
         call_id: &str,
+        custom: bool,
         output: &str,
         images: &[Image],
     ) -> Result<Vec<u8>> {
@@ -180,6 +186,9 @@ impl Family {
             }
         };
         let item = match self {
+            Family::Responses if custom => {
+                json!({"type":"custom_tool_call_output","call_id":call_id,"output":output})
+            }
             Family::Responses => {
                 json!({"type":"function_call_output","call_id":call_id,"output":output})
             }
@@ -200,6 +209,9 @@ impl Family {
         let encoded: Vec<Value> = tools
             .iter()
             .map(|tool| match self {
+                Family::Responses if let Some(grammar) = tool.grammar => json!({"type":"custom",
+                    "name":tool.name,"description":tool.description,
+                    "format":{"type":"grammar","syntax":"lark","definition":grammar}}),
                 Family::Responses => json!({"type":"function","name":tool.name,
                     "description":tool.description,"parameters":tool.parameters,"strict":false}),
                 Family::Anthropic => json!({"name":tool.name,"description":tool.description,
@@ -435,7 +447,7 @@ mod tests {
         let result = |family: Family| -> Value {
             serde_json::from_slice(
                 &family
-                    .tool_result_item_with("c1", "a.png", &images)
+                    .tool_result_item_with("c1", false, "a.png", &images)
                     .unwrap(),
             )
             .unwrap()
@@ -500,13 +512,42 @@ mod tests {
     }
     #[test]
     fn families_encode_the_same_facts_differently() {
-        let responses: Value =
-            serde_json::from_slice(&Family::Responses.tool_result_item("c1", "out").unwrap())
-                .unwrap();
+        let responses: Value = serde_json::from_slice(
+            &Family::Responses
+                .tool_result_item("c1", false, "out")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(responses["type"], "function_call_output");
-        let anthropic: Value =
-            serde_json::from_slice(&Family::Anthropic.tool_result_item("c1", "out").unwrap())
-                .unwrap();
+        let anthropic: Value = serde_json::from_slice(
+            &Family::Anthropic
+                .tool_result_item("c1", false, "out")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(anthropic["content"][0]["tool_use_id"], "c1");
+        // A custom tool is answered and declared in its own shape on
+        // Responses, and as a function taking its text elsewhere.
+        let custom: Value = serde_json::from_slice(
+            &Family::Responses
+                .tool_result_item("c1", true, "out")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(custom["type"], "custom_tool_call_output");
+        let patch = ToolSchema {
+            name: "apply_patch".into(),
+            description: "d".into(),
+            parameters: json!({"type":"object","properties":{"input":{"type":"string"}}}),
+            grammar: Some("start: \"x\""),
+        };
+        let declared = Family::Responses.tools(std::slice::from_ref(&patch));
+        assert_eq!(declared[0]["type"], "custom");
+        assert_eq!(declared[0]["format"]["definition"], "start: \"x\"");
+        let declared = Family::Anthropic.tools(std::slice::from_ref(&patch));
+        assert_eq!(
+            declared[0]["input_schema"]["properties"]["input"]["type"],
+            "string"
+        );
     }
 }

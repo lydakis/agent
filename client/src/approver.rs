@@ -894,11 +894,15 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
 }
 
 /// The whole arguments of `call_id` in a planning item, in either family's
-/// encoding: a Responses `function_call` item, or an Anthropic assistant
-/// message holding `tool_use` blocks.
+/// encoding: a Responses `function_call` item, or a `custom_tool_call`
+/// whose free-form input reads as `{"input": ...}`, as the daemon runs it,
+/// or an Anthropic assistant message holding `tool_use` blocks.
 pub fn call_arguments(item: &Value, call_id: &str) -> Option<Value> {
     if item["type"] == "function_call" && item["call_id"] == call_id {
         return serde_json::from_str(item["arguments"].as_str()?).ok();
+    }
+    if item["type"] == "custom_tool_call" && item["call_id"] == call_id {
+        return Some(json!({"input":item["input"].as_str()?}));
     }
     item["content"]
         .as_array()?

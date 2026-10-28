@@ -3981,6 +3981,7 @@ mod tests {
                     )?
                     .turn;
                 let call = agent_runtime::provider::ToolCall {
+                    custom: false,
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: r#"{"handles":["proc:1"]}"#.into(),
@@ -4845,6 +4846,7 @@ mod tests {
         store
             .call(move |db| {
                 let call = agent_runtime::provider::ToolCall {
+                    custom: false,
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: json!({"handles":[parked]}).to_string(),
@@ -5859,6 +5861,7 @@ mod tests {
         store
             .call(move |db| {
                 let call = agent_runtime::provider::ToolCall {
+                    custom: false,
                     name: "wait".into(),
                     call_id: "wait-1".into(),
                     arguments: r#"{"handles":["proc:1"]}"#.into(),
@@ -5929,6 +5932,7 @@ mod tests {
                     )?
                     .turn;
                 let call = agent_runtime::provider::ToolCall {
+                    custom: false,
                     name: "shell".into(),
                     call_id: "shell-1".into(),
                     arguments: r#"{"command":"true"}"#.into(),

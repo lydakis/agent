@@ -2606,7 +2606,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
             json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
                 "instructions": instructions,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-                "tools": crate::project::TOOLS,
+                "tools": agent_client::default_tools(client.providers(), model),
                 "created_by": by.as_ref().map(|(bot, _)| bot),
                 "created_by_id": by.as_ref().map(|(_, id)| id),
                 "settings": agent_client::policy::cache_ttl(model)
