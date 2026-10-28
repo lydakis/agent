@@ -2190,6 +2190,13 @@ impl App {
             if self.spread.is_some_and(|(_, at)| at <= Instant::now()) {
                 self.spread().await;
             }
+            // What the side chat copied goes on the clipboard, as the
+            // terminal Sonny runs in would have put it.
+            if let Some(program) = self.pane.as_ref().and_then(|p| p.program.as_ref()) {
+                for text in program.copied() {
+                    term::copy(&text);
+                }
+            }
             self.side_closed();
             self.shell_ran().await;
             self.listed();

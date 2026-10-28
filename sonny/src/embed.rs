@@ -3,7 +3,9 @@
 //! output is read as a terminal reads it (vt100), and keys, pastes and
 //! the mouse go to it as a terminal would send them. What it asks the
 //! terminal at start (the background, the cursor, which terminal this
-//! is) is answered here, as the terminal Sonny runs in would.
+//! is) is answered here, as the terminal Sonny runs in would. What it
+//! copies (OSC 52) is kept for Sonny to put on the clipboard, as the
+//! terminal Sonny runs in would have.
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +23,7 @@ pub struct Embedded {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     size: (u16, u16),
+    copied: Arc<Mutex<Vec<String>>>,
 }
 
 impl Embedded {
@@ -53,7 +56,8 @@ impl Embedded {
             pty.master.take_writer().map_err(|e| e.to_string())?,
         ));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
-        let (screen, replies) = (parser.clone(), writer.clone());
+        let copied = Arc::new(Mutex::new(Vec::new()));
+        let (screen, replies, copies) = (parser.clone(), writer.clone(), copied.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             // The start of a question a read cut off, kept for the next.
@@ -73,6 +77,13 @@ impl Embedded {
                     match piece {
                         Piece::Output(bytes) => parser.process(bytes),
                         Piece::Asked(query) => answers.push(answer(query, &parser, light)),
+                        Piece::Copied(payload) => {
+                            if let Some(text) = copy_text(payload)
+                                && let Ok(mut copies) = copies.lock()
+                            {
+                                copies.push(text);
+                            }
+                        }
                     }
                 }
                 drop(parser);
@@ -95,7 +106,16 @@ impl Embedded {
             master: pty.master,
             child,
             size: (rows, cols),
+            copied,
         })
+    }
+
+    /// What the program copied since last asked, oldest first.
+    pub fn copied(&self) -> Vec<String> {
+        self.copied
+            .lock()
+            .map(|mut copied| std::mem::take(&mut *copied))
+            .unwrap_or_default()
     }
 
     /// Whether the program has ended.
@@ -278,7 +298,14 @@ enum Query {
 enum Piece<'a> {
     Output(&'a [u8]),
     Asked(Query),
+    /// OSC 52's `c;BASE64`: text the program put on the clipboard.
+    Copied(&'a [u8]),
 }
+
+/// Where OSC 52, a copy to the clipboard, starts.
+const COPY: &[u8] = b"\x1b]52;";
+/// The longest copy waited for over reads; a longer one is let through.
+const MOST_COPIED: usize = 8 << 20;
 
 const ASKS: [(&[u8], Query); 4] = [
     (b"\x1b]11;?\x1b\\", Query::Background),
@@ -287,42 +314,79 @@ const ASKS: [(&[u8], Query); 4] = [
     (b"\x1b[6n", Query::Cursor),
 ];
 
-/// Output cut where it asks the terminal something, so each question is
-/// answered after the output before it, as a terminal would; and the
-/// end of it that may be the start of a question the next read finishes,
-/// held back.
+/// Output cut where it asks the terminal something or copies, so each is
+/// handled after the output before it, as a terminal would; and the end
+/// of it that may be the start of one the next read finishes, held back.
 fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
-    let longest = ASKS.iter().map(|(seq, _)| seq.len()).max().unwrap_or(0);
+    let starts = || ASKS.iter().map(|(seq, _)| *seq).chain([COPY]);
+    let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
     let held = (bytes.len().saturating_sub(longest - 1)..bytes.len())
         .find(|&at| {
-            ASKS.iter()
-                .any(|(seq, _)| seq.len() > bytes.len() - at && seq.starts_with(&bytes[at..]))
+            starts().any(|seq| seq.len() > bytes.len() - at && seq.starts_with(&bytes[at..]))
         })
         .unwrap_or(bytes.len());
-    let (bytes, rest) = bytes.split_at(held);
     let mut out = Vec::new();
     let mut from = 0;
     let mut at = 0;
-    while at < bytes.len() {
-        let found = (bytes[at] == 0x1b)
-            .then(|| ASKS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)))
-            .flatten();
-        match found {
-            Some((seq, query)) => {
-                if from < at {
-                    out.push(Piece::Output(&bytes[from..at]));
-                }
-                out.push(Piece::Asked(*query));
-                at += seq.len();
-                from = at;
-            }
-            None => at += 1,
+    while at < held {
+        if bytes[at] != 0x1b {
+            at += 1;
+            continue;
         }
+        if let Some((seq, query)) = ASKS.iter().find(|(seq, _)| bytes[at..].starts_with(seq)) {
+            if from < at {
+                out.push(Piece::Output(&bytes[from..at]));
+            }
+            out.push(Piece::Asked(*query));
+            at += seq.len();
+            from = at;
+            continue;
+        }
+        if bytes[at..].starts_with(COPY) {
+            let body = &bytes[at + COPY.len()..];
+            // Ended by BEL or ST; base64 has neither.
+            let end = body.iter().position(|&b| b == 0x07 || b == 0x1b);
+            let ended = end.and_then(|end| match body[end] {
+                0x07 => Some((end, 1)),
+                _ => body.get(end + 1).map(|_| (end, 2)),
+            });
+            match ended {
+                Some((end, closing)) => {
+                    if from < at {
+                        out.push(Piece::Output(&bytes[from..at]));
+                    }
+                    out.push(Piece::Copied(&body[..end]));
+                    let (more, rest) = pieces(&body[end + closing..]);
+                    out.extend(more);
+                    return (out, rest);
+                }
+                // The rest of it is for a later read.
+                None if body.len() < MOST_COPIED => {
+                    if from < at {
+                        out.push(Piece::Output(&bytes[from..at]));
+                    }
+                    return (out, &bytes[at..]);
+                }
+                None => {}
+            }
+        }
+        at += 1;
     }
-    if from < bytes.len() {
-        out.push(Piece::Output(&bytes[from..]));
+    if from < held {
+        out.push(Piece::Output(&bytes[from..held]));
     }
-    (out, rest)
+    (out, &bytes[held..])
+}
+
+/// The text of OSC 52's `c;BASE64`; none when it asks what is on the
+/// clipboard instead (`c;?`) or is not base64.
+fn copy_text(payload: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let (_, data) = std::str::from_utf8(payload).ok()?.rsplit_once(';')?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn answer(query: Query, parser: &vt100::Parser, light: bool) -> Vec<u8> {
@@ -426,6 +490,36 @@ mod tests {
         assert_eq!((cut, rest), (vec![Piece::Output(b"ab")], &b"\x1b[6"[..]));
         let (cut, rest) = pieces(b"\x1b[6n");
         assert_eq!((cut, rest), (vec![Piece::Asked(Query::Cursor)], &b""[..]));
+    }
+
+    #[test]
+    fn copies_are_kept_for_the_clipboard() {
+        let (cut, rest) = pieces(b"a\x1b]52;c;aGk=\x07b\x1b]52;c;eW8=\x1b\\\x1b[6n");
+        assert!(rest.is_empty());
+        assert_eq!(
+            cut,
+            [
+                Piece::Output(b"a"),
+                Piece::Copied(b"c;aGk="),
+                Piece::Output(b"b"),
+                Piece::Copied(b"c;eW8="),
+                Piece::Asked(Query::Cursor),
+            ]
+        );
+        assert_eq!(copy_text(b"c;aGk=").as_deref(), Some("hi"));
+        assert_eq!(copy_text(b"c;?"), None);
+        // A copy a read cuts off, anywhere, waits for the rest.
+        assert_eq!(
+            pieces(b"a\x1b]5"),
+            (vec![Piece::Output(b"a")], &b"\x1b]5"[..])
+        );
+        let (cut, rest) = pieces(b"a\x1b]52;c;aG");
+        assert_eq!(
+            (cut, rest),
+            (vec![Piece::Output(b"a")], &b"\x1b]52;c;aG"[..])
+        );
+        let (cut, rest) = pieces(b"\x1b]52;c;aGk=\x1b");
+        assert_eq!((cut, rest), (vec![], &b"\x1b]52;c;aGk=\x1b"[..]));
     }
 
     #[test]
