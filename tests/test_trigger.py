@@ -264,12 +264,20 @@ class TriggerFireTests(ModelFixture):
                   'prompt': prompt, 'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}
         kept = {'store_id': self.store_identity(), 'generation': 'g1', 'reply_to': ['p.lead', lead], 'submit': submit}
         (taking / '100.1.1').write_text(json.dumps(kept))
+        # Cut short before it settled: the row has no result of it.
+        row = self.home / '.agent/triggers/p.task.json'
+        row.write_text(json.dumps({**json.loads(row.read_text()), 'last': None, 'sent': 0}))
         # Its `--if` said go once already: one that would say no now is not asked.
         again = self.fire('p.task', 'second', generation='g2', extra=['--if', 'exit 1', '--dir', str(self.path)])
         self.assertEqual((again['last']['outcome'], again['last']['turn']), ('sent', turn['turn']), again)
         self.assertEqual(again['last']['reply']['outcome'], 'sent', again)
         self.assertEqual(len(self.turns('p.task')), 2)
         self.assertEqual(len(self.turns('p.lead')), answers)
+        self.assertFalse((taking / '100.1.1').exists())
+        # Cut short once it had settled: its send is not counted again.
+        (taking / '100.1.1').write_text(json.dumps(kept))
+        settled = self.fire('p.task', 'second', generation='g2')
+        self.assertEqual((settled['sent'], settled['last']['turn']), (1, turn['turn']), settled)
         self.assertFalse((taking / '100.1.1').exists())
         # What went to another store is that store's: this one sends its own.
         (taking / '100.1.2').write_text(json.dumps({**kept, 'store_id': 'another-store'}))

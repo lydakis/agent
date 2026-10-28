@@ -1428,13 +1428,14 @@ fn fired(places: &Places, name: &str, file: &str, wait: Duration) -> Value {
         if row["checked"]["ask"] == file && row["checked"]["gate"] == "no" {
             break came(&json!({"outcome": "declined", "detail": row["checked"]["detail"]}));
         }
-        // Sent: its fire may still wait for the answer `--reply-to` passes
-        // on, or have ended the trigger, row and all.
-        let sent = std::fs::read(&receipt)
+        // What came of it, also while its fire waits for the answer
+        // `--reply-to` passes on, after it ended the trigger, row and all, or
+        // once another fire's result is the row's.
+        let received = std::fs::read(&receipt)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-        if let Some(sent) = sent.filter(|s| s["outcome"] == "sent") {
-            break came(&sent);
+        if let Some(received) = received.filter(|r| r["outcome"].is_string()) {
+            break came(&received);
         }
         if std::time::Instant::now() > until {
             break json!({"name": name, "fired": true, "pending": true});
@@ -1625,6 +1626,7 @@ fn settle(
         eprintln!("{}", error_json(&error));
         false
     };
+    received(places, trigger, outcome);
     let _lock = match Lock::take(places) {
         Ok(lock) => lock,
         Err(error) => return log(error),
@@ -1663,6 +1665,14 @@ fn settle(
         return retire(places, &trigger.name, kept_row, launchd).map_or_else(log, |_| true);
     }
     recorded.is_ok()
+}
+
+/// What came of a `fire NAME`'s ask, in its receipt for that `fire`: the
+/// trigger's row says only its latest, which another fire can write first.
+fn received(places: &Places, trigger: &Trigger, outcome: &Value) {
+    if let Some(file) = outcome["ask"].as_str().filter(|f| Ask::of(f) == Ask::Fire) {
+        let _ = std::fs::write(places.receipt(&trigger.name, file), outcome.to_string());
+    }
 }
 
 /// The one way a trigger goes, by `rm` or by its own end, under the lock:
@@ -2817,9 +2827,10 @@ fn sends() -> u64 {
 /// none of launchd's own runs is asked for.
 fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     let asked = ask.is_some_and(|a| a.kind.sends());
-    // What came of a `fire NAME` names its ask, for that `fire` to find.
+    // What came of an ask names it: a `fire NAME` finds its own, and a
+    // fire run again for one already settled knows it.
     let named = |mut outcome: Value| {
-        if let Some(ask) = ask.filter(|a| a.kind.sends()) {
+        if let Some(ask) = ask {
             outcome["ask"] = json!(ask.name());
         }
         outcome
@@ -2838,9 +2849,14 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     // An ask that sent its request is past its time, its commit and its
     // `--if`: what is left is sending it again, which the daemon takes once,
     // and passing its answer on.
-    if ask.is_some_and(|a| sent_for(a, trigger).is_some()) {
+    if let Some(ask) = ask.filter(|a| sent_for(a, trigger).is_some()) {
+        // Settled already, and cut short before it was done with its ask:
+        // its send is counted.
+        if durable["last"]["ask"] == ask.name() {
+            return;
+        }
         let outcome = with_daemon(trigger, async |client| {
-            deliver(client, places, trigger, &mut kept, "fired", ask).await
+            deliver(client, places, trigger, &mut kept, "fired", Some(ask)).await
         });
         let (Ok(outcome) | Err(outcome)) = outcome;
         settle(places, trigger, &named(outcome), &kept, &launchctl);
@@ -2918,6 +2934,11 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
                 return;
             }
             noted(places, trigger, &kept);
+            received(
+                places,
+                trigger,
+                &named(json!({"outcome": "declined", "detail": no})),
+            );
             if trigger.commit.is_some() {
                 // The commit it said no to is not news again.
                 looked(places, trigger, &kept.seen);
@@ -3975,6 +3996,21 @@ mod tests {
             json!({"name": s.name, "fired": true, "outcome": "skipped", "detail": "bot_busy"})
         );
         assert_eq!(wait("another")["pending"], true);
+        // Two settled before the first one's `fire` looked: each finds its own.
+        let (one, two) = (
+            fire_now(&w.places, &s.name).unwrap(),
+            fire_now(&w.places, &s.name).unwrap(),
+        );
+        w.settle(
+            &s,
+            json!({"outcome": "skipped", "detail": "bot_busy", "ask": one}),
+        );
+        w.settle(
+            &s,
+            json!({"outcome": "failed", "detail": "down", "ask": two}),
+        );
+        assert_eq!(wait(&one)["outcome"], "skipped");
+        assert_eq!(wait(&two)["outcome"], "failed");
         // Its `--if` said no: nothing went, and the row's check says why.
         let third = fire_now(&w.places, &s.name).unwrap();
         let kept = Kept {
