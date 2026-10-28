@@ -566,8 +566,10 @@ enum Api {
 pub struct Judge {
     api: Api,
     pub name: String,
-    /// For `Model`: its `provider/model`.
+    /// For `Model`: its `provider/model`, and its effort
+    /// (`AGENT_JUDGE_EFFORT`; unset, the model's own).
     model: String,
+    effort: Option<String>,
     /// For `Decisions`: the API.
     decisions: Option<judge::Decisions>,
     /// For `Model`: the idle base bot each check forks, once made.
@@ -621,6 +623,7 @@ impl Judge {
             api,
             name: name.to_owned(),
             model: model.to_owned(),
+            effort: key(judge::EFFORT_VAR),
             decisions,
             base: Default::default(),
             context,
@@ -701,9 +704,13 @@ impl Judge {
         }
         let name = format!(
             "lookout.{}",
-            &digest(&format!("{}\n{MODEL_INSTRUCTIONS}", self.model))[..12]
+            &digest(&match &self.effort {
+                Some(effort) => format!("{}\n{effort}\n{MODEL_INSTRUCTIONS}", self.model),
+                None => format!("{}\n{MODEL_INSTRUCTIONS}", self.model),
+            })[..12]
         );
-        let made = judge::Base::make(client, &name, &self.model, None, MODEL_INSTRUCTIONS)
+        let effort = self.effort.as_deref();
+        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS)
             .await
             .map(Arc::new)
             .map_err(|e| failed(format!("the judge could not be made: {e}")))?;
@@ -2726,6 +2733,7 @@ mod tests {
             api,
             name: "test".into(),
             model: "m".into(),
+            effort: None,
             decisions,
             base: Default::default(),
             context: false,

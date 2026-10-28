@@ -43,8 +43,30 @@ since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
 and a file that no longer matches, or one Sonny never wrote, is the
 person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
 first. How the lead starts a task with `sonny task`, which names this
-Sonny, and the task settings from `.agents/project.toml` are composed
-after the lead's role, not kept in the file.
+Sonny, and where the project's tasks work are composed after the lead's
+role, not kept in the file.
+
+#### Effort for leads and tasks
+
+Each agent's effort is the daemon's to keep; Sonny only picks what a new
+one starts with, and imposes nothing. With nothing set, a new lead starts
+at its model's own effort (`AGENT_EFFORT` when its model is
+`AGENT_MODEL`'s), and each task at its lead's. Defaults go in
+`~/.agent/env` (or the shell, which the file overrides), and a project's
+`.agents/project.toml` overrides them for that project:
+
+| What | `~/.agent/env` | `.agents/project.toml` |
+| --- | --- | --- |
+| A new lead's effort | `SONNY_LEAD_EFFORT` | `effort` |
+| Each new task's model | (the lead's) | `threads_model` |
+| Each new task's effort | `SONNY_TASK_EFFORT` | `threads_effort` |
+| The approver's and lookout's judge | `AGENT_JUDGE_EFFORT` | |
+
+`sonny task` applies them in code, so the lead's prompt says nothing about
+effort; the lead names `--model` or `--effort` only for one the person asks
+for. A task on its lead's model with neither set takes the lead's effort,
+as before; one on another model takes that model's own. `/model` changes a
+lead's effort after it is made.
 
 A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
@@ -231,7 +253,7 @@ with, and steers it at once only for a message that redirects other tasks
 or work that collides with another task's; what else the judge picks, such
 as a stuck task or a result the person should hear, is flagged in the next
 note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
-own model, and with the judge `off` sends the task updates alone. Any agent can
+own model, at `AGENT_JUDGE_EFFORT` when set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).

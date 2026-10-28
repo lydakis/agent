@@ -122,8 +122,8 @@ fn start_rule(sonny: &str) -> String {
         "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead, which makes its folder first; \
          messages to tasks that exist still go through \"$AGENT_BIN\" run, as above. Pick a NAME that \"$AGENT_BIN\" ls --name \"${{AGENT_BOT%%.*}}.*\" does not list yet, \
          that starts with your own name before .lead and a dot, and that is a valid git branch name; from this folder run\n\
-         {sonny} task NAME --agents --setup MODEL-FLAGS -- TASK\n\
-         with the task rule's --model and --effort as MODEL-FLAGS: \
+         {sonny} task NAME --agents --setup -- TASK\n\
+         which picks the task's model and effort as the person set them up (add --model or --effort only for one the person asks for): \
          it makes the task's folder the way the person set Sonny up, starts the task there and prints the turn's handle, as run --detach does. \
          Pass --profile ROLE in place of --agents when a listed role fits, and leave out --setup for a task that only reads, \
          so the folder's .agents/setup runs only for a task that will change files. \
@@ -265,7 +265,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     })?;
     let said = |key: &str| read.get(key).and_then(toml::Value::as_str);
     if said("model") != Some(model)
-        || said("reasoning") != effort
+        || said("effort") != effort
         || edited.len() as u64 > agent_client::project::LIMIT
     {
         return Err(format!(
@@ -284,7 +284,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     agent_client::project::read(dir).map(|_| ())
 }
 
-/// `text` with its top-level `model` and `reasoning` set (or `reasoning`
+/// `text` with its top-level `model` and `effort` set (or `effort`
 /// removed), each in place when there, else added after `model`.
 fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
     // A JSON string is a TOML basic string.
@@ -306,10 +306,10 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
                 at = Some(lines.len());
                 lines.push(format!("model = {}", quote(model)));
             }
-            Some("reasoning") => {
+            Some("effort") => {
                 placed = true;
                 if let Some(level) = effort {
-                    lines.push(format!("reasoning = {}", quote(level)));
+                    lines.push(format!("effort = {}", quote(level)));
                 }
             }
             _ => lines.push(line.to_owned()),
@@ -320,7 +320,7 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
         lines.len() - 1
     });
     if let Some(level) = effort.filter(|_| !placed) {
-        lines.insert(at + 1, format!("reasoning = {}", quote(level)));
+        lines.insert(at + 1, format!("effort = {}", quote(level)));
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -417,15 +417,19 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, then the newest agent's, so a bare
-    // `sonny` needs no flag.
+    // `sonny` needs no flag. Its effort: SONNY_LEAD_EFFORT, else
+    // AGENT_EFFORT with AGENT_MODEL's model, as the CLI takes them.
+    let (mut effort, model) = (None, model.map(str::to_owned));
     let model = match model
-        .map(str::to_owned)
         .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
     {
         Some(model) => model,
         None => match std::env::var("AGENT_MODEL").ok() {
-            Some(model) => model,
+            Some(model) => {
+                effort = std::env::var("AGENT_EFFORT").ok();
+                model
+            }
             None => newest(client)
                 .await?
                 .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
@@ -433,6 +437,7 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     };
     let picks = agent_client::project::Picks {
         model: Some(model),
+        effort: crate::setting(crate::LEAD_EFFORT).or(effort.filter(|e| !e.is_empty())),
         ..Default::default()
     };
     make(client, dir, &role, &picks).await.map(|_| ())
@@ -467,7 +472,7 @@ async fn make(
     .await
 }
 
-const USAGE: &str = "usage: project add DIR [--model PROVIDER/MODEL] [--effort LEVEL] [--threads-model PROVIDER/MODEL [--threads-effort LEVEL]] [--threads-in worktree|project]";
+const USAGE: &str = "usage: project add DIR [--model PROVIDER/MODEL] [--effort LEVEL] [--threads-model PROVIDER/MODEL] [--threads-effort LEVEL] [--threads-in worktree|project]";
 
 /// What `~/.agent/project` says it takes.
 pub fn usage() -> &'static str {
@@ -489,6 +494,8 @@ pub fn cli(args: &[String]) -> i32 {
                 let (client, _events) = Client::connect(&socket)
                     .await
                     .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
+                let mut picks = picks;
+                picks.effort = picks.effort.or_else(|| crate::setting(crate::LEAD_EFFORT));
                 let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
                 if let Ok(made) = &mut made {
                     open_new_lead(&client, &socket, made).await;
@@ -558,15 +565,12 @@ fn add_args(args: &[String]) -> Result<(PathBuf, agent_client::project::Picks), 
             return Err(usage());
         }
     }
-    if threads_effort.is_some() && threads_model.is_none() {
-        return Err("usage: --threads-effort goes with --threads-model".into());
-    }
     let in_project = match threads_in.as_deref() {
         None | Some("worktree") => false,
         Some("project") => true,
         Some(_) => return Err(usage()),
     };
-    if threads_model.is_some() || threads_in.is_some() {
+    if threads_model.is_some() || threads_effort.is_some() || threads_in.is_some() {
         picks.threads = Some(agent_client::project::ThreadPicks {
             model: threads_model,
             effort: threads_effort,
@@ -627,7 +631,6 @@ mod tests {
             &["add", "/x", "--color", "red"],
             &["add", "/x", "--threads-in", "elsewhere"],
             &["add", "/x", "--model", "a", "--model", "b"],
-            &["add", "/x", "--threads-effort", "low"],
         ] {
             assert!(run(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
         }
@@ -643,6 +646,11 @@ mod tests {
                 .threads
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
+        // Tasks may take an effort of their own on the lead's model.
+        let (_, picks) = run(&["add", "/", "--threads-effort", "xhigh"]).unwrap();
+        assert!(picks.threads.is_some_and(|t| t.model.is_none()
+            && t.effort.as_deref() == Some("xhigh")
+            && !t.in_project));
         assert_eq!(error_json("project_exists: x")["error"], "project_exists");
     }
 
@@ -650,7 +658,8 @@ mod tests {
     fn a_lead_starts_its_tasks_with_sonny() {
         let text = start_rule("/opt/sonny");
         for said in [
-            "\"/opt/sonny\" task NAME --agents --setup MODEL-FLAGS -- TASK\n",
+            "\"/opt/sonny\" task NAME --agents --setup -- TASK\n",
+            "which picks the task's model and effort as the person set them up",
             "Wherever these instructions start a new task with \"$AGENT_BIN\" run --detach --new, in a worktree or not, start it with Sonny instead",
             "leave out --setup for a task that only reads",
             "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
@@ -718,12 +727,12 @@ mod tests {
             "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\nthreads_in = \"project\"\n";
         assert_eq!(
             with_model(file, "anthropic/b", Some("high")),
-            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\nreasoning = \"high\"\nthreads_in = \"project\"\n"
+            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\nthreads_in = \"project\"\n"
         );
-        let file = "name = \"shop\"\nreasoning = \"low\"\nmodel = \"openai/a\"\n";
+        let file = "name = \"shop\"\neffort = \"low\"\nmodel = \"openai/a\"\n";
         assert_eq!(
             with_model(file, "openai/a", Some("high")),
-            "name = \"shop\"\nreasoning = \"high\"\nmodel = \"openai/a\"\n"
+            "name = \"shop\"\neffort = \"high\"\nmodel = \"openai/a\"\n"
         );
         assert_eq!(
             with_model(file, "openai/c", None),

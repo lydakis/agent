@@ -103,6 +103,12 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
             return failed(&place, false, format!("{} failed", script.display()));
         }
     }
+    let lead = (
+        std::env::var("AGENT_MODEL").ok(),
+        std::env::var("AGENT_EFFORT").ok(),
+    );
+    let flags = with_defaults(&info, &flags, lead, crate::setting(crate::TASK_EFFORT));
+    let flags: Vec<&String> = flags.iter().collect();
     let flags = match told(&place.dir, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
@@ -140,6 +146,55 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The run flags with the task's model and effort, unless they name their
+/// own: the project's `threads_model`, else the lead's (`lead`, its
+/// AGENT_MODEL and AGENT_EFFORT), so a role (--profile) never swaps it;
+/// and the project's `threads_effort`, else `task_effort`
+/// (SONNY_TASK_EFFORT), else the lead's own when the task runs its model.
+fn with_defaults(
+    info: &Value,
+    flags: &[&String],
+    lead: (Option<String>, Option<String>),
+    task_effort: Option<String>,
+) -> Vec<String> {
+    let mut flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+    // A value flag is --flag VALUE or --flag=VALUE.
+    let value = |flags: &[String], name: &str| -> Option<Option<String>> {
+        let at = flags.iter().position(|flag| {
+            flag == name || flag.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+        })?;
+        Some(match flags[at].split_once('=') {
+            Some((_, value)) => Some(value.to_owned()),
+            None => flags.get(at + 1).cloned(),
+        })
+    };
+    let (lead_model, lead_effort) = lead;
+    let model = match value(&flags, "--model") {
+        Some(model) => model,
+        None => {
+            let model = info["threads_model"]
+                .as_str()
+                .map(str::to_owned)
+                .or(lead_model.clone());
+            if let Some(model) = &model {
+                flags.extend(["--model".to_owned(), model.clone()]);
+            }
+            model
+        }
+    };
+    if value(&flags, "--effort").is_none() {
+        let effort = info["threads_effort"]
+            .as_str()
+            .map(str::to_owned)
+            .or(task_effort)
+            .or(lead_effort.filter(|_| model.is_some() && model == lead_model));
+        if let Some(effort) = effort {
+            flags.extend(["--effort".to_owned(), effort]);
+        }
+    }
+    flags
 }
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
@@ -789,6 +844,57 @@ mod tests {
         assert!(same_disk(&tmp, &tmp.join("not/made/yet")));
         // A device file system is never the one temporary files are on.
         assert!(!same_disk(Path::new("/dev"), &tmp));
+    }
+
+    #[test]
+    fn a_task_runs_as_the_person_set_tasks_up() {
+        let run = |info: Value, flags: &[&str], task: Option<&str>| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let lead = (Some("a/lead".to_owned()), Some("high".to_owned()));
+            with_defaults(
+                &info,
+                &flags.iter().collect::<Vec<_>>(),
+                lead,
+                task.map(str::to_owned),
+            )
+        };
+        let none = serde_json::json!({});
+        // Nothing set: the lead's own model and effort, as before.
+        assert_eq!(
+            run(none.clone(), &["--agents"], None),
+            ["--agents", "--model", "a/lead", "--effort", "high"]
+        );
+        // SONNY_TASK_EFFORT over the lead's effort.
+        assert_eq!(
+            run(none.clone(), &[], Some("xhigh")),
+            ["--model", "a/lead", "--effort", "xhigh"]
+        );
+        // The project's file over both.
+        let file = serde_json::json!({"threads_effort": "medium"});
+        assert_eq!(
+            run(file, &[], Some("xhigh")),
+            ["--model", "a/lead", "--effort", "medium"]
+        );
+        // Another model leaves the lead's effort, which was set for its own.
+        let file = serde_json::json!({"threads_model": "b/other"});
+        assert_eq!(run(file.clone(), &[], None), ["--model", "b/other"]);
+        assert_eq!(
+            run(file, &[], Some("low")),
+            ["--model", "b/other", "--effort", "low"]
+        );
+        // What the lead names is kept.
+        assert_eq!(
+            run(
+                none.clone(),
+                &["--model=c/d", "--effort", "max"],
+                Some("low")
+            ),
+            ["--model=c/d", "--effort", "max"]
+        );
+        assert_eq!(
+            run(none, &["--model", "a/lead"], None),
+            ["--model", "a/lead", "--effort", "high"]
+        );
     }
 
     #[test]

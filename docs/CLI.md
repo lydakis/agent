@@ -117,7 +117,8 @@ identity is `bot_not_found`.
   `AGENT_JUDGE`, else `AGENT_MODEL`. OpenAI's Decisions
   API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
   own API, at `--judge-url` when given; any other model runs through the
-  daemon, with a tag of at most 67 bytes, and `--effort` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  daemon, with a tag of at most 67 bytes, and `--effort` (default
+  `AGENT_JUDGE_EFFORT`) sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.

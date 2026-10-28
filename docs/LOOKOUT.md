@@ -161,6 +161,8 @@ Sonny shows it folded, as `↳ Task updates`.
 `--judge SPEC`, else `AGENT_JUDGE` (in the shell or `~/.agent/env`, the
 approver's setting too), else the lead's own model, as the approver picks
 (`agent_client::judge`); no smaller model is guessed for a provider.
+`AGENT_JUDGE_EFFORT` (the shell or `~/.agent/env`) sets a model judge's
+effort, as for the approver; unset, the model's own.
 `openai-decisions/MODEL` with `OPENAI_API_KEY` asks OpenAI's Decisions API
 (about $0.0002 a check with `gpt-6-luna`), and any other
 `provider/model` runs through the daemon on a fork of an idle, tool-less

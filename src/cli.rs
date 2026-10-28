@@ -267,7 +267,7 @@ fn print_flags(flags: &str) {
             ),
             "--effort" => (
                 "LEVEL",
-                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn; the approver's judge's (default AGENT_JUDGE_EFFORT)",
             ),
             "--request-id" => (
                 "ID",

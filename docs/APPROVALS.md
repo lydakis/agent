@@ -690,7 +690,8 @@ approver`, the bot's model for the approver the CLI starts. No smaller
 model is guessed for a provider (George, 2026-10-27): a cheaper judge is
 one `AGENT_JUDGE` names. `AGENT_JUDGE` is the one decision-model setting:
 the lookout reads it too, and the clients pass `~/.agent/env` to the
-approvers they start. Jev was dropped on
+approvers they start. `AGENT_JUDGE_EFFORT` sets a model judge's effort for
+both (`agent approver --effort` over it); unset, the model's own. Jev was dropped on
 2026-10-27 (George's call): nobody ran it, and on the lookout it woke the
 lead correctly 0.47 of the time against `gpt-6-luna`'s 0.92.
 

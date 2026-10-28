@@ -16,6 +16,8 @@ use std::{
 
 /// The judge for everything that judges, as one setting.
 pub const VAR: &str = "AGENT_JUDGE";
+/// A model judge's effort, for everything that judges; unset, the model's own.
+pub const EFFORT_VAR: &str = "AGENT_JUDGE_EFFORT";
 /// The key OpenAI's Decisions API takes.
 pub const DECISIONS_KEY: &str = "OPENAI_API_KEY";
 /// Where OpenAI's Decisions API is, unless the caller points elsewhere.

@@ -1822,7 +1822,7 @@ fn approver(options: &Options) -> Result<i32> {
         tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
         judge: options.judge.clone(),
         caller: env("AGENT_MODEL"),
-        effort: options.effort.clone(),
+        effort: (options.effort.clone()).or_else(|| env(agent_client::judge::EFFORT_VAR)),
         url: options.judge_url.clone(),
         key: env(DECISIONS_KEY),
         note,
