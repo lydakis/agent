@@ -45,7 +45,9 @@ ask for a sign-in: a ChatGPT plan (signed in with `agent login chatgpt`), an
 Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS profile. A new
 project's model is `--model`, else the project file's or the role's, else
 `AGENT_MODEL`, else the newest agent's; with none, Sonny lists what the
-providers offer and keeps the pick as `AGENT_MODEL`. Outside a terminal
+providers offer and keeps the pick as `AGENT_MODEL`. Either step also
+writes suggested efforts, `SONNY_LEAD_EFFORT=medium` and
+`SONNY_TASK_EFFORT=high`, unless the file already sets them. Outside a terminal
 both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.

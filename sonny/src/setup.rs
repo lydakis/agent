@@ -85,8 +85,7 @@ pub fn provider(bin: &std::path::Path) -> Result<(), String> {
             kept
         }
     };
-    let pairs: Vec<(&str, &str)> = kept.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    agent_client::env_file::set(&file, &pairs)?;
+    save(&file, kept)?;
     println!("Saved.\n");
     Ok(())
 }
@@ -132,12 +131,31 @@ pub async fn model(client: &Client) -> Result<String, String> {
             None => filter = answer,
         }
     };
-    agent_client::env_file::set(&file, &[("AGENT_MODEL", &model)])?;
+    save(&file, vec![("AGENT_MODEL", model.clone())])?;
     println!(
         "Saved {model} as the default model in {}.\n",
         crate::tilde(&file.display().to_string())
     );
     Ok(model)
+}
+
+/// Efforts a first run suggests, which the person may edit: written once,
+/// never over a value the file already has.
+const SUGGESTED: [(&str, &str); 2] = [
+    ("SONNY_LEAD_EFFORT", "medium"),
+    ("SONNY_TASK_EFFORT", "high"),
+];
+
+/// `kept` into the env file, with the suggested efforts it does not set yet.
+fn save(file: &std::path::Path, mut kept: Vec<(&str, String)>) -> Result<(), String> {
+    let present = agent_client::env_file::read(file)?;
+    for (key, value) in SUGGESTED {
+        if !present.iter().any(|(set, _)| set == key) {
+            kept.push((key, value.to_owned()));
+        }
+    }
+    let pairs: Vec<(&str, &str)> = kept.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    agent_client::env_file::set(file, &pairs)
 }
 
 /// Models listed at once; typing narrows the rest.
