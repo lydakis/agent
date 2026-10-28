@@ -66,6 +66,17 @@ the identity check refuses a deleted creator or a replacement with the same name
 Your final reply already reaches whoever waits on your turn, so contact your creator only to ask something you need, \
 not to report results.";
 
+/// The prompt-cache lifetime human-facing clients make a bot with: an hour
+/// for Claude, on Anthropic's API and on Bedrock, where a lead or monitor that
+/// rests past five minutes would otherwise send its whole context again
+/// uncached. An hour's writes cost twice the input rate instead of 1.25 times,
+/// and a read a tenth. The daemon keeps five minutes for Bedrock models that
+/// take no hour; Responses providers have no such setting.
+pub fn cache_ttl(model: &str) -> Option<&'static str> {
+    let claude = model.starts_with("anthropic/") || model.starts_with("bedrock/");
+    claude.then_some("1h")
+}
+
 /// What human-facing clients tell a new bot's summarizer at compaction. The daemon has
 /// no such text; a bot created without any never compacts.
 pub const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "You are summarizing the earlier part of an agent's conversation so the agent can continue \
@@ -860,6 +871,19 @@ pub fn instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_caches_for_an_hour() {
+        for model in [
+            "anthropic/claude-opus-5-5",
+            "bedrock/us.anthropic.claude-opus-5-5-v1:0",
+        ] {
+            assert_eq!(cache_ttl(model), Some("1h"), "{model}");
+        }
+        for model in ["openai/gpt-6", "chatgpt/gpt-6-sol"] {
+            assert_eq!(cache_ttl(model), None, "{model}");
+        }
+    }
 
     #[test]
     fn a_client_that_wraps_the_cli_names_its_own_way_in() {
