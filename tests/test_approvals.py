@@ -150,6 +150,106 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'write-2')[1]['error'], 'write_denied')
         self.assertEqual(list(outside.iterdir()), [])
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandboxed_bot_uses_the_daemon_as_itself_and_no_further(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell',
+                              settings={'sandbox': 'workspace-write'})
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path))
+        daemon.request('create', bot='Alice', workspace=str(outside), settings={})
+        # Another sandboxed bot, whose own socket is open once it has run a
+        # command.
+        carl = daemon.request('create', bot='Carl', workspace=str(self.path))['result']['bot_id']
+        turn = daemon.request('submit', bot='Carl', request_id='c', prompt='shell:true')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        (self.path / 'kid').mkdir()
+        act = {'name': 'act', 'description': 'Act.', 'parameters': {'type': 'object'}, 'answered_by': 'client'}
+        # A bot in its folder with a tool a client answers, which isn't Bob's.
+        daemon.request('create', bot='Dave', workspace=str(self.path), declare=[act])
+        child = dict(op='create', model='openai/synthetic-model', instructions='Kid.', tools=['echo'])
+        requests = [
+            dict(op='bots'),
+            dict(op='configure', bot='Bob', instructions='free'),
+            dict(op='answer', bot='Bob', turn=1, call_id='shell-1', request=1, decision='allow'),
+            dict(op='shutdown'),
+            dict(child, bot='Kid', workspace=str(self.path / 'kid')),
+            dict(child, bot='Out', workspace=str(outside)),
+            dict(child, bot='Liar', workspace=str(self.path / 'kid'), created_by='Alice'),
+            dict(op='delete', bot='Alice'),
+            dict(op='delete', bot='Kid'),
+            dict(op='fork', source='Alice', bot='Copy'),
+            dict(op='fork', source='Alice', bot='Ask', allow=[], expire_ms=60000),
+            dict(child, bot='Hand', workspace=str(self.path / 'kid'), declare=[act]),
+            dict(op='fork', source='Dave', bot='Tooled'),
+            dict(op='submit', bot='Bob', request_id='away', prompt='echo:hi', workspace=str(outside),
+                 delivery='queue'),
+            dict(op='delete', bot='Kid'),
+            dict(child, bot='Src', workspace=str(self.path / 'kid')),
+            dict(op='fork', source='Src', bot='Twin', request_id='twin'),
+            dict(op='delete', bot='Src'),
+            dict(op='fork', source='Src', bot='Twin', request_id='twin'),
+        ]
+        (self.path / 'requests.json').write_text(json.dumps(requests))
+        (self.path / 'probe.py').write_text(
+            'import json, os, socket, sys\n'
+            'def ask(path, requests):\n'
+            '    s = socket.socket(socket.AF_UNIX); s.connect(path); f = s.makefile("rw")\n'
+            '    f.readline()\n'
+            '    out = []\n'
+            '    for i, request in enumerate(requests):\n'
+            '        f.write(json.dumps({"id": i, **request}) + "\\n"); f.flush()\n'
+            '        while (line := json.loads(f.readline())).get("id") != i: pass\n'
+            '        out.append(line)\n'
+            '    return out\n'
+            'requests = json.load(open("requests.json"))\n'
+            'try:\n'
+            '    ask(sys.argv[1] + ".d/" + sys.argv[2], requests[:1]); borrowed = True\n'
+            'except OSError:\n'
+            '    borrowed = False\n'
+            'try:\n'
+            '    open(sys.argv[1] + ".d/planted", "w"); planted = True\n'
+            'except OSError:\n'
+            '    planted = False\n'
+            'print(json.dumps({"own": os.environ["AGENT_SOCKET"], "planted": planted, "borrowed": borrowed, "answers": ask(os.environ["AGENT_SOCKET"], requests)}))\n')
+        turn = daemon.request('submit', bot='Bob', request_id='t',
+                              prompt=f'shell:python3 probe.py {daemon.socket_path} {carl}')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
+        # On Linux its own socket is in the daemon's socket's place.
+        if sys.platform == 'linux':
+            self.assertEqual(probed['own'], str(daemon.socket_path))
+        # No bot can put its own listener in place of another's.
+        self.assertFalse(probed['planted'])
+        # Nor reach another bot's, which would answer as that bot.
+        self.assertFalse(probed['borrowed'])
+        (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
+         ask, hand, tooled, away, again, src, twin, delete_src, twin_again) = probed['answers']
+        self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away):
+            self.assertEqual(refused['error'], 'not_permitted', refused)
+        # What it makes is its own and no less sandboxed.
+        self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),
+                         ('Bob', 'workspace-write'))
+        self.assertIn('result', delete_kid)
+        # A delete resent for a bot already gone reaches the daemon's answer.
+        self.assertEqual(again['error'], 'bot_not_found', again)
+        # So does a fork resent once its source is gone: the fork it made.
+        for answer in (src, twin, delete_src):
+            self.assertIn('result', answer)
+        self.assertEqual(twin_again['result']['bot_id'], twin['result']['bot_id'], twin_again)
+        # A fork that may call nothing only answers.
+        self.assertEqual(ask['result']['created_by'], 'Bob')
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(daemon.request('inspect', bot='Bob')['result']['instructions'], 'Test agent.')
+        # A bot's own socket goes with it.
+        own = Path(f'{daemon.socket_path}.d') / str(carl)
+        self.assertTrue(own.is_socket())
+        self.assertIn('result', daemon.request('delete', bot='Carl'))
+        self.assertFalse(own.exists())
+
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:touch ran')['result']['turn']
