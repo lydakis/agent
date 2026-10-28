@@ -848,10 +848,17 @@ impl Provider {
             input: self.input_estimate(&pace, prefix.len() + request.items.weight, 0),
             output: 0,
         };
-        let mut park_for = None;
         let by = expires.min(tokio::time::Instant::now() + KEEP_WARM_WAIT);
         let (mut reservation, admission) = tokio::time::timeout_at(by, async {
-            let reservation = pace.acquire_cost(estimate, &mut park_for).await?;
+            // A refresh has no turn of its own to park, so it waits out a
+            // parking wait here, within its deadline.
+            let reservation = loop {
+                let mut park_for = None;
+                match pace.acquire_cost(estimate, &mut park_for).await {
+                    Err(_) if let Some(wait) = park_for => tokio::time::sleep(wait).await,
+                    result => break result?,
+                }
+            };
             Ok::<_, Error>((reservation, self.admit().await?))
         })
         .await

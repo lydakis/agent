@@ -158,6 +158,26 @@ const OVERLOAD_CLUSTER: u32 = 3;
 const OVERLOAD_WINDOW: Duration = Duration::from_secs(2);
 
 impl State {
+    /// The allowance refilled to `now`, what parked calls booked and none
+    /// spent returned to it, and never more than the limit with what they
+    /// still hold.
+    fn refill(&mut self, now: Instant) {
+        self.requests.refill(now);
+        for dim in self.tokens.iter_mut() {
+            dim.bucket.refill(now);
+        }
+        self.unbook_expired(now);
+        if let Some(limit) = self.requests.per_minute {
+            let held = self.booked.len() as f64;
+            self.requests.available = self.requests.available.min(limit - held);
+        }
+        for (index, dim) in self.tokens.iter_mut().enumerate() {
+            if let Some(limit) = dim.bucket.per_minute {
+                let held = self.booked.iter().map(|b| b.costs[index]).sum::<u64>() as f64;
+                dim.bucket.available = dim.bucket.available.min(limit - held);
+            }
+        }
+    }
     /// Return to the allowance what parked calls booked and none spent.
     fn unbook_expired(&mut self, now: Instant) {
         let (requests, tokens) = (&mut self.requests, &mut self.tokens);
@@ -185,18 +205,16 @@ impl State {
         park_for: &mut Option<Duration>,
     ) -> crate::Result<Duration> {
         // What the allowance must still hold for this call: its estimate,
-        // or beside a due booking, what the estimate grew by while every
-        // other booking is still owed. A booking whose wait counted on a
-        // refund that did not come is not yet paid for.
+        // or beside a due booking, its estimate less everything booked, as
+        // the booking is first in line and every other one is still owed. A
+        // booking whose wait counted on a refund that did not come is not
+        // yet paid for.
         let mut request = 1.0;
         let mut need = costs.map(|cost| cost as f64);
-        if let Some(at) = due {
-            let held = self.booked[at].costs;
-            request = 1.0 - self.booked.len() as f64;
-            for index in 0..DIMS {
-                let owed: u64 = self.booked.iter().map(|b| b.costs[index]).sum();
-                need[index] =
-                    costs[index].saturating_sub(held[index]) as f64 - (owed - held[index]) as f64;
+        if due.is_some() {
+            request -= self.booked.len() as f64;
+            for (index, need) in need.iter_mut().enumerate() {
+                *need -= self.booked.iter().map(|b| b.costs[index]).sum::<u64>() as f64;
             }
         }
         let mut wait = self.requests.shortfall(request);
@@ -500,11 +518,7 @@ impl Pace {
                     }
                     _ => {
                         state.blocked_until = None;
-                        state.requests.refill(now);
-                        for dim in state.tokens.iter_mut() {
-                            dim.bucket.refill(now);
-                        }
-                        state.unbook_expired(now);
+                        state.refill(now);
                         let due = state.booked.iter().position(|b| b.due <= now + MIN_PARK);
                         let left =
                             due.map(|at| state.booked[at].due.saturating_duration_since(now));
@@ -729,10 +743,7 @@ impl Pace {
     pub fn status(&self) -> serde_json::Value {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        state.requests.refill(now);
-        for dim in state.tokens.iter_mut() {
-            dim.bucket.refill(now);
-        }
+        state.refill(now);
         let blocked_ms = state
             .blocked_until
             .map_or(0, |u| u.saturating_duration_since(now).as_millis() as u64);
@@ -1098,6 +1109,23 @@ mod tests {
         assert!(early.is_err(), "admitted before it was paid for");
         drop(flying);
         about(park(&pace, 200).await, 7);
+
+        // A smaller call goes once the refill pays for it, and returns the
+        // rest of the booking.
+        let pace = limited("100");
+        let _flying = sent(&pace, 100).await.unwrap();
+        assert_eq!(park(&pace, 200).await, Duration::from_secs(10));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let small = pace.acquire(10, &mut None).await.unwrap();
+        assert!(small.waited.is_zero());
+        assert_eq!(available(&pace), 90.0);
+
+        // Resumed late, a booking holds no more than the limit.
+        let pace = limited("0");
+        assert_eq!(park(&pace, 600).await, Duration::from_secs(60));
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let _full = pace.acquire(600, &mut None).await.unwrap();
+        assert_eq!(available(&pace), 0.0);
 
         // Headers leave what later calls booked owed.
         let pace = limited("0");
