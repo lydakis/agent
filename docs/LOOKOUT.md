@@ -42,7 +42,13 @@ be told again.
 ## What it checks
 
 What a lead's `tasks` subscription watches is every bot it or one of its
-tasks made, and every bot named `PROJECT.*`. Two events count:
+tasks made, every bot named `PROJECT.*`, and the leads of the projects
+inside its folder: each project's lead whose folder is below the lead's
+with no other project's between, as a workspace's lead watches its
+repositories' leads. Those leads are its tasks in all but what they make,
+which stays theirs, and the turns their own lookout's notes start, which
+are their own work with their tasks. The home folder's lead watches no
+other leads. Two events count:
 
 | Event | When |
 | --- | --- |
@@ -50,7 +56,7 @@ tasks made, and every bot named `PROJECT.*`. Two events count:
 | Ended | a task's turn ends, unless the lead is waiting on it |
 
 Each is task updates (below), told once the lead rests. Each is also one
-check, with up to two questions:
+check, with up to three questions:
 
 - `interrupt`, only while the lead is in the middle of a turn: can it not
   wait until that turn ends, because it changes what the lead or another
@@ -67,9 +73,17 @@ check, with up to two questions:
   lets it pass: in `bench/lookout_turns.py` (3-run means) it caught 11 of
   24 drifting tasks on its own and 13 with drift picked, with no fewer
   results told.
+- `lacks`, busy or not, of turn ends when the project has other tasks: is
+  the task going without something it needs or was asked for, a fact, a
+  finding, a decision, a file or access, that another task, the memory or
+  the lead has or is better placed to get, saying it does not know,
+  guessing, asking the person or stopping for want of it? A yes is picked
+  with "get it to this task from whoever has it, and tell this task it is
+  coming". A lead reads the person's question and the task's "I don't have
+  that" as the task's own business and lets the person carry it across.
 
 The judge reads the event's text, the lead's latest message to that task
-(its brief) or the person's latest words in it, for `drifts` what passed
+(its brief) or the person's latest words in it, for `drifts` and `lacks` what passed
 in that task since the lead last wrote there (the person's messages and the
 first line of each reply, the last six), the other tasks' briefs and latest
 lines, and the project's memory indexes. Anything less than a yes is told
@@ -110,9 +124,9 @@ call answers with all of them:
   `bots` every bot its name matches, `*` matching any run of characters.
   A subscription needs one of them, and may have several.
 - `on` picks the events, `said` and `ended`; both by default.
-- `ask: ["interrupt"]`, `ask: ["drifts"]` ask those built-in questions;
-  with no `ask`, a subscription asks both, unless it looks for something of
-  its own, when it asks only that.
+- `ask: ["interrupt"]`, `ask: ["drifts"]`, `ask: ["lacks"]` ask those
+  built-in questions; with no `ask`, a subscription asks every one, unless
+  it looks for something of its own, when it asks only that.
 - `look_for` adds questions of the subscriber's own, each `text` with what
   it does `then`, asked of every event it watches, busy or not; a yes
   wakes it, steering when `urgent`.
