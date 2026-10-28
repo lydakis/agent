@@ -41,6 +41,8 @@ mod status;
 mod table;
 mod task;
 mod term;
+#[cfg(test)]
+mod testing;
 mod transcript;
 mod trigger;
 mod user_shell;
