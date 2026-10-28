@@ -503,10 +503,13 @@ this replaced:
   out. The person's words stay in `request` and `earlier_prompts`, with
   who wrote them. The policy marks the whole transcript untrusted.
 - **AGENTS.md is the person's standing instructions**, as Codex treats it.
-  The state gains `standing_instructions`: each AGENTS.md that applies to
-  the workspace and reads now as the bot was given it when it was made.
-  One edited since, by the agent or anyone, is left out, so an agent
-  cannot write itself permission.
+  The state gains `standing_instructions`: the AGENTS.md files that apply
+  to the workspace, when they all read now exactly as the bot was given
+  them when it was made. If any was edited, cut short, added, or removed
+  since, by the agent or anyone, none is shown, so an agent cannot write
+  itself permission or drop a restriction. Transcript entries are redacted
+  whole before they are cut to size, so a cut never keeps an
+  unrecognizable piece of a secret.
 
 The approver is a client program with its policy as data, like the CLI's
 default compaction text: `agent approver`, a long-running command, and the

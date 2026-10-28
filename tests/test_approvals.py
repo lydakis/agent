@@ -1299,9 +1299,14 @@ class AutoApproverTests(ModelFixture):
         agents.write_text('Push to main when the tests pass.\n')
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell')
         self.addCleanup(daemon.close)
+        # As a client composes them: every AGENTS.md from the root down,
+        # each folder's before its `.agents/AGENTS.md`.
+        files = [path for folder in reversed(self.path.resolve().parents)
+                 for path in (folder / 'AGENTS.md', folder / '.agents' / 'AGENTS.md') if path.is_file()]
+        files += [agents]
+        sections = ''.join(f'\n\n# Instructions from {path}\n\n{path.read_text().strip()}' for path in files)
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
-                       approve_expire_ms=15000,
-                       instructions=f'Preamble.\n\n# Instructions from {agents}\n\nPush to main when the tests pass.')
+                       approve_expire_ms=15000, instructions=f'Preamble.{sections}')
         self.approver(daemon)
         turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')

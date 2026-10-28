@@ -940,7 +940,7 @@ async fn intent(
         .iter()
         .filter_map(|call| call["call_id"].as_str())
         .collect();
-    let transcript = transcript(client, bot, &judged).await?;
+    let transcript = transcript(client, &shared.redactor, bot, &judged).await?;
     let instructions = match &workspace {
         Some(workspace) => {
             let bot = client.request("inspect", json!({"bot":bot})).await?;
@@ -977,6 +977,7 @@ async fn intent(
 /// being judged are left to the state's own entries.
 async fn transcript(
     client: &Client,
+    redactor: &Redactor,
     bot: &str,
     judged: &[&str],
 ) -> std::result::Result<Transcript, Unjudged> {
@@ -1016,7 +1017,7 @@ async fn transcript(
                 }
                 // An item's entries newest first, as the transcript is read.
                 for said in policy::entries(&entry["item"], judged).into_iter().rev() {
-                    if !transcript.offer(said) {
+                    if !transcript.offer(said, redactor) {
                         break 'read;
                     }
                 }

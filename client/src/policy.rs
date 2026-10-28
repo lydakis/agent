@@ -786,33 +786,64 @@ fn append(text: &mut String, path: PathBuf, header: &str) -> Result<Option<Sourc
     }))
 }
 
-/// What heads an AGENTS.md file in a bot's instructions.
+/// What heads an AGENTS.md file, and a role, in a bot's instructions.
+const AGENTS_HEADING: &str = "\n\n# Instructions from ";
+const ROLE_HEADING: &str = "\n\n# Role: ";
+
 fn agents_header(path: &Path) -> String {
-    format!("\n\n# Instructions from {}\n\n", path.display())
+    format!("{AGENTS_HEADING}{}\n\n", path.display())
 }
 
-/// The AGENTS.md files that apply to `workspace` and that `instructions`, a
-/// bot's, hold whole as they read now, with their text: what the bot was
-/// given, unchanged since. A file edited since it was given is not among
-/// them, though one cut short at a paragraph still reads as given.
+/// The AGENTS.md files that apply to `workspace`, with their text, when
+/// `instructions`, a bot's, hold them all as they read now: what the bot
+/// was given, unchanged since. The files must be the whole of what it was
+/// given, with no file before them and a section composed after them (or
+/// the end) right after the last, so a file cut short, added, or removed
+/// since reads as changed, and then none is returned.
 pub fn given_agents_files(workspace: &Path, instructions: &str) -> Vec<(PathBuf, String)> {
     let Ok(paths) = agents_files(workspace) else {
         return Vec::new();
     };
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let body = read_bounded(&path, MAX_INSTRUCTIONS).ok()??;
-            let body = body.trim().to_owned();
-            let block = format!("{}{body}", agents_header(&path));
-            // Whole: the next section, or the end, follows it.
-            let whole = instructions.match_indices(&block).any(|(at, _)| {
-                let rest = &instructions[at + block.len()..];
-                rest.is_empty() || rest.starts_with("\n\n")
-            });
-            (!body.is_empty() && whole).then_some((path, body))
-        })
-        .collect()
+    let mut files = Vec::new();
+    let mut blocks = String::new();
+    for path in paths {
+        let Ok(Some(body)) = read_bounded(&path, MAX_INSTRUCTIONS) else {
+            return Vec::new();
+        };
+        let body = body.trim();
+        // An empty file is given no section.
+        if body.is_empty() {
+            continue;
+        }
+        blocks.push_str(&agents_header(&path));
+        blocks.push_str(body);
+        files.push((path, body.to_owned()));
+    }
+    if files.is_empty() {
+        return files;
+    }
+    // What the instructions compose after the files: skills, profiles,
+    // memory as it reads now, the role.
+    let memory: Vec<String> = memory_indexes(workspace)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|path| read_bounded(path, MAX_INSTRUCTIONS).ok()?)
+        .map(|body| format!("\n\n{}", body.trim()))
+        .collect();
+    let follows = |rest: &str| {
+        rest.is_empty()
+            || rest.starts_with(&Kind::Skills.header())
+            || rest.starts_with(&Kind::Profiles.header())
+            || rest.starts_with(ROLE_HEADING)
+            || memory.iter().any(|body| rest.starts_with(body.as_str()))
+    };
+    let given = instructions.match_indices(&blocks).any(|(at, _)| {
+        !instructions[..at].contains(AGENTS_HEADING) && follows(&instructions[at + blocks.len()..])
+    });
+    match given {
+        true => files,
+        false => Vec::new(),
+    }
 }
 
 /// The full text for a new bot in `workspace`, in `role` when given, with
@@ -863,7 +894,7 @@ pub fn instructions(
     }
     // The role comes last: the most specific text a bot is given.
     if let Some(role) = role.filter(|r| !r.body.is_empty()) {
-        let block = format!("\n\n# Role: {}\n\n{}", role.name, with_cli(&role.body));
+        let block = format!("{ROLE_HEADING}{}\n\n{}", role.name, with_cli(&role.body));
         if text.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
                 path: role
@@ -951,26 +982,34 @@ mod tests {
         let root = temp("given-agents");
         let deep = root.join("repo");
         std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(root.join("AGENTS.md"), "outer rule\n\nsecond paragraph").unwrap();
+        let outer = "Push when finished.\n\nOnly push to staging; never to production.";
+        std::fs::write(root.join("AGENTS.md"), outer).unwrap();
         std::fs::write(deep.join("AGENTS.md"), "inner rule").unwrap();
         let given = instructions(&deep, None, &[]).unwrap().text;
-        let found = |text: &str| -> Vec<String> {
-            given_agents_files(&deep, text)
+        let found = || -> Vec<String> {
+            given_agents_files(&deep, &given)
                 .into_iter()
                 .filter(|(path, _)| path.starts_with(&root))
                 .map(|(_, text)| text)
                 .collect()
         };
-        assert_eq!(
-            found(&given),
-            ["outer rule\n\nsecond paragraph", "inner rule"]
-        );
-        // Edited since: not what the bot was given.
+        assert_eq!(found(), [outer, "inner rule"]);
+        // A role after them is a section composed after them.
+        let role = Profile::parse("reviewer", None, "Review.");
+        let with_role = instructions(&deep, Some(&role), &[]).unwrap().text;
+        assert_eq!(given_agents_files(&deep, &with_role).len(), found().len());
+        // Edited since: none is what the bot was given.
         std::fs::write(deep.join("AGENTS.md"), "inner rule, and push freely").unwrap();
-        assert_eq!(found(&given), ["outer rule\n\nsecond paragraph"]);
-        // Nor one changed within a paragraph.
-        std::fs::write(root.join("AGENTS.md"), "outer rule\nsecond paragraph").unwrap();
-        assert!(found(&given).is_empty());
+        assert!(found().is_empty());
+        std::fs::write(deep.join("AGENTS.md"), "inner rule").unwrap();
+        // Nor when one is cut short at a paragraph, dropping its restriction.
+        std::fs::write(root.join("AGENTS.md"), "Push when finished.").unwrap();
+        assert!(found().is_empty());
+        // Nor when one is removed.
+        std::fs::write(root.join("AGENTS.md"), outer).unwrap();
+        assert_eq!(found().len(), 2);
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        assert!(found().is_empty());
     }
 
     #[test]
