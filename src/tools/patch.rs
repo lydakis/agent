@@ -227,6 +227,7 @@ impl Patch {
         for change in &self.changes {
             match change {
                 Change::Add { path, contents } => {
+                    writable(workspace, path).await?;
                     staged += contents.len();
                     writes.push(Write::Put(workspace.join(path), contents.clone(), None));
                     summary.push_str(&format!("A {path}\n"));
@@ -275,6 +276,7 @@ impl Patch {
                     }
                     match move_to {
                         Some(to) => {
+                            writable(workspace, to).await?;
                             // A moved script stays executable.
                             let permissions = tokio::fs::metadata(&source).await?.permissions();
                             writes.push(Write::Put(workspace.join(to), updated, Some(permissions)));
@@ -305,6 +307,30 @@ impl Patch {
         }
         Ok(summary)
     }
+}
+
+/// Fail unless `path` can be written as a regular file: what is there, if
+/// anything, is one, and every folder above it is a folder or missing.
+/// Checked before anything is written, so a patch that cannot apply
+/// changes nothing.
+async fn writable(workspace: &Path, path: &str) -> Result<()> {
+    let target = workspace.join(path);
+    if let Ok(metadata) = tokio::fs::metadata(&target).await
+        && !metadata.is_file()
+    {
+        return Err(Error::with("file_not_regular", path.to_owned()));
+    }
+    for above in target.ancestors().skip(1) {
+        if above == workspace {
+            break;
+        }
+        if let Ok(metadata) = tokio::fs::metadata(above).await
+            && !metadata.is_dir()
+        {
+            return Err(Error::with("file_not_regular", path.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 fn path_of(path: &str, line: usize) -> Result<String> {
@@ -452,7 +478,8 @@ fn update(text: &str, chunks: &[Chunk], path: &str) -> Result<String> {
     out.extend(&lines[next..]);
     let eol = if crlf { "\r\n" } else { "\n" };
     let mut updated = out.join(eol);
-    if !updated.is_empty() {
+    // Every line ends: a file of one empty line is a newline.
+    if !out.is_empty() {
         updated.push_str(eol);
     }
     Ok(updated)
@@ -609,6 +636,12 @@ mod tests {
         let error = update("other\n", chunks, "f").unwrap_err();
         assert_eq!(error.code, "patch_context_not_found");
         assert!(error.detail.unwrap().contains("say(\"hi\")"));
+        // One empty line is still a line.
+        let parsed = patch("*** Update File: f\n-a\n+\n");
+        let Change::Update { chunks, .. } = &parsed.changes[0] else {
+            panic!()
+        };
+        assert_eq!(update("a\n", chunks, "f").unwrap(), "\n");
         // A long run of like lines whose last line is not there fails fast.
         let text = "x\n".repeat(20_000);
         let mut long = "*** Update File: f\n".to_owned();
@@ -653,6 +686,22 @@ mod tests {
             "patch_context_not_found"
         );
         assert!(!dir.join("new.txt").exists());
+        // So does one that adds a file where a folder is, or below a file.
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        for target in ["folder", "keep.txt/inner"] {
+            let failing = patch(&format!(
+                "*** Update File: keep.txt\n-b\n+b2\n*** Add File: {target}\n+n\n"
+            ));
+            assert_eq!(
+                failing.apply(&dir).await.unwrap_err().code,
+                "file_not_regular"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+                "a\nb\n"
+            );
+        }
+        std::fs::remove_dir(dir.join("folder")).unwrap();
         let good = patch(
             "*** Add File: sub/new.txt\n+n\n*** Update File: keep.txt\n*** Move to: moved.txt\n a\n-b\n+b2\n\
              *** Delete File: gone.txt\n",

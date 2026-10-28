@@ -6396,6 +6396,14 @@ impl Database {
             truncated |= cut(&mut arguments, &mut calls_left);
             let mut call = json!({"call_id":call_id,"name":data["name"],"arguments":arguments,
                 "arguments_truncated":truncated,"done":done.contains(&call_id)});
+            // The files a cut patch changes, when they fit what is left.
+            if let Some(paths) = data.get("paths") {
+                let size = paths.to_string().len();
+                if size <= calls_left {
+                    calls_left -= size;
+                    call["paths"] = paths.clone();
+                }
+            }
             if failed.contains(&call_id) {
                 call["failed"] = json!(true);
             }
@@ -8480,8 +8488,19 @@ fn epoch_ms() -> i64 {
 /// A `tool_started` event's data: the call with its arguments previewed.
 fn started(call: &ToolCall) -> Value {
     let preview: String = call.arguments.chars().take(2048).collect();
-    json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
-        "arguments_truncated":preview.len() < call.arguments.len()})
+    let truncated = preview.len() < call.arguments.len();
+    let mut data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
+        "arguments_truncated":truncated});
+    // A cut patch still names every file it changes, for a judge of a later
+    // call that runs one.
+    if truncated
+        && call.name == "apply_patch"
+        && let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments)
+        && let Some(Ok(patch)) = arguments["input"].as_str().map(crate::tools::Patch::parse)
+    {
+        data["paths"] = json!(patch.paths().collect::<Vec<_>>());
+    }
+    data
 }
 /// In an answered call's start, note it as waiting for its client, and
 /// name that client and the call's deadline in `tool_started`. A call
@@ -10255,6 +10274,29 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_patch_still_names_every_file_it_changes() {
+        let input = format!(
+            "*** Begin Patch\n*** Add File: notes.txt\n+{}\n*** Add File: run.sh\n+ls\n*** End Patch",
+            "x".repeat(3000)
+        );
+        let call = ToolCall {
+            name: "apply_patch".into(),
+            call_id: "c".into(),
+            arguments: json!({"input":input}).to_string(),
+            custom: true,
+        };
+        let data = started(&call);
+        assert_eq!(data["arguments_truncated"], true);
+        assert_eq!(data["paths"], json!(["notes.txt", "run.sh"]));
+        let short = ToolCall {
+            arguments: json!({"input":"*** Begin Patch\n*** Add File: a\n+b\n*** End Patch"})
+                .to_string(),
+            ..call
+        };
+        assert!(started(&short).get("paths").is_none());
+    }
 
     #[test]
     fn compaction_follows_the_window_as_codex_and_claude_code_do() {

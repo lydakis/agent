@@ -709,6 +709,15 @@ fn patch_paths(text: &str) -> Vec<String> {
     paths
 }
 
+/// The files a file-changing call too large to read back changes: a
+/// patch's as the daemon named them whole, else as its preview names them.
+fn cut_files(tool: &str, call: &Value, preview: &str) -> std::result::Result<Value, Unjudged> {
+    match call["paths"].as_array() {
+        Some(paths) if tool == "apply_patch" => Ok(json!({"paths":paths})),
+        _ => cut_change(tool, preview),
+    }
+}
+
 /// What is shown of a file-changing call too large to read back: the
 /// files it changes, when its preview names them.
 fn cut_change(tool: &str, preview: &str) -> std::result::Result<Value, Unjudged> {
@@ -921,7 +930,7 @@ async fn intent(
                     // Too large to read back: as a call with no node.
                     Err(Unjudged::TooLong) if writes => {
                         sized = false;
-                        cut_change(&tool, preview)?
+                        cut_files(&tool, call, preview)?
                     }
                     Err(Unjudged::TooLong) => {
                         allowed_cut = true;
@@ -933,7 +942,7 @@ async fn intent(
                 // no file this turn wrote could be matched.
                 None if writes => {
                     sized = false;
-                    cut_change(&tool, preview)?
+                    cut_files(&tool, call, preview)?
                 }
                 None => {
                     allowed_cut = true;
@@ -1402,6 +1411,16 @@ mod tests {
             Some(json!({"paths":["a.rs"]}))
         );
         assert!(cut_change("apply_patch", r#"{"input":"*** Begin Pa"#).is_err());
+        // The files the daemon named whole win over a cut preview's.
+        let call = json!({"paths":["a.rs", "b.rs", "c.rs", "run.sh"]});
+        assert_eq!(
+            cut_files("apply_patch", &call, preview).ok(),
+            Some(json!({"paths":["a.rs", "b.rs", "c.rs", "run.sh"]}))
+        );
+        assert_eq!(
+            cut_files("apply_patch", &json!({}), preview).ok(),
+            Some(json!({"paths":["a.rs"]}))
+        );
         // What a cut preview yields still names its files.
         assert_eq!(
             changed_paths("apply_patch", &json!({"paths":["a.rs", "b.rs"]})),
