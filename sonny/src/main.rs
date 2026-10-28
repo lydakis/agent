@@ -5202,6 +5202,8 @@ impl App {
         }
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
+        // The full screen's links, to be written again as hyperlinks.
+        let mut linked = Vec::new();
         terminal.draw(|frame| {
             // The full screen: the conversation above the rows that move,
             // which sit right under it until it fills the screen, as inline.
@@ -5211,6 +5213,7 @@ impl App {
                     if let (Some(at), Some(open)) = (pane, &mut self.pane) {
                         let file = |word: &str| links::file_line(&workspace, word);
                         open.render(at, frame.buffer_mut(), self.pane_keys, file);
+                        linked.extend(open.screen.link_cells(frame.buffer_mut()));
                         // The line between them, as a split's.
                         if area.width > 0 {
                             let line = Rect {
@@ -5240,6 +5243,7 @@ impl App {
                         ..history
                     };
                     self.screen.render(history, frame.buffer_mut(), file);
+                    linked.extend(self.screen.link_cells(frame.buffer_mut()));
                     view
                 }
                 false => frame.area(),
@@ -5445,6 +5449,20 @@ impl App {
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
+        // Over themselves, the cursor kept where the frame left it.
+        if !linked.is_empty() {
+            execute!(
+                terminal.backend_mut(),
+                ratatui::crossterm::cursor::SavePosition
+            )?;
+            terminal
+                .backend_mut()
+                .draw(linked.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+            execute!(
+                terminal.backend_mut(),
+                ratatui::crossterm::cursor::RestorePosition
+            )?;
+        }
         Ok(())
     }
 

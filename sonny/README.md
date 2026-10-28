@@ -304,7 +304,10 @@ a click on a file opens it in a pane beside the conversation: code in
 syntax colors with its line numbers, at the line the link names
 (`src/main.rs:120`), and Markdown as replies read. The pane scrolls,
 selects and copies as the conversation does; a click on its name opens
-the file in the app the system opens it with, and Esc closes it. Keys go
+the file in the app the system opens it with, and Esc closes it. Links
+are the terminal's own links too, so its link click (Cmd+click, or
+Shift+Cmd+click in Ghostty) opens a file outside Sonny from the
+conversation. Keys go
 to the pane after a click in it; Tab takes them back to the composer, and
 Tab with nothing typed puts them in the pane again. A window too narrow for
 both shows the one the keys are in. Ctrl+F finds text in

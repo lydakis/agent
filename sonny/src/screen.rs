@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, Cell},
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -525,6 +525,34 @@ impl Screen {
                 }
             }
         }
+    }
+
+    /// The cells of the links drawn last, from `buf` they were drawn in,
+    /// each link's first opening an OSC 8 hyperlink and its last closing
+    /// it: written again over themselves, they let the terminal's own
+    /// link click (Cmd+click) open the file or page outside Sonny.
+    pub fn link_cells(&self, buf: &Buffer) -> Vec<(u16, u16, Cell)> {
+        let mut cells = Vec::new();
+        for (y, from, to, url) in &self.links {
+            // The line a preview opens at is no part of the file's address.
+            let url = match url.starts_with("file://") {
+                true => url.split('#').next().unwrap_or(url),
+                false => url,
+            };
+            for x in *from..*to {
+                let mut cell = buf[(x, *y)].clone();
+                let mut symbol = cell.symbol().to_owned();
+                if x == *from {
+                    symbol = format!("\x1b]8;;{url}\x1b\\{symbol}");
+                }
+                if x + 1 == *to {
+                    symbol.push_str("\x1b]8;;\x1b\\");
+                }
+                cell.set_symbol(&symbol);
+                cells.push((x, *y, cell));
+            }
+        }
+        cells
     }
 
     /// The links in the rows just drawn, as `links::cells` finds them.
