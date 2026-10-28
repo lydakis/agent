@@ -14,8 +14,14 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
             &json!({"command":"printf out; printf err >&2; exit 7","timeout_ms":1000}).to_string(),
         )
         .unwrap();
-    let output: Value =
-        serde_json::from_str(&tools.execute(prepared, &cwd, &[]).await.unwrap().output).unwrap();
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(prepared, &cwd, &[], None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     assert_eq!(output["stdout"], "out");
     assert_eq!(output["stderr"], "err");
     assert_eq!(output["exit_code"], 7);
@@ -29,8 +35,14 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
         )
         .unwrap();
     let env = [("PAGER".to_owned(), "less".to_owned())];
-    let output: Value =
-        serde_json::from_str(&tools.execute(prepared, &cwd, &env).await.unwrap().output).unwrap();
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(prepared, &cwd, &env, None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     assert_eq!(output["stdout"], "dumb 1 less cat cat");
     assert!(
         Registry::new("echo")
@@ -58,7 +70,7 @@ async fn shell_timeout_and_output_overflow_are_bounded() {
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            tools.execute(prepared, &cwd, &[]),
+            tools.execute(prepared, &cwd, &[], None),
         )
     };
     // A timed-out command still shows what it wrote before it was killed.
@@ -109,7 +121,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .unwrap();
     assert!(
         tools
-            .execute(echo, &std::env::temp_dir(), &[])
+            .execute(echo, &std::env::temp_dir(), &[], None)
             .await
             .unwrap()
             .output
@@ -117,7 +129,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
     );
     let shell = tools.prepare("shell", &json!({"command": "printf '%s' 'synthetic-\"test-value'; printf '%s' 'synthetic-\"test-value' >&2"}).to_string()).unwrap();
     let output = tools
-        .execute(shell, &std::env::temp_dir(), &[])
+        .execute(shell, &std::env::temp_dir(), &[], None)
         .await
         .unwrap()
         .output;
@@ -131,7 +143,7 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         )
         .unwrap();
     let outcome = tools
-        .execute(binary, &std::env::temp_dir(), &[])
+        .execute(binary, &std::env::temp_dir(), &[], None)
         .await
         .unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
@@ -155,7 +167,7 @@ async fn rotated_overlapping_credentials_are_fully_redacted() {
         .unwrap();
     assert_eq!(
         tools
-            .execute(echo, &std::env::temp_dir(), &[])
+            .execute(echo, &std::env::temp_dir(), &[], None)
             .await
             .unwrap()
             .output,
@@ -180,7 +192,7 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
         .unwrap();
     assert!(
         tools
-            .execute(write, &dir, &[])
+            .execute(write, &dir, &[], None)
             .await
             .unwrap()
             .output
@@ -193,7 +205,7 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
             &json!({"path":"alias.rs","offset":2,"limit":1}).to_string(),
         )
         .unwrap();
-    let shown = tools.execute(read, &dir, &[]).await.unwrap().output;
+    let shown = tools.execute(read, &dir, &[], None).await.unwrap().output;
     assert!(shown.starts_with("     2\ttwo\n"), "{shown}");
     assert!(shown.contains("showing lines 2-2 of 3"));
     let ambiguous = tools
@@ -203,7 +215,11 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
         )
         .unwrap();
     assert_eq!(
-        tools.execute(ambiguous, &dir, &[]).await.unwrap_err().code,
+        tools
+            .execute(ambiguous, &dir, &[], None)
+            .await
+            .unwrap_err()
+            .code,
         "edit_target_ambiguous"
     );
     let edit = tools
@@ -214,7 +230,7 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
         .unwrap();
     assert!(
         tools
-            .execute(edit, &dir, &[])
+            .execute(edit, &dir, &[], None)
             .await
             .unwrap()
             .output
@@ -237,7 +253,11 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
     // Three replacements fit; five replacements exceed the file bound.
     std::fs::write(dir.join("src/lib.rs"), "a\nb\nc\nd\ne\n").unwrap();
     assert_eq!(
-        tools.execute(oversized, &dir, &[]).await.unwrap_err().code,
+        tools
+            .execute(oversized, &dir, &[], None)
+            .await
+            .unwrap_err()
+            .code,
         "tool_output_limit"
     );
     assert_eq!(
@@ -250,7 +270,7 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
             &json!({"path":"alias.rs","content":"short"}).to_string(),
         )
         .unwrap();
-    tools.execute(rewrite, &dir, &[]).await.unwrap();
+    tools.execute(rewrite, &dir, &[], None).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
         "short"
@@ -260,7 +280,11 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
         .prepare("read", &json!({"path":"nope.txt"}).to_string())
         .unwrap();
     assert_eq!(
-        tools.execute(missing, &dir, &[]).await.unwrap_err().code,
+        tools
+            .execute(missing, &dir, &[], None)
+            .await
+            .unwrap_err()
+            .code,
         "file_unreadable"
     );
     // Oversized shell output keeps a preview and retains the full stream.
@@ -270,7 +294,7 @@ async fn file_tools_read_write_and_edit_within_the_workspace() {
             &json!({"command":"head -c 200000 /dev/zero | tr '\\0' 'y'"}).to_string(),
         )
         .unwrap();
-    let outcome = tools.execute(big, &dir, &[]).await.unwrap();
+    let outcome = tools.execute(big, &dir, &[], None).await.unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
     assert!(result["stdout"].as_str().unwrap().contains("bytes omitted"));
     assert_eq!(outcome.artifacts[0].0, "stdout");
@@ -289,12 +313,12 @@ async fn read_distinguishes_long_lines_from_eof_and_keeps_pages_bounded() {
             .unwrap()
     };
     std::fs::write(dir.join("data"), "x".repeat(80_000)).unwrap();
-    let error = tools.execute(read(1), &dir, &[]).await.unwrap_err();
+    let error = tools.execute(read(1), &dir, &[], None).await.unwrap_err();
     assert_eq!(error.code, "read_line_too_long");
     assert!(error.detail.unwrap().contains("line 1"));
     assert!(
         tools
-            .execute(read(2), &dir, &[])
+            .execute(read(2), &dir, &[], None)
             .await
             .unwrap()
             .output
@@ -305,16 +329,24 @@ async fn read_distinguishes_long_lines_from_eof_and_keeps_pages_bounded() {
         format!("ok\n{}\ntail\n", "x".repeat(80_000)),
     )
     .unwrap();
-    let page = tools.execute(read(1), &dir, &[]).await.unwrap().output;
+    let page = tools
+        .execute(read(1), &dir, &[], None)
+        .await
+        .unwrap()
+        .output;
     assert!(page.starts_with("     1\tok\n"));
     assert!(page.contains("offset=2"));
     assert_eq!(
-        tools.execute(read(2), &dir, &[]).await.unwrap_err().code,
+        tools
+            .execute(read(2), &dir, &[], None)
+            .await
+            .unwrap_err()
+            .code,
         "read_line_too_long"
     );
     assert!(
         tools
-            .execute(read(3), &dir, &[])
+            .execute(read(3), &dir, &[], None)
             .await
             .unwrap()
             .output
@@ -324,7 +356,7 @@ async fn read_distinguishes_long_lines_from_eof_and_keeps_pages_bounded() {
     let page = tools
         .prepare("read", &json!({"path":"data","limit":5000}).to_string())
         .unwrap();
-    let output = tools.execute(page, &dir, &[]).await.unwrap().output;
+    let output = tools.execute(page, &dir, &[], None).await.unwrap().output;
     assert!(output.len() <= agent_runtime::tools::PREVIEW_BYTES);
     assert!(output.contains("continue with offset="));
     std::fs::remove_dir_all(dir).unwrap();
@@ -350,8 +382,14 @@ async fn detached_commands_run_in_their_own_session_and_write_only_where_told() 
                 .to_string(),
         )
         .unwrap();
-    let output: Value =
-        serde_json::from_str(&tools.execute(prepared, &dir, &[]).await.unwrap().output).unwrap();
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(prepared, &dir, &[], None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     assert_eq!(output.as_object().unwrap().len(), 2);
     let pid = output["pid"].as_i64().unwrap() as i32;
     // Its own session, so no group kill of the calling command reaches it.
@@ -389,7 +427,7 @@ async fn detached_commands_are_bounded_and_reaped() {
     for _ in 0..2 {
         let output: Value = serde_json::from_str(
             &tools
-                .execute(detach("exec sleep 30"), &dir, &[])
+                .execute(detach("exec sleep 30"), &dir, &[], None)
                 .await
                 .unwrap()
                 .output,
@@ -398,7 +436,10 @@ async fn detached_commands_are_bounded_and_reaped() {
         pids.push(output["pid"].as_i64().unwrap() as i32);
     }
     // Two running: the bound refuses a third, as a tool error the model sees.
-    let error = tools.execute(detach("true"), &dir, &[]).await.unwrap_err();
+    let error = tools
+        .execute(detach("true"), &dir, &[], None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "detached_limit");
     assert!(
         error
@@ -426,7 +467,7 @@ async fn detached_commands_are_bounded_and_reaped() {
         -1
     );
     let output = tools
-        .execute(detach("true"), &dir, &[])
+        .execute(detach("true"), &dir, &[], None)
         .await
         .unwrap()
         .output;
@@ -442,6 +483,7 @@ async fn detached_commands_are_bounded_and_reaped() {
             .unwrap(),
             &dir,
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -450,4 +492,264 @@ async fn detached_commands_are_bounded_and_reaped() {
         libc::kill(pids[1], libc::SIGKILL);
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Whether sandboxes run here. CI sets AGENT_TEST_SANDBOX, where one that
+/// can't is a failure; elsewhere the test says why it skipped.
+#[cfg(target_os = "linux")]
+fn sandboxes() -> bool {
+    match agent_runtime::sandbox::available() {
+        Ok(()) => true,
+        Err(error) if std::env::var_os("AGENT_TEST_SANDBOX").is_some() => {
+            panic!("no sandbox: {error:?}")
+        }
+        Err(error) => {
+            eprintln!("skipped: {error:?}");
+            false
+        }
+    }
+}
+
+/// A sandboxed command writes its roots and nothing else, keeps `.git`
+/// and the store read-only, can't make a missing `.git`, and has no
+/// network; a confined write or edit is held to the same roots.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_sandboxed_command_writes_only_its_roots() {
+    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    use std::sync::Arc;
+    if !sandboxes() {
+        return;
+    }
+    // Outside the temporary directory, which a sandbox may write.
+    let base = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .join(format!("agent-sandbox-{}", std::process::id()));
+    let (dir, other, repo, fresh) = (
+        base.join("work"),
+        base.join("other"),
+        base.join("repo"),
+        base.join("fresh"),
+    );
+    for folder in [&dir, &other, &repo.join(".git"), &fresh] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    std::fs::write(dir.join("store"), "db").unwrap();
+    let daemon = Daemon {
+        store: Some(dir.join("store")),
+        socket: None,
+        helper: Some(env!("CARGO_BIN_EXE_agent").into()),
+    };
+    let writable = [
+        repo.to_str().unwrap().to_owned(),
+        fresh.to_str().unwrap().to_owned(),
+    ];
+    let policy = Arc::new(
+        Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&dir),
+            &writable,
+            None,
+            false,
+            &daemon,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    let tools = Registry::new("shell,write,edit").unwrap();
+    let run = |command: String| {
+        let tools = tools.clone();
+        let (dir, policy) = (dir.clone(), policy.clone());
+        async move {
+            let prepared = tools
+                .prepare("shell", &json!({"command":command}).to_string())
+                .unwrap();
+            let outcome = tools
+                .execute(prepared, &dir, &[], Some(policy))
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(&outcome.output).unwrap()
+        }
+    };
+    // Its folder, a named one and the temporary directory take writes,
+    // from where the command started.
+    let output = run(format!(
+        "echo a > made && echo b > {repo}/b && echo c > /tmp/agent-sandbox-tmp-{pid} && pwd",
+        repo = repo.display(),
+        pid = std::process::id()
+    ))
+    .await;
+    assert_eq!(output["exit_code"], 0, "{output}");
+    assert_eq!(
+        output["stdout"].as_str().unwrap().trim(),
+        dir.to_str().unwrap()
+    );
+    assert!(dir.join("made").exists() && repo.join("b").exists());
+    std::fs::remove_file(format!("/tmp/agent-sandbox-tmp-{}", std::process::id())).unwrap();
+    // Anything else, git's folder and the store stay as they were.
+    for target in [
+        other.join("x"),
+        repo.join(".git/config"),
+        dir.join("store"),
+        fresh.join(".git"),
+    ] {
+        let output = run(format!("mkdir {0} || echo x > {0}", target.display())).await;
+        assert_ne!(output["exit_code"], 0, "{} {output}", target.display());
+    }
+    assert!(!other.join("x").exists() && !repo.join(".git/config").exists());
+    assert_eq!(std::fs::read_to_string(dir.join("store")).unwrap(), "db");
+    // The placeholder that kept `.git` from being made goes with the
+    // command, off the runtime thread.
+    for _ in 0..100 {
+        if !fresh.join(".git").exists() && !dir.join(".git").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!fresh.join(".git").exists() && !dir.join(".git").exists());
+    // Only loopback: no network.
+    let output = run("tail -n +3 /proc/net/dev | cut -d: -f1".into()).await;
+    assert_eq!(output["stdout"].as_str().unwrap().trim(), "lo");
+    // A confined write or edit is held to the same roots.
+    let write = |path: &str| {
+        tools
+            .prepare("write", &json!({"path":path,"content":"x"}).to_string())
+            .unwrap()
+    };
+    tools
+        .execute(write("notes/a.md"), &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap();
+    for denied in [
+        other.join("a").to_str().unwrap(),
+        repo.join(".git/HEAD").to_str().unwrap(),
+        "store",
+    ] {
+        let error = tools
+            .execute(write(denied), &dir, &[], Some(policy.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "write_denied", "{denied}");
+    }
+    std::os::unix::fs::symlink(&other, dir.join("out")).unwrap();
+    let edit = tools
+        .prepare(
+            "edit",
+            &json!({"path":"out/a","old":"x","new":"y"}).to_string(),
+        )
+        .unwrap();
+    let error = tools
+        .execute(edit, &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    // A link to a file that doesn't exist yet is followed to where a write
+    // through it would land.
+    std::os::unix::fs::symlink(other.join("new"), dir.join("dangling")).unwrap();
+    let error = tools
+        .execute(write("dangling"), &dir, &[], Some(policy.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "write_denied");
+    assert!(!other.join("new").exists());
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// A root outside every folder in `within` is not one.
+#[test]
+fn a_root_outside_within_is_not_writable() {
+    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    let base = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .join(format!("agent-within-{}", std::process::id()));
+    let (mine, other) = (base.join("mine"), base.join("other"));
+    for folder in [&mine, &other] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    let named = [mine.to_str().unwrap().to_owned()];
+    let policy = |within: &[String]| {
+        Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&other),
+            &named,
+            Some(within),
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let held = policy(&named);
+    assert!(held.can_write(&mine.join("a")));
+    assert!(!held.can_write(&other.join("a")));
+    let none = policy(&[]);
+    assert!(!none.can_write(&mine.join("a")));
+    assert!(none.can_write(std::path::Path::new("/tmp/a")));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Read-only writes nothing, not even the temporary directory.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_read_only_sandbox_writes_nothing() {
+    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    if !sandboxes() {
+        return;
+    }
+    let dir = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let policy = Policy::new(
+        Some(Mode::ReadOnly),
+        Some(&dir),
+        &[],
+        None,
+        true,
+        &Daemon::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!policy.network);
+    let tools = Registry::new("shell").unwrap();
+    let marker = format!("agent-read-only-{}", std::process::id());
+    let prepared = tools
+        .prepare(
+            "shell",
+            &json!({"command":format!("cat /etc/hostname >/dev/null && echo x > {marker} || echo x > /tmp/{marker}")})
+                .to_string(),
+        )
+        .unwrap();
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(
+                prepared,
+                &dir,
+                &[],
+                Some(std::sync::Arc::new(policy.clone())),
+            )
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_ne!(output["exit_code"], 0, "{output}");
+    assert!(!dir.join(&marker).exists());
+    assert!(!std::path::Path::new("/tmp").join(&marker).exists());
+    // The write a confined write tool runs is held by the kernel as well,
+    // whatever the daemon checked before it.
+    let target = dir.join(&marker);
+    let mut write = agent_runtime::sandbox::command(
+        &policy,
+        env!("CARGO_BIN_EXE_agent"),
+        &[agent_runtime::sandbox::WRITE, target.to_str().unwrap()],
+        false,
+    )
+    .unwrap();
+    let written = write
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(!written.status.success());
+    let reported: Value = serde_json::from_slice(&written.stderr).unwrap();
+    assert_eq!(reported["error"], "write_denied", "{reported}");
+    assert!(!target.exists());
 }

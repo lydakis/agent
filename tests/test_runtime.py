@@ -409,6 +409,12 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
                            'arguments': json.dumps({'command': user[6:], 'timeout_ms': 2000})}]
+            elif user.startswith('calls:'):
+                # Calls given whole, as [[name, arguments], ...], in one response.
+                text = ''
+                output = [{'type': 'function_call', 'name': name, 'call_id': f'{name}-{i + 1}',
+                           'arguments': json.dumps(arguments)}
+                          for i, (name, arguments) in enumerate(json.loads(user[6:]))]
             elif user.startswith('shellecho:'):
                 # A command, then an echo, in one response.
                 text = ''

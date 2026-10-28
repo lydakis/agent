@@ -95,6 +95,11 @@ fn run() -> Result<i32> {
             cli::help(args.get(1).map(String::as_str))?;
             return Ok(0);
         }
+        // A sandboxed bot's write, which the daemon runs in the sandbox.
+        Some(agent_runtime::sandbox::WRITE) if args.len() == 2 => {
+            agent_runtime::sandbox::write(std::path::Path::new(&args[1]))?;
+            return Ok(0);
+        }
         None => return fail_with("usage", "a command is required; use agent --help"),
         _ => {}
     }

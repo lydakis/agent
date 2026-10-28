@@ -218,6 +218,10 @@ fn parse(args: &[String]) -> Result<Options> {
             "--full" => options.full = true,
             "--active" => options.active = true,
             "--newest" => options.newest = true,
+            "--network" => {
+                options.settings.insert("network".to_owned(), json!(true));
+                options.settings_flags.push("--network".to_owned());
+            }
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -360,6 +364,35 @@ fn parse(args: &[String]) -> Result<Options> {
                             .settings
                             .insert("keep_warm".to_owned(), json!(seconds));
                         options.settings_flags.push(flag.to_owned());
+                    }
+                    "--sandbox" => {
+                        if !matches!(
+                            value.as_str(),
+                            "read-only" | "workspace-write" | "danger-full-access"
+                        ) {
+                            return fail_with(
+                                "usage",
+                                "--sandbox needs read-only, workspace-write or danger-full-access",
+                            );
+                        }
+                        options.settings.insert("sandbox".to_owned(), json!(value));
+                        options.settings_flags.push(flag.to_owned());
+                    }
+                    "--writable" => {
+                        let path = std::path::absolute(&value)?;
+                        let path = path
+                            .to_str()
+                            .ok_or(Error::with("usage", "--writable needs a UTF-8 path"))?;
+                        let writable = options
+                            .settings
+                            .entry("writable".to_owned())
+                            .or_insert_with(|| json!([]));
+                        if let Value::Array(paths) = writable {
+                            paths.push(json!(path));
+                        }
+                        if !options.settings_flags.iter().any(|f| f == flag) {
+                            options.settings_flags.push(flag.to_owned());
+                        }
                     }
                     "--cache-ttl" => {
                         if !matches!(value.as_str(), "5m" | "1h") {
