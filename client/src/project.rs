@@ -408,6 +408,10 @@ pub async fn create(
     if !policy["declare"].is_null() {
         params["declare"] = policy["declare"].clone();
     }
+    // The client's gate, `create`'s approval fields.
+    if let (Value::Object(params), Some(gate)) = (&mut params, policy["gate"].as_object()) {
+        params.extend(gate.clone());
+    }
     let record = match daemon.request("create", params).await {
         Ok(record) => record,
         // Made since the look above: as when it was there before.
@@ -682,6 +686,29 @@ mod tests {
             "no effort picked sends none"
         );
         assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        // A client's gate and settings go with the lead it makes.
+        let dir = root("gated");
+        let daemon = Fake::default();
+        make(
+            &daemon,
+            &dir,
+            &json!({"instructions": "rules", "model": "alpha/role",
+                    "gate": {"approve": ["shell"], "approver": "auto"},
+                    "settings": {"sandbox": "workspace-write", "network": true}}),
+            &Picks::default(),
+        )
+        .unwrap();
+        let calls = daemon.calls.lock().unwrap().clone();
+        let create = &calls.iter().find(|(op, _)| op == "create").unwrap().1;
+        assert_eq!(
+            (&create["approve"], &create["approver"]),
+            (&json!(["shell"]), &json!("auto"))
+        );
+        assert_eq!(
+            create["settings"],
+            json!({"sandbox": "workspace-write", "network": true})
+        );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

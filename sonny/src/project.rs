@@ -496,14 +496,23 @@ async fn make(
     picks: &agent_client::project::Picks,
 ) -> Result<Value, String> {
     let (instructions, _) = folder(dir, role)?;
+    // Gated and confined from the start, as a new lead's mode makes it,
+    // whoever opens it first.
+    let mode = crate::approvals::MODES[0].0;
+    let tools: Vec<String> = match &role.tools {
+        Some(tools) => tools.clone(),
+        None => TOOLS.map(String::from).to_vec(),
+    };
+    let declare = json!(crate::declared::tools(true));
+    let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     let policy = json!({
         "instructions": instructions,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "model": role.model,
         "tools": role.tools,
-        "declare": crate::declared::tools(true),
-        // Confined from the start, as a new lead's mode confines it.
-        "settings": crate::approvals::sandbox(crate::approvals::MODES[0].0, true, dir),
+        "declare": declare,
+        "gate": gate,
+        "settings": crate::approvals::sandbox(mode, true, dir),
     });
     let copies = crate::settings::Settings::load().copies;
     agent_client::project::create(client, dir, &policy, &json!(TOOLS), picks, &copies, None).await

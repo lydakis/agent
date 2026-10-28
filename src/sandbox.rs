@@ -36,11 +36,11 @@ const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 /// the project's own settings.
 const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
 /// In a git folder given as a root, so a bot may commit, what git runs
-/// stays read-only as it does under `.git`: its hooks, and the config that
-/// can name other hooks or programs. Missing hooks are kept from being
-/// made. A git folder is known by its name, `.git` or `NAME.git`, which the
+/// stays read-only as it does under `.git`: its hooks, the config that can
+/// name other hooks or programs, and its submodules' git folders, which
+/// hold their own. Missing hooks and submodules are kept from being made. A git folder is known by its name, `.git` or `NAME.git`, which the
 /// bot can't change, never by what is inside it, which it can.
-const GIT_PROTECTED: [&str; 3] = ["hooks", "config", "config.worktree"];
+const GIT_PROTECTED: [&str; 4] = ["hooks", "config", "config.worktree", "modules"];
 
 /// A folder the bot may write, and what inside it stays read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,7 +400,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             match std::fs::symlink_metadata(&kept) {
                 Ok(found) if found.file_type().is_symlink() => return linked(&kept),
                 Ok(_) => read_only.push(kept),
-                Err(_) if name == "hooks" => missing.push(kept),
+                Err(_) if matches!(name, "hooks" | "modules") => missing.push(kept),
                 Err(_) => {}
             }
         }
@@ -431,11 +431,13 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
 
 /// Whether a git folder may be written with its hooks and config kept: not
 /// when its config is missing, which git would read once made, nor when it
-/// turns on per-worktree config, whose files git reads wherever a worktree
-/// keeps one, made or not. Any mention of that setting counts.
+/// turns on per-worktree config or includes other files, which git reads
+/// wherever they are, made or not. Any mention of either counts.
 fn git_folder_writable(path: &Path) -> bool {
-    std::fs::read_to_string(path.join("config"))
-        .is_ok_and(|config| !config.to_ascii_lowercase().contains("worktreeconfig"))
+    std::fs::read_to_string(path.join("config")).is_ok_and(|config| {
+        let config = config.to_ascii_lowercase();
+        !config.contains("worktreeconfig") && !config.contains("include")
+    })
 }
 
 /// A symlink the sandbox may replace can't be held read-only: whatever is
@@ -1055,8 +1057,9 @@ mod tests {
         assert!(policy.can_write(&git.join("objects/ab/cdef")));
         assert!(policy.can_write(&git.join("index.lock")));
         assert!(!policy.can_write(&git.join("config")));
-        // Missing hooks may not be made.
+        // Missing hooks may not be made, nor a submodule's git folder.
         assert!(!policy.can_write(&git.join("hooks/pre-commit")));
+        assert!(!policy.can_write(&git.join("modules/sub/hooks/pre-commit")));
         // With per-worktree config on, whose files git reads wherever they
         // are made, none of it is written.
         std::fs::write(
@@ -1075,6 +1078,18 @@ mod tests {
         .unwrap();
         assert!(!policy.can_write(&git.join("objects/ab/cdef")));
         assert!(!policy.can_write(&git.join("worktrees/x/config.worktree")));
+        // As with config it includes, which may be anywhere.
+        std::fs::write(git.join("config"), "[include]\n\tpath = extra.conf\n").unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!policy.can_write(&git.join("extra.conf")));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

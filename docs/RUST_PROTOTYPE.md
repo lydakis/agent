@@ -2107,11 +2107,12 @@ is there. The daemon's store and the files beside it stay read-only too. A
 protected folder that is a symlink refuses the call with
 `sandbox_unavailable`, since the link could be swapped from inside. A git
 folder given as a `writable` folder, so a bot may commit, keeps what git
-runs read-only as `.git` does: its `hooks`, `config` and `config.worktree`,
-and its missing `hooks` may not be made. It is known by its name, `.git` or
-`NAME.git`, which the bot can't change, not by what is inside it. One whose
-config is missing or turns on per-worktree config stays read-only as a
-whole, since git reads those files wherever they are made. Network is
+runs read-only as `.git` does: its `hooks`, `config`, `config.worktree` and
+submodules' `modules`, and missing `hooks` or `modules` may not be made. It is
+known by its name, `.git` or `NAME.git`, which the bot can't change, not by
+what is inside it. One whose config is missing, turns on per-worktree config
+or includes other files stays read-only as a whole, since git reads those
+files wherever they are made. Network is
 off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 
