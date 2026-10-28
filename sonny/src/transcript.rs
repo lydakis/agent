@@ -1448,6 +1448,7 @@ fn as_unified(patch: &str, workspace: &str) -> String {
                 path = to["*** Move to: ".len()..].trim().to_owned();
             }
             let now = current(&std::path::Path::new(workspace).join(&path)).unwrap_or_default();
+            let now: Vec<&str> = now.lines().collect();
             out.push_str(&format!("--- {path}\n+++ {path}\n"));
             // Each chunk's lines, then its place: the line where its new
             // side starts now, and that less what earlier chunks added.
@@ -1469,7 +1470,7 @@ fn as_unified(patch: &str, workspace: &str) -> String {
                     chunk.push(line);
                 }
             }
-            let (mut grown, mut from) = (0isize, 0);
+            let (mut grown, mut from, mut budget) = (0isize, 0, PLACING);
             for chunk in chunks.into_iter().filter(|c| !c.is_empty()) {
                 let new: Vec<&str> = chunk
                     .iter()
@@ -1477,7 +1478,7 @@ fn as_unified(patch: &str, workspace: &str) -> String {
                     .map(|l| &l[1..])
                     .collect();
                 let old = chunk.iter().filter(|l| !l.starts_with('+')).count();
-                let start = find_lines(&now, &new, from).unwrap_or(from);
+                let start = find_lines(&now, &new, from, &mut budget).unwrap_or(from);
                 from = start + new.len();
                 let old_start = (start as isize - grown).max(0) as usize;
                 grown += new.len() as isize - old as isize;
@@ -1497,28 +1498,29 @@ fn as_unified(patch: &str, workspace: &str) -> String {
     out
 }
 
-/// The first line, at or after `from`, where `text` holds `wanted` in a
-/// row, by content with ends trimmed. Drawing waits on it, so it gives up
-/// past a bounded number of line comparisons and the caller places the
-/// chunk where it would otherwise be.
-fn find_lines(text: &str, wanted: &[&str], from: usize) -> Option<usize> {
-    const COMPARED: usize = 1 << 20;
-    let lines: Vec<&str> = text.lines().collect();
+/// Line comparisons placing one file's chunks may make. Drawing waits on
+/// them, so past this the rest are placed where they would otherwise be.
+const PLACING: usize = 1 << 20;
+
+/// The first line, at or after `from`, where `lines` holds `wanted` in a
+/// row, by content with ends trimmed. Each comparison comes out of
+/// `budget`, and once it runs out nothing more is found.
+fn find_lines(lines: &[&str], wanted: &[&str], from: usize, budget: &mut usize) -> Option<usize> {
     if wanted.is_empty() || wanted.len() > lines.len() {
         return None;
     }
-    let (last, mut compared) = (wanted.len() - 1, 0);
+    let last = wanted.len() - 1;
     (from..=lines.len() - wanted.len()).find_map(|at| {
-        if compared > COMPARED {
+        if *budget == 0 {
             return Some(None);
         }
-        compared += 1;
+        *budget -= 1;
         // The last line first: a long run rarely ends the same by chance.
         if wanted[last].trim_end() != lines[at + last].trim_end() {
             return None;
         }
         let same = wanted.iter().zip(&lines[at..]).take_while(|(want, have)| {
-            compared += 1;
+            *budget = budget.saturating_sub(1);
             want.trim_end() == have.trim_end()
         });
         (same.count() == wanted.len()).then_some(Some(at))
@@ -1807,16 +1809,33 @@ mod tests {
 
     #[test]
     fn a_long_repeated_context_is_placed_quickly() {
-        let mut text = "x\n".repeat(100_000);
-        text.push_str("y\n");
+        let mut lines = vec!["x"; 100_000];
+        lines.push("y");
         let mut wanted = vec!["x"; 10_000];
         wanted.push("y");
         let started = std::time::Instant::now();
-        let found = find_lines(&text, &wanted, 0);
+        let found = find_lines(&lines, &wanted, 0, &mut { PLACING });
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert!(found.is_none_or(|at| at == 90_000), "{found:?}");
-        assert_eq!(find_lines("a\nb\nc\n", &["b", "c"], 0), Some(1));
-        assert_eq!(find_lines("a\nb\nc\n", &["c", "b"], 0), None);
+        let find = |wanted: &[&str]| find_lines(&["a", "b", "c"], wanted, 0, &mut { PLACING });
+        assert_eq!(find(&["b", "c"]), Some(1));
+        assert_eq!(find(&["c", "b"]), None);
+    }
+
+    #[test]
+    fn many_chunks_against_a_long_file_are_drawn_quickly() {
+        let dir = std::env::temp_dir().join(format!("sonny-chunks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "x\n".repeat(100_000)).unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: f\n{}*** End Patch\n",
+            "@@\n-x\n+x\n".repeat(5_000)
+        );
+        let started = std::time::Instant::now();
+        let unified = as_unified(&patch, dir.to_str().unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(unified.matches("@@ -").count(), 5_000);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
