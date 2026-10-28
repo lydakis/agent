@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn a_subscription_asks_what_it_names() {
         let mut sub = Sub::lead("shop.lead", "shop");
-        assert_eq!(sub.builtins(Kind::Said), ["interrupt"]);
+        assert_eq!(sub.builtins(Kind::Said), ["interrupt", "drifts"]);
         sub.ask = Some(Vec::new());
         assert!(sub.builtins(Kind::Ended).is_empty());
         sub.ask = Some(vec!["interrupt".into()]);

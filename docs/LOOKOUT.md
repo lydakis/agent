@@ -4,8 +4,9 @@
 every message someone else wrote in them and how each turn ended. It is a
 Sonny feature and a client of the daemon like any other: it follows every
 bot and submits one short note to the subscriber as soon as it rests,
-which decides itself what matters. A judge decides only what cannot wait
-for a busy subscriber's turn to end. Neither the daemon nor the `agent`
+which decides itself what matters. A judge decides what cannot wait for a
+busy subscriber's turn to end, and picks out a task drifting from what the
+person means. Neither the daemon nor the `agent`
 CLI knows of it.
 
 The lookout knows no leads. Sonny subscribes each lead to its tasks when it
@@ -43,20 +44,34 @@ tasks made, and every bot named `PROJECT.*`. Two events count:
 | Said | someone other than the lead writes in a task: the person, a program, another task |
 | Ended | a task's turn ends, unless the lead is waiting on it |
 
-Each is task updates (below), told unjudged once the lead rests. While the
-lead is in the middle of a turn, each is also one check, with one
-question, `interrupt`: can it not wait until that turn ends, because it
-changes what the lead or another task is doing right now, or the task is
-blocked on something only the lead or the person can give? The judge
-reads the event's text, the lead's latest message to that task (its
-brief), the other tasks' briefs and latest lines, and the project's memory
-indexes. A yes (0.70 or more) steers the lead at once with
-`--delivery steer`; anything else waits for the lead to rest, as all news
-does. A resting lead is never judged for: it hears everything anyway. A
-judge answers at most two checks at once for one subscriber, so many busy
-tasks never crowd the model pool they work in; up to 16 more wait their
-turn, one still waiting when the lead comes to rest is not asked, and
-past those the rest go unjudged, told once the lead rests.
+Each is task updates (below), told once the lead rests. Each is also one
+check, with up to two questions:
+
+- `interrupt`, only while the lead is in the middle of a turn: can it not
+  wait until that turn ends, because it changes what the lead or another
+  task is doing right now, or the task is blocked on something only the
+  lead or the person can give? A yes (0.70 or more) steers the lead at
+  once with `--delivery steer`.
+- `drifts`, busy or not, of the person's own messages and of turn ends, in
+  a task with a brief: is the task drifting from what the person means,
+  misreading them, swinging between readings as they correct it, going in
+  circles, arguing past what they asked, or doing part of it while
+  presenting it as done? A yes is picked, with what to do, in the note the
+  lead gets once it rests. A lead that hears every message reads a
+  person's correction or the end of a turn they asked for as theirs and
+  lets it pass: in `bench/lookout_turns.py` it caught 10 of 24 drifting
+  tasks on its own (a 3-run mean).
+
+The judge reads the event's text, the lead's latest message to that task
+(its brief) or the person's latest words in it, for `drifts` what passed
+in that task since the lead last wrote there (the person's messages and the
+first line of each reply, the last six), the other tasks' briefs and latest
+lines, and the project's memory indexes. Anything less than a yes is told
+unjudged with the rest. A resting lead's news waits up to 15 seconds for
+checks under way, so a pick and its news usually go in one note. A judge
+answers at most two checks at once for one subscriber, so many busy tasks
+never crowd the model pool they work in; up to 16 more wait their turn,
+and past those the rest go unjudged.
 
 Because the lookout watches the tasks, a lead no longer sets itself
 triggers to check on running work; triggers stay for what the person
@@ -87,9 +102,9 @@ sonny lookout rm deploys
   `--bot GLOB` every bot its name matches, `*` matching any run of
   characters. A subscription needs one of them, and may have several.
 - `--on said,ended` picks the events; both by default.
-- `--ask interrupt` asks the built-in question; with no `--ask`, a
-  subscription asks it, unless it looks for something of its own, when it
-  asks only that.
+- `--ask interrupt`, `--ask drifts` ask those built-in questions; with no
+  `--ask`, a subscription asks both, unless it looks for something of its
+  own, when it asks only that.
 - `--look-for TEXT --then ACTION` adds a question of the subscriber's own,
   asked of every event it watches, busy or not; a yes wakes it, steering
   with `--urgent`.
@@ -159,9 +174,13 @@ A quoted message is the person's own words.
 Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 ```
 
-A note that steers a busy lead lists what was picked first, under "Picked
-by your lookout:", with why (`interrupt 0.90; it cannot wait for your turn
-to end`), and ends "Handle what cannot wait, then carry on with your turn."
+What the judge picked is listed first, under "Picked by your lookout:",
+with why and what to do (`drifts 0.82; settle what the person means and
+steer the task with that reading`). A note that steers a busy lead says
+`interrupt 0.90; it cannot wait for your turn to end` and ends "Handle what
+cannot wait, then carry on with your turn." A turn the person asked for in
+the task is listed apart as theirs only once it completed: one that failed
+or was stopped is listed with the rest.
 
 It quotes only the person's own words and names everything else by handle
 and status, so it reaches the approver as the person's and the lead can act
