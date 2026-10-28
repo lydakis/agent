@@ -83,6 +83,12 @@ impl Places {
     fn taking(&self, name: &str) -> PathBuf {
         taking(&self.asks(name))
     }
+    /// The turn an ask from `fire NAME` sent, for the `fire` waiting on it:
+    /// beside the trigger's files, so a trigger that ends with that send
+    /// does not take it. `fire` removes it, and Sonny's start one left.
+    fn receipt(&self, name: &str, file: &str) -> PathBuf {
+        self.state.join(format!(".fired.{name}.{file}"))
+    }
 }
 
 /// What launchd is asked to do. Tests stand in for it.
@@ -1246,14 +1252,16 @@ pub fn install(
                 Some(_) if replace => {
                     // Another definition under the name: what its fires
                     // did stays on its row, its count of sends starts again,
-                    // and an agent it started is the one it messages.
+                    // and an agent it started is the one it messages, while
+                    // the store it started it in is the one it sends to.
                     let durable = state(places, &there);
                     let mut kept = Kept {
                         sent: 0,
                         ..Kept::of(&durable)
                     };
-                    let same_start = matches!((&there.target, &trigger.target),
-                        (Target::Start { name: a, .. }, Target::Start { name: b, .. }) if a == b);
+                    let same_start = there.store_id == trigger.store_id
+                        && matches!((&there.target, &trigger.target),
+                            (Target::Start { name: a, .. }, Target::Start { name: b, .. }) if a == b);
                     if !same_start {
                         kept.started_id = None;
                     }
@@ -1411,26 +1419,30 @@ fn fired(places: &Places, name: &str, file: &str, wait: Duration) -> Value {
         }
         came
     };
-    loop {
+    let receipt = places.receipt(name, file);
+    let came = loop {
         let row = one(places, name).unwrap_or(Value::Null);
         if row["last"]["ask"] == file {
-            return came(&row["last"]);
+            break came(&row["last"]);
         }
         if row["checked"]["ask"] == file && row["checked"]["gate"] == "no" {
-            return came(&json!({"outcome": "declined", "detail": row["checked"]["detail"]}));
+            break came(&json!({"outcome": "declined", "detail": row["checked"]["detail"]}));
         }
-        // Sent, and its fire still waits for the answer `--reply-to` passes on.
-        let sent = std::fs::read(places.taking(name).join(file))
+        // Sent: its fire may still wait for the answer `--reply-to` passes
+        // on, or have ended the trigger, row and all.
+        let sent = std::fs::read(&receipt)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         if let Some(sent) = sent.filter(|s| s["outcome"] == "sent") {
-            return came(&sent);
+            break came(&sent);
         }
         if std::time::Instant::now() > until {
-            return json!({"name": name, "fired": true, "pending": true});
+            break json!({"name": name, "fired": true, "pending": true});
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
+    let _ = std::fs::remove_file(&receipt);
+    came
 }
 
 /// What an ask asks of the fire launchd runs for it.
@@ -1494,6 +1506,7 @@ fn ask(places: &Places, name: &str, kind: Ask) -> Result<String, String> {
 struct Asked {
     kind: Ask,
     path: PathBuf,
+    receipt: PathBuf,
 }
 
 impl Asked {
@@ -1538,6 +1551,7 @@ fn take_ask(places: &Places, trigger: &Trigger) -> Result<Option<Asked>, String>
     if let Some((file, path)) = oldest(&taking)? {
         return Ok(Some(Asked {
             kind: Ask::of(&file),
+            receipt: places.receipt(name, &file),
             path,
         }));
     }
@@ -1550,7 +1564,11 @@ fn take_ask(places: &Places, trigger: &Trigger) -> Result<Option<Asked>, String>
             .and_then(|()| std::fs::File::open(&asks)?.sync_all())
             .and_then(|()| std::fs::File::open(&taking)?.sync_all())
             .map_err(|e| format!("asks_stuck: {}: {e}", path.display()))?;
-        return Ok(Some(Asked { kind, path: to }));
+        return Ok(Some(Asked {
+            kind,
+            receipt: places.receipt(name, &file),
+            path: to,
+        }));
     }
     Ok(None)
 }
@@ -2298,6 +2316,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
     let watching = std::fs::read_to_string(places.plist(&trigger.name))
         .ok()
         .and_then(|text| watched(&text));
+    let keeps_seen = asked.replace && keeps_seen(places, &trigger);
     let app = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
     let environment = environment();
     match install(
@@ -2322,7 +2341,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         None => {
             // A trigger without its baseline would take the commit there for
             // news, so it goes.
-            if let Some(seen) = seen
+            if let Some(seen) = seen.filter(|_| !keeps_seen)
                 && let Err(error) = baseline(places, &trigger, &seen, !asked.replace)
             {
                 let _ = remove(places, &trigger.name, &launchctl);
@@ -2331,6 +2350,18 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             Ok(trigger.json(&state(places, &trigger)))
         }
     }
+}
+
+/// Whether the trigger `replace` puts in a name's place keeps where the one
+/// there last looked: one on the same repository, to which a commit since
+/// is still news.
+fn keeps_seen(places: &Places, trigger: &Trigger) -> bool {
+    std::fs::read_to_string(places.plist(&trigger.name))
+        .ok()
+        .and_then(|text| read_plist(&text))
+        .is_some_and(|(there, _)| {
+            there.commit == trigger.commit && !state(places, &there)["seen_at"].is_null()
+        })
 }
 
 /// What a fire did, kept for `ls` to show and the next fire to read.
@@ -2552,10 +2583,11 @@ async fn deliver(
             if started {
                 sent["started"] = json!(true);
             }
-            // A `fire NAME` waiting for this one finds its turn in its ask,
-            // also while an answer for `--reply-to` takes its time.
-            if let Some(ask) = ask.filter(|a| a.kind.sends()) {
-                let _ = std::fs::write(&ask.path, sent.to_string());
+            // A `fire NAME` waiting for this one finds its turn in its
+            // receipt, also while an answer for `--reply-to` takes its time
+            // and after a trigger this send ends has gone.
+            if let Some(ask) = ask.filter(|a| a.kind == Ask::Fire) {
+                let _ = std::fs::write(&ask.receipt, sent.to_string());
             }
             sent
         }
@@ -3820,16 +3852,22 @@ mod tests {
             wait(&first),
             json!({"name": s.name, "fired": true, "pending": true})
         );
-        // Sent, its answer still on its way to `--reply-to`: the ask says.
-        let taking = w.places.taking(&s.name);
-        std::fs::create_dir_all(&taking).unwrap();
+        // Sent, its answer still on its way to `--reply-to`, or the trigger
+        // it ended gone: its receipt says, once.
         let sent = json!({"outcome": "sent", "turn": 7, "handle": "turn:p.fix-login/7"});
-        std::fs::write(taking.join(&first), sent.to_string()).unwrap();
+        let receipt = w.places.receipt(&s.name, &first);
+        std::fs::write(&receipt, sent.to_string()).unwrap();
         assert_eq!(
             wait(&first),
             json!({"name": s.name, "fired": true, "outcome": "sent", "turn": 7,
                 "handle": "turn:p.fix-login/7"})
         );
+        assert!(!receipt.exists());
+        let ending = fire_now(&w.places, &s.name).unwrap();
+        std::fs::write(w.places.receipt(&s.name, &ending), sent.to_string()).unwrap();
+        w.remove(&s.name).unwrap();
+        assert_eq!(wait(&ending)["handle"], "turn:p.fix-login/7");
+        w.install(&s).unwrap();
         // Settled: the row says, for this ask and no other.
         let second = fire_now(&w.places, &s.name).unwrap();
         w.settle(
@@ -3922,6 +3960,7 @@ mod tests {
                 .unwrap_err()
                 .starts_with("trigger_exists")
         );
+        assert!(keeps_seen(&w.places, &other), "a commit since is news");
         assert_eq!(add(&other, true).unwrap(), None);
         assert!(w.plist(&s.name).contains("something else"));
         let row = &w.rows()[0];
@@ -3936,9 +3975,47 @@ mod tests {
             commit: Some("/elsewhere".into()),
             ..other.clone()
         };
+        assert!(!keeps_seen(&w.places, &moved));
         add(&moved, true).unwrap();
         assert_eq!(Kept::of(&state(&w.places, &moved)).seen, Seen::default());
         assert_eq!(w.rows()[0]["last"]["outcome"], "sent");
+        // The agent it started is its own only on the store it started it in.
+        let starts = Trigger {
+            generation: "test-4".into(),
+            target: Target::Start {
+                name: "p.review".into(),
+                model: "m".into(),
+                effort: None,
+                by: None,
+            },
+            ..moved.clone()
+        };
+        add(&starts, true).unwrap();
+        let started = Kept {
+            started_id: Some(9),
+            ..Kept::of(&state(&w.places, &starts))
+        };
+        settle(
+            &w.places,
+            &starts,
+            &json!({"outcome": "sent", "turn": 1}),
+            &started,
+            &|x| w.fake.call(x),
+        );
+        let reworded = Trigger {
+            generation: "test-5".into(),
+            message: "reworded".into(),
+            ..starts.clone()
+        };
+        add(&reworded, true).unwrap();
+        assert_eq!(Kept::of(&state(&w.places, &reworded)).started_id, Some(9));
+        let elsewhere = Trigger {
+            generation: "test-6".into(),
+            store_id: "another-store".into(),
+            ..reworded.clone()
+        };
+        add(&elsewhere, true).unwrap();
+        assert_eq!(Kept::of(&state(&w.places, &elsewhere)).started_id, None);
     }
 
     #[test]
