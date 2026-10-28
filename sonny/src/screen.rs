@@ -322,7 +322,10 @@ impl Screen {
         drawn: Rect,
         file: impl Fn(&str) -> Option<String>,
     ) -> Vec<(u16, u16, u16, String)> {
-        let cut = |row: usize| self.shown[row].line.alignment == Some(crate::transcript::CUT);
+        if drawn.height == 0 {
+            return Vec::new();
+        }
+        let cut = |row: usize| self.cut(row);
         let (top, bottom) = (self.top, self.top + drawn.height as usize);
         let mut from = top;
         while from > 0 && top - from < LINK_ROWS && cut(from) {
@@ -828,6 +831,19 @@ mod tests {
             drag(&mut screen, (0, 0), (19, 4)),
             Some(Action::Copy("row 13\nrow 14\nrow 15\nrow 16".into()))
         );
+    }
+
+    #[test]
+    fn no_room_for_rows_draws_none() {
+        let url = "https://example.com/a/very/long/path/to/a/page";
+        let lines = crate::transcript::wrap(Line::from(url), 20, Span::raw(""), Span::raw(""));
+        let (mut screen, _) = screen(lines, 20, 0);
+        screen.scroll(1);
+        let area = Rect::new(0, 0, 20, 0);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert!(screen.links.is_empty());
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), 2, 0);
+        assert_eq!(screen.mouse(click), None);
     }
 
     #[test]
