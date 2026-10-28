@@ -436,7 +436,10 @@ impl Pace {
                                 for ((dim, cost), held) in
                                     state.tokens.iter_mut().zip(costs).zip(booking.costs)
                                 {
-                                    dim.bucket.take(cost as f64 - held as f64);
+                                    match cost.checked_sub(held) {
+                                        Some(grew) => dim.bucket.take(grew as f64),
+                                        None => dim.bucket.give((held - cost) as f64),
+                                    }
                                 }
                                 Duration::ZERO
                             }
