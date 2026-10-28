@@ -62,8 +62,25 @@ async fn shell_timeout_and_output_overflow_are_bounded() {
     assert_eq!(output["timed_out"], true);
     assert_eq!(output["success"], false);
     assert!(output["exit_code"].is_null());
-    let overflow = run("yes x", 1000).await.unwrap().unwrap_err();
-    assert_eq!(overflow.code, "shell_output_limit");
+    // Past 1 MiB a stream keeps both ends, and the command runs to its end.
+    let overflow = run(
+        "head -c 3000000 /dev/zero | tr '\\0' x; echo; echo done",
+        1500,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let output: Value = serde_json::from_str(&overflow.output).unwrap();
+    assert_eq!(output["exit_code"], 0);
+    assert_eq!(output["success"], true);
+    let shown = output["stdout"].as_str().unwrap();
+    assert!(shown.starts_with("xxxx"));
+    assert!(shown.ends_with("x\ndone\n"));
+    assert!(shown.contains("more past 1 MiB were not kept"));
+    let (stream, kept) = &overflow.artifacts[0];
+    assert_eq!(*stream, "stdout");
+    assert!(kept.len() <= agent_runtime::tools::ARTIFACT_BYTES);
+    assert!(String::from_utf8_lossy(kept).contains("bytes dropped: past 1 MiB"));
 }
 
 #[tokio::test]

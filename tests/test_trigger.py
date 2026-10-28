@@ -239,6 +239,55 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(first['generation'], 'g1')
         self.assertFalse(last.exists())
 
+    def test_an_ask_sends_the_request_it_sent_before_also_for_the_trigger_that_replaced_it(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        lead = self.bot_id('p.lead')
+        taking = self.home / '.agent/triggers/p.task.taking'
+        taking.mkdir(parents=True)
+        (taking / '100.1.1').write_text('')
+        sent = self.fire('p.task', 'first', generation='g1', extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
+        self.assertEqual((sent['last']['outcome'], sent['last']['reply']['outcome']), ('sent', 'sent'), sent)
+        self.settle('p.lead')
+        turn = self.turns('p.task')[-1]
+        answers = len(self.turns('p.lead'))
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            prompt = connection.request('prompts', bot='p.task', turn=turn['turn'], bytes=65536)['result']['prompts'][0]['text']
+        finally:
+            connection.close()
+        # The fire was cut short once its turn and its answer went, and
+        # another definition took the name: the ask it left sends what went,
+        # and its answer where it went, under the ids they went under, which
+        # the daemon takes once; not the new message under the new generation.
+        submit = {'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'],
+                  'prompt': prompt, 'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}
+        kept = {'store_id': self.store_identity(), 'generation': 'g1', 'reply_to': ['p.lead', lead], 'submit': submit}
+        (taking / '100.1.1').write_text(json.dumps(kept))
+        # Cut short before it settled: the row has no result of it.
+        row = self.home / '.agent/triggers/p.task.json'
+        row.write_text(json.dumps({**json.loads(row.read_text()), 'last': None, 'sent': 0}))
+        # Its `--if` said go once already: one that would say no now is not asked.
+        again = self.fire('p.task', 'second', generation='g2', extra=['--if', 'exit 1', '--dir', str(self.path)])
+        self.assertEqual((again['last']['outcome'], again['last']['turn']), ('sent', turn['turn']), again)
+        self.assertEqual(again['last']['reply']['outcome'], 'sent', again)
+        self.assertEqual(len(self.turns('p.task')), 2)
+        self.assertEqual(len(self.turns('p.lead')), answers)
+        self.assertFalse((taking / '100.1.1').exists())
+        # Cut short once it had settled: its send is not counted again.
+        (taking / '100.1.1').write_text(json.dumps(kept))
+        settled = self.fire('p.task', 'second', generation='g2')
+        self.assertEqual((settled['sent'], settled['last']['turn']), (1, turn['turn']), settled)
+        self.assertFalse((taking / '100.1.1').exists())
+        # What went to another store is that store's: this one sends its own.
+        (taking / '100.1.2').write_text(json.dumps({**kept, 'store_id': 'another-store'}))
+        own = self.fire('p.task', 'third', generation='g3')
+        self.assertEqual(own['last']['outcome'], 'sent', own)
+        self.settle('p.task')
+        self.assertEqual(len(self.turns('p.task')), 3)
+        self.assertRegex(self.turns('p.task')[-1]['prompt_preview'], LINE.format('p.task', 'fired') + 'third$')
+        self.assertEqual(len(self.turns('p.lead')), answers)
+
     def test_a_start_trigger_makes_its_agent_once_and_messages_it_after(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         lead = self.bot_id('p.lead')
@@ -345,10 +394,13 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        self.assertIsNone(self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(self.path)]))
+        # Its row says when it looked and why it said no, with no result yet.
+        no = self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(self.path)])
+        self.assertEqual((no['last'], no['checked']['gate'], no['checked']['detail']),
+                         (None, 'no', '--if: exit status: 1'), no)
         self.assertEqual(len(self.turns('p.task')), 1)
         yes = self.fire('p.task', 'x', extra=['--if', 'test -d .', '--dir', str(self.path)])
-        self.assertEqual(yes['last']['outcome'], 'sent', yes)
+        self.assertEqual((yes['last']['outcome'], yes['checked']['gate']), ('sent', 'go'), yes)
 
     def test_a_commit_trigger_sends_only_for_a_new_commit(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -457,7 +509,7 @@ class TriggerFireTests(ModelFixture):
 
         def trigger(*args, ok=True):
             result = subprocess.run([str(SONNY), 'trigger', *args], env=env, capture_output=True, text=True,
-                                    timeout=60, cwd=self.path)
+                                    timeout=120, cwd=self.path)
             if ok:
                 self.assertEqual(result.returncode, 0, result.stderr)
             return result
@@ -487,9 +539,11 @@ class TriggerFireTests(ModelFixture):
         watched.write_text('synthetic\n')
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 3, 60), 'launchd did not fire on the write')
         self.settle('p.task')
-        # Fire by name: launchd runs it now.
-        self.assertEqual(json.loads(trigger('fire', name).stdout), {'name': name, 'fired': True})
+        # Fire by name: launchd runs it now, and `fire` says the turn it sent.
+        fired = json.loads(trigger('fire', name).stdout)
+        self.assertEqual((fired['name'], fired['fired'], fired['outcome']), (name, True, 'sent'), fired)
         self.assertTrue(until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
+        self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
         self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[trigger {name} · '))
         # A plist launchd no longer has, as after a failed reload: rm still removes it.
         subprocess.run(['/bin/launchctl', 'bootout', target], check=True, capture_output=True)
