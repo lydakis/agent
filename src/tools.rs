@@ -1205,6 +1205,7 @@ impl Registry {
             Prepared::Write { path, content } => {
                 let target = resolve(workspace, &path);
                 writable(sandbox.clone(), &target, &path).await?;
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = self.helper_slot(&sandbox).await?;
                 files::write(&target, content.as_bytes(), sandbox).await?;
                 Ok(Outcome::text(format!(
@@ -1246,6 +1247,7 @@ impl Registry {
                     text.replacen(&old, &new, 1)
                 };
                 debug_assert_eq!(updated.len(), expanded);
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let _slot = self.helper_slot(&sandbox).await?;
                 files::write(&target, updated.as_bytes(), sandbox).await?;
                 Ok(Outcome::text(format!(
@@ -1339,6 +1341,9 @@ impl Registry {
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
+            // Held until the command and the sandbox around it are gone,
+            // and taken before the slot, so no slot waits on it.
+            let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
             let _slot = registry
                 .slots
                 .acquire()
@@ -1385,6 +1390,7 @@ impl Registry {
                 };
                 drop(queued);
                 let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                 let (stdout, stderr, exit, elapsed) = shell(
                     &command,
                     &workspace,
@@ -1779,10 +1785,7 @@ async fn detach(
         })?)
     };
     // What the sandbox holds in place stays held while the command runs.
-    let held = match sandbox.as_deref() {
-        Some(policy) => Some(crate::sandbox::hold(policy).await),
-        None => None,
-    };
+    let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     tokio::spawn(async move {
@@ -1833,11 +1836,6 @@ async fn shell(
             }
         }
     }
-    // Held until the command and the sandbox around it are gone.
-    let _held = match sandbox {
-        Some(policy) => Some(crate::sandbox::hold(policy).await),
-        None => None,
-    };
     let child = sh(command, workspace, registry, environment, sandbox, false)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

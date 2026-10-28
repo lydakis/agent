@@ -741,9 +741,8 @@ fn gates_are_capped_before_a_bot_is_written() {
     gated_bot(&mut db, "g8", "t8", None, None).unwrap();
 }
 
-/// A sandboxed bot can't make its way out of its sandbox: a bot it makes
-/// takes its sandbox unless it names a stricter one, and writes only
-/// within the creator's own roots.
+/// A bot that a sandboxed bot makes takes its sandbox unless it names a
+/// stricter one, as Codex's subagents inherit their parent's.
 #[test]
 fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     use agent_runtime::sandbox::Mode;
@@ -781,10 +780,6 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
     let unconfined = made(&mut db, "Bob", Settings::default());
     assert_eq!(unconfined.sandbox, Some(Mode::WorkspaceWrite));
     assert_eq!(unconfined.writable, ["/shared"]);
-    assert_eq!(
-        unconfined.within,
-        Some(vec!["/work".into(), "/shared".into()])
-    );
     let full = made(
         &mut db,
         "Cid",
@@ -799,15 +794,13 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
         "Dee",
         Settings {
             sandbox: Some(Mode::WorkspaceWrite),
-            writable: vec!["/shared/part".into()],
+            writable: vec!["/other".into()],
             network: true,
-            within: Some(vec!["/shared".into(), "/other".into()]),
             ..Settings::default()
         },
     );
     assert!(!networked.network);
-    assert_eq!(networked.writable, ["/shared/part"]);
-    assert_eq!(networked.within, Some(vec!["/shared".into()]));
+    assert_eq!(networked.writable, ["/other"]);
     let read_only = made(
         &mut db,
         "Eve",
@@ -817,23 +810,12 @@ fn a_bot_made_by_a_sandboxed_bot_is_no_less_sandboxed() {
         },
     );
     assert_eq!(read_only.sandbox, Some(Mode::ReadOnly));
-    assert_eq!(read_only.within, None);
-    // A bot that bot makes is held within the same roots, or fewer.
-    let bob = db.inspect("Bob").unwrap();
-    let grandchild = Settings::default().under(&bob.settings, Some("/work/sub"));
-    assert_eq!(
-        grandchild.within,
-        Some(vec!["/work/sub".into(), "/shared".into()])
-    );
-    let outside = Settings::default().under(&bob.settings, Some("/elsewhere"));
-    assert_eq!(outside.within, Some(vec!["/shared".into()]));
-    // A bot in a folder its creator keeps read-only passes none of it on.
-    let git = Settings::default().under(&bob.settings, Some("/work/.git"));
-    let below = Settings::default().under(&git, Some("/work/.git"));
-    assert_eq!(below.within, Some(vec!["/shared".into()]));
+    assert!(read_only.writable.is_empty());
     // An unconfined creator imposes nothing.
-    let free = Settings::default().under(&Settings::default(), Some("/work"));
-    assert_eq!(free, Settings::default());
+    assert_eq!(
+        Settings::default().under(&Settings::default()),
+        Settings::default()
+    );
 }
 
 #[test]

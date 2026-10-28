@@ -64,7 +64,7 @@ pub(super) async fn read_head(path: &Path, count: u64) -> Result<Vec<u8>> {
 /// sandbox, in the agent binary, as Codex runs `apply_patch`: the kernel
 /// decides what it reaches, so a link swapped in after the path was
 /// checked can't carry it out. An unconfined one makes the folders above
-/// `path` itself first.
+/// `path` itself first. The caller holds the sandbox's placeholders.
 pub(super) async fn write(path: &Path, content: &[u8], sandbox: Option<Arc<Policy>>) -> Result<()> {
     if let Some(policy) = sandbox {
         return confined(&policy, path, content).await;
@@ -88,7 +88,6 @@ async fn confined(policy: &Policy, path: &Path, content: &[u8]) -> Result<()> {
     let Some(target) = path.to_str() else {
         return fail("path_not_utf8");
     };
-    let _held = crate::sandbox::hold(policy).await;
     let mut command = crate::sandbox::command(policy, helper, &[WRITE, target], false)?;
     command
         .env_clear()

@@ -223,12 +223,6 @@ pub struct Settings {
     /// Whether a workspace-write sandbox reaches the network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
-    /// Folders a workspace-write sandbox's roots must lie in, by their real
-    /// paths: a root outside them all is not writable. A bot made by a
-    /// sandboxed bot gets its creator's roots here, so it writes no more
-    /// than its creator; none sets no bound.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub within: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -238,8 +232,8 @@ pub enum CacheTtl {
     Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
-/// The most a bot's `writable` or `within` folders take as JSON, by their
-/// real paths, so a reply that repeats them has a bound.
+/// The most a bot's `writable` folders take as JSON, by their real paths,
+/// so a reply that repeats them has a bound.
 pub const FOLDERS_JSON: usize = 32 << 10;
 const MIN_COMPACT_TOKENS: u64 = 1024;
 /// Where a model with a `window`-token context compacts unless the bot
@@ -289,13 +283,12 @@ impl Settings {
             None => Some(crate::provider::KEEP_WARM),
         }
     }
-    /// These settings for a bot that a bot with `creator`'s settings and
-    /// folder makes: no weaker a sandbox than its creator's. A sandboxed
-    /// creator's child takes the creator's sandbox unless it names a
-    /// stricter one, reaches the network only if both do, and writes only
-    /// within the creator's own roots, as Codex's subagents inherit their
-    /// parent's sandbox.
-    pub fn under(mut self, creator: &Settings, folder: Option<&str>) -> Settings {
+    /// These settings for a bot that a bot with `creator`'s settings
+    /// makes: no weaker a sandbox than its creator's, as Codex's subagents
+    /// inherit their parent's. A sandboxed creator's child takes the
+    /// creator's sandbox and writable folders unless it names a stricter
+    /// sandbox, and reaches the network only if both do.
+    pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         let sandboxed = |settings: &Settings| {
             matches!(
@@ -314,56 +307,8 @@ impl Settings {
         if self.sandbox != Some(Mode::WorkspaceWrite) {
             self.writable.clear();
             self.network = false;
-            self.within = None;
-            return self;
         }
         self.network &= creator.network;
-        let inside = |path: &str, folders: &[String]| {
-            folders
-                .iter()
-                .any(|folder| std::path::Path::new(path).starts_with(folder))
-        };
-        // A root the creator's own `within` keeps read-only is none of its
-        // roots: one inside a protected folder at the top of the deepest
-        // folder that holds it.
-        let allowed = |root: &String| {
-            let Some(within) = &creator.within else {
-                return true;
-            };
-            let root = std::path::Path::new(root);
-            within
-                .iter()
-                .map(std::path::Path::new)
-                .filter(|ceiling| root.starts_with(ceiling))
-                .max_by_key(|ceiling| ceiling.components().count())
-                .is_some_and(|ceiling| {
-                    let first = root
-                        .strip_prefix(ceiling)
-                        .ok()
-                        .and_then(|rest| rest.iter().next());
-                    !first.is_some_and(crate::sandbox::protected)
-                })
-        };
-        let roots: Vec<String> = folder
-            .into_iter()
-            .map(str::to_owned)
-            .chain(creator.writable.iter().cloned())
-            .filter(allowed)
-            .collect();
-        self.within = Some(match self.within.take() {
-            None => roots,
-            Some(own) => {
-                let mut both: Vec<String> = own
-                    .iter()
-                    .filter(|path| inside(path, &roots))
-                    .chain(roots.iter().filter(|root| inside(root, &own)))
-                    .cloned()
-                    .collect();
-                both.sort();
-                both.dedup();
-                both
-            }
-        });
         self
     }
     pub fn cache_hour(&self) -> bool {
@@ -413,27 +358,17 @@ impl Settings {
         if !confined && (!self.writable.is_empty() || self.network) {
             return refuse("writable and network go with sandbox workspace-write");
         }
-        if !confined && self.within.is_some() {
-            return refuse("within goes with sandbox workspace-write");
+        if self.writable.len() > 64
+            || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
+        {
+            return refuse("writable names at most 64 folders, 32 KiB in all");
         }
-        for (name, paths) in [
-            ("writable", Some(&self.writable)),
-            ("within", self.within.as_ref()),
-        ] {
-            let Some(paths) = paths else {
-                continue;
-            };
-            if paths.len() > 64
-                || crate::output::encoded_len(paths).unwrap_or(usize::MAX) > FOLDERS_JSON
-            {
-                return refuse(&format!("{name} names at most 64 folders, 32 KiB in all"));
-            }
-            if paths
-                .iter()
-                .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
-            {
-                return refuse(&format!("{name} folders are absolute paths"));
-            }
+        if self
+            .writable
+            .iter()
+            .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("writable folders are absolute paths");
         }
         Ok(())
     }
@@ -2168,25 +2103,18 @@ impl Database {
             None => Vec::new(),
         })
     }
-    /// The settings and folder of the bot a client creates for, whose
-    /// sandbox the new bot may not weaken.
-    fn creator_settings(
-        conn: &Connection,
-        creator: Option<i64>,
-    ) -> Result<Option<(Settings, Option<String>)>> {
+    /// The settings of the bot a client creates for, whose sandbox the new
+    /// bot may not weaken.
+    fn creator_settings(conn: &Connection, creator: Option<i64>) -> Result<Option<Settings>> {
         let Some(id) = creator else {
             return Ok(None);
         };
-        let (settings, workspace): (Option<String>, Option<String>) = conn.query_row(
-            "SELECT settings,workspace FROM bots WHERE id=?",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let settings = match settings {
+        let settings: Option<String> =
+            conn.query_row("SELECT settings FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        Ok(Some(match settings {
             Some(text) => serde_json::from_str(&text)?,
             None => Settings::default(),
-        };
-        Ok(Some((settings, workspace)))
+        }))
     }
     /// The tools the creating bot's client declared, which a bot it
     /// creates takes unless its own client declares others: all but those
@@ -2502,7 +2430,7 @@ impl Database {
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(inherited.iter().chain(binding.gate), &tools))?;
         let settings = match Self::creator_settings(&tx, created_by_id)? {
-            Some((creator, folder)) => binding.settings.clone().under(&creator, folder.as_deref()),
+            Some(creator) => binding.settings.clone().under(&creator),
             None => binding.settings.clone(),
         };
         tx.execute(
@@ -7393,7 +7321,7 @@ impl Database {
         ))?;
         // And the stricter of its source's sandbox and its creator's.
         let settings = match Self::creator_settings(&tx, created_by_id)? {
-            Some((creator, folder)) => parent.settings.clone().under(&creator, folder.as_deref()),
+            Some(creator) => parent.settings.clone().under(&creator),
             None => parent.settings.clone(),
         };
         tx.execute(

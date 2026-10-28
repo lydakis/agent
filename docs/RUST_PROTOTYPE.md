@@ -407,7 +407,6 @@ keep-warm when it sets any of them.
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
-| `within` | Absolute folders a `workspace-write` bot's writable folders must lie in, by their real paths; one outside them all is not writable. Set from the creator for a bot a sandboxed bot makes (see [Sandbox](#sandbox)). Limits as `writable`. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -2103,8 +2102,10 @@ runs hooks and config from there outside the sandbox, and agents trust what
 is there. The daemon's store and the files beside it stay read-only too. A
 protected folder that is a symlink refuses the call with
 `sandbox_unavailable`, since the link could be swapped from inside. Network is
-off unless `network` is set; the daemon's socket stays reachable, so a
-sandboxed bot can still delegate. `danger-full-access`, or no `sandbox`, runs
+off unless `network` is set. The daemon's socket is out of reach either way,
+as Codex keeps its own from a sandboxed command: nothing confined may drive
+the daemon, so a sandboxed bot delegates through tools its client declares,
+not through `agent` in its shell. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 
 Creating a sandboxed bot checks that sandboxes run here and refuses with
@@ -2124,7 +2125,9 @@ refused with `write_denied`; the write itself then runs inside the sandbox,
 as Codex runs `apply_patch`, in the agent binary started as
 `agent --agent-run-as-write PATH` with the content on stdin, so a link
 swapped in after the check can't carry it out. Being a process, it takes a
-slot of the daemon's process budget as a command does. To leave the sandbox, a shell call sets
+slot of the daemon's process budget as a command does.
+
+To leave the sandbox, a shell call sets
 `sandbox_permissions: "require_escalated"` with a `justification`, which a
 sandboxed bot's `shell` schema shows with Codex's descriptions; a `write` or
 `edit` leaves it by naming a path outside its writable folders. Only such an
@@ -2138,15 +2141,10 @@ a policy that never asks, a command asking to escalate is refused with
 from its arguments and the folders' names alone, so the round that announces
 it and the run that starts it agree.
 
-A bot can't make its way out of its sandbox. A bot that a sandboxed bot
-makes (its `created_by`), or forks, takes the creator's sandbox unless it
-names a stricter one, reaches the network only if both do, and writes only
-within the creator's own roots: its `within` is the creator's folder and
-`writable` folders, as Codex's subagents inherit their parent's sandbox.
-What the creator's roots keep read-only stays so: a root inside one of
-those is none, and a root that holds one keeps it read-only.
-`danger-full-access` or no `sandbox` there gives the creator's sandbox,
-`writable` and `network`.
+A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
+creator's sandbox and `writable` folders unless it names a stricter sandbox,
+and reaches the network only if both do, as Codex's subagents inherit their
+parent's sandbox.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds

@@ -136,20 +136,14 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace and the writable and within folders, canonical,
-            // which the reply's settings repeat; a bot's creator's sandbox
-            // can add its own folders and its roots to them.
+            // The workspace and the writable folders, canonical, which the
+            // reply's settings repeat; a bot a sandboxed bot makes can take
+            // its creator's.
             usize::from(workspace.is_some()) * PATH_JSON
-                + [
-                    &settings.writable,
-                    settings.within.as_ref().unwrap_or(&Vec::new()),
-                ]
-                .iter()
-                .map(|paths| (paths.len() * PATH_JSON).min(FOLDERS_JSON))
-                .sum::<usize>()
-                + created_by
-                    .as_ref()
-                    .map_or(0, |_| 2 * FOLDERS_JSON + PATH_JSON),
+                + match created_by {
+                    Some(_) => FOLDERS_JSON,
+                    None => (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON),
+                },
             // Both the bot and its event carry its gates, most of them
             // inherited from its creator, so the command does not show
             // them. Each gate keeps only the bot's tools, which it lists.
@@ -801,18 +795,16 @@ fn confine(settings: &mut Settings) -> Result<()> {
     ) {
         agent_runtime::sandbox::available()?;
     }
-    for paths in std::iter::once(&mut settings.writable).chain(&mut settings.within) {
-        for path in paths.iter_mut() {
-            let real = std::fs::canonicalize(&*path)
-                .map_err(|_| Error::with("path_not_found", path.clone()))?;
-            *path = real
-                .to_str()
-                .ok_or(Error::with("path_not_utf8", path.clone()))?
-                .to_owned();
-        }
-        paths.sort();
-        paths.dedup();
+    for path in &mut settings.writable {
+        let real = std::fs::canonicalize(&*path)
+            .map_err(|_| Error::with("path_not_found", path.clone()))?;
+        *path = real
+            .to_str()
+            .ok_or(Error::with("path_not_utf8", path.clone()))?
+            .to_owned();
     }
+    settings.writable.sort();
+    settings.writable.dedup();
     Ok(())
 }
 /// A field given as `null` deserializes to `Some(None)`, apart from one

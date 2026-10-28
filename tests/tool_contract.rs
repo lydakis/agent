@@ -549,7 +549,6 @@ async fn a_sandboxed_command_writes_only_its_roots() {
             Some(Mode::WorkspaceWrite),
             Some(&dir),
             &writable,
-            None,
             false,
             &daemon,
         )
@@ -655,68 +654,58 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// A root outside every folder in `within` is not one.
-#[test]
-fn a_root_outside_within_is_not_writable() {
+/// The daemon's socket is out of reach from inside a sandbox, network on
+/// or off, as Codex keeps its own.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
     use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    if !sandboxes() {
+        return;
+    }
     let base = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR"))
         .unwrap()
-        .join(format!("agent-within-{}", std::process::id()));
-    let (mine, other) = (base.join("mine"), base.join("other"));
-    for folder in [&mine, &other] {
-        std::fs::create_dir_all(folder).unwrap();
-    }
-    let named = [mine.to_str().unwrap().to_owned()];
-    let policy = |within: &[String]| {
-        Policy::new(
-            Some(Mode::WorkspaceWrite),
-            Some(&other),
-            &named,
-            Some(within),
-            false,
-            &Daemon::default(),
-        )
-        .unwrap()
-        .unwrap()
+        .join(format!("agent-socket-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let socket = base.join("agent.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let tools = Registry::new("shell").unwrap();
+    let connect = format!(
+        "python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
+        socket.display()
+    );
+    let run = |sandbox: Option<Policy>| {
+        let tools = tools.clone();
+        let (base, connect) = (base.clone(), connect.clone());
+        async move {
+            let prepared = tools
+                .prepare("shell", &json!({"command": connect}).to_string())
+                .unwrap();
+            let output = tools
+                .execute(prepared, &base, &[], sandbox.map(std::sync::Arc::new))
+                .await
+                .unwrap()
+                .output;
+            serde_json::from_str::<Value>(&output).unwrap()["exit_code"].clone()
+        }
     };
-    let held = policy(&named);
-    assert!(held.can_write(&mine.join("a")));
-    assert!(!held.can_write(&other.join("a")));
-    let none = policy(&[]);
-    assert!(!none.can_write(&mine.join("a")));
-    assert!(none.can_write(std::path::Path::new("/tmp/a")));
-    // What `within` keeps read-only stays so for a root in it: a root that
-    // is one of those is none, and a root holding a worktree's git folder
-    // keeps it.
-    let checkout = base.join("checkout");
-    let gitdir = checkout.join("bare/worktrees/x");
-    std::fs::create_dir_all(&gitdir).unwrap();
-    std::fs::create_dir_all(mine.join(".git")).unwrap();
-    std::fs::write(
-        checkout.join(".git"),
-        format!("gitdir: {}\n", gitdir.display()),
-    )
-    .unwrap();
-    let ceilings = [
-        mine.to_str().unwrap().to_owned(),
-        checkout.to_str().unwrap().to_owned(),
-    ];
-    let inside = |workspace: &std::path::Path| {
-        Policy::new(
+    assert_eq!(run(None).await, 0);
+    for network in [false, true] {
+        let daemon = Daemon {
+            socket: Some(socket.clone()),
+            ..Daemon::default()
+        };
+        let policy = Policy::new(
             Some(Mode::WorkspaceWrite),
-            Some(workspace),
+            Some(&base),
             &[],
-            Some(&ceilings),
-            false,
-            &Daemon::default(),
+            network,
+            &daemon,
         )
         .unwrap()
-        .unwrap()
-    };
-    assert!(!inside(&mine.join(".git")).can_write(&mine.join(".git/config")));
-    let bare = inside(&checkout.join("bare"));
-    assert!(bare.can_write(&checkout.join("bare/objects")));
-    assert!(!bare.can_write(&gitdir.join("HEAD")));
+        .unwrap();
+        assert_ne!(run(Some(policy)).await, 0, "network {network}");
+    }
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -733,7 +722,6 @@ async fn a_read_only_sandbox_writes_nothing() {
         Some(Mode::ReadOnly),
         Some(&dir),
         &[],
-        None,
         true,
         &Daemon::default(),
     )

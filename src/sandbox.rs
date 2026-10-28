@@ -36,12 +36,6 @@ const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 /// the project's own settings.
 const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
 
-/// Whether `name`, at the top of a root, is a folder the root keeps
-/// read-only.
-pub fn protected(name: &std::ffi::OsStr) -> bool {
-    PROTECTED.iter().any(|kept| name == *kept)
-}
-
 /// A folder the bot may write, and what inside it stays read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Root {
@@ -59,7 +53,7 @@ pub struct Policy {
     /// Shallowest first: a deeper root decides for what is inside it.
     pub roots: Vec<Root>,
     pub network: bool,
-    /// The daemon's socket, which a command may reach with network off.
+    /// The daemon's socket, which no command in the sandbox may reach.
     pub socket: Option<PathBuf>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
@@ -68,15 +62,12 @@ pub struct Policy {
 impl Policy {
     /// The policy for a bot in `mode`, whose folder is `workspace` and
     /// whose client named `writable`; `None` when its commands run
-    /// unconfined. A folder outside every one of `within`, when it is
-    /// given, is not a root: a bot made by a sandboxed bot writes no more than
-    /// its creator. `daemon` holds what the daemon itself keeps: its store,
+    /// unconfined. `daemon` holds what the daemon itself keeps: its store,
     /// which no root may write, and its socket.
     pub fn new(
         mode: Option<Mode>,
         workspace: Option<&Path>,
         writable: &[String],
-        within: Option<&[String]>,
         network: bool,
         daemon: &Daemon,
     ) -> Result<Option<Policy>> {
@@ -85,71 +76,11 @@ impl Policy {
             Some(mode) => mode,
         };
         let mut paths = writable_paths(mode, workspace, writable);
-        // What each folder of `within` keeps read-only stays so in a root
-        // inside it: a root inside one of those is none, and a root holding
-        // one keeps it, so the bot writes nothing its creator could not.
-        let mut kept: Vec<(PathBuf, Vec<PathBuf>, Vec<PathBuf>)> = Vec::new();
-        if let Some(within) = within {
-            let mut ceilings = Vec::new();
-            for path in within {
-                if let Ok(real) = std::fs::canonicalize(path) {
-                    ceilings.push(root(&real, &daemon.store)?);
-                }
-            }
-            let temporary: Vec<&PathBuf> = temporary().iter().map(|(_, real)| real).collect();
-            paths.retain(|path| {
-                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-                if temporary.contains(&&path) {
-                    return true;
-                }
-                let Some(ceiling) = ceilings
-                    .iter()
-                    .filter(|ceiling| path.starts_with(&ceiling.path))
-                    .max_by_key(|ceiling| depth(&ceiling.path))
-                else {
-                    return false;
-                };
-                let protected = |kept: &PathBuf| path.starts_with(kept);
-                if ceiling
-                    .read_only
-                    .iter()
-                    .chain(&ceiling.missing)
-                    .any(protected)
-                {
-                    return false;
-                }
-                let inside = |found: &Vec<PathBuf>| {
-                    found
-                        .iter()
-                        .filter(|kept| kept.starts_with(&path))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-                kept.push((
-                    path.clone(),
-                    inside(&ceiling.read_only),
-                    inside(&ceiling.missing),
-                ));
-                true
-            });
-        }
         paths.sort_by_key(|path| (depth(path), path.clone()));
         paths.dedup();
         let mut roots = Vec::new();
         for path in paths {
-            let mut found = root(&path, &daemon.store)?;
-            let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if let Some((_, read_only, missing)) = kept.iter().find(|(kept, ..)| *kept == real) {
-                for (into, from) in [
-                    (&mut found.read_only, read_only),
-                    (&mut found.missing, missing),
-                ] {
-                    into.extend(from.iter().cloned());
-                    into.sort();
-                    into.dedup();
-                }
-            }
-            roots.push(found);
+            roots.push(root(&path, &daemon.store)?);
         }
         Ok(Some(Policy {
             roots,
@@ -624,6 +555,11 @@ mod linux {
                 ]);
             }
         }
+        // The daemon's socket is out of reach, as Codex keeps its own from
+        // a sandboxed command: nothing confined may drive the daemon.
+        if let Some(socket) = &policy.socket {
+            args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]);
+        }
         args.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"].map(String::from));
         if !policy.network {
             args.push("--unshare-net".into());
@@ -709,6 +645,14 @@ pub async fn hold(policy: &Policy) -> Hold {
             }
         }
         removed.await;
+    }
+}
+
+/// [`hold`] for a call that may run unconfined.
+pub async fn hold_for(policy: Option<&Policy>) -> Option<Hold> {
+    match policy {
+        Some(policy) => Some(hold(policy).await),
+        None => None,
     }
 }
 
@@ -825,22 +769,20 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
         sections.push(format!("(allow file-write*\n{}\n)", allows.join(" ")));
         sections.extend(anchors);
     }
-    // Network as Codex allows it: everything when on, and with it off only
-    // the daemon's socket, which network-off would deny too (Claude Code's
-    // allowUnixSockets keeps one the same way).
-    let socket = policy.socket.as_ref().map(|socket| {
+    // Network as Codex allows it: everything when on, nothing when off.
+    if policy.network {
+        sections.push(format!(
+            "(allow network-outbound)\n(allow network-inbound)\n{SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}"
+        ));
+    }
+    // Never the daemon's socket, as Codex keeps its own from a sandboxed
+    // command: nothing confined may drive the daemon.
+    if let Some(socket) = &policy.socket {
         params.push(("DAEMON_SOCKET".to_owned(), socket.clone()));
-        "; allow unix domain sockets for local IPC\n\
-         (allow system-socket (socket-domain AF_UNIX))\n\
-         (allow network-outbound (remote unix-socket (subpath (param \"DAEMON_SOCKET\"))))\n"
-    });
-    match (policy.network, socket) {
-        (true, socket) => sections.push(format!(
-            "(allow network-outbound)\n(allow network-inbound)\n{}{SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}",
-            socket.unwrap_or_default()
-        )),
-        (false, Some(socket)) => sections.push(format!("{socket}{SEATBELT_NETWORK}")),
-        (false, None) => {}
+        sections.push(
+            "(deny network-outbound (remote unix-socket (subpath (param \"DAEMON_SOCKET\"))))"
+                .to_owned(),
+        );
     }
     sections.push(SEATBELT_PREFERENCES.to_owned());
     sections.push("(deny mach-lookup (xpc-service-name-prefix \"\"))".to_owned());
@@ -914,7 +856,6 @@ mod tests {
             Some(Mode::WorkspaceWrite),
             Some(&base),
             &[inner.to_str().unwrap().to_owned()],
-            None,
             false,
             &Daemon::default(),
         )
@@ -945,6 +886,29 @@ mod tests {
         assert!(kept.contains(&&inner.join(".git")));
         // Paths go in as parameters, never into the profile's text.
         assert!(!profile.contains(base.to_str().unwrap()));
+        // The daemon's socket is denied, network on or off.
+        for network in [false, true] {
+            let socket = Policy {
+                network,
+                socket: Some(base.join("agent.sock")),
+                ..policy.clone()
+            };
+            let (profile, params) = seatbelt(&socket);
+            assert!(profile.contains(
+                "(deny network-outbound (remote unix-socket (subpath (param \"DAEMON_SOCKET\"))))"
+            ));
+            assert!(
+                params
+                    .iter()
+                    .any(|(key, path)| key == "DAEMON_SOCKET" && path == &base.join("agent.sock"))
+            );
+            #[cfg(target_os = "linux")]
+            assert!(
+                linux::args(&socket, false)
+                    .windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null")
+            );
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -957,7 +921,6 @@ mod tests {
             Some(Mode::WorkspaceWrite),
             Some(&base),
             &[],
-            None,
             false,
             &Daemon::default(),
         )
