@@ -1092,33 +1092,40 @@ fn unkept(repo: &Path) -> Result<(String, Vec<String>), String> {
         repo,
         &[
             "for-each-ref",
-            "--format=%(objectname) %(objecttype) %(refname:short)",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname:short)",
             "refs/heads",
             "refs/tags",
         ],
     )?;
-    let stashes = git(repo, &["stash", "list", "--format=%H commit %gd"])?;
-    let head = format!("{} commit HEAD", git(repo, &["rev-parse", "HEAD"])?);
+    let stashes = git(repo, &["stash", "list", "--format=%H commit   %gd"])?;
+    let head = format!("{} commit   HEAD", git(repo, &["rev-parse", "HEAD"])?);
     let local = Path::new(&origin).is_dir();
     let unkept = refs
         .lines()
         .chain(stashes.lines())
         .chain([head.as_str()])
         .filter_map(|line| {
-            let mut parts = line.splitn(3, ' ');
-            Some((parts.next()?, parts.next()?, parts.next()?))
+            let mut parts = line.splitn(5, ' ');
+            let (object, kind) = (parts.next()?, parts.next()?);
+            // An annotated tag, and what it names.
+            let (named, named_kind) = (parts.next()?, parts.next()?);
+            let (named, named_kind) = match named.is_empty() {
+                true => (object, kind),
+                false => (named, named_kind),
+            };
+            Some((object, named, named_kind, parts.next()?))
         })
-        .filter(|(object, kind, _)| match local {
+        .filter(|(object, named, kind, _)| match local {
             // Any object origin has, it has with all it names.
             true => git(Path::new(&origin), &["cat-file", "-e", object]).is_err(),
-            false if *kind == "commit" => git(repo, &["branch", "-r", "--contains", object])
+            false if *kind == "commit" => git(repo, &["branch", "-r", "--contains", named])
                 .unwrap_or_default()
                 .is_empty(),
             // A tag of a tree or blob, which no remote branch contains,
             // can't be checked against a remote without asking it.
             false => false,
         })
-        .map(|(_, _, name)| name.to_owned())
+        .map(|(_, _, _, name)| name.to_owned())
         .collect();
     Ok((origin, unkept))
 }
@@ -1486,6 +1493,16 @@ mod tests {
         );
         run(&sub, &["push", "-q", "origin", "HEAD:refs/heads/task"]);
         assert_eq!(left(&copy), "");
+        // With an origin by URL, a commit only an annotated tag keeps.
+        let url = format!("file://{}", top.display());
+        run(&copy, &["remote", "set-url", "origin", &url]);
+        run(&copy, &["fetch", "-q", "origin"]);
+        assert_eq!(left(&copy), "");
+        run(&copy, &["checkout", "-q", "--detach"]);
+        run(&copy, &["commit", "-q", "--allow-empty", "-m", "private"]);
+        run(&copy, &["tag", "-a", "-m", "kept", "kept"]);
+        run(&copy, &["switch", "-q", "main"]);
+        assert_eq!(left(&copy), format!("commits not pushed to {url}, on kept"));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
