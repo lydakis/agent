@@ -171,10 +171,16 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    let flags = match told(&place.dir, &flags) {
+    let mut flags = match told(&place.dir, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
+    // Every task works in a sandbox, whatever its lead's mode, and may
+    // commit to its repository.
+    flags.extend(["--sandbox", "workspace-write", "--network"].map(String::from));
+    if let Some(git) = crate::approvals::repository(&place.dir) {
+        flags.extend(["--writable".to_owned(), git]);
+    }
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
     let brief = vec![start.brief.clone()];

@@ -1184,8 +1184,12 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. It answers `{bot, bot_id, changed}`, `changed` naming the fields
-(`model`, `instructions`, `gates`, `declared`) that differed; the same request again
+anything is written. `sandbox`, with `writable` and `network` (as `create`'s
+settings name them), replaces the bot's sandbox, and the two left out go back
+to none and off; a bot another bot made keeps no weaker a sandbox than its
+creator's, as when it was made, and a bot's own socket may not configure
+at all. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+(`model`, `instructions`, `gates`, `declared`, `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
@@ -2106,7 +2110,19 @@ read-only, and a missing `.git`, `.agents` or `.codex` may not be made: git
 runs hooks and config from there outside the sandbox, and agents trust what
 is there. The daemon's store and the files beside it stay read-only too. A
 protected folder that is a symlink refuses the call with
-`sandbox_unavailable`, since the link could be swapped from inside. Network is
+`sandbox_unavailable`, since the link could be swapped from inside. A git
+folder given as a `writable` folder, so a bot may commit, keeps what git
+runs read-only as `.git` does: its `hooks`, `config`, `config.worktree`,
+submodules' `modules`, and the `commondir` that would point git at another
+folder's hooks and config, its own and each linked worktree's under
+`worktrees`. Missing `hooks` or `modules` may not be made, nor the git
+folder's own missing `commondir` on macOS; on Linux, where a folder held in
+its place would stop git, one the command makes is removed when it ends. So a sandboxed `git
+worktree remove` of an existing worktree is refused. It is
+known by its name, `.git` or `NAME.git`, which the bot can't change, not by
+what is inside it. One whose config is missing, turns on per-worktree config
+or includes other files stays read-only as a whole, since git reads those
+files wherever they are made. Network is
 off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 

@@ -870,6 +870,19 @@ async fn run() -> Result<(), String> {
         app.workspace = dir.display().to_string();
         app.move_to = Some(app.workspace.clone());
     }
+    // A lead made before Sonny confined leads, or whose sandbox is not its
+    // mode's in the folder it now works in, takes its mode's again. Only
+    // ever confined this way: a lead is unconfined by the person's pick.
+    if project.is_some()
+        && app.gating.is_none()
+        && let Some(mode) = app.mode.filter(|mode| *mode != "full")
+        && !approvals::sandboxed_as(
+            &bot,
+            &approvals::sandbox(mode, true, std::path::Path::new(&app.workspace)),
+        )
+    {
+        app.gating = Some(mode);
+    }
     app.project = project;
     // A new project's lead has no history yet: Sonny says hello over it.
     if fresh && options.side.is_none() {
@@ -921,9 +934,12 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         "instructions": instructions, "tools": tools, "declare": declare,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
+    // Confined from the start, as the mode it is made with confines it.
+    let mut settings = approvals::sandbox(approvals::MODES[0].0, true, &workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
-        asked["settings"] = json!({"cache_ttl": ttl});
+        settings.insert("cache_ttl".into(), json!(ttl));
     }
+    asked["settings"] = Value::Object(settings);
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = &mut asked {
@@ -2502,6 +2518,11 @@ impl App {
                 mode,
                 &approvals::gateable(&self.tools, declared),
             ));
+            // A lead's sandbox goes with its mode.
+            if self.project.is_some() {
+                let workspace = std::path::Path::new(&self.workspace);
+                fields.extend(approvals::sandbox(mode, true, workspace));
+            }
         }
         match self.client.request("configure", asked).await {
             Ok(_) => {

@@ -237,6 +237,14 @@ off again never shows.
   now once it is idle. While the judge reviews a call the status row says
   `Reviewing approval request`, and a denied call is drawn as
   `✗ Request denied for …` with the judge's reason, in either view.
+  The mode sets the lead's sandbox too, as Codex's modes do: in `auto`
+  and `ask` its commands, writes and edits stay in its folder (and
+  `/tmp`), reach the network, and may commit to the folder's repository,
+  whose hooks and config stay read-only; a call that leaves the sandbox
+  waits for the verdict. In `full` the lead runs unconfined. Every task
+  is sandboxed the same way in its own folder, whatever the lead's mode.
+  A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
+  it. On Linux sandboxes need bubblewrap.
 - `/approve` lists the calls the judge denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so

@@ -402,12 +402,40 @@ pub async fn create(
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
     }
+    // The client's settings, such as a sandbox, with the model's.
+    let mut settings = policy["settings"].as_object().cloned().unwrap_or_default();
     if let Some(ttl) = crate::policy::cache_ttl(model) {
-        params["settings"] = json!({"cache_ttl": ttl});
+        settings.insert("cache_ttl".into(), json!(ttl));
+    }
+    if !settings.is_empty() {
+        params["settings"] = Value::Object(settings);
     }
     // The tools its client declares on the lead, from its first turn.
     if !policy["declare"].is_null() {
         params["declare"] = policy["declare"].clone();
+    }
+    // The client's gate, `create`'s approval fields, for the tools the lead
+    // has: the client may not know which its model is given.
+    if let (Value::Object(params), Some(gate)) = (&mut params, policy["gate"].as_object()) {
+        let has = |name: &str| {
+            params["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|tool| tool == name)
+                || (params.get("declare").and_then(Value::as_array))
+                    .into_iter()
+                    .flatten()
+                    .any(|tool| tool["name"] == name)
+        };
+        let mut gate = gate.clone();
+        if let Some(Value::Array(approve)) = gate.get_mut("approve") {
+            approve.retain(|tool| tool.as_str().is_some_and(has));
+            if approve.is_empty() {
+                gate.remove("approver");
+            }
+        }
+        params.extend(gate);
     }
     let record = match daemon.request("create", params).await {
         Ok(record) => record,
@@ -687,6 +715,29 @@ mod tests {
             "no effort picked sends none"
         );
         assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        // A client's gate and settings go with the lead it makes.
+        let dir = root("gated");
+        let daemon = Fake::default();
+        make(
+            &daemon,
+            &dir,
+            &json!({"instructions": "rules", "model": "alpha/role",
+                    "gate": {"approve": ["shell"], "approver": "auto"},
+                    "settings": {"sandbox": "workspace-write", "network": true}}),
+            &Picks::default(),
+        )
+        .unwrap();
+        let calls = daemon.calls.lock().unwrap().clone();
+        let create = &calls.iter().find(|(op, _)| op == "create").unwrap().1;
+        assert_eq!(
+            (&create["approve"], &create["approver"]),
+            (&json!(["shell"]), &json!("auto"))
+        );
+        assert_eq!(
+            create["settings"],
+            json!({"sandbox": "workspace-write", "network": true})
+        );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

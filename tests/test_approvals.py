@@ -133,6 +133,57 @@ class ApprovalTests(ModelFixture):
         self.assertTrue((self.path / 'notes.md').exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_bot_given_its_repository_commits_in_its_worktree_and_leaves_what_git_runs(self):
+        git = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com']
+        repo, tree = self.path / 'repo', self.path / 'tree'
+        repo.mkdir()
+        for args in (['init', '-q', '-b', 'main'], ['commit', '-q', '--allow-empty', '-m', 'one'],
+                     ['worktree', 'add', '-q', '-b', 'task', str(tree)]):
+            subprocess.run(git + args, cwd=repo, check=True, capture_output=True)
+        config = (repo / '.git/config').read_text()
+        # An unsandboxed bot is confined once configured; one it makes keeps
+        # its sandbox whatever it is configured to.
+        client = self.client('shell')
+        bob = client.request('create', bot='Bob', workspace=str(tree))['result']['bot_id']
+        configured = client.request('configure', bot='Bob', sandbox='workspace-write',
+                                    writable=[str(repo / '.git')], network=True)['result']
+        self.assertEqual(configured['changed'], ['sandbox'])
+        client.request('create', bot='Kid', workspace=str(tree), created_by='Bob', created_by_id=bob)
+        client.request('configure', bot='Kid', sandbox='danger-full-access')
+        self.assertEqual(client.request('inspect', bot='Kid')['result']['settings']['sandbox'], 'workspace-write')
+        self.assertEqual(client.request('configure', bot='Bob', network=True)['error'], 'invalid_setting')
+        calls = [['shell', {'command': ' '.join(git) + ' commit -q --allow-empty -m two'}],
+                 ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/pre-commit'}],
+                 ['shell', {'command': f'echo "[core] hooksPath = /tmp" >> {repo}/.git/config'}],
+                 # What is inside the folder doesn't make it git's: one call
+                 # moving HEAD leaves the next still kept from the hooks.
+                 ['shell', {'command': f'mv {repo}/.git/HEAD {repo}/.git/HEAD.x'}],
+                 ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/post-checkout; '
+                                       f'mv {repo}/.git/HEAD.x {repo}/.git/HEAD'}],
+                 # Nor may it point git at another folder's hooks and config.
+                 ['shell', {'command': f'echo /tmp > {repo}/.git/commondir'}],
+                 ['shell', {'command': f'echo /tmp > {repo}/.git/worktrees/tree/commondir'}]]
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
+        log = subprocess.run(['git', 'log', '--format=%s', 'task'], cwd=repo, capture_output=True, text=True)
+        self.assertEqual(log.stdout.split(), ['two', 'one'])
+        self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
+        self.assertNotEqual(self.tool_output(client, 'shell-3')[1]['exit_code'], 0)
+        self.assertEqual(self.tool_output(client, 'shell-4')[1]['exit_code'], 0)
+        self.assertFalse((repo / '.git/hooks/pre-commit').exists())
+        self.assertFalse((repo / '.git/hooks/post-checkout').exists())
+        self.assertEqual((repo / '.git/config').read_text(), config)
+        self.assertNotEqual(self.tool_output(client, 'shell-7')[1]['exit_code'], 0)
+        self.assertEqual((repo / '.git/worktrees/tree/commondir').read_text(), '../..\n')
+        # Linux can't keep it from being made, only removes it after.
+        deadline = time.monotonic() + 5
+        while (repo / '.git/commondir').exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse((repo / '.git/commondir').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_without_a_gate_cannot_leave_its_sandbox(self):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))

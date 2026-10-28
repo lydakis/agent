@@ -495,12 +495,31 @@ async fn make(
     picks: &agent_client::project::Picks,
 ) -> Result<Value, String> {
     let (instructions, _) = folder(dir, role)?;
+    // Gated and confined from the start, as a new lead's mode makes it,
+    // whoever opens it first.
+    let mode = crate::approvals::MODES[0].0;
+    let tools: Vec<String> = match &role.tools {
+        Some(tools) => tools.clone(),
+        // The tools the client will give it; one the gate names that the
+        // lead doesn't get is left out there.
+        None => {
+            let model = picks.model.as_deref().or(role.model.as_deref());
+            agent_client::default_tools(client.providers(), model.unwrap_or(""), picks.web_search)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+    };
+    let declare = json!(crate::declared::tools(true));
+    let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     let policy = json!({
         "instructions": instructions,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "model": role.model,
         "tools": role.tools,
-        "declare": crate::declared::tools(true),
+        "declare": declare,
+        "gate": gate,
+        "settings": crate::approvals::sandbox(mode, true, dir),
     });
     let copies = crate::settings::Settings::load().copies;
     agent_client::project::create(

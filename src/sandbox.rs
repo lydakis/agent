@@ -35,6 +35,15 @@ const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
 /// would be run by git outside the sandbox, and a new `.agents` read as
 /// the project's own settings.
 const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
+/// In a git folder given as a root, so a bot may commit, what git runs
+/// stays read-only as it does under `.git`: its hooks, the config that can
+/// name other hooks or programs, its submodules' git folders, which hold
+/// their own, and `commondir`, which would have git take another folder's
+/// hooks and config in its place. Missing hooks, submodules and `commondir`
+/// are kept from being made. A git folder is known by its name, `.git` or
+/// `NAME.git`, which the bot can't change, never by what is inside it,
+/// which it can.
+const GIT_PROTECTED: [&str; 5] = ["hooks", "config", "config.worktree", "modules", "commondir"];
 
 /// A folder the bot may write, and what inside it stays read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +53,11 @@ pub struct Root {
     pub read_only: Vec<PathBuf>,
     /// Paths inside the root that don't exist and may not be made.
     pub missing: Vec<PathBuf>,
+    /// Paths right under the root that don't exist and may not be left made:
+    /// files git reads whenever they are there, so an empty folder held in
+    /// their place would stop git. On Linux, removed when the command ends;
+    /// elsewhere they are `missing`.
+    pub left: Vec<PathBuf>,
 }
 
 /// What a sandboxed command may do: write its roots, and reach the network
@@ -125,6 +139,7 @@ impl Policy {
                     .read_only
                     .iter()
                     .chain(&root.missing)
+                    .chain(&root.left)
                     .any(|kept| path.starts_with(kept))
             })
     }
@@ -372,6 +387,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     }
     let mut read_only = Vec::new();
     let mut missing = Vec::new();
+    let mut left = Vec::new();
     for name in PROTECTED {
         let kept = path.join(name);
         if held(&kept) {
@@ -379,20 +395,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             continue;
         }
         match std::fs::symlink_metadata(&kept) {
-            // A symlink the sandbox may replace can't be held read-only:
-            // whatever is mounted over its target, the link itself can be
-            // swapped for a folder of the command's own. Codex refuses it
-            // too.
-            Ok(found) if found.file_type().is_symlink() => {
-                return fail_with(
-                    "sandbox_unavailable",
-                    format!(
-                        "{} is a symlink in a folder the bot may write, so it can't be kept \
-                         read-only",
-                        kept.display()
-                    ),
-                );
-            }
+            Ok(found) if found.file_type().is_symlink() => return linked(&kept),
             Ok(found) => {
                 // A linked worktree's .git names its repository's folder for
                 // it, which stays read-only too when the root holds it.
@@ -407,6 +410,51 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             }
             Err(_) if PROTECTED_MISSING.contains(&name) => missing.push(kept),
             Err(_) => {}
+        }
+    }
+    let git = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".git"));
+    if git && !git_folder_writable(path) {
+        read_only.push(path.to_owned());
+    } else if git {
+        for name in GIT_PROTECTED {
+            let kept = path.join(name);
+            if held(&kept) {
+                missing.push(kept);
+                continue;
+            }
+            match std::fs::symlink_metadata(&kept) {
+                Ok(found) if found.file_type().is_symlink() => return linked(&kept),
+                Ok(_) => read_only.push(kept),
+                Err(_) if matches!(name, "hooks" | "modules") => missing.push(kept),
+                Err(_) if name == "commondir" && cfg!(target_os = "linux") => left.push(kept),
+                Err(_) if name == "commondir" => missing.push(kept),
+                Err(_) => {}
+            }
+        }
+        // Each linked worktree's folder names the repository's folder for
+        // it the same way. One without it was made since, and serves only a
+        // checkout the bot made to name it. Nothing this deep is removed
+        // after a command, as the root's own `commondir` is: its folder
+        // could be swapped for a link elsewhere before the removal follows.
+        for entry in std::fs::read_dir(path.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            match entry.file_type() {
+                Ok(found) if found.is_symlink() => return linked(&entry.path()),
+                Ok(found) if found.is_dir() => {}
+                _ => continue,
+            }
+            let kept = entry.path().join("commondir");
+            match std::fs::symlink_metadata(&kept) {
+                Ok(found) if found.file_type().is_symlink() => return linked(&kept),
+                Ok(_) => read_only.push(kept),
+                Err(_) => {}
+            }
         }
     }
     if let Some(store) = &daemon.store
@@ -430,7 +478,32 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         path: path.to_owned(),
         read_only,
         missing,
+        left,
     })
+}
+
+/// Whether a git folder may be written with its hooks and config kept: not
+/// when its config is missing, which git would read once made, nor when it
+/// turns on per-worktree config or includes other files, which git reads
+/// wherever they are, made or not. Any mention of either counts.
+fn git_folder_writable(path: &Path) -> bool {
+    std::fs::read_to_string(path.join("config")).is_ok_and(|config| {
+        let config = config.to_ascii_lowercase();
+        !config.contains("worktreeconfig") && !config.contains("include")
+    })
+}
+
+/// A symlink the sandbox may replace can't be held read-only: whatever is
+/// mounted over its target, the link itself can be swapped for a folder of
+/// the command's own. Codex refuses it too.
+fn linked(kept: &Path) -> Result<Root> {
+    fail_with(
+        "sandbox_unavailable",
+        format!(
+            "{} is a symlink in a folder the bot may write, so it can't be kept read-only",
+            kept.display()
+        ),
+    )
 }
 
 /// The store and the files SQLite and the daemon keep beside it.
@@ -724,8 +797,9 @@ fn held(path: &Path) -> bool {
 }
 
 /// What a running sandbox holds in place; dropping it lets the
-/// placeholders go once no other sandbox holds them.
-pub struct Hold(Vec<PathBuf>);
+/// placeholders go once no other sandbox holds them, and removes what the
+/// command may not leave made.
+pub struct Hold(Vec<PathBuf>, Vec<PathBuf>);
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
 /// being removed is gone.
@@ -758,7 +832,12 @@ pub async fn hold(policy: &Policy) -> Hold {
                         }),
                     }
                 }
-                return Hold(paths);
+                let left = policy
+                    .roots
+                    .iter()
+                    .flat_map(|root| root.left.iter().cloned())
+                    .collect();
+                return Hold(paths, left);
             }
         }
         removed.await;
@@ -788,12 +867,20 @@ impl Drop for Hold {
                 }
             }
         }
-        if released.is_empty() {
+        let left = std::mem::take(&mut self.1);
+        if released.is_empty() && left.is_empty() {
             return;
         }
         // Off the runtime thread, and with no lock held: no sandbox takes
-        // one up while it is marked as being removed.
+        // one up while it is marked as being removed. On a thread of its
+        // own, since a runtime shutting down drops blocking work not yet
+        // started, which would leave them in place.
         let remove = move || {
+            // Git never makes these in a repository's own folder: one there
+            // now is the command's.
+            for path in &left {
+                let _ = std::fs::remove_file(path);
+            }
             for path in &released {
                 // Only an empty one: a placeholder, never what a command
                 // outside the sandbox made there since.
@@ -804,9 +891,21 @@ impl Drop for Hold {
                 .retain(|held| !(held.removing && released.contains(&held.path)));
             REMOVED.notify_waiters();
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
-            Err(_) => remove(),
+        type Job = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
+        let run = |job: &Job| {
+            if let Some(remove) = job.lock().unwrap().take() {
+                remove();
+            }
+        };
+        let job: std::sync::Arc<Job> =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(remove))));
+        let theirs = job.clone();
+        if std::thread::Builder::new()
+            .name("sandbox-placeholders".into())
+            .spawn(move || run(&theirs))
+            .is_err()
+        {
+            run(&job);
         }
     }
 }
@@ -1031,6 +1130,70 @@ mod tests {
     }
 
     #[test]
+    fn a_git_folder_given_as_a_root_keeps_what_git_runs() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-git-{}", std::process::id()));
+        let git = base.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        std::fs::create_dir_all(git.join("worktrees/wt")).unwrap();
+        std::fs::write(git.join("worktrees/wt/commondir"), "../..\n").unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let git = base.join(".git");
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.can_write(&git.join("objects/ab/cdef")));
+        assert!(policy.can_write(&git.join("index.lock")));
+        assert!(!policy.can_write(&git.join("config")));
+        // Missing hooks may not be made, nor a submodule's git folder.
+        assert!(!policy.can_write(&git.join("hooks/pre-commit")));
+        assert!(!policy.can_write(&git.join("modules/sub/hooks/pre-commit")));
+        // Nor a `commondir`, which would have git take another folder's hooks
+        // and config, here or in a linked worktree's folder.
+        assert!(!policy.can_write(&git.join("commondir")));
+        assert!(!policy.can_write(&git.join("worktrees/wt/commondir")));
+        assert!(policy.can_write(&git.join("worktrees/wt/index.lock")));
+        // With per-worktree config on, whose files git reads wherever they
+        // are made, none of it is written.
+        std::fs::write(
+            git.join("config"),
+            "[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!policy.can_write(&git.join("objects/ab/cdef")));
+        assert!(!policy.can_write(&git.join("worktrees/x/config.worktree")));
+        // As with config it includes, which may be anywhere.
+        std::fs::write(git.join("config"), "[include]\n\tpath = extra.conf\n").unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[git.to_str().unwrap().to_owned()],
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!policy.can_write(&git.join("extra.conf")));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn the_deepest_root_decides_and_seatbelt_keeps_what_it_keeps() {
         let base = std::env::temp_dir().join(format!("agent-sandbox-unit-{}", std::process::id()));
         let inner = base.join("inner");
@@ -1198,6 +1361,7 @@ mod tests {
                 Root {
                     read_only: PROTECTED.iter().map(|name| path.join(name)).collect(),
                     missing: Vec::new(),
+                    left: Vec::new(),
                     path: path.clone(),
                 }
             })

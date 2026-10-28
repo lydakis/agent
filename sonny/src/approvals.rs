@@ -67,6 +67,56 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
     }
 }
 
+/// The sandbox fields, as `configure` takes them and `create`'s settings
+/// hold them, for an agent working in `workspace`: Codex's
+/// `workspace-write`, reaching the network, with the folder's repository
+/// writable too so a commit runs without asking (its hooks and config stay
+/// read-only). A lead in `full` mode runs unconfined, as Codex's full
+/// access does; a task is always confined.
+pub fn sandbox(mode: &str, lead: bool, workspace: &std::path::Path) -> Map<String, Value> {
+    let fields = match mode {
+        "full" if lead => json!({"sandbox": "danger-full-access"}),
+        _ => {
+            let writable: Vec<String> = repository(workspace).into_iter().collect();
+            json!({"sandbox": "workspace-write", "writable": writable, "network": true})
+        }
+    };
+    match fields {
+        Value::Object(fields) => fields,
+        _ => Map::new(),
+    }
+}
+
+/// The git folder of the repository `dir` is in, which its linked
+/// worktrees share, by its real path as the daemon keeps it. Only one
+/// named as the daemon knows a git folder, `.git` or `NAME.git`: in one
+/// named otherwise, such as a separate git folder, its hooks and config
+/// would not be kept, so a commit there asks instead.
+pub fn repository(dir: &std::path::Path) -> Option<String> {
+    let found = crate::task::git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .filter(|path| !path.is_empty())?;
+    let real = std::fs::canonicalize(found).ok()?;
+    real.to_str()
+        .filter(|path| path.ends_with(".git"))
+        .map(str::to_owned)
+}
+
+/// Whether `record`'s sandbox is the one `fields` give it: its mode, its
+/// writable folders, which a moved folder leaves stale, and its network.
+pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
+    let fields = Value::Object(fields.clone());
+    let settings = &record["settings"];
+    let writable = |value: &Value| value["writable"].as_array().cloned().unwrap_or_default();
+    settings["sandbox"] == fields["sandbox"]
+        && writable(settings) == writable(&fields)
+        && settings["network"].as_bool().unwrap_or(false)
+            == fields["network"].as_bool().unwrap_or(false)
+}
+
 /// What a bot's gate may hold back: its own `tools`, and of the tools its
 /// client declared, those Sonny gates (`served::GATED`).
 pub fn gateable(tools: &[String], declared: &Value) -> Vec<String> {
@@ -149,6 +199,51 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_is_confined_but_in_full_mode_and_a_task_always() {
+        let dir = std::env::temp_dir().join(format!("sonny-sandbox-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        crate::task::git(&dir, &["init", "-q"]).unwrap();
+        let git = dir.join(".git").display().to_string();
+        let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true});
+        for (mode, _) in MODES {
+            let fields = sandbox(mode, false, &dir);
+            assert_eq!(Value::Object(fields.clone()), confined);
+            assert!(sandboxed_as(&json!({"settings": fields}), &fields));
+        }
+        assert_eq!(Value::Object(sandbox("auto", true, &dir)), confined);
+        let full = sandbox("full", true, &dir);
+        assert_eq!(
+            Value::Object(full.clone()),
+            json!({"sandbox": "danger-full-access"})
+        );
+        let unconfined = json!({"settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
+        assert!(sandboxed_as(&unconfined, &full));
+        // A lead made before leads were confined is confined again, and
+        // one whose repository moved is given it where it is now.
+        let auto = sandbox("auto", true, &dir);
+        assert!(!sandboxed_as(&json!({"settings": {}}), &auto));
+        let moved = json!({"settings": {"sandbox": "workspace-write", "writable": ["/gone/.git"],
+            "network": true}});
+        assert!(!sandboxed_as(&moved, &auto));
+        // Outside a repository, only its own folder; with a git folder
+        // named otherwise, whose hooks the daemon wouldn't know to keep,
+        // commits ask.
+        let plain = std::env::temp_dir();
+        assert_eq!(sandbox("ask", true, &plain)["writable"], json!([]));
+        let apart = dir.join("apart");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        crate::task::git(
+            &tree,
+            &["init", "-q", "--separate-git-dir", apart.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(sandbox("ask", true, &tree)["writable"], json!([]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn modes_are_read_back_from_the_gates_they_make() {
