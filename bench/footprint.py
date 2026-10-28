@@ -47,7 +47,8 @@ def run(binary, out, bots):
     model, url = start()
     client = None
     try:
-        (out / 'workspace').mkdir()
+        workspace = (out / 'workspace').resolve()
+        workspace.mkdir()
         client = Client(binary, out / 'state.sqlite', url, 'echo,shell,wait', extra=['--max-active', '0'])
         process = psutil.Process(client.process.pid)
 
@@ -57,7 +58,7 @@ def run(binary, out, bots):
 
         idle = rss_mib()
         for first in range(0, bots, BATCH):
-            for reply in pipelined(client, [('create', dict(bot=f'b{n}', workspace=str(out / 'workspace')))
+            for reply in pipelined(client, [('create', dict(bot=f'b{n}', workspace=str(workspace)))
                                             for n in range(first, min(bots, first + BATCH))]):
                 assert 'result' in reply, reply
         created = rss_mib()
