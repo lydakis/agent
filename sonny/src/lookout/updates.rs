@@ -1,10 +1,12 @@
 //! Task updates: what the lead hears of its tasks unjudged, as its role
-//! says it will. A turn it asked for and did not wait on, a turn another
-//! agent or a trigger asked for, an approval only the person can give, and
-//! a running turn that has printed nothing for a long while are always
-//! news; turns the person asked for in the task themselves are
-//! listed apart, as theirs. A turn the lead waits on is not news, nor its
-//! own forks.
+//! says it will. Every message someone other than the lead writes in a
+//! task, a turn it asked for and did not wait on, a turn another agent or
+//! a trigger asked for, an approval only the person can give, and a
+//! running turn that has printed nothing for a long while are always news;
+//! turns the person asked for in the task themselves are listed apart, as
+//! theirs. The person's words are quoted; anyone else's stay behind the
+//! turn's handle, as the note reaches the approver as the person's own. A
+//! turn the lead waits on is not news, nor its own forks.
 //!
 //! Only live turns count. The lookout sends the news with its next note,
 //! or on its own as soon as the lead rests; one note
@@ -22,6 +24,12 @@ use std::{
 /// daemon is asked whether it is.
 pub const DOUBT: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
+/// About what one note may take, well under the daemon's prompt limit; a
+/// line other than the person's words counts as `LINE_BYTES`.
+const NOTE_BYTES: usize = 64 * 1024;
+const LINE_BYTES: usize = 160;
+/// How many messages a task's news keeps the person's words for.
+const PENDING: usize = 128;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
@@ -47,8 +55,18 @@ struct Turn {
     which: Option<String>,
 }
 
+/// A message written in a task: who wrote it, and the words, only when
+/// the person did.
+#[derive(Clone, Debug, PartialEq)]
+struct Said {
+    turn: i64,
+    from: String,
+    words: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct News {
+    said: Vec<Said>,
     act: Option<Turn>,
     theirs: Option<Turn>,
 }
@@ -65,8 +83,24 @@ impl News {
                 (a, t) => a.or(t),
             }
         }
+        self.said.extend(news.said);
+        self.said.sort_by_key(|said| said.turn);
+        self.said.dedup_by_key(|said| said.turn);
+        // A long backlog keeps its count and who wrote, but past PENDING
+        // the oldest lose their words, then go: the wait tool reads them.
+        let over = self.said.len().saturating_sub(PENDING);
+        for said in self.said.iter_mut().take(over) {
+            said.words = None;
+        }
+        if self.said.len() > 2 * PENDING {
+            self.said.drain(..self.said.len() - 2 * PENDING);
+        }
         self.act = one(self.act.take(), news.act);
         self.theirs = one(self.theirs.take(), news.theirs);
+    }
+
+    fn empty(&self) -> bool {
+        self.said.is_empty() && self.act.is_none() && self.theirs.is_none()
     }
 }
 
@@ -93,13 +127,25 @@ pub struct Told {
     seen: Option<HashMap<String, u64>>,
 }
 
+impl Told {
+    /// Each message it tells of: its task and turn.
+    pub fn messages(&self) -> impl Iterator<Item = (String, i64)> + '_ {
+        (self.sent.iter())
+            .flat_map(|(task, news)| news.said.iter().map(|said| (task.clone(), said.turn)))
+    }
+}
+
 pub struct Line {
     pub handle: String,
+    /// Words written in the task, not how a turn ended.
+    pub said: bool,
     /// Asked for by the person in the task: theirs, not the lead's.
     pub theirs: bool,
     pub text: String,
     /// The news itself: the same news twice is one note.
     pub key: String,
+    /// It tells of more than one message.
+    pub many: bool,
 }
 
 type Key = (String, i64);
@@ -111,6 +157,9 @@ pub struct Updates {
     memory: Vec<PathBuf>,
     /// Bots with subscriptions of their own: no one's tasks here.
     subscribers: HashSet<String>,
+    /// The bots whose news this is, as the lookout's subscriptions with
+    /// task updates name them.
+    pub watched: HashSet<String>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -145,6 +194,7 @@ impl Updates {
             lead: lead.to_owned(),
             memory,
             subscribers: HashSet::new(),
+            watched: HashSet::new(),
             live: false,
             bots: HashMap::new(),
             from: HashMap::new(),
@@ -382,6 +432,47 @@ impl Updates {
         }
     }
 
+    /// Whether the bot is one of the lead's tasks: one a subscription with
+    /// task updates watches, not a fork of the lead nor a subscriber of its
+    /// own.
+    fn task(&self, name: &str) -> bool {
+        self.watched.contains(name)
+            && !self.subscribers.contains(name)
+            && !name.starts_with(&format!("{}-", self.lead))
+    }
+
+    /// The task's news, made in the order it first came.
+    fn news_of(&mut self, name: &str) -> &mut News {
+        let at = match self.tasks.iter().position(|(task, _)| task == name) {
+            Some(at) => at,
+            None => {
+                self.tasks.push((name.to_owned(), News::default()));
+                self.tasks.len() - 1
+            }
+        };
+        &mut self.tasks[at].1
+    }
+
+    /// Someone other than the lead wrote in a task: `from` names them, and
+    /// `words` are what the person wrote, when it was the person.
+    pub fn said(&mut self, name: &str, turn: i64, from: &str, words: Option<&str>) {
+        if !self.live || !self.task(name) {
+            return;
+        }
+        // Only what a note quotes is kept.
+        let line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
+        let said = Said {
+            turn,
+            from: from.to_owned(),
+            words,
+        };
+        self.news_of(name).merge(News {
+            said: vec![said],
+            ..News::default()
+        });
+    }
+
     fn tell(
         &mut self,
         name: &str,
@@ -391,10 +482,7 @@ impl Updates {
         which: Option<String>,
         origin: Option<String>,
     ) {
-        if self.creator(name) != Some(self.lead.as_str())
-            || self.subscribers.contains(name)
-            || name.starts_with(&format!("{}-", self.lead))
-        {
+        if !self.task(name) {
             return;
         }
         let handle = format!("turn:{name}/{turn}");
@@ -406,14 +494,7 @@ impl Updates {
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         };
-        let at = match self.tasks.iter().position(|(task, _)| task == name) {
-            Some(at) => at,
-            None => {
-                self.tasks.push((name.to_owned(), News::default()));
-                self.tasks.len() - 1
-            }
-        };
-        let news = &mut self.tasks[at].1;
+        let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
         });
@@ -491,8 +572,7 @@ impl Updates {
                 }
             }
         }
-        self.tasks
-            .retain(|(_, news)| news.act.is_some() || news.theirs.is_some());
+        self.tasks.retain(|(_, news)| !news.empty());
         self.forwarding
             .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
     }
@@ -509,6 +589,11 @@ impl Updates {
                 .bots
                 .get(&self.lead)
                 .is_some_and(|lead| lead.id.is_some() && !ACTIVE.contains(&lead.status.as_str()))
+    }
+
+    /// Whether the lead is in the middle of a turn, as its events say.
+    pub fn busy(&self) -> bool {
+        (self.bots.get(&self.lead)).is_some_and(|lead| ACTIVE.contains(&lead.status.as_str()))
     }
 
     /// Whether to ask the daemon if the lead rests: news came `since` and
@@ -544,16 +629,55 @@ impl Updates {
     /// act on first.
     pub fn take(&mut self) -> Told {
         let mut tasks = std::mem::take(&mut self.tasks);
-        tasks.sort_by_key(|(_, news)| news.act.is_none());
-        self.tasks = tasks.split_off(tasks.len().min(WAKE_TASKS));
-        let mut items: Vec<Line> = tasks
-            .iter()
-            .flat_map(|(name, news)| {
-                [(false, &news.act), (true, &news.theirs)]
-                    .into_iter()
-                    .filter_map(move |(theirs, turn)| Some(line(name, theirs, turn.as_ref()?)))
-            })
-            .collect();
+        tasks.sort_by_key(|(_, news)| news.said.is_empty() && news.act.is_none());
+        let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
+        let mut quoted = HashMap::new();
+        let mut items: Vec<Line> = Vec::new();
+        let mut sent = Vec::new();
+        // What does not fit in this note's bytes waits for the next.
+        let mut later = Vec::new();
+        let mut bytes = 0;
+        for (name, mut news) in tasks {
+            if bytes >= NOTE_BYTES {
+                later.push((name, news));
+                continue;
+            }
+            let (mut kept, mut wait) = (Vec::new(), Vec::new());
+            for message in std::mem::take(&mut news.said) {
+                let size = message.words.as_ref().map_or(0, String::len) + LINE_BYTES;
+                let first = items.is_empty() && kept.is_empty();
+                if wait.is_empty() && (first || bytes + size <= NOTE_BYTES) {
+                    bytes += size;
+                    kept.push(message);
+                } else {
+                    wait.push(message);
+                }
+            }
+            news.said = kept;
+            if !wait.is_empty() {
+                let waiting = News {
+                    said: wait,
+                    ..News::default()
+                };
+                later.push((name.clone(), waiting));
+            }
+            // A message that started a turn told below as asked by its
+            // writer says nothing more; the person's words are still quoted.
+            let ended = |s: &&Said| {
+                s.words.is_none() && news.act.as_ref().is_some_and(|t| t.turn == s.turn)
+            };
+            let left: Vec<Said> = news.said.iter().filter(|s| !ended(s)).cloned().collect();
+            items.extend(said(&name, &left, &mut quoted));
+            let turns = [(false, &news.act), (true, &news.theirs)];
+            items.extend(
+                (turns.into_iter())
+                    .filter_map(|(theirs, t)| Some(line(&name, theirs, t.as_ref()?))),
+            );
+            bytes += 2 * LINE_BYTES;
+            sent.push((name, news));
+        }
+        later.extend(rest);
+        self.tasks = later;
         // The person's own turns come last, under a line of their own.
         items.sort_by_key(|item| item.theirs);
         let (memory, seen) = match self.memory_news() {
@@ -564,7 +688,7 @@ impl Updates {
             items,
             more: self.tasks.len(),
             memory,
-            sent: tasks,
+            sent,
             seen,
         }
     }
@@ -588,6 +712,11 @@ impl Updates {
     }
 
     /// The lead's ID, to send it the note and no later bot of its name.
+    /// Every bot seated, by name.
+    pub fn listed(&self) -> Vec<String> {
+        self.bots.keys().cloned().collect()
+    }
+
     pub fn lead_id(&self) -> Option<i64> {
         self.bots.get(&self.lead)?.id
     }
@@ -717,10 +846,60 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     let which = t.which.as_deref().unwrap_or("");
     Line {
         handle: format!("turn:{name}/{}", t.turn),
+        said: false,
         theirs,
         text,
         key: format!("{name}/{}/{}/{theirs}/{which}", t.turn, t.status),
+        many: false,
     }
+}
+
+/// What was written in a task, as the note says it: each of the person's
+/// messages quoted, unless the note quoted the same words for another task
+/// already, and everyone else's in one line by its latest turn.
+fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let line = |turn: i64, text: String, many: bool| Line {
+        handle: format!("turn:{name}/{turn}"),
+        said: true,
+        theirs: false,
+        text,
+        key: format!("{name}/{turn}/said"),
+        many,
+    };
+    for message in said {
+        let Some(words) = &message.words else {
+            continue;
+        };
+        // Kept as told: one line, cut at the quote's length.
+        let handle = format!("turn:{name}/{}", message.turn);
+        let text = match quoted.get(words) {
+            Some(first) => format!("- {name}: {handle}, the person wrote the same as in {first}"),
+            None => format!("- {name}: {handle}, the person wrote: \"{words}\""),
+        };
+        quoted.entry(words.clone()).or_insert(handle);
+        lines.push(line(message.turn, text, false));
+    }
+    let others: Vec<&Said> = said.iter().filter(|s| s.words.is_none()).collect();
+    if let Some(last) = others.last() {
+        let mut from: Vec<&str> = others.iter().map(|s| s.from.as_str()).collect();
+        from.sort();
+        from.dedup();
+        let text = match others.len() {
+            1 => format!(
+                "- {name}: turn:{name}/{}, {} wrote in it",
+                last.turn, last.from
+            ),
+            n => format!(
+                "- {name}: turn:{name}/{}, {n} messages in it since turn:{name}/{}, from {}",
+                last.turn,
+                others[0].turn,
+                from.join(", ")
+            ),
+        };
+        lines.push(line(last.turn, text, others.len() > 1));
+    }
+    lines
 }
 
 struct Fact {
@@ -797,6 +976,8 @@ mod tests {
             );
         }
         updates.event(&json!({"event": "follow_live"}), now);
+        // The lead's own tasks, as its subscription names them.
+        updates.watched = ["shop.fix", "shop.docs"].map(str::to_owned).into();
         updates
     }
 
@@ -887,6 +1068,64 @@ mod tests {
             "completed",
         );
         assert!(updates.due(false));
+    }
+
+    #[test]
+    fn a_message_that_started_a_turn_told_as_ended_is_not_told_twice() {
+        let mut updates = fleet();
+        let from = json!({"from": {"bot": "shop.docs", "turn": 3}});
+        updates.said("shop.fix", 6, "shop.docs", None);
+        turn(&mut updates, "shop.fix", 6, from.clone(), "completed");
+        updates.said("shop.fix", 7, "shop.docs", None);
+        updates.said("shop.fix", 8, "the person", Some("and tabs"));
+        let now = Instant::now();
+        updates.event(&ev("shop.fix", Some(7), "accepted", from), now);
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.fix: turn:shop.fix/8, the person wrote: \"and tabs\"\n\
+             - shop.fix: turn:shop.fix/7, shop.docs wrote in it\n\
+             - shop.fix: turn:shop.fix/6 completed, asked by shop.docs"
+        );
+    }
+
+    #[test]
+    fn messages_past_one_note_s_bytes_wait_for_the_next() {
+        let mut updates = fleet();
+        let words = "x".repeat(super::super::QUOTE_CHARS);
+        for turn in 1..=50 {
+            updates.said(
+                "shop.fix",
+                turn,
+                "the person",
+                Some(&format!("{turn} {words}")),
+            );
+        }
+        let first = updates.take();
+        let told = first.items.len();
+        assert!((20..50).contains(&told), "{told}");
+        assert!(first.items.iter().map(|i| i.text.len()).sum::<usize>() <= NOTE_BYTES);
+        assert_eq!(first.more, 1);
+        updates.sent(first);
+        let second = updates.take();
+        let handles: Vec<&str> = second.items.iter().map(|i| i.handle.as_str()).collect();
+        assert_eq!(handles.len(), 50 - told);
+        assert_eq!(handles[0], format!("turn:shop.fix/{}", told + 1));
+    }
+
+    #[test]
+    fn a_long_backlog_keeps_only_the_newest_words() {
+        let mut updates = fleet();
+        let long = "y".repeat(10 * super::super::QUOTE_CHARS);
+        for turn in 1..=300 {
+            updates.said("shop.fix", turn, "the person", Some(&long));
+        }
+        let said = &updates.tasks[0].1.said;
+        assert_eq!(said.len(), 2 * PENDING);
+        assert_eq!(said[0].turn, 300 - 2 * PENDING as i64 + 1);
+        let quoted = said.iter().filter(|s| s.words.is_some()).count();
+        assert_eq!(quoted, PENDING);
+        let kept = said.last().and_then(|s| s.words.as_ref()).unwrap();
+        assert!(kept.len() < 2 * super::super::QUOTE_CHARS);
     }
 
     #[test]

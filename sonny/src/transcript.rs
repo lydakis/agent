@@ -637,8 +637,20 @@ fn news(text: &str) -> Option<Vec<String>> {
             // "- shop.fix: turn:shop.fix/5 failed, asked by you", and from
             // the judge "- shop.fix: turn:shop.fix/5, turn failed (why; todo)"
             let status = turn.split_once(' ').map_or("", |(_, s)| s);
-            let status = status.split([',', '(']).next().unwrap_or_default().trim();
-            parts.push(format!("{name} {status}"));
+            // A message in it: "the person wrote: \"…\"", "shop.api wrote
+            // in it", "3 messages in it since turn:…, from a, b".
+            if status.starts_with("the person wrote") {
+                parts.push(format!("you wrote in {name}"));
+            } else if let Some(who) = status.strip_suffix(" wrote in it") {
+                parts.push(format!("{who} wrote in {name}"));
+            } else if let Some((count, _)) = status.split_once(" messages in it")
+                && count.parse::<usize>().is_ok()
+            {
+                parts.push(format!("{count} messages in {name}"));
+            } else {
+                let status = status.split([',', '(']).next().unwrap_or_default().trim();
+                parts.push(format!("{name} {status}"));
+            }
         }
     }
     if memory {
@@ -1434,16 +1446,19 @@ mod tests {
             text(&super::prompt(told, None, 40)),
             ["↳ Task updates · shop.fix failed · shop…"]
         );
-        let note = "Task updates: what your tasks did since you last heard; the wait tool reads each turn by its handle.\n\
-             May need you:\n\
-             - shop.fix: turn:shop.fix/5, turn failed (stuck 0.91; send it a targeted correction)\n\
-             - shop.docs: turn:shop.docs/2, waits on the person's approval (not checked; look)\n\
+        let note = "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
+             Picked by your lookout:\n\
+             - shop.fix: turn:shop.fix/5, turn failed (interrupt 0.91; it cannot wait for your turn to end)\n\
+             In your tasks:\n\
+             - shop.docs: turn:shop.docs/2, the person wrote: \"Use tabs.\"\n\
+             - shop.api: turn:shop.api/4, shop.fix wrote in it\n\
+             - shop.web: turn:shop.web/3, 2 messages in it since turn:shop.web/1, from shop.fix, a trigger\n\
              - 1 more in the next note\n\
              A quoted message is the person's own words.";
         assert_eq!(
-            text(&super::prompt(note, None, 100)),
+            text(&super::prompt(note, None, 160)),
             [
-                "↳ Task updates · shop.fix turn failed · shop.docs waits on the person's approval · +1 more"
+                "↳ Task updates · shop.fix turn failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
             ]
         );
     }

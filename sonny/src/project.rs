@@ -43,6 +43,8 @@ pub struct Lead {
     /// The folder it is brought back to: it was moved elsewhere, and the
     /// next message it is sent moves it here.
     pub moving: Option<PathBuf>,
+    /// Made just now below another project's folder: that project's lead.
+    pub above: Option<String>,
 }
 
 /// The folder's own name reduced to name characters, the name of a
@@ -334,22 +336,17 @@ fn same_name(dir: &Path, name: &str) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    let root = match agent_client::policy::project_root(dir) {
-        Ok(Some((_, root))) => root,
-        _ => dir.to_owned(),
-    };
+    let root = dir
+        .canonicalize()
+        .map_err(|e| e.to_string())
+        .and_then(|dir| folder_of(&dir))
+        .unwrap_or_else(|_| dir.to_owned());
     default_name(&root).is_ok_and(|found| found == name)
 }
 
 /// The lead for `dir`, made first when the folder is not a project yet.
 pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Lead, String> {
-    let mut dir = dir.canonicalize().map_err(|e| e.to_string())?;
-    // Inside a project, wherever below its folder (or in a worktree of
-    // it), its lead, which works in that folder: made there first when
-    // missing, and brought back when moved.
-    if let Some((_, root)) = agent_client::policy::project_root(&dir).map_err(|e| e.to_string())? {
-        dir = root;
-    }
+    let dir = folder_of(&dir.canonicalize().map_err(|e| e.to_string())?)?;
     let project = default_name(&dir)?;
     let bot = format!("{project}.lead");
     if let Some(found) = find(client, &bot).await? {
@@ -369,6 +366,7 @@ pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Le
             bot,
             new: false,
             moving,
+            above: None,
         });
     }
     create(client, &dir, model).await?;
@@ -377,7 +375,76 @@ pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Le
         bot,
         new: true,
         moving: None,
+        above: above(&dir),
     })
+}
+
+/// The folder whose lead Sonny opens in `dir` (canonical): in a git
+/// repository, the nearest project in it, else the repository's top, so a
+/// subfolder such as `src` reaches the repository's lead, and a worktree
+/// its main checkout's; anywhere else `dir` itself, so every folder can
+/// have a lead, whatever project holds the folder above it. Either way,
+/// one with no project file of its own is the project's above it when
+/// that project keeps its subfolders. A task's folder under `~/.agent` is
+/// never a project's.
+fn folder_of(dir: &Path) -> Result<PathBuf, String> {
+    folder_in(dir, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn folder_in(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_owned()));
+    let folder = match agent_client::policy::checkout(dir) {
+        Some(top) => agent_client::policy::project_root(dir)
+            .map_err(|e| e.to_string())?
+            .map_or(top, |(_, root)| root),
+        None => dir.to_owned(),
+    };
+    let folder = claimed(&folder, home.as_deref())?.unwrap_or(folder);
+    if let Some(home) = home {
+        for kept in ["worktrees", "tasks"] {
+            let under = home.join(".agent").join(kept);
+            if let Some(task) = folder
+                .strip_prefix(&under)
+                .ok()
+                .and_then(|rest| rest.components().next())
+            {
+                let task = task.as_os_str().to_string_lossy();
+                return Err(format!(
+                    "task_folder: {} is in task {task}'s folder; run sonny in its project's \
+                     folder, or sonny --bot {task} for the task",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(folder)
+}
+
+/// The project folder above `folder` that keeps the folders below it as
+/// its own (`subfolders = "project"`), when `folder` has no project file:
+/// the nearest project above decides, looking no higher than the home
+/// folder.
+fn claimed(folder: &Path, home: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let file = agent_client::project::FILE;
+    if folder.join(file).is_file() {
+        return Ok(None);
+    }
+    for at in folder.ancestors().skip(1) {
+        if home == Some(at) {
+            break;
+        }
+        if at.join(file).is_file() {
+            let info = agent_client::project::read(at)?;
+            return Ok((info["subfolders"] == "project").then(|| at.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The lead of the project holding the folder above `dir`, when there is one.
+fn above(dir: &Path) -> Option<String> {
+    let (name, _) = agent_client::policy::project_root(dir.parent()?).ok()??;
+    Some(format!("{name}.lead"))
 }
 
 async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
@@ -676,6 +743,99 @@ mod tests {
         assert!(same_name(&two, "shop"));
         assert!(!same_name(&other, "shop"));
         assert!(!same_name(&base.join("gone/shop"), "shop"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn every_folder_outside_git_has_its_own_lead_and_a_repository_one() {
+        let base = std::env::temp_dir().join(format!("sonny-folder-of-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let (new, repo, bare) = (ws.join("new"), ws.join("repo"), ws.join("bare"));
+        for dir in [
+            &new,
+            &repo.join("src/deep"),
+            &bare.join("src"),
+            &ws.join(".agents"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(ws.join(".agents/project.toml"), "name = \"ws\"\n").unwrap();
+        let git = |dir: &Path| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        git(&repo);
+        git(&bare);
+        std::fs::create_dir_all(repo.join(".agents")).unwrap();
+        std::fs::write(repo.join(".agents/project.toml"), "name = \"repo\"\n").unwrap();
+        let home = base.join("home");
+        let at = |dir: &Path| folder_in(&dir.canonicalize().unwrap(), Some(&home)).unwrap();
+        let real = |dir: &Path| dir.canonicalize().unwrap();
+        // A new folder in the workspace is a project of its own, not the
+        // workspace's, and knows whose folder is above it.
+        assert_eq!(at(&new), real(&new));
+        assert_eq!(at(&ws), real(&ws));
+        assert_eq!(above(&real(&new)).as_deref(), Some("ws.lead"));
+        // In a repository, its project or its top, never a subfolder.
+        assert_eq!(at(&repo.join("src/deep")), real(&repo));
+        assert_eq!(at(&bare.join("src")), real(&bare));
+        assert_eq!(above(&real(&bare)).as_deref(), Some("ws.lead"));
+        // A task's folder under ~/.agent is no project's.
+        let task = home.join(".agent/tasks/ws.fix/sub");
+        std::fs::create_dir_all(&task).unwrap();
+        let error = folder_in(&task.canonicalize().unwrap(), Some(&home)).unwrap_err();
+        assert!(error.starts_with("task_folder: "), "{error}");
+        assert!(error.contains("sonny --bot ws.fix"), "{error}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_project_that_keeps_its_subfolders_is_their_lead() {
+        let base = std::env::temp_dir().join(format!("sonny-subfolders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (top, a) = (base.join("top"), base.join("top/a"));
+        let (pkg, own) = (a.join("src/pkg"), a.join("src/own"));
+        for dir in [&top, &a, &pkg, &own, &top.join("new")] {
+            std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        }
+        let file = |dir: &Path, text: &str| {
+            std::fs::write(dir.join(agent_client::project::FILE), text).unwrap()
+        };
+        file(&top, "name = \"top\"\n");
+        file(&a, "name = \"a\"\nsubfolders = \"project\"\n");
+        file(&own, "name = \"own\"\n");
+        for repo in [&pkg, &own] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        let home = base.join("home");
+        let at = |dir: &Path| folder_in(&dir.canonicalize().unwrap(), Some(&home)).unwrap();
+        let real = |dir: &Path| dir.canonicalize().unwrap();
+        // Below a, a plain folder and a repository without a project are a's.
+        assert_eq!(at(&a.join("src")), real(&a));
+        assert_eq!(at(&pkg), real(&a));
+        assert_eq!(at(&pkg.join("src")), real(&a));
+        // A project of its own stays one, and top keeps the default.
+        assert_eq!(at(&own), real(&own));
+        assert_eq!(at(&top.join("new")), real(&top.join("new")));
+        // The home folder's file says nothing about the folders below it.
+        let plain = home.join("plain");
+        std::fs::create_dir_all(home.join(".agents")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        file(&home, "name = \"me\"\nsubfolders = \"project\"\n");
+        assert_eq!(at(&plain), real(&plain));
         let _ = std::fs::remove_dir_all(&base);
     }
 

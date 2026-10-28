@@ -29,7 +29,19 @@ skills it writes name `"…/sonny" agent` wherever they would say
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
 Sonny in its `lead` role, with the folder's
-`.agents/project.toml` written when it had none.
+`.agents/project.toml` written when it had none. Every folder can have a
+lead: outside git, the folder Sonny opens in is its own project, whatever
+project holds the folder above it. In a git repository, Sonny opens the
+nearest project in that repository, else makes the repository's top one,
+so `src` reaches the repository's lead and a task's worktree its main
+checkout's; a subfolder of a repository is its own project once it has a
+file (`sonny project add DIR`). A project whose file says
+`subfolders = "project"` keeps the folders below it: Sonny opened in any of
+them that has no project file of its own, a repository among them, opens
+that project's lead (the nearest project above decides; the home folder's
+file never does). A lead made below another project's folder says which
+lead holds the folder above. Sonny refuses to make a lead in a task's own
+folder under `~/.agent`.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -261,13 +273,15 @@ PEER`, and in Rex opens a window following each detached job.
 
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. It tells a lead what its tasks
-did in one "Task updates" note, by the handles its wait tool reads them
-with, and steers it at once only for a message that redirects other tasks
-or work that collides with another task's; what else the judge picks, such
-as a stuck task or a result the person should hear, is flagged in the next
-note. It judges with `AGENT_JUDGE`, the approver's setting, else the lead's
-own model, and with the judge `off` sends the task updates alone. Any agent can
+subscribes each lead to its tasks. As soon as the lead rests, it tells it
+every message someone else wrote in its tasks and how each turn ended, in
+one "Task updates" note, by the handles its wait tool reads them with; the
+lead decides what matters. While the lead is mid-turn, a judge asks of each
+event only whether it cannot wait, and steers the lead at once if so. A
+turn a note started that ends with nothing to say stays folded under the
+note, with no sound. It judges with `AGENT_JUDGE`, the approver's setting,
+else the lead's own model, and with the judge `off` sends the task updates
+alone. Any agent can
 subscribe to more with `sonny lookout add` (other agents' tasks, bots by
 name, questions of its own), and `/lookout` lists what it watches; see
 [docs/LOOKOUT.md](../docs/LOOKOUT.md).
@@ -289,13 +303,16 @@ settings; `/verbose` again goes back to clean.
 
 Sonny owns the whole screen, as Codex does. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
-it; rows that arrive while you have scrolled back leave the view still,
-and PgDn or Enter takes you back to the latest. Copying needs no key held:
+it, older messages loading as you go past the first; rows that arrive
+while you have scrolled back leave the view still, and PgDn or Enter
+takes you back to the latest. Copying needs no key held:
 a drag selects and copies when you let go, a double click takes a word and
 a triple click its line, Ctrl+C copies a selection instead of
 interrupting, and Esc clears it. The copy is the text as written: a line
 wrapped over rows comes back as one line, without the bullets and indents
-Sonny drew around it. A click on a link opens it. `/fullscreen` switches
+Sonny drew around it. A click on a link opens it. Ctrl+F finds text in
+the conversation, from the newest place back: ↑ or Enter steps older, ↓
+newer, and Esc stops where you are. `/fullscreen` switches
 to inline, where Sonny writes into the terminal's own scrollback, and back;
 the choice is kept with the other settings.
 

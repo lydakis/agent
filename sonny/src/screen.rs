@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -102,12 +102,43 @@ pub struct Screen {
     /// drawn when they were found.
     links: Vec<(u16, u16, u16, String)>,
     linked: Option<(usize, usize, usize, Rect)>,
+    /// What Ctrl+F looks for, and where it is.
+    finding: Option<Finding>,
+    /// Counts each change to the rows shown, so what was found in them is
+    /// looked for again.
+    laid: usize,
+}
+
+/// The place found is to be picked again, the rows having been drawn anew.
+const AGAIN: usize = usize::MAX;
+
+/// The newest of `hits` that starts above `bottom`, else the newest.
+fn nearest(hits: &[(Spot, Spot)], bottom: usize) -> usize {
+    (hits.iter())
+        .rposition(|(start, _)| start.0 < bottom)
+        .unwrap_or(hits.len().saturating_sub(1))
+}
+
+/// Text looked for in the rows (Ctrl+F): each place it is, from the
+/// oldest, as the rows it starts and ends on, and the one shown.
+struct Finding {
+    query: String,
+    hits: Vec<(Spot, Spot)>,
+    at: usize,
+    laid: usize,
 }
 
 impl Screen {
     /// The conversation drawn again from the start, as a repaint does.
+    /// What is being found stays, looked for again in the rows drawn anew.
     pub fn clear(&mut self) {
+        let finding = self.finding.take().map(|finding| Finding {
+            at: AGAIN,
+            laid: usize::MAX,
+            ..finding
+        });
         *self = Self::default();
+        self.finding = finding;
     }
 
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
@@ -153,6 +184,22 @@ impl Screen {
     /// Back to the newest rows.
     pub fn latest(&mut self) {
         self.back = 0;
+    }
+
+    /// How many rows the view is up from the newest.
+    pub fn back(&self) -> usize {
+        self.back
+    }
+
+    /// The view `back` rows up from the newest, as it was before the rows
+    /// were drawn again.
+    pub fn hold(&mut self, back: usize) {
+        self.back = back;
+    }
+
+    /// The view is at the first row, and there is room for older ones.
+    pub fn at_top(&self) -> bool {
+        self.back >= self.most(self.area.height as usize) && self.rows.len() < KEEP
     }
 
     /// Up (`rows` > 0) or down the conversation.
@@ -201,11 +248,19 @@ impl Screen {
             self.relaid = 0;
             self.selection = None;
             self.linked = None;
+            self.laid += 1;
         }
         let before = self.shown.len();
+        self.laid += usize::from(self.wrapped < self.rows.len());
         for row in &self.rows[self.wrapped..] {
             let line = row.line.clone();
-            let rows = match line.width() <= width {
+            // A picture's row is cut at the edge, not wrapped into pieces:
+            // Kitty's placeholders, or one drawn in half blocks.
+            let picture = (line.spans.iter()).any(|span| {
+                span.content.starts_with(crate::image::PLACEHOLDER)
+                    || span.content.contains(['▀', '▄'])
+            });
+            let rows = match line.width() <= width || picture {
                 true => vec![line],
                 false => {
                     let rest = row.rest.clone().unwrap_or(Line::from("    "));
@@ -244,7 +299,121 @@ impl Screen {
             self.shown.drain(..gone);
             self.selection = None;
             self.linked = None;
+            self.laid += 1;
         }
+    }
+
+    /// Look for `query` in the rows, case aside unless it has a capital,
+    /// and show the newest place it is, at the bottom of the view or above.
+    pub fn find(&mut self, query: &str) {
+        let bottom = self.shown.len() - self.back.min(self.shown.len());
+        let hits = self.hits(query);
+        let at = nearest(&hits, bottom);
+        self.finding = Some(Finding {
+            query: query.to_owned(),
+            hits,
+            at,
+            laid: self.laid,
+        });
+        self.reveal();
+    }
+
+    /// The next place the text found is: older, or newer, round to the
+    /// other end past the last.
+    pub fn find_next(&mut self, older: bool) {
+        let Some(finding) = &mut self.finding else {
+            return;
+        };
+        let count = finding.hits.len();
+        if count == 0 {
+            return;
+        }
+        finding.at = match older {
+            true => (finding.at + count - 1) % count,
+            false => (finding.at + 1) % count,
+        };
+        self.reveal();
+    }
+
+    /// Stop finding, the view left where it is.
+    pub fn end_find(&mut self) {
+        self.finding = None;
+    }
+
+    /// Which place of how many the view shows, when finding.
+    pub fn found(&self) -> Option<(usize, usize)> {
+        let finding = self.finding.as_ref()?;
+        let count = finding.hits.len();
+        Some(((finding.at + 1).min(count), count))
+    }
+
+    /// The view moved so the place found is in it, midway if it was out.
+    fn reveal(&mut self) {
+        let Some(&(start, end)) = (self.finding.as_ref()).and_then(|f| f.hits.get(f.at)) else {
+            return;
+        };
+        let height = self.area.height as usize;
+        let bottom = self.shown.len() - self.back.min(self.shown.len());
+        if start.0 >= bottom.saturating_sub(height) && end.0 < bottom {
+            return;
+        }
+        let bottom = (start.0 + height.div_ceil(2)).min(self.shown.len());
+        self.back = (self.shown.len() - bottom).min(self.most(height));
+    }
+
+    /// Every place `query` is in the rows, read whole over the rows a line
+    /// was wrapped onto, without their leads.
+    fn hits(&self, query: &str) -> Vec<(Spot, Spot)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let fold = !query.chars().any(char::is_uppercase);
+        let query = match fold {
+            true => query.to_lowercase(),
+            false => query.to_owned(),
+        };
+        let mut hits = Vec::new();
+        // A line's text, and where each of its characters is drawn.
+        let (mut text, mut at) = (String::new(), Vec::<(usize, Spot, usize)>::new());
+        let mut look = |text: &mut String, at: &mut Vec<(usize, Spot, usize)>| {
+            for (from, found) in text.match_indices(&query) {
+                let cell = |byte| at.partition_point(|(b, _, _)| *b <= byte) - 1;
+                let start = at[cell(from)].1;
+                let (_, (row, column), wide) = at[cell(from + found.len() - 1)];
+                hits.push((start, (row, column + wide)));
+            }
+            text.clear();
+            at.clear();
+        };
+        for (row, shown) in self.shown.iter().enumerate() {
+            if shown.joins.is_none() {
+                look(&mut text, &mut at);
+            }
+            let cells = cells(&shown.line);
+            if cells
+                .iter()
+                .any(|g| g.starts_with(crate::image::PLACEHOLDER))
+            {
+                continue;
+            }
+            for (column, cell) in cells.iter().enumerate().skip(shown.joins.unwrap_or(0)) {
+                if cell.is_empty() {
+                    continue;
+                }
+                let wide = cells[column + 1..]
+                    .iter()
+                    .take_while(|next| next.is_empty())
+                    .count()
+                    + 1;
+                at.push((text.len(), (row, column), wide));
+                match fold {
+                    true => text.push_str(&cell.to_lowercase()),
+                    false => text.push_str(cell),
+                }
+            }
+        }
+        look(&mut text, &mut at);
+        hits
     }
 
     /// Draw the rows that fit `area` of `buf`: the newest, or those the
@@ -274,6 +443,43 @@ impl Screen {
             for x in *from..*to {
                 let cell = &mut buf[(x, *y)];
                 cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+            }
+        }
+        if let Some(finding) = &self.finding
+            && finding.laid != self.laid
+        {
+            let (query, at) = (finding.query.clone(), finding.at);
+            let hits = self.hits(&query);
+            self.finding = Some(Finding {
+                at: match at {
+                    AGAIN => nearest(&hits, bottom),
+                    at => at.min(hits.len().saturating_sub(1)),
+                },
+                query,
+                hits,
+                laid: self.laid,
+            });
+        }
+        if let Some(finding) = &self.finding {
+            for (i, (start, end)) in finding.hits.iter().enumerate() {
+                if end.0 < top || start.0 >= bottom {
+                    continue;
+                }
+                let style = match i == finding.at {
+                    true => Style::new().fg(Color::Black).bg(Color::Yellow),
+                    false => Style::new().fg(Color::Yellow).underlined(),
+                };
+                for row in start.0.max(top)..=end.0.min(bottom - 1) {
+                    let from = if row == start.0 { start.1 } else { 0 };
+                    let to = match row == end.0 {
+                        true => end.1,
+                        false => self.shown[row].line.width(),
+                    };
+                    let y = area.y + (row - top) as u16;
+                    for x in from..to.min(area.width as usize) {
+                        buf[(area.x + x as u16, y)].set_style(style);
+                    }
+                }
             }
         }
         if let Some(selection) = &self.selection {
@@ -903,6 +1109,99 @@ mod tests {
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 4).trim_end(), "row 20");
+    }
+
+    #[test]
+    fn find_shows_the_newest_place_and_steps_older() {
+        let lines: Vec<Line> = (0..30)
+            .map(|i| {
+                Line::from(format!(
+                    "row {i}{}",
+                    if i % 10 == 3 { " Needle" } else { "" }
+                ))
+            })
+            .collect();
+        let (mut screen, _) = screen(lines, 20, 5);
+        let area = Rect::new(0, 0, 20, 5);
+        screen.find("needle");
+        assert_eq!(screen.found(), Some((3, 3)));
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert!((0..5).any(|y| row(&buf, y).trim_end() == "row 23 Needle"));
+        screen.find_next(true);
+        assert_eq!(screen.found(), Some((2, 3)));
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        let y = (0..5)
+            .find(|y| row(&buf, *y).trim_end() == "row 13 Needle")
+            .unwrap();
+        assert_eq!(buf[(7, y)].bg, Color::Yellow);
+        // Typing on looks from where the view is.
+        screen.find("needle");
+        assert_eq!(screen.found(), Some((2, 3)));
+        // A capital asks for that case.
+        screen.find("NEEDLE");
+        assert_eq!(screen.found(), Some((0, 0)));
+        // Round from the oldest to the newest.
+        screen.find("Needle");
+        assert_eq!(screen.found(), Some((2, 3)));
+        screen.find_next(true);
+        screen.find_next(true);
+        assert_eq!(screen.found(), Some((3, 3)));
+    }
+
+    #[test]
+    fn find_goes_on_in_the_rows_drawn_again() {
+        let lines = |from| (from..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines(10), 20, 5);
+        screen.find("row 1");
+        assert_eq!(screen.found(), Some((10, 10)));
+        screen.clear();
+        screen.push(lines(0));
+        let area = Rect::new(0, 0, 20, 5);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert_eq!(screen.found(), Some((11, 11)));
+    }
+
+    #[test]
+    fn find_reads_a_line_whole_over_its_rows() {
+        let text = "The stub answers after the 2s timeout, so the test reads an empty cart.";
+        let reply = crate::transcript::reply(text, 80);
+        let (mut screen, _) = screen(reply, 30, 10);
+        screen.find("test reads an");
+        assert_eq!(screen.found(), Some((1, 1)));
+        let (start, end) = screen.finding.as_ref().unwrap().hits[0];
+        assert!(end.0 > start.0);
+        assert_eq!(screen.text(start, end), "test reads an");
+    }
+
+    #[test]
+    fn the_view_holds_while_older_rows_are_drawn_above() {
+        let lines: Vec<Line> = (10..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 20, 5);
+        screen.page(true);
+        screen.page(true);
+        assert!(screen.at_top());
+        let back = screen.back();
+        screen.clear();
+        screen.hold(back);
+        screen.push((0..20).map(|i| Line::from(format!("row {i}"))).collect());
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "row 10");
+        assert!(!screen.at_top());
+    }
+
+    #[test]
+    fn a_pictures_rows_are_cut_at_the_edge_not_wrapped() {
+        let cells: String = std::iter::repeat_n(crate::image::PLACEHOLDER, 30).collect();
+        let picture = Line::from(vec![Span::raw("  "), Span::raw(cells)]);
+        let (mut kitty, _) = screen(vec![picture.clone(), picture], 20, 5);
+        assert_eq!(kitty.height(20), 2);
+        let blocks = Line::from("  ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄");
+        let (mut banner, _) = screen(vec![blocks], 20, 5);
+        assert_eq!(banner.height(20), 1);
     }
 
     #[test]
