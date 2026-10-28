@@ -1,6 +1,0 @@
-{
-  "git": {
-    "sha1": "a5db5949c5fec976f27176be93751ee89aaf467d"
-  },
-  "path_in_vcs": "crates/sandfs-git"
-}
