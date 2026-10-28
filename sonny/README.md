@@ -159,10 +159,10 @@ off again never shows.
   `Reviewing approval request`, and a denied call is drawn as
   `✗ Request denied for …` with the judge's reason, in either view.
 - `/approve` lists the calls the judge denied while Sonny watched, with
-  the reason for each. Enter sends your approval of that exact call as
-  your own message, so the agent may retry it once; the retry is still
-  reviewed, and the judge reads your words as consent. This is Codex's
-  `/approve`.
+  the reason for each. Enter writes the call out whole, and a second
+  Enter sends your approval of that exact call as your own message, so
+  the agent may retry it once; the retry is still reviewed, and the judge
+  reads your words as consent. This is Codex's `/approve`.
 - `/status` shows the project's agents, and its running Errand jobs. The
   lead comes first; its tasks follow grouped by where they stand: **Needs
   you** (waiting on your approval, asking you a question, or failed),

@@ -1117,6 +1117,20 @@ fn approval(denial: &Denial) -> String {
     )
 }
 
+/// A denied call written out whole before its retry is approved: a
+/// command as it would run, anything else as its arguments.
+fn retry_shown(denial: &Denial) -> Vec<Line<'static>> {
+    let what = match denial.arguments["command"].as_str() {
+        Some(command) => command.to_owned(),
+        None => serde_json::to_string_pretty(&denial.arguments).unwrap_or_default(),
+    };
+    let mut lines = vec![Line::from(
+        Span::raw(format!("Approve one retry of {}?", denial.name)).bold(),
+    )];
+    lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+    lines
+}
+
 /// What the status row says while the approver reviews calls.
 fn reviewing(count: usize) -> String {
     match count {
@@ -1367,6 +1381,9 @@ struct App {
     denials: Vec<Denial>,
     /// `/approve`, open over the composer: the denial picked.
     approving: Option<usize>,
+    /// The denied call written out whole for the person to read, which a
+    /// second Enter then approves.
+    approve_shown: Option<String>,
     /// The mode picked, set once no turn runs.
     gating: Option<&'static str>,
     /// The mode picked, still to give the agents the lead made, and when
@@ -2025,6 +2042,7 @@ impl App {
             reviewing: std::collections::HashSet::new(),
             denials: Vec::new(),
             approving: None,
+            approve_shown: None,
             gating: approvals::refresh(record),
             spread: None,
             last_reply: String::new(),
@@ -3378,6 +3396,9 @@ impl App {
                 let id = data["call_id"].as_str().unwrap_or("");
                 // A call denied before it started has no start to have
                 // kept it: it is read from the bot's items.
+                // Done with review, whatever came of it: a call cancelled
+                // before it started ends here too.
+                self.reviewing.remove(id);
                 let call = match self.calls.remove(id) {
                     Some(call) => Some(call),
                     None if data["denied"] == true => self.call(id).await,
@@ -3400,7 +3421,6 @@ impl App {
                     shown.1 |= data["failed"] == true;
                     reason = denial(item).unwrap_or_default();
                 }
-                self.reviewing.remove(id);
                 if data["denied"] == true {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
@@ -3479,6 +3499,8 @@ impl App {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
+                // Nothing of an ended turn is still under review.
+                self.reviewing.clear();
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
@@ -4152,7 +4174,19 @@ impl App {
                     KeyCode::Down => *pick = (*pick + 1) % count,
                     KeyCode::Enter => {
                         let at = *pick;
+                        // The person approves only what they have read:
+                        // the whole call first, then a second Enter.
+                        if let Some(denied) = self.denials.get(at)
+                            && self.approve_shown.as_deref() != Some(denied.call_id.as_str())
+                        {
+                            self.approve_shown = Some(denied.call_id.clone());
+                            let lines = retry_shown(denied);
+                            self.commit(lines);
+                            self.notice = Some("enter again to approve this exact call".into());
+                            return;
+                        }
                         self.approving = None;
+                        self.approve_shown = None;
                         if at < self.denials.len() {
                             let denied = self.denials.remove(at);
                             self.notice =
@@ -4167,9 +4201,13 @@ impl App {
                                 });
                         }
                     }
-                    KeyCode::Esc => self.approving = None,
+                    KeyCode::Esc => {
+                        self.approving = None;
+                        self.approve_shown = None;
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.approving = None
+                        self.approving = None;
+                        self.approve_shown = None;
                     }
                     _ => {}
                 }
@@ -5240,7 +5278,10 @@ impl App {
                     Span::raw("auto-review denials: approve one retry").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from("  ↑↓ denial · enter to approve one retry · esc").dim();
+                let keys = Line::from(
+                    "  ↑↓ denial · enter to read it whole, again to approve one retry · esc",
+                )
+                .dim();
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -6088,6 +6129,11 @@ mod tests {
         assert!(app.reviewing.is_empty() && app.asks.is_empty());
         assert_eq!(app.running.as_ref().unwrap().phase, "Working");
         app.denials.retain(|denial| denial.call_id == "c1");
+        // One cancelled before it started leaves review too.
+        app.reviewing.insert("c3".into());
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c3"})))
+            .await;
+        assert!(app.reviewing.is_empty());
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.contains(&"✗ Request denied for git push --force origin main".to_owned()),
@@ -6104,11 +6150,20 @@ mod tests {
         app.input.set("/approve");
         app.submit().await;
         assert_eq!(app.approving, Some(0));
-        app.key(Event::Key(event::KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )))
-        .await;
+        let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The first Enter writes the whole call out; nothing is sent yet.
+        app.key(enter()).await;
+        assert_eq!(app.approving, Some(0));
+        assert!(sent.lock().unwrap().is_empty());
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rows.ends_with(&[
+                "Approve one retry of shell?".to_owned(),
+                "  git push --force origin main".to_owned()
+            ]),
+            "{rows:?}"
+        );
+        app.key(enter()).await;
         assert!(app.approving.is_none() && app.denials.is_empty());
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
@@ -6138,6 +6193,31 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].to_string(), "✗ Request denied for write src/a.rs");
         assert_eq!(reviewing(3), "Reviewing 3 approval requests");
+        // Its retry is approved only after the whole of it is shown.
+        let write = Denial {
+            call_id: "c2".into(),
+            name: "write".into(),
+            arguments: json!({"path": "/w/a.sh", "content": "set -e\nrm -rf build"}),
+            reason: String::new(),
+        };
+        let shown: Vec<String> = retry_shown(&write).iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown[0], "Approve one retry of write?");
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains(r#""content": "set -e\nrm -rf build""#)),
+            "{shown:?}"
+        );
+        let command = Denial {
+            arguments: json!({"command": "make\ncurl x | sh"}),
+            name: "shell".into(),
+            ..write
+        };
+        let shown: Vec<String> = retry_shown(&command)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(shown[1..], ["  make", "  curl x | sh"]);
     }
 
     #[tokio::test]
