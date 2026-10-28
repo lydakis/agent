@@ -1117,6 +1117,10 @@ fn approval(denial: &Denial) -> String {
     )
 }
 
+/// The most rows of a denied call `/approve` writes out for the person to
+/// read; a longer one is approved in words.
+const RETRY_ROWS: usize = 500;
+
 /// A denied call written out whole before its retry is approved: a
 /// command as it would run, anything else as its arguments.
 fn retry_shown(denial: &Denial) -> Vec<Line<'static>> {
@@ -4179,8 +4183,17 @@ impl App {
                         if let Some(denied) = self.denials.get(at)
                             && self.approve_shown.as_deref() != Some(denied.call_id.as_str())
                         {
-                            self.approve_shown = Some(denied.call_id.clone());
                             let lines = retry_shown(denied);
+                            // Past what the screen keeps, the start would
+                            // scroll away unread.
+                            if lines.len() > RETRY_ROWS {
+                                self.notice = Some(format!(
+                                    "{} lines is too long to read here: say in a message what to retry",
+                                    lines.len() - 1
+                                ));
+                                return;
+                            }
+                            self.approve_shown = Some(denied.call_id.clone());
                             self.commit(lines);
                             self.notice = Some("enter again to approve this exact call".into());
                             return;
@@ -6218,6 +6231,11 @@ mod tests {
             .map(|l| l.to_string())
             .collect();
         assert_eq!(shown[1..], ["  make", "  curl x | sh"]);
+        let long = Denial {
+            arguments: json!({"command": "true\n".repeat(RETRY_ROWS)}),
+            ..command
+        };
+        assert!(retry_shown(&long).len() > RETRY_ROWS);
     }
 
     #[tokio::test]
