@@ -3054,6 +3054,8 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
+        answered_by: None,
+        expire_ms: None,
     };
     let declared = [react.clone()];
     let (lead, _) = db

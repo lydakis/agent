@@ -138,8 +138,9 @@ impl Tool {
 
 /// A tool a client declares on a bot: shown to the model beside the
 /// daemon's own, never run. A call that fits its parameters is recorded
-/// with `result` at once; what it means is the client's, which reads the
-/// call from events and history.
+/// with `result` at once, or, when a client answers the tool, with the
+/// answer that client gives; what it means is the client's, which reads
+/// the call from events and history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Declared {
@@ -150,13 +151,35 @@ pub struct Declared {
     /// What the model reads as the call's result.
     #[serde(default = "declared_result")]
     pub result: String,
+    /// The tag of the client that answers a call, as a gate names its
+    /// approver: the call waits for its `tool_result` instead of taking
+    /// `result`. The daemon never reads the tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    /// How long an answered call waits for its answer, from its start,
+    /// before it ends `tool_unserved`; `ANSWER_EXPIRE_MS` when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_ms: Option<u64>,
 }
 fn declared_result() -> String {
     "ok".into()
 }
+impl Declared {
+    /// Until when a call that started at `started_ms` waits for its
+    /// answer, for a tool a client answers.
+    pub fn answer_by(&self, started_ms: u64) -> Option<u64> {
+        self.answered_by.as_ref()?;
+        Some(started_ms + self.expire_ms.unwrap_or(ANSWER_EXPIRE_MS))
+    }
+}
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 16;
 pub const DECLARED_BYTES: usize = 64 * 1024;
+/// How long an answered call waits by default, and at most.
+pub const ANSWER_EXPIRE_MS: u64 = 60_000;
+pub const MAX_ANSWER_EXPIRE_MS: u64 = 3_600_000;
+/// The most bytes an answer's output or detail may take.
+pub const ANSWER_BYTES: usize = 64 * 1024;
 
 /// A bot's declared tools must be few, small, named apart from each other
 /// and from the daemon's own tools, and take an object of arguments.
@@ -200,6 +223,43 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                 "invalid_declare",
                 format!("{name}: parameters must be an object schema"),
             );
+        }
+        match &tool.answered_by {
+            Some(tag) => {
+                let named = !tag.is_empty()
+                    && tag.len() <= 64
+                    && tag
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+                if !named {
+                    return fail_with(
+                        "invalid_declare",
+                        format!("{name}: answered_by is 1 to 64 letters, digits, _, - or ."),
+                    );
+                }
+                if tool.result != declared_result() {
+                    return fail_with(
+                        "invalid_declare",
+                        format!("{name}: an answered tool takes its client's answer, not a result"),
+                    );
+                }
+                if tool
+                    .expire_ms
+                    .is_some_and(|ms| ms == 0 || ms > MAX_ANSWER_EXPIRE_MS)
+                {
+                    return fail_with(
+                        "invalid_declare",
+                        format!("{name}: expire_ms must be 1 to {MAX_ANSWER_EXPIRE_MS}"),
+                    );
+                }
+            }
+            None if tool.expire_ms.is_some() => {
+                return fail_with(
+                    "invalid_declare",
+                    format!("{name}: expire_ms goes with answered_by"),
+                );
+            }
+            None => {}
         }
     }
     Ok(())
@@ -613,7 +673,7 @@ impl ReadSource {
 }
 
 /// Model-facing result text plus any full outputs that were truncated.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
