@@ -62,6 +62,9 @@ struct Said {
     turn: i64,
     from: String,
     words: Option<String>,
+    /// For the person's: how many they wrote in the task since the lead
+    /// last did, this one included.
+    nth: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -180,6 +183,9 @@ pub struct Updates {
     asked: Option<Instant>,
     memory_seen: Option<HashMap<String, u64>>,
     opened: u64,
+    /// The turns of the person's messages in each task since the lead last
+    /// wrote there: one after another, they are correcting it.
+    running: HashMap<String, Vec<i64>>,
 }
 
 fn now_ms() -> u64 {
@@ -208,6 +214,7 @@ impl Updates {
             asked: None,
             memory_seen: None,
             opened: now_ms(),
+            running: HashMap::new(),
         }
     }
 
@@ -462,15 +469,34 @@ impl Updates {
         // Only what a note quotes is kept.
         let line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let words = words.map(|words| line(&super::cut(&line(words), super::QUOTE_CHARS)));
+        let mut nth = 0;
+        if words.is_some() {
+            let turns = self.running.entry(name.to_owned()).or_default();
+            if !turns.contains(&turn) {
+                turns.push(turn);
+            }
+            nth = turns.iter().position(|t| *t == turn).map_or(0, |n| n + 1);
+            // Past a few, how many no longer matters.
+            if turns.len() > 16 {
+                turns.remove(0);
+            }
+        }
         let said = Said {
             turn,
             from: from.to_owned(),
             words,
+            nth,
         };
         self.news_of(name).merge(News {
             said: vec![said],
             ..News::default()
         });
+    }
+
+    /// The lead wrote in a task: the person's next message there starts a
+    /// new run.
+    pub fn lead_wrote(&mut self, name: &str) {
+        self.running.remove(name);
     }
 
     fn tell(
@@ -857,6 +883,18 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
 /// What was written in a task, as the note says it: each of the person's
 /// messages quoted, unless the note quoted the same words for another task
 /// already, and everyone else's in one line by its latest turn.
+/// 2nd, 3rd, 4th, as a note counts the person's messages.
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<Line> {
     let mut lines = Vec::new();
     let line = |turn: i64, text: String, many: bool| Line {
@@ -875,6 +913,10 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
         let handle = format!("turn:{name}/{}", message.turn);
         let text = match quoted.get(words) {
             Some(first) => format!("- {name}: {handle}, the person wrote the same as in {first}"),
+            None if message.nth > 1 => format!(
+                "- {name}: {handle}, the person wrote, their {} message in it since you last wrote there: \"{words}\"",
+                ordinal(message.nth)
+            ),
             None => format!("- {name}: {handle}, the person wrote: \"{words}\""),
         };
         quoted.entry(words.clone()).or_insert(handle);
@@ -1126,6 +1168,34 @@ mod tests {
         assert_eq!(quoted, PENDING);
         let kept = said.last().and_then(|s| s.words.as_ref()).unwrap();
         assert!(kept.len() < 2 * super::super::QUOTE_CHARS);
+    }
+
+    #[test]
+    fn the_person_writing_again_since_the_lead_is_counted() {
+        let mut updates = fleet();
+        updates.said("shop.fix", 1, "the person", Some("strings"));
+        updates.said("shop.fix", 2, "the person", Some("no, numbers"));
+        updates.said("shop.fix", 3, "shop.api", None);
+        updates.said("shop.fix", 4, "the person", Some("then strings"));
+        let texts: Vec<String> = updates.take().items.into_iter().map(|l| l.text).collect();
+        assert_eq!(
+            texts[..3],
+            [
+                "- shop.fix: turn:shop.fix/1, the person wrote: \"strings\"",
+                "- shop.fix: turn:shop.fix/2, the person wrote, their 2nd message in it since you last wrote there: \"no, numbers\"",
+                "- shop.fix: turn:shop.fix/4, the person wrote, their 3rd message in it since you last wrote there: \"then strings\"",
+            ]
+        );
+        // Once the lead writes there, the count starts again.
+        updates.lead_wrote("shop.fix");
+        updates.said("shop.fix", 6, "the person", Some("thanks"));
+        let told = updates.take();
+        assert_eq!(
+            told.items[0].text,
+            "- shop.fix: turn:shop.fix/6, the person wrote: \"thanks\""
+        );
+        assert_eq!(super::ordinal(11), "11th");
+        assert_eq!(super::ordinal(22), "22nd");
     }
 
     #[test]
