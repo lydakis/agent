@@ -473,18 +473,8 @@ impl Screen {
             // The cell under the mouse is selected too.
             Unit::Cell => end.1 = (end.1 + 1).min(self.shown[end.0].line.width()),
             Unit::Word => {
-                start.1 = self.word(start, true);
-                end.1 = self.word(end, false);
-                // A word cut at a row's end goes on in the row below.
-                while start.0 > 0 && self.cut(start.0) && self.leads(start) {
-                    let above = start.0 - 1;
-                    start = (above, self.word((above, self.width), true));
-                }
-                while self.cut(end.0 + 1) && self.ends(end.0) {
-                    let below = end.0 + 1;
-                    let lead = self.shown[below].joins.unwrap_or(0);
-                    end = (below, self.word((below, lead), false));
-                }
+                start = self.word(start, true);
+                end = self.word(end, false);
             }
             Unit::Line => {
                 while start.0 > 0 && self.shown[start.0].joins.is_some() {
@@ -506,55 +496,77 @@ impl Screen {
             .is_some_and(|shown| shown.line.alignment == Some(crate::transcript::CUT))
     }
 
-    /// Nothing but the row's lead is before `column`.
-    fn leads(&self, (row, column): Spot) -> bool {
-        let cells = cells(&self.shown[row].line);
-        cells[..column.min(cells.len())]
-            .iter()
-            .all(|g| g.trim().is_empty())
-    }
-
-    /// The row's last cell is part of a word.
-    fn ends(&self, row: usize) -> bool {
-        cells(&self.shown[row].line)
-            .last()
-            .is_some_and(|g| !g.trim().is_empty())
-    }
-
     /// Where the word at `spot` starts, or ends: a run without spaces, so
-    /// a path or an address is one word, less the punctuation around it.
-    fn word(&self, (row, column): Spot, starts: bool) -> usize {
-        let cells = cells(&self.shown[row].line);
-        let word = |at: usize| cells.get(at).is_some_and(|g| !g.trim().is_empty());
-        let around = |at: usize, set: &str| {
-            cells
-                .get(at)
-                .is_some_and(|g| !g.is_empty() && set.contains(g.as_str()))
-        };
-        let mut at = column.min(cells.len());
-        if starts {
-            while at > 0 && word(at - 1) {
-                at -= 1;
+    /// a path or an address is one word, a word cut over rows whole, less
+    /// the punctuation around it.
+    fn word(&self, (row, column): Spot, starts: bool) -> Spot {
+        let row_cells = |r: usize| cells(&self.shown[r].line);
+        let word = |g: &String| !g.trim().is_empty();
+        // The word's cells, in order, and how many are before `column`.
+        let mut before: Vec<(Spot, String)> = Vec::new();
+        let (mut r, mut here) = (row, row_cells(row));
+        let mut c = column.min(here.len());
+        loop {
+            while c > 0 && word(&here[c - 1]) {
+                c -= 1;
+                before.push(((r, c), here[c].clone()));
             }
-            while word(at) && around(at, "(\"'[`<") && at < column {
-                at += 1;
+            // Only the row's lead before it, in a row a word was cut onto.
+            if r == 0 || !self.cut(r) || here[..c].iter().any(word) {
+                break;
             }
-        } else {
-            while word(at) {
-                at += 1;
-            }
-            let first = self.word((row, column), true);
-            // A closing bracket the word opens stays: `len(values)`.
-            let opened = |at: usize, open: &str| cells[first..at].iter().any(|g| g == open);
-            while at > column + 1
-                && around(at - 1, ".,;:!?)\"']`>")
-                && !(around(at - 1, ")") && opened(at - 1, "("))
-                && !(around(at - 1, "]") && opened(at - 1, "["))
-            {
-                at -= 1;
+            r -= 1;
+            here = row_cells(r);
+            c = here.len();
+            if !here.last().is_some_and(word) {
+                break;
             }
         }
-        at
+        before.reverse();
+        let clicked = before.len();
+        let mut cells = before;
+        let (mut r, mut here) = (row, row_cells(row));
+        let mut c = column.min(here.len());
+        loop {
+            while c < here.len() && word(&here[c]) {
+                cells.push(((r, c), here[c].clone()));
+                c += 1;
+            }
+            if c < here.len() || !self.cut(r + 1) {
+                break;
+            }
+            r += 1;
+            here = row_cells(r);
+            c = self.shown[r].joins.unwrap_or(0);
+        }
+        let is = |at: usize, set: &str| set.contains(cells[at].1.as_str());
+        let (mut first, mut last) = (0, cells.len());
+        while first < clicked && is(first, "(\"'[`<") {
+            first += 1;
+        }
+        // A closing bracket the word opens stays: `len(values)`.
+        let opened = |end: usize, open: &str| cells[first..end].iter().any(|(_, g)| g == open);
+        while last > clicked + 1
+            && is(last - 1, ".,;:!?)\"']`>")
+            && !(is(last - 1, ")") && opened(last - 1, "("))
+            && !(is(last - 1, "]") && opened(last - 1, "["))
+        {
+            last -= 1;
+        }
+        match starts {
+            true => cells.get(first).map_or((row, column), |(spot, _)| *spot),
+            false if last > clicked => {
+                let ((r, c), _) = cells[last - 1];
+                // A wide character's second column goes with it.
+                let here = row_cells(r);
+                let mut end = c + 1;
+                while here.get(end).is_some_and(|g| g.is_empty()) {
+                    end += 1;
+                }
+                (r, end)
+            }
+            false => (row, column),
+        }
     }
 
     /// The text from `start` to `end`: rows a line was wrapped onto join
@@ -814,6 +826,23 @@ mod tests {
         let (screen, buf) = screen(reply, 80, 5);
         assert_eq!(screen.shown.len(), 1);
         assert_eq!(row(&buf, 0).trim_end(), format!("• {text}"));
+    }
+
+    #[test]
+    fn a_word_cut_over_rows_keeps_the_bracket_it_opens() {
+        let word = "len(abcdefghijklmnopqrstuvwxyz)";
+        let lines = crate::transcript::wrap(
+            Line::from(format!("{word}.")),
+            20,
+            Span::raw(""),
+            Span::raw(""),
+        );
+        let (mut screen, _) = screen(lines, 20, 5);
+        for _ in 0..2 {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 0));
+        }
+        assert_eq!(screen.selected().as_deref(), Some(word));
     }
 
     #[test]
