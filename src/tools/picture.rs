@@ -20,16 +20,20 @@ const MOST_PIXELS: u64 = 64 << 20;
 
 /// `read`, in a blocking worker and one picture at a time: decoding and
 /// scaling are CPU work that would hold up every bot on the daemon's thread,
-/// and each one can take hundreds of megabytes while it runs.
+/// and each one can take hundreds of megabytes while it runs. The worker
+/// holds the turn until it is done, even when its caller is interrupted.
 pub async fn read_apart(bytes: Vec<u8>) -> Result<Option<(Image, String)>> {
     static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let _turn = ONE
+    let turn = ONE
         .acquire()
         .await
         .map_err(|_| Error::new("invalid_image"))?;
-    tokio::task::spawn_blocking(move || read(&bytes))
-        .await
-        .map_err(|_| Error::new("invalid_image"))?
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        read(&bytes)
+    })
+    .await
+    .map_err(|_| Error::new("invalid_image"))?
 }
 
 /// The picture an image file holds, with a line for the model on what it
