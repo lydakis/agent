@@ -1242,6 +1242,12 @@ impl Service {
         self.live = false;
         self.resume = self.cursor.or(self.resume);
         let (done, mut results) = tokio::sync::mpsc::channel(64);
+        // Checks a dropped connection left under way answer the old
+        // channel, never this one: none is under way here yet.
+        for lookout in self.lookouts.values_mut() {
+            lookout.checking = 0;
+            lookout.judging = 0;
+        }
         // Often enough for a note whose news has settled; subscription
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);

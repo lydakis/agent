@@ -74,7 +74,14 @@ class Failed(Exception):
 
 
 def key(row):
-    return (row['task'], row['turn'], row['kind'])
+    """One event as one subscriber saw it: two leads watching a task each
+    get their own rehearsal."""
+    return (row.get('lead'), row['task'], row['turn'], row['kind'])
+
+
+def event(k):
+    """The event alone, as labels name it."""
+    return k[1:]
 
 
 def cut(text, most):
@@ -282,9 +289,9 @@ def run(args):
                 bands.setdefault(key(row), row)
     if args.labels:
         wanted = set(labelled(args.labels, args.old))
-        rows = {k: r for k, r in rows.items() if k in wanted}
+        rows = {k: r for k, r in rows.items() if event(k) in wanted}
     if 'today' in args.arms.split(','):
-        missing = sum(k not in bands for k in rows)
+        missing = sum(k not in bands and (None, *event(k)) not in bands for k in rows)
         print(f'{missing} of {len(rows)} events have no band: today sends them as no judge picked them',
               file=sys.stderr)
     arms = args.arms.split(',')
@@ -292,7 +299,7 @@ def run(args):
     try:
         for row in load(args.out):
             if 'failed' not in row:
-                done.add((row['task'], row['turn'], row['kind'], row['arm']))
+                done.add((*key(row), row['arm']))
     except FileNotFoundError:
         pass
     work = []
@@ -300,7 +307,9 @@ def run(args):
         for arm in arms:
             if (*k, arm) in done:
                 continue
-            note = today(row, bands.get(k)) if arm == 'today' else every(row)
+            # A replay from before rows named their lead matches any lead.
+            band = bands.get(k, bands.get((None, *event(k))))
+            note = today(row, band) if arm == 'today' else every(row)
             work.append((row, arm, note, n))
     unsent = [w for w in work if w[2] is None]
     work = [w for w in work if w[2] is not None]
@@ -369,7 +378,7 @@ def grade_one(socket_path, model, turn, label, event, n):
 def labelled(path, old_path):
     """Labels by task, turn and kind; those keyed by `n` through the replay
     they were made for."""
-    old = {r['n']: key(r) for r in load(old_path)} if old_path else {}
+    old = {r['n']: event(key(r)) for r in load(old_path)} if old_path else {}
     labels = {}
     for label in load(path):
         k = (label['task'], label['turn'], label['kind']) if 'task' in label else old.get(label.get('n'))
@@ -387,9 +396,9 @@ def grade(args):
     work = []
     for n, turn in enumerate(load(args.turns)):
         k = key(turn)
-        if 'failed' in turn or k not in labels:
+        if 'failed' in turn or event(k) not in labels:
             continue
-        work.append((turn, labels[k], events.get(k, {'task': turn['task'], 'kind': turn['kind']}), n))
+        work.append((turn, labels[event(k)], events.get(k, {'task': turn['task'], 'kind': turn['kind']}), n))
     print(f'{len(work)} turns to grade', file=sys.stderr)
     with open(args.out, 'w') as sink, ThreadPoolExecutor(args.jobs) as pool:
         # A note never sent left the lead doing nothing.
