@@ -1272,6 +1272,8 @@ struct App {
     replies: Vec<(i64, String)>,
     /// `/react`'s list is open, at this reply from the newest.
     reacting: Option<usize>,
+    /// What Ctrl+F looks for on the full screen, while it does.
+    finding: Option<String>,
     /// The reply `/react` picked, which the next emoji sent answers.
     react_to: Option<(i64, String)>,
     /// The turn of the last reaction sent, whose attaching says nothing.
@@ -1303,6 +1305,12 @@ struct App {
     repaint: bool,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
+    /// The node before it, while the bot has older ones.
+    older: Option<i64>,
+    /// The full screen was scrolled past its first row: older items are
+    /// read, and the view held where it was while all is drawn again.
+    want_older: bool,
+    hold_view: bool,
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
@@ -1951,6 +1959,7 @@ impl App {
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
             reacting: None,
+            finding: None,
             react_to: None,
             reaction_turn: None,
             declare: None,
@@ -1964,6 +1973,9 @@ impl App {
             down: false,
             repaint: false,
             first_node: None,
+            older: None,
+            want_older: false,
+            hold_view: false,
             verbose: false,
             instruct: None,
             move_to: None,
@@ -2135,6 +2147,9 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
+            if std::mem::take(&mut self.want_older) {
+                self.older().await;
+            }
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && self.watch.is_none() && self.side.is_none()
             {
@@ -2386,7 +2401,11 @@ impl App {
             own_screen(!full());
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
+        let back = self.screen.back();
         self.screen.clear();
+        if std::mem::take(&mut self.hold_view) {
+            self.screen.hold(back);
+        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2415,6 +2434,36 @@ impl App {
             None => self.history().await,
         }
         Ok(())
+    }
+
+    /// The page of items before the oldest drawn, read by drawing the
+    /// conversation again from there once idle.
+    async fn older(&mut self) {
+        let Some(from) = self.older else {
+            return;
+        };
+        let asked = json!({"bot": self.bot, "from": from, "limit": HISTORY_ITEMS});
+        let page = match self.client.request("history_nodes", asked).await {
+            Ok(page) => page,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                return;
+            }
+        };
+        let Some(oldest) = (page["nodes"].as_array())
+            .and_then(|nodes| nodes.last())
+            .and_then(|node| node["node"].as_i64())
+        else {
+            self.older = None;
+            return;
+        };
+        self.first_node = Some(oldest);
+        self.older = page["next_from"].as_i64();
+        self.hold_view = true;
+        self.repaint = true;
+        if self.running.is_some() {
+            self.notice = Some("older messages once this turn ends".into());
+        }
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -2659,6 +2708,10 @@ impl App {
             let Ok(page) = self.client.request("history_nodes", asked.clone()).await else {
                 return;
             };
+            // On attach, where older items start.
+            if !every {
+                self.older = page["next_from"].as_i64();
+            }
             for n in page["nodes"].as_array().into_iter().flatten() {
                 let Some(node) = n["node"].as_i64().filter(|node| *node > after) else {
                     continue;
@@ -3930,7 +3983,17 @@ impl App {
     /// the selection, and the keys that scroll. Whether it took `event`.
     fn full_screen(&mut self, event: &Event) -> bool {
         let key = match event {
+            // A paste while finding is more to find.
+            Event::Paste(text) if let Some(query) = &mut self.finding => {
+                query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
+                self.screen.find(query);
+                return true;
+            }
             Event::Mouse(mouse) => {
+                let up = mouse.kind == ratatui::crossterm::event::MouseEventKind::ScrollUp;
+                if up && self.screen.at_top() && self.older.is_some() {
+                    self.want_older = true;
+                }
                 match self.screen.mouse(*mouse) {
                     Some(screen::Action::Copy(text)) => self.copied(&text),
                     Some(screen::Action::Open(link)) => {
@@ -3945,16 +4008,52 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return false,
         };
-        let copy = key.code == KeyCode::Char('c')
-            && (key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::SUPER));
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let copy =
+            key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        if let Some(query) = &mut self.finding {
+            match key.code {
+                KeyCode::Esc => self.finding = None,
+                _ if copy => self.finding = None,
+                KeyCode::Up | KeyCode::Enter => self.screen.find_next(true),
+                KeyCode::Char('f' | 'p') if ctrl => self.screen.find_next(true),
+                KeyCode::Down => self.screen.find_next(false),
+                KeyCode::Char('n') if ctrl => self.screen.find_next(false),
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.screen.find(query);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    query.push(c);
+                    self.screen.find(query);
+                }
+                KeyCode::PageUp => self.page_up(),
+                KeyCode::PageDown => self.screen.page(false),
+                _ => {}
+            }
+            if self.finding.is_none() {
+                self.screen.end_find();
+            }
+            return true;
+        }
         match key.code {
+            // Over the composer, not over a list open on it.
+            KeyCode::Char('f')
+                if ctrl
+                    && self.picker.is_none()
+                    && self.choosing.is_none()
+                    && self.reacting.is_none() =>
+            {
+                self.screen.unselect();
+                self.finding = Some(String::new());
+                self.screen.find("");
+            }
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
             }
             KeyCode::Esc if self.screen.unselect() => {}
-            KeyCode::PageUp => self.screen.page(true),
+            KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.screen.page(false),
             // Sending goes back to the newest rows, where its answer comes.
             KeyCode::Enter => {
@@ -3964,6 +4063,14 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// A page up the full screen, or the page before its first row.
+    fn page_up(&mut self) {
+        if self.screen.at_top() && self.older.is_some() {
+            self.want_older = true;
+        }
+        self.screen.page(true);
     }
 
     /// `text` put on the clipboard, and said so.
@@ -5001,6 +5108,22 @@ impl App {
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(Paragraph::new(rows), area);
             }
+            if let Some(query) = &self.finding {
+                let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
+                frame.render_widget(Paragraph::new(line), composer);
+                frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
+                let place = match self.screen.found() {
+                    Some((_, 0)) if !query.is_empty() => "  not found · ".to_owned(),
+                    Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
+                    _ => "  ".to_owned(),
+                };
+                let keys = Line::from(vec![
+                    Span::raw(place),
+                    Span::raw("↑ or enter older · ↓ newer · esc").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
             if let Some(pick) = self.reacting {
                 // Newest at the bottom, nearest the composer, as they read.
                 let first = pick.saturating_sub(2);
@@ -5192,7 +5315,10 @@ impl App {
                 ])
             })
             .collect();
-        let keep = match self.choosing.is_some() || self.picker.is_some() || self.reacting.is_some()
+        let keep = match self.choosing.is_some()
+            || self.picker.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
         {
             true => 1,
             false => COMPOSER_ROWS,
