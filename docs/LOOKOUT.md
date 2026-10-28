@@ -117,8 +117,9 @@ The note names a subscription's answer as `deploys look-for 1 0.90` and
 says "do what your deploys look-for 1 says (your subscriptions tool lists
 it)", numbering each subscription's look-fors from 1: the
 subscriber's own words stay in its file, since the note reaches the
-approver as the person's. `/lookout` in Sonny lists the window's agent's
-subscriptions, and how many checks each asked for in the last day.
+approver as the person's. `/background` in Sonny lists the project's
+agents' subscriptions, with their triggers, and how many checks each asked
+for in the last day; `d` there removes one.
 
 ## Task updates
 
@@ -176,9 +177,11 @@ it and no sound. Anything the lead does write shows as any reply.
 
 ## The judge
 
-`--judge SPEC`, else `AGENT_JUDGE` (in the shell or `~/.agent/env`, the
+`--judge SPEC`, else `[judge] model` in `~/.agent/config.toml` (the
 approver's setting too), else the lead's own model, as the approver picks
 (`agent_client::judge`); no smaller model is guessed for a provider.
+`[judge] effort` sets a model judge's effort, as for the approver; unset,
+the model's own.
 `openai-decisions/MODEL` with `OPENAI_API_KEY` asks OpenAI's Decisions API
 (about $0.0002 a check with `gpt-6-luna`), and any other
 `provider/model` runs through the daemon on a fork of an idle, tool-less

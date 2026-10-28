@@ -46,6 +46,16 @@ pub(super) async fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The first `count` bytes of a file, or fewer when it is shorter.
+pub(super) async fn read_head(path: &Path, count: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    (open_regular(path, false).await?)
+        .take(count)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
+}
+
 pub(super) async fn write(path: &Path, content: &[u8]) -> Result<()> {
     let mut file = open_regular(path, true).await?;
     file.set_len(0).await?;

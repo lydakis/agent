@@ -320,6 +320,25 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
     std::fs::rename(&partial, &path).map_err(|e| e.to_string())
 }
 
+/// Remove the subscriber's subscription by that name: whether it had one.
+pub fn remove(store: &Path, subscriber: &str, name: &str) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read(store, subscriber);
+    drop_named(store, subscriber, &mut subs, name)
+}
+
+fn drop_named(
+    store: &Path,
+    subscriber: &str,
+    subs: &mut Vec<Sub>,
+    name: &str,
+) -> Result<bool, String> {
+    let before = subs.len();
+    subs.retain(|s| s.name != name);
+    write(store, subscriber, subs)?;
+    Ok(subs.len() < before)
+}
+
 /// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
 /// writes it, or `remove` one by name, then list them all. Adding one
 /// again changes nothing; one under a name in use that differs is
@@ -339,10 +358,7 @@ pub fn change(
     let mut subs = read(store, subscriber);
     let mut said = json!({});
     if let Some(name) = remove {
-        let before = subs.len();
-        subs.retain(|s| s.name != name);
-        said["removed"] = json!(subs.len() < before);
-        write(store, subscriber, &subs)?;
+        said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
     }
     if let Some(sub) = add {
         match subs.iter().find(|s| s.name == sub.name) {

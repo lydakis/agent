@@ -90,7 +90,7 @@ fn start() -> Value {
                     "description": "PROVIDER/MODEL, when the person asked for one; else the one this \
                         project's task rule names, else yours."},
                 "effort": {"type": "string", "minLength": 1,
-                    "description": "The task's effort level, with model."}
+                    "description": "The task's effort level."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
@@ -144,7 +144,7 @@ fn project() -> Value {
                 "threads_model": {"type": "string", "minLength": 1,
                     "description": "PROVIDER/MODEL for the project's tasks, when the person picked one."},
                 "threads_effort": {"type": "string", "minLength": 1,
-                    "description": "The tasks' effort level, with threads_model."},
+                    "description": "The tasks' effort level."},
                 "threads_in": {"type": "string", "enum": ["worktree", "project"],
                     "description": "project when the person wants every task to work in the project's \
                         folder itself."}

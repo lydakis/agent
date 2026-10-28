@@ -13,7 +13,7 @@
 //! tools Sonny answers (`served`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
-pub mod subs;
+pub(crate) mod subs;
 mod updates;
 
 use agent_client::{
@@ -428,8 +428,10 @@ enum Api {
 pub struct Judge {
     api: Api,
     pub name: String,
-    /// For `Model`: its `provider/model`.
+    /// For `Model`: its `provider/model`, and its effort (the config's
+    /// `[judge] effort`; unset, the model's own).
     model: String,
+    effort: Option<String>,
     /// For `Decisions`: the API.
     decisions: Option<judge::Decisions>,
     /// For `Model`: the idle base bot each check forks, once made.
@@ -479,22 +481,26 @@ impl Judge {
             Some(base) if base != "lead" => (base, true),
             _ => (spec, false),
         };
-        let judge = |api, model: &str, decisions| Judge {
+        let judge = |api, model: &str, effort, decisions| Judge {
             api,
             name: name.to_owned(),
             model: model.to_owned(),
+            effort,
             decisions,
             base: Default::default(),
             context,
         };
         if spec == "lead" {
-            return Ok(judge(Api::Lead, "", None));
+            return Ok(judge(Api::Lead, "", None, None));
         }
         match judge::spec(spec) {
             None => Err(format!(
                 "lookout: {spec} is not openai-decisions/MODEL, PROVIDER/MODEL or lead"
             )),
-            Some(judge::Spec::Model(model)) => Ok(judge(Api::Model, model, None)),
+            Some(judge::Spec::Model(model)) => {
+                let config = agent_client::config::load().map_err(|e| format!("lookout: {e}"))?;
+                Ok(judge(Api::Model, model, config.judge.effort, None))
+            }
             Some(judge::Spec::Decisions(model)) => {
                 let key = key(judge::DECISIONS_KEY)
                     .ok_or_else(|| format!("lookout: set {} for {spec}", judge::DECISIONS_KEY))?;
@@ -503,7 +509,7 @@ impl Judge {
                     .filter(|url| !url.is_empty());
                 let decisions = judge::Decisions::new(model, url.as_deref(), key)
                     .map_err(|e| format!("lookout: {e}"))?;
-                Ok(judge(Api::Decisions, "", Some(decisions)))
+                Ok(judge(Api::Decisions, "", None, Some(decisions)))
             }
         }
     }
@@ -563,9 +569,13 @@ impl Judge {
         }
         let name = format!(
             "lookout.{}",
-            &digest(&format!("{}\n{MODEL_INSTRUCTIONS}", self.model))[..12]
+            &digest(&match &self.effort {
+                Some(effort) => format!("{}\n{effort}\n{MODEL_INSTRUCTIONS}", self.model),
+                None => format!("{}\n{MODEL_INSTRUCTIONS}", self.model),
+            })[..12]
         );
-        let made = judge::Base::make(client, &name, &self.model, None, MODEL_INSTRUCTIONS)
+        let effort = self.effort.as_deref();
+        let made = judge::Base::make(client, &name, &self.model, effort, MODEL_INSTRUCTIONS)
             .await
             .map(Arc::new)
             .map_err(|e| failed(format!("the judge could not be made: {e}")))?;
@@ -676,12 +686,20 @@ fn judge_bot(name: &str) -> bool {
         .is_some_and(|hash| hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// The judge for a lead on `lead_model`: `--judge SPEC`, else
-/// `AGENT_JUDGE`, else the lead's own model. `None` when it is `off`,
-/// which judges nothing.
-fn pick(spec: Option<&str>, lead_model: &str) -> Option<String> {
-    let named = spec.map(str::to_owned).or_else(|| key(judge::VAR));
-    judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off")
+/// The judge for a lead on `lead_model`: `--judge SPEC`, else the
+/// config's `[judge] model`, else the lead's own model. `None` when it is
+/// `off`, which judges nothing.
+fn pick(spec: Option<&str>, lead_model: &str) -> Result<Option<String>, String> {
+    let named = match spec {
+        Some(spec) => Some(spec.to_owned()),
+        None => {
+            (agent_client::config::load())
+                .map_err(|e| format!("lookout: {e}"))?
+                .judge
+                .model
+        }
+    };
+    Ok(judge::pick(named.as_deref(), Some(lead_model)).filter(|spec| spec != "off"))
 }
 
 #[derive(Debug)]
@@ -1571,8 +1589,12 @@ impl Service {
             record["model"].as_str().unwrap_or_default()
         );
         let judge = match self::pick(self.judge.as_deref(), &model) {
-            Some(spec) => self.judge_for(&spec, lead),
-            None => None,
+            Ok(Some(spec)) => self.judge_for(&spec, lead),
+            Ok(None) => None,
+            Err(why) => {
+                self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "no_judge": why}));
+                None
+            }
         };
         // Said once a lead is watched, so `/status` shows it from the start.
         self.write(&json!({"at_ms": epoch_ms(), "lead": lead, "seated": true,
@@ -1751,30 +1773,25 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
     subs::ensure(store, lead, subs::Sub::lead(lead, project))
 }
 
-/// What `/lookout` shows: the lookout's line, then each subscription the
-/// bot has and how many checks it asked for in the last day.
-pub fn subscriptions(store: &std::path::Path, bot: &str) -> Vec<String> {
-    let subs = subs::read(store, bot);
-    let logged = logged(store, bot);
-    let mut lines = vec![status(store, bot)];
-    if subs.is_empty() {
-        lines.push("No subscriptions: an agent adds one with its subscriptions tool".to_owned());
+/// How many checks each of the subscriber's subscriptions asked for in
+/// the last day, by its name, as `/background` lists them.
+pub fn checks(store: &std::path::Path, bot: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for line in logged(store, bot) {
+        if !today(&line) || line.get("answers").is_none() {
+            continue;
+        }
+        match line["subs"].as_array() {
+            Some(names) => {
+                for name in names.iter().filter_map(Value::as_str) {
+                    *counts.entry(name.to_owned()).or_default() += 1;
+                }
+            }
+            // Logged before subscriptions: the lead's own tasks.
+            None => *counts.entry("tasks".to_owned()).or_default() += 1,
+        }
     }
-    for sub in subs {
-        let checks = (logged.iter())
-            .filter(|line| today(line) && line.get("answers").is_some())
-            .filter(|line| match line["subs"].as_array() {
-                Some(names) => names.iter().any(|n| *n == sub.name.as_str()),
-                // Logged before subscriptions: the lead's own tasks.
-                None => sub.name == "tasks",
-            })
-            .count();
-        lines.push(format!(
-            "{} · {checks} checks in the last day",
-            sub.describe()
-        ));
-    }
-    lines
+    counts
 }
 
 /// Every bot the daemon lists, page by page.
@@ -2769,6 +2786,7 @@ mod tests {
             api,
             name: "test".into(),
             model: "m".into(),
+            effort: None,
             decisions,
             base: Default::default(),
             context: false,
@@ -3537,7 +3555,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_lookout_lists_each_subscription_and_its_checks() {
+    fn each_subscription_counts_its_checks_in_the_last_day() {
         let dir = std::env::temp_dir().join(format!("lookout-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3552,28 +3570,18 @@ mod tests {
             &log,
             &json!({"at_ms": now, "lead": "calc.lead", "answers": {}, "subs": ["tasks", "ops"]}),
         );
-        std::fs::create_dir_all(subs::dir(&store)).unwrap();
-        std::fs::write(
-            subs::dir(&store).join("calc.lead.json"),
-            json!({"subscriptions": [subs::Sub::lead("calc.lead", "calc").to_json(),
-                sub("ops", &[], &["ops.*"]).to_json()]})
-            .to_string(),
-        )
-        .unwrap();
-        let lines = subscriptions(&store, "calc.lead");
-        assert_eq!(lines[0], "Lookout · not running");
-        assert_eq!(
-            lines[1],
-            "tasks · tasks of calc.lead, bots calc.* · on said, ended · asks every built-in · task updates · 2 checks in the last day"
+        append(
+            &log,
+            &json!({"at_ms": now - 2 * 24 * 60 * 60 * 1000, "lead": "calc.lead", "answers": {}, "subs": ["ops"]}),
         );
-        assert_eq!(
-            lines[2],
-            "ops · bots ops.* · on said, ended · asks every built-in · 1 checks in the last day"
+        append(
+            &log,
+            &json!({"at_ms": now, "lead": "calc.lead", "woke": {}, "subs": ["ops"]}),
         );
-        assert_eq!(
-            subscriptions(&store, "reviewer")[1],
-            "No subscriptions: an agent adds one with its subscriptions tool"
-        );
+        let counts = checks(&store, "calc.lead");
+        assert_eq!(counts.get("tasks"), Some(&2));
+        assert_eq!(counts.get("ops"), Some(&1));
+        assert!(checks(&store, "reviewer").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

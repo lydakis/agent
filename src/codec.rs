@@ -2,6 +2,7 @@
 //! encoding so requests stream them without translation; a bot is bound to
 //! one family for its lifetime.
 use crate::{Result, fail};
+use base64::Engine;
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -10,6 +11,62 @@ pub enum Family {
     Responses,
     /// Anthropic Messages API.
     Anthropic,
+}
+
+/// A picture sent with a person's words, as a client gave it: its media
+/// type and its bytes in standard base64.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Image {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// The media types an [`Image`] may have: those both families take.
+pub const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// The longest side Anthropic's models see a picture at: larger ones are
+/// scaled down to it.
+pub const LONGEST_SIDE: u32 = 1568;
+
+impl Image {
+    /// What the picture weighs in context accounting: the bytes of text
+    /// that cost as many input tokens, at four bytes a token. Its tokens are
+    /// Anthropic's estimate, width × height / 750 once the longest side fits
+    /// [`LONGEST_SIDE`], at most 1600; OpenAI's high detail counts fewer. A
+    /// picture whose size cannot be read weighs the most.
+    pub fn weight(&self) -> usize {
+        const MOST_TOKENS: u64 = 1600;
+        let size = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .ok()
+            .and_then(|bytes| {
+                image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()?
+                    .into_dimensions()
+                    .ok()
+            });
+        let tokens = size.map_or(MOST_TOKENS, |(width, height)| {
+            let (width, height) = (u64::from(width), u64::from(height));
+            let longest = width.max(height).max(1);
+            let fit = u64::from(LONGEST_SIDE).min(longest);
+            // Scaled so the longest side is `fit`, in whole pixels.
+            let area = (width * fit / longest).max(1) * (height * fit / longest).max(1);
+            area.div_ceil(750).min(MOST_TOKENS)
+        });
+        tokens as usize * 4
+    }
+}
+
+/// What `images` add to the item they go in beyond their weight: their
+/// encoded bytes less what they weigh, which is negative for a picture that
+/// compresses to less than it costs. Context accounting leaves this out, so
+/// a picture counts at its token cost rather than its size.
+pub fn pictured(images: &[Image]) -> i64 {
+    images
+        .iter()
+        .map(|image| image.data.len() as i64 - image.weight() as i64)
+        .sum()
 }
 
 /// Provider-neutral tool description; each family encodes it differently.
@@ -80,15 +137,42 @@ impl Family {
         }
     }
     pub fn user_item(self, text: &str) -> Result<Vec<u8>> {
-        let item = match self {
-            Family::Responses => {
-                json!({"role":"user","content":[{"type":"input_text","text":text}]})
-            }
-            Family::Anthropic => json!({"role":"user","content":[{"type":"text","text":text}]}),
-        };
-        Ok(serde_json::to_vec(&item)?)
+        self.user_item_with(text, &[])
+    }
+    /// A person's words and the pictures sent with them, the words first
+    /// so `content[0].text` reads them.
+    pub fn user_item_with(self, text: &str, images: &[Image]) -> Result<Vec<u8>> {
+        let mut content = vec![match self {
+            Family::Responses => json!({"type":"input_text","text":text}),
+            Family::Anthropic => json!({"type":"text","text":text}),
+        }];
+        content.extend(images.iter().map(|image| self.image(image)));
+        Ok(serde_json::to_vec(
+            &json!({"role":"user","content":content}),
+        )?)
     }
     pub fn tool_result_item(self, call_id: &str, output: &str) -> Result<Vec<u8>> {
+        self.tool_result_item_with(call_id, output, &[])
+    }
+    /// A tool's result with pictures after its text, as both families take
+    /// them in a result: a list of parts in place of the text alone.
+    pub fn tool_result_item_with(
+        self,
+        call_id: &str,
+        output: &str,
+        images: &[Image],
+    ) -> Result<Vec<u8>> {
+        let output = match images {
+            [] => json!(output),
+            _ => {
+                let mut parts = vec![match self {
+                    Family::Responses => json!({"type":"input_text","text":output}),
+                    Family::Anthropic => json!({"type":"text","text":output}),
+                }];
+                parts.extend(images.iter().map(|image| self.image(image)));
+                Value::Array(parts)
+            }
+        };
         let item = match self {
             Family::Responses => {
                 json!({"type":"function_call_output","call_id":call_id,"output":output})
@@ -97,6 +181,14 @@ impl Family {
                 {"type":"tool_result","tool_use_id":call_id,"content":output}]}),
         };
         Ok(serde_json::to_vec(&item)?)
+    }
+    fn image(self, image: &Image) -> Value {
+        match self {
+            Family::Responses => json!({"type":"input_image",
+                "image_url":format!("data:{};base64,{}", image.media_type, image.data)}),
+            Family::Anthropic => json!({"type":"image","source":{"type":"base64",
+                "media_type":image.media_type,"data":image.data}}),
+        }
     }
     pub fn tools(self, tools: &[ToolSchema]) -> Value {
         let encoded: Vec<Value> = tools
@@ -274,6 +366,84 @@ mod tests {
         assert_eq!(Family::Responses.pool_key("gpt-4-32k"), "gpt-4-32k");
     }
     use super::*;
+    #[test]
+    fn a_picture_weighs_its_estimated_tokens() {
+        let png = |width: u32, height: u32| {
+            let mut bytes = Vec::new();
+            image::RgbImage::new(width, height)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            Image {
+                media_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        };
+        // 40 × 30 is 1200 pixels: 2 tokens.
+        assert_eq!(png(40, 30).weight(), 8);
+        // 1000 × 600 is 800 tokens.
+        assert_eq!(png(1000, 600).weight(), 3200);
+        // 3000 × 2000 is seen at 1568 × 1045, past the 1600 tokens most.
+        assert_eq!(png(3000, 2000).weight(), 6400);
+        // A picture whose size cannot be read weighs the most.
+        let unreadable = Image {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        };
+        assert_eq!(unreadable.weight(), 6400);
+        // What a picture adds beyond its weight is left out of accounting;
+        // one smaller than its weight still counts at its weight.
+        let shot = png(40, 30);
+        assert_eq!(
+            pictured(std::slice::from_ref(&shot)),
+            shot.data.len() as i64 - 8
+        );
+        assert_eq!(pictured(&[unreadable]), 12 - 6400);
+    }
+    #[test]
+    fn pictures_follow_the_words_in_each_familys_shape() {
+        let images = [Image {
+            media_type: "image/png".into(),
+            data: "iVBO".into(),
+        }];
+        let item = |family: Family| -> Value {
+            serde_json::from_slice(&family.user_item_with("look", &images).unwrap()).unwrap()
+        };
+        assert_eq!(
+            item(Family::Responses)["content"],
+            json!([{"type":"input_text","text":"look"},
+                {"type":"input_image","image_url":"data:image/png;base64,iVBO"}])
+        );
+        assert_eq!(
+            item(Family::Anthropic)["content"],
+            json!([{"type":"text","text":"look"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}])
+        );
+        assert_eq!(
+            Family::Anthropic.user_item("look").unwrap(),
+            Family::Anthropic.user_item_with("look", &[]).unwrap()
+        );
+        // A result's pictures follow its text the same way.
+        let result = |family: Family| -> Value {
+            serde_json::from_slice(
+                &family
+                    .tool_result_item_with("c1", "a.png", &images)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            result(Family::Responses)["output"],
+            json!([{"type":"input_text","text":"a.png"},
+                {"type":"input_image","image_url":"data:image/png;base64,iVBO"}])
+        );
+        assert_eq!(
+            result(Family::Anthropic)["content"][0]["content"][1]["source"]["data"],
+            "iVBO"
+        );
+    }
     #[test]
     fn previews_cut_each_field_so_a_long_one_hides_no_other() {
         let content = "x".repeat(5000);

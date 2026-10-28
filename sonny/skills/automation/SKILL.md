@@ -158,7 +158,7 @@ one the job chose to pass on.
 
 So the lead hears when the monitor itself goes wrong, it subscribes to it
 in the lookout with its `subscriptions` tool, which needs a judge
-(`AGENT_JUDGE`) to answer a look-for:
+(`[judge] model` in `~/.agent/config.toml`, else the lead's model) to answer a look-for:
 
 ```json
 {"add": {"name": "NAME", "bots": ["NAME"], "on": ["ended"],

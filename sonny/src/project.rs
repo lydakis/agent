@@ -235,7 +235,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     })?;
     let said = |key: &str| read.get(key).and_then(toml::Value::as_str);
     if said("model") != Some(model)
-        || said("reasoning") != effort
+        || said("effort") != effort
         || edited.len() as u64 > agent_client::project::LIMIT
     {
         return Err(format!(
@@ -254,7 +254,7 @@ pub fn keep_model(dir: &Path, model: &str, effort: Option<&str>) -> Result<(), S
     agent_client::project::read(dir).map(|_| ())
 }
 
-/// `text` with its top-level `model` and `reasoning` set (or `reasoning`
+/// `text` with its top-level `model` and `effort` set (or `effort`
 /// removed), each in place when there, else added after `model`.
 fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
     // A JSON string is a TOML basic string.
@@ -276,10 +276,10 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
                 at = Some(lines.len());
                 lines.push(format!("model = {}", quote(model)));
             }
-            Some("reasoning") => {
+            Some("effort") => {
                 placed = true;
                 if let Some(level) = effort {
-                    lines.push(format!("reasoning = {}", quote(level)));
+                    lines.push(format!("effort = {}", quote(level)));
                 }
             }
             _ => lines.push(line.to_owned()),
@@ -290,7 +290,7 @@ fn with_model(text: &str, model: &str, effort: Option<&str>) -> String {
         lines.len() - 1
     });
     if let Some(level) = effort.filter(|_| !placed) {
-        lines.insert(at + 1, format!("reasoning = {}", quote(level)));
+        lines.insert(at + 1, format!("effort = {}", quote(level)));
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -452,15 +452,20 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, then the newest agent's, so a bare
-    // `sonny` needs no flag.
+    // `sonny` needs no flag. Its effort: the config's `[sonny]
+    // lead_effort`, else AGENT_EFFORT with AGENT_MODEL's model, as the CLI
+    // takes them.
+    let (mut effort, model) = (None, model.map(str::to_owned));
     let model = match model
-        .map(str::to_owned)
         .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
     {
         Some(model) => model,
         None => match std::env::var("AGENT_MODEL").ok() {
-            Some(model) => model,
+            Some(model) => {
+                effort = std::env::var("AGENT_EFFORT").ok();
+                model
+            }
             None => newest(client)
                 .await?
                 .ok_or("model_required: no agent has run yet; pass --model PROVIDER/MODEL once")?,
@@ -468,6 +473,8 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
     };
     let picks = agent_client::project::Picks {
         model: Some(model),
+        effort: (agent_client::config::load()?.sonny.lead_effort)
+            .or(effort.filter(|e| !e.is_empty())),
         ..Default::default()
     };
     make(client, dir, &role, &picks).await.map(|_| ())
@@ -497,7 +504,10 @@ async fn make(
 /// folder, on the caller's daemon (`created: false` when it was there
 /// already), its lead opened in a home of its own.
 pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
-    let (dir, picks) = picks(arguments)?;
+    let (dir, mut picks) = picks(arguments)?;
+    if picks.effort.is_none() {
+        picks.effort = agent_client::config::load()?.sonny.lead_effort;
+    }
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;
@@ -550,15 +560,13 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
         ..Default::default()
     };
     let (threads_model, threads_effort) = (text("threads_model"), text("threads_effort"));
-    if threads_effort.is_some() && threads_model.is_none() {
-        return Err("project_invalid: threads_effort goes with threads_model".into());
-    }
-    let in_project = match text("threads_in").as_deref() {
+    let threads_in = text("threads_in");
+    let in_project = match threads_in.as_deref() {
         None | Some("worktree") => false,
         Some("project") => true,
         Some(other) => return Err(format!("project_invalid: threads_in {other:?}")),
     };
-    if threads_model.is_some() || in_project {
+    if threads_model.is_some() || threads_effort.is_some() || threads_in.is_some() {
         picks.threads = Some(agent_client::project::ThreadPicks {
             model: threads_model,
             effort: threads_effort,
@@ -584,11 +592,7 @@ mod tests {
     #[test]
     fn a_new_project_reads_its_picks_and_refuses_others() {
         let picked = |arguments: Value| picks(&arguments);
-        for bad in [
-            json!({}),
-            json!({"folder": "/", "threads_in": "elsewhere"}),
-            json!({"folder": "/", "threads_effort": "low"}),
-        ] {
+        for bad in [json!({}), json!({"folder": "/", "threads_in": "elsewhere"})] {
             assert!(
                 picked(bad.clone())
                     .unwrap_err()
@@ -609,6 +613,11 @@ mod tests {
                 .threads
                 .is_some_and(|t| t.in_project && t.model.is_none())
         );
+        // Tasks may take an effort of their own on the lead's model.
+        let (_, picks) = picked(json!({"folder": "/", "threads_effort": "xhigh"})).unwrap();
+        assert!(picks.threads.is_some_and(|t| t.model.is_none()
+            && t.effort.as_deref() == Some("xhigh")
+            && !t.in_project));
     }
 
     #[test]
@@ -761,12 +770,12 @@ mod tests {
             "# mine\nname = \"shop\"\nmodel = \"openai/a\"   # pinned\nthreads_in = \"project\"\n";
         assert_eq!(
             with_model(file, "anthropic/b", Some("high")),
-            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\nreasoning = \"high\"\nthreads_in = \"project\"\n"
+            "# mine\nname = \"shop\"\nmodel = \"anthropic/b\"\neffort = \"high\"\nthreads_in = \"project\"\n"
         );
-        let file = "name = \"shop\"\nreasoning = \"low\"\nmodel = \"openai/a\"\n";
+        let file = "name = \"shop\"\neffort = \"low\"\nmodel = \"openai/a\"\n";
         assert_eq!(
             with_model(file, "openai/a", Some("high")),
-            "name = \"shop\"\nreasoning = \"high\"\nmodel = \"openai/a\"\n"
+            "name = \"shop\"\neffort = \"high\"\nmodel = \"openai/a\"\n"
         );
         assert_eq!(
             with_model(file, "openai/c", None),
