@@ -847,12 +847,17 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 field("show"),
             ) {
                 (true, ..) => {
+                    // As the trigger script's add says it.
                     let add = &arguments["add"];
                     let name = (add["name"].as_str())
                         .or(add["start"]["name"].as_str())
                         .or(add["bot"].as_str())
-                        .unwrap_or("you");
-                    let mut said = said("Added a trigger for", name.trim());
+                        .map(|name| name.trim().to_owned());
+                    let when = ["every", "cron", "at", "in"]
+                        .into_iter()
+                        .find_map(|key| Some(format!("{key} {}", add[key].as_str()?.trim())));
+                    let what = [name, when].into_iter().flatten().collect::<Vec<_>>();
+                    let mut said = said("Scheduled", &what.join(" · "));
                     if let Some(message) = add["message"].as_str() {
                         said.under
                             .push(Line::from(first_line(message)).italic().dim());
