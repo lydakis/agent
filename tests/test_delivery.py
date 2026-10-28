@@ -709,13 +709,17 @@ class DeliveryTests(ModelFixture):
         # Recovery ends the interrupted turn and the line moves at once.
         self.assertEqual(poll(client, 'Bob', first)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
-        outcome = client.finished(third)['data']
-        # The steer joins the next turn at its first boundary, or runs alone.
+        # The steer joins a turn at its first boundary, or runs alone. The
+        # first turn may have taken it before the kill, and that outcome was
+        # announced to the old process only, so read the durable one.
+        handle = f'turn:Bob/{third}'
+        outcome = client.request('wait', handles=[handle], timeout_ms=5000)['result']['results'][handle]
         text = poll(client, 'Bob', second)['result']['text']
-        if outcome['status'] == 'steered':
-            self.assertEqual((outcome['into'], text), (second, 'reply:third'))
+        if outcome['status'] == 'steered' and outcome['into'] == second:
+            self.assertEqual(text, 'reply:third')
         else:
-            self.assertEqual((outcome['status'], text), ('completed', 'reply:second'))
+            self.assertIn((outcome['status'], outcome.get('into')), [('steered', first), ('completed', None)])
+            self.assertEqual(text, 'reply:second')
 
 
     def test_durable_events_arrive_in_commit_order_exactly_once(self):
