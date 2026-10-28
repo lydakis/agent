@@ -2572,14 +2572,26 @@ async fn deliver(
     } else {
         "reject"
     };
-    let submitted = client
-        .request(
-            "submit",
-            json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
-                "prompt": prompt, "delivery": delivery, "origin": "trigger",
-                "budget_tokens": trigger.turn_budget_tokens}),
-        )
-        .await;
+    let mut asking = json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
+        "prompt": prompt, "delivery": delivery, "origin": "trigger",
+        "budget_tokens": trigger.turn_budget_tokens});
+    // An ask keeps the request sent for it, before it goes: a fire cut
+    // short, or the trigger that replaced this one, sends it again as it
+    // was, which the daemon takes once.
+    if let Some(ask) = ask {
+        match std::fs::read(&ask.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|sent| sent["request_id"].is_string())
+        {
+            Some(sent) => asking = sent,
+            None => {
+                let _ = std::fs::write(&ask.path, asking.to_string());
+            }
+        }
+    }
+    let bot = asking["bot"].as_str().unwrap_or(bot).to_owned();
+    let submitted = client.request("submit", asking).await;
     let outcome = match submitted {
         Ok(turn) => {
             let mut sent = json!({"outcome": "sent", "turn": turn["turn"],
@@ -2603,7 +2615,7 @@ async fn deliver(
         }
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
-    reply(client, trigger, bot, outcome).await
+    reply(client, trigger, &bot, outcome).await
 }
 
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire

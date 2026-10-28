@@ -239,6 +239,31 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(first['generation'], 'g1')
         self.assertFalse(last.exists())
 
+    def test_an_ask_sends_the_request_it_sent_before_also_for_the_trigger_that_replaced_it(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        taking = self.home / '.agent/triggers/p.task.taking'
+        taking.mkdir(parents=True)
+        (taking / '100.1.1').write_text('')
+        sent = self.fire('p.task', 'first', generation='g1')
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
+        self.settle('p.task')
+        turn = self.turns('p.task')[-1]
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            prompt = connection.request('prompts', bot='p.task', turn=turn['turn'], bytes=65536)['result']['prompts'][0]['text']
+        finally:
+            connection.close()
+        # The fire was cut short once its turn went, and another definition
+        # took the name: the ask it left sends what went, which the daemon
+        # takes once, not the new message under the new generation.
+        (taking / '100.1.1').write_text(json.dumps({
+            'bot': 'p.task', 'bot_id': self.bot_id('p.task'), 'request_id': turn['request_id'], 'prompt': prompt,
+            'delivery': 'queue', 'origin': 'trigger', 'budget_tokens': None}))
+        again = self.fire('p.task', 'second', generation='g2')
+        self.assertEqual((again['last']['outcome'], again['last']['turn']), ('sent', turn['turn']), again)
+        self.assertEqual(len(self.turns('p.task')), 2)
+        self.assertFalse((taking / '100.1.1').exists())
+
     def test_a_start_trigger_makes_its_agent_once_and_messages_it_after(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         lead = self.bot_id('p.lead')
@@ -345,10 +370,13 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        self.assertIsNone(self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(self.path)]))
+        # Its row says when it looked and why it said no, with no result yet.
+        no = self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(self.path)])
+        self.assertEqual((no['last'], no['checked']['gate'], no['checked']['detail']),
+                         (None, 'no', '--if: exit status: 1'), no)
         self.assertEqual(len(self.turns('p.task')), 1)
         yes = self.fire('p.task', 'x', extra=['--if', 'test -d .', '--dir', str(self.path)])
-        self.assertEqual(yes['last']['outcome'], 'sent', yes)
+        self.assertEqual((yes['last']['outcome'], yes['checked']['gate']), ('sent', 'go'), yes)
 
     def test_a_commit_trigger_sends_only_for_a_new_commit(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
