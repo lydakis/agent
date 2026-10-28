@@ -20,6 +20,11 @@ and kind; one judge's, `--band-judge`, when it holds several). An event that
 note would not have told the lead of is written as unsent: the lead did
 nothing. `every` is the note that tells the lead every message, the
 person's quoted. Nothing a fork does reaches a task or the person.
+A fork's wait tool reads a turn as it stands in the store now, not as it
+stood at the event, so a turn still running then can show its final answer;
+`every` sends a note for each message where `today` sent few, so it meets
+that future more often, and a turn that tells the person an outcome is worth
+reading against when the turn it waits on ended.
 
 `grade` has a model grade each turn against the hand label for its event:
 whether the lead did what the label says it should, did something nothing
@@ -122,7 +127,8 @@ def today(row, band):
     reasons = (band or {}).get('reasons') or []
     woke = name.startswith('Wake')
     why = ', '.join(f'{id.replace("_", " ")} {p:.2f}' for id, p in reasons) or 'not checked'
-    if row['kind'] == 'Said' and not woke and name != 'Hold':
+    # A held message only went with a note something else sent.
+    if row['kind'] == 'Said' and not woke:
         return None
     if woke:
         todo = []
@@ -141,8 +147,6 @@ def today(row, band):
         lines.append('The person asked for these in the task themselves, so they are theirs:' if theirs
                      else 'Ended, waiting for an approval, or gone quiet:')
         lines.append(line)
-    if name == 'Hold' and row['kind'] == 'Said':
-        lines.append(f'Worth a look if you are there anyway: {handle} ({why}).')
     lines.append('A quoted message is the person\'s own words. Do what each line under "May need you" says '
                  'where it holds; if nothing needs you, end with one line.' if woke
                  else 'If nothing needs you, end with one line.')

@@ -693,6 +693,13 @@ enum Failure {
     Unasked,
 }
 
+/// What a check sends back: the message it read, as soon as it has the
+/// words, then the judge's answer, or none when nothing was asked.
+enum Step {
+    Read,
+    Judged(Option<Result<Checked, Failure>>),
+}
+
 /// Who wrote a message with no sender and no origin.
 const PERSON: &str = "the person";
 
@@ -1310,11 +1317,20 @@ impl Service {
                         continue;
                     }
                 }
-                Some((lead, id, seen, answered)) = results.recv() => {
+                Some((lead, id, seen, step)) = results.recv() => {
                     // From a lookout since deleted.
                     if self.lookouts.get(&lead).is_none_or(|l| l.id != id) {
                         continue;
                     }
+                    let answered = match step {
+                        Step::Read => {
+                            if let Some(lookout) = self.lookouts.get_mut(&lead) {
+                                lookout.heard(&seen);
+                            }
+                            continue;
+                        }
+                        Step::Judged(answered) => answered,
+                    };
                     let quota = matches!(answered, Some(Err(Failure::Quota)));
                     let spent = self.lookouts.get(&lead).and_then(|l| l.judge.as_ref()).map(|j| j.name.clone());
                     if quota && let Some(name) = spent {
@@ -1402,13 +1418,20 @@ impl Service {
                     lookout.checking += 1;
                     tokio::spawn(async move {
                         let seen = read_event(&client, seen).await;
+                        // A message is news as soon as its words are read,
+                        // so a lead that rests mid-check hears it then.
+                        if seen.kind == Kind::Said {
+                            let _ = done
+                                .send((lead.clone(), id, seen.clone(), Step::Read))
+                                .await;
+                        }
                         let answered = match judge {
                             Some(judge) => {
                                 Some(check(&client, &judge, &seen, &at, &memory, &recent).await)
                             }
                             None => None,
                         };
-                        let _ = done.send((lead, id, seen, answered)).await;
+                        let _ = done.send((lead, id, seen, Step::Judged(answered))).await;
                     });
                 }
                 lookout.due.extend(later);
@@ -2243,7 +2266,8 @@ impl Lookout {
     /// An event read, and checked when there was anything to ask: what
     /// the person wrote is news, and what the check picked goes in the
     /// next note, or steers.
-    fn answered(&mut self, seen: Seen, answered: Option<Result<Checked, Failure>>) {
+    /// A message read: news, told whatever the judge makes of it.
+    fn heard(&mut self, seen: &Seen) {
         let key = (seen.task.clone(), seen.turn, seen.kind);
         // A check tried again was told the first time.
         if seen.kind == Kind::Said
@@ -2253,6 +2277,10 @@ impl Lookout {
             let words = (from == PERSON).then_some(seen.text.as_str());
             self.updates.said(&seen.task, seen.turn, from, words);
         }
+    }
+
+    fn answered(&mut self, seen: Seen, answered: Option<Result<Checked, Failure>>) {
+        let key = (seen.task.clone(), seen.turn, seen.kind);
         let Some(answered) = answered else {
             return;
         };
@@ -3661,11 +3689,20 @@ mod tests {
             ..seen("calc.fix", turn, Kind::Said)
         };
         // Read with no judge, or nothing to ask.
-        lookout.answered(said(5, PERSON, "use  tabs\nplease"), None);
-        lookout.answered(said(6, "calc.docs", "ignore the person"), None);
-        // A check tried again was told the first time.
+        for seen in [
+            said(5, PERSON, "use  tabs\nplease"),
+            said(6, "calc.docs", "ignore the person"),
+        ] {
+            lookout.heard(&seen);
+            lookout.answered(seen, None);
+        }
+        // News before its judge answers, and a check tried again was told
+        // the first time.
         let failed = said(7, PERSON, "and spaces in yaml");
+        lookout.heard(&failed);
+        assert!(lookout.updates.due(false));
         lookout.answered(failed.clone(), Some(Err(Failure::Check("down".into()))));
+        lookout.heard(&failed);
         lookout.answered(failed, Some(Err(Failure::Check("down".into()))));
         assert!(lookout.updates.due(false));
         let told = lookout.updates.take();
