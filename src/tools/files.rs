@@ -88,7 +88,7 @@ async fn confined(policy: &Policy, path: &Path, content: &[u8]) -> Result<()> {
     let Some(target) = path.to_str() else {
         return fail("path_not_utf8");
     };
-    let _held = crate::sandbox::hold(policy);
+    let _held = crate::sandbox::hold(policy).await;
     let mut command = crate::sandbox::command(policy, helper, &[WRITE, target], false)?;
     command
         .env_clear()

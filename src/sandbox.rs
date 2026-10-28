@@ -79,22 +79,71 @@ impl Policy {
             Some(mode) => mode,
         };
         let mut paths = writable_paths(mode, workspace, writable);
+        // What each folder of `within` keeps read-only stays so in a root
+        // inside it: a root inside one of those is none, and a root holding
+        // one keeps it, so the bot writes nothing its creator could not.
+        let mut kept: Vec<(PathBuf, Vec<PathBuf>, Vec<PathBuf>)> = Vec::new();
         if let Some(within) = within {
-            let within: Vec<PathBuf> = within
-                .iter()
-                .filter_map(|path| std::fs::canonicalize(path).ok())
-                .collect();
+            let mut ceilings = Vec::new();
+            for path in within {
+                if let Ok(real) = std::fs::canonicalize(path) {
+                    ceilings.push(root(&real, &daemon.store)?);
+                }
+            }
             let temporary: Vec<&PathBuf> = temporary().iter().map(|(_, real)| real).collect();
             paths.retain(|path| {
                 let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-                temporary.contains(&&path) || within.iter().any(|kept| path.starts_with(kept))
+                if temporary.contains(&&path) {
+                    return true;
+                }
+                let Some(ceiling) = ceilings
+                    .iter()
+                    .filter(|ceiling| path.starts_with(&ceiling.path))
+                    .max_by_key(|ceiling| depth(&ceiling.path))
+                else {
+                    return false;
+                };
+                let protected = |kept: &PathBuf| path.starts_with(kept);
+                if ceiling
+                    .read_only
+                    .iter()
+                    .chain(&ceiling.missing)
+                    .any(protected)
+                {
+                    return false;
+                }
+                let inside = |found: &Vec<PathBuf>| {
+                    found
+                        .iter()
+                        .filter(|kept| kept.starts_with(&path))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                kept.push((
+                    path.clone(),
+                    inside(&ceiling.read_only),
+                    inside(&ceiling.missing),
+                ));
+                true
             });
         }
         paths.sort_by_key(|path| (depth(path), path.clone()));
         paths.dedup();
         let mut roots = Vec::new();
         for path in paths {
-            roots.push(root(&path, &daemon.store)?);
+            let mut found = root(&path, &daemon.store)?;
+            let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if let Some((_, read_only, missing)) = kept.iter().find(|(kept, ..)| *kept == real) {
+                for (into, from) in [
+                    (&mut found.read_only, read_only),
+                    (&mut found.missing, missing),
+                ] {
+                    into.extend(from.iter().cloned());
+                    into.sort();
+                    into.dedup();
+                }
+            }
+            roots.push(found);
         }
         Ok(Some(Policy {
             roots,
@@ -594,23 +643,34 @@ mod linux {
 }
 
 /// The placeholders that running sandboxes hold for missing protected
-/// folders, by how many hold each. bubblewrap makes a placeholder on the
-/// host for its read-only mount; removing it while any sandbox still
-/// mounts it would lift that mount there, so the last one out removes it.
-static HELD: std::sync::Mutex<Vec<(PathBuf, usize)>> = std::sync::Mutex::new(Vec::new());
+/// folders: how many hold each, and whether it is being removed. bubblewrap
+/// makes a placeholder on the host for its read-only mount; removing it
+/// while any sandbox still mounts it would lift that mount there, so the
+/// last one out removes it, and a sandbox that needs one being removed waits
+/// until it is gone. The lock covers only this list, never the filesystem.
+static HELD: std::sync::Mutex<Vec<Placeholder>> = std::sync::Mutex::new(Vec::new());
+/// Woken when placeholders being removed are gone.
+static REMOVED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// Whether a running sandbox holds `path` as a placeholder: then it is
-/// still missing, whatever is there now.
+struct Placeholder {
+    path: PathBuf,
+    holders: usize,
+    removing: bool,
+}
+
+/// Whether a running sandbox holds `path` as a placeholder, or it is being
+/// removed: then it is still missing, whatever is there now.
 fn held(path: &Path) -> bool {
-    HELD.lock().unwrap().iter().any(|(held, _)| held == path)
+    HELD.lock().unwrap().iter().any(|held| held.path == path)
 }
 
 /// What a running sandbox holds in place; dropping it lets the
 /// placeholders go once no other sandbox holds them.
 pub struct Hold(Vec<PathBuf>);
 
-/// Hold `policy`'s placeholders while its command runs.
-pub fn hold(policy: &Policy) -> Hold {
+/// Hold `policy`'s placeholders while its command runs, once any of them
+/// being removed is gone.
+pub async fn hold(policy: &Policy) -> Hold {
     let paths: Vec<PathBuf> = match cfg!(target_os = "linux") {
         true => policy
             .roots
@@ -619,44 +679,63 @@ pub fn hold(policy: &Policy) -> Hold {
             .collect(),
         false => Vec::new(),
     };
-    let mut held = HELD.lock().unwrap();
-    for path in &paths {
-        match held.iter_mut().find(|(held, _)| held == path) {
-            Some((_, count)) => *count += 1,
-            None => held.push((path.clone(), 1)),
+    loop {
+        let removed = REMOVED.notified();
+        tokio::pin!(removed);
+        removed.as_mut().enable();
+        {
+            let mut held = HELD.lock().unwrap();
+            let removing = held
+                .iter()
+                .any(|held| held.removing && paths.contains(&held.path));
+            if !removing {
+                for path in &paths {
+                    match held.iter_mut().find(|held| held.path == *path) {
+                        Some(held) => held.holders += 1,
+                        None => held.push(Placeholder {
+                            path: path.clone(),
+                            holders: 1,
+                            removing: false,
+                        }),
+                    }
+                }
+                return Hold(paths);
+            }
         }
+        removed.await;
     }
-    Hold(paths)
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
         let mut released = Vec::new();
-        let mut held = HELD.lock().unwrap();
-        for path in self.0.drain(..) {
-            if let Some(index) = held.iter().position(|(held, _)| *held == path) {
-                held[index].1 -= 1;
-                if held[index].1 == 0 {
-                    held.swap_remove(index);
-                    released.push(path);
+        {
+            let mut held = HELD.lock().unwrap();
+            for path in self.0.drain(..) {
+                if let Some(held) = held.iter_mut().find(|held| held.path == path) {
+                    held.holders -= 1;
+                    if held.holders == 0 {
+                        held.removing = true;
+                        released.push(path);
+                    }
                 }
             }
         }
-        drop(held);
         if released.is_empty() {
             return;
         }
-        // Off the runtime thread, and under the lock again, so a sandbox
-        // that took one up meanwhile keeps it.
+        // Off the runtime thread, and with no lock held: no sandbox takes
+        // one up while it is marked as being removed.
         let remove = move || {
-            let held = HELD.lock().unwrap();
-            for path in released {
-                if !held.iter().any(|(held, _)| *held == path) {
-                    // Only an empty one: a placeholder, never what a
-                    // command outside the sandbox made there since.
-                    let _ = std::fs::remove_dir(path);
-                }
+            for path in &released {
+                // Only an empty one: a placeholder, never what a command
+                // outside the sandbox made there since.
+                let _ = std::fs::remove_dir(path);
             }
+            HELD.lock()
+                .unwrap()
+                .retain(|held| !(held.removing && released.contains(&held.path)));
+            REMOVED.notify_waiters();
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => drop(runtime.spawn_blocking(remove)),

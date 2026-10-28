@@ -685,6 +685,38 @@ fn a_root_outside_within_is_not_writable() {
     let none = policy(&[]);
     assert!(!none.can_write(&mine.join("a")));
     assert!(none.can_write(std::path::Path::new("/tmp/a")));
+    // What `within` keeps read-only stays so for a root in it: a root that
+    // is one of those is none, and a root holding a worktree's git folder
+    // keeps it.
+    let checkout = base.join("checkout");
+    let gitdir = checkout.join("bare/worktrees/x");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::create_dir_all(mine.join(".git")).unwrap();
+    std::fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", gitdir.display()),
+    )
+    .unwrap();
+    let ceilings = [
+        mine.to_str().unwrap().to_owned(),
+        checkout.to_str().unwrap().to_owned(),
+    ];
+    let inside = |workspace: &std::path::Path| {
+        Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(workspace),
+            &[],
+            Some(&ceilings),
+            false,
+            &Daemon::default(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    assert!(!inside(&mine.join(".git")).can_write(&mine.join(".git/config")));
+    let bare = inside(&checkout.join("bare"));
+    assert!(bare.can_write(&checkout.join("bare/objects")));
+    assert!(!bare.can_write(&gitdir.join("HEAD")));
     std::fs::remove_dir_all(base).unwrap();
 }
 

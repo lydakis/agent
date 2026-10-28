@@ -2123,7 +2123,8 @@ read-only filesystem, and the model sees that result. A confined `write` or
 refused with `write_denied`; the write itself then runs inside the sandbox,
 as Codex runs `apply_patch`, in the agent binary started as
 `agent --agent-run-as-write PATH` with the content on stdin, so a link
-swapped in after the check can't carry it out. To leave the sandbox, a shell call sets
+swapped in after the check can't carry it out. Being a process, it takes a
+slot of the daemon's process budget as a command does. To leave the sandbox, a shell call sets
 `sandbox_permissions: "require_escalated"` with a `justification`, which a
 sandboxed bot's `shell` schema shows with Codex's descriptions; a `write` or
 `edit` leaves it by naming a path outside its writable folders. Only such an
@@ -2142,12 +2143,15 @@ makes (its `created_by`), or forks, takes the creator's sandbox unless it
 names a stricter one, reaches the network only if both do, and writes only
 within the creator's own roots: its `within` is the creator's folder and
 `writable` folders, as Codex's subagents inherit their parent's sandbox.
+What the creator's roots keep read-only stays so: a root inside one of
+those is none, and a root that holds one keeps it read-only.
 `danger-full-access` or no `sandbox` there gives the creator's sandbox,
 `writable` and `network`.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
-it, and a detached command holds it until it exits.
+it, and a detached command holds it until it exits. A sandbox that needs
+one being removed waits until it is gone.
 
 ### Declared tools
 

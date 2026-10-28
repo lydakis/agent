@@ -1148,7 +1148,9 @@ impl Registry {
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
-            Prepared::Detach(command) => detach(&command, workspace, self, environment, sandbox),
+            Prepared::Detach(command) => {
+                detach(&command, workspace, self, environment, sandbox).await
+            }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
@@ -1203,6 +1205,7 @@ impl Registry {
             Prepared::Write { path, content } => {
                 let target = resolve(workspace, &path);
                 writable(sandbox.clone(), &target, &path).await?;
+                let _slot = self.helper_slot(&sandbox).await?;
                 files::write(&target, content.as_bytes(), sandbox).await?;
                 Ok(Outcome::text(format!(
                     "wrote {} bytes to {}",
@@ -1243,6 +1246,7 @@ impl Registry {
                     text.replacen(&old, &new, 1)
                 };
                 debug_assert_eq!(updated.len(), expanded);
+                let _slot = self.helper_slot(&sandbox).await?;
                 files::write(&target, updated.as_bytes(), sandbox).await?;
                 Ok(Outcome::text(format!(
                     "replaced {count} occurrence{} in {path}",
@@ -1307,6 +1311,23 @@ impl Registry {
     /// can be moved to a task of its own. Dropping it kills the command.
     /// `started` fires once it holds a process slot: only then is it
     /// running, and only then may it move.
+    /// A process slot for a confined write, which runs as a process of
+    /// its own and so waits its turn as a command does.
+    async fn helper_slot(
+        &self,
+        sandbox: &Option<Arc<Policy>>,
+    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>> {
+        match sandbox {
+            Some(_) => Ok(Some(
+                self.slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::new("tool_scheduler_closed"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     pub fn foreground(
         &self,
         command: String,
@@ -1712,7 +1733,7 @@ fn sh(
 /// No process slot, group kill, or handle applies to it. An async waiter
 /// reaps it on exit and releases its detached slot.
 #[cfg(unix)]
-fn detach(
+async fn detach(
     command: &str,
     workspace: &Path,
     registry: &Registry,
@@ -1758,7 +1779,10 @@ fn detach(
         })?)
     };
     // What the sandbox holds in place stays held while the command runs.
-    let held = sandbox.as_deref().map(crate::sandbox::hold);
+    let held = match sandbox.as_deref() {
+        Some(policy) => Some(crate::sandbox::hold(policy).await),
+        None => None,
+    };
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     tokio::spawn(async move {
@@ -1772,7 +1796,7 @@ fn detach(
 }
 
 #[cfg(not(unix))]
-fn detach(
+async fn detach(
     _: &str,
     _: &Path,
     _: &Registry,
@@ -1810,7 +1834,10 @@ async fn shell(
         }
     }
     // Held until the command and the sandbox around it are gone.
-    let _held = sandbox.map(crate::sandbox::hold);
+    let _held = match sandbox {
+        Some(policy) => Some(crate::sandbox::hold(policy).await),
+        None => None,
+    };
     let child = sh(command, workspace, registry, environment, sandbox, false)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
