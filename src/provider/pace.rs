@@ -414,9 +414,9 @@ impl Pace {
     /// calls' output, at most `cap`, or `unknown` until enough have
     /// reported. A call that writes more is charged the rest when it settles.
     /// Output is written over time, so a reply longer than the limit can
-    /// still be served: the estimate waits for a full allowance at most,
-    /// and is never refused.
-    pub fn output_estimate(&self, unknown: u64, cap: u64) -> u64 {
+    /// still be served: beside the call's `input`, the estimate waits for a
+    /// full allowance at most, and is never refused.
+    pub fn output_estimate(&self, unknown: u64, cap: u64, input: u64) -> u64 {
         let state = self.state.lock().unwrap();
         let mut estimate = match state.outputs.len() < OUTPUT_KNOWN {
             true => unknown,
@@ -426,10 +426,11 @@ impl Pace {
                 u64::from(*seen.select_nth_unstable(at).1).min(cap)
             }
         };
-        for dim in [OUTPUT, TOTAL] {
-            if let Some(limit) = state.tokens[dim].bucket.per_minute {
-                estimate = estimate.min(limit as u64);
-            }
+        if let Some(limit) = state.tokens[OUTPUT].bucket.per_minute {
+            estimate = estimate.min(limit as u64);
+        }
+        if let Some(limit) = state.tokens[TOTAL].bucket.per_minute {
+            estimate = estimate.min((limit as u64).saturating_sub(input));
         }
         estimate
     }
@@ -702,18 +703,18 @@ mod tests {
         let pace = Pace::default();
         // Until eight calls report, a call reserves what it did before.
         wrote(&pace, 7, 100).await;
-        assert_eq!(pace.output_estimate(512, 4096), 512);
+        assert_eq!(pace.output_estimate(512, 4096, 0), 512);
         wrote(&pace, 1, 100).await;
-        assert_eq!(pace.output_estimate(512, 4096), 100);
+        assert_eq!(pace.output_estimate(512, 4096, 0), 100);
         // The 90th percentile of the latest 32: three long replies in 32
         // still leave it at the short ones; a fourth moves it.
         wrote(&pace, 21, 100).await;
         wrote(&pace, 3, 3000).await;
-        assert_eq!(pace.output_estimate(512, 4096), 100);
+        assert_eq!(pace.output_estimate(512, 4096, 0), 100);
         wrote(&pace, 1, 3000).await;
-        assert_eq!(pace.output_estimate(512, 4096), 3000);
+        assert_eq!(pace.output_estimate(512, 4096, 0), 3000);
         // Never above the cap the call asks for.
-        assert_eq!(pace.output_estimate(512, 1000), 1000);
+        assert_eq!(pace.output_estimate(512, 1000, 0), 1000);
         // Nor above the limit, which a reply written over time can pass.
         pace.seed(
             &headers(&[
@@ -722,7 +723,7 @@ mod tests {
             ]),
             crate::codec::Family::Anthropic,
         );
-        assert_eq!(pace.output_estimate(512, 4096), 2000);
+        assert_eq!(pace.output_estimate(512, 4096, 0), 2000);
         assert!(sent(&pace, 0).await.is_ok());
         // A cache refresh writes nothing and says nothing of what calls
         // write.
@@ -732,7 +733,17 @@ mod tests {
                 .unwrap()
                 .settle_refresh(&Usage::default());
         }
-        assert_eq!(pace.output_estimate(512, 4096), 2000);
+        assert_eq!(pace.output_estimate(512, 4096, 0), 2000);
+        // Beside its input, a call never asks for more than the total limit.
+        pace.seed(
+            &headers(&[
+                ("anthropic-ratelimit-tokens-limit", "10000"),
+                ("anthropic-ratelimit-tokens-remaining", "10000"),
+            ]),
+            crate::codec::Family::Anthropic,
+        );
+        assert_eq!(pace.output_estimate(512, 4096, 9000), 1000);
+        assert_eq!(pace.output_estimate(512, 4096, 3000), 2000);
     }
 
     #[tokio::test(start_paused = true)]

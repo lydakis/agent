@@ -1002,8 +1002,9 @@ impl Provider {
         }
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
+        let input = ((prefix.len() + request.items.weight) / 4) as u64;
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.weight) / 4) as u64,
+            input,
             // Anthropic counts output as it is written, not the cap a
             // request asks for: reserve what this model's calls have been
             // writing. OpenAI counts the cap, so it is reserved whole.
@@ -1011,6 +1012,7 @@ impl Provider {
                 Family::Anthropic => pace.output_estimate(
                     u64::from(self.max_output_tokens.unwrap_or(512)),
                     u64::from(self.anthropic_max_tokens(request.model)),
+                    input,
                 ),
                 Family::Responses => u64::from(self.max_output_tokens.unwrap_or(512)),
             },
