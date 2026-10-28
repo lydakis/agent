@@ -3575,6 +3575,12 @@ impl Turn {
                     Ok(outcome) => outcome,
                     Err(error) => failure(error),
                 },
+                Ok(Prepared::HistorySearch { bot, query, before }) => {
+                    match self.history_search(&call.call_id, bot, query, before).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => failure(error),
+                    }
+                }
                 // Stored with the result: one commit records the note, its
                 // version node, and the tool outcome together.
                 Ok(Prepared::Note { text }) => {
@@ -4171,6 +4177,31 @@ impl Turn {
             page["truncated"] = json!(true);
             page["done"] = json!(false);
         }
+    }
+
+    /// Matches of literal text in a bot's history, newest first; the
+    /// caller's own turn is left out of a search of its own.
+    async fn history_search(
+        &self,
+        call_id: &str,
+        bot: Option<String>,
+        query: String,
+        before: Option<i64>,
+    ) -> Result<Outcome> {
+        let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
+        let own = bot.is_none() || bot.as_deref() == Some(self.bot.as_str());
+        let bot = bot.unwrap_or_else(|| self.bot.clone());
+        let found = self
+            .store
+            .read("history_search", move |db| {
+                db.history_search(&bot, &query, before, own)
+            })
+            .await?;
+        let output = self.registry.redact_text(found.to_string());
+        if family.tool_result_item(call_id, false, &output)?.len() > budget {
+            return fail("history_context_exhausted");
+        }
+        Ok(Outcome::text(output))
     }
 
     /// Make the turn durable as waiting, then register its handles. Returns
