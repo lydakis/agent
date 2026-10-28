@@ -166,7 +166,17 @@ off again never shows.
   would help them (in `lead.md`, and in `task.md` for the rest); so
   `sonny task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. `sonny task changes NAME [--apply]` lists,
-  or writes back, what a sandfs copy of a plain folder changed. A plain
+  or writes back, what a sandfs copy of a plain folder changed.
+  `sonny task done NAME`, from the lead's folder, ends a task whose work is
+  back: it deletes the task, then its folder (a sandfs copy, unmounted, or
+  a worktree, whose branch stays while its commits aren't merged). It
+  refuses while the folder holds work that is nowhere else: files that
+  differ from the lead's folder or commits on no remote in a sandfs copy,
+  uncommitted changes in a worktree. `--apply` writes a sandfs copy's
+  changes back first; `--discard` drops them. The lead is told to end its
+  tasks this way. `sonny task gc` lists the task folders whose task is
+  gone, each still mounted and holding memory until it ends, and Sonny no
+  longer mounts those again. A plain
   folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
   as an external volume, can't be copied, so its task gets a sandfs
   workspace over the folder itself: the task's changes still stay in the

@@ -152,7 +152,9 @@ fn usage() -> String {
      uncommitted changes along and work outside git too.\n\
      sonny task NAME [--setup] [RUN FLAGS] -- BRIEF, from the lead's shell or a terminal, makes a task's\n\
      folder that way and starts the task there; sonny task changes NAME [--apply] lists\n\
-     (or writes here) what a sandfs copy of a plain folder changed.\n\
+     (or writes here) what a sandfs copy of a plain folder changed; sonny task done NAME\n\
+     [--apply|--discard] deletes a task and its folder, and sonny task gc lists folders\n\
+     whose task is gone.\n\
      sonny memory ..., sonny project add DIR ... and sonny trigger ... are what\n\
      ~/.agent/memory, ~/.agent/project and ~/.agent/trigger run, which Sonny writes\n\
      at each start.\n\

@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const USAGE: &str = "usage: sonny task NAME [--setup] [RUN FLAGS...] -- BRIEF\n\
-                     \x20      sonny task changes NAME [--apply]";
+                     \x20      sonny task changes NAME [--apply]\n\
+                     \x20      sonny task done NAME [--apply|--discard]\n\
+                     \x20      sonny task gc";
 
 /// The task's folder, how its work comes back, and what undoes it.
 struct Place {
@@ -51,8 +53,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match args {
         [changes, name] if changes == "changes" => list(name, None),
         [changes, name, apply] if changes == "changes" && apply == "--apply" => {
-            list(name, Some(here))
+            list(name, Some(top(&here)?))
         }
+        [done, name, rest @ ..] if done == "done" && !name.starts_with('-') => {
+            finish(&here, name, rest)
+        }
+        [gc] if gc == "gc" => left_over(),
         [name, rest @ ..] if !name.starts_with('-') => start(&here, name, rest),
         _ => Err(USAGE.into()),
     }
@@ -534,6 +540,11 @@ pub fn mount_of(here: &Path) -> Result<Option<sandfs::WorkspaceInfo>, String> {
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    Ok(git_raw(dir, args)?.trim().to_owned())
+}
+
+/// `git` without trimming what it printed.
+fn git_raw(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -546,7 +557,7 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         let said = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git {}: {}", args.join(" "), said.trim()));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// The task `name`'s sandfs copy of `here`, or the one it has, mounted
@@ -708,9 +719,253 @@ fn list(name: &str, to: Option<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// The top of the folder `here` is in that a task's copy is a copy of.
+fn top(here: &Path) -> Result<PathBuf, String> {
+    Ok(match source(here)? {
+        Source::Mount { root, .. } => root,
+        Source::Git { top } => top,
+        Source::Folder => here.to_owned(),
+    })
+}
+
+/// `sonny task done NAME [--apply|--discard]`: end a task whose work is
+/// taken: delete the task, then its folder. Refused while the folder holds
+/// work that is nowhere else: in a sandfs copy, files that differ from this
+/// folder's and commits on no remote; in a worktree, uncommitted changes.
+/// `--apply` first writes a sandfs copy's changes here; `--discard` drops
+/// what would be lost. A worktree's branch stays when its commits are not
+/// merged.
+fn finish(here: &Path, name: &str, flags: &[String]) -> Result<(), String> {
+    let (apply, discard) = match flags {
+        [] => (false, false),
+        [flag] if flag == "--apply" => (true, false),
+        [flag] if flag == "--discard" => (false, true),
+        _ => return Err(USAGE.into()),
+    };
+    let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let copy = task_copy(name)?;
+    let worktree = task_worktree(name)?;
+    if apply && copy.is_none() {
+        return Err(format!("{name} has no sandfs copy to apply"));
+    }
+    if apply {
+        list(name, Some(top(here)?))?;
+    }
+    if !discard {
+        let me = me();
+        if let Some(dir) = &copy {
+            let left = unsaved(&top(here)?, name, dir)?;
+            if !left.is_empty() {
+                return Err(format!(
+                    "{name}: its copy holds {}, which this folder does not; `{me} task done {name} \
+                     --apply` writes its files here first, `--discard` drops them",
+                    left.join(", ")
+                ));
+            }
+        }
+        if let Some(path) = &worktree
+            && !git(path, &["status", "--porcelain"])?.is_empty()
+        {
+            return Err(format!(
+                "{name}: its worktree {} has uncommitted changes; commit them on agent/{name}, \
+                 or `{me} task done {name} --discard` drops them",
+                shell_quote(path)
+            ));
+        }
+    }
+    let has_bot = bots(&agent)?.iter().any(|bot| bot == name);
+    if !has_bot && copy.is_none() && worktree.is_none() {
+        return Err(format!("{name}: no such task, and no folder of one"));
+    }
+    if has_bot {
+        let output = crate::agent_command(&agent)?
+            .args(["rm", "--bot", name])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("running {}: {e}", agent.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{name} could not be deleted, so its folder stays: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    if let Some(dir) = &copy {
+        sandfs()?.remove(name, true).map_err(|e| format!("{e:#}"))?;
+        // The folder it was mounted on, empty now.
+        let _ = std::fs::remove_dir(dir);
+    }
+    if let Some(path) = &worktree {
+        let common = git(
+            path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let target = path.to_string_lossy();
+        let force: &[&str] = if discard { &["--force"] } else { &[] };
+        git(path, &[&["worktree", "remove"], force, &[&target]].concat())?;
+        let branch = format!("agent/{name}");
+        let delete = if discard { "-D" } else { "-d" };
+        if git(Path::new(&common), &["branch", delete, &branch]).is_err() {
+            eprintln!("{name}: its branch {branch} stays, as its commits are not merged");
+        }
+    }
+    eprintln!("{name}: done");
+    Ok(())
+}
+
+/// The folder of the task `name`'s sandfs copy, if it has one.
+fn task_copy(name: &str) -> Result<Option<PathBuf>, String> {
+    let dir = tasks()?.join(name);
+    if !Home::locate().is_ok_and(|home| home.root().exists()) {
+        return Ok(None);
+    }
+    let found = sandfs()?
+        .workspaces()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .any(|ws| ws.name == name && dir.is_dir());
+    Ok(found.then_some(dir))
+}
+
+/// The task `name`'s worktree, if it has one: on its branch.
+fn task_worktree(name: &str) -> Result<Option<PathBuf>, String> {
+    let path = home_dir()?.join(".agent/worktrees").join(name);
+    let branch = format!("agent/{name}");
+    Ok(
+        (path.is_dir() && git(&path, &["branch", "--show-current"]).is_ok_and(|b| b == branch))
+            .then_some(path),
+    )
+}
+
+/// What the task's sandfs copy at `dir` holds that `top`, the folder it is
+/// a copy of, does not: files that differ, and in a git copy, commits that
+/// are on no remote.
+fn unsaved(top: &Path, name: &str, dir: &Path) -> Result<Vec<String>, String> {
+    let mut left = Vec::new();
+    let paths: Vec<String> = if dir.join(".git").exists() {
+        let commits = git(dir, &["rev-list", "--count", "HEAD", "--not", "--remotes"])?;
+        if commits != "0" {
+            left.push(format!(
+                "{commits} commit{} no remote has (`git -C {} push origin agent/{name}` sends them)",
+                if commits == "1" { "" } else { "s" },
+                shell_quote(dir)
+            ));
+        }
+        // What the copy has uncommitted that this folder doesn't: it came
+        // with this folder's own uncommitted changes.
+        let status = git_raw(
+            dir,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?;
+        let mut entries = status.split('\0').filter(|entry| !entry.is_empty());
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next() {
+            let (code, path) = entry.split_at(3.min(entry.len()));
+            paths.push(path.to_owned());
+            // A rename names where it came from next.
+            if code.starts_with('R') || code.starts_with('C') {
+                paths.extend(entries.next().map(str::to_owned));
+            }
+        }
+        paths
+    } else {
+        let found = sandfs()?
+            .changes(name, &ChangesOptions::default())
+            .map_err(|e| format!("{e:#}"))?;
+        found
+            .changes
+            .into_iter()
+            .map(|change| change.path)
+            .collect()
+    };
+    let differ: Vec<String> = paths
+        .into_iter()
+        .filter(|path| !same(&dir.join(path), &top.join(path)))
+        .collect();
+    if let [first, ..] = differ.as_slice() {
+        left.push(match differ.len() {
+            1 => first.clone(),
+            n => format!("{n} files ({first}, ...)"),
+        });
+    }
+    Ok(left)
+}
+
+/// Whether `a` and `b` hold the same: both missing, folders, links to one
+/// target, or files with the same bytes.
+fn same(a: &Path, b: &Path) -> bool {
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Err(_), Err(_)) => true,
+        (Ok(x), Ok(y)) if x.is_dir() && y.is_dir() => true,
+        (Ok(x), Ok(y)) if x.is_symlink() && y.is_symlink() => {
+            std::fs::read_link(a).ok() == std::fs::read_link(b).ok()
+        }
+        (Ok(x), Ok(y)) if x.is_file() && y.is_file() && x.len() == y.len() => {
+            matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+        }
+        _ => false,
+    }
+}
+
+/// The names of every bot the daemon has.
+fn bots(agent: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new(agent)
+        .arg("ls")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(bots)) if output.status.success() => Ok(bots
+            .iter()
+            .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+            .collect()),
+        _ => Err(format!("{} ls did not list the bots", agent.display())),
+    }
+}
+
+/// `sonny task gc`: the task folders, sandfs copies and worktrees, whose
+/// task is gone, each holding its caches and mount until it ends.
+fn left_over() -> Result<(), String> {
+    let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let bots = bots(&agent)?;
+    let mut found = Vec::new();
+    if Home::locate().is_ok_and(|home| home.root().exists()) {
+        let tasks = tasks()?;
+        for ws in sandfs()?.workspaces().map_err(|e| format!("{e:#}"))? {
+            if tasks.join(&ws.name).is_dir() && !bots.contains(&ws.name) {
+                found.push((ws.name.clone(), tasks.join(&ws.name)));
+            }
+        }
+    }
+    let worktrees = home_dir()?.join(".agent/worktrees");
+    for entry in std::fs::read_dir(&worktrees)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !bots.contains(&name) && task_worktree(&name)?.is_some() {
+            found.push((name, entry.path()));
+        }
+    }
+    for (name, path) in &found {
+        println!("{name}\t{}", path.display());
+    }
+    match found.is_empty() {
+        true => eprintln!("every task folder has its task"),
+        false => eprintln!(
+            "these tasks are gone; `{} task done NAME`, from the folder each copied, ends one",
+            me()
+        ),
+    }
+    Ok(())
+}
+
 /// Mount again the task copies a restart unmounted, so a task never works
 /// in an empty folder: every workspace whose folder in `~/.agent/tasks`
-/// is there but not mounted. Returns what could not be mounted.
+/// is there but not mounted, and whose task is still there (`sonny task
+/// gc` lists the rest). Returns what could not be mounted.
 pub fn remount() -> Vec<String> {
     let Ok(tasks) = tasks() else {
         return Vec::new();
@@ -724,9 +979,12 @@ pub fn remount() -> Vec<String> {
     let Ok(workspaces) = home.workspaces() else {
         return Vec::new();
     };
+    // Unlisted, every copy might still have its task.
+    let bots = crate::agent_bin().and_then(|agent| bots(&agent).ok());
     workspaces
         .into_iter()
         .filter(|ws| ws.mounted.is_none() && tasks.join(&ws.name).is_dir())
+        .filter(|ws| bots.as_ref().is_none_or(|bots| bots.contains(&ws.name)))
         .filter_map(|ws| {
             home.mount(&ws.name, &tasks.join(&ws.name), &MountOptions::default())
                 .err()

@@ -31,7 +31,8 @@ impl Lab {
             &agent,
             "#!/bin/sh\ncase \"$1\" in\n\
              run) printf '%s\\n' \"$@\" > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
-             ls) echo '[]';;\nesac\n",
+             ls) cat \"$AGENT_BOTS\" 2>/dev/null || echo '[]';;\n\
+             rm) [ -z \"$AGENT_BUSY\" ] || { echo busy >&2; exit 1; }; echo '[]' > \"$AGENT_BOTS\"; echo '{}';;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -70,6 +71,7 @@ impl Lab {
             .env("SANDFS_HOME", self.home.join("sandfs"))
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
+            .env("AGENT_BOTS", self.scratch.join("bots.json"))
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -102,6 +104,22 @@ impl Lab {
             &args,
             fail,
         );
+        (ok, format!("{out}\n{err}"))
+    }
+
+    /// The daemon has the task `demo.fix`, or no bots.
+    fn has_task(&self, has: bool) {
+        let bots = if has {
+            r#"[{"name":"demo.fix"}]"#
+        } else {
+            "[]"
+        };
+        std::fs::write(self.scratch.join("bots.json"), bots).unwrap();
+    }
+
+    /// `sonny ARGS` in the lead's folder `dir`.
+    fn sonny(&self, dir: &Path, args: &[&str]) -> (bool, String) {
+        let (ok, out, err) = self.run(dir, env!("CARGO_BIN_EXE_sonny"), args, false);
         (ok, format!("{out}\n{err}"))
     }
 
@@ -349,4 +367,136 @@ fn a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it() {
     finish(&lab);
     assert_eq!(listed, "M notes.txt");
     assert_eq!(source, "one\n");
+}
+
+#[test]
+fn a_task_done_goes_with_its_worktree_once_its_work_is_committed() {
+    let lab = Lab::new("done-worktree");
+    let (ok, said) = lab.task(false, &[]);
+    assert!(ok, "{said}");
+    lab.has_task(true);
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::write(worktree.join("src/new.rs"), "new\n").unwrap();
+    let (ok, said) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    assert!(!ok && said.contains("uncommitted changes"), "{said}");
+    assert!(worktree.exists());
+    lab.git(&worktree, &["add", "."]);
+    lab.git(&worktree, &["commit", "-qm", "new"]);
+    let (ok, said) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    assert!(ok, "{said}");
+    assert!(!worktree.exists());
+    // The task's commits stay on its branch, which isn't merged.
+    assert!(said.contains("stays"), "{said}");
+    assert_eq!(
+        lab.git(&lab.repo, &["show", "agent/demo.fix:src/new.rs"]),
+        "new"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lab.scratch.join("bots.json"))
+            .unwrap()
+            .trim(),
+        "[]"
+    );
+}
+
+#[test]
+fn a_task_done_keeps_its_sandfs_copy_until_its_work_is_elsewhere() {
+    let lab = Lab::new("done-sandfs");
+    lab.sandfs();
+    let (ok, said) = lab.task(false, &[]);
+    assert!(ok, "{said}");
+    lab.has_task(true);
+    let copy = lab.home.join(".agent/tasks/demo.fix");
+    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
+    let finish = || {
+        let _ = sandfs.remove("demo.fix", true);
+    };
+    // The lead's uncommitted edit came along and isn't the task's work;
+    // the task's own edit, then its commit, are.
+    std::fs::write(copy.join("src/lib.rs"), "three\n").unwrap();
+    let (ok, said) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let refused_edit = !ok && said.contains("src/lib.rs");
+    lab.git(&copy, &["commit", "-qam", "three"]);
+    let (ok, said_commit) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let refused_commit = !ok && said_commit.contains("1 commit no remote has");
+    // Still working: the task can't be deleted, so neither is its copy.
+    lab.git(&copy, &["push", "-q", "origin", "agent/demo.fix"]);
+    let sonny = env!("CARGO_BIN_EXE_sonny");
+    let done = ["AGENT_BUSY=1", sonny, "task", "done", "demo.fix"];
+    let (_, _, busy) = lab.run(&lab.repo, "env", &done, false);
+    let kept_while_busy = copy.join("src/lib.rs").exists();
+    let (ok, said_done) = lab.sonny(&lab.repo, &["task", "done", "demo.fix"]);
+    let gone = sandfs.workspaces().unwrap().is_empty();
+    if !gone {
+        finish();
+    }
+    assert!(refused_edit, "{said}");
+    assert!(refused_commit, "{said_commit}");
+    assert!(
+        busy.contains("could not be deleted") && kept_while_busy,
+        "{busy}"
+    );
+    assert!(ok && gone, "{said_done}");
+    assert!(!copy.exists());
+    assert_eq!(
+        lab.git(&lab.repo, &["show", "agent/demo.fix:src/lib.rs"]),
+        "three"
+    );
+}
+
+#[test]
+fn a_task_done_with_apply_writes_a_plain_folder_s_copy_back_first() {
+    // On another disk, as in a_plain_folder_on_another_disk_gets_a_sandfs_workspace_over_it.
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return;
+    }
+    let lab = Lab::new("done-apply");
+    lab.sandfs();
+    let folder = shm.join(format!("sonny-task-done-apply-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("notes.txt"), "one\n").unwrap();
+    let (ok, said) = lab.sonny(&folder, &["task", "demo.fix", "--", "go"]);
+    assert!(ok, "{said}");
+    lab.has_task(true);
+    let copy = lab.home.join(".agent/tasks/demo.fix");
+    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
+    std::fs::write(copy.join("notes.txt"), "two\n").unwrap();
+    let (done_as_is, said) = lab.sonny(&folder, &["task", "done", "demo.fix"]);
+    let (ok, said_apply) = lab.sonny(&folder, &["task", "done", "demo.fix", "--apply"]);
+    let gone = sandfs.workspaces().unwrap().is_empty();
+    if !gone {
+        let _ = sandfs.remove("demo.fix", true);
+    }
+    let applied = std::fs::read_to_string(folder.join("notes.txt")).unwrap();
+    let _ = std::fs::remove_dir_all(&folder);
+    assert!(!done_as_is && said.contains("notes.txt"), "{said}");
+    assert!(ok && gone, "{said_apply}");
+    assert_eq!(applied, "two\n");
+}
+
+#[test]
+fn gc_lists_the_task_folders_whose_task_is_gone() {
+    let lab = Lab::new("gc");
+    lab.sandfs();
+    let (ok, said) = lab.task(false, &[]);
+    assert!(ok, "{said}");
+    let copy = lab.home.join(".agent/tasks/demo.fix");
+    lab.has_task(true);
+    let (_, kept) = lab.sonny(&lab.repo, &["task", "gc"]);
+    lab.has_task(false);
+    let (_, gone) = lab.sonny(&lab.repo, &["task", "gc"]);
+    let (ok, discarded) = lab.sonny(&lab.repo, &["task", "done", "demo.fix", "--discard"]);
+    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
+    let removed = sandfs.workspaces().unwrap().is_empty();
+    if !removed {
+        let _ = sandfs.remove("demo.fix", true);
+    }
+    assert!(kept.contains("every task folder has its task"), "{kept}");
+    assert!(
+        gone.contains(&format!("demo.fix\t{}", copy.display())),
+        "{gone}"
+    );
+    assert!(ok && removed, "{discarded}");
 }
