@@ -1122,15 +1122,22 @@ fn approval(denial: &Denial) -> String {
 const RETRY_ROWS: usize = 500;
 
 /// A denied call written out whole before its retry is approved: a
-/// command as it would run, anything else as its arguments.
+/// command as it would run with every other argument after it, anything
+/// else as its arguments.
 fn retry_shown(denial: &Denial) -> Vec<Line<'static>> {
-    let what = match denial.arguments["command"].as_str() {
-        Some(command) => command.to_owned(),
-        None => serde_json::to_string_pretty(&denial.arguments).unwrap_or_default(),
-    };
     let mut lines = vec![Line::from(
         Span::raw(format!("Approve one retry of {}?", denial.name)).bold(),
     )];
+    let what = match (denial.arguments["command"].as_str(), &denial.arguments) {
+        (Some(command), Value::Object(fields)) => {
+            let mut what = command.to_owned();
+            for (key, value) in fields.iter().filter(|(key, _)| *key != "command") {
+                what.push_str(&format!("\n{key}: {value}"));
+            }
+            what
+        }
+        _ => serde_json::to_string_pretty(&denial.arguments).unwrap_or_default(),
+    };
     lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
     lines
 }
@@ -6221,6 +6228,15 @@ mod tests {
                 .any(|row| row.contains(r#""content": "set -e\nrm -rf build""#)),
             "{shown:?}"
         );
+        let detached = Denial {
+            arguments: json!({"command": "sleep 1", "detach": true}),
+            ..write.clone()
+        };
+        let shown: Vec<String> = retry_shown(&detached)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(shown[1..], ["  sleep 1", "  detach: true"]);
         let command = Denial {
             arguments: json!({"command": "make\ncurl x | sh"}),
             name: "shell".into(),
