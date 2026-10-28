@@ -3507,10 +3507,35 @@ impl Turn {
                     }
                 }
                 Ok(Prepared::Read {
-                    source: source @ (ReadSource::Artifact { .. } | ReadSource::Result { .. }),
+                    source:
+                        ReadSource::Artifact {
+                            turn: owner,
+                            call_id: ref_call,
+                            stream,
+                        },
                     offset,
                     limit,
-                }) => self.read_stored(&call.call_id, source, offset, limit).await,
+                }) => {
+                    let bot = self.bot.clone();
+                    let text = self
+                        .store
+                        .op("artifact_lines", move |db| {
+                            db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
+                        })
+                        .await;
+                    match text {
+                        Ok(page) => Outcome::text(self.registry.redact_text(page)),
+                        Err(error) => failure(error),
+                    }
+                }
+                Ok(Prepared::Read {
+                    source: ReadSource::Result { node },
+                    offset,
+                    limit,
+                }) => match self.result_page(&call.call_id, node, offset, limit).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure(error),
+                },
                 Ok(Prepared::History {
                     bot,
                     turn: wanted,
@@ -3604,7 +3629,7 @@ impl Turn {
     }
 
     /// The call prepared, when it may run beside others: an ungated
-    /// command in the foreground or a read, which the bot may call. Codex
+    /// command in the foreground or a file read, which the bot may call. Codex
     /// runs these together too; a change to a file runs alone, in order.
     /// A sandboxed bot's command runs beside others only inside its
     /// sandbox; one that asks to leave it goes the lone way, to be refused.
@@ -3623,11 +3648,16 @@ impl Turn {
             return None;
         }
         match self.registry.prepare(&call.name, &call.arguments) {
+            // A stored stream or result is paged to fit the context left,
+            // which a read beside it would spend too: it runs alone.
             Ok(
                 prepared @ (Prepared::Shell {
                     background: false, ..
                 }
-                | Prepared::Read { .. }),
+                | Prepared::Read {
+                    source: ReadSource::Path(_),
+                    ..
+                }),
             ) => Some(prepared),
             _ => None,
         }
@@ -3673,11 +3703,27 @@ impl Turn {
         });
         let record = async {
             let mut results = stream::iter(runs).buffered(PARALLEL_CALLS);
-            while let Some((id, outcome)) = results.next().await {
-                let outcome = outcome?;
-                self.store
-                    .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
-                    .await?;
+            // Each result is queued as it comes, in call order, and not
+            // waited on before the next: results done together share a
+            // commit, and the calls still running are polled meanwhile.
+            let mut writes = stream::FuturesOrdered::new();
+            loop {
+                tokio::select! {
+                    Some(written) = writes.next(), if !writes.is_empty() => drop(written?),
+                    next = results.next() => match next {
+                        Some((id, outcome)) => {
+                            let outcome = outcome?;
+                            writes.push_back(self.store.slot().await?.op(
+                                "tool_finish",
+                                move |db| db.tool_finish(turn, &id, &outcome),
+                            ));
+                        }
+                        None => break,
+                    },
+                }
+            }
+            while let Some(written) = writes.next().await {
+                written?;
             }
             Ok(())
         };
@@ -3732,14 +3778,6 @@ impl Turn {
                     Some(result) => result,
                     None => return (call_id.clone(), self.lift_shell(&call_id, run).await),
                 }
-            }
-            Prepared::Read {
-                source: source @ (ReadSource::Artifact { .. } | ReadSource::Result { .. }),
-                offset,
-                limit,
-            } => {
-                let outcome = self.read_stored(&call_id, source, offset, limit).await;
-                return (call_id, Ok(outcome));
             }
             prepared => {
                 self.registry
@@ -3796,42 +3834,6 @@ impl Turn {
         .map_err(|_| Error::new("sandbox_unavailable"))
         .flatten()
         .map(|policy| policy.map(Arc::new))
-    }
-
-    /// A page of a stored stream or result, for `read`.
-    async fn read_stored(
-        &self,
-        call_id: &str,
-        source: ReadSource,
-        offset: usize,
-        limit: usize,
-    ) -> Outcome {
-        match source {
-            ReadSource::Artifact {
-                turn: owner,
-                call_id: ref_call,
-                stream,
-            } => {
-                let bot = self.bot.clone();
-                let text = self
-                    .store
-                    .op("artifact_lines", move |db| {
-                        db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
-                    })
-                    .await;
-                match text {
-                    Ok(page) => Outcome::text(self.registry.redact_text(page)),
-                    Err(error) => failure(error),
-                }
-            }
-            ReadSource::Result { node } => {
-                match self.result_page(call_id, node, offset, limit).await {
-                    Ok(outcome) => outcome,
-                    Err(error) => failure(error),
-                }
-            }
-            ReadSource::Path(_) => unreachable!("a file is read by the registry"),
-        }
     }
 
     /// Wait for a gated call's verdict: live for the hold, then parked like
