@@ -1181,8 +1181,8 @@ struct App {
     /// The slash command picked in the menu.
     pick: usize,
     watch: Option<Watch>,
-    /// What `/status` read of each idle agent's last turn: the turn, and
-    /// the question it left open.
+    /// What `/status` read of each idle agent's history: its last turn
+    /// then, and the question left open.
     asks_seen: HashMap<String, (i64, Option<String>)>,
     /// The live area is drawn afresh: the main screen is back from `/status`.
     redraw: bool,
@@ -2674,7 +2674,7 @@ impl App {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
                             if name == resolved::TOOL && !failed && !reactions::refused(&item) {
-                                self.resolve(&arguments, turns.get(&node).copied(), false)
+                                self.resolve(&arguments, id, turns.get(&node).copied(), false)
                                     .await;
                             }
                             if name == asks::TOOL
@@ -3241,7 +3241,7 @@ impl App {
                     && !shown.1
                     && !reactions::refused(&json!({"output": shown.0}))
                 {
-                    self.resolve(&arguments, turn, true).await;
+                    self.resolve(&arguments, id, turn, true).await;
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
@@ -3357,17 +3357,20 @@ impl App {
             .unwrap_or_else(|_| self.options.store.clone())
     }
 
-    /// Note the task a lead's `resolve_task` call in `turn` names as
-    /// resolved, up to its newest turn finished by then: `now`, as it
+    /// Note the task a lead's `resolve_task` call `call` in `turn` names
+    /// as resolved, up to its newest turn finished by then: `now`, as it
     /// happens, when its window closes too; replayed, by the time the
-    /// lead's turn ended.
-    async fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
+    /// lead's turn ended, unless the mark it made then is kept.
+    async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
         let Some(project) = &self.project else {
             return;
         };
         let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
             return;
         };
+        if !now && resolved::made_by(&self.store(), &task, call) {
+            return;
+        }
         let clock = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3394,7 +3397,7 @@ impl App {
             return;
         };
         let upto = resolved::upto(page["turns"].as_array().map_or(&[][..], Vec::as_slice), at);
-        if let Err(error) = resolved::keep(&self.store(), &task, upto) {
+        if let Err(error) = resolved::keep(&self.store(), &task, upto, call) {
             self.notice = Some(error);
         }
         if now && let Some(fleet) = &mut self.fleet {
@@ -3538,19 +3541,21 @@ impl App {
             let resolved =
                 resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
             let Latest { mut step, pr, ask } = self.latest(name).await;
-            // Asking ends a turn, but work that does not wait on the
-            // answer may come first: an idle agent's whole last turn is
-            // read, once.
-            let ask = match (running, turn["turn"].as_i64()) {
-                (false, Some(last)) => match self.asks_seen.get(name) {
+            // A question stays open until its answer lands, past work that
+            // does not wait on it and messages that answer something else:
+            // an idle agent's recent history is read once per turn it
+            // ended. While a turn runs, its last items, or what was read
+            // before it, say.
+            let ask = match turn["turn"].as_i64() {
+                Some(last) if !running => match self.asks_seen.get(name) {
                     Some((seen, ask)) if *seen == last => ask.clone(),
                     _ => {
-                        let ask = self.asked_in(name, last).await;
+                        let ask = self.open_ask(name).await;
                         self.asks_seen.insert(name.to_owned(), (last, ask.clone()));
                         ask
                     }
                 },
-                _ => ask,
+                _ => ask.or_else(|| self.asks_seen.get(name).and_then(|(_, ask)| ask.clone())),
             };
             if let Some(question) = &ask {
                 step = format!("asks: {}", first_line(question));
@@ -3598,9 +3603,9 @@ impl App {
         Ok((project, rows))
     }
 
-    /// The question `bot` asked in its turn `turn` and has no answer to,
-    /// read from that turn's items, newest first.
-    async fn asked_in(&self, bot: &str, turn: i64) -> Option<String> {
+    /// The oldest question `bot` asked and has no answer to, read from its
+    /// newest 400 nodes.
+    async fn open_ask(&self, bot: &str) -> Option<String> {
         let page = self
             .client
             .request("history_nodes", json!({"bot": bot, "limit": 400}))
@@ -3609,7 +3614,6 @@ impl App {
         let nodes: Vec<i64> = page["nodes"]
             .as_array()?
             .iter()
-            .take_while(|n| n["turn"].as_i64().is_none_or(|t| t == turn))
             .filter_map(|n| n["node"].as_i64())
             .collect();
         let mut items = Vec::new();

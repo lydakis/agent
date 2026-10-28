@@ -54,8 +54,17 @@ fn file(store: &Path, task: &str) -> PathBuf {
 
 /// The newest turn of `task` its resolving covered, if it was resolved.
 pub fn read(store: &Path, task: &str) -> Option<i64> {
-    let value: Value = serde_json::from_slice(&std::fs::read(file(store, task)).ok()?).ok()?;
-    value["turn"].as_i64()
+    kept(store, task)?["turn"].as_i64()
+}
+
+fn kept(store: &Path, task: &str) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(file(store, task)).ok()?).ok()
+}
+
+/// Whether the mark kept for `task` is the one the lead's call `call`
+/// made, which a replay of that call leaves as it is.
+pub fn made_by(store: &Path, task: &str, call: &str) -> bool {
+    kept(store, task).is_some_and(|mark| mark["call"] == call)
 }
 
 /// Whether a task resolved up to its turn `mark` still is: none of its
@@ -79,9 +88,9 @@ pub fn upto(turns: &[Value], at: i64) -> i64 {
         .unwrap_or(0)
 }
 
-/// Note `task` resolved up to its turn `turn`, unless it was resolved past
-/// that already.
-pub fn keep(store: &Path, task: &str, turn: i64) -> Result<(), String> {
+/// Note `task` resolved up to its turn `turn` by the lead's call `call`,
+/// unless it was resolved past that already.
+pub fn keep(store: &Path, task: &str, turn: i64, call: &str) -> Result<(), String> {
     if read(store, task).is_some_and(|kept| kept >= turn) {
         return Ok(());
     }
@@ -92,7 +101,7 @@ pub fn keep(store: &Path, task: &str, turn: i64) -> Result<(), String> {
     }
     // Its own, so two windows never write one file together.
     let next = path.with_extension(format!("json.{}.next", std::process::id()));
-    std::fs::write(&next, json!({"turn": turn}).to_string()).map_err(failed)?;
+    std::fs::write(&next, json!({"turn": turn, "call": call}).to_string()).map_err(failed)?;
     std::fs::rename(&next, &path).map_err(failed)
 }
 
@@ -139,13 +148,15 @@ mod tests {
     fn marks_are_kept_beside_the_store_and_only_move_on() {
         let dir = std::env::temp_dir().join(format!("sonny-resolved-{}", std::process::id()));
         let store = dir.join("state.sqlite");
-        keep(&store, "calc.fix", 9).unwrap();
+        keep(&store, "calc.fix", 9, "r1").unwrap();
         assert_eq!(read(&store, "calc.fix"), Some(9));
+        assert!(made_by(&store, "calc.fix", "r1"));
         assert!(dir.join("state.sqlite.resolved/calc.fix.json").exists());
         // A replay of an older resolve leaves the newer one.
-        keep(&store, "calc.fix", 4).unwrap();
+        keep(&store, "calc.fix", 4, "r0").unwrap();
         assert_eq!(read(&store, "calc.fix"), Some(9));
-        keep(&store, "calc.fix", 15).unwrap();
+        assert!(!made_by(&store, "calc.fix", "r0"));
+        keep(&store, "calc.fix", 15, "r2").unwrap();
         assert_eq!(read(&store, "calc.fix"), Some(15));
         assert_eq!(read(&store, "calc.other"), None);
         let _ = std::fs::remove_dir_all(dir);
