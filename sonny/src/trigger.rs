@@ -2135,6 +2135,72 @@ pub fn cli(args: &[String]) -> i32 {
     1
 }
 
+/// A `triggers` call: `add` one, or `remove`, `fire` or `show` one by
+/// name; with none, every trigger. Run as `add` and the rest run from an
+/// agent's shell, for the calling agent.
+pub fn tool(arguments: &Value) -> Result<Value, String> {
+    let places = Places::home()?;
+    let named = |key: &str| arguments[key].as_str().filter(|name| !name.is_empty());
+    if let Some(asked) = arguments.get("add") {
+        return add(&places, &add_args(asked));
+    }
+    if let Some(name) = named("remove") {
+        return remove(&places, name, &launchctl).map(|()| json!({"removed": name}));
+    }
+    if let Some(name) = named("fire") {
+        return fire_now(&places, name).map(|file| fired(&places, name, &file, FIRE_WAIT));
+    }
+    if let Some(name) = named("show") {
+        return one(&places, name).ok_or_else(|| format!("trigger_not_found: {name}"));
+    }
+    Ok(list(&places, None))
+}
+
+/// The `add` arguments a `triggers` call's `add` names.
+fn add_args(asked: &Value) -> Vec<String> {
+    let mut args = Vec::new();
+    for (key, flag) in [
+        ("name", "--name"),
+        ("every", "--every"),
+        ("in", "--in"),
+        ("at", "--at"),
+        ("cron", "--cron"),
+        ("file", "--file"),
+        ("commit", "--commit"),
+        ("bot", "--bot"),
+        ("reply_to", "--reply-to"),
+        ("if", "--if"),
+    ] {
+        if let Some(value) = asked[key].as_str() {
+            args.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    let start = &asked["start"];
+    for (key, flag) in [
+        ("name", "--start"),
+        ("model", "--model"),
+        ("effort", "--effort"),
+    ] {
+        if let Some(value) = start[key].as_str() {
+            args.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    for (key, flag) in [
+        ("runs", "--runs"),
+        ("turn_budget_tokens", "--turn-budget-tokens"),
+    ] {
+        if let Some(count) = asked[key].as_u64() {
+            args.extend([flag.to_owned(), count.to_string()]);
+        }
+    }
+    if asked["replace"] == true {
+        args.push("--replace".to_owned());
+    }
+    let message = asked["message"].as_str().unwrap_or_default();
+    args.extend(["--".to_owned(), message.to_owned()]);
+    args
+}
+
 /// A trigger that watched the triggers' own folder would fire itself: each
 /// fire writes its result there; so would one watching its daemon's store,
 /// which each message it sends writes, or that store's `-wal` and `-shm`.
@@ -4660,6 +4726,45 @@ mod tests {
             error_json(&coded(missing)),
             json!({"error": "bot_not_found", "detail": "p.x"})
         );
+    }
+
+    #[test]
+    fn a_triggers_call_adds_as_add_does() {
+        let now = clock(2026, 9, 28, 23, 52);
+        let asked = json!({"name": "pr", "cron": "0 9 * * 1", "start": {"name": "p.r", "model": "a/m",
+            "effort": "high"}, "reply_to": "p.lead", "if": "test -e x", "runs": 3,
+            "turn_budget_tokens": 50000, "replace": true, "message": "-- check the PR --"});
+        let add = parse_add(&add_args(&asked), now).unwrap();
+        assert_eq!(add.name.as_deref(), Some("pr"));
+        assert_eq!(add.when.text, "cron 0 9 * * 1");
+        assert_eq!(
+            add.start,
+            Some(("p.r".into(), "a/m".into(), Some("high".into())))
+        );
+        assert_eq!(
+            (
+                add.reply_to.as_deref(),
+                add.gate.as_deref(),
+                add.runs,
+                add.turn_budget_tokens,
+                add.replace
+            ),
+            (
+                Some("p.lead"),
+                Some("test -e x"),
+                Some(3),
+                Some(50_000),
+                true
+            )
+        );
+        // The message is the message, flags and all.
+        assert_eq!(add.message, "-- check the PR --");
+        let mine = parse_add(&add_args(&json!({"every": "30m", "message": "go"})), now).unwrap();
+        assert_eq!(
+            (mine.bot, mine.start, mine.when.text.as_str()),
+            (None, None, "every 30m")
+        );
+        assert!(parse_add(&add_args(&json!({"every": "7m", "message": "go"})), now).is_err());
     }
 
     #[test]
