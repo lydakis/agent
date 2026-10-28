@@ -70,7 +70,13 @@ supports Herdr the way its own agents do: each Sonny reports its bot through
 (working, idle, or blocked on an approval), the workspace rolls that up and
 notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 (`shop-fix-cart` for `shop.fix-cart`), and after a Herdr restart the pane runs
-`sonny` on the same bot again (when `sonny` is on the PATH). The place a
+`sonny` on the same bot again (when `sonny` is on the PATH; Herdr before
+0.9.2 lists Sonny but takes no command to restart it). Sonny reports from a
+pane of the Herdr server on its own machine: one reached by plain `ssh` from a
+Herdr pane is not listed, one in a remote machine Herdr itself connects to is.
+The daemon, lookout and approver Sonny starts run in a session of their own,
+so closing their pane or stopping Herdr leaves them and their turns running.
+The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `sonny run` and `sonny show` go to that Herdr workspace or Rex session, in
 that multiplexer, rather than one guessed from the agent's shell, which runs
@@ -182,22 +188,31 @@ off again never shows.
   what they will need next, and say once when a better way of working
   would help them (in `lead.md`, and in `task.md` for the rest); so
   `sonny task` gives what `--agents` or `--profile` would compose as the
-  task's instructions, with `task.md` after it. `sonny task changes NAME [--apply]` lists,
-  or writes back, what a sandfs copy of a plain folder changed. A plain
-  folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
-  as an external volume, can't be copied, so its task gets a sandfs
-  workspace over the folder itself: the task's changes still stay in the
-  workspace, but a file it has looked at stays as it first saw it, and
-  `--apply` writes over what changed in the folder meanwhile without
-  asking. Paths in the lead's folder that a brief names (through a link
-  such as `~/workplace` too) are turned into the same paths in the task's
-  copy, so the task never writes the lead's folder by its full path.
-  `sonny task` also works from a plain terminal, with the `agent` installed
-  beside Sonny. sandfs is
+  task's instructions, with `task.md` after it. Paths in the lead's folder
+  that a brief names (through a link too) are turned into the same paths
+  in the task's copy, so the task never writes the lead's folder by its
+  full path. `sonny task changes NAME [--all] [--apply [--force]
+  [--only PATH...]]` lists, or writes back, what a sandfs copy of a plain
+  folder changed: never git's own files, and files git ignores (such as
+  `__pycache__`) only with `--all`. Commits a task makes in a repository
+  inside a plain folder stay in its copy, and in the copy of a linked
+  worktree, whose `.git` names its repository outside the copy, git is
+  turned off, so it can't change that repository while the files stay
+  behind. A plain folder on another disk than sandfs's home
+  (`~/.local/share/sandfs`), such as an external volume, can't be copied,
+  so its task gets a sandfs workspace over the folder itself: the task's
+  changes still stay in the workspace, but a file it has looked at stays
+  as it first saw it, and `--apply` writes over what changed in the folder
+  meanwhile without asking. `sonny task rm NAME [--discard]` removes a
+  task that is done and the folder Sonny made it, refusing while its work
+  isn't back yet: changes not applied, uncommitted or not pushed. A
+  worktree's branch is kept unless it is merged. `sonny task` also works
+  from a plain terminal, with the `agent` installed beside Sonny. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
   on Linux, nothing on macOS). Its mounts are served by Sonny run again in
   the background, which outlives Sonny; Sonny mounts task copies a restart
-  unmounted again when it opens the lead.
+  unmounted again when it opens the lead, but not those whose task is gone,
+  which it names instead.
 - **Needs you:** when the lead needs the person to decide something, it
   calls its `ask` tool with the question and up to nine choices. Sonny
   pins the open questions above the composer, oldest first, until each is

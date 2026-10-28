@@ -67,9 +67,14 @@ struct Presence {
     bot: String,
     /// What reopens this Sonny after a Herdr restart, when Herdr can run it.
     resume: Option<Vec<String>>,
+    /// Whether this Herdr refused a report for its resume command: before
+    /// 0.9.2 its CLI takes none, and refuses the report that carries one.
+    no_resume: AtomicBool,
     /// The last report's number: Herdr drops one that is not above it,
     /// so a late report cannot undo a newer one.
     seq: AtomicU64,
+    /// Whether Herdr shows the bot by name: it keeps that until Sonny
+    /// releases the pane, so it is said once, not with every report.
     named: AtomicBool,
 }
 
@@ -103,6 +108,7 @@ pub fn announce(bot: &str, resume: Vec<String>) {
         name: agent_name(bot),
         bot: bot.to_owned(),
         resume: resumable(resume),
+        no_resume: AtomicBool::new(false),
         seq: AtomicU64::new(0),
         named: AtomicBool::new(false),
     });
@@ -142,10 +148,6 @@ impl Presence {
             args.extend(["--message".into(), "waiting for your approval".into()]);
         }
         args.extend(["--agent-session-id".into(), self.bot.clone()]);
-        if let Some(resume) = &self.resume {
-            args.push("--".into());
-            args.extend(resume.iter().cloned());
-        }
         let display = [
             "pane",
             "report-metadata",
@@ -162,17 +164,34 @@ impl Presence {
         .map(str::to_owned);
         Some(std::thread::spawn(move || {
             let limit = Duration::from_secs(5);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            if !run(&self.bin, &args, limit) {
+            let report = |args: &[String]| {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                run(&self.bin, &args, limit)
+            };
+            let reported = match &self.resume {
+                Some(resume) if !self.no_resume.load(Ordering::Relaxed) => {
+                    report(&[&args[..], &["--".to_owned()], resume].concat()) || {
+                        let reported = report(&args);
+                        self.no_resume.store(reported, Ordering::Relaxed);
+                        reported
+                    }
+                }
+                _ => report(&args),
+            };
+            if !reported {
                 return;
             }
             // Shown by name once Herdr holds the agent; a name another live
             // agent has is left to it.
+            if self.named.load(Ordering::Relaxed) {
+                return;
+            }
             let display: Vec<&str> = display.iter().map(String::as_str).collect();
-            run(&self.bin, &display, limit);
-            if let Some(name) = &self.name
-                && !self.named.swap(true, Ordering::Relaxed)
-            {
+            if !run(&self.bin, &display, limit) {
+                return;
+            }
+            self.named.store(true, Ordering::Relaxed);
+            if let Some(name) = &self.name {
                 run(&self.bin, &["agent", "rename", &self.pane, name], limit);
             }
         }))
@@ -599,6 +618,9 @@ here = os.path.dirname(os.path.abspath(sys.argv[0]))
 state = json.load(open(os.path.join(here, "state.json")))
 args = sys.argv[1:]
 open(os.path.join(here, "calls"), "a").write(json.dumps(args) + "\n")
+if state.get("before_resume") and "--" in args:
+    sys.stderr.write("unknown option: --\n")
+    sys.exit(2)
 def flag(name):
     return args[args.index(name) + 1] if name in args else None
 def pane(ws, tab, label=None):
@@ -650,9 +672,7 @@ if out is not None:
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("herdr");
-        std::fs::write(&bin, FAKE).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testing::script(&bin, FAKE);
         std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
         (bin, dir)
     }
@@ -883,6 +903,7 @@ if out is not None:
             name: agent_name("shop.fix-cart"),
             bot: "shop.fix-cart".into(),
             resume: Some(vec!["sonny".into(), "--bot".into(), "shop.fix-cart".into()]),
+            no_resume: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             named: AtomicBool::new(false),
         }));
@@ -909,9 +930,7 @@ if out is not None:
                 "report-metadata",
                 "rename",
                 "report-agent blocked",
-                "report-metadata",
                 "report-agent idle",
-                "report-metadata",
                 "release-agent",
             ]
         );
@@ -940,6 +959,44 @@ if out is not None:
             .map(|c| flag(c, "--seq").unwrap().parse().unwrap())
             .collect();
         assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    }
+
+    #[test]
+    fn a_herdr_without_resume_commands_still_lists_sonny() {
+        let (bin, dir) = fake(
+            "before-resume",
+            json!({"n": 0, "workspaces": [], "panes": [], "before_resume": true}),
+        );
+        let me: &'static Presence = Box::leak(Box::new(Presence {
+            bin,
+            pane: "w1:p2".into(),
+            shown: "Sonny: lead".into(),
+            name: agent_name("shop.lead"),
+            bot: "shop.lead".into(),
+            resume: Some(vec!["sonny".into()]),
+            no_resume: AtomicBool::new(false),
+            seq: AtomicU64::new(0),
+            named: AtomicBool::new(false),
+        }));
+        for state in ["working", "idle"] {
+            me.report(state).unwrap().join().unwrap();
+        }
+        let what: Vec<(String, bool)> = calls(&dir)
+            .iter()
+            .map(|c| (c[1].clone(), c.iter().any(|a| a == "--")))
+            .collect();
+        let call = |name: &str, resume| (name.to_owned(), resume);
+        // Refused with its resume command once, then reported without it.
+        assert_eq!(
+            what,
+            [
+                call("report-agent", true),
+                call("report-agent", false),
+                call("report-metadata", false),
+                call("rename", false),
+                call("report-agent", false),
+            ]
+        );
     }
 
     #[test]

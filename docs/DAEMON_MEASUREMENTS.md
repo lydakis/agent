@@ -5188,3 +5188,72 @@ half a creation. An unkeyed creation builds no stored request: an earlier
 build of this change that built it for every creation measured 10.81 ms
 unkeyed against 10.25 ms on main in a run of the same size, inside the same
 spread. macOS is not measured.
+
+## Answered declared tools
+
+A declared tool may wait for its client's answer (protocol 20). A call holds
+live for up to 250 ms and then parks like `wait`. This screen measures what
+an answered call costs a turn, compared with the same call to a tool whose
+result is fixed. It also checks that fixed declared tools and turns that
+call no tools cost what they did before.
+
+Method: [`bench.approval_overhead`](../bench/approval_overhead.py) with
+`--arms declared,answered,answered_parked --turns 200 --rounds 3`. One bot
+runs 200 turns. Each turn makes one call to a declared tool with no
+parameters, then replies. The arms are:
+
+- `declared`: the tool has a fixed result.
+- `answered`: this client answers as soon as `tool_started` names the tag,
+  so the call is answered within the hold.
+- `answered_parked`: the same, but with `approval_hold_ms` 0. The client
+  answers after `turn_waiting`.
+
+`--before` runs the `declared` arm on main (`cf8cf65`). `--fsync` makes a
+separate pass that counts fsync calls under strace. The completion and
+lifecycle screens run on the same two builds:
+
+- `bench.completion_burst --bots 32 --repeat 5`
+- `bench.lifecycle --agents 32 --mode echo --tools echo --repeat 5`
+
+Environment: Linux x86_64 container, 4 vCPUs, 2026-10-28.
+
+| Build and arm | Submit to finish p50 | p99 | Daemon CPU | Store time | Commits | fsync | Events |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main, `declared` | 10.20 ms | 15.29 ms | 7.55 ms | 7.22 ms | 11 | 6.26 | 1045 B |
+| this, `declared` | 9.83 ms | 16.15 ms | 7.60 ms | 7.30 ms | 11 | 6.26 | 1045 B |
+| this, `answered` | 10.43 ms | 19.71 ms | 8.10 ms | 7.72 ms | 14 | 6.27 | 1094 B |
+| this, `answered_parked` | 12.95 ms | 19.04 ms | 9.85 ms | 9.59 ms | 19 | 9.33 | 1310 B |
+
+All cells are per turn. Cells other than fsync are medians of three runs. The
+client sends a 98-byte `tool_result` per turn.
+
+A fixed declared tool costs the same as before. An answer within the hold
+adds 0.2–0.6 ms at p50 and no fsync. Its three extra commits are empty
+storage-worker rounds:
+
+- the first `answer_take`, which finds no answer;
+- the `tool_result`, which holds the answer in live state;
+- the second `answer_take`, which takes the answer.
+
+The answer is written with the call's result. A parked call adds about
+2.8 ms and three fsyncs: the park, the stored answer, and the resume.
+
+32-bot completion burst, release to terminal p50 (median of five runs, range
+in brackets):
+
+- main: 13.3 ms (12.2–15.0)
+- this change: 12.1 ms (11.8–16.4)
+
+32-bot echo lifecycle, medians of five runs:
+
+| Build | Turn p50 | Turn p99 | Restart ready | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| main | 578.3 ms | 589.3 ms | 245 ms | 22.6 MiB |
+| this change | 578.6 ms | 588.5 ms | 235 ms | 22.4 MiB |
+
+Both screens are within noise. A store at rest is 12 KiB larger: three pages
+for the `answers` table and its two indexes. In both builds the retained
+store bytes are bimodal, about 1.4 MiB or about 5.5 MiB, depending on
+whether the WAL had been checkpointed when the run ended. Answers that come
+from another process over the socket are not measured, and neither is
+macOS.

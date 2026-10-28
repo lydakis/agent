@@ -67,7 +67,23 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 20;
+pub const PROTOCOL: u64 = 21;
+
+/// Start `command` in a session of its own, for a service that outlives the
+/// terminal it was started from: closing a Herdr pane, or stopping Herdr,
+/// ends every process in the pane's session, not only its foreground job.
+pub fn own_session(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe and touches no parent state.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
 // No await occurs while this lock is held. Synchronous removal makes dropping
 // a request release its registration immediately, without a cleanup task.
@@ -337,6 +353,21 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_leaves_the_session_it_was_started_from() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("5");
+        own_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: getsid only reads the session of a process this test owns.
+        let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(theirs, pid);
+        assert_ne!(theirs, ours);
+    }
 
     #[tokio::test]
     async fn canceled_waits_release_pending_requests_without_closing_the_session() {

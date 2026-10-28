@@ -136,7 +136,9 @@ fn start_rule(sonny: &str) -> String {
          A task works in its own folder only, and each file has one writer: Sonny turns paths in this folder named in the brief into the task's, \
          and never copy a task's files into this folder yourself (cp, a redirect, tee), which can write zeros over the files there; \
          take its work back only as above. \
-         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it."
+         Commits a task makes in a repository inside a copy of a plain folder do not come back, so work that commits starts in that repository's own folder. \
+         A start that fails leaves no folder behind; if it fails again, tell the person why instead of working around it. \
+         Once the person says a task is done, {sonny} task rm NAME, from this folder, removes it and its folder; it refuses while its work is not here yet."
     ))
 }
 
@@ -699,6 +701,7 @@ mod tests {
             "Pick a NAME that \"$AGENT_BIN\" ls --name \"${AGENT_BOT%%.*}.*\" does not list yet",
             "\"/opt/sonny\" task changes NAME --apply writes it here",
             "never copy a task's files into this folder yourself",
+            "\"/opt/sonny\" task rm NAME, from this folder, removes it",
         ] {
             assert!(text.contains(said), "{said} in {text}");
         }
