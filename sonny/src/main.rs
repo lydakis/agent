@@ -1187,6 +1187,9 @@ fn from_lookout(data: &Value) -> bool {
 /// message, well under what the daemon takes in one.
 const UNSENT_BYTES: usize = 64 * 1024;
 
+/// How the daemon ends a turn whose model round came back with nothing.
+const EMPTY: &str = "empty_completion";
+
 /// What sends a command's record: what it printed is not the person's
 /// words, so it authorizes nothing the agent then does.
 const SHELL: &str = "shell";
@@ -1391,6 +1394,9 @@ struct App {
     react_to: Option<(i64, String)>,
     /// The turn of the last reaction sent, whose attaching says nothing.
     reaction_turn: Option<i64>,
+    /// Messages attached to the bot's next call, by their turns, until a
+    /// call takes them in: the footer's clip.
+    attached: Vec<i64>,
     /// The tools to declare on the bot so it can react, sent once no turn
     /// runs.
     declare: Option<Value>,
@@ -2001,6 +2007,7 @@ impl Fleet {
                         bot,
                         match data["status"].as_str() {
                             Some("completed" | "steered") => "done",
+                            Some("failed") if data["error"] == EMPTY => "done",
                             Some("interrupted") => "stopped",
                             _ => "failed",
                         },
@@ -2114,6 +2121,7 @@ impl App {
             finding: None,
             react_to: None,
             reaction_turn: None,
+            attached: Vec::new(),
             declare: None,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
@@ -3060,9 +3068,10 @@ impl App {
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
-    /// `accepted` or `steered` it missed: those whose turn no longer waits.
+    /// `accepted` or `steered` it missed, and the attached messages a call
+    /// took in meanwhile: those whose turn no longer waits.
     async fn unstage_landed(&mut self) {
-        let ids = self.staged.iter().map(|(turn, _)| *turn);
+        let ids = (self.staged.iter().map(|(turn, _)| *turn)).chain(self.attached.iter().copied());
         let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
             return;
         };
@@ -3081,7 +3090,12 @@ impl App {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
+                    .filter(|row| {
+                        matches!(
+                            row["status"].as_str(),
+                            Some("queued" | "ready" | "attached")
+                        )
+                    })
                     .filter_map(|row| row["turn"].as_i64()),
             );
             match page["next_after"].as_i64() {
@@ -3090,6 +3104,7 @@ impl App {
             }
         }
         self.staged.retain(|(turn, _)| waiting.contains(turn));
+        self.attached.retain(|turn| waiting.contains(turn));
     }
 
     /// What was sent and has not landed yet, dim, the way it will read
@@ -3388,8 +3403,9 @@ impl App {
                 }
             }
             "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
-            "attached" if turn.is_none() || turn != self.reaction_turn => {
-                self.notice = Some("attached to its next call".into())
+            // Shown as a clip in the footer until a call takes it in.
+            "attached" if turn.is_some() && turn != self.reaction_turn => {
+                self.attached.extend(turn);
             }
             "text_delta" => {
                 self.thought.clear();
@@ -3664,19 +3680,28 @@ impl App {
                 }
             }
             "turn_finished" => {
-                // A staged prompt whose turn ended without starting.
+                // A staged prompt whose turn ended without starting, or an
+                // attached message a call took in.
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
+                self.attached.retain(|attached| Some(*attached) != turn);
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
                 // Nothing of an ended turn is still under review.
                 self.reviewing.clear();
-                let status = data["status"].as_str().unwrap_or("unknown");
+                let mut status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
+                // A model round that came back empty ended the turn with
+                // nothing more to say: no failure for the person to read.
+                if status == "failed" && detail == EMPTY {
+                    status = "completed";
+                }
+                let empty = detail == EMPTY;
                 let running = self.running.take();
                 let note = running.as_ref().is_some_and(|r| r.note);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
-                let line = transcript::finished(status, detail, seconds, self.prose());
+                let shown = if empty { "" } else { detail };
+                let line = transcript::finished(status, shown, seconds, self.prose());
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -3691,8 +3716,9 @@ impl App {
                     self.draw_bot_reactions();
                 }
                 // A turn the lookout's note started that ended with nothing
-                // to say stays under its task updates: no line, no sound.
-                let quiet = note && !words && ended;
+                // to say stays under its task updates: no line, no sound;
+                // so does one whose model said nothing at the end.
+                let quiet = (note || empty) && !words && ended;
                 // A turn that ended well puts its reply under the line, apart
                 // from the steps above; one written as it came, or one
                 // that failed, keeps the line under it.
@@ -6170,6 +6196,12 @@ impl App {
             0 => right,
             n => format!("↻ {n} in background · {right}"),
         };
+        // Messages its next call takes in, which need nothing of the person.
+        let right = match self.attached.len() {
+            0 => right,
+            1 => format!("📎 · {right}"),
+            n => format!("📎 {n} · {right}"),
+        };
         // The folder, and what it is a copy of; its branch is kept whole.
         let folder = match &self.place.copy_of {
             Some(source) => format!("{folder}, a sandfs copy of {}", tilde(source)),
@@ -7244,6 +7276,74 @@ mod tests {
         ))
         .await;
         assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+    }
+
+    #[tokio::test]
+    async fn an_empty_completion_ends_the_turn_with_no_failure_shown() {
+        let client = daemon_answering(|_| {
+            json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Started it."}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        let lines = |app: &App| -> Vec<String> {
+            app.pending.iter().map(|line| line.to_string()).collect()
+        };
+        let empty = json!({"status": "failed", "error": "empty_completion"});
+        // Nothing said: nothing drawn, not even the turn's line.
+        app.daemon(turn_event("accepted", 1, json!({"request_id": "r1"})))
+            .await;
+        app.daemon(turn_event("turn_finished", 1, empty.clone()))
+            .await;
+        assert!(lines(&app).is_empty(), "{:?}", lines(&app));
+        assert!(app.running.is_none());
+        // Words before it end under the turn's line, as a turn that ended
+        // well, with no error on it.
+        app.daemon(turn_event("accepted", 2, json!({"request_id": "r2"})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 2, "text": "Started it."}))
+            .await;
+        app.daemon(turn_event("message", 2, json!({"node": 4})))
+            .await;
+        app.daemon(turn_event("turn_finished", 2, empty)).await;
+        let rows = lines(&app);
+        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
+        assert!(line.starts_with("─ Worked"), "{line}");
+        assert!(!line.contains("empty_completion"));
+        // Another failure still says what it was.
+        app.pending.clear();
+        app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "failed", "error": "provider_error"}),
+        ))
+        .await;
+        assert!(lines(&app).iter().any(|row| row.contains("provider_error")));
+    }
+
+    #[tokio::test]
+    async fn an_attached_message_is_a_clip_in_the_footer_until_a_call_takes_it() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.daemon(turn_event("attached", 5, json!({"status": "attached"})))
+            .await;
+        assert_eq!(app.notice, None, "nothing for the person to do");
+        assert!(app.footer_line(120).to_string().contains("📎 ·"));
+        app.daemon(turn_event("attached", 6, json!({"status": "attached"})))
+            .await;
+        assert!(app.footer_line(120).to_string().contains("📎 2 ·"));
+        // Taken in by the running turn's next call.
+        for turn in [5, 6] {
+            app.daemon(turn_event(
+                "turn_finished",
+                turn,
+                json!({"status": "steered", "into": 4}),
+            ))
+            .await;
+        }
+        assert!(!app.footer_line(120).to_string().contains('📎'));
     }
 
     #[tokio::test]
