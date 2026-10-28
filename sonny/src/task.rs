@@ -1,12 +1,14 @@
-//! `sonny task`: start one of the lead's tasks in a folder of its own, made
-//! the way Sonny's `copies` setting says, then started there with the
-//! daemon's `agent run`. A git worktree (the default) starts at the last
-//! commit on a branch of its own. A sandfs copy (experimental), made with
-//! the sandfs library built into Sonny so nothing needs installing, is the
-//! checkout as it is, uncommitted changes included, on a branch of its own;
-//! in a folder sandfs mounts, a fork of that workspace; in any other
-//! folder, the folder as it is now. A task that could not start leaves
-//! no folder behind, and `sonny task rm` takes away one that is done.
+//! A lead's tasks, each in a folder of its own: the `start_task` tool Sonny
+//! answers makes the folder the way Sonny's `copies` setting says, then
+//! starts the task there with the daemon's `agent run`. A git worktree
+//! (the default) starts at the last commit on a branch of its own. A
+//! sandfs copy (experimental), made with the sandfs library built into
+//! Sonny so nothing needs installing, is the checkout as it is, uncommitted
+//! changes included, on a branch of its own; in a folder sandfs mounts, a
+//! fork of that workspace; in any other folder, the folder as it is now.
+//! A task that could not start leaves no folder behind, and the
+//! `remove_task` tool takes away one that is done. `sonny task changes`
+//! lists, and applies here, what a sandfs copy of a plain folder changed.
 //!
 //! sandfs mounts are served by Sonny run again as `sonny sandfs daemon`,
 //! which outlives the command that asked for them and shares sandfs's home
@@ -17,9 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const USAGE: &str = "usage: sonny task NAME [--setup] [RUN FLAGS...] -- BRIEF\n\
-                     \x20      sonny task changes NAME [--all] [--apply [--force] [--only PATH...]]\n\
-                     \x20      sonny task rm NAME [--discard]";
+const USAGE: &str = "usage: sonny task changes NAME [--all] [--apply [--force] [--only PATH...]]";
 
 /// The task's folder, how its work comes back, and what undoes it.
 struct Place {
@@ -44,27 +44,43 @@ enum Undo {
     },
 }
 
-/// `sonny task ...`, from the lead's shell.
+/// `sonny task changes ...`, from the lead's shell or a terminal.
 pub fn run(args: &[String]) -> Result<(), String> {
     let here = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .map_err(|e| e.to_string())?;
     match args {
         [changes, name, rest @ ..] if changes == "changes" => list(&here, name, rest),
-        [rm, name, rest @ ..] if rm == "rm" => remove(&here, name, rest),
-        [name, rest @ ..] if !name.starts_with('-') => start(&here, name, rest),
         _ => Err(USAGE.into()),
     }
 }
 
-fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
-    let split = rest.iter().position(|arg| arg == "--").ok_or(USAGE)?;
-    let (flags, brief) = (&rest[..split], &rest[split + 1..]);
-    if brief.is_empty() {
-        return Err(USAGE.into());
+/// A `start_task` call.
+pub struct Start {
+    pub name: String,
+    pub brief: String,
+    pub profile: Option<String>,
+    pub setup: bool,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Start the task `start` asks for of the lead `lead`, whose folder is
+/// `here`, and say what started and how its work comes back.
+pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
+    let project = lead.strip_suffix(".lead").unwrap_or(lead);
+    let short = start.name.trim();
+    let name = match short.strip_prefix(&format!("{project}.")) {
+        Some(_) => short.to_owned(),
+        None => format!("{project}.{short}"),
+    };
+    let name = name.as_str();
+    if short.is_empty() || !branch_name(name) {
+        return Err(format!("{short:?} is not a name a git branch can have"));
     }
-    let setup = flags.iter().any(|flag| flag == "--setup");
-    let flags: Vec<&String> = flags.iter().filter(|flag| *flag != "--setup").collect();
+    if start.brief.trim().is_empty() {
+        return Err("a task starts with a brief".into());
+    }
     // The daemon's binary in an agent's shell; in a terminal, the one
     // Sonny would start.
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
@@ -74,6 +90,16 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     let config = agent_client::config::load()?;
 
     let info = agent_client::project::read(here)?;
+    let mut flags = match &start.profile {
+        Some(role) => vec!["--profile".to_owned(), role.clone()],
+        None => vec!["--agents".to_owned()],
+    };
+    if let Some(model) = start.model.clone().filter(|m| !m.is_empty()) {
+        flags.extend(["--model".to_owned(), model]);
+    }
+    if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
+        flags.extend(["--effort".to_owned(), effort]);
+    }
     let place = if info["threads_in"] == "project" {
         in_place(here)
     } else {
@@ -93,20 +119,40 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     // The folder's setup script, run in the task's own folder, as for a
     // worktree; a task in the lead's folder has nothing to set up.
     let script = here.join(".agents/setup");
-    if setup && place.dir != here && script.exists() {
-        let status = Command::new(&script)
+    if start.setup && place.dir != here && script.exists() {
+        // Its output is not kept, however long a build runs: only the last
+        // lines of its errors, which a failure shows.
+        let mut setup = Command::new(&script);
+        // The folder's own code, run outside any sandbox: none of the
+        // keys Agent keeps, as a bot's shell has none.
+        for key in kept_keys() {
+            setup.env_remove(key);
+        }
+        let ran = setup
             .current_dir(&place.dir)
             .env("AGENT_SOURCE", here)
             .stdin(Stdio::null())
-            .status();
-        if !status.is_ok_and(|status| status.success()) {
-            return failed(&place, false, format!("{} failed", script.display()));
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                let tail = child.stderr.take().map(tail).unwrap_or_default();
+                Ok((child.wait()?, tail))
+            });
+        match ran {
+            Ok((status, _)) if status.success() => {}
+            Ok((_, tail)) => {
+                let error = format!("{} failed:\n{}", script.display(), tail.join("\n"));
+                return failed(&place, false, error);
+            }
+            Err(e) => return failed(&place, false, format!("{}: {e}", script.display())),
         }
     }
     let lead = (
         std::env::var("AGENT_MODEL").ok(),
         std::env::var("AGENT_EFFORT").ok(),
     );
+    let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
     let flags = match told(&place.dir, &flags) {
@@ -115,37 +161,60 @@ fn start(here: &Path, name: &str, rest: &[String]) -> Result<(), String> {
     };
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
+    let brief = vec![start.brief.clone()];
     let (brief, moved) = match &place.copy {
-        Some((from, to)) => in_copy(brief, from, to),
-        None => (brief.to_vec(), 0),
+        Some((from, to)) => in_copy(&brief, from, to),
+        None => (brief, 0),
     };
-    let status = command
+    let output = command
         .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
         .arg("--")
         .args(&brief)
         .stdin(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(_) => return failed(&place, true, format!("{name} did not start")),
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let said = String::from_utf8_lossy(&output.stderr);
+            return failed(
+                &place,
+                true,
+                format!("{name} did not start: {}", said.trim()),
+            );
+        }
         Err(e) => {
             return failed(&place, false, format!("running {}: {e}", agent.display()));
         }
-    }
-    if let Some(note) = &place.note {
-        eprintln!("{note}");
-    }
+    };
+    let mut said = vec![format!(
+        "Started {name}: {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    )];
+    said.extend(place.note.clone());
     if let (Some((from, to)), 1..) = (&place.copy, moved) {
-        eprintln!(
-            "{name}: the brief named {} {moved} time{}; it names the task's copy {} instead",
+        said.push(format!(
+            "The brief named {} {moved} time{}; it names the task's copy {} instead.",
             shell_quote(from),
             if moved == 1 { "" } else { "s" },
             shell_quote(to)
-        );
+        ));
     }
-    Ok(())
+    Ok(said.join("\n"))
+}
+
+/// Whether git would take `name` for the branch `agent/NAME`.
+fn branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && Command::new("git")
+            .args(["check-ref-format", "--branch", &format!("agent/{name}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 /// The run flags with the task's model and effort, unless they name their
@@ -484,7 +553,7 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
         // worktree of this repository on the task's branch.
         if !ours(here, &path, &branch) {
             return Err(format!(
-                "{} exists and is not this repository's worktree on {branch}; pick another NAME",
+                "{} exists and is not this repository's worktree on {branch}; pick another name",
                 path.display()
             ));
         }
@@ -659,7 +728,7 @@ fn sandfs_copy(here: &Path, name: &str) -> Result<Place, String> {
         // workspace something else made.
         Some(_) => {
             return Err(format!(
-                "a sandfs workspace named {name} exists that is not this task's; pick another NAME"
+                "a sandfs workspace named {name} exists that is not this task's; pick another name"
             ));
         }
         None => {
@@ -755,6 +824,73 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
         true => copy.to_owned(),
         false => copy.join(prefix),
     }
+}
+
+/// The provider credentials this process may hold, as the daemon keeps
+/// them from a bot's shell: the well-known keys, Bedrock's, the key a
+/// provider in `AGENT_PROVIDER` names, and what `~/.agent/env` sets.
+fn kept_keys() -> Vec<String> {
+    let mut keys: Vec<String> = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ]
+    .map(String::from)
+    .into();
+    keys.extend(provider_keys(
+        &std::env::var("AGENT_PROVIDER").unwrap_or_default(),
+    ));
+    if let Some(file) = agent_client::env_file::path()
+        && let Ok(set) = agent_client::env_file::read(&file)
+    {
+        keys.extend(set.iter().map(|(key, _)| key.clone()));
+        let named = set.iter().find(|(key, _)| key == "AGENT_PROVIDER");
+        keys.extend(
+            named
+                .map(|(_, specs)| provider_keys(specs))
+                .unwrap_or_default(),
+        );
+    }
+    keys
+}
+
+/// The key variables `NAME=FAMILY,URL,KEY_ENV` specs name.
+fn provider_keys(specs: &str) -> Vec<String> {
+    (specs.split_whitespace())
+        .filter_map(|spec| spec.split(',').nth(2))
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The last 20 lines with words `stream` writes, each cut to 1000 bytes,
+/// read to its end without keeping the rest.
+fn tail(stream: impl std::io::Read) -> Vec<String> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut lines = std::collections::VecDeque::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // A longer line is read as several.
+        match std::io::Read::take(&mut reader, 1000).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+        if text.is_empty() {
+            continue;
+        }
+        if lines.len() == 20 {
+            lines.pop_front();
+        }
+        lines.push_back(text);
+    }
+    lines.into()
 }
 
 /// This program, by the path that outlives an upgrade.
@@ -1021,17 +1157,13 @@ fn list(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `sonny task rm NAME [--discard]`: remove the task and the folder Sonny
-/// made it, once its work is here: a sandfs copy's changes applied, or for
-/// a git copy, committed and pushed; a worktree's changes committed, its
-/// branch kept unless merged. `--discard` removes them anyway. An agent
-/// still working is not removed, and then neither is anything else.
-fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
-    let discard = match args {
-        [] => false,
-        [flag] if flag == "--discard" => true,
-        _ => return Err(USAGE.into()),
-    };
+/// A `remove_task` call: remove the task and the folder Sonny made it,
+/// once its work is here: a sandfs copy's changes applied, or for a git
+/// copy, committed and pushed; a worktree's changes committed, its branch
+/// kept unless merged. `discard` removes them anyway. An agent still
+/// working is not removed, and then neither is anything else. Says what
+/// was removed and what was kept.
+pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> {
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     let folder = tasks()?.join(name);
     let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
@@ -1084,7 +1216,7 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
             let left = not_here(name, &folder, here)?;
             if !left.is_empty() {
                 return Err(format!(
-                    "{name} has work that is not here: {left}; pass --discard to remove it anyway"
+                    "{name} has work that is not here: {left}; with discard, it is removed anyway"
                 ));
             }
         }
@@ -1092,8 +1224,8 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
             && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
         {
             return Err(format!(
-                "{name}'s worktree has uncommitted changes; commit them, or pass --discard to \
-                 remove it anyway"
+                "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
+                 removed anyway"
             ));
         }
         Ok(())
@@ -1126,14 +1258,13 @@ fn remove(here: &Path, name: &str, args: &[String]) -> Result<(), String> {
         git(here, &args)?;
         let delete = if discard { "-D" } else { "-d" };
         if git(here, &["branch", delete, &branch]).is_err() {
-            eprintln!(
-                "{branch} is kept, since it has commits not merged here; `git branch -D {branch}` \
-                 deletes it"
-            );
+            return Ok(format!(
+                "Removed {name}. {branch} is kept, since it has commits not merged here; \
+                 `git branch -D {branch}` deletes it."
+            ));
         }
     }
-    eprintln!("{name}: removed");
-    Ok(())
+    Ok(format!("Removed {name}."))
 }
 
 /// What the repository at `repo` keeps that its origin lacks, by name:
@@ -1412,10 +1543,9 @@ pub fn remount(socket: &Path) -> Vec<String> {
         said.insert(
             0,
             format!(
-                "task copies whose task is gone: {}; `{} task rm NAME` in the folder one came \
-                 from removes it",
-                gone.join(", "),
-                me()
+                "task copies whose task is gone: {}; ask its lead to remove one, which it does \
+                 with remove_task",
+                gone.join(", ")
             ),
         );
     }
@@ -1425,6 +1555,30 @@ pub fn remount(socket: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_spec_s_key_is_kept_from_setup() {
+        assert_eq!(
+            provider_keys("openai=responses,http://x/v1,WORK_KEY local=chat,http://y"),
+            ["WORK_KEY"]
+        );
+    }
+
+    #[test]
+    fn a_setup_s_errors_keep_only_their_last_lines() {
+        let mut said: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        said.push_str(&"x".repeat(2500));
+        said.push_str("\n\n");
+        let kept = tail(said.as_bytes());
+        assert_eq!(kept.len(), 20);
+        assert_eq!(kept[0], "line 14");
+        assert_eq!(kept[16], "line 30");
+        // A long line is kept in pieces of 1000 bytes.
+        assert_eq!(
+            kept[17..].iter().map(String::len).collect::<Vec<_>>(),
+            [1000, 1000, 500]
+        );
+    }
 
     #[test]
     fn a_brief_names_the_copy_where_it_named_the_folder() {

@@ -1,8 +1,10 @@
 //! The tools Sonny declares on the bots it opens: the daemon shows them to
-//! the model and records each call with a fixed result, and Sonny gives
-//! the calls their meaning. A bot reacts to the person, asks them to
-//! decide something, and keeps its plan where they see it; a lead also
-//! marks its tasks resolved.
+//! the model and records each call, with a fixed result or with the one
+//! Sonny's lookout answers (`served`), and Sonny gives the calls their
+//! meaning. A bot reacts to the person, asks them to decide something,
+//! keeps its plan where they see it, and puts windows and panes where they
+//! look; a lead also starts, removes and resolves its tasks, makes
+//! projects and subscribes to the lookout.
 use serde_json::Value;
 
 /// The most tools a bot may have declared, and the most bytes they take,
@@ -20,6 +22,7 @@ pub fn tools(lead: bool) -> Vec<Value> {
     if lead {
         tools.push(crate::resolved::tool());
     }
+    tools.extend(crate::served::tools(lead));
     tools
 }
 
@@ -28,7 +31,15 @@ pub fn tools(lead: bool) -> Vec<Value> {
 /// would not fit beside its own.
 pub fn declare(record: &Value, lead: bool) -> Option<Value> {
     let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
-    let ours = tools(lead);
+    let mut ours = tools(lead);
+    // A gate Sonny did not set, as another client's tag or several, is
+    // not one Sonny can add its gated tools to, so that bot goes without
+    // them rather than run them unjudged.
+    if crate::approvals::mode(record).is_none() {
+        ours.retain(|tool| {
+            !(tool["name"].as_str()).is_some_and(|name| crate::served::GATED.contains(&name))
+        });
+    }
     let names = tools(true);
     let sonnys = |other: &Value| names.iter().any(|tool| tool["name"] == other["name"]);
     if ours.iter().all(|tool| declared.contains(tool))
@@ -66,6 +77,26 @@ mod tests {
             declare(&json!({"declared": [old]}), false),
             Some(Value::Array(tools(false)))
         );
+        // A bot gated as Sonny does not gate goes without the tools Sonny
+        // gates, and loses them if it had them.
+        let names = |declared: Value| -> Vec<String> {
+            (declared.as_array().into_iter().flatten())
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        for gates in [
+            json!([{"tag": "ci", "tools": ["shell"]}]),
+            json!([{"tag": "auto", "tools": ["shell"]}, {"tag": "manual", "tools": ["shell"]}]),
+        ] {
+            let custom = declare(&json!({"gates": gates, "declared": tools(true)}), true).unwrap();
+            let custom = names(custom);
+            assert!(custom.contains(&"show_agent".to_owned()), "{custom:?}");
+            for gated in crate::served::GATED {
+                assert!(!custom.contains(&gated.to_owned()), "{gated} in {custom:?}");
+            }
+        }
+        let auto = json!({"gates": [{"tag": "auto", "tools": ["shell"]}]});
+        assert!(names(declare(&auto, true).unwrap()).contains(&"run_in_pane".to_owned()));
         // A bot whose own tools leave no room keeps them as they are.
         let full: Vec<Value> = (0..14)
             .map(|n| {
