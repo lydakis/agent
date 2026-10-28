@@ -28,9 +28,25 @@ skills it writes name `"…/sonny" agent` wherever they would say
     sonny --bot NAME                         # any one bot
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
-Sonny in its coordinator profile (`agents/coordinator.md`, unless the folder
-or `~/.agents/agents` has a `coordinator.md`), with the folder's
-`.agents/project.toml` written when it had none. A lead moved to another
+Sonny in its `lead` role, with the folder's
+`.agents/project.toml` written when it had none.
+
+Sonny's two roles are normal profiles the person can read and edit in
+`~/.agents/agents`, beside their own: `lead.md`
+([agents/lead.md](agents/lead.md)), the lead's role, and `task.md`
+([agents/task.md](agents/task.md)), what every other agent Sonny starts
+is told after its instructions and any role (`--profile`) it starts in:
+tasks, a trigger's agents and `sonny --new` bots. Sonny writes both at
+each start, as it writes its skills: it rewrites a file when its text
+changes, and writes it again once it is deleted, but never over an edit,
+since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
+and a file that no longer matches, or one Sonny never wrote, is the
+person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
+first. How the lead starts a task with `sonny task`, which names this
+Sonny, and the task settings from `.agents/project.toml` are composed
+after the lead's role, not kept in the file.
+
+A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
 `$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
@@ -149,12 +165,22 @@ off again never shows.
   folder. The lead starts each task with `sonny task NAME [--setup] [run
   flags] -- BRIEF`, which makes its folder that way, runs `.agents/setup`
   there with `--setup`, starts the task with `agent run`, and leaves no
-  folder behind when that fails; `sonny task changes NAME [--apply]` lists,
+  folder behind when that fails. Every agent Sonny starts, leads and tasks
+  alike, is told that the person it works for may be under pressure, and
+  to care whether they succeed: take work off their plate, do or offer
+  what they will need next, and say once when a better way of working
+  would help them (in `lead.md`, and in `task.md` for the rest); so
+  `sonny task` gives what `--agents` or `--profile` would compose as the
+  task's instructions, with `task.md` after it. `sonny task changes NAME [--apply]` lists,
   or writes back, what a sandfs copy of a plain folder changed. A plain
   folder on another disk than sandfs's home (`~/.local/share/sandfs`), such
   as an external volume, can't be copied, so its task gets a sandfs
   workspace over the folder itself: the task's changes still stay in the
-  workspace, but it also sees what changes in the folder meanwhile.
+  workspace, but a file it has looked at stays as it first saw it, and
+  `--apply` writes over what changed in the folder meanwhile without
+  asking. Paths in the lead's folder that a brief names (through a link
+  such as `~/workplace` too) are turned into the same paths in the task's
+  copy, so the task never writes the lead's folder by its full path.
   `sonny task` also works from a plain terminal, with the `agent` installed
   beside Sonny. sandfs is
   built into Sonny, so it needs no install, only what a mount needs (FUSE 3
@@ -169,7 +195,8 @@ off again never shows.
   sets the questions aside for a message of your own, and Esc again goes
   back to them. The open questions are read from the lead's history (its
   `ask` calls not yet answered), so one asked while Sonny was closed is
-  pinned when it opens.
+  pinned when it opens; Sonny keeps them in `~/.agent/sonny/asks` too, so
+  one asked before the history it replays still comes back.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
@@ -229,5 +256,20 @@ waited for, a question to you, the plan, memory, a trigger, a window
 opened). Commands, reads and edits are left out. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
+
+`/fullscreen` lets Sonny own the whole screen instead, as Codex does by
+default, and is kept with the other settings (`/fullscreen` again goes back
+to inline). The conversation is Sonny's to draw, so it rewraps when the
+window changes size and the wheel scrolls it; rows that arrive while you
+have scrolled back leave the view still, under a note that a click, PgDn or
+Enter takes you back to the latest. Copying needs no key held: a drag
+selects and copies when you let go, a double click takes a word and a
+triple click its line, Ctrl+C copies a selection instead of
+interrupting, and Esc clears it. The copy is the text as written: a line
+wrapped over rows comes back as one line, without the bullets and indents
+Sonny drew around it. A click on a link opens it. Full screen is new and
+off by default.
+
+![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
 `demo/` has the scripted model and folder the recordings use.

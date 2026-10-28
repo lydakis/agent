@@ -352,15 +352,15 @@ pub struct Entry {
 }
 pub type Skill = Entry;
 
-/// Roles a client starts its own bots in: the app's coordinator and its
-/// Home. A `.agents/agents` file of one of these names replaces
-/// the client's text for that role, so it is not a role to start a peer in,
-/// and the Profiles index leaves it out.
-pub const CLIENT_ROLES: [&str; 2] = ["coordinator", "home"];
+/// Roles a client starts its own bots in: Sonny's lead, and the task
+/// text Sonny tells every other agent it starts. A `.agents/agents` file
+/// of one of these names replaces the client's text for that role, so it
+/// is not a role to start a peer in, and the Profiles index leaves it out.
+pub const CLIENT_ROLES: [&str; 2] = ["lead", "task"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
-/// case-insensitive filesystem (macOS's default) `Coordinator.md` is the
-/// file `profile(_, "coordinator")` reads.
+/// case-insensitive filesystem (macOS's default) `Lead.md` is the
+/// file `profile(_, "lead")` reads.
 fn client_role(stem: &str) -> bool {
     CLIENT_ROLES
         .iter()
@@ -1198,7 +1198,7 @@ mod tests {
     fn a_clients_own_roles_are_read_but_not_offered_as_peer_roles() {
         let root = temp("client-roles");
         std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
-        for name in ["coordinator", "reviewer"] {
+        for name in ["lead", "reviewer"] {
             std::fs::write(
                 root.join(".agents/agents").join(format!("{name}.md")),
                 format!("---\ndescription: the {name}\n---\nBe the {name}.\n"),
@@ -1208,17 +1208,13 @@ mod tests {
         let composed = instructions(&root, None, &[]).unwrap();
         let listed: Vec<&str> = composed.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(listed, ["reviewer"]);
-        assert!(!composed.text.contains("- coordinator:"));
-        assert!(client_role("Coordinator"));
+        assert!(!composed.text.contains("- lead:"));
+        assert!(client_role("Lead"));
         // The file still replaces the client's text when it starts a bot in that role.
-        let role = profile(&root, "coordinator").unwrap().unwrap();
-        assert_eq!(role.body, "Be the coordinator.");
+        let role = profile(&root, "lead").unwrap().unwrap();
+        assert_eq!(role.body, "Be the lead.");
         let composed = instructions(&root, Some(&role), &[]).unwrap();
-        assert!(
-            composed
-                .text
-                .ends_with("# Role: coordinator\n\nBe the coordinator.")
-        );
+        assert!(composed.text.ends_with("# Role: lead\n\nBe the lead."));
         let _ = std::fs::remove_dir_all(&root);
     }
 

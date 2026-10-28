@@ -66,10 +66,10 @@ the daemon with `--provider chatgpt`; it signs in through OpenAI's
 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
 and keeps the token fresh itself.
 `agent models --discover` writes `~/.agent/models` from what your providers
-list; edit it down to the models the app and your agents should offer.
+list; edit it down to the models Sonny and your agents should offer.
 
-Each bot keeps the model it was created with, so bots on different providers
-can run side by side in one daemon. Other OpenAI Responses-compatible gateways
+Each bot has its own model, so bots on different providers can run side by
+side in one daemon. Other OpenAI Responses-compatible gateways
 can be added with `--provider`; see [providers and models](docs/RUST_PROTOTYPE.md#providers-and-models).
 
 From your project directory, start a bot:
@@ -90,8 +90,12 @@ Name the bot again to give it its next turn in the same conversation:
 agent run --pretty --bot scout -- "Which parts are tested?"
 ```
 
-A bot keeps its model, instructions, and tools for life. `--model` on a later
-turn overrides the model for that turn only.
+A bot keeps the model, instructions, and tools it was created with until a
+client changes them. `--model` on a later turn overrides the model for that
+turn only. Between turns, a client can give a bot a new model of the same
+provider, new instructions, or new approval gates with the socket protocol's
+`configure`, as Sonny does when you switch a lead's model or its skills and
+memory change; see the [software protocol](docs/RUST_PROTOTYPE.md#software-protocol).
 
 ### Leave it running and come back
 

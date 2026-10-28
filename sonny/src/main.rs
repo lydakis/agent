@@ -32,6 +32,7 @@ mod project;
 mod prompt;
 mod reactions;
 mod rex;
+mod screen;
 mod settings;
 mod shell;
 mod skills;
@@ -50,8 +51,8 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
-            self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-            KeyModifiers,
+            self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+            EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         },
         execute,
         terminal::{
@@ -86,12 +87,39 @@ const REACTABLE: usize = 9;
 /// How much of a reply's first line a reaction quotes.
 const QUOTED: usize = 72;
 
+/// Draws in a row that may fail before the client gives up on its
+/// terminal: each failed cursor query waits up to 2 s, so about a minute.
+const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How long a side chat's copy stays once idle.
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Sonny owns the whole screen (`/fullscreen`): the alternate screen and
+/// the mouse, the conversation kept in [`screen::Screen`].
+static FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn full() -> bool {
+    FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Into the full screen, or out of it.
+fn own_screen(own: bool) {
+    FULL.store(own, std::sync::atomic::Ordering::Relaxed);
+    let _ = match own {
+        true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
+        false => execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen),
+    };
+}
+
+/// A terminal drawn inline, under the scrollback, or over the full screen.
+fn viewport() -> Viewport {
+    match full() {
+        true => Viewport::Fullscreen,
+        false => Viewport::Inline(VIEWPORT),
+    }
+}
 
 type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -705,13 +733,20 @@ async fn run() -> Result<(), String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    if settings::Settings::load().fullscreen {
+        own_screen(true);
+    }
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(std::io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT),
+            viewport: viewport(),
         },
     )
     .map_err(|e| e.to_string())?;
+    // A side chat opens on its window's alternate screen, still drawn on.
+    if full() {
+        let _ = terminal.clear();
+    }
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = context;
     if options.side.is_some() {
@@ -802,6 +837,9 @@ async fn run() -> Result<(), String> {
     }
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
+    if full() {
+        own_screen(false);
+    }
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     status_report("clear", &name);
@@ -820,9 +858,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         None => std::env::current_dir().map_err(|e| e.to_string())?,
     };
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
-    let instructions = agent_client::policy::instructions(&workspace, None, &memory)
-        .map_err(|e| e.to_string())?
-        .text;
+    let composed =
+        agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
+    let instructions = project::as_task(&workspace, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": DEFAULT_TOOLS,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
@@ -836,6 +874,23 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// A link, file or page, opened as the system opens it.
+fn open(target: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("{opener}: {error}"))
 }
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
@@ -865,6 +920,10 @@ fn window(mut rows: Vec<Line<'static>>, row: usize, keep: usize) -> (Vec<Line<'s
 }
 
 fn fit(terminal: &mut Tui, height: u16) -> std::io::Result<()> {
+    // The full screen keeps its size; history goes above whatever height.
+    if full() {
+        return Ok(());
+    }
     let area = terminal.get_frame().area();
     let height = height.min(terminal.size()?.height);
     if area.height == height {
@@ -1054,7 +1113,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, unlisted.
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 15] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1072,6 +1131,10 @@ const COMMANDS: [(&str, &str); 14] = [
     (
         "/verbose",
         "every tool call, or only what moves the work on",
+    ),
+    (
+        "/fullscreen",
+        "Sonny owns the screen (select, copy, scroll), or writes into the scrollback",
     ),
     (
         "/copies",
@@ -1140,6 +1203,9 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
+    /// Where its open questions are kept, for those older than the
+    /// history Sonny replays.
+    asks_file: Option<PathBuf>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -1249,6 +1315,10 @@ struct App {
     /// Those whose output this window showed, from when their record is
     /// sent until it lands.
     ran_here: Vec<user_shell::Ran>,
+    /// The conversation's rows, kept when Sonny owns the whole screen.
+    screen: screen::Screen,
+    /// Into the full screen, or out of it, at the next repaint.
+    switch_screen: bool,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -1607,6 +1677,15 @@ impl Fleet {
             .unwrap_or(bot)
     }
 
+    /// The bot as the person tells it apart from every other project's:
+    /// the lead by its project, as `shop lead`, a task by its own name.
+    fn named(&self, bot: &str) -> String {
+        match bot == self.lead {
+            true => format!("{} lead", self.project),
+            false => self.short(bot).to_owned(),
+        }
+    }
+
     /// Note what the bot is doing, and name the windows after it.
     fn doing(&mut self, bot: &str, doing: &'static str) {
         if self.doing.get(bot) != Some(&doing) {
@@ -1628,7 +1707,7 @@ impl Fleet {
 
     /// Each window holding the project's bots is named after the lead, or
     /// its first bot, and what that bot is doing, with a count of the others
-    /// that are working or need the person: `lead · done · 2 working`. A
+    /// that are working or need the person: `shop lead · done · 2 working`. A
     /// window that also holds the person's own blocks, as when Sonny was
     /// opened beside them, keeps the name they gave it.
     fn name_windows(&mut self) {
@@ -1648,7 +1727,7 @@ impl Fleet {
             else {
                 continue;
             };
-            let mut name = format!("{} · {}", self.short(first), self.doing[first]);
+            let mut name = format!("{} · {}", self.named(first), self.doing[first]);
             for state in ["needs you", "working"] {
                 let others = bots
                     .iter()
@@ -1806,6 +1885,7 @@ impl App {
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
                 reactions::key(&store, id)
             }),
+            asks_file: None,
             chatting: false,
             asked: None,
             following: true,
@@ -1864,6 +1944,8 @@ impl App {
             shown: Vec::new(),
             unsent: Vec::new(),
             ran_here: Vec::new(),
+            screen: screen::Screen::default(),
+            switch_screen: false,
         }
     }
 
@@ -1872,6 +1954,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.asks_file = self.reactions_key.as_deref().and_then(asks::file);
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
@@ -1910,6 +1993,8 @@ impl App {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                // A read that fails, as one can while the Mac wakes, is
+                // tried again rather than leaving the client deaf to keys.
                 match event::poll(Duration::from_millis(50)) {
                     Ok(false) => {}
                     Ok(true) => match event::read() {
@@ -1918,15 +2003,23 @@ impl App {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
                     },
-                    Err(_) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
         });
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        // A terminal waking with the Mac can be slow to answer the cursor
+        // query a resize makes, and a draw then fails; the next tick draws
+        // again, and only a terminal that keeps failing ends the client.
+        let mut failed_draws = 0;
         loop {
-            self.draw(terminal).map_err(|e| e.to_string())?;
+            match self.draw(terminal) {
+                Ok(()) => failed_draws = 0,
+                Err(_) if failed_draws < DRAW_ATTEMPTS => failed_draws += 1,
+                Err(error) => return Err(error.to_string()),
+            }
             if self.quit {
                 return Ok(());
             }
@@ -2243,20 +2336,28 @@ impl App {
     /// in the view just picked, once no turn is running: the screen and scrollback cleared, and the
     /// bot's items read again as on attach.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
-        execute!(
-            std::io::stdout(),
-            Clear(ClearType::Purge),
-            Clear(ClearType::All),
-            ratatui::crossterm::cursor::MoveTo(0, 0)
-        )
-        .map_err(|e| e.to_string())?;
+        if std::mem::take(&mut self.switch_screen) {
+            own_screen(!full());
+        }
+        // The full screen's rows are Sonny's own; inline, the scrollback's.
+        self.screen.clear();
+        if !full() {
+            execute!(
+                std::io::stdout(),
+                Clear(ClearType::Purge),
+                Clear(ClearType::All),
+                ratatui::crossterm::cursor::MoveTo(0, 0)
+            )
+            .map_err(|e| e.to_string())?;
+        }
         *terminal = Terminal::with_options(
             CrosstermBackend::new(std::io::stdout()),
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT),
+                viewport: viewport(),
             },
         )
         .map_err(|e| e.to_string())?;
+        terminal.clear().map_err(|e| e.to_string())?;
         self.pending.clear();
         self.held.clear();
         self.live = None;
@@ -2522,13 +2623,20 @@ impl App {
         // Drawn from the start (attaching, or a repaint), the bot's
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
+        // The open questions kept, those asked before the history replayed
+        // among them, are joined with the replay's once it is read.
+        let mut kept = None;
         if self.seen_node == 0 || after < self.seen_node {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
+            kept = Some(asks::load(self.asks_file.as_deref()));
             self.asks.clear();
             self.sent_answers.clear();
         }
+        // The questions the replay asks, and the answers to none of them.
+        let mut asked_here: std::collections::HashSet<String> = Default::default();
+        let mut answered_older: Vec<String> = Vec::new();
         self.seen_node = nodes.last().copied().unwrap_or(self.seen_node);
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
@@ -2553,7 +2661,11 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
-                        asks::close(&mut self.asks, &text(&item));
+                        if !asks::close(&mut self.asks, &text(&item))
+                            && let Some(question) = asks::answered(&text(&item))
+                        {
+                            answered_older.push(question.to_owned());
+                        }
                         // What the person ran is shown as it was when it ran.
                         let lines = landed(&text(&item), &mut self.ran_here, self.width);
                         self.commit(lines);
@@ -2587,6 +2699,9 @@ impl App {
                             .and_then(|a| serde_json::from_str(a).ok())
                             .unwrap_or(Value::Null);
                         let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                        if name == asks::TOOL {
+                            asked_here.insert(item["call_id"].as_str().unwrap_or("").to_owned());
+                        }
                         calls.insert(
                             item["call_id"].as_str().unwrap_or("").to_owned(),
                             (name, arguments),
@@ -2614,8 +2729,13 @@ impl App {
                         {
                             let (output, failed) = output(&item);
                             self.commit_call(&name, &arguments, &output, failed);
-                            if name == asks::TOOL && !failed && !reactions::refused(&item) {
-                                self.asked(id, &arguments);
+                            if name == asks::TOOL
+                                && !failed
+                                && !reactions::refused(&item)
+                                && let Some(ask) = asks::call(id, &arguments)
+                                && !self.asks.iter().any(|open| open.id == ask.id)
+                            {
+                                self.asks.push(ask);
                             }
                         }
                     }
@@ -2632,6 +2752,19 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        // Kept ones the replay asked are as it left them; the rest were
+        // asked before it, and stay open unless it answered them.
+        if let Some(mut older) = kept {
+            older.retain(|ask| !asked_here.contains(&ask.id));
+            for question in &answered_older {
+                if let Some(at) = older.iter().position(|ask| &ask.question == question) {
+                    older.remove(at);
+                }
+            }
+            older.append(&mut self.asks);
+            self.asks = older;
+        }
+        self.keep_asks();
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
@@ -2668,27 +2801,36 @@ impl App {
     }
 
     /// What was sent and has not landed yet, dim, the way it will read
-    /// once it does.
+    /// once it does: a blank row above each, as in the history, and one
+    /// under the last, so the status row does not touch it.
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
-        self.staged
+        let mut rows: Vec<Line<'static>> = self
+            .staged
             .iter()
-            .flat_map(|(_, prompt)| match user_shell::read(prompt) {
-                Some(ran) => user_shell::header(&ran.command, width, true),
-                None => prompt
-                    .split('\n')
-                    .enumerate()
-                    .flat_map(|(at, line)| {
-                        let lead = if at == 0 { "› " } else { "  " };
-                        transcript::wrap(
-                            Line::from(line.to_owned()).dim(),
-                            width,
-                            Span::raw(lead).dim(),
-                            Span::raw("  "),
-                        )
-                    })
-                    .collect(),
+            .flat_map(|(_, prompt)| {
+                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
+                    Some(ran) => user_shell::header(&ran.command, width, true),
+                    None => prompt
+                        .split('\n')
+                        .enumerate()
+                        .flat_map(|(at, line)| {
+                            let lead = if at == 0 { "› " } else { "  " };
+                            transcript::wrap(
+                                Line::from(line.to_owned()).dim(),
+                                width,
+                                Span::raw(lead).dim(),
+                                Span::raw("  "),
+                            )
+                        })
+                        .collect(),
+                };
+                std::iter::once(Line::default()).chain(shown)
             })
-            .collect()
+            .collect();
+        if !rows.is_empty() {
+            rows.push(Line::default());
+        }
+        rows
     }
 
     /// The person's command while it runs, and those the agent could not
@@ -3265,9 +3407,16 @@ impl App {
             }
         };
         let jobs = errand::jobs(self.folder_name()).await;
-        let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        // The full screen is the alternate screen already.
+        if !full() {
+            let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+        }
         match Terminal::new(CrosstermBackend::new(std::io::stdout())) {
-            Ok(screen) => {
+            Ok(mut screen) => {
+                // A new terminal draws only what differs from blank.
+                if full() {
+                    let _ = screen.clear();
+                }
                 self.watch = Some(Watch {
                     screen,
                     project,
@@ -3278,7 +3427,9 @@ impl App {
                 })
             }
             Err(error) => {
-                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                if !full() {
+                    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                }
                 self.notice = Some(error.to_string());
             }
         }
@@ -3578,7 +3729,69 @@ impl App {
             .collect()
     }
 
-    async fn key(&mut self, event: Event) {
+    /// What the full screen takes before the rest: the mouse, a copy of
+    /// the selection, and the keys that scroll. Whether it took `event`.
+    fn full_screen(&mut self, event: &Event) -> bool {
+        let key = match event {
+            Event::Mouse(mouse) => {
+                match self.screen.mouse(*mouse) {
+                    Some(screen::Action::Copy(text)) => self.copied(&text),
+                    Some(screen::Action::Open(link)) => {
+                        if let Err(error) = open(&link) {
+                            self.notice = Some(error);
+                        }
+                    }
+                    None => {}
+                }
+                return true;
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            _ => return false,
+        };
+        let copy = key.code == KeyCode::Char('c')
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER));
+        match key.code {
+            _ if copy && let Some(text) = self.screen.selected() => {
+                self.copied(&text);
+                self.screen.unselect();
+            }
+            KeyCode::Esc if self.screen.unselect() => {}
+            KeyCode::PageUp => self.screen.page(true),
+            KeyCode::PageDown => self.screen.page(false),
+            // Sending goes back to the newest rows, where its answer comes.
+            KeyCode::Enter => {
+                self.screen.latest();
+                return false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `text` put on the clipboard, and said so.
+    fn copied(&mut self, text: &str) {
+        term::copy(text);
+        let count = text.chars().count();
+        self.notice = Some(match count {
+            1 => "copied 1 character".into(),
+            _ => format!("copied {count} characters"),
+        });
+    }
+
+    async fn key(&mut self, mut event: Event) {
+        // Ctrl-H is the backspace a terminal sends as 0x08, which reads as
+        // Ctrl and `h`: it deletes, as in a shell.
+        if let Event::Key(key) = &mut event
+            && key.code == KeyCode::Char('h')
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            key.code = KeyCode::Backspace;
+            key.modifiers = KeyModifiers::NONE;
+        }
+        if full() && self.watch.is_none() && self.full_screen(&event) {
+            return;
+        }
         if self.watch.is_some() {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
@@ -3587,7 +3800,9 @@ impl App {
                         && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 self.watch = None;
-                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                if !full() {
+                    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                }
                 self.redraw = true;
             }
             return;
@@ -3847,23 +4062,10 @@ impl App {
             self.input.clear();
             let page = transcript::PAGE.lock().ok().and_then(|page| page.clone());
             self.notice = Some(match page {
-                Some(page) => {
-                    let opener = if cfg!(target_os = "macos") {
-                        "open"
-                    } else {
-                        "xdg-open"
-                    };
-                    match std::process::Command::new(opener)
-                        .arg(&page)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        Ok(_) => "opened in your browser".to_owned(),
-                        Err(error) => format!("{opener}: {error}"),
-                    }
-                }
+                Some(page) => match open(&page.to_string_lossy()) {
+                    Ok(()) => "opened in your browser".to_owned(),
+                    Err(error) => error,
+                },
                 None => "no HTML page in this conversation yet".into(),
             });
             return;
@@ -3957,6 +4159,27 @@ impl App {
                         "chime off"
                     }
                     .to_owned()
+                }
+                Err(error) => error,
+            });
+            return;
+        }
+        if prompt == "/fullscreen" {
+            self.input.clear();
+            let mut settings = settings::Settings::load();
+            settings.fullscreen = !full();
+            self.notice = Some(match settings.save() {
+                Ok(()) => {
+                    self.switch_screen = true;
+                    self.repaint = true;
+                    let then = match self.running {
+                        Some(_) => " once this turn ends",
+                        None => "",
+                    };
+                    match settings.fullscreen {
+                        true => format!("full screen{then}"),
+                        false => format!("inline{then}"),
+                    }
                 }
                 Err(error) => error,
             });
@@ -4072,15 +4295,17 @@ impl App {
         }
         match self.send(prompt, None, join).await {
             Ok(()) => {
+                self.input.clear();
+                self.notice = None;
                 if let Some(ask) = answering {
                     self.asks.retain(|open| open.id != ask.id);
                     self.sent_answers.push(ask.question);
+                    // After the notice is cleared, so a failure to keep shows.
+                    self.keep_asks();
                     if self.asks.is_empty() {
                         self.chatting = false;
                     }
                 }
-                self.input.clear();
-                self.notice = None;
             }
             Err(error) => self.notice = Some(error),
         }
@@ -4146,6 +4371,14 @@ impl App {
             && !self.asks.iter().any(|open| open.id == ask.id)
         {
             self.asks.push(ask);
+            self.keep_asks();
+        }
+    }
+
+    /// The open questions kept for the next start.
+    fn keep_asks(&mut self) {
+        if let Err(error) = asks::keep(self.asks_file.as_deref(), &self.asks) {
+            self.notice = Some(error);
         }
     }
 
@@ -4160,6 +4393,7 @@ impl App {
             return;
         }
         asks::close(&mut self.asks, message);
+        self.keep_asks();
         if self.asks.is_empty() {
             self.chatting = false;
         }
@@ -4336,6 +4570,10 @@ impl App {
             DisableBracketedPaste,
             EnterAlternateScreen
         );
+        // The side chat's Sonny takes the mouse if it wants it.
+        if full() {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
         let _ = disable_raw_mode();
         match command.spawn() {
             Ok(child) => self.side = Some(child),
@@ -4358,11 +4596,12 @@ impl App {
 
     fn side_back(&mut self) {
         let _ = enable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            LeaveAlternateScreen,
-            EnableBracketedPaste
-        );
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        // A full-screen side chat left the alternate screen on its way out.
+        let _ = match full() {
+            true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
+            false => execute!(std::io::stdout(), LeaveAlternateScreen),
+        };
         self.keys_paused
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.redraw = true;
@@ -4456,6 +4695,9 @@ impl App {
             terminal,
             VIEWPORT - 2 + live_rows + composer_rows.len() as u16,
         )?;
+        if full() {
+            self.screen.push(std::mem::take(&mut self.pending));
+        }
         if !self.pending.is_empty() {
             let lines: Vec<Line<'static>> = std::mem::take(&mut self.pending)
                 .into_iter()
@@ -4474,9 +4716,11 @@ impl App {
                     .iter()
                     .map(|row| row.alignment == Some(transcript::CUT))
                     .collect();
+                // Paths are read against the agent's folder.
+                let workspace = std::path::Path::new(&self.workspace);
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
-                    linked = links::cells(buf, &cut);
+                    linked = links::cells(buf, &cut, |word| links::file(workspace, word));
                 })?;
                 // The rows sit just above the viewport now; those still on
                 // the screen get their addresses linked.
@@ -4491,8 +4735,29 @@ impl App {
                 }
             }
         }
+        let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
+        let workspace = std::path::PathBuf::from(&self.workspace);
         terminal.draw(|frame| {
-            let [live, status, _, composer, footer] = areas(frame.area(), live_rows);
+            // The full screen: the conversation above the rows that move,
+            // which sit right under it until it fills the screen, as inline.
+            let view = match full() {
+                true => {
+                    let area = frame.area();
+                    let room = area.height.saturating_sub(below);
+                    let rows = self.screen.height(area.width as usize).min(room as usize);
+                    let [history, view, _] = Layout::vertical([
+                        Constraint::Length(rows as u16),
+                        Constraint::Length(below),
+                        Constraint::Min(0),
+                    ])
+                    .areas(area);
+                    let file = |word: &str| links::file(&workspace, word);
+                    self.screen.render(history, frame.buffer_mut(), file);
+                    view
+                }
+                false => frame.area(),
+            };
+            let [live, status, _, composer, footer] = areas(view, live_rows);
             frame.render_widget(Paragraph::new(open_rows.clone()), live);
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
@@ -4522,7 +4787,7 @@ impl App {
                         }
                     })
                     .collect();
-                let [_, _, _, composer_row, _] = areas(frame.area(), live_rows);
+                let [_, _, _, composer_row, _] = areas(view, live_rows);
                 let area = ratatui::layout::Rect {
                     y: composer_row.y.saturating_sub(rows.len() as u16),
                     height: rows.len() as u16,
@@ -4684,11 +4949,16 @@ impl App {
     /// cursor's row.
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         if self.input.is_empty() {
+            // Named, so a message typed in the wrong pane is caught first.
+            let name = match &self.project {
+                Some(project) => format!("{project} lead"),
+                None => self.bot.clone(),
+            };
             let hint = match self.running {
-                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat",
-                _ if self.react_to.is_some() => "An emoji for that reply, or Esc",
-                Some(_) => "Steer the running turn",
-                None => "Ask anything",
+                _ if !self.asks.is_empty() && !self.chatting => "Answer, or Esc to chat".into(),
+                _ if self.react_to.is_some() => "An emoji for that reply, or Esc".into(),
+                Some(_) => format!("Steer {name}"),
+                None => format!("Message {name}"),
             };
             return (
                 vec![Line::from(vec![
@@ -5198,6 +5468,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kept_questions_join_the_replay_by_the_call_that_asked_them() {
+        let user = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        let ask = |id: &str, question: &str| {
+            [
+                json!({"type": "function_call", "name": "ask", "call_id": id,
+                    "arguments": json!({"question": question}).to_string()}),
+                json!({"type": "function_call_output", "call_id": id, "output": "Asked."}),
+            ]
+        };
+        // Asked twice, answered between: the second is the one open. An
+        // older question, answered in the history replayed, is closed; one
+        // never answered stays.
+        let mut items = vec![user("go on")];
+        items.extend(ask("c1", "Proceed?"));
+        items.push(user("You asked: Proceed?\n\nyes"));
+        items.extend(ask("c2", "Proceed?"));
+        items.push(user("You asked: Rename the crate?\n\nno"));
+        let count = items.len() as i64;
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": (1..=count).rev().map(|node| json!({"node": node}))
+                .collect::<Vec<_>>(), "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node,
+                    "item": items[node.as_u64().unwrap() as usize - 1]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        let file =
+            std::env::temp_dir().join(format!("sonny-asks-join-{}.json", std::process::id()));
+        let kept =
+            |id: &str, question: &str| asks::call(id, &json!({"question": question})).unwrap();
+        asks::keep(
+            Some(&file),
+            &[
+                kept("o1", "Rename the crate?"),
+                kept("o2", "Bump the version?"),
+                kept("c2", "Proceed?"),
+            ],
+        )
+        .unwrap();
+        app.asks_file = Some(file.clone());
+        app.history().await;
+        assert_eq!(
+            app.asks,
+            [kept("o2", "Bump the version?"), kept("c2", "Proceed?")]
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
     async fn a_question_asked_is_pinned_until_an_answer_lands() {
         let items = json!({
             "1": {"type": "message", "role": "user",
@@ -5226,16 +5552,22 @@ mod tests {
         })
         .await;
         let mut app = app(client);
+        // Kept from before: one asked earlier than the history replayed,
+        // and one the history asks again.
+        let file = std::env::temp_dir().join(format!("sonny-asks-app-{}.json", std::process::id()));
+        let older = asks::call("o1", &json!({"question": "Rename the crate?"})).unwrap();
+        let tag = asks::Ask {
+            id: "a1".into(),
+            question: "Tag 0.4.1?".into(),
+            choices: vec!["Yes".into(), "No".into()],
+        };
+        asks::keep(Some(&file), &[older.clone(), tag.clone()]).unwrap();
+        app.asks_file = Some(file.clone());
         app.history().await;
-        // The refused one was never asked, and the answered one is closed.
-        assert_eq!(
-            app.asks,
-            [asks::Ask {
-                id: "a1".into(),
-                question: "Tag 0.4.1?".into(),
-                choices: vec!["Yes".into(), "No".into()]
-            }]
-        );
+        // The refused one was never asked, and the answered one is closed;
+        // the older one is still open.
+        assert_eq!(app.asks, [older.clone(), tag]);
+        assert_eq!(asks::load(Some(&file)), app.asks);
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.contains(&"• Asked you Tag 0.4.1?".to_owned()),
@@ -5243,7 +5575,9 @@ mod tests {
         );
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
+        app.answered("You asked: Rename the crate?\n\nNo");
         assert!(app.asks.is_empty());
+        assert!(!file.exists());
         // Live, a question is pinned once the daemon took the call.
         let arguments = json!({"question": "Merge?"}).to_string();
         app.daemon(turn_event("accepted", 4, json!({}))).await;
@@ -5257,6 +5591,7 @@ mod tests {
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "a4"})))
             .await;
         assert_eq!(app.asks[0].question, "Merge?");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
@@ -5295,7 +5630,7 @@ mod tests {
         assert_eq!(ran.output, "hello");
         // Staged until its turn takes it, as its name alone.
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(staged, ["! echo hello"]);
+        assert_eq!(staged, ["", "! echo hello", ""]);
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         assert!(app.staged.is_empty());
         // To a busy one, as a steer of its running turn.
@@ -5427,7 +5762,7 @@ mod tests {
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
-        assert_eq!(app.staged_rows(80).len(), 2);
+        assert_eq!(app.staged_rows(80).len(), 5, "each with a blank row above");
         // Turn 1 takes in the first; its own turn ends as steered.
         app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
             .await;
@@ -5974,6 +6309,18 @@ mod tests {
             "{narrow}"
         );
         assert_eq!(narrow.trim_end().width(), 56 - 2);
+    }
+
+    #[tokio::test]
+    async fn ctrl_h_deletes_as_backspace_does() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.input.set("helo");
+        let ctrl_h = event::KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_h)).await;
+        assert_eq!(&*app.input, "hel");
+        app.input.set("/mo");
+        app.key(Event::Key(ctrl_h)).await;
+        assert_eq!(&*app.input, "/m", "with the command menu open too");
     }
 
     #[test]

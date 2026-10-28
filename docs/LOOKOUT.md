@@ -48,8 +48,8 @@ task with that reading.
 
 A high answer (0.70 or more) to an urgent question (redirects, conflict)
 steers the lead at once with `--delivery steer`. Any other high answer
-goes in the next note, under "May need you", once the lead rests and at
-most once a minute, as task updates do. A middle one (0.35 or more)
+goes in the next note, under "May need you", as soon as the lead rests,
+as task updates do. A middle one (0.35 or more)
 sends no note by itself and rides along with the next. The rest are only
 counted.
 
@@ -127,10 +127,13 @@ with subscriptions of their own:
   memory indexes name.
 
 A turn the subscriber waits on is not news, nor its own forks. A note goes
-once the subscriber rests, at most once a minute, or at once with an
-urgent answer; memory alone never sends one. When a note has waited a
-minute for a subscriber the events say is busy, the lookout asks the
-daemon, so a missed event never holds the note until the next turn.
+as soon as the subscriber rests, or at once with an urgent answer; memory
+alone never sends one. News settles for 2 seconds first, and up to 15
+while a check of it is under way, so turns that end together and the
+judge's answers on them go in one note. A busy subscriber hears once its
+turn ends. When a note has waited a minute for a subscriber the events
+say is busy, the lookout asks the daemon, so a missed event never holds
+the note until the next turn.
 
 ## The note
 

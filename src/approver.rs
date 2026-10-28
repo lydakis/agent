@@ -1,10 +1,11 @@
 //! `agent approver`: serve a gate tag and have a judge model decide every
-//! call waiting on it, in one request a round. The policy (the questions,
-//! the verdicts, what the judge sees, and redaction) is
+//! call waiting on it, in one request a round. The policy (what the judge is
+//! told, the verdicts, what it sees, and redaction) is
 //! `agent_client::approver` and the judge's transport `agent_client::judge`;
 //! this is the loop.
-//! It never pages a person: a round it cannot judge in time is denied with
-//! the reason, and the model can ask its caller instead.
+//! As in Codex, a denial goes back to the model at once, and a round the
+//! judge never assessed is denied as a review failure; only a call too long
+//! to show is handed to a person, where one can be asked.
 use agent_client::{
     Client,
     approver::{
@@ -76,6 +77,7 @@ pub fn main(settings: Settings) -> Result<i32> {
 
 /// What a judge request came back with.
 enum Judged {
+    /// An assessment for every call, by its id.
     Answers {
         answers: Value,
         usage: Usage,
@@ -107,24 +109,27 @@ enum Picked<'a> {
 }
 
 impl Judge {
-    async fn ask(
-        &self,
-        client: &Client,
-        state: &Value,
-        questions: &[(String, String)],
-        deadline: Instant,
-    ) -> Judged {
+    async fn ask(&self, client: &Client, state: &Value, ids: &[&str], deadline: Instant) -> Judged {
         let answered = match &self.via {
+            // One predicate a call, its probability read as an outcome.
             Via::Decisions(decisions) => {
                 let text = policy::state_text(state);
+                let questions = policy::questions(ids);
                 decisions
-                    .ask(policy::DECISIONS_INSTRUCTIONS, &text, questions, deadline)
+                    .ask(policy::DECISIONS_INSTRUCTIONS, &text, &questions, deadline)
                     .await
+                    .map(|(answers, usage)| {
+                        let assessed = answers
+                            .into_iter()
+                            .map(|(id, p)| (id, policy::decided(p.as_f64().unwrap_or(1.0))))
+                            .collect();
+                        (assessed, usage)
+                    })
             }
             Via::Model(base) => {
-                let ids: Vec<&str> = questions.iter().map(|(id, _)| id.as_str()).collect();
-                let prompt = policy::model_prompt(state, questions);
-                base.ask(client, &prompt, &ids, deadline).await
+                let prompt = policy::model_prompt(state, ids);
+                base.ask_with(client, &prompt, ids, policy::assessments, deadline)
+                    .await
             }
         };
         match answered {
@@ -212,26 +217,25 @@ async fn serve(settings: Settings) -> Result<i32> {
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
     };
-    let (via, deadline_ms) = match picked {
-        Picked::Decisions(decisions) => (Via::Decisions(decisions), policy::DEADLINE_MS),
-        Picked::Model(model) => {
-            let base = judge::Base::make(
+    let via = match picked {
+        Picked::Decisions(decisions) => Via::Decisions(decisions),
+        Picked::Model(model) => Via::Model(
+            judge::Base::make(
                 &client,
                 &format!("approver.{tag}"),
                 model,
                 settings.effort.as_deref(),
-                &policy::judge_instructions(),
+                policy::JUDGE_INSTRUCTIONS,
             )
-            .await?;
-            (Via::Model(base), policy::MODEL_DEADLINE_MS)
-        }
+            .await?,
+        ),
     };
     let shared = Arc::new(Shared {
         client,
         judge: Judge {
             via,
             slots: Semaphore::new(IN_FLIGHT),
-            deadline_ms,
+            deadline_ms: policy::DEADLINE_MS,
         },
         tag: tag.clone(),
         lease,
@@ -415,17 +419,17 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     let left = (announced + shared.judge.deadline_ms as i64 - epoch_ms()).max(0) as u64;
     let deadline = started + Duration::from_millis(left);
     let counts = &calls[0]["denials"][&shared.tag];
-    let (in_row, in_turn) = (
+    let (in_row, recent) = (
         counts["in_row"].as_u64().unwrap_or(0),
-        counts["in_turn"].as_u64().unwrap_or(0),
+        counts["recent"].as_u64().unwrap_or(0),
     );
     let key = (bot.clone(), turn);
     let mut usage = Usage::default();
     let verdicts: Vec<Verdict> = if shared.tripped.lock().unwrap().contains(&key) {
         // The turn kept going after it was told to stop: end it now.
         interrupt(&shared, &bot, turn).await;
-        vec![policy::tripped(in_row.max(policy::IN_ROW), in_turn).unwrap(); calls.len()]
-    } else if let Some(stop) = policy::tripped(in_row, in_turn) {
+        vec![policy::tripped(in_row.max(policy::IN_ROW), recent).unwrap(); calls.len()]
+    } else if let Some(stop) = policy::tripped(in_row, recent) {
         shared.tripped.lock().unwrap().insert(key);
         let later = shared.clone();
         let (b, t) = (bot.clone(), turn);
@@ -437,20 +441,27 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         });
         vec![stop; calls.len()]
     } else if left == 0 {
-        vec![policy::not_reviewed("the approver is overloaded"); calls.len()]
+        vec![policy::timed_out(); calls.len()]
     } else {
-        // A check that failed is tried once more while the round has time:
-        // a failure is the approver's, not the call's.
-        let mut retried = false;
+        // A check that failed is tried again while the round has time, up
+        // to Codex's attempts: a failure is the approver's, not the call's.
+        let mut attempt = 1;
         loop {
             match judge(&shared, &bot, turn, &calls, deadline).await {
                 Ok((verdicts, used)) => {
                     usage = used;
                     break verdicts;
                 }
-                Err(Unreviewed::Failed) if !retried && Instant::now() < deadline => retried = true,
-                Err(Unreviewed::Failed) => {
-                    break vec![policy::not_reviewed("the check failed"); calls.len()];
+                Err(Unreviewed::Failed(_))
+                    if attempt < policy::ATTEMPTS && Instant::now() < deadline =>
+                {
+                    attempt += 1
+                }
+                Err(Unreviewed::Failed(_)) if Instant::now() >= deadline => {
+                    break vec![policy::timed_out(); calls.len()];
+                }
+                Err(Unreviewed::Failed(why)) => {
+                    break vec![policy::not_reviewed(&why); calls.len()];
                 }
                 Err(Unreviewed::Not(verdict)) => break vec![verdict; calls.len()],
             }
@@ -461,16 +472,20 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     for (call, verdict) in calls.iter().zip(&verdicts) {
         let (mut decision, reason) = match verdict {
             Verdict::Allow => ("allow", None),
-            Verdict::Deny(reason) => ("deny", Some(reason.as_str())),
+            Verdict::Deny(reason) | Verdict::Unreviewed(reason) => ("deny", Some(reason.as_str())),
             Verdict::Doubt(reason) => ("ask", Some(reason.as_str())),
         };
+        // A round nobody assessed is denied without counting toward the
+        // breaker, as in Codex.
+        let unreviewed = matches!(verdict, Verdict::Unreviewed(_));
         let answer = |decision: &str| {
-            shared.client.request(
-                "answer",
-                json!({"bot":bot,"turn":turn,"call_id":call["call_id"],"request":call["request"],
-                    "tag":shared.tag,"decision":decision,"reason":reason,"by":"approver",
-                    "lease":shared.lease}),
-            )
+            let mut answer = json!({"bot":bot,"turn":turn,"call_id":call["call_id"],
+                "request":call["request"],"tag":shared.tag,"decision":decision,"reason":reason,
+                "by":"approver","lease":shared.lease});
+            if unreviewed {
+                answer["unreviewed"] = json!(true);
+            }
+            shared.client.request("answer", answer)
         };
         let mut result = answer(decision).await;
         // A gate that lapses has nobody to wait on: the doubt is a denial.
@@ -513,8 +528,9 @@ async fn interrupt(shared: &Shared, bot: &str, turn: i64) {
 
 /// Why a round has no verdicts from the judge.
 enum Unreviewed {
-    /// Reading the turn or asking the judge failed: worth one more try.
-    Failed,
+    /// Reading the turn or asking the judge failed, and why: worth another
+    /// try.
+    Failed(String),
     /// It cannot be judged now: this verdict for every call.
     Not(Verdict),
 }
@@ -527,48 +543,50 @@ async fn judge(
     calls: &[Value],
     deadline: Instant,
 ) -> std::result::Result<(Vec<Verdict>, Usage), Unreviewed> {
-    let not = |why: &str| Unreviewed::Not(policy::not_reviewed(why));
+    let late = || Unreviewed::Not(policy::timed_out());
+    let long = |why: &str| Unreviewed::Not(policy::too_long(why));
     let Ok(Ok(_slot)) =
         tokio::time::timeout_at(deadline.into(), shared.judge.slots.acquire()).await
     else {
-        return Err(not("the approver is overloaded"));
+        return Err(late());
     };
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
-            Err(_) => return Err(not("the approver is overloaded")),
-            Ok(Err(Unjudged::TooLong)) => return Err(not("the call is too long to show")),
-            Ok(Err(Unjudged::Failed)) => return Err(Unreviewed::Failed),
+            Err(_) => return Err(late()),
+            Ok(Err(Unjudged::TooLong)) => return Err(long("the call is too long to show")),
+            Ok(Err(Unjudged::Failed)) => {
+                return Err(Unreviewed::Failed("the turn could not be read".into()));
+            }
             Ok(Ok(intent)) => intent,
         };
-    let (state, consent) = match policy::build(&intent, &shared.redactor) {
-        State::TooLong => return Err(not("the calls are too long to show")),
-        State::Built { state, consent } => (state, consent),
+    let state = match policy::build(&intent, &shared.redactor) {
+        State::TooLong => return Err(long("the calls are too long to show")),
+        State::Built { state, .. } => state,
     };
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
-    let questions = policy::questions(&ids, consent);
     match shared
         .judge
-        .ask(&shared.client, &state, &questions, deadline)
+        .ask(&shared.client, &state, &ids, deadline)
         .await
     {
-        Judged::Overloaded => Err(not("the approver is overloaded")),
+        Judged::Overloaded => Err(late()),
         Judged::Failed(detail) => {
             report(json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":detail}));
-            Err(Unreviewed::Failed)
+            Err(Unreviewed::Failed(detail))
         }
         Judged::Answers { answers, usage } => {
             let verdicts = intent
                 .planned
                 .iter()
                 .map(|call| {
-                    let verdict = policy::verdict(&call.id, &answers, consent)?;
+                    let verdict = policy::verdict(&answers[&call.id])?;
                     Some(match call.unseen {
                         true => policy::unseen(verdict),
                         false => verdict,
                     })
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or(Unreviewed::Failed)?;
+                .ok_or_else(|| Unreviewed::Failed("the judge's answer did not parse".into()))?;
             Ok((verdicts, usage))
         }
     }
@@ -705,7 +723,7 @@ async fn intent(
         )
         .await?;
     // The read keeps the earliest words of the turn, so steers it left out
-    // or cut may hold the person's latest word: consent is not asked then.
+    // or cut may hold the person's latest word: authorization is unreadable then.
     let mut left_out = Left {
         newest: read["prompts_more"] == true,
         ..Left::default()

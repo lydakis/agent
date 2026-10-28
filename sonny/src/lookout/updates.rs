@@ -7,7 +7,7 @@
 //! own forks.
 //!
 //! Only live turns count. The lookout sends the news with its next note,
-//! or on its own once the lead rests, at most once a minute; one note
+//! or on its own as soon as the lead rests; one note
 //! names each task's latest turn of each kind, by the handle the wait tool
 //! reads it with. What changed in memory rides along, and never sends a
 //! note by itself.
@@ -18,7 +18,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const WAKE: Duration = Duration::from_secs(60);
+/// How long news waits on a lead its events say is busy before the
+/// daemon is asked whether it is.
+pub const DOUBT: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
@@ -125,7 +127,6 @@ pub struct Updates {
     /// whether that silence was told already.
     quiet: HashMap<String, (i64, Instant, bool)>,
     silences: u64,
-    last: Option<Instant>,
     /// When the daemon last said whether the lead rests.
     asked: Option<Instant>,
     memory_seen: Option<HashMap<String, u64>>,
@@ -154,7 +155,6 @@ impl Updates {
             tasks: Vec::new(),
             quiet: HashMap::new(),
             silences: 0,
-            last: None,
             asked: None,
             memory_seen: None,
             opened: now_ms(),
@@ -497,26 +497,27 @@ impl Updates {
             .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
     }
 
-    /// Whether the lead is to hear now: there is news, or `held` other news
-    /// for it, it rests, and it last heard long enough ago.
-    pub fn due(&self, now: Instant, held: bool) -> bool {
-        self.live
-            && (held || !self.tasks.is_empty())
+    /// Whether there is news for the lead: its own, or `held` other news.
+    pub fn news(&self, held: bool) -> bool {
+        self.live && (held || !self.tasks.is_empty())
+    }
+
+    /// Whether the lead is to hear now: there is news and it rests.
+    pub fn due(&self, held: bool) -> bool {
+        self.news(held)
             && self
                 .bots
                 .get(&self.lead)
                 .is_some_and(|lead| lead.id.is_some() && !ACTIVE.contains(&lead.status.as_str()))
-            && self.last.is_none_or(|last| now >= last + WAKE)
     }
 
-    /// Whether to ask the daemon if the lead rests: the note is due but for
-    /// the lead's turn, and the events said it started long ago. A missed
-    /// event would otherwise hold the note until the lead's next turn.
-    pub fn doubt(&self, now: Instant, held: bool) -> bool {
-        self.live
-            && (held || !self.tasks.is_empty())
-            && self.last.is_none_or(|last| now >= last + WAKE)
-            && self.asked.is_none_or(|asked| now >= asked + WAKE)
+    /// Whether to ask the daemon if the lead rests: news came `since` and
+    /// has waited a while on a lead its events say is busy. A missed event
+    /// would otherwise hold the note until the lead's next turn.
+    pub fn doubt(&self, now: Instant, held: bool, since: Instant) -> bool {
+        self.news(held)
+            && now >= since + DOUBT
+            && self.asked.is_none_or(|asked| now >= asked + DOUBT)
             && self
                 .bots
                 .get(&self.lead)
@@ -539,13 +540,12 @@ impl Updates {
         Some(std::mem::replace(&mut lead.status, "idle".into()))
     }
 
-    /// The news for the next note, taken: every task's when the lead
-    /// heard nothing for a while, those with news to act on first.
-    pub fn take(&mut self, now: Instant) -> Told {
+    /// The news for the next note, taken: every task's, those with news to
+    /// act on first.
+    pub fn take(&mut self) -> Told {
         let mut tasks = std::mem::take(&mut self.tasks);
         tasks.sort_by_key(|(_, news)| news.act.is_none());
         self.tasks = tasks.split_off(tasks.len().min(WAKE_TASKS));
-        self.last = Some(now);
         let mut items: Vec<Line> = tasks
             .iter()
             .flat_map(|(name, news)| {
@@ -567,11 +567,6 @@ impl Updates {
             sent: tasks,
             seen,
         }
-    }
-
-    /// A note went without task updates: the next waits as long.
-    pub fn noted(&mut self, now: Instant) {
-        self.last = Some(now);
     }
 
     /// The note was sent: what it said of memory has been told.
@@ -862,7 +857,7 @@ mod tests {
             json!({"from": {"bot": "shop.fix", "turn": 4}}),
             "completed",
         );
-        assert!(!updates.due(now, false), "the lead is working");
+        assert!(!updates.due(false), "the lead is working");
         updates.event(
             &ev(
                 "shop.lead",
@@ -872,8 +867,8 @@ mod tests {
             ),
             now,
         );
-        assert!(updates.due(now, false));
-        let told = updates.take(now);
+        assert!(updates.due(false));
+        let told = updates.take();
         assert_eq!(
             text(&told),
             "- shop.fix: turn:shop.fix/5 failed, asked by you, and 1 earlier since turn:shop.fix/4\n\
@@ -883,7 +878,7 @@ mod tests {
         assert_eq!(theirs, [false, true]);
         assert_eq!(told.items[0].handle, "turn:shop.fix/5");
         updates.sent(told);
-        // A minute apart at most.
+        // The next news is due at once: no gap after a note.
         turn(
             &mut updates,
             "shop.docs",
@@ -891,8 +886,7 @@ mod tests {
             json!({"from": {"bot": "shop.lead", "turn": 10}}),
             "completed",
         );
-        assert!(!updates.due(now + Duration::from_secs(30), false));
-        assert!(updates.due(now + WAKE, false));
+        assert!(updates.due(false));
     }
 
     #[test]
@@ -908,23 +902,29 @@ mod tests {
             json!({"from": {"bot": "shop.lead", "turn": 10}}),
             "completed",
         );
-        assert!(!updates.due(now, false));
-        assert!(updates.doubt(now, false));
+        assert!(!updates.due(false));
+        // Not until the news has waited a while.
+        assert!(!updates.doubt(now, false, now));
+        let later = now + DOUBT;
+        assert!(updates.doubt(later, false, now));
         // Still running there: still busy here, and not asked again soon.
         let running =
             json!({"name": "shop.lead", "bot_id": 1, "status": "running", "running_turn": 11});
-        assert_eq!(updates.rests(now, &running), None);
-        assert!(!updates.doubt(now + Duration::from_secs(30), false));
-        assert!(!updates.due(now + WAKE, false));
+        assert_eq!(updates.rests(later, &running), None);
+        assert!(!updates.doubt(later + Duration::from_secs(30), false, now));
+        assert!(!updates.due(false));
         // Another bot under the name says nothing of this one.
         let other =
             json!({"name": "shop.lead", "bot_id": 8, "status": "idle", "running_turn": null});
-        assert_eq!(updates.rests(now + WAKE, &other), None);
+        assert_eq!(updates.rests(later + DOUBT, &other), None);
         let idle =
             json!({"name": "shop.lead", "bot_id": 1, "status": "idle", "running_turn": null});
-        assert_eq!(updates.rests(now + WAKE, &idle).as_deref(), Some("running"));
-        assert!(updates.due(now + WAKE, false));
-        assert!(!updates.doubt(now + WAKE * 2, false));
+        assert_eq!(
+            updates.rests(later + DOUBT, &idle).as_deref(),
+            Some("running")
+        );
+        assert!(updates.due(false));
+        assert!(!updates.doubt(later + DOUBT * 2, false, now));
     }
 
     #[test]
@@ -968,19 +968,16 @@ mod tests {
         );
         // The approver has its say first.
         updates.expire(now);
-        assert!(
-            !updates.due(now, false),
-            "the lead read shop.fix with its wait"
-        );
+        assert!(!updates.due(false), "the lead read shop.fix with its wait");
         updates.expire(now + APPROVAL_AFTER);
-        let told = updates.take(now);
+        let told = updates.take();
         assert_eq!(
             text(&told),
             "- shop.docs: turn:shop.docs/2 waiting for the person's approval"
         );
         // Refused: the news comes back for next time.
         updates.unsent(told);
-        let again = updates.take(now + WAKE);
+        let again = updates.take();
         assert!(text(&again).contains("shop.docs/2 waiting for the person's approval"));
     }
 
@@ -990,7 +987,7 @@ mod tests {
         let now = Instant::now();
         let silent = |updates: &mut Updates, at: Instant| {
             updates.expire(at);
-            let told = updates.take(at);
+            let told = updates.take();
             text(&told)
         };
         updates.event(
@@ -1008,12 +1005,12 @@ mod tests {
             silent(&mut updates, later),
             "- shop.fix: turn:shop.fix/3 has printed nothing for 30 minutes"
         );
-        assert_eq!(silent(&mut updates, later + WAKE), "");
+        assert_eq!(silent(&mut updates, later + DOUBT), "");
         // A wait that returned before the turn ended read no silence.
         updates.event(&ev("shop.fix", Some(3), "text_delta", json!({})), later);
         updates.expire(later + QUIET_AFTER);
         updates.read(&["turn:shop.fix/3".to_owned()].into());
-        let told = updates.take(later + QUIET_AFTER);
+        let told = updates.take();
         assert_eq!(told.items.len(), 1);
         // Printing again starts a new silence, which is news of its own.
         assert_ne!(told.items[0].key, "");
@@ -1035,7 +1032,7 @@ mod tests {
             ),
             at,
         );
-        updates.take(at + WAKE);
+        updates.take();
         assert_eq!(silent(&mut updates, at + 4 * QUIET_AFTER), "");
         // A turn already running when its bot came to be watched is
         // tracked from what it does next.
@@ -1063,7 +1060,7 @@ mod tests {
         // The approver allowed it.
         updates.event(&ev("shop.docs", Some(2), "turn_resumed", json!({})), now);
         updates.expire(now + APPROVAL_AFTER);
-        assert!(updates.take(now).items.is_empty());
+        assert!(updates.take().items.is_empty());
         turn(
             &mut updates,
             "shop.fix",
@@ -1080,9 +1077,9 @@ mod tests {
         );
         // Reading an earlier turn leaves the latest news.
         updates.read(&["turn:shop.fix/4".to_owned()].into());
-        assert!(updates.due(now + WAKE, false));
+        assert!(updates.due(false));
         updates.read(&["turn:shop.fix/5".to_owned()].into());
-        assert!(!updates.due(now + WAKE, false));
+        assert!(!updates.due(false));
     }
 
     #[test]
@@ -1103,7 +1100,6 @@ mod tests {
         updates.memory = vec![root.clone(), project.clone()];
         updates.opened = 0;
         let news = |updates: &mut Updates| {
-            let now = Instant::now() + WAKE * 10;
             turn(
                 updates,
                 "shop.fix",
@@ -1111,7 +1107,7 @@ mod tests {
                 json!({"from": {"bot": "shop.lead", "turn": 9}}),
                 "completed",
             );
-            let told = updates.take(now);
+            let told = updates.take();
             let prompt = text(&told);
             updates.sent(told);
             prompt
@@ -1166,14 +1162,13 @@ mod tests {
             } else {
                 updates.seat(&json!({"name": "shop.lead", "bot_id": 7, "status": "idle"}));
             }
-            assert!(!updates.due(now, false), "{gone}");
-            assert!(updates.take(now).sent.is_empty());
+            assert!(!updates.due(false), "{gone}");
+            assert!(updates.take().sent.is_empty());
         }
     }
 
     #[test]
     fn a_new_task_under_the_name_does_not_inherit_the_last_ones_news() {
-        let now = Instant::now();
         let mut updates = fleet();
         turn(
             &mut updates,
@@ -1184,13 +1179,12 @@ mod tests {
         );
         // Deleted and made again while the lookout was away: seated afresh.
         updates.seat(&json!({"name": "shop.fix", "bot_id": 99, "status": "idle"}));
-        assert!(!updates.due(now, false));
-        assert!(updates.take(now).sent.is_empty());
+        assert!(!updates.due(false));
+        assert!(updates.take().sent.is_empty());
     }
 
     #[test]
     fn a_task_deleted_while_the_lookout_was_away_has_no_news() {
-        let now = Instant::now();
         let mut updates = fleet();
         turn(
             &mut updates,
@@ -1203,7 +1197,7 @@ mod tests {
             .map(str::to_owned)
             .into();
         updates.seated(&listed);
-        assert!(!updates.due(now, false));
-        assert!(updates.take(now).sent.is_empty());
+        assert!(!updates.due(false));
+        assert!(updates.take().sent.is_empty());
     }
 }

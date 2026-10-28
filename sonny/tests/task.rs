@@ -133,12 +133,15 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
         "demo.fix",
         "--workspace",
         &workspace,
-        "--agents",
-        "--",
-        "fix",
-        "it",
+        "--instructions",
     ];
-    assert_eq!(lab.ran(), expected);
+    // What --agents composes, given as the task's instructions, with who
+    // it works for after it.
+    let ran = lab.ran();
+    assert_eq!(ran[..expected.len()], expected);
+    assert_eq!(ran[ran.len() - 3..], ["--", "fix", "it"]);
+    let told = ran[expected.len()..ran.len() - 3].join("\n");
+    assert!(told.contains("The person you work for"), "{told}");
     assert!(said.contains("\"handle\""), "{said}");
     // From the last commit, on its own branch.
     assert_eq!(
@@ -149,6 +152,30 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
         lab.git(&worktree, &["branch", "--show-current"]),
         "agent/demo.fix"
     );
+}
+
+#[test]
+fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
+    let lab = Lab::new("brief");
+    // A link in the home to the repository, as `~/workplace` is to
+    // `/Volumes/workplace`.
+    std::os::unix::fs::symlink(&lab.repo, lab.home.join("link")).unwrap();
+    let repo = lab.repo.to_string_lossy();
+    let brief = format!("edit {repo}/src/lib.rs and ~/link/src, keep {repo}2/x");
+    let (ok, _, said) = lab.run(
+        &lab.repo.join("src"),
+        env!("CARGO_BIN_EXE_sonny"),
+        &["task", "demo.fix", "--", &brief],
+        false,
+    );
+    assert!(ok, "{said}");
+    let copy = lab.home.join(".agent/worktrees/demo.fix");
+    let copy = copy.to_string_lossy();
+    assert_eq!(
+        lab.ran().last().unwrap(),
+        &format!("edit {copy}/src/lib.rs and {copy}/src, keep {repo}2/x")
+    );
+    assert!(said.contains("2 times"), "{said}");
 }
 
 #[test]
