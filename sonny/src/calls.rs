@@ -80,9 +80,6 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
         "sonny" if args.first().is_some_and(|a| a == "agent") => {
             agent(&args[1..], stdin, printed, failed)
         }
-        "sonny" if args.first().is_some_and(|a| a == "task") => {
-            sonny_task(&args[1..], printed, failed)
-        }
         _ => None,
     }?;
     // Where its output went, and what came out.
@@ -731,29 +728,6 @@ fn errand(words: &[String], output: &str, failed: bool) -> Option<Said> {
         said.output = Some(output.to_owned());
     }
     Some(said)
-}
-
-/// `sonny task changes`, as the changes of a sandfs copy, listed or
-/// applied.
-fn sonny_task(words: &[String], output: &str, failed: bool) -> Option<Said> {
-    let [changes, name, rest @ ..] = words else {
-        return None;
-    };
-    if changes != "changes" {
-        return None;
-    }
-    let apply = rest.iter().any(|w| w == "--apply");
-    Some(Said {
-        verb: match apply {
-            true => "Applied the changes of",
-            false => "Listed the changes of",
-        }
-        .into(),
-        what: name.clone(),
-        under: Vec::new(),
-        failed,
-        output: (!apply).then(|| output.to_owned()),
-    })
 }
 
 /// A call of a tool Sonny declares, said as what it does: a question to

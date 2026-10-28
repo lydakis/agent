@@ -277,15 +277,13 @@ off again never shows.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
-- `/copies` (or `--copies worktree|sandfs`) picks how the lead's tasks get
-  their own copy of the folder: git worktrees (the default), or
-  [sandfs](https://github.com/lydakis/sandfs) copies (experimental), which
-  take the folder's uncommitted changes along, cost no disk until written,
-  and work outside git too. Every task gets one; only the lead works in the
-  folder. The lead starts each task with its `start_task` tool (`name`,
-  `brief`, `setup`, `profile`, `model`, `effort`), which makes its folder
-  that way, runs `.agents/setup` there with `setup`, starts the task with
-  `agent run`, and leaves no folder behind when that fails. Every agent Sonny starts, leads and tasks
+- Every task works in a git worktree of its own, at the last commit on
+  the branch `agent/NAME`, so only the lead works in the folder; outside
+  git, tasks work in the lead's folder. The lead starts each task with its
+  `start_task` tool (`name`, `brief`, `setup`, `profile`, `model`,
+  `effort`), which makes its worktree, runs `.agents/setup` there with
+  `setup`, starts the task with `agent run`, and leaves no folder behind
+  when that fails. Every agent Sonny starts, leads and tasks
   alike, is told that the person it works for may be under pressure, and
   to care whether they succeed: take work off their plate, do or offer
   what they will need next, and say once when a better way of working
@@ -293,28 +291,10 @@ off again never shows.
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
-  in the task's copy, so the task never writes the lead's folder by its
-  full path. `sonny task changes NAME [--all] [--apply [--force]
-  [--only PATH...]]` lists, or writes back, what a sandfs copy of a plain
-  folder changed: never git's own files, and files git ignores (such as
-  `__pycache__`) only with `--all`. Commits a task makes in a repository
-  inside a plain folder stay in its copy, and in the copy of a linked
-  worktree, whose `.git` names its repository outside the copy, git is
-  turned off, so it can't change that repository while the files stay
-  behind. A plain folder on another disk than sandfs's home, such as an
-  external volume, is copied on its own disk, in a `.sandfs` folder at
-  that disk's top; on a disk that can't clone files (ext4) its files are
-  copied in full. A task that is done, fails or needs the person has its
-  copy give back the memory it can do without. The `remove_task` tool
-  (`task`, `discard`) removes a task that is done and the folder Sonny made
-  it, refusing while its work isn't back yet: changes not applied,
-  uncommitted or not pushed. A worktree's branch is kept unless it is
-  merged. sandfs is
-  built into Sonny, so it needs no install, only what a mount needs (FUSE 3
-  on Linux, nothing on macOS). Its mounts are served by Sonny run again in
-  the background, which outlives Sonny; Sonny mounts task copies a restart
-  unmounted again when it opens the lead, but not those whose task is gone,
-  which it names instead.
+  in the task's worktree, so the task never writes the lead's folder by
+  its full path. The `remove_task` tool (`task`, `discard`) removes a task
+  that is done and its worktree, refusing while the worktree has
+  uncommitted changes. Its branch is kept unless it is merged.
 - **Decisions:** when the lead reaches a fork in the road, an
   architectural choice or a step that cannot be undone, it calls its `ask`
   tool with the question, why it asks, two to four options each with what
