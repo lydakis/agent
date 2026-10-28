@@ -307,12 +307,24 @@ pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<B
 pub struct Items {
     /// Exact byte length every stream yields.
     pub bytes: usize,
+    /// What the items weigh as input: their length, with pictures counted
+    /// at their token cost rather than their size.
+    pub weight: usize,
     open: Box<dyn Fn() -> ItemStream + Send + Sync>,
 }
 impl Items {
     pub fn new(bytes: usize, open: impl Fn() -> ItemStream + Send + Sync + 'static) -> Items {
+        Items::weighing(bytes, bytes, open)
+    }
+    /// Items of `bytes` that weigh `weight`.
+    pub fn weighing(
+        bytes: usize,
+        weight: usize,
+        open: impl Fn() -> ItemStream + Send + Sync + 'static,
+    ) -> Items {
         Items {
             bytes,
+            weight,
             open: Box::new(open),
         }
     }
@@ -833,7 +845,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix_for(&request, true)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            input: ((prefix.len() + request.items.weight) / 4) as u64,
             output: 0,
         };
         let mut park_for = None;
@@ -991,7 +1003,7 @@ impl Provider {
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
-            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            input: ((prefix.len() + request.items.weight) / 4) as u64,
             output: u64::from(self.max_output_tokens.unwrap_or(512)),
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;

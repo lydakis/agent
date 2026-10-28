@@ -340,6 +340,9 @@ enum Command {
         /// The most input plus output tokens this turn may spend, beside
         /// the bot's own budget; absent leaves only that.
         budget_tokens: Option<u64>,
+        /// Pictures sent with the prompt, each a media type and base64;
+        /// absent or null is none.
+        images: Option<Vec<agent_runtime::codec::Image>>,
     },
     Interrupt {
         bot: String,
@@ -711,6 +714,56 @@ fn name(field: &str, value: &str) -> Result<()> {
             format!("{field} must be 1 to 128 of A-Z a-z 0-9 . _ -"),
         )
         .facts(json!({"field":field})));
+    }
+    Ok(())
+}
+/// The most bytes a prompt's pictures may have together, decoded: what
+/// Anthropic takes for one image, so one alone always fits.
+const IMAGES_BYTES: usize = 5 << 20;
+/// The most pictures one prompt may carry.
+const IMAGES: usize = 20;
+
+/// Pictures a provider takes: a media type both families know, base64 of
+/// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
+fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
+    use base64::Engine;
+    if images.len() > IMAGES {
+        return fail_with(
+            "image_limit",
+            format!("a prompt may carry up to {IMAGES} images"),
+        );
+    }
+    let mut bytes = 0;
+    for (at, image) in images.iter().enumerate() {
+        let invalid = |why: &str| {
+            Error::with("invalid_image", format!("images[{at}] {why}"))
+                .facts(json!({"field":"images","index":at}))
+        };
+        if !agent_runtime::codec::IMAGE_TYPES.contains(&image.media_type.as_str()) {
+            return Err(invalid(&format!(
+                "media_type must be one of {}",
+                agent_runtime::codec::IMAGE_TYPES.join(", ")
+            )));
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .map_err(|_| invalid("data must be standard base64"))?;
+        let signature = match image.media_type.as_str() {
+            "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => data.starts_with(b"\xff\xd8\xff"),
+            "image/gif" => data.starts_with(b"GIF8"),
+            _ => data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP"),
+        };
+        if !signature {
+            return Err(invalid(&format!("data is not {}", image.media_type)));
+        }
+        bytes += data.len();
+    }
+    if bytes > IMAGES_BYTES {
+        return fail_with(
+            "image_limit",
+            format!("a prompt's images may be up to {IMAGES_BYTES} bytes together, decoded"),
+        );
     }
     Ok(())
 }
@@ -2673,6 +2726,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
+                            images: Vec::new(),
                             note: None,
                             failed: true,
                         }
@@ -2991,8 +3045,11 @@ impl Service {
                 from,
                 origin,
                 budget_tokens,
+                images,
             } => {
                 name("request_id", &request_id)?;
+                let images = images.unwrap_or_default();
+                check_images(&images)?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }
@@ -3048,6 +3105,7 @@ impl Service {
                     from: from.map(|author| (author.bot, author.turn)),
                     origin,
                     budget_tokens,
+                    images,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -4229,6 +4287,7 @@ mod tests {
             from: None,
             origin: None,
             budget_tokens: None,
+            images: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
