@@ -2944,10 +2944,15 @@ impl Turn {
                 .then(|| provider.blocked_for(model))
                 .flatten()
                 .filter(|block| *block >= MIN_PARK);
-            // Rate limits and overloads already hold the pool; other transient failures
-            // back off exponentially with a little spread.
+            // A rate limit holds the pool, as do clustered overloads; a lone
+            // overload backs off from half a second as the providers' SDKs
+            // do, and other transient failures from a quarter, with a little
+            // spread.
             let delay = match pool {
                 Some(block) => block,
+                None if paced && agent_runtime::provider::overload(&error.code) => {
+                    backoff(attempt + 1, turn as u64)
+                }
                 None if paced => std::time::Duration::ZERO,
                 None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
                 None if error.code == "provider_stream_stalled" => {
@@ -4062,8 +4067,7 @@ fn retryable(code: &str) -> bool {
 }
 
 /// A stream that stalled on this request stalls again when resent at once
-/// with the same context: its retries start at 2 s. An overload is the
-/// pool's to wait out, as a rate limit is.
+/// with the same context: its retries start at 2 s.
 const STALL_START: u32 = 3;
 
 /// Retry backoffs at least this long park the turn instead of sleeping in it.

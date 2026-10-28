@@ -5317,3 +5317,26 @@ pool closed on every refusal costs: at 5 % refused, both builds fall from
 about 285 to about 20 turns/s with p50 latency near 3 s. That is the pacer
 behaving as designed today; whether one refusal should close the pool is
 left to a pacer change.
+
+## Lone overloads back off their own call
+
+An overload naming no delay closed the model's pool for a second, doubling
+while refusals continued, so every bot on the model waited for one refused
+call. Now a lone overload backs off its own call from half a second, as
+Codex and the providers' SDKs retry one; the pool closes only when overloads
+cluster (three within two seconds and at least a quarter of the answers) or
+name a delay.
+
+Screen, 2026-10-28, Linux x86_64 container: 64 bots resubmitting as each
+turn ends, a local fixture answering after 200 ms and refusing a random
+fraction of calls with 529 and no `Retry-After`; 3 s warmup, 15 s measured,
+one run each. The #257 head (`f63a8f8`) against this change.
+
+| Refused | Before: turns/s | p50 ms | p95 ms | After: turns/s | p50 ms | p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 % | 290.7 | 217 | 234 | 291.7 | 216 | 231 |
+| 5 % | 20.4 | 3096 | 5140 | 256.2 | 217 | 631 |
+| 50 % | 1.3 | 9324 | 16351 | 3.9 | 9179 | 17302 |
+
+No turn failed in any run. At 50 % the clusters still close the pool: the
+fixture saw 97 requests in 18 s, not a storm of retries.

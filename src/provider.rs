@@ -875,7 +875,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                pace.limited(retry_after(&headers));
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             return Err(Error {
@@ -1113,7 +1113,7 @@ impl Provider {
                 reservation.learn(&headers, self.family);
             }
             if matches!(status, 429 | 529) && !quota {
-                pace.limited(retry_after(&headers));
+                refused(&pace, status == 529, retry_after(&headers));
             }
             reservation.settle(0);
             let code = if quota {
@@ -1253,12 +1253,16 @@ impl Provider {
         };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
-        // An overload or rate limit inside the stream closes the pool as
+        // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
         if let Err(error) = &result
             && paced(&error.code)
         {
-            pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+            refused(
+                &pace,
+                overload(&error.code),
+                error.detail.as_deref().and_then(pace::named_delay),
+            );
         }
         result?;
         // Only a completed stream ends a refusal streak: a 200 can still end
@@ -1268,7 +1272,11 @@ impl Provider {
             .inspect(|_| pace.accepted())
             .inspect_err(|error| {
                 if paced(&error.code) {
-                    pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+                    refused(
+                        &pace,
+                        overload(&error.code),
+                        error.detail.as_deref().and_then(pace::named_delay),
+                    );
                 }
             })
     }
@@ -1500,6 +1508,21 @@ pub fn paced(code: &str) -> bool {
     )
 }
 
+/// Whether a paced refusal is an overload rather than a rate limit.
+pub fn overload(code: &str) -> bool {
+    matches!(code, "provider_overloaded" | "provider_http_529")
+}
+
+/// Tell the model's pool a call was refused: an overload, which closes it
+/// only when it names a delay or overloads cluster, or a rate limit.
+fn refused(pace: &pace::Pace, overload: bool, after: Option<Duration>) {
+    if overload {
+        pace.overloaded(after);
+    } else {
+        pace.limited(after);
+    }
+}
+
 /// How long a response asks to be left alone: `retry-after-ms`, which
 /// OpenAI and Anthropic send beside `retry-after` and both SDKs read first,
 /// else `retry-after` in seconds.
@@ -1516,9 +1539,9 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
-/// Close the model's pool for a rate limit a socket reported: a 429 or 529
+/// Tell the model's pool of a refusal a socket reported: a 429 or 529
 /// status with its `retry-after`, as on HTTP, or an in-stream rate limit or
-/// overload naming its delay.
+/// overload with the delay it names.
 fn limit(pace: &pace::Pace, failure: &socket::Failure) {
     if matches!(failure.status, Some(429 | 529)) || paced(&failure.error.code) {
         let after = failure
@@ -1526,7 +1549,9 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
             .as_deref()
             .and_then(retry_after)
             .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
-        pace.limited(after);
+        let overload = failure.status == Some(529)
+            || (failure.status != Some(429) && overload(&failure.error.code));
+        refused(pace, overload, after);
     }
 }
 
