@@ -128,6 +128,41 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'setup.done').exists())
         self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
+    def test_a_lookout_that_gives_way_mid_setup_stops_it_and_the_next_serves_the_call(self):
+        repo = self.path / 'calc'
+        (repo / '.agents').mkdir(parents=True)
+        setup = repo / '.agents/setup'
+        # The first setup is slow; the one the next lookout runs is not.
+        pids = self.path / 'setup.pids'
+        setup.write_text(f'#!/bin/sh\nfirst=$(test -e {pids} || echo 1)\necho $$ >> {pids}\n'
+                         f'test -n "$first" && sleep 30\nexit 0\n')
+        setup.chmod(0o755)
+        self.git(repo, 'init', '-q', '-b', 'main')
+        self.git(repo, 'add', '.')
+        self.git(repo, 'commit', '-qm', 'one')
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[dict(declared('start_task', inherit=False),
+                                                                expire_ms=120_000)])
+        old = self.lookout()
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not pids.exists() or not pids.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, 'the setup never ran')
+            time.sleep(.05)
+        first = int(pids.read_text().split()[0])
+        (self.path / 'state.sqlite.lookout.sonny').write_text('0.0.1 1')
+        self.lookout()
+        old.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        stat = Path(f'/proc/{first}/stat')
+        while stat.exists() and stat.read_text().split()[2] != 'Z':
+            self.assertLess(time.monotonic(), deadline, 'the first setup still runs')
+            time.sleep(.05)
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        self.assertTrue(self.output('calc.lead', turn).startswith('Started calc.fix: '))
+        self.assertEqual(len(pids.read_text().split()), 2)
+
     def test_a_start_the_person_denies_runs_no_setup(self):
         repo = self.path / 'calc'
         (repo / '.agents').mkdir(parents=True)

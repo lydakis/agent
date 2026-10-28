@@ -1170,6 +1170,16 @@ async fn serve(settings: Settings) -> Result<(), String> {
         json!({"event": "watching", "pid": std::process::id()})
     );
     let served = crate::served::Server::start(service.store.clone(), service.socket.clone());
+    // Asked to give way, as by another build's lookout: what it still
+    // serves stops first, since that one serves it again.
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::spawn(async move {
+            term.recv().await;
+            crate::served::stop();
+            std::process::exit(0);
+        });
+    }
     let mut gone: Option<Instant> = None;
     loop {
         if let Ok((client, events)) = Client::connect(&service.socket).await {

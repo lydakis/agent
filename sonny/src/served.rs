@@ -12,7 +12,7 @@
 //! that call. What it prints is the call's result.
 use agent_client::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -593,7 +593,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
-    let group = child.id().map(Group);
+    let group = child.id().map(Group::new);
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         let _ = stdin
@@ -612,7 +612,9 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .map_err(|_| ("tool_unserved", "ran out of time".to_owned()))?;
     // Answered: what it left running on purpose, as a pane's program or a
     // lookout it started, runs on.
-    std::mem::forget(group);
+    if let Some(group) = group {
+        group.keep();
+    }
     let output = output.map_err(|e| ("tool_failed", e.to_string()))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let said: Option<Value> = stdout
@@ -636,10 +638,44 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
 /// time, or its turn over, as the person interrupting a slow setup.
 struct Group(u32);
 
+/// The groups of the calls being answered, which `stop` ends.
+static GROUPS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+impl Group {
+    fn new(pid: u32) -> Group {
+        GROUPS.lock().unwrap().get_or_insert_default().insert(pid);
+        Group(pid)
+    }
+
+    /// Answered: the group runs on.
+    fn keep(self) {
+        if let Some(groups) = GROUPS.lock().unwrap().as_mut() {
+            groups.remove(&self.0);
+        }
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for Group {
     fn drop(&mut self) {
-        // SAFETY: a signal to the group this call's process leads.
-        unsafe { libc::kill(-(self.0 as libc::pid_t), libc::SIGKILL) };
+        if let Some(groups) = GROUPS.lock().unwrap().as_mut() {
+            groups.remove(&self.0);
+        }
+        kill(self.0);
+    }
+}
+
+fn kill(group: u32) {
+    // SAFETY: a signal to the group a call's process leads.
+    unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+}
+
+/// Stop every call still being answered, as a lookout that gives way to
+/// another build's does: that one answers them again, and two of a call
+/// would run at once, as two setups in one task's folder.
+pub fn stop() {
+    for group in GROUPS.lock().unwrap().take().unwrap_or_default() {
+        kill(group);
     }
 }
 
