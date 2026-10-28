@@ -53,6 +53,8 @@ struct Turn {
     count: u32,
     /// Which call waits on approval, or which silence: each its own news.
     which: Option<String>,
+    /// The turn resolved the task, with the task's own `resolve_task`.
+    resolved: bool,
 }
 
 /// A message written in a task: who wrote it, and the words, only when
@@ -180,6 +182,8 @@ pub struct Updates {
     asked: Option<Instant>,
     memory_seen: Option<HashMap<String, u64>>,
     opened: u64,
+    /// Tasks' turns that resolved them, until they are told.
+    resolving: crate::resolved::Own,
 }
 
 fn now_ms() -> u64 {
@@ -208,6 +212,7 @@ impl Updates {
             asked: None,
             memory_seen: None,
             opened: now_ms(),
+            resolving: Default::default(),
         }
     }
 
@@ -277,6 +282,7 @@ impl Updates {
         if let Some(turn) = turn {
             self.printed(name, kind, turn, data, now);
         }
+        self.resolving.event(event, &self.lead);
         match kind {
             "created" | "forked" => {
                 let mut record = data.clone();
@@ -381,6 +387,9 @@ impl Updates {
                         _ => status.clone(),
                     };
                 }
+                if !self.live {
+                    self.resolving.ended(name, turn);
+                }
                 // A steer's turn is part of the turn it joined.
                 if !self.live || status == "steered" {
                     return;
@@ -482,6 +491,10 @@ impl Updates {
         which: Option<String>,
         origin: Option<String>,
     ) {
+        // A note while the turn still runs leaves its resolve for the last.
+        let resolved = ![APPROVAL, QUIET].contains(&status)
+            && self.resolving.ended(name, turn)
+            && status == "completed";
         if !self.task(name) {
             return;
         }
@@ -508,6 +521,7 @@ impl Updates {
             by,
             count: 1,
             which,
+            resolved,
         };
         news.merge(match theirs {
             true => News {
@@ -838,6 +852,9 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     if let Some(by) = &t.by {
         text.push_str(&format!(", asked by {by}"));
     }
+    if t.resolved {
+        text.push_str(", and resolved itself");
+    }
     if t.count > 1 {
         text.push_str(&format!(
             ", and {} earlier since turn:{name}/{}",
@@ -1001,6 +1018,54 @@ mod tests {
         updates.event(
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
+        );
+    }
+
+    #[test]
+    fn a_task_that_resolved_itself_says_so() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let lead = json!({"from": {"bot": "shop.lead"}});
+        updates.event(&ev("shop.fix", Some(5), "accepted", lead.clone()), now);
+        let resolve = |call: &str, arguments: &str| json!({"name": "resolve_task", "call_id": call, "arguments": arguments});
+        // Resolving another task is the lead's to do, not a task's.
+        for (call, arguments) in [("c1", "{}"), ("c2", "{\"task\":\"docs\"}")] {
+            updates.event(
+                &ev(
+                    "shop.fix",
+                    Some(5),
+                    "tool_started",
+                    resolve(call, arguments),
+                ),
+                now,
+            );
+            updates.event(
+                &ev(
+                    "shop.fix",
+                    Some(5),
+                    "tool_completed",
+                    json!({"call_id": call}),
+                ),
+                now,
+            );
+        }
+        // A silence noted while the turn still runs keeps its resolve.
+        updates.expire(now + QUIET_AFTER);
+        updates.event(
+            &ev(
+                "shop.fix",
+                Some(5),
+                "turn_finished",
+                json!({"status": "completed"}),
+            ),
+            now,
+        );
+        turn(&mut updates, "shop.docs", 6, lead, "completed");
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.fix: turn:shop.fix/5 completed, asked by you, and resolved itself, \
+             and 1 earlier since turn:shop.fix/5\n\
+             - shop.docs: turn:shop.docs/6 completed, asked by you"
         );
     }
 
