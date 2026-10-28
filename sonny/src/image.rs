@@ -179,9 +179,11 @@ pub fn raster(bytes: &[u8], width: usize, most_rows: u32) -> Result<Drawn, Strin
     // never more than the picture has.
     let up = up(cell_h);
     let (room_w, room_h) = (cols * cell_w * up, rows * cell_h * up);
-    let scale = (room_w as f32 / w as f32)
-        .min(room_h as f32 / h as f32)
-        .min(1.0);
+    let fit = (room_w as f32 / w as f32).min(room_h as f32 / h as f32);
+    // Never more pixels than the picture has: a small one keeps its own,
+    // on a canvas as much smaller than the cells.
+    let scale = fit.min(1.0);
+    let shrink = fit.max(1.0);
     let (to_w, to_h) = (
         ((w as f32 * scale).round() as u32).max(1),
         ((h as f32 * scale).round() as u32).max(1),
@@ -192,6 +194,18 @@ pub fn raster(bytes: &[u8], width: usize, most_rows: u32) -> Result<Drawn, Strin
             image::imageops::resize(&picture, to_w, to_h, image::imageops::FilterType::Triangle)
         }
     };
+    // Drawn on a clear canvas the shape of the cells, so the whole cells
+    // it is rounded up to pad it rather than stretch it.
+    let canvas_w = ((room_w as f32 / shrink).round() as u32).max(to_w);
+    let canvas_h = ((room_h as f32 / shrink).round() as u32).max(to_h);
+    let mut canvas = image::RgbaImage::new(canvas_w, canvas_h);
+    image::imageops::overlay(
+        &mut canvas,
+        &picture,
+        ((canvas_w - to_w) / 2) as i64,
+        ((canvas_h - to_h) / 2) as i64,
+    );
+    let picture = canvas;
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(picture)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -441,6 +455,12 @@ mod tests {
         assert_eq!((small.cols, small.rows), (20, 5));
         let shot = image::load_from_memory(&small.png).unwrap();
         assert_eq!((shot.width(), shot.height()), (160, 80));
+        // Rounded up to whole cells, it is padded, not stretched: 160×81
+        // takes 20×6 cells, a canvas of 160×96 with the picture whole in it.
+        let odd = raster(&encoded(160, 81), 80, ROWS).unwrap();
+        assert_eq!((odd.cols, odd.rows), (20, 6));
+        let shot = image::load_from_memory(&odd.png).unwrap();
+        assert_eq!((shot.width(), shot.height()), (160, 96));
         // A wide one narrows to the pane, keeping its shape.
         let wide = raster(&encoded(4000, 1000), 60, ROWS).unwrap();
         assert_eq!((wide.cols, wide.rows), (56, 7));

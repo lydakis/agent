@@ -365,6 +365,9 @@ impl Markdown {
             return None;
         }
         let src = src.split(['?', '#']).next().unwrap_or(src);
+        // `%20` and the like read back, as a browser reads them.
+        let (src, _) = crate::pane::file_url(&format!("file://{src}"))?;
+        let src = src.to_str()?;
         let path = match src.strip_prefix("~/") {
             Some(rest) => std::path::Path::new(&std::env::var_os("HOME")?).join(rest),
             None => match &self.folder {
@@ -2142,6 +2145,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-pictures-md-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shot.png"), b"not drawn in tests").unwrap();
+        std::fs::write(dir.join("a b.png"), b"not drawn in tests").unwrap();
         let mut markdown = Markdown::document(&dir);
         let rows = markdown.feed(
             "![A shot](shot.png) [![CI](https://x/ci.svg)](https://x)",
@@ -2150,6 +2154,9 @@ mod tests {
         );
         // A file here keeps its path, to be clicked; another's only its words.
         assert_eq!(text(&rows), vec!["  ▣ A shot (shot.png)  ▣ CI"]);
+        // An escaped name reads back as the file's.
+        let rows = markdown.feed("![Spaced](a%20b.png)", 80, false);
+        assert_eq!(text(&rows), vec!["  ▣ Spaced (a%20b.png)"]);
         // Among words, a picture is a link to it.
         let rows = markdown.feed("Look: ![plot](out/plot.png).", 80, false);
         assert_eq!(text(&rows), vec!["  Look: ▣ plot (out/plot.png)."]);
