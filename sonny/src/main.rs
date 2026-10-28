@@ -4536,6 +4536,20 @@ impl App {
                 && pane.is_card()
                 && let Some(view) = self.watch.as_mut().and_then(|w| w.background.as_mut())
             {
+                // A key the pane takes keeps the item a removal was asked
+                // for, as any other key does.
+                let scrolls = matches!(
+                    key.code,
+                    KeyCode::Tab
+                        | KeyCode::BackTab
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                );
+                if scrolls || (copy && pane.screen.selected().is_some()) {
+                    view.keep();
+                }
                 match key.code {
                     KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {

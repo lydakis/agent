@@ -254,6 +254,11 @@ impl View {
         items
     }
 
+    /// The item a removal was asked for is kept: a key went elsewhere.
+    pub fn keep(&mut self) {
+        self.confirm = None;
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> Key {
         let confirm = self.confirm.take();
         self.notice = None;
@@ -593,6 +598,11 @@ mod tests {
             view.confirm,
             Some((Kind::Trigger, "calc.lead".into(), "nightly".into()))
         );
+        // A key the pane took instead keeps it.
+        view.keep();
+        assert_eq!(view.confirm, None);
+        assert_eq!(press(&mut view, KeyCode::Char('d')), Key::Stay);
+        assert!(view.confirm.is_some());
         // A reload that no longer finds it there forgets it.
         view.reload();
         assert_eq!(view.confirm, None);
