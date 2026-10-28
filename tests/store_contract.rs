@@ -3054,23 +3054,39 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
+        inherit: true,
+        answered_by: None,
+        expire_ms: None,
+    };
+    // The lead's own tool, which a bot it creates does not take.
+    let resolve = Declared {
+        name: "resolve".into(),
+        description: "Resolve a task.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        inherit: false,
+        answered_by: None,
+        expire_ms: None,
     };
     let declared = [react.clone()];
+    let leads = [react.clone(), resolve];
     let (lead, _) = db
         .create(
             "Lead",
             Some("/synthetic"),
             Binding {
-                declared: Some(&declared),
+                declared: Some(&leads),
                 ..binding()
             },
         )
         .unwrap();
-    assert_eq!(lead.declared, declared);
+    assert_eq!(lead.declared, leads);
     assert_eq!(
         serde_json::to_value(&lead).unwrap()["declared"],
         json!([{"name":"react","description":"React to a message.",
-            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"}])
+            "parameters":{"type":"object","properties":{"emoji":{"type":"string"}}},"result":"ok"},
+            {"name":"resolve","description":"Resolve a task.","parameters":{"type":"object"},
+            "result":"ok","inherit":false}])
     );
     // A bot the lead creates takes its tools unless its client declares others.
     let child = |db: &mut Database, name: &str, declared: Option<&[Declared]>| {
@@ -3080,21 +3096,22 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         b.declared = declared;
         db.create(name, Some("/synthetic"), b).unwrap().0
     };
+    // All but the lead's own.
     assert_eq!(child(&mut db, "Task", None).declared, declared);
     assert!(child(&mut db, "Own", Some(&[])).declared.is_empty());
     // A bot nobody created declares nothing it was not given.
     let plain = db.create("Plain", Some("/synthetic"), binding()).unwrap().0;
     assert!(plain.declared.is_empty() && !plain.may_call("react"));
     // Declaring again says whether anything changed.
-    assert!(!db.set_declared("Lead", None, &declared).unwrap());
+    assert!(!db.set_declared("Lead", None, &leads).unwrap());
     assert!(db.set_declared("Plain", None, &declared).unwrap());
     assert!(db.inspect("Plain").unwrap().may_call("react"));
     assert!(db.set_declared("Plain", None, &[]).unwrap());
     assert!(db.inspect("Plain").unwrap().declared.is_empty());
-    // A fork keeps them, and its allowed list narrows them like the rest.
+    // A fork keeps them all, and its allowed list narrows them like the rest.
     converse(&mut db, "Lead", 1);
     let fork = db.fork("Lead", "Copy", Fork::default()).unwrap().0;
-    assert_eq!(fork.declared, declared);
+    assert_eq!(fork.declared, leads);
     assert!(fork.declared("react").is_some());
     let only_read = ["read".to_owned()];
     let narrowed = db
@@ -3134,6 +3151,74 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         )
         .unwrap_err();
     assert_eq!(refused.code, "allow_not_in_source");
+}
+
+#[test]
+fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        inherit: true,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    let mut expires = 0;
+    for call in &calls {
+        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+            .as_u64()
+            .unwrap();
+    }
+    // The first two are answered and held by the worker: a page of one
+    // that reads only them still goes on to the third.
+    for id in ["c1", "c2"] {
+        db.answer_call("Lead", turn, id, result("started"), 0)
+            .unwrap();
+    }
+    let page = db.tool_calls("sonny", 0, 1).unwrap();
+    assert_eq!(page["calls"], json!([]));
+    let after = page["next_after"].as_i64().unwrap();
+    let page = db.tool_calls("sonny", after, 1).unwrap();
+    assert_eq!(page["calls"][0]["call_id"], "c3");
+    assert_eq!(page["next_after"], Value::Null);
+    // Out of time, an answer is refused, however late the turn learns it.
+    let Err(late) = db.answer_call("Lead", turn, "c3", result("late"), expires) else {
+        panic!("an answer out of time was taken");
+    };
+    assert_eq!(
+        (late.code.as_str(), late.detail.as_deref()),
+        ("no_pending_call", Some("the call ran out of time"))
+    );
 }
 
 #[test]
@@ -11624,19 +11709,19 @@ fn a_bot_changes_its_gate_even_one_another_bot_made() {
         tools: vec![tool.into()],
         expire_ms: Some(45_000),
     };
-    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     assert_eq!(db.inspect("Ann").unwrap().gates, [gate("read")]);
-    assert!(!db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(!db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     assert_eq!(
-        db.set_gate("Ann", None, Some(gate("shell")))
+        db.set_gate("Ann", None, Some(gate("shell")), None)
             .unwrap_err()
             .code,
         "approve_not_in_tools"
     );
-    assert!(db.set_gate("Ann", None, None).unwrap());
+    assert!(db.set_gate("Ann", None, None, None).unwrap());
     assert!(db.inspect("Ann").unwrap().gates.is_empty());
     // A bot Ann makes takes her gate, and the person can still lift it.
-    assert!(db.set_gate("Ann", None, Some(gate("read"))).unwrap());
+    assert!(db.set_gate("Ann", None, Some(gate("read")), None).unwrap());
     db.create(
         "Bob",
         None,
@@ -11648,7 +11733,7 @@ fn a_bot_changes_its_gate_even_one_another_bot_made() {
     )
     .unwrap();
     assert_eq!(db.inspect("Bob").unwrap().gates, [gate("read")]);
-    assert!(db.set_gate("Bob", None, None).unwrap());
+    assert!(db.set_gate("Bob", None, None, None).unwrap());
     assert!(db.inspect("Bob").unwrap().gates.is_empty());
 }
 

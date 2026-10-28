@@ -88,7 +88,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"}},
@@ -138,8 +138,9 @@ impl Tool {
 
 /// A tool a client declares on a bot: shown to the model beside the
 /// daemon's own, never run. A call that fits its parameters is recorded
-/// with `result` at once; what it means is the client's, which reads the
-/// call from events and history.
+/// with `result` at once, or, when a client answers the tool, with the
+/// answer that client gives; what it means is the client's, which reads
+/// the call from events and history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Declared {
@@ -150,13 +151,45 @@ pub struct Declared {
     /// What the model reads as the call's result.
     #[serde(default = "declared_result")]
     pub result: String,
+    /// The tag of the client that answers a call, as a gate names its
+    /// approver: the call waits for its `tool_result` instead of taking
+    /// `result`. The daemon never reads the tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    /// How long an answered call waits for its answer, from its start,
+    /// before it ends `tool_unserved`; `ANSWER_EXPIRE_MS` when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_ms: Option<u64>,
+    /// Whether a bot this one creates takes the tool too; `false` keeps it
+    /// the declaring bot's own.
+    #[serde(default = "inherited", skip_serializing_if = "is_inherited")]
+    pub inherit: bool,
 }
 fn declared_result() -> String {
     "ok".into()
 }
+impl Declared {
+    /// Until when a call that started at `started_ms` waits for its
+    /// answer, for a tool a client answers.
+    pub fn answer_by(&self, started_ms: u64) -> Option<u64> {
+        self.answered_by.as_ref()?;
+        Some(started_ms + self.expire_ms.unwrap_or(ANSWER_EXPIRE_MS))
+    }
+}
+fn inherited() -> bool {
+    true
+}
+fn is_inherited(inherit: &bool) -> bool {
+    *inherit
+}
 /// The most tools a bot may have declared, and the most bytes they take.
 pub const MAX_DECLARED: usize = 16;
 pub const DECLARED_BYTES: usize = 64 * 1024;
+/// How long an answered call waits by default, and at most.
+pub const ANSWER_EXPIRE_MS: u64 = 60_000;
+pub const MAX_ANSWER_EXPIRE_MS: u64 = 3_600_000;
+/// The most bytes an answer's output or detail may take.
+pub const ANSWER_BYTES: usize = 64 * 1024;
 
 /// A bot's declared tools must be few, small, named apart from each other
 /// and from the daemon's own tools, and take an object of arguments.
@@ -200,6 +233,43 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                 "invalid_declare",
                 format!("{name}: parameters must be an object schema"),
             );
+        }
+        match &tool.answered_by {
+            Some(tag) => {
+                let named = !tag.is_empty()
+                    && tag.len() <= 64
+                    && tag
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+                if !named {
+                    return fail_with(
+                        "invalid_declare",
+                        format!("{name}: answered_by is 1 to 64 letters, digits, _, - or ."),
+                    );
+                }
+                if tool.result != declared_result() {
+                    return fail_with(
+                        "invalid_declare",
+                        format!("{name}: an answered tool takes its client's answer, not a result"),
+                    );
+                }
+                if tool
+                    .expire_ms
+                    .is_some_and(|ms| ms == 0 || ms > MAX_ANSWER_EXPIRE_MS)
+                {
+                    return fail_with(
+                        "invalid_declare",
+                        format!("{name}: expire_ms must be 1 to {MAX_ANSWER_EXPIRE_MS}"),
+                    );
+                }
+            }
+            None if tool.expire_ms.is_some() => {
+                return fail_with(
+                    "invalid_declare",
+                    format!("{name}: expire_ms goes with answered_by"),
+                );
+            }
+            None => {}
         }
     }
     Ok(())
@@ -613,7 +683,7 @@ impl ReadSource {
 }
 
 /// Model-facing result text plus any full outputs that were truncated.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
@@ -1101,7 +1171,13 @@ impl Registry {
 }
 
 impl Registry {
-    fn shell_outcome(&self, stdout: Captured, stderr: Captured, exit: Exit) -> Outcome {
+    fn shell_outcome(
+        &self,
+        stdout: Captured,
+        stderr: Captured,
+        exit: Exit,
+        elapsed: Duration,
+    ) -> Outcome {
         let mut artifacts = Vec::new();
         let mut preview = |name: &'static str, captured: Captured| {
             let (bytes, dropped) = captured.finish();
@@ -1121,16 +1197,17 @@ impl Registry {
             shown
         };
         let (stdout, stderr) = (preview("stdout", stdout), preview("stderr", stderr));
+        let elapsed_ms = elapsed.as_millis() as u64;
         let (output, success) = match exit {
             Exit::Status(status) => (
                 json!({"stdout":stdout,"stderr":stderr,
-                    "exit_code":status.code(),"success":status.success()}),
+                    "exit_code":status.code(),"success":status.success(),"wall_time_ms":elapsed_ms}),
                 status.success(),
             ),
             // The output up to the kill is what a long command has to show.
             Exit::TimedOut => (
                 json!({"stdout":stdout,"stderr":stderr,
-                    "exit_code":null,"success":false,"timed_out":true}),
+                    "exit_code":null,"success":false,"timed_out":true,"wall_time_ms":elapsed_ms}),
                 false,
             ),
         };
@@ -1162,7 +1239,7 @@ impl Registry {
                 .await
                 .map_err(|_| Error::new("tool_scheduler_closed"))?;
             let _ = started.send(());
-            let (stdout, stderr, exit) = shell(
+            let (stdout, stderr, exit, elapsed) = shell(
                 &command,
                 &workspace,
                 Duration::from_millis(timeout_ms),
@@ -1170,7 +1247,7 @@ impl Registry {
                 &environment,
             )
             .await?;
-            Ok(registry.shell_outcome(stdout, stderr, exit))
+            Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
         }
     }
 
@@ -1199,7 +1276,7 @@ impl Registry {
                 };
                 drop(queued);
                 let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let (stdout, stderr, exit) = shell(
+                let (stdout, stderr, exit, elapsed) = shell(
                     &command,
                     &workspace,
                     Duration::from_millis(timeout_ms),
@@ -1207,7 +1284,7 @@ impl Registry {
                     &environment,
                 )
                 .await?;
-                Ok(registry.shell_outcome(stdout, stderr, exit))
+                Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
             }
             .await;
             let _ = done.send(result);
@@ -1421,8 +1498,18 @@ async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -
             return Ok(());
         }
         captured.keep(&chunk[..read]);
+        // Past the bound nothing more is shown, so a runaway writer is
+        // drained slowly: the daemon's one thread serves every bot, and the
+        // writer waits on the full pipe instead of spending it.
+        if captured.dropped > 0 {
+            tokio::time::sleep(DRAIN_PAUSE).await;
+        }
     }
 }
+
+/// The pause after each read once a stream has passed `ARTIFACT_BYTES`,
+/// which bounds its drain to about 64 MiB/s.
+const DRAIN_PAUSE: Duration = Duration::from_millis(1);
 
 /// How a shell command ended: on its own, or killed at its timeout.
 pub enum Exit {
@@ -1479,6 +1566,17 @@ fn sh(
         "HERDR_PANE_ID",
     ] {
         process.env_remove(name);
+    }
+    // No command has a terminal: plain output and no pager, as other
+    // harnesses run commands. What the caller or bot sets still wins.
+    for (name, value) in [
+        ("TERM", "dumb"),
+        ("NO_COLOR", "1"),
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("GH_PAGER", "cat"),
+    ] {
+        process.env(name, value);
     }
     for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
@@ -1553,7 +1651,7 @@ async fn shell(
     timeout: Duration,
     registry: &Registry,
     environment: &[(String, String)],
-) -> Result<(Captured, Captured, Exit)> {
+) -> Result<(Captured, Captured, Exit, Duration)> {
     use std::process::Stdio;
     use tokio::process::Child;
     struct ProcessGroup {
@@ -1579,6 +1677,7 @@ async fn shell(
         .process_group(0)
         .kill_on_drop(true)
         .spawn()?;
+    let started = tokio::time::Instant::now();
     let group = child.id().ok_or(Error::new("shell_spawn_failed"))? as i32;
     let mut owned = ProcessGroup { child, group };
     let mut stdout = owned
@@ -1608,8 +1707,9 @@ async fn shell(
     }
     let _ = owned.child.wait().await;
     owned.group = 0;
+    let elapsed = started.elapsed();
     match result {
-        Ok(result) => result.map(|(_, _, status)| (out, err, Exit::Status(status))),
+        Ok(result) => result.map(|(_, _, status)| (out, err, Exit::Status(status), elapsed)),
         Err(_) => {
             // What the group wrote before it was killed is still in the pipes.
             // A process that left the group may hold them open, so the drain
@@ -1624,7 +1724,7 @@ async fn shell(
             {
                 return Err(error);
             }
-            Ok((out, err, Exit::TimedOut))
+            Ok((out, err, Exit::TimedOut, elapsed))
         }
     }
 }
@@ -1636,7 +1736,7 @@ async fn shell(
     _: Duration,
     _: &Registry,
     _: &[(String, String)],
-) -> Result<(Captured, Captured, Exit)> {
+) -> Result<(Captured, Captured, Exit, Duration)> {
     fail("shell_platform_unsupported")
 }
 
