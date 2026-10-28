@@ -469,7 +469,7 @@ pub fn entries(item: &Value, judged: &[&str], redactor: &Redactor) -> Vec<Entry>
         Some("function_call_output") => found.push(Entry {
             said: Said::Output,
             call: item["call_id"].as_str().map(str::to_owned),
-            text: content_text(&item["output"]),
+            text: output_text(&item["output"], redactor),
         }),
         Some("reasoning") => {}
         _ => match (item["role"].as_str(), &item["content"]) {
@@ -508,7 +508,7 @@ pub fn entries(item: &Value, judged: &[&str], redactor: &Redactor) -> Vec<Entry>
                     found.push(Entry {
                         said: Said::Output,
                         call: block["tool_use_id"].as_str().map(str::to_owned),
-                        text: content_text(&block["content"]),
+                        text: output_text(&block["content"], redactor),
                     });
                 }
             }
@@ -516,6 +516,18 @@ pub fn entries(item: &Value, judged: &[&str], redactor: &Redactor) -> Vec<Entry>
         },
     }
     found
+}
+
+/// An output's text, redacted as values when it is JSON, as a shell's
+/// result is: a secret with a quote in it reads otherwise once escaped.
+fn output_text(content: &Value, redactor: &Redactor) -> String {
+    let text = content_text(content);
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => {
+            redactor.redact_value(&value).to_string()
+        }
+        _ => text,
+    }
 }
 
 /// The text of an output: a string, or the text of its parts.
@@ -1634,6 +1646,19 @@ mod tests {
         };
         assert!(!call.text.contains("synthetic"), "{}", call.text);
         assert!(call.text.contains("[secret:"), "{}", call.text);
+        // So is a shell's result, which encodes what the command printed.
+        let printed = json!({"exit_code":0,"stdout":format!("{secret}\n"),"stderr":""}).to_string();
+        let outputs = [
+            json!({"type":"function_call_output","call_id":"a","output":printed}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":printed}]}),
+        ];
+        for item in outputs {
+            let [output] = &entries(&item, &[], &redactor)[..] else {
+                panic!()
+            };
+            assert!(!output.text.contains("synthetic"), "{}", output.text);
+            assert!(output.text.contains("[secret:"), "{}", output.text);
+        }
     }
 
     #[test]

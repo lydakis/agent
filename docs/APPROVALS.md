@@ -502,9 +502,10 @@ this replaced:
   each call tied to its output, and `transcript_cut` when some were left
   out. The person's words stay in `request` and `earlier_prompts`, with
   who wrote them. The policy marks the whole transcript untrusted. A call's
-  arguments are redacted as values, as planned calls are, and the whole
-  state stays within 240 KiB so it fits one judge prompt: past that the
-  oldest transcript entries go first, then the standing instructions.
+  arguments, and JSON outputs such as a shell's result, are redacted as
+  values, as planned calls are, and the whole state stays within 240 KiB
+  so it fits one judge prompt: past that the oldest transcript entries go
+  first, then the standing instructions.
 - **AGENTS.md is the person's standing instructions**, as Codex treats it.
   The state gains `standing_instructions`: the AGENTS.md files that apply
   to the workspace, when they all read now exactly as the bot was given
