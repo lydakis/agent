@@ -9,7 +9,8 @@
 //! and of whatever its subscriptions look for. One lookout watches a
 //! daemon, for every subscriber on it, started by the first Sonny to open;
 //! the daemon is unchanged: this follows every bot and submits to the
-//! subscribers like any client.
+//! subscribers like any client. It also answers its agents' calls of the
+//! tools Sonny answers (`served`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod subs;
@@ -328,7 +329,7 @@ fn note(items: &[Item], more: usize, told: &updates::Told) -> String {
         // A subscription's own action is the subscriber's words, so the
         // note names it and the lead reads it there.
         for (look, _) in &item.looks {
-            let sub = format!("do what your {look} says (sonny lookout ls)");
+            let sub = format!("do what your {look} says (your subscriptions tool lists it)");
             if !todo.contains(&sub) {
                 todo.push(sub);
             }
@@ -991,27 +992,11 @@ async fn check(
 }
 
 const USAGE: &str = "usage: sonny lookout [--store PATH] [--socket PATH] [--judge PROVIDER/MODEL|off]\n\
-       sonny lookout --replay --judge SPEC[,SPEC]... [--store PATH] [--socket PATH] [--limit N]\n\
-       sonny lookout ls|add|rm ... (sonny lookout ls --help)";
+       sonny lookout --replay --judge SPEC[,SPEC]... [--store PATH] [--socket PATH] [--limit N]";
 
-/// `sonny lookout`: one lookout for the store's daemon, a replay of its
-/// checks over what the store kept, or the subscriptions it watches for.
+/// `sonny lookout`: one lookout for the store's daemon, or a replay of its
+/// checks over what the store kept.
 pub fn run(args: &[String]) -> Result<(), String> {
-    if let Some((command, rest)) = args.split_first()
-        && matches!(command.as_str(), "ls" | "add" | "rm")
-    {
-        let mut store = None;
-        let mut kept = Vec::new();
-        let mut rest = rest.iter();
-        while let Some(arg) = rest.next() {
-            match arg.as_str() {
-                "--store" => store = Some(PathBuf::from(rest.next().ok_or(USAGE)?)),
-                _ => kept.push(arg.clone()),
-            }
-        }
-        let (store, _) = crate::daemon_paths(store, None)?;
-        return subs::run(&store, command, &kept);
-    }
     let (mut store, mut socket, mut judge, mut replaying, mut limit) =
         (None, None, None, false, 150);
     let mut args = args.iter();
@@ -1050,15 +1035,68 @@ pub struct Settings {
 /// says so and exits. Every check is logged beside the store, in
 /// `STORE.lookout.jsonl`.
 pub fn main(settings: Settings) -> Result<(), String> {
-    let Some(_held) = lock(&settings.store)? else {
+    let held = match lock(&settings.store)? {
+        Some(held) => Some(held),
+        None => replace(&settings.store)?,
+    };
+    let Some(_held) = held else {
         println!("{}", json!({"event": "already_watching"}));
         return Ok(());
     };
+    // Which Sonny this is, for the next one to start to tell.
+    let _ = std::fs::write(beside(&settings.store, ".lookout.sonny"), identity());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
         .block_on(serve(settings))
+}
+
+/// `store`'s path with `suffix` after it, for the files beside it.
+fn beside(store: &Path, suffix: &str) -> PathBuf {
+    let mut path = store.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// This Sonny, told apart from another build of it: its version and when
+/// its binary was written.
+fn identity() -> String {
+    let written = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |at| at.as_nanos());
+    format!("{} {written}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The lock, taken from a lookout another Sonny started, as one an upgrade
+/// left running, so the tools this Sonny gives its agents are answered:
+/// that lookout is stopped, and the lock awaited for a few seconds. `None`
+/// when the lookout holding it is this Sonny's own.
+fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
+    let theirs = std::fs::read_to_string(beside(store, ".lookout.sonny")).unwrap_or_default();
+    if theirs == identity() {
+        return Ok(None);
+    }
+    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok());
+    let Some(pid) = pid.filter(|pid| *pid > 0 && *pid != std::process::id() as i32) else {
+        return Ok(None);
+    };
+    // SAFETY: a signal to the process the lock file names, which asks it
+    // to exit.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until {
+        if let Some(held) = lock(store)? {
+            return Ok(Some(held));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(None)
 }
 
 /// The store's lookout lock, held while this process lives: `None` when
@@ -1116,11 +1154,22 @@ async fn serve(settings: Settings) -> Result<(), String> {
         "{}",
         json!({"event": "watching", "pid": std::process::id()})
     );
+    let served = crate::served::Server::start(service.store.clone(), service.socket.clone());
+    // Asked to give way, as by another build's lookout: what it still
+    // serves stops first, since that one serves it again.
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::spawn(async move {
+            term.recv().await;
+            crate::served::stop();
+            std::process::exit(0);
+        });
+    }
     let mut gone: Option<Instant> = None;
     loop {
         if let Ok((client, events)) = Client::connect(&service.socket).await {
             gone = None;
-            service.watch(client, events).await;
+            service.watch(client, events, &served).await;
         }
         // A daemon restarting is back within moments; one shut down is not,
         // and the client that starts the next daemon starts its lookout.
@@ -1220,7 +1269,12 @@ fn others(subscriber: &str, subscribers: &HashMap<String, Vec<subs::Sub>>) -> Ha
 }
 
 impl Service {
-    async fn watch(&mut self, client: Arc<Client>, mut events: agent_client::Events) {
+    async fn watch(
+        &mut self,
+        client: Arc<Client>,
+        mut events: agent_client::Events,
+        served: &crate::served::Server,
+    ) {
         // Judges are picked before the replay starts: a model listing can
         // take seconds, and a replay nobody reads fills the connection.
         let bots = all_bots(&client).await;
@@ -1272,6 +1326,7 @@ impl Service {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { return };
+                    served.event(&event);
                     let cursor = event["cursor"].as_i64();
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
@@ -1362,8 +1417,9 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
-                    // What `sonny lookout add` and `rm` wrote since.
-                    if reread.is_none_or(|at| now >= at + REREAD) {
+                    // What `subscriptions` calls wrote since: at once for
+                    // one this lookout answered, else now and then.
+                    if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
                         if read != self.subscribers {
@@ -2958,7 +3014,7 @@ mod tests {
         ));
         assert!(!note.contains("Fixed avg"));
         assert!(note.contains(
-            "- calc.docs: turn:calc.docs/3, the person wrote in it (style look-for 1 0.97; do what your style look-for 1 says (sonny lookout ls)): \"Use tabs everywhere. Thanks.\""
+            "- calc.docs: turn:calc.docs/3, the person wrote in it (style look-for 1 0.97; do what your style look-for 1 says (your subscriptions tool lists it)): \"Use tabs everywhere. Thanks.\""
         ));
         assert!(note.contains("- 2 more in the next note"));
         assert!(note.ends_with("Handle what cannot wait, then carry on with your turn."));
@@ -3176,7 +3232,7 @@ mod tests {
         let note = note(&[item], 0, &updates::Told::default());
         // The subscriber's own words stay in its file, never in the note.
         assert!(note.contains(
-            "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 1 0.90; do what your deploys look-for 1 says (sonny lookout ls))"
+            "- calc.fix: turn:calc.fix/3, turn completed (deploys look-for 1 0.90; do what your deploys look-for 1 says (your subscriptions tool lists it))"
         ), "{note}");
         assert!(!note.contains("tell me") && !note.contains("a deploy"));
     }

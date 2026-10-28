@@ -825,7 +825,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 25] = [
+const KEPT: [&str; 29] = [
     "Started",
     "Messaged",
     "Steered",
@@ -846,6 +846,10 @@ const KEPT: [&str; 25] = [
     "Fired the trigger",
     "Added the project",
     "Moved",
+    "Opened",
+    "Discarded",
+    "Subscribed to",
+    "Unsubscribed from",
     "Opened a tab",
     "Opened a split",
     "Stopped Errand job",
@@ -875,9 +879,14 @@ fn drawn(
     let elbow = || Span::raw("  └ ").dim();
     let gap = || Span::raw("    ");
     // A tool Sonny declares, said as what it does.
-    if let Some(said) = crate::calls::declared(name, arguments, failed) {
+    if let Some(mut said) = crate::calls::declared(name, arguments, failed) {
         if clean && !kept(&said) {
             return Vec::new();
+        }
+        // One Sonny answered with an error says why, so the call is not
+        // read as done.
+        if let Some(why) = failed.then(|| refusal(output)).flatten() {
+            said.under.insert(0, Line::from(why).red());
         }
         return said_lines(said, width);
     }
@@ -1119,6 +1128,14 @@ fn assignment(part: &str) -> bool {
 }
 
 /// A call said as an action, with up to two rows of each line under it.
+/// The first line of a failed call's `{"error","detail"}` output: its
+/// detail, else its code.
+fn refusal(output: Option<&str>) -> Option<String> {
+    let error: Value = serde_json::from_str(output?).ok()?;
+    let why = error["detail"].as_str().or(error["error"].as_str())?;
+    Some(why.lines().next().unwrap_or("").to_owned())
+}
+
 fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
@@ -1629,12 +1646,29 @@ mod tests {
             r#"{"bot":"calc.fix","handle":"turn:calc.fix/2","turn":2}"#,
         );
         assert_eq!(started[0], "• Started calc.fix · turn 2");
-        // How a lead in Sonny starts a task, and the note it prints after.
-        let task = shell(
-            r#""/Applications/Sonny/sonny" task calc.fix --agents --setup --model "$AGENT_MODEL" -- 'Fix the tests.'"#,
-            "{\"bot\":\"calc.fix\",\"handle\":\"turn:calc.fix/3\",\"turn\":3}\nIts work comes back on branch agent/calc.fix.",
+        // How a lead in Sonny starts a task.
+        let task = clean(
+            "start_task",
+            serde_json::json!({"name": "fix", "brief": "Fix the tests.", "setup": true}),
+            "Started calc.fix: {\"handle\":\"turn:calc.fix/3\"}",
         );
-        assert_eq!(task, ["• Started calc.fix · turn 3", "  └ Fix the tests."]);
+        assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
+        // One that failed says why first.
+        let shown = text(&super::clean(
+            "show_agent",
+            &serde_json::json!({"agent": "calc.fix", "split": "right"}),
+            Some(r#"{"error":"not_shown","detail":"neither rex nor herdr was found"}"#),
+            true,
+            "/w",
+            80,
+        ));
+        assert_eq!(
+            shown,
+            [
+                "• Moved calc.fix to a split right of you",
+                "  └ neither rex nor herdr was found"
+            ]
+        );
         assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
         assert_eq!(
             shell(r#"sonny task changes calc.fix --apply"#, ""),
@@ -1691,10 +1725,7 @@ mod real_calls {
         );
         for row in rows {
             let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(
-                !text.contains("AGENT_BIN") && !text.contains("sonny show"),
-                "{command}\n  drew: {text}"
-            );
+            assert!(!text.contains("AGENT_BIN"), "{command}\n  drew: {text}");
         }
     }
 
@@ -1734,15 +1765,15 @@ mod real_calls {
             false,
         );
         show(
-            r#""$AGENT_BIN" --help; "$HOME/.agent/project" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
+            r#""$AGENT_BIN" --help; ls /Applications | grep -Ei 'rex|agent|sonny'"#,
             "Usage: agent COMMAND [OPTIONS]\n",
             false,
         );
         show(
             &format!(
-                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'; "/Users/x/sonny" show calc.single-negative --split right"#
+                r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'"#
             ),
-            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}\n{\"bot\":\"calc.single-negative\",\"session\":\"calc\"}",
+            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}",
             false,
         );
     }
