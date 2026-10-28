@@ -41,6 +41,8 @@ pub const INTERRUPT_AFTER_MS: u64 = 30_000;
 /// not allowed on the judge's word alone.
 pub const CHANGE_SHOWN: usize = 64 * 1024;
 
+/// The most of a judge's rationale a denial carries.
+const RATIONALE_BYTES: usize = 4096;
 /// What a denial tells the model, after the judge's reason: Codex's words.
 const REJECTED: &str = "The agent must not attempt to achieve the same outcome via workaround, \
 indirect execution, or policy circumvention. Proceed only with a materially safer alternative, \
@@ -240,14 +242,25 @@ pub fn verdict(assessment: &Value) -> Option<Verdict> {
     match assessment["outcome"].as_str()? {
         "allow" => Some(Verdict::Allow),
         "deny" => {
+            // A reason's whole size stays well inside the daemon's limit
+            // for one, whatever the judge wrote.
             let rationale = assessment["rationale"]
                 .as_str()
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
-                .unwrap_or("The judge denied the action without a specific rationale.");
+                .map_or(
+                    Cow::Borrowed("The judge denied the action without a specific rationale."),
+                    |text| clip(text, RATIONALE_BYTES),
+                );
+            let level = |key: &str, levels: &[&str]| {
+                assessment[key]
+                    .as_str()
+                    .filter(|level| levels.contains(level))
+                    .map(str::to_owned)
+            };
             let rated = match (
-                assessment["risk_level"].as_str(),
-                assessment["user_authorization"].as_str(),
+                level("risk_level", &["low", "medium", "high", "critical"]),
+                level("user_authorization", &["unknown", "low", "medium", "high"]),
             ) {
                 (Some(risk), Some(authorization)) => {
                     format!(" (risk: {risk}, authorization: {authorization})")
@@ -967,6 +980,18 @@ mod tests {
             panic!()
         };
         assert!(bare.contains("Reason: The judge denied the action without a specific rationale."));
+        // However long the rationale, or odd the levels, the reason fits
+        // the daemon's limit, and only known levels are named.
+        let long = json!({"risk_level":"x".repeat(20_000),"user_authorization":"high",
+            "outcome":"deny","rationale":"界".repeat(6_000)});
+        let Some(Verdict::Deny(reason)) = verdict(&long) else {
+            panic!()
+        };
+        assert!(reason.len() < 6 * 1024, "{}", reason.len());
+        assert!(
+            reason.starts_with("This action was rejected due to unacceptable risk.\nReason: 界")
+        );
+        assert!(reason.contains("bytes not shown]"));
         // No outcome, or one that is neither, is a failed check.
         assert_eq!(verdict(&json!({"risk_level":"low"})), None);
         assert_eq!(verdict(&json!({"outcome":"maybe"})), None);

@@ -1683,6 +1683,44 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
 }
 
 #[test]
+fn schema_53_denial_counts_become_the_newest_of_a_window() {
+    let path = std::env::temp_dir().join(format!("agent-schema53-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let turn = gated_turn(&mut db, None);
+    drop(db);
+    let old = json!({"manual":{"in_row":2,"in_turn":3,"turn":turn},
+        "auto":{"in_row":60,"in_turn":60,"turn":turn}});
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE bots SET denials=? WHERE name='Bob'",
+            [format!("{old}")],
+        )
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version=53;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let denials = db.inspect("Bob").unwrap().denials;
+    assert_eq!(
+        (
+            denials["manual"].in_row,
+            denials["manual"].window,
+            denials["manual"].turn
+        ),
+        (2, 0b111, turn)
+    );
+    assert_eq!(
+        denials["auto"].window.count_ones(),
+        agent_runtime::store::DENIAL_WINDOW
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_49_waiting_calls_were_not_handed_to_anyone() {
     let path = std::env::temp_dir().join(format!("agent-schema49-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);

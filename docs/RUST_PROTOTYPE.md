@@ -2191,7 +2191,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   for a denial; a listed or served call carries `{tag: {in_row, recent}}`,
   `recent` the denials in that window, as seen from its own turn, so an
   approver that restarts or takes over counts on where the last one left
-  off.
+  off. Schema 54 turned a stored count of N a turn into N denials as the
+  window's newest calls, since their order was never kept.
 - **Serving a tag.** `{"op":"serve_approvals","tag","lease_ms","limit"?}`
   hands the session the tag. The reply is the first page of the calls
   waiting on it, as `approvals {tag}` lists them, with the `lease` number,
