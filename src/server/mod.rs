@@ -5063,16 +5063,20 @@ mod tests {
         dir
     }
     /// Hold the storage worker inside a job until the gate is fed, so the
-    /// jobs queued meanwhile join its group.
+    /// jobs queued meanwhile join its group. It returns once the worker runs
+    /// the job: every group queued before it has been answered and counted.
     async fn hold(store: &Store) -> (Answer<()>, std::sync::mpsc::Sender<()>) {
         let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let (began, running) = tokio::sync::oneshot::channel::<()>();
         let held = store
             .queue("hold", move |_| {
+                let _ = began.send(());
                 let _ = wait.recv();
                 Ok(())
             })
             .await
             .unwrap();
+        running.await.unwrap();
         (held, gate)
     }
 
@@ -5120,12 +5124,17 @@ mod tests {
         );
         gate.send(()).unwrap();
         held.await.unwrap();
+        // Counted with the worker held again: every admission is answered by
+        // then, and the turns they start, which write too, are not yet.
+        let (again, gate) = hold(&store).await;
+        assert_eq!(groups(&store) - before, 1, "one commit for all of them");
+        gate.send(()).unwrap();
+        again.await.unwrap();
         let mut answers = Vec::new();
         while !service.admissions.is_empty() {
             let (_, _, id, result) = service.settle().await;
             answers.push((id, result));
         }
-        assert_eq!(groups(&store) - before, 1, "one commit for all of them");
         assert_eq!(
             answers.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
             (0..count).map(|index| json!(index)).collect::<Vec<_>>(),

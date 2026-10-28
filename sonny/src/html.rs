@@ -14,9 +14,14 @@ const WINDOW_HEIGHT: u32 = 1600;
 /// The page at `path` as a PNG, `css_width` CSS pixels wide at twice
 /// that in device pixels; or why not.
 pub fn render(path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
+    render_with(chrome(), path, css_width)
+}
+
+/// [`render`] with this browser, or Quick Look without one.
+fn render_with(chrome: Option<PathBuf>, path: &Path, css_width: u32) -> Result<Vec<u8>, String> {
     let out = std::env::temp_dir().join(format!("sonny-shot-{}", std::process::id()));
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let shot = match chrome() {
+    let shot = match chrome {
         Some(chrome) => {
             let png = out.join("page.png");
             let _ = std::fs::remove_file(&png);
@@ -120,23 +125,53 @@ fn finish(mut command: Command, what: &str, limit: Duration) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    use resvg::tiny_skia;
+
+    /// A page drawn by a stand-in browser: it is asked for a screenshot of
+    /// the page at the width wanted, and its blank end is cut. A real
+    /// browser's start-up time is not this code's to test.
     #[test]
     fn a_page_draws_and_its_blank_end_is_cut() {
-        if super::chrome().is_none() {
-            return;
-        }
         let dir = std::env::temp_dir().join(format!("sonny-html-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("page.html");
-        std::fs::write(
-            &path,
-            "<h1>Hello</h1><table border=1><tr><td>a</td><td>b</td></tr></table>",
-        )
-        .unwrap();
-        let png = super::render(&path, 480).unwrap();
+        std::fs::write(&path, "<h1>Hello</h1>").unwrap();
+        // What the browser would draw: 1600 CSS pixels at twice that, a
+        // heading's worth of ink at the top and blank below.
+        let mut page = tiny_skia::Pixmap::new(960, 3200).unwrap();
+        page.fill(tiny_skia::Color::WHITE);
+        let ink = tiny_skia::Rect::from_xywh(32.0, 32.0, 400.0, 64.0).unwrap();
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color(tiny_skia::Color::BLACK);
+        page.fill_rect(ink, &paint, tiny_skia::Transform::identity(), None);
+        page.save_png(dir.join("drawn.png")).unwrap();
+        let browser = dir.join("chrome");
+        crate::testing::script(
+            &browser,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\n\
+                 for a; do case $a in --screenshot=*) cp '{drawn}' \"${{a#--screenshot=}}\";; esac; done\n",
+                args = dir.join("args").display(),
+                drawn = dir.join("drawn.png").display(),
+            ),
+        );
+        let png = super::render_with(Some(browser), &path, 480).unwrap();
+        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        for wanted in [
+            "--headless=new",
+            "--window-size=480,1600",
+            "--force-device-scale-factor=2",
+        ] {
+            assert!(args.lines().any(|a| a == wanted), "{args}");
+        }
+        assert_eq!(
+            args.lines().last(),
+            Some(format!("file://{}", path.display()).as_str())
+        );
         let drawn = crate::image::page(&png, 80).unwrap();
         assert!(!drawn.cut);
-        // 1600 CSS pixels laid out, a heading and a table kept.
-        assert!((2..12).contains(&drawn.rows), "{}", drawn.rows);
+        // The heading kept, the blank 3000 pixels below it dropped.
+        assert!((1..6).contains(&drawn.rows), "{}", drawn.rows);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
