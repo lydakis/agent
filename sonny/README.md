@@ -289,7 +289,9 @@ every Sonny window closed; a call nobody answers in time ends as
 verdict wherever the agent's other calls do (`/approvals`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
-and a pane runs a command outside the agent's sandbox. An agent of Sonny's reaches Sonny only through these tools: none
+and a pane runs a command outside the agent's sandbox. An agent whose
+gate Sonny did not set, as another client's, goes without these until the
+person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
 and a call answered with an error says why under it. The lead's Sonny keeps each
 task the lead resolved beside the store (`state.sqlite.resolved/`), with

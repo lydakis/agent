@@ -2235,7 +2235,13 @@ impl App {
             return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
-        let declare = self.declare.take();
+        let mut declare = self.declare.take();
+        // A bot that went without the tools Sonny gates, as its gate was
+        // not Sonny's, has them with the mode the person picks.
+        if declare.is_none() && gating.is_some() && self.mode.is_none() {
+            declare =
+                declared::declare(&json!({"declared": self.declared}), self.project.is_some());
+        }
         // New tools are gated as the bot's mode gates the rest, so a tool
         // Sonny gates never runs unjudged where the mode judges.
         let gating = gating.or(declare
@@ -6878,6 +6884,36 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bot_gated_as_sonny_does_not_gets_its_gated_tools_with_a_picked_mode() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["declared", "gates"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.tools = vec!["shell".into()];
+        let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
+        app.mode = approvals::mode(&custom);
+        app.declared = declared::declare(&custom, true).unwrap();
+        app.gating = Some("ask");
+        assert!(app.configure().await);
+        let sent = asked.lock().unwrap()[0].clone();
+        let names: Vec<&str> = (sent["declare"].as_array().into_iter().flatten())
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"run_in_pane"), "{names:?}");
+        assert!(
+            sent["approve"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run_in_pane"))
+        );
+        assert_eq!(sent["approver"], "manual");
     }
 
     #[tokio::test]
