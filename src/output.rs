@@ -64,8 +64,13 @@ impl Output {
             let stdout = std::io::stdout();
             let mut writer = stdout.lock();
             while let Some((bytes, _permit, flushed)) = receiver.blocking_recv() {
-                writer.write_all(&bytes)?;
-                writer.flush()?;
+                // A reader that stopped reading ends the command quietly.
+                if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                    if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        std::process::exit(0);
+                    }
+                    return Err(error.into());
+                }
                 if let Some(flushed) = flushed {
                     let _ = flushed.send(());
                 }

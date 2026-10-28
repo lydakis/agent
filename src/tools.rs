@@ -91,7 +91,7 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers (an image or other binary file is refused, naming its kind): a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -118,7 +118,7 @@ impl Tool {
                 "required":["text"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
@@ -267,6 +267,28 @@ pub struct Registry {
     encodings: Encodings,
 }
 type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
+/// What a file that is not text holds, named by its first bytes, as `file`
+/// would: a NUL in its first 8 KiB marks one as binary, as git decides.
+fn binary(bytes: &[u8]) -> Option<&'static str> {
+    const KINDS: [(&[u8], &str); 6] = [
+        (b"\x89PNG", "a PNG image"),
+        (b"\xff\xd8\xff", "a JPEG image"),
+        (b"GIF8", "a GIF image"),
+        (b"%PDF", "a PDF"),
+        (b"PK\x03\x04", "a zip archive"),
+        (b"\x7fELF", "an executable"),
+    ];
+    if let Some((_, kind)) = KINDS.iter().find(|(magic, _)| bytes.starts_with(magic)) {
+        return Some(kind);
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("a WebP image");
+    }
+    bytes[..bytes.len().min(8192)]
+        .contains(&0)
+        .then_some("a binary file")
+}
+
 /// A background command's admission: a slot taken at once when one was
 /// free, otherwise a counted place in line released when it gets a slot
 /// or is dropped before starting.
@@ -1009,6 +1031,12 @@ impl Registry {
                 limit,
             } => {
                 let bytes = read_bounded(&resolve(workspace, &path)).await?;
+                if let Some(kind) = binary(&bytes) {
+                    return fail_with(
+                        "file_not_text",
+                        format!("{kind} of {} bytes; read returns text", bytes.len()),
+                    );
+                }
                 let text = String::from_utf8_lossy(&bytes);
                 Ok(Outcome::text(
                     self.redact(page_lines(&text, offset, limit)?),
@@ -1543,6 +1571,29 @@ async fn shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn binary_files_are_named_and_text_passes() {
+        assert_eq!(binary(b"\x89PNG\r\n\x1a\n\0\0"), Some("a PNG image"));
+        assert_eq!(binary(b"RIFF\0\0\0\0WEBPVP8 "), Some("a WebP image"));
+        assert_eq!(binary(b"data\0more"), Some("a binary file"));
+        assert_eq!(binary("caf\u{e9}\n".as_bytes()), None);
+        assert_eq!(binary(b""), None);
+    }
+    #[tokio::test]
+    async fn read_refuses_an_image_by_its_kind() {
+        let dir = std::env::temp_dir().join(format!("agent-read-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\nIHDR").unwrap();
+        let registry = Registry::new("read").unwrap();
+        let prepared = registry.prepare("read", r#"{"path":"shot.png"}"#).unwrap();
+        let error = registry.execute(prepared, &dir, &[]).await.unwrap_err();
+        assert_eq!(error.code, "file_not_text");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("a PNG image of 12 bytes; read returns text")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn oversized_output_keeps_head_and_tail_on_char_boundaries() {
         let text = format!(

@@ -1742,6 +1742,14 @@ impl Database {
     /// Whether the bot's running turn takes a steer at its next boundary:
     /// the oldest one for it is queued and fits the turn, as `absorb` reads
     /// them. Delivery steer only.
+    /// Whether the model has called a tool in `turn`: it has replied there.
+    pub fn turn_called(&self, turn: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=?)",
+            [turn],
+            |r| r.get(0),
+        )?)
+    }
     pub fn joining_steer(&self, name: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -6378,6 +6386,34 @@ impl Database {
         };
         let bounded: String = text.chars().take(16 * 1024).collect();
         outcome["text_truncated"] = json!(bounded.len() < text.len());
+        // A turn steered after it wrote its answer can end on its reply to
+        // the steer, so the last text it wrote before its last steer comes
+        // back too, when that differs.
+        let steered: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM events WHERE turn=? AND kind='steered' ORDER BY id DESC LIMIT 1",
+                [turn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(steered) = steered {
+            let mut items = self.conn.prepare_cached(
+                "SELECT n.item FROM events e JOIN nodes n ON n.id=json_extract(e.data,'$.node')
+                 WHERE e.turn=? AND e.kind='message' AND e.id<? ORDER BY e.id DESC",
+            )?;
+            let mut rows = items.query(params![turn, steered])?;
+            let mut before = String::new();
+            while before.trim().is_empty() {
+                let Some(r) = rows.next()? else { break };
+                before = assistant_text(&serde_json::from_slice(&r.get::<_, Vec<u8>>(0)?)?);
+            }
+            if !before.trim().is_empty() && before != text {
+                let cut: String = before.chars().take(16 * 1024).collect();
+                outcome["before_steer_truncated"] = json!(cut.len() < before.len());
+                outcome["before_steer"] = json!(cut);
+            }
+        }
         outcome["text"] = json!(bounded);
         Ok(Some(outcome))
     }
