@@ -157,8 +157,16 @@ impl Screen {
 
     /// Up (`rows` > 0) or down the conversation.
     pub fn scroll(&mut self, rows: isize) {
-        let most = (self.shown.len() + 1).saturating_sub(self.area.height as usize);
+        let most = self.most(self.area.height as usize);
         self.back = self.back.saturating_add_signed(rows).min(most);
+    }
+
+    /// How far back the view can go with `height` rows: to the first row,
+    /// with the note under the rows.
+    fn most(&self, height: usize) -> usize {
+        (self.shown.len() + 1)
+            .saturating_sub(height)
+            .min(self.shown.len())
     }
 
     /// A page up or down.
@@ -248,7 +256,7 @@ impl Screen {
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, file: impl Fn(&str) -> Option<String>) {
         self.layout(area.width as usize);
         let height = area.height as usize;
-        self.back = self.back.min((self.shown.len() + 1).saturating_sub(height));
+        self.back = self.back.min(self.most(height));
         // While scrolled back, the bottom row is the note, over no row.
         let rows = height - usize::from(self.back > 0 && height > 1);
         let bottom = self.shown.len() - self.back;
@@ -838,9 +846,12 @@ mod tests {
         let url = "https://example.com/a/very/long/path/to/a/page";
         let lines = crate::transcript::wrap(Line::from(url), 20, Span::raw(""), Span::raw(""));
         let (mut screen, _) = screen(lines, 20, 0);
-        screen.scroll(1);
         let area = Rect::new(0, 0, 20, 0);
-        screen.render(area, &mut Buffer::empty(area), |_| None);
+        for _ in 0..3 {
+            screen.mouse(mouse(MouseEventKind::ScrollUp, 2, 0));
+            screen.page(true);
+            screen.render(area, &mut Buffer::empty(area), |_| None);
+        }
         assert!(screen.links.is_empty());
         let click = mouse(MouseEventKind::Down(MouseButton::Left), 2, 0);
         assert_eq!(screen.mouse(click), None);
