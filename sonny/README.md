@@ -288,7 +288,9 @@ opened). Commands, reads and edits are left out. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-Sonny owns the whole screen, as Codex does. The conversation is Sonny's
+Sonny owns the whole screen, as Codex does. The conversation and the
+composer keep to a column 100 wide, however wide the window, so a reply
+reads as a column rather than a band across the screen. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
 it, older messages loading as you go past the first; rows that arrive
 while you have scrolled back leave the view still, and PgDn or Enter

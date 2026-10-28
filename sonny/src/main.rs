@@ -95,6 +95,12 @@ const QUOTED: usize = 72;
 const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// The widest the conversation is written, however wide the window: a
+/// reply reads as a column, not a band across the screen. Prose reads
+/// best at 45 to 90 characters a line, but replies carry code, paths and
+/// tables too, which most style guides keep within 100 (rustfmt's own
+/// width), so they stay whole at 100 and prose stays near the measure.
+const PROSE: usize = 100;
 /// How long a side chat's copy stays once idle.
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
@@ -2166,7 +2172,7 @@ impl App {
     async fn shell_ran(&mut self) {
         if self.shell.as_ref().is_some_and(|s| s.is_finished()) {
             let ran = self.shell.take().unwrap().ran().await;
-            self.shown.extend(user_shell::lines(&ran, self.width));
+            self.shown.extend(user_shell::lines(&ran, self.prose()));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
             match self.send(record.clone(), Some(SHELL), false).await {
@@ -2590,7 +2596,7 @@ impl App {
             Some(output),
             failed,
             &self.workspace,
-            self.width,
+            self.prose(),
         );
         self.commit(transcript::quiet(lines));
     }
@@ -2774,14 +2780,15 @@ impl App {
                             answered_older.push(question.to_owned());
                         }
                         // What the person ran is shown as it was when it ran.
-                        let lines = landed(&text(&item), &mut self.ran_here, self.width);
+                        let prose = self.prose();
+                        let lines = landed(&text(&item), &mut self.ran_here, prose);
                         self.commit(lines);
                         self.answering = Some((first_words(&text(&item)), self.rows_drawn));
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let mut lines = transcript::reply(&reply, self.width);
+                            let mut lines = transcript::reply(&reply, self.prose());
                             lines.extend(self.reacted_row(node));
                             said = Some(lines);
                             self.saw_reply(node, &reply);
@@ -3024,7 +3031,7 @@ impl App {
                         self.live_line(&mut live, line);
                     }
                 }
-                let held = live.markdown.end(self.width, live.lines == 0);
+                let held = live.markdown.end(self.prose(), live.lines == 0);
                 self.live_rows(&mut live, held);
                 live.closed = true;
             }
@@ -3056,7 +3063,7 @@ impl App {
     }
 
     fn live_line(&mut self, live: &mut Live, line: &str) {
-        let rows = live.markdown.feed(line, self.width, live.lines == 0);
+        let rows = live.markdown.feed(line, self.prose(), live.lines == 0);
         self.live_rows(live, rows);
     }
 
@@ -3171,7 +3178,8 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                     && !reactions::is_reaction(&text(item))
                 {
-                    let lines = landed(&text(item), &mut self.ran_here, self.width);
+                    let prose = self.prose();
+                    let lines = landed(&text(item), &mut self.ran_here, prose);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
                     self.answered(&text(item));
@@ -3189,7 +3197,8 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    let lines = landed(&text(item), &mut self.ran_here, self.width);
+                    let prose = self.prose();
+                    let lines = landed(&text(item), &mut self.ran_here, prose);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
                     self.answered(&text(item));
@@ -3287,7 +3296,7 @@ impl App {
                 } else if let Some(item) = &item {
                     self.end_live(Words::Reply);
                     let mut live = Live::new(self.any_history);
-                    let rows = transcript::reply(&text(item), self.width);
+                    let rows = transcript::reply(&text(item), self.prose());
                     self.live_rows(&mut live, rows);
                     live.closed = true;
                     self.live = Some(live);
@@ -3448,7 +3457,7 @@ impl App {
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let detail = data["error"].as_str().unwrap_or("");
                 let seconds = self.running.take().map(|r| r.started.elapsed().as_secs());
-                let line = transcript::finished(status, detail, seconds, self.width);
+                let line = transcript::finished(status, detail, seconds, self.prose());
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -4073,6 +4082,11 @@ impl App {
         self.screen.page(true);
     }
 
+    /// The width the conversation is written at.
+    fn prose(&self) -> usize {
+        self.width.min(PROSE)
+    }
+
     /// `text` put on the clipboard, and said so.
     fn copied(&mut self, text: &str) {
         term::copy(text);
@@ -4294,10 +4308,10 @@ impl App {
                     KeyCode::Home => self.input.home(),
                     KeyCode::End => self.input.end(),
                     KeyCode::Up => {
-                        self.input.up(self.width);
+                        self.input.up(self.prose());
                     }
                     KeyCode::Down => {
-                        self.input.down(self.width);
+                        self.input.down(self.prose());
                     }
                     KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         self.input.insert("\n")
@@ -4731,7 +4745,7 @@ impl App {
                 };
                 let rows = transcript::wrap(
                     Line::from(what),
-                    self.width,
+                    self.prose(),
                     Span::raw("  "),
                     Span::raw("    "),
                 );
@@ -4805,7 +4819,7 @@ impl App {
         };
         let rows = transcript::wrap(
             Line::from(what),
-            self.width,
+            self.prose(),
             Span::raw("  "),
             Span::raw("    "),
         );
@@ -4987,13 +5001,13 @@ impl App {
         let width = terminal.size()?.width as usize;
         self.width = width;
         self.height = terminal.size()?.height as usize;
-        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width);
+        let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(PROSE));
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
-        let mut open_rows = self.open_rows(width);
+        let mut open_rows = self.open_rows(width.min(PROSE));
         // Then what was sent and has not landed, kept in view below it.
         open_rows.extend(self.staged_rows(width));
         open_rows.extend(self.shell_rows(width));
@@ -5056,7 +5070,8 @@ impl App {
                 true => {
                     let area = frame.area();
                     let room = area.height.saturating_sub(below);
-                    let rows = self.screen.height(area.width as usize).min(room as usize);
+                    let column = area.width.min(PROSE as u16);
+                    let rows = self.screen.height(column as usize).min(room as usize);
                     let [history, view, _] = Layout::vertical([
                         Constraint::Length(rows as u16),
                         Constraint::Length(below),
@@ -5064,6 +5079,10 @@ impl App {
                     ])
                     .areas(area);
                     let file = |word: &str| links::file(&workspace, word);
+                    let history = ratatui::layout::Rect {
+                        width: column,
+                        ..history
+                    };
                     self.screen.render(history, frame.buffer_mut(), file);
                     view
                 }
