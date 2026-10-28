@@ -1,131 +1,141 @@
-//! Questions for the person: the lead calls the `ask` tool Sonny declares
-//! on it, which the daemon records and Sonny pins above the composer,
-//! oldest first, until the person answers them one at a time. The answer
-//! goes to the lead as the person's next message. The open questions are
-//! read from the lead's history: its `ask` calls not yet answered; those
-//! older than the history Sonny replays come back from a file it keeps.
+//! Decisions for the person: the lead calls the `ask` tool Sonny declares
+//! on it, which the daemon records, and Sonny draws the question in the
+//! conversation where it was asked: why it is asked, each option with what
+//! picking it means, and the one the lead recommends and why. What the
+//! person types next answers it, and goes to the lead as their next
+//! message. The open questions are read from the history Sonny replays:
+//! its `ask` calls not yet answered.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
 };
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
 
 /// The name of the tool the lead asks with.
 pub const TOOL: &str = "ask";
-/// Choices are picked by one digit.
-const CHOICES: usize = 9;
+/// Options are picked by one digit.
+const OPTIONS: usize = 9;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ask {
     /// The call that asked it.
     pub id: String,
     pub question: String,
-    pub choices: Vec<String>,
+    /// Why it is asked: what the answer decides.
+    pub why: String,
+    pub options: Vec<Choice>,
+    /// The option recommended, from 0, and why.
+    pub recommended: Option<usize>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Choice {
+    pub label: String,
+    /// What picking it means.
+    pub explanation: String,
 }
 
 /// The `ask` tool as Sonny declares it on a bot.
 pub fn tool() -> Value {
     json!({
         "name": TOOL,
-        "description": "Ask the person to decide something you cannot go on without. Sonny pins the \
-            question above their composer until they answer, and the answer comes as their next \
-            message, starting \"You asked:\" and your question. One question per call, with up to 9 \
-            short choices when the answer is one of a few. Then end your turn, unless you have work \
-            that does not depend on the answer.",
+        "description": "Put a decision in front of the person: a fork in the road, an architectural \
+            choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
+            shows it in the conversation where you ask it: the question, why you ask it, each option \
+            with what happens if they pick it, and the one you recommend and why. Options without \
+            what they mean are useless to the person, so say what each one does to their goal. Ask \
+            once, one decision per call, and do not repeat it in your reply. Their answer comes as \
+            their next message, starting \"You asked:\" and your question. While you wait, go on \
+            with the option you recommend if it can be undone once they have seen it, or with work \
+            that does not depend on the answer; otherwise end your turn. A question with nothing to \
+            choose between goes in your reply instead.",
         "parameters": {
             "type": "object",
             "properties": {
-                "question": {"type": "string", "description": "The question, as the person reads it."},
-                "choices": {"type": "array", "items": {"type": "string"},
-                    "description": "Up to 9 short answers the person picks from by number."}
+                "question": {"type": "string",
+                    "description": "The question, verb first, in the person's own words, in about twelve words."},
+                "why": {"type": "string",
+                    "description": "Why you ask now: what the answer decides and the background the person needs to choose, in a sentence or three."},
+                "options": {"type": "array",
+                    "description": "2 to 4 options, each a different way forward.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "description": "The option, in a few words."},
+                            "explanation": {"type": "string",
+                                "description": "What happens if the person picks it, in one sentence."}
+                        },
+                        "required": ["label", "explanation"],
+                        "additionalProperties": false
+                    }},
+                "recommended": {"type": "integer",
+                    "description": "The number of the option you recommend, from 1."},
+                "reason": {"type": "string", "description": "Why you recommend it, in one sentence."}
             },
-            "required": ["question"],
+            "required": ["question", "why", "options", "recommended", "reason"],
             "additionalProperties": false
         },
-        "result": "Asked. Sonny shows the question to the person until they answer, and the answer comes as their next message. End your turn now, unless you have work that does not depend on it."
+        "result": "Asked. Sonny shows the decision to the person, and their answer comes as their next message. Go on with the option you recommend if it can be undone, or with work that does not depend on the answer; otherwise end your turn now."
     })
 }
 
-/// The question an `ask` call with `arguments` put, as call `id`.
-pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
-    // Without blank lines, so its answer still reads as answering it.
-    let question = arguments["question"]
-        .as_str()?
+/// `text` trimmed, without blank lines, so an answer that quotes it
+/// still reads as answering it.
+fn tidy(text: Option<&str>) -> String {
+    text.unwrap_or("")
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
-    let question = question.trim();
-    let choices: Vec<String> = arguments["choices"]
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+/// The question an `ask` call with `arguments` put, as call `id`.
+pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
+    let question = tidy(arguments["question"].as_str());
+    let options: Vec<Choice> = arguments["options"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|choice| choice.as_str().map(str::trim))
-        .filter(|choice| !choice.is_empty())
-        .map(str::to_owned)
-        .take(CHOICES)
+        .map(|option| Choice {
+            label: tidy(option["label"].as_str()),
+            explanation: tidy(option["explanation"].as_str()),
+        })
+        .filter(|choice| !choice.label.is_empty())
+        .take(OPTIONS)
         .collect();
+    let recommended = arguments["recommended"]
+        .as_u64()
+        .and_then(|n| (n as usize).checked_sub(1))
+        .filter(|at| *at < options.len());
     (!question.is_empty()).then(|| Ask {
         id: id.to_owned(),
-        question: question.to_owned(),
-        choices,
+        question,
+        why: tidy(arguments["why"].as_str()),
+        options,
+        recommended,
+        reason: tidy(arguments["reason"].as_str()),
     })
-}
-
-/// Where the open questions of the bot under `key`, its
-/// [`crate::reactions::key`], are kept: history holds them, but Sonny
-/// replays only its newest part, so one asked before that comes back from
-/// here.
-pub fn file(key: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(format!(".agent/sonny/asks/{key}.json")))
-}
-
-/// The open questions kept in `file`; none kept is none.
-pub fn load(file: Option<&Path>) -> Vec<Ask> {
-    let kept: Value = file
-        .and_then(|file| std::fs::read(file).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    kept.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|ask| call(ask["id"].as_str()?, ask))
-        .collect()
-}
-
-/// Keeps `asks` in `file`, as the questions still open; none removes it.
-pub fn keep(file: Option<&Path>, asks: &[Ask]) -> Result<(), String> {
-    let Some(file) = file else {
-        return Ok(());
-    };
-    let failed = |e: std::io::Error| format!("{}: {e}", file.display());
-    if asks.is_empty() {
-        return match std::fs::remove_file(file) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
-            _ => Ok(()),
-        };
-    }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir).map_err(failed)?;
-    }
-    let kept: Vec<Value> = asks
-        .iter()
-        .map(|ask| json!({"id": ask.id, "question": ask.question, "choices": ask.choices}))
-        .collect();
-    let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
-    // Its own, so two windows of the bot never write one file together.
-    let next = file.with_extension(format!("json.{}.next", std::process::id()));
-    std::fs::write(&next, json).map_err(failed)?;
-    std::fs::rename(&next, file).map_err(failed)
 }
 
 /// The question a person's message answers, when [`answer`] wrote it.
 pub fn answered(text: &str) -> Option<&str> {
-    let (question, _) = text.strip_prefix("You asked: ")?.split_once("\n\n")?;
-    Some(question)
+    split(text).map(|(question, _)| question)
+}
+
+/// A person's message [`answer`] wrote, as the question and its answer.
+pub fn split(text: &str) -> Option<(&str, &str)> {
+    text.strip_prefix("You asked: ")?.split_once("\n\n")
+}
+
+/// The row that says which question a message answers, above it.
+pub fn answering(question: &str, width: usize) -> Line<'static> {
+    let first = question.lines().next().unwrap_or("");
+    let cut = crate::transcript::cut(first, width.saturating_sub(14).max(8));
+    Line::from(format!("  answering “{cut}”")).dim()
 }
 
 /// `asks` without the first one `text` answers; whether there was one.
@@ -135,88 +145,149 @@ pub fn close(asks: &mut Vec<Ask>, text: &str) -> bool {
     at.map(|at| asks.remove(at)).is_some()
 }
 
-/// The person's message answering `ask`: a choice's number stands for
-/// the choice.
+/// The person's message answering `ask`: an option's number stands for
+/// the option.
 pub fn answer(ask: &Ask, typed: &str) -> String {
     let picked = typed
         .parse::<usize>()
         .ok()
         .and_then(|n| n.checked_sub(1))
-        .and_then(|at| ask.choices.get(at))
-        .map_or(typed, String::as_str);
+        .and_then(|at| ask.options.get(at))
+        .map_or(typed, |choice| choice.label.as_str());
     format!("You asked: {}\n\n{picked}", ask.question)
 }
 
-/// The panel: how many questions are open, then the first, and its
-/// choices by number.
-pub fn rows(asks: &[Ask], width: usize, chatting: bool) -> Vec<Line<'static>> {
-    let Some(ask) = asks.first() else {
-        return Vec::new();
-    };
-    let mut head = vec![
-        Span::raw("? ").fg(Color::Yellow),
-        Span::raw("Needs you").bold(),
-    ];
-    if asks.len() > 1 {
-        head.push(Span::raw(format!(" · 1 of {}", asks.len())).dim());
-    }
-    if chatting {
-        head.push(Span::raw(" · Esc to answer").dim());
-    }
-    // A blank row apart from the history above.
-    let mut rows = vec![Line::default(), Line::from(head)];
-    for line in ask.question.lines() {
+/// The decision as it is drawn where it was asked: the question, why,
+/// each option by number with what it means, and the recommendation.
+pub fn lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
+    let indent = || Span::raw("  ");
+    let mut rows = Vec::new();
+    for (at, line) in ask.question.lines().enumerate() {
+        let first = match at {
+            0 => Span::raw("? ").fg(Color::Yellow).bold(),
+            _ => indent(),
+        };
         rows.extend(crate::transcript::wrap(
-            Line::from(line.to_owned()),
+            Line::from(line.to_owned()).bold(),
             width,
-            Span::raw("  "),
-            Span::raw("  "),
+            first,
+            indent(),
         ));
     }
-    if !ask.choices.is_empty() {
-        let mut spans = Vec::new();
-        for (at, choice) in ask.choices.iter().enumerate() {
-            if at > 0 {
-                spans.push(Span::raw(" · ").dim());
-            }
-            spans.push(Span::raw(format!("{} ", at + 1)).bold());
-            spans.push(Span::raw(choice.clone()));
-        }
+    for line in ask.why.lines() {
         rows.extend(crate::transcript::wrap(
-            Line::from(spans),
+            Line::from(line.to_owned()).dim(),
             width,
-            Span::raw("  "),
-            Span::raw("  "),
+            indent(),
+            indent(),
+        ));
+    }
+    if !ask.options.is_empty() {
+        rows.push(Line::default());
+    }
+    // The explanation sits under its label, past the number.
+    let under = || Span::raw("     ");
+    for (at, choice) in ask.options.iter().enumerate() {
+        let mut label = vec![Span::raw(choice.label.clone()).bold()];
+        if ask.recommended == Some(at) {
+            label.push(Span::raw(" · recommended").fg(Color::Green));
+        }
+        rows.extend(crate::transcript::wrap_lines(
+            Line::from(label),
+            width,
+            Line::from(vec![
+                indent(),
+                Span::raw(format!("{:<3}", at + 1)).fg(Color::Yellow),
+            ]),
+            Line::from(under()),
+        ));
+        for line in choice.explanation.lines() {
+            rows.extend(crate::transcript::wrap(
+                Line::from(line.to_owned()),
+                width,
+                under(),
+                under(),
+            ));
+        }
+    }
+    if let Some(at) = ask.recommended
+        && !ask.reason.is_empty()
+    {
+        rows.push(Line::default());
+        rows.extend(crate::transcript::wrap_lines(
+            Line::from(ask.reason.clone()).dim(),
+            width,
+            Line::from(vec![
+                indent(),
+                Span::raw(format!("Why {}: ", at + 1)).fg(Color::Green),
+            ]),
+            Line::from(indent()),
         ));
     }
     rows
+}
+
+/// The composer's hint while what is typed answers `ask`, cut to `width`.
+pub fn hint(ask: &Ask, more: usize, width: usize) -> String {
+    let keys = match ask.options.len() {
+        0 => "type your answer".to_owned(),
+        1 => "1 or your own words".to_owned(),
+        n => format!("1–{n} or your own words"),
+    };
+    let more = match more {
+        0 => String::new(),
+        n => format!(" · {n} more open"),
+    };
+    let tail = format!(": {keys}{more} · Esc to chat");
+    let room = width.saturating_sub(tail.chars().count() + "Answer “”".chars().count());
+    let question = ask.question.lines().next().unwrap_or("");
+    format!(
+        "Answer “{}”{tail}",
+        crate::transcript::cut(question, room.max(8))
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn keep_api() -> Value {
+        json!({
+            "question": " Keep the old API? ",
+            "why": "The wire format changes, and 0.3 clients break.",
+            "options": [
+                {"label": "Keep it", "explanation": "Old clients work; a shim stays a release."},
+                {"label": " ", "explanation": "nothing"},
+                {"label": "Drop it", "explanation": "A smaller daemon; 0.3 users upgrade both."}
+            ],
+            "recommended": 2,
+            "reason": "Nobody runs 0.3 outside this machine."
+        })
+    }
+
     #[test]
     fn a_call_puts_its_question_and_an_answer_closes_it() {
-        let ask = call(
-            "c1",
-            &json!({"question": " Keep the old API? ",
-            "choices": ["Keep it", " ", "Drop it"]}),
-        )
-        .unwrap();
+        let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(ask.question, "Keep the old API?");
-        assert_eq!(ask.choices, ["Keep it", "Drop it"]);
+        assert_eq!(
+            ask.options
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Keep it", "Drop it"]
+        );
+        assert_eq!(ask.recommended, Some(1));
         assert_eq!(call("c2", &json!({"question": " "})), None);
-        let mut open = vec![
-            ask.clone(),
-            call("c3", &json!({"question": "Tag it?"})).unwrap(),
-        ];
+        // A recommendation past the options recommends none.
+        let past = call("c2", &json!({"question": "Tag it?", "recommended": 3})).unwrap();
+        assert_eq!(past.recommended, None);
+        let mut open = vec![ask.clone(), past];
         close(&mut open, "how is it going?");
         assert_eq!(open.len(), 2);
         close(&mut open, &answer(&ask, "2"));
         assert_eq!(
             open.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["c3"]
+            ["c2"]
         );
         // A question with a blank line in it is still closed by its answer.
         let long = call("c4", &json!({"question": "Ship it?\n\n  Tests pass.  "})).unwrap();
@@ -227,37 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn open_questions_are_kept_until_none_are() {
-        let file = std::env::temp_dir().join(format!("sonny-asks-{}/b.json", std::process::id()));
-        assert_eq!(load(Some(&file)), []);
-        let open = vec![
-            call(
-                "c1",
-                &json!({"question": "Tag it?", "choices": ["Yes", "No"]}),
-            )
-            .unwrap(),
-            call("c2", &json!({"question": "Bump?"})).unwrap(),
-        ];
-        keep(Some(&file), &open).unwrap();
-        assert_eq!(load(Some(&file)), open);
-        keep(Some(&file), &[]).unwrap();
-        assert!(!file.exists());
-        keep(Some(&file), &[]).unwrap();
-        keep(None, &open).unwrap();
-    }
-
-    #[test]
-    fn a_number_answers_with_its_choice() {
-        let ask = Ask {
-            id: "c1".into(),
-            question: "Keep the old API?".into(),
-            choices: vec!["Keep it".into(), "Drop it".into()],
-        };
+    fn a_number_answers_with_its_option() {
+        let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(answer(&ask, "2"), "You asked: Keep the old API?\n\nDrop it");
         assert_eq!(
             answer(&ask, "3"),
             "You asked: Keep the old API?\n\n3",
-            "no third choice: the digit is the answer"
+            "no third option: the digit is the answer"
         );
         assert_eq!(
             answer(&ask, "Keep it for one release"),
@@ -266,19 +313,44 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_shows_the_first_question_and_how_many_wait() {
-        let ask = |question: &str| Ask {
-            id: question.into(),
-            question: question.into(),
-            choices: vec!["Yes".into(), "No".into()],
-        };
-        let shown: Vec<String> = rows(&[ask("Ship it?"), ask("Tag it?")], 40, false)
-            .iter()
-            .map(|row| row.to_string())
-            .collect();
+    fn the_decision_reads_as_question_why_options_and_recommendation() {
+        let ask = call("c1", &keep_api()).unwrap();
+        let shown: Vec<String> = lines(&ask, 60).iter().map(|row| row.to_string()).collect();
         assert_eq!(
             shown,
-            ["", "? Needs you · 1 of 2", "  Ship it?", "  1 Yes · 2 No"]
+            [
+                "? Keep the old API?",
+                "  The wire format changes, and 0.3 clients break.",
+                "",
+                "  1  Keep it",
+                "     Old clients work; a shim stays a release.",
+                "  2  Drop it · recommended",
+                "     A smaller daemon; 0.3 users upgrade both.",
+                "",
+                "  Why 2: Nobody runs 0.3 outside this machine.",
+            ]
         );
+        // Narrow, each part wraps under its own indent.
+        let narrow: Vec<String> = lines(&ask, 30)
+            .iter()
+            .map(|row| row.to_string().trim_end().to_owned())
+            .collect();
+        let at = narrow.iter().position(|row| row == "  1  Keep it").unwrap();
+        assert_eq!(narrow[at + 1], "     Old clients work; a shim");
+        assert_eq!(narrow[at + 2], "     stays a release.");
+    }
+
+    #[test]
+    fn the_hint_names_the_question_and_its_keys() {
+        let ask = call("c1", &keep_api()).unwrap();
+        assert_eq!(
+            hint(&ask, 0, 80),
+            "Answer “Keep the old API?”: 1–2 or your own words · Esc to chat"
+        );
+        assert_eq!(
+            hint(&ask, 1, 80),
+            "Answer “Keep the old API?”: 1–2 or your own words · 1 more open · Esc to chat"
+        );
+        assert!(hint(&ask, 0, 50).contains('…'));
     }
 }
