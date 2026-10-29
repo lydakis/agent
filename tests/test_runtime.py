@@ -53,7 +53,10 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         models = getattr(self.server, 'models', None) or ('synthetic-model',)
-        body = json.dumps({'data': [{'id': m, 'context_window': window} for m in models]}).encode()
+        names = getattr(self.server, 'model_names', {})
+        listed = [{'id': m, 'context_window': window} | ({'display_name': names[m]} if m in names else {})
+                  for m in models]
+        body = json.dumps({'data': listed}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
