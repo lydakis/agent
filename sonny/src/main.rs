@@ -17,6 +17,7 @@ mod banner;
 mod cache;
 mod calls;
 mod cmux;
+mod config;
 mod declared;
 mod diff;
 mod embed;
@@ -826,11 +827,17 @@ async fn run() -> Result<(), String> {
     app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
-        app.notice = Some(format!(
-            "a copy of {source} that answers without acting; {source} carries on"
-        ));
+        // One allowed no tool answers; one with its source's acts.
+        let acts = !bot["allowed"]
+            .as_array()
+            .is_some_and(|tools| tools.is_empty());
+        app.notice = Some(match acts {
+            true => format!("a copy of {source} that can do anything it can; {source} carries on"),
+            false => format!("a copy of {source} that answers without acting; {source} carries on"),
+        });
     }
-    // The person's agent can react to them; a side chat calls no tool.
+    // The person's agent can react to them; a side chat has its agent's
+    // tools, or none.
     if options.side.is_none() {
         app.declare = declared::declare(&bot, project.is_some());
     }
@@ -1099,6 +1106,24 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
 }
 
+/// The agent a side chat is a copy of, from the name `/side` gives it,
+/// `SOURCE.side-HEX`; `None` for any other bot. A name alone can be a
+/// task's, so `side_copy` checks the record too.
+pub fn side_source(bot: &str) -> Option<&str> {
+    let (source, stamp) = bot.rsplit_once(".side-")?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    (!source.is_empty() && (1..=6).contains(&stamp.len()) && stamp.bytes().all(hex))
+        .then_some(source)
+}
+
+/// The agent `record`, a bot as `bots` lists it, is a side chat of: named
+/// as `/side` names one, made by that agent, and expiring as a side chat
+/// does. `None` for any other bot, a task named `NAME.side-feed` included.
+pub fn side_copy(record: &Value) -> Option<&str> {
+    let source = side_source(record["name"].as_str()?)?;
+    (record["created_by"] == source && record["expire_ms"].is_u64()).then_some(source)
+}
+
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
 /// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
 /// the same to Herdr, which takes it from its own CLI instead.
@@ -1314,9 +1339,9 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
-/// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 17] = [
+/// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
+/// open `/background`, and `/settings` opens `/config`, unlisted.
+const COMMANDS: [(&str, &str); 18] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1339,6 +1364,7 @@ const COMMANDS: [(&str, &str); 17] = [
     ),
     ("/usage", "the tokens the agents spent, over time"),
     ("/mcp", "the MCP servers agents' scripts call"),
+    ("/config", "the settings in ~/.agent/config.toml"),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/verbose",
@@ -1585,6 +1611,8 @@ struct App {
     retry: Option<Instant>,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
+    /// `/config`, open over the composer.
+    config: Option<config::View>,
     /// The model listing `/model` waits on.
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
     /// The model and effort picked, set once no turn runs.
@@ -2220,6 +2248,7 @@ impl App {
             lead: String::new(),
             retry: None,
             picker: None,
+            config: None,
             listing: None,
             switch: None,
             cache: None,
@@ -4001,9 +4030,15 @@ impl App {
     /// happens, when its window closes too; replayed, by the time the
     /// lead's turn ended, unless the mark it made then is kept.
     async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
-        let Some(project) = &self.project else {
+        // A side chat forked from a lead resolves that lead's tasks.
+        let side = (self.options.side.is_some())
+            .then(|| side_source(&self.bot))
+            .flatten()
+            .and_then(|source| source.strip_suffix(".lead"));
+        let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
             return;
         };
+        let project = &project;
         let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
             return;
         };
@@ -4901,6 +4936,7 @@ impl App {
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
                 && self.input.is_empty()
                 && self.picker.is_none()
+                && self.config.is_none()
                 && self.choosing.is_none()
                 && self.reacting.is_none()
             {
@@ -4939,6 +4975,7 @@ impl App {
             KeyCode::Char('f')
                 if ctrl
                     && self.picker.is_none()
+                    && self.config.is_none()
                     && self.choosing.is_none()
                     && self.reacting.is_none() =>
             {
@@ -5330,6 +5367,21 @@ impl App {
             }
             return;
         }
+        if let Some(view) = &mut self.config {
+            if let Event::Resize(width, _) = event {
+                self.width = width as usize;
+            } else if let config::Key::Close = view.event(&event) {
+                self.config = None;
+            }
+            // The chime and the view as the file now has them.
+            let settings = settings::Settings::load();
+            self.sounds.chime = settings.chime;
+            if self.verbose != settings.verbose {
+                self.verbose = settings.verbose;
+                self.repaint = true;
+            }
+            return;
+        }
         if let Some(picker) = &mut self.picker {
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -5592,6 +5644,14 @@ impl App {
                 },
                 None => "no HTML page in this conversation yet".into(),
             });
+            return;
+        }
+        if matches!(prompt.as_str(), "/config" | "/settings") {
+            self.input.clear();
+            match config::View::open() {
+                Ok(view) => self.config = Some(view),
+                Err(error) => self.notice = Some(error),
+            }
             return;
         }
         if prompt == "/model" {
@@ -6117,26 +6177,51 @@ impl App {
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
     /// mid-turn included, and opened in a Sonny of its own on the alternate
     /// screen. The copy may call no tool, so it answers from what the bot
-    /// knows; the daemon deletes it once it has been idle a quarter hour.
-    /// This bot carries on, and its lines wait for the main screen.
+    /// knows, unless the config's `[sonny] side_chat` is `"fork"`: then it
+    /// may do anything the bot may. The daemon deletes it once it has been
+    /// idle a quarter hour. This bot carries on, and its lines wait for the
+    /// main screen.
     async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
         }
+        let tools = match agent_client::config::load() {
+            Ok(config) => config.sonny.side_chat,
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
-        let forked = self
+        // Made by the agent it copies, which is how Sonny's own tools know
+        // the copy for one rather than by its name alone.
+        let page = self
             .client
-            .request(
-                "fork",
-                json!({"source": self.bot, "bot": name, "allow": [],
-                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name}),
-            )
-            .await;
+            .request("bots", json!({"name": self.bot, "limit": 1}));
+        let source = match page.await {
+            Ok(page) if page["bots"][0]["name"] == self.bot.as_str() => page["bots"][0].clone(),
+            Ok(_) => {
+                self.notice = Some(format!("no side chat: {} is gone", self.bot));
+                return;
+            }
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
+        let mut fork = json!({"source": self.bot, "bot": name,
+            "created_by": self.bot, "created_by_id": source["bot_id"],
+            "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name});
+        // A fork with no list keeps its source's tools.
+        if tools == agent_client::config::SideChat::Answer {
+            fork["allow"] = json!([]);
+        }
+        let forked = self.client.request("fork", fork).await;
         let forked = match forked {
             Ok(forked) => forked,
             Err(error) => {
@@ -6499,6 +6584,11 @@ impl App {
                     let room = area.height.saturating_sub(below);
                     let column = area.width.min(PROSE as u16);
                     let rows = self.screen.height(column as usize).min(room as usize);
+                    // `/config` lists every setting over the rows above.
+                    let rows = match &self.config {
+                        Some(_) => (rows + config::SETTINGS.len()).min(room as usize),
+                        None => rows,
+                    };
                     let [history, view, _] = Layout::vertical([
                         Constraint::Length(rows as u16),
                         Constraint::Length(below),
@@ -6707,6 +6797,24 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some(view) = &self.config {
+                // Every setting where there is room, over the rows above.
+                let rows = view.rows(composer.y.saturating_sub(frame.area().y) as usize);
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(rows.len() as u16),
+                    height: rows.len() as u16,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let (line, cursor) = view.line();
+                frame.render_widget(Paragraph::new(line), composer);
+                if let Some(column) = cursor {
+                    frame.set_cursor_position((composer.x + column, composer.y));
+                }
+                frame.render_widget(Paragraph::new(view.keys()), footer);
+                return;
+            }
             if let Some(picker) = &self.picker {
                 let shown = picker.shown();
                 let at = picker.at();
@@ -6877,6 +6985,7 @@ impl App {
         let keep = match self.choosing.is_some()
             || self.approving.is_some()
             || self.picker.is_some()
+            || self.config.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
         {

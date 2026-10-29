@@ -138,6 +138,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -329,14 +331,29 @@ off again never shows.
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included: in the pane beside
   the conversation on the full screen, on the alternate screen inline.
-  The copy answers from the agent's history and may call no tool;
-  follow-ups stay with it, and Esc goes back. In the pane, every key goes
-  to the side chat but Shift+Tab, which goes back to the main composer
-  while the side chat stays open. The agent carries on meanwhile, in
-  view on the full screen, waiting on the main screen inline. The daemon
-  deletes the copy once it has been idle 15 minutes (`fork --expires`), and
-  no copy shows among the project's agents, in `/status`, or to the
-  lookout.
+  The copy answers from the agent's history and may call no tool, unless
+  `~/.agent/config.toml` sets `[sonny] side_chat = "fork"`: then it is a
+  full fork that can do anything the agent can, with its tools, in its
+  folder, under its approvals. Follow-ups stay with it, and Esc goes
+  back. In the pane, every key goes to the side chat but Shift+Tab, which
+  goes back to the main composer while the side chat stays open. The agent
+  carries on meanwhile, in view on the full screen, waiting on the main
+  screen inline. The daemon deletes the copy once it has been idle 15
+  minutes (`fork --expires`), and no copy shows among the project's
+  agents, in `/status`, or to the lookout.
+
+  ![A side chat forked with every tool writes a file beside the lead](../docs/sonny/side-fork.png)
+- `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
+  with its value or what its default is, over the composer. ↑/↓ picks
+  one; ←/→ steps a key with a few values (efforts, `web_search`,
+  `senders`, `side_chat`, `chime`, `verbose`, `suggest`) through them
+  and its default; Enter types one that takes a name (`model`, `provider`,
+  `judge.model`, the profiles), empty for its default; ⌫
+  takes a key back to its default. Each change is written at once, the
+  file's comments and order kept, and a file that does not read is
+  refused by name, as every reader refuses it.
+
+  ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
@@ -494,7 +511,10 @@ turn of the task numbered after that one reopens it.
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
-Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
+Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
+`[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
+the view (`verbose`, off by default), besides the efforts and the side chat
+above; only the screen is in `~/.agent/sonny/settings.json`.
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
