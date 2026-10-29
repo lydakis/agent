@@ -1354,9 +1354,9 @@ mod tests {
         // The check failed and the task works again: no news.
         updates.goal_turn("shop.fix", 4);
         turn(&mut updates, "shop.fix", 4, lead.clone(), "completed");
-        assert!(!updates.due(false), "held for its check");
+        assert!(!updates.due(), "held for its check");
         updates.goal_settled("shop.fix", 4, None);
-        assert!(!updates.due(false), "it works again");
+        assert!(!updates.due(), "it works again");
         // The check passed: the turn, with how the goal ended.
         updates.goal_turn("shop.fix", 5);
         turn(&mut updates, "shop.fix", 5, goal.clone(), "completed");
