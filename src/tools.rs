@@ -21,6 +21,7 @@ use tokio::{
     sync::Semaphore,
 };
 
+mod fetch;
 mod files;
 mod patch;
 mod picture;
@@ -59,6 +60,7 @@ enum Tool {
     History,
     Note,
     WebSearch,
+    WebFetch,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -73,6 +75,7 @@ impl Tool {
             "history" => Tool::History,
             "note" => Tool::Note,
             "web_search" => Tool::WebSearch,
+            "web_fetch" => Tool::WebFetch,
             _ => return None,
         })
     }
@@ -88,6 +91,7 @@ impl Tool {
             Tool::History => "history",
             Tool::Note => "note",
             Tool::WebSearch => "web_search",
+            Tool::WebFetch => "web_fetch",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -98,7 +102,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"}},
@@ -144,6 +148,11 @@ impl Tool {
                 include_str!("tools/web_run.md"),
                 serde_json::from_str(include_str!("tools/web_run.json")).expect("web.run schema"),
             ),
+            Tool::WebFetch => (
+                "Fetch a public http or https URL and return its text: an HTML page as Markdown, with its title and links resolved to absolute URLs; other text as it is. The result names the final URL after redirects and the HTTP status. Text past 64 KiB is cut to its start and end, with the whole kept as an artifact to page with read. Use it to read a page you were given or found; it does not run the page's scripts or sign in.",
+                json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},
+                "required":["url"],"additionalProperties":false}),
+            ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
@@ -155,7 +164,7 @@ impl Tool {
             name: self.name().into(),
             description: description.into(),
             parameters,
-            grammar: (self == Tool::ApplyPatch).then_some(patch::GRAMMAR),
+            grammar: (self == Tool::ApplyPatch).then_some(patch::GRAMMAR.into()),
         }
     }
 }
@@ -172,6 +181,13 @@ pub struct Declared {
     pub description: String,
     /// A JSON Schema object for the call's arguments.
     pub parameters: serde_json::Value,
+    /// A Lark grammar the call's input follows, for a tool whose input is
+    /// free-form text: declared as a custom tool where the provider has
+    /// them, and as a function of that text as `input` elsewhere, so
+    /// `parameters` must take `input` as a string. Either way the call's
+    /// arguments are `{"input": TEXT}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
     /// What the model reads as the call's result.
     #[serde(default = "declared_result")]
     pub result: String,
@@ -257,6 +273,21 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                 "invalid_declare",
                 format!("{name}: parameters must be an object schema"),
             );
+        }
+        if let Some(grammar) = &tool.grammar {
+            let input = &tool.parameters["properties"]["input"];
+            // Its call is the text alone, so nothing else may be required.
+            let required = tool.parameters["required"]
+                .as_array()
+                .is_some_and(|fields| fields.len() == 1 && fields[0] == "input");
+            if grammar.is_empty() || input["type"] != "string" || !required {
+                return fail_with(
+                    "invalid_declare",
+                    format!(
+                        "{name}: a tool with a grammar takes its text as `input`, a string and its only required field"
+                    ),
+                );
+            }
         }
         match &tool.answered_by {
             Some(tag) => {
@@ -651,6 +682,8 @@ pub enum Prepared {
         timeout_ms: Option<u64>,
         any: bool,
     },
+    /// A page the daemon fetches.
+    WebFetch(reqwest::Url),
     /// A `web.run` call's commands, which the bot's provider answers.
     /// Resolved by the runtime, never by the registry.
     WebSearch(String),
@@ -711,7 +744,7 @@ impl ReadSource {
             && let Ok(turn) = turn.parse::<i64>()
             && turn > 0
             && !call_id.is_empty()
-            && matches!(stream, "stdout" | "stderr")
+            && matches!(stream, "stdout" | "stderr" | "text")
         {
             return Ok(ReadSource::Artifact {
                 turn,
@@ -764,9 +797,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search"
+            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch"
         } else {
-            "echo,read,write,edit,apply_patch,wait,history,note,web_search"
+            "echo,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -843,7 +876,7 @@ impl Registry {
                 name: tool.name.clone().into(),
                 description: tool.description.clone().into(),
                 parameters: tool.parameters.clone(),
-                grammar: None,
+                grammar: tool.grammar.clone().map(Into::into),
             }))
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
@@ -1139,6 +1172,15 @@ impl Registry {
                 }
                 Prepared::WebSearch(args.to_owned())
             }
+            Tool::WebFetch => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct WebFetch {
+                    url: String,
+                }
+                let args: WebFetch = serde_json::from_str(args).map_err(invalid)?;
+                Prepared::WebFetch(fetch::parse(&args.url)?)
+            }
             Tool::Note => {
                 #[derive(serde::Deserialize)]
                 struct Note {
@@ -1247,6 +1289,7 @@ impl Registry {
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
+            Prepared::WebFetch(url) => Ok(self.fetched(fetch::fetch(url).await?)),
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -1365,6 +1408,48 @@ impl Registry {
 }
 
 impl Registry {
+    /// A fetched page's result: its text up to the preview, the whole of
+    /// it kept as the `text` artifact past that.
+    fn fetched(&self, page: fetch::Page) -> Outcome {
+        let mut artifacts = Vec::new();
+        let mut text = self.redact(page.text);
+        // Kept as a shell stream is: at most its first and last `KEPT_END`.
+        let mut dropped = 0;
+        if text.len() > ARTIFACT_BYTES {
+            let head = boundary(&text, KEPT_END);
+            let tail = boundary(&text, text.len() - KEPT_END);
+            dropped = (tail - head) as u64;
+            text = format!(
+                "{}\n[... {dropped} bytes dropped: past 1 MiB only the first and last {KEPT_END} bytes of this page are kept ...]\n{}",
+                &text[..head],
+                &text[tail..]
+            );
+        }
+        let shown = if text.len() <= PREVIEW_BYTES {
+            text
+        } else {
+            let shown = truncate(&text, dropped);
+            artifacts.push(("text", text.into_bytes()));
+            shown
+        };
+        let success = (200..300).contains(&page.status);
+        let mut output = json!({"url":page.url,"status":page.status,
+            "content_type":page.content_type,"text":shown});
+        if let Some(title) = page.title {
+            output["title"] = json!(self.redact(title));
+        }
+        if page.cut {
+            output["cut"] = json!("the page ends past 4 MiB; only its start was read");
+        }
+        Outcome {
+            output: output.to_string(),
+            artifacts,
+            images: Vec::new(),
+            note: None,
+            failed: !success,
+        }
+    }
+
     fn shell_outcome(
         &self,
         stdout: Captured,
@@ -1825,8 +1910,10 @@ fn sh(
         process.env_remove(name);
     }
     // No command has a terminal: plain output and no pager, as other
-    // harnesses run commands. What the caller or bot sets still wins.
+    // harnesses run commands. AI_AGENT tells tools an agent runs them, as
+    // fx sets it. What the caller or bot sets still wins.
     for (name, value) in [
+        ("AI_AGENT", "agent"),
         ("TERM", "dumb"),
         ("NO_COLOR", "1"),
         ("PAGER", "cat"),

@@ -208,8 +208,9 @@ which model new projects use. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
 which Sonny applies to the daemon and everything else it starts, so nothing
 goes in your shell profile. Bots search the web where their provider offers
-it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Put
-`web_search = "disabled"` in `config.toml` to leave it out of new bots.
+it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Every
+bot can also read a page with `web_fetch`, which the daemon runs itself. Put
+`web_search = "disabled"` in `config.toml` to leave both out of new bots.
 
 ## How fast is it?
 
