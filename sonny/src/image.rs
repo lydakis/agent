@@ -10,7 +10,7 @@ use ratatui::{
 };
 use resvg::{tiny_skia, usvg};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Write,
     sync::{Arc, Mutex, OnceLock, atomic::AtomicU32, atomic::Ordering},
 };
@@ -89,19 +89,60 @@ pub fn show(drawn: Drawn) -> Vec<Line<'static>> {
     let id = next_id();
     let rows = placeholders(id, drawn.cols, drawn.rows);
     let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-    waiting.get_or_insert_with(HashMap::new).insert(id, drawn);
+    waiting.get_or_insert_with(Waiting::default).add(id, drawn);
     rows
 }
 
+/// How many bytes of pictures not yet shown are kept; past it the oldest
+/// are sent now, as every picture was before, so rows dropped or a pane
+/// left behind never hold their pictures here for good.
+const WAITING_BYTES: usize = 64 << 20;
+
 /// Pictures made and not yet sent, by image id: a long history's are
 /// many, and only those scrolled to are sent.
-static WAITING: Mutex<Option<HashMap<u32, Drawn>>> = Mutex::new(None);
+static WAITING: Mutex<Option<Waiting>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Waiting {
+    pictures: HashMap<u32, Drawn>,
+    /// The ids in the order made, sent ones among them until pruned.
+    order: VecDeque<u32>,
+    bytes: usize,
+}
+
+impl Waiting {
+    fn add(&mut self, id: u32, drawn: Drawn) {
+        self.bytes += drawn.png.len();
+        self.order.push_back(id);
+        if let Some(old) = self.pictures.insert(id, drawn) {
+            self.bytes -= old.png.len();
+        }
+        while self.bytes > WAITING_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.send(oldest);
+        }
+        if self.order.len() > 2 * self.pictures.len() + 16 {
+            let pictures = &self.pictures;
+            self.order.retain(|id| pictures.contains_key(id));
+        }
+    }
+
+    fn send(&mut self, id: u32) {
+        if let Some(drawn) = self.pictures.remove(&id) {
+            self.bytes -= drawn.png.len();
+            // A picture the terminal would not take shows as its cells.
+            let _ = send(id, drawn.cols, drawn.rows, &drawn.png);
+        }
+    }
+}
 
 /// Send the pictures `buf` shows that the terminal does not have yet,
 /// before the frame that shows them is written.
 pub fn send_shown(buf: &Buffer) {
     let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(waiting) = waiting.as_mut().filter(|w| !w.is_empty()) else {
+    let Some(waiting) = waiting.as_mut().filter(|w| !w.pictures.is_empty()) else {
         return;
     };
     for cell in &buf.content {
@@ -111,18 +152,8 @@ pub fn send_shown(buf: &Buffer) {
         let Color::Rgb(r, g, b) = cell.fg else {
             continue;
         };
-        let id = u32::from_be_bytes([0, r, g, b]);
-        if let Some(drawn) = waiting.remove(&id) {
-            // A picture the terminal would not take shows as its cells.
-            let _ = send(id, drawn.cols, drawn.rows, &drawn.png);
-        }
+        waiting.send(u32::from_be_bytes([0, r, g, b]));
     }
-}
-
-/// The pictures not yet sent let go: the rows that showed them are gone.
-pub fn forget_waiting() {
-    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-    *waiting = None;
 }
 
 /// What a picture shown with [`show_linked`] opens, by its image id.

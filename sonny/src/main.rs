@@ -2626,7 +2626,6 @@ impl App {
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
-        image::forget_waiting();
         if !full() {
             execute!(
                 std::io::stdout(),
