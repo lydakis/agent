@@ -570,7 +570,13 @@ pub async fn open(
                     lead_short(&bot)
                 ));
             }
-            create(client, &dir, model, Some(&bot)).await?;
+            // Made by another thread since the look above: theirs.
+            if !create(client, &dir, model, Some(&bot)).await? {
+                return Err(format!(
+                    "lead_exists: {bot} is there already; /lead {} opens it",
+                    lead_short(&bot)
+                ));
+            }
             Ok(Lead {
                 project,
                 bot,
@@ -580,20 +586,49 @@ pub async fn open(
             })
         }
     };
-    let free = |leads: &[Value], stem: &str| -> String {
-        let taken = |bot: &str| leads.iter().any(|b| b["name"] == bot);
+    // The first name free of `taken` from `stem`, numbered from 2, cut so
+    // the number fits.
+    let free = |taken: &[String], stem: &str| -> String {
         let mut n = 2;
         loop {
-            let name = match stem {
-                "" => n.to_string(),
-                stem => format!("{stem}-{n}"),
+            let number = n.to_string();
+            let room = 32 - number.len() - 1;
+            let cut = stem
+                .get(..stem.len().min(room))
+                .unwrap_or("")
+                .trim_end_matches('-');
+            let name = match cut {
+                "" => number,
+                cut => format!("{cut}-{number}"),
             };
             let bot = lead_bot(&project, &name);
-            if !taken(&bot) {
+            if !taken.contains(&bot) {
                 return bot;
             }
             n += 1;
         }
+    };
+    // A new lead under the first free name: one another thread takes
+    // meanwhile is passed over.
+    let fresh = |stem: String, first_try: Option<String>| async move {
+        let mut taken: Vec<String> = (existing().await?.iter())
+            .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+            .collect();
+        let mut bot = first_try
+            .filter(|bot| !taken.contains(bot))
+            .unwrap_or_else(|| free(&taken, &stem));
+        for _ in 0..8 {
+            match make(bot.clone()).await {
+                Err(error) if error.starts_with("lead_exists") => {
+                    taken.push(bot);
+                    bot = free(&taken, &stem);
+                }
+                made => return made,
+            }
+        }
+        Err(format!(
+            "lead_exists: no free name for a new lead from {stem}"
+        ))
     };
     let bot = match pick {
         Pick::Named(name) => {
@@ -606,16 +641,11 @@ pub async fn open(
             bot
         }
         Pick::New(Some(name)) => return make(lead_bot(&project, name)).await,
-        Pick::New(None) => return make(free(&existing().await?, "")).await,
+        Pick::New(None) => return fresh(String::new(), None).await,
         Pick::Thread(words) => {
-            let leads = existing().await?;
             let stem = lead_name_from(words);
             let bot = lead_bot(&project, &stem);
-            let bot = match leads.iter().any(|b| b["name"] == bot.as_str()) {
-                true => free(&leads, &stem),
-                false => bot,
-            };
-            return make(bot).await;
+            return fresh(stem, Some(bot)).await;
         }
         Pick::Last => last_lead(&dir)
             .filter(|bot| lead_project(bot) == Some(project.as_str()))
@@ -737,13 +767,14 @@ async fn newest(client: &Client) -> Result<Option<String>, String> {
     }
 }
 
-/// Make the folder's first lead, or `bot`, another lead of it.
+/// Make the folder's first lead, or `bot`, another lead of it: whether
+/// this made it, not found it there already.
 async fn create(
     client: &Client,
     dir: &Path,
     model: Option<&str>,
     bot: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let role = role(dir)?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
@@ -781,7 +812,8 @@ async fn create(
         fallbacks: config.fallbacks,
         ..Default::default()
     };
-    make(client, dir, &role, &picks, bot).await.map(|_| ())
+    let made = make(client, dir, &role, &picks, bot).await?;
+    Ok(made["created"] == true)
 }
 
 /// Make the project in `dir` with its lead in `role`, told the task rule;

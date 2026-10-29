@@ -690,8 +690,9 @@ fn reopen(bot: &str) -> Vec<String> {
         }
     }
     let named = std::env::args().any(|arg| arg == "--bot");
+    // A lead by its name, the first one too, so a pane restored later
+    // opens the same lead, whichever the folder opens by then.
     match project::lead_project(bot) {
-        Some(_) if !named && bot.ends_with(".lead") => {}
         Some(_) if !named => command.extend(["--lead".into(), project::lead_short(bot).into()]),
         _ => command.extend(["--bot".into(), bot.to_owned()]),
     }
