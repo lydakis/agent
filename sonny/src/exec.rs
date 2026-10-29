@@ -32,6 +32,10 @@ const PRAGMA: &str = "// @exec:";
 /// expiry say less.
 const MEMORY: usize = 256 << 20;
 pub const TIMEOUT: Duration = Duration::from_secs(600);
+/// Scripts that run at once in the lookout, so that agents' scripts at the
+/// memory cap hold at most a gigabyte; the rest wait their turn.
+const SCRIPTS: usize = 4;
+static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SCRIPTS);
 /// The output a script returns, in tokens of about four bytes, unless its
 /// options line says otherwise.
 const OUTPUT_TOKENS: usize = 10_000;
@@ -448,6 +452,9 @@ async fn run(
     left: Duration,
 ) -> Result<String, String> {
     let script = parse(input)?;
+    let waiting = Instant::now();
+    let _running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
+    let left = left.saturating_sub(waiting.elapsed());
     let mut nested: BTreeMap<String, Nested> = BTreeMap::new();
     let mut listed = Vec::new();
     let mut failed = Vec::new();
@@ -1172,19 +1179,19 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             "{said}"
         );
         assert!(said.ends_with("mcp__test__echo,mcp__test__add,mcp__test__fail,mcp__test__slow"));
-        // Fan-out runs at once: four calls of 300 ms in well under 1.2 s.
-        let started = Instant::now();
-        ran(
+        // Fan-out runs at once: four calls of 300 ms in well under 1.2 s,
+        // by the script's own clock, which starts once it may run.
+        let fanned = ran(
             &hub,
             &dir,
             "await Promise.all([1,2,3,4].map(() => tools.mcp__test__slow({ms: 300})));",
         )
         .await;
-        assert!(
-            started.elapsed() < Duration::from_millis(1000),
-            "{:?}",
-            started.elapsed()
-        );
+        let wall: f64 = (fanned.split("Wall time ").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap();
+        assert!(wall < 1.0, "{fanned}");
         // One server process served every call, kept up between scripts.
         let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
         assert_eq!(starts.lines().count(), 1, "{starts}");
@@ -1279,6 +1286,34 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
         );
         let after = ran(&hub, &dir, "text('next');").await;
         assert!(after.ends_with("next") && started.elapsed() < Duration::from_secs(5));
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn scripts_past_the_running_limit_wait_their_turn() {
+        let dir = scratch("running");
+        let hub = hub(&dir).await;
+        let slept = "await tools.mcp__test__slow({ms: 400}); text('done');";
+        let started = Instant::now();
+        assert_eq!(SCRIPTS, 4);
+        let (a, b, c, d, e) = tokio::join!(
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept)
+        );
+        let all = [a, b, c, d, e];
+        assert!(
+            all.iter().all(|said| said.ends_with("Output:\ndone")),
+            "{all:?}"
+        );
+        // One more than may run at once ran after the first finished.
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
         hub.stop().await;
     }
 
