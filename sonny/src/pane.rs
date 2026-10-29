@@ -1,8 +1,8 @@
-//! The pane beside the conversation, where what the
-//! person opens to look at goes instead of over the conversation: a file
-//! they clicked, as a preview, `/status`, or a side chat. Its rows are a [`Screen`] of
-//! their own, so they scroll, select, copy and follow links as the
-//! conversation's do.
+//! The pane beside the conversation on the full screen: the margin, with
+//! the agent's notes, and laid over it what the person opens to look at
+//! instead of over the conversation: a file they clicked, as a preview,
+//! `/status`, or a side chat. Its rows are a [`Screen`] of their own, so
+//! they scroll, select, copy and follow links as the conversation's do.
 use std::path::{Path, PathBuf};
 
 use ratatui::{
@@ -18,6 +18,11 @@ use crate::screen::Screen;
 /// The narrowest the conversation and the pane are side by side; a
 /// window narrower than both shows one of them at a time.
 pub const NARROWEST: u16 = 50;
+/// The narrowest the margin is shown by itself, beside a conversation
+/// that has all it is written at.
+pub const MARGIN: u16 = 40;
+/// What the keys do in the margin.
+pub const MARGIN_KEYS: &str = "esc closes";
 /// The most of a file read for its preview, and the most lines shown.
 const MOST_BYTES: u64 = 4 << 20;
 const MOST_LINES: usize = 9_000;
@@ -34,6 +39,14 @@ pub fn width(width: u16, prose: u16) -> u16 {
     }
     let rest = width - 1;
     (rest / 2).max(rest.saturating_sub(prose))
+}
+
+/// How wide the margin is by itself in a window `width` columns wide,
+/// beside a conversation written at most `prose` wide: what the
+/// conversation leaves, when that is at least [`MARGIN`].
+pub fn margin_width(width: u16, prose: u16) -> Option<u16> {
+    let rest = width.checked_sub(prose + 1)?;
+    (rest >= MARGIN).then_some(rest)
 }
 
 pub struct Pane {
@@ -68,6 +81,14 @@ pub struct Pane {
     /// A folder, drawn as a tree its folders open and close in.
     tree: Option<crate::tree::Tree>,
     width: usize,
+    /// The margin's first row in place of a title, and its buttons.
+    head: Option<(Line<'static>, crate::screen::Buttons)>,
+    /// The marks the margin's lines were last set with.
+    marks: Vec<(usize, crate::screen::Mark)>,
+    /// It is the margin, not something opened over it.
+    margin: bool,
+    /// The margin is under it, which its title's arrow goes back to.
+    pub over: bool,
 }
 
 impl Pane {
@@ -129,6 +150,10 @@ impl Pane {
             forward: Vec::new(),
             tree,
             width,
+            head: None,
+            marks: Vec::new(),
+            margin: false,
+            over: false,
         })
     }
 
@@ -202,7 +227,9 @@ impl Pane {
         if row != self.area.y || (self.back.is_empty() && self.forward.is_empty()) {
             return None;
         }
-        match column.checked_sub(self.area.x)? {
+        // After the margin's ←, when there is one.
+        let at = column.checked_sub(self.area.x + 2 * self.over as u16)?;
+        match at {
             1 => Some(true),
             3 => Some(false),
             _ => None,
@@ -227,6 +254,10 @@ impl Pane {
             forward: Vec::new(),
             tree: None,
             width: 0,
+            head: None,
+            marks: Vec::new(),
+            margin: false,
+            over: false,
         }
     }
 
@@ -248,6 +279,10 @@ impl Pane {
             forward: Vec::new(),
             tree: None,
             width: 0,
+            head: None,
+            marks: Vec::new(),
+            margin: false,
+            over: false,
         }
     }
 
@@ -257,9 +292,51 @@ impl Pane {
         (self.area.x + 1, self.area.y + 2)
     }
 
-    /// Whether this is a card, not a file.
+    /// The margin: the agent's notes, under a glance line.
+    pub fn margin() -> Self {
+        Self {
+            margin: true,
+            ..Self::card("margin", MARGIN_KEYS)
+        }
+    }
+
+    /// Whether this is a card the app draws, not a file or the margin.
     pub fn is_card(&self) -> bool {
-        self.card.is_some()
+        self.card.is_some() && !self.margin
+    }
+
+    pub fn is_margin(&self) -> bool {
+        self.margin
+    }
+
+    /// The margin's lines, with their tags and buttons, put in only when
+    /// they changed, as [`Pane::set_card`] puts a card's; and its first row.
+    pub fn set_margin(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        marks: Vec<(usize, crate::screen::Mark)>,
+        head: (Line<'static>, crate::screen::Buttons),
+    ) {
+        self.head = Some(head);
+        // The same rows for another note still point at the other note.
+        if self.card.as_ref() != Some(&lines) || self.marks != marks {
+            self.screen.replace_marked(lines.clone(), marks.clone());
+            self.card = Some(lines);
+            self.marks = marks;
+        }
+    }
+
+    /// The button under `column` on the title row, if any: the margin's
+    /// glance, or the arrow back to the margin.
+    pub fn head_button(&self, column: u16) -> Option<String> {
+        let at = column.checked_sub(self.area.x)?;
+        if self.over && at < 3 {
+            return Some(format!("{}back", crate::screen::BUTTON));
+        }
+        let (_, buttons) = self.head.as_ref()?;
+        (buttons.iter())
+            .find(|(from, to, _)| (*from..*to).contains(&at))
+            .map(|(.., url)| url.clone())
     }
 
     /// A card's lines, put in only when they changed, so a selection in
@@ -317,8 +394,12 @@ impl Pane {
         } else {
             style = style.add_modifier(Modifier::BOLD);
         }
-        // ‹ › go back and forward, while there is somewhere to go.
+        // ← goes back to the margin under it, and ‹ › back and forward,
+        // while there is somewhere to go.
         let mut head = vec![Span::raw(" ")];
+        if self.over {
+            head.push(Span::raw("← "));
+        }
         if !self.back.is_empty() || !self.forward.is_empty() {
             let arrow = |text, there: bool| match there {
                 true => Span::raw(text),
@@ -329,14 +410,32 @@ impl Pane {
             head.push(arrow("›", !self.forward.is_empty()));
             head.push(Span::raw(" "));
         }
-        let used: usize = head.iter().map(|s| s.content.width()).sum();
-        let room = (area.width as usize).saturating_sub(used + keys.width());
-        let title = crate::transcript::cut(&self.title, room);
-        let gap = (area.width as usize).saturating_sub(used + title.width() + keys.width());
-        head.push(Span::styled(title, style));
-        head.push(Span::raw(" ".repeat(gap)));
-        head.push(Span::raw(keys).dim());
-        let head = Line::from(head);
+        let head = match &self.head {
+            // The margin's glance in place of a title, its keys after.
+            Some((glance, _)) => {
+                let room = (area.width as usize).saturating_sub(keys.width() + 1);
+                let cut = crate::transcript::cut(&glance.to_string(), room);
+                let mut spans = match cut.width() < glance.width() {
+                    true => vec![Span::raw(cut)],
+                    false => glance.spans.clone(),
+                };
+                let gap =
+                    (area.width as usize).saturating_sub(glance.width().min(room) + keys.width());
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.push(Span::raw(keys).dim());
+                Line::from(spans)
+            }
+            None => {
+                let used: usize = head.iter().map(|s| s.content.width()).sum();
+                let room = (area.width as usize).saturating_sub(used + keys.width());
+                let title = crate::transcript::cut(&self.title, room);
+                let gap = (area.width as usize).saturating_sub(used + title.width() + keys.width());
+                head.push(Span::styled(title, style));
+                head.push(Span::raw(" ".repeat(gap)));
+                head.push(Span::raw(keys).dim());
+                Line::from(head)
+            }
+        };
         buf.set_line(area.x, area.y, &head, area.width);
         // A row between the name and what it holds, and above the foot.
         let mut rows = Rect {
@@ -768,6 +867,13 @@ mod tests {
         let mut card = Pane::card("/status", "esc closes");
         assert!(!rows(&mut card, 30, 2)[0].contains('‹'));
         assert_eq!(card.on_arrow(1, 0), None);
+        // Over the margin, its ← comes first and the arrows after it.
+        a.over = true;
+        assert!(rows(&mut a, 60, 3)[0].starts_with(" ← ‹ › a.md"));
+        assert_eq!(a.head_button(1).as_deref(), Some("sonny:back"));
+        assert_eq!(a.on_arrow(1, 0), None);
+        assert_eq!(a.on_arrow(3, 0), Some(true));
+        assert_eq!(a.on_arrow(5, 0), Some(false));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -885,5 +991,21 @@ mod tests {
         assert_eq!(shown[4], "  Some code.");
         assert_eq!(shown[6], "    fn a() {}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_same_rows_for_another_note_point_at_it() {
+        use crate::screen::{Mark, Tag};
+        let mut pane = Pane::margin();
+        let lines = vec![Line::from(" ✎ Repro")];
+        let head = (Line::from("calc"), Vec::new());
+        pane.set_margin(
+            lines.clone(),
+            vec![(0, Mark::Tag(Tag::Note(1)))],
+            head.clone(),
+        );
+        pane.set_margin(lines, vec![(0, Mark::Tag(Tag::Note(2)))], head);
+        assert!(pane.screen.show_tagged(Tag::Note(2), 0));
+        assert!(!pane.screen.show_tagged(Tag::Note(1), 0));
     }
 }
