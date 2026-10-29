@@ -34,6 +34,10 @@ const INVALID_PARAMS: i64 = -32602;
 const NOT_FOUND: i64 = -32601;
 const FAILED: i64 = -32603;
 
+/// The model picker's first choice: the model the thread's bot runs, or
+/// the one Sonny gives a new lead.
+const DEFAULT_MODEL: &str = "default";
+
 /// `sonny acp [--store PATH] [--socket PATH]`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let (mut store, mut socket) = (None, None);
@@ -196,6 +200,10 @@ impl Agent {
                 Some(session) => session.prompt(&self, id, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
             },
+            "session/set_config_option" => match self.session(params) {
+                Some(session) => session.set_option(&self, params).await,
+                None => Err((INVALID_PARAMS, "no such session".into())),
+            },
             "session/close" => {
                 let closed = params["sessionId"].as_str().and_then(|session| {
                     self.sessions
@@ -250,6 +258,38 @@ impl Agent {
     /// Whether the client follows work the agent starts on its own.
     fn v2(&self) -> bool {
         self.version.load(Ordering::Relaxed) >= 2
+    }
+
+    /// A thread's options: its model, picked from `~/.agent/models` as
+    /// `agent models` lists it, with Sonny's own choice first. A bot's
+    /// thread offers only its family's, since a bot changes model only
+    /// within it; `bound` is the model the bot runs and the daemon's
+    /// providers.
+    fn options(&self, value: &str, bound: Option<(&str, &Value)>) -> Value {
+        let listed = agent_client::models::path()
+            .and_then(|path| agent_client::models::read(&path).ok())
+            .unwrap_or_default();
+        let mut choices = vec![json!({"value": DEFAULT_MODEL, "name": "Default",
+            "description": "The model the lead or task runs, or the one Sonny gives a new lead"})];
+        for model in listed {
+            if let Some((current, providers)) = bound
+                && family(providers, &model.id) != family(providers, current)
+            {
+                continue;
+            }
+            let mut choice = json!({"value": model.id, "name": model.id});
+            if let Some(note) = model.note {
+                choice["description"] = json!(note);
+            }
+            choices.push(choice);
+        }
+        if !choices.iter().any(|choice| choice["value"] == value) {
+            choices.push(json!({"value": value, "name": value}));
+        }
+        let mut option = json!({"name": "Model", "category": "model", "type": "select",
+            "currentValue": value, "options": choices});
+        option[if self.v2() { "configId" } else { "id" }] = json!("model");
+        json!([option])
     }
 
     /// The daemon, started as `sonny` starts it, with Sonny's skills
@@ -308,9 +348,10 @@ impl Agent {
             }
             return Err((FAILED, error));
         }
+        let options = session.options(self).await;
         Ok(match resumed {
-            Some(_) => json!({}),
-            None => json!({"sessionId": id}),
+            Some(_) => json!({"configOptions": options}),
+            None => json!({"sessionId": id, "configOptions": options}),
         })
     }
 }
@@ -359,6 +400,9 @@ struct State {
     /// The last steer a running turn took in, and that turn: for a prompt
     /// whose steer went in before its turn was named.
     steered: Option<(i64, i64)>,
+    /// The model the person picked, which the bot takes when it is next
+    /// idle; a new lead starts on it.
+    picked: Option<String>,
 }
 
 struct Bound {
@@ -369,6 +413,9 @@ struct Bound {
     workspace: String,
     /// The folder a moved lead comes back to with its next turn.
     moving: Option<String>,
+    /// `provider/model`, as the daemon names it, and its effort.
+    model: String,
+    effort: Option<String>,
 }
 
 impl Session {
@@ -391,7 +438,8 @@ impl Session {
                 (bot, project, None)
             }
             None => {
-                let lead = project::open(&client, &self.cwd, None).await?;
+                let picked = self.state.lock().await.picked.clone();
+                let lead = project::open(&client, &self.cwd, picked.as_deref()).await?;
                 let moving = lead.moving.as_ref().map(|dir| dir.display().to_string());
                 setup_lead(agent, &self.id, &client, &lead, moving.as_deref()).await?;
                 (lead.bot, Some(lead.project), moving)
@@ -424,6 +472,12 @@ impl Session {
             .map_err(|e| e.to_string())?;
         let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
         let running = record["running_turn"].as_i64();
+        let model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or(""),
+            record["model"].as_str().unwrap_or("")
+        );
+        let effort = record["effort"].as_str().map(str::to_owned);
         let mut calls = HashMap::new();
         for (turn, data) in started.into_values() {
             if running.is_some() && turn == running {
@@ -439,12 +493,19 @@ impl Session {
             state.running = running;
             state.calls = calls;
             state.cursor = cursor;
+            // A task keeps the model its lead gave it, whatever T3 Code
+            // picked for the thread it opened.
+            if claimed || state.picked.as_ref() == Some(&model) {
+                state.picked = None;
+            }
             state.bound = Some(Bound {
                 bot,
                 client,
                 project,
                 workspace,
                 moving,
+                model,
+                effort,
             });
             // The thread T3 Code opened for a task stands for its first
             // turn, which runs already.
@@ -452,6 +513,7 @@ impl Session {
                 state.prompt = state.prompt.take().map(|(id, _)| (id, Some(turn)));
             }
         }
+        self.show_options(agent).await;
         let (session, agent) = (self.clone(), agent.clone());
         // Calls already waiting for the person, whose events were before
         // this thread came, are put to it too.
@@ -472,6 +534,109 @@ impl Session {
             old.abort();
         }
         Ok(())
+    }
+
+    /// The thread's options as they are now.
+    async fn options(&self, agent: &Agent) -> Value {
+        let state = self.state.lock().await;
+        let bound = state.bound.as_ref();
+        let value = (state.picked.as_deref())
+            .or(bound.map(|bound| bound.model.as_str()))
+            .unwrap_or(DEFAULT_MODEL);
+        agent.options(
+            value,
+            bound.map(|bound| (bound.model.as_str(), bound.client.providers())),
+        )
+    }
+
+    async fn show_options(&self, agent: &Agent) {
+        let options = self.options(agent).await;
+        agent.out.update(
+            &self.id,
+            json!({"sessionUpdate": "config_option_update", "configOptions": options}),
+        );
+    }
+
+    /// The person picks a model. A bot's thread takes one of its family
+    /// only, at once when the bot is idle and with its next turn when it
+    /// is not; a thread that is no bot yet keeps it for the lead it makes.
+    async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
+        if params["configId"] != "model" {
+            return Err((
+                INVALID_PARAMS,
+                format!("Sonny has no option {}", params["configId"]),
+            ));
+        }
+        let Some(value) = params["value"].as_str() else {
+            return Err((INVALID_PARAMS, "a model is picked by its id".into()));
+        };
+        {
+            let mut state = self.state.lock().await;
+            let picked = match &state.bound {
+                Some(bound) if value != DEFAULT_MODEL && value != bound.model => {
+                    let providers = bound.client.providers();
+                    let wanted = family(providers, value);
+                    if wanted.is_null() {
+                        return Err((INVALID_PARAMS, format!("no provider serves {value}")));
+                    }
+                    if wanted != family(providers, &bound.model) {
+                        return Err((
+                            INVALID_PARAMS,
+                            format!(
+                                "{} stays in {}'s family: its history is in that family's shape",
+                                bound.bot, bound.model
+                            ),
+                        ));
+                    }
+                    Some(value.to_owned())
+                }
+                Some(_) => None,
+                None => (value != DEFAULT_MODEL).then(|| value.to_owned()),
+            };
+            state.picked = picked;
+        }
+        self.switch(agent)
+            .await
+            .map_err(|error| (INVALID_PARAMS, error))?;
+        Ok(json!({"configOptions": self.options(agent).await}))
+    }
+
+    /// Give an idle bot the model the person picked.
+    async fn switch(&self, agent: &Agent) -> Result<(), String> {
+        let (client, asked, model) = {
+            let state = self.state.lock().await;
+            let (Some(bound), Some(model), None) = (&state.bound, &state.picked, state.running)
+            else {
+                return Ok(());
+            };
+            let asked = json!({"bot": bound.bot, "model": model, "effort": bound.effort});
+            (bound.client.clone(), asked, model.clone())
+        };
+        let answer = client.request("configure", asked).await;
+        let mut state = self.state.lock().await;
+        // Picked again meanwhile: that pick waits its turn.
+        if state.picked.as_ref() != Some(&model) {
+            return Ok(());
+        }
+        match answer {
+            Ok(_) => {
+                state.picked = None;
+                if let Some(bound) = &mut state.bound {
+                    bound.model = model;
+                }
+                drop(state);
+                self.show_options(agent).await;
+                Ok(())
+            }
+            // It took a turn meanwhile: the pick waits for the next.
+            Err(error) if error.code == "bot_busy" => Ok(()),
+            Err(error) => {
+                state.picked = None;
+                drop(state);
+                self.show_options(agent).await;
+                Err(error.to_string())
+            }
+        }
     }
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
@@ -517,6 +682,15 @@ impl Session {
                 }
                 return Ok(Value::Null);
             }
+        }
+        // A model picked while the bot worked, or before a lead that was
+        // there already: the bot takes it before this turn.
+        if let Err(error) = self.switch(agent).await {
+            agent.out.update(
+                &self.id,
+                json!({"sessionUpdate": "notice", "severity": "warning",
+                "title": "Sonny kept the model", "description": error}),
+            );
         }
         let mut state = self.state.lock().await;
         if std::mem::take(&mut state.cancelled) {
@@ -748,6 +922,20 @@ impl Session {
                     state.calls.clear();
                 }
                 state.running = turn;
+                // What the turn runs on: another client may have picked
+                // another model for the bot.
+                if let (Some(bound), Some(model)) = (&mut state.bound, data["model"].as_str())
+                    && model != bound.model
+                {
+                    bound.model = model.to_owned();
+                    bound.effort = data["effort"].as_str().map(str::to_owned);
+                    let value = state.picked.as_deref().unwrap_or(model);
+                    let options = agent.options(value, Some((model, client.providers())));
+                    out.update(
+                        id,
+                        json!({"sessionUpdate": "config_option_update", "configOptions": options}),
+                    );
+                }
                 let ours = match &mut state.prompt {
                     Some((_, at @ None)) => {
                         *at = turn;
@@ -1382,6 +1570,15 @@ fn text_content(text: &str) -> Value {
 }
 
 /// At most `OUTPUT_BYTES` of a call's output, on a character boundary.
+/// The family a `provider/model` belongs to, as the daemon's providers
+/// say: null for a provider it does not serve.
+fn family<'a>(providers: &'a Value, model: &str) -> &'a Value {
+    let provider = model
+        .split_once('/')
+        .map_or(model, |(provider, _)| provider);
+    &providers[provider]["family"]
+}
+
 fn cut(text: &str) -> String {
     if text.len() <= OUTPUT_BYTES {
         return text.to_owned();
