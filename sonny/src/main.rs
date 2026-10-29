@@ -3093,7 +3093,29 @@ impl App {
                 .request("turns", json!({"bot": bot, "newest": true, "limit": 8}))
                 .await;
             let state = match read {
-                Ok(page) => started::state(&self.task_turn(&page).await),
+                Ok(page) => {
+                    let turn = self.task_turn(&page).await;
+                    let state = started::state(&turn);
+                    // A turn that ended on a question waits on the person,
+                    // as `/status` says; read once per turn it ended.
+                    match (state.as_str(), turn["turn"].as_i64()) {
+                        ("done", Some(last)) => {
+                            let seen = match self.asks_seen.get(&bot) {
+                                Some((at, seen)) if *at == last => seen.clone(),
+                                _ => {
+                                    let seen = self.scan(&bot, Some(last)).await;
+                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                    seen
+                                }
+                            };
+                            match seen.ask.is_some() && !seen.itself {
+                                true => "needs you".to_owned(),
+                                false => state,
+                            }
+                        }
+                        _ => state,
+                    }
+                }
                 Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
                 // Not read this time: it stays as it was.
                 Err(_) => continue,
@@ -9085,6 +9107,37 @@ mod tests {
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ✓ quiet  done    Fix quiet");
         assert_eq!(rows[2], "  ✗ bad    failed  Fix bad");
+    }
+
+    #[tokio::test]
+    async fn a_task_that_ended_on_a_question_needs_you() {
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scanned = scans.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"nodes": [{"node": 3, "turn": 1}]})
+            }
+            Some("history_items") => {
+                let arguments = json!({"question": "Merge?", "options": [
+                    {"label": "Yes", "explanation": "Now."},
+                    {"label": "No", "explanation": "Later."}]});
+                json!({"items": [{"node": 3, "item": {"type": "function_call", "name": "ask",
+                    "call_id": "a1", "arguments": arguments.to_string()}}]})
+            }
+            _ => json!({"turns": [{"turn": 1, "status": "completed"}]}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"name": "ask", "brief": "Fix ask"});
+        app.commit_call("c", served::START, &arguments, "turn:calc.ask/1", false);
+        app.read_tasks().await;
+        assert_eq!(drawn(&mut app)[1], "  ● ask  needs you  Fix ask");
+        // Its history is read once for the turn it ended.
+        app.tasks_read = None;
+        app.read_tasks().await;
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
