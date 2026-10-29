@@ -223,6 +223,10 @@ pub struct Settings {
     /// Whether a workspace-write sandbox reaches the network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
+    /// Whether a prompt another bot or a named client sent reaches the
+    /// model without the line saying so after its words.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_senders: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -381,7 +385,8 @@ impl Settings {
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
-            "sandbox":self.sandbox,"writable":self.writable,"network":self.network})
+            "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
+            "hide_senders":self.hide_senders})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -1424,6 +1429,28 @@ fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> 
         .map(|(key, request)| json!({"request_id":key,"request":request}).to_string())
 }
 /// An offset must start a character: page from a returned `next_offset`.
+/// Matches one history search lists.
+const HISTORY_MATCHES: usize = 20;
+/// Item bytes one history search reads before it stops at a turn's start.
+const HISTORY_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
+const HISTORY_QUERY_BYTES: usize = 256;
+/// Text shown on each side of a history search's match.
+const HISTORY_AROUND_BYTES: usize = 160;
+
+/// The match at `at`, `len` bytes long, with up to `HISTORY_AROUND_BYTES`
+/// on each side, cut at character boundaries.
+fn around(text: &str, at: usize, len: usize) -> String {
+    let mut start = at.saturating_sub(HISTORY_AROUND_BYTES);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + len + HISTORY_AROUND_BYTES).min(text.len());
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    text[start..end].to_owned()
+}
+
 fn inside_character(code: &str) -> Error {
     Error::with(
         code,
@@ -4299,12 +4326,6 @@ impl Database {
         // one JSONL record even when its original response spans multiple lines.
         // Already single-line items need no rewrite (escaped newlines are fine).
         // Pictures go without their bytes, as other history reads return them.
-        const READING_ITEM: &str = "CASE
-            WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
-             AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
-            THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
-            WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
-            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
         let mut length = self.conn.prepare_cached(&format!(
             "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
         ))?;
@@ -4365,6 +4386,99 @@ impl Database {
             json!({"turn":turn_seq,"format":"jsonl","offset":offset,"next_offset":next,
             "items":items,"truncated":!done,"done":done,"text":text}),
         )
+    }
+
+    /// Search a bot's history, newest first, for literal text, ignoring
+    /// ASCII case: each match's turn, its item's type, and the text around
+    /// it in the view `history_read` pages. With `own`, the turn the search
+    /// runs in is left out, since it is the caller's own and holds the
+    /// call itself. With `before`, the search starts at the turn before
+    /// that one. It ends at a turn's start once `HISTORY_MATCHES` matches
+    /// are listed or `HISTORY_SEARCH_BYTES` of items are searched, naming
+    /// that turn as `next_before` to continue from.
+    pub fn history_search(
+        &self,
+        name: &str,
+        query: &str,
+        before: Option<i64>,
+        own: bool,
+    ) -> Result<Value> {
+        if query.is_empty() || query.len() > HISTORY_QUERY_BYTES {
+            return fail_with(
+                "invalid_history_search",
+                format!("query must be 1 to {HISTORY_QUERY_BYTES} bytes"),
+            );
+        }
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        let needle = query.to_ascii_lowercase();
+        // Ordered by depth, the walk yields the head first and ends at the
+        // root, so a search that finds enough stops early.
+        let mut chain = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth,turn_seq,size) AS (
+                SELECT id,parent,depth,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,COALESCE(length(n.item),0)
+                FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
+             SELECT id,turn_seq,size FROM chain",
+        )?;
+        // SQLite's lower() folds ASCII only, as to_ascii_lowercase does. A
+        // multiline item reads with its whitespace compacted, so text the
+        // view has may not be in the item as stored: the view decides.
+        let mut contains = self.conn.prepare_cached(
+            "SELECT instr(item,x'0a')>0 OR instr(item,x'0d')>0
+                OR instr(lower(CAST(item AS TEXT)),?2)>0 FROM nodes WHERE id=?1",
+        )?;
+        // The raw item may match only in what the view leaves out, such as
+        // a picture's bytes, so a match counts once the view has it too.
+        let mut reading = self.conn.prepare_cached(&format!(
+            "SELECT CAST({READING_ITEM} AS TEXT),json_extract(CAST(item AS TEXT),'$.type')
+             FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+        ))?;
+        let mut rows = chain.query(params![head])?;
+        let mut skipping = own || before.is_some();
+        let mut found: Vec<Value> = Vec::new(); // In the turn being walked.
+        let mut matches: Vec<Value> = Vec::new();
+        let mut searched = 0_u64;
+        let mut next_before = None;
+        while let Some(row) = rows.next()? {
+            let (id, turn, size): (i64, Option<i64>, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            if skipping {
+                if let Some(turn) = turn
+                    && before.is_none_or(|before| before == turn)
+                {
+                    skipping = false;
+                }
+                continue;
+            }
+            searched += size as u64;
+            if matches.len() + found.len() < HISTORY_MATCHES
+                && contains.query_row(params![id, needle], |r| r.get::<_, bool>(0))?
+            {
+                let (text, kind): (String, Option<String>) =
+                    reading.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                if let Some(at) = text.to_ascii_lowercase().find(&needle) {
+                    found.push(json!({"type":kind,"text":around(&text, at, needle.len())}));
+                }
+            }
+            let Some(turn) = turn else { continue };
+            matches.extend(found.drain(..).map(|mut found| {
+                found["turn"] = json!(turn);
+                found
+            }));
+            if turn > 1 && (matches.len() >= HISTORY_MATCHES || searched >= HISTORY_SEARCH_BYTES) {
+                next_before = Some(turn);
+                break;
+            }
+        }
+        if skipping && before.is_some() {
+            return fail("turn_not_in_history");
+        }
+        Ok(json!({"bot":name,"query":query,"matches":matches,
+            "done":next_before.is_none(),"next_before":next_before}))
     }
 
     /// Reconcile duplicates first, then validate the effective provider using
@@ -5022,12 +5136,22 @@ impl Database {
                 bytes += size;
                 picture_bytes += pictured_size;
                 let id: i64 = row.get(0)?;
-                let images: Option<String> = self
+                let (images, sender) = self
                     .conn
-                    .prepare_cached("SELECT images FROM turns WHERE id=?")?
-                    .query_row([id], |r| r.get(0))?;
+                    .prepare_cached(
+                        "SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?",
+                    )?
+                    .query_row([id], |r| {
+                        Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+                    })?;
                 let pictures = images_from(images.as_deref())?;
-                let prompted = prompt_item(family, &row.get::<_, String>(1)?, &pictures)?;
+                let sender = sender.filter(|_| !bot.settings.hide_senders);
+                let prompted = prompt_item(
+                    family,
+                    &row.get::<_, String>(1)?,
+                    sender.as_deref(),
+                    &pictures,
+                )?;
                 // Its pictures count at their weight, as the node will.
                 let weight = (prompted.0.len() as i64 - prompted.1.extra) as usize;
                 if weight + 1 > room_bytes || room_items == 0 {
@@ -9152,6 +9276,21 @@ fn sender_fields(
         data["origin"] = json!(origin);
     }
 }
+/// The line a prompt carries to the model after its words when another
+/// bot's turn or a named client sent it, read from a turn's `from_bot`,
+/// `from_turn` and `origin` at `at`, so the model does not take it for a
+/// person's.
+fn sent_by(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<String>> {
+    let (bot, turn, origin): (Option<String>, Option<i64>, Option<String>) =
+        (r.get(at)?, r.get(at + 1)?, r.get(at + 2)?);
+    Ok(match (bot, turn, origin) {
+        (Some(bot), Some(turn), _) => Some(format!(
+            "[Written by the agent {bot} in turn:{bot}/{turn}, not by a person.]"
+        )),
+        (_, _, Some(origin)) => Some(format!("[Sent by {origin}.]")),
+        _ => None,
+    })
+}
 /// Put a turn's user item on the lineage and mark the bot busy with it,
 /// adding who sent it to `data`, the turn's `accepted` event.
 fn start_locked(
@@ -9161,11 +9300,14 @@ fn start_locked(
     prompt: &str,
     data: &mut Value,
 ) -> Result<Option<i64>> {
-    let images: Option<String> = tx
-        .prepare_cached("SELECT images FROM turns WHERE id=?")?
-        .query_row([turn], |r| r.get(0))?;
+    let (images, sender) = tx
+        .prepare_cached("SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?")?
+        .query_row([turn], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+        })?;
     let pictures = images_from(images.as_deref())?;
-    let prompted = prompt_item(bot.family()?, prompt, &pictures)?;
+    let sender = sender.filter(|_| !bot.settings.hide_senders);
+    let prompted = prompt_item(bot.family()?, prompt, sender.as_deref(), &pictures)?;
     let head = prompt_node(tx, bot.head, &prompted, Some(turn))?;
     keep_once(tx, turn, images.as_deref())?;
     data["node"] = json!(head);
@@ -9226,6 +9368,14 @@ fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
 /// of a user item or a tool's result without their bytes, each counted in
 /// `omitted_bytes` (a data URL keeps its media type). The model is sent
 /// them whole.
+/// An item as history reads show it: one line, without reasoning's
+/// encrypted content. Applied to `item`, which `PICTURELESS` provides.
+const READING_ITEM: &str = "CASE
+    WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
+     AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
+    THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+    WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
+    ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
 const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
 THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CAST(item AS TEXT),'$.content')='array'
     THEN CAST(json_set(CAST(item AS TEXT),'$.content',(SELECT json_group_array(
@@ -10357,15 +10507,16 @@ impl Pictured {
 fn prompt_item(
     family: Family,
     prompt: &str,
+    sender: Option<&str>,
     images: &[crate::codec::Image],
 ) -> Result<(Vec<u8>, Pictured, Option<Vec<u8>>)> {
-    let item = family.user_item_with(prompt, images)?;
+    let item = family.user_item_from(prompt, sender, images)?;
     let pictured = Pictured::of(images);
     let stub = match images.len() {
         0 => None,
         count => {
             let weight = (item.len() as i64 - pictured.extra) as usize;
-            super::context::prompt_stub(family, prompt, count, weight)?
+            super::context::prompt_stub(family, prompt, sender, count, weight)?
         }
     };
     Ok((item, pictured, stub))

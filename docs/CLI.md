@@ -168,7 +168,7 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder) and `--network`; they are not daemon options, and an existing bot
+  folder), `--network` and `--hide-senders`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope
@@ -302,10 +302,10 @@ on its creator's model thinks as hard as its creator; a bot given
 `run --instructions` and `--instructions-file` set a new bot's instructions,
 with the CLI's built-in text as the default; the daemon has none. `run
 --tools LIST` chooses a new bot's tools from those the daemon registers,
-default `shell,read,write,wait,history` with the file editor its model
+default `shell,write_stdin,read,write,wait,history` with the file editor its model
 family is trained on: `apply_patch` for a Responses model, else `edit`, and
-`web_search` where the provider offers it, unless `~/.agent/config.toml` sets
-`web_search = "disabled"`. An
+`web_search` where the provider offers it and `web_fetch` for any, unless
+`~/.agent/config.toml` sets `web_search = "disabled"`. An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 Other client commands require an already running daemon.

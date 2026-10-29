@@ -1,8 +1,8 @@
-# Sonny's triggers, memory and skills
+# Sonny's triggers, memory, skills and MCP
 
 What Sonny gives every agent beyond its terminal: triggers that wake an agent
-when something happens, memory that later agents read, and the skills that
-teach agents both. [sonny/README.md](../sonny/README.md) covers the terminal
+when something happens, memory that later agents read, the skills that
+teach agents both, and the person's MCP servers, reached through scripts. [sonny/README.md](../sonny/README.md) covers the terminal
 client itself.
 
 ## Triggers
@@ -358,8 +358,8 @@ At each start Sonny writes the skills it ships into `~/.agents/skills`, where
 every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
 as a file; `memory`, what to save for later agents; `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
-Triggers); and, depending on where it runs, `pictures`, `rex-windows` or
-`herdr-panes`, and `errand`. They are normal skills, real files
+Triggers); and, depending on where it runs, `pictures`, `rex-windows`,
+`herdr-panes` or `cmux-tabs`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
 while it is as Sonny last wrote it: one the person edited, or one of that
@@ -368,6 +368,59 @@ to get Sonny's). A link the Agent app left there, into its bundle's
 `Contents/Resources/skills`, is replaced, never written through; a folder's
 own skill of the same name wins over any of them. Agents already running
 keep the index they were created with.
+
+## MCP servers
+
+The person's MCP servers live in `~/.agent/config.toml`, under Codex's key
+names so an entry can be copied across:
+
+```toml
+[sonny.mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+bearer_token_env_var = "LINEAR_TOKEN"      # from the environment or ~/.agent/env
+description = "Issues and projects in Linear"
+
+[sonny.mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]
+enabled_tools = ["browser_navigate", "browser_snapshot", "browser_click"]
+```
+
+A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
+`bearer_token_env_var` and `http_headers` (streamable HTTP), and either way
+`enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_sec`,
+`tool_timeout_sec` and `description`. `sonny mcp add NAME -- COMMAND ARGS`
+(or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
+drops it, and `sonny mcp list` starts each and says what it offers or why
+it did not start. `/mcp` in Sonny shows the same from the last listings,
+and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
+
+Agents do not get a tool per MCP tool. While any server is on, every agent
+Sonny opens has one tool, `exec`, with Codex's code mode contract
+([exec.rs](../sonny/src/exec.rs)): the model writes JavaScript, each tool is
+`await tools.mcp__SERVER__TOOL(args)` and resolves to its `CallToolResult`,
+and only what the script passes to `text()` (or `image()`, saved to a file
+whose path it names) comes back, so twenty calls and the filtering between
+them cost one result. `store` and `load` keep small values for the agent's
+later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
+them for a query. The description lists each server and declares its tools
+in TypeScript up to about 3,000 tokens; the rest are found from a script. A
+script runs in QuickJS with no files, network or timers, at most 256 MB and
+10 minutes, four at once in the lookout (more wait their turn), and returns
+at most 10,000 tokens, longer output keeping its start and end and saving
+the whole to a file; saved outputs and images are kept a week. A first
+line such as
+`// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
+
+The lookout runs the scripts and keeps the servers
+([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,
+started by the first call and stopped after ten idle minutes, with each
+server's tool list kept in `~/.agent/sonny/mcp` so agents are told of its
+tools without starting it. Servers run as the person, beside the lookout and
+outside every agent's sandbox, as Codex starts its own: a sandboxed task
+reaches them only through `exec`, which waits for a verdict as Sonny's other
+gated tools do, one per script. A turn that ends, as one the person
+interrupts, stops its script and the calls it has in flight.
 
 ## Checks
 

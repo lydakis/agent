@@ -2265,19 +2265,29 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|n| json!([n["item"]["content"][0]["text"], n["from"], n["origin"]]))
+            .map(|n| {
+                let content = &n["item"]["content"];
+                json!([
+                    content[0]["text"],
+                    content[1]["text"],
+                    n["from"],
+                    n["origin"]
+                ])
+            })
             .collect()
     };
+    // The model reads who sent each prompt no person wrote, after its words.
+    let by = format!("[Written by the agent Bob in turn:Bob/{person}, not by a person.]");
     let expected = [
-        json!(["ran", null, null]),
-        json!(["nightly", null, "schedule"]),
-        json!(["noted", null, null]),
-        json!(["then the changelog", bob, null]),
-        json!(["done", null, null]),
-        json!(["and the tests", null, null]),
-        json!(["task update", null, "tasks"]),
-        json!(["also the docs", bob, null]),
-        json!(["delegated work", bob, null]),
+        json!(["ran", null, null, null]),
+        json!(["nightly", "[Sent by schedule.]", null, "schedule"]),
+        json!(["noted", null, null, null]),
+        json!(["then the changelog", by, bob, null]),
+        json!(["done", null, null, null]),
+        json!(["and the tests", null, null, null]),
+        json!(["task update", "[Sent by tasks.]", null, "tasks"]),
+        json!(["also the docs", by, bob, null]),
+        json!(["delegated work", by, bob, null]),
     ];
     assert_eq!(senders(&db, "Carol"), expected);
     // A fork shares the nodes; the sender outlives the source's turns and
@@ -2286,6 +2296,50 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     db.delete_bot("Carol").unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     assert_eq!(senders(&db, "Branch"), expected);
+}
+
+#[test]
+fn a_bot_that_hides_senders_reads_only_the_words() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut quiet = binding();
+    quiet.settings.hide_senders = true;
+    db.create("Carol", Some("/synthetic"), quiet).unwrap();
+    let person = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let from_bob = TurnOptions {
+        from: Some(("Bob".into(), person)),
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin(
+            "Carol",
+            "b1",
+            "delegated work",
+            true,
+            &from_bob,
+            allow_provider,
+        )
+        .unwrap();
+    let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+    let item = read_item(&db, "Carol", node).unwrap();
+    assert_eq!(
+        item["content"],
+        json!([{"type": "input_text", "text": "delegated work"}])
+    );
+    assert_eq!(
+        db.inspect("Carol").unwrap().settings.resolved()["hide_senders"],
+        true
+    );
 }
 
 #[test]
@@ -3142,7 +3196,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false})
+            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false,"hide_senders":false})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -3233,6 +3287,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         inherit: true,
         answered_by: None,
         expire_ms: None,
+        grammar: None,
     };
     // The lead's own tool, which a bot it creates does not take.
     let resolve = Declared {
@@ -3243,6 +3298,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         inherit: false,
         answered_by: None,
         expire_ms: None,
+        grammar: None,
     };
     let declared = [react.clone()];
     let leads = [react.clone(), resolve];
@@ -3339,6 +3395,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         result: "ok".into(),
         answered_by: Some("sonny".into()),
         expire_ms: None,
+        grammar: None,
         inherit: true,
     };
     db.create(
@@ -5696,6 +5753,159 @@ fn history_reads_one_turn_by_ordinal_along_the_lineage() {
     );
     let window = db.window("branch", i64::MAX, 3).unwrap().unwrap();
     assert_eq!((window.omitted_items, window.omitted_turns), (6, 3));
+}
+
+/// A turn with `prompt` and one reply, left running unless `finish`.
+fn searched_turn(db: &mut Database, bot: &str, key: &str, prompt: &str, reply: &str, finish: bool) {
+    let turn = db
+        .begin(
+            bot,
+            key,
+            prompt,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant(reply)], &[], None).unwrap();
+    if finish {
+        db.finish(turn, None).unwrap();
+    }
+}
+
+#[test]
+fn history_search_finds_text_newest_first_and_continues_before_a_turn() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=30 {
+        let reply = if n % 2 == 0 {
+            format!("the NEEDLE is {n}")
+        } else {
+            format!("nothing at {n}")
+        };
+        searched_turn(
+            &mut db,
+            "Bob",
+            &format!("k{n}"),
+            &format!("task {n}"),
+            &reply,
+            true,
+        );
+    }
+    let found = db.history_search("Bob", "needle", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, (1..=15).rev().map(|n| n * 2).collect::<Vec<_>>());
+    assert_eq!(found["done"], true);
+    assert_eq!(found["next_before"], Value::Null);
+    let first = &found["matches"][0];
+    assert_eq!(first["type"], "message");
+    assert!(first["text"].as_str().unwrap().contains("the NEEDLE is 30"));
+    // A turn with more than one match lists each; past 20 the search ends
+    // at a turn's start and names it to continue from.
+    let found = db.history_search("Bob", "task 2", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, vec![29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 2]);
+    let found = db.history_search("Bob", "is", None, false).unwrap();
+    assert_eq!(found["matches"].as_array().unwrap().len(), 20);
+    assert_eq!(found["done"], false);
+    assert_eq!(found["next_before"], 11);
+    let older = db.history_search("Bob", "is", Some(11), false).unwrap();
+    assert_eq!(older["matches"][0]["turn"], 10);
+    assert_eq!(older["done"], true);
+    assert_eq!(
+        db.history_search("Bob", "is", Some(31), false)
+            .unwrap_err()
+            .code,
+        "turn_not_in_history"
+    );
+    assert_eq!(
+        db.history_search("Bob", "", None, false).unwrap_err().code,
+        "invalid_history_search"
+    );
+    // A search of the caller's own history leaves out the turn it runs in,
+    // which holds the call itself.
+    searched_turn(
+        &mut db,
+        "Bob",
+        "k31",
+        "find the needle",
+        "searching for needle",
+        false,
+    );
+    let own = db.history_search("Bob", "needle", None, true).unwrap();
+    assert_eq!(own["matches"][0]["turn"], 30);
+    let other = db.history_search("Bob", "needle", None, false).unwrap();
+    assert_eq!(other["matches"][0]["turn"], 31);
+    assert_eq!(other["matches"][1]["turn"], 31);
+}
+
+#[test]
+fn history_search_follows_the_lineage_of_a_fork() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    searched_turn(&mut db, "Bob", "k1", "shared fact", "ok", true);
+    db.fork(
+        "Bob",
+        "branch",
+        Fork {
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    searched_turn(&mut db, "branch", "k2", "branch fact", "ok", true);
+    let found = db.history_search("branch", "fact", None, false).unwrap();
+    let turns: Vec<i64> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["turn"].as_i64().unwrap())
+        .collect();
+    assert_eq!(turns, vec![2, 1]);
+    // A multiline item is searched as history reads show it, compacted.
+    let turn = db
+        .begin(
+            "branch",
+            "k3",
+            "multiline",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let item = "{\n  \"type\": \"message\",\n  \"role\": \"assistant\",\n  \"content\": [{\"type\": \"output_text\", \"text\": \"spaced\"}]\n}";
+    db.append(turn, vec![Bytes::from(item)], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let found = db
+        .history_search("branch", r#""role":"assistant","content""#, None, false)
+        .unwrap();
+    assert_eq!(found["matches"][0]["turn"], 3);
+    assert!(
+        found["matches"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("spaced")
+    );
+    let source = db.history_search("Bob", "branch", None, false).unwrap();
+    assert!(source["matches"].as_array().unwrap().is_empty());
+    assert_eq!(
+        db.history_search("nobody", "fact", None, false)
+            .unwrap_err()
+            .code,
+        "bot_not_found"
+    );
 }
 
 #[test]

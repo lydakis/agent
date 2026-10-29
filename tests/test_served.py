@@ -217,6 +217,31 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': []})
 
+    def test_an_agent_s_script_calls_an_mcp_server_the_lookout_keeps_up(self):
+        server = Path(__file__).with_name('mcp_server.py')
+        (self.path / '.agent').mkdir(exist_ok=True)
+        (self.path / '.agent/config.toml').write_text(
+            f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
+            f'env = {{ MCP_STARTS = {json.dumps(str(self.path / "starts"))} }}\n')
+        # The tool as Sonny gives it to the agents it opens.
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertEqual((script['name'], script['answered_by']), ('exec', 'sonny'))
+        self.assertIn('## test', script['description'])
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[script])
+        self.lookout()
+        said = self.call('calc.lead', 'exec', 'const r = await tools.mcp__test__echo({text: "hi"});\ntext(r.content[0].text);')
+        self.assertTrue(said.startswith('Script completed\n'), said)
+        self.assertTrue(said.endswith('MCP calls: test 1\nOutput:\nhi'), said)
+        summed = self.call('calc.lead', 'exec', 'text((await tools.mcp__test__add({a: 1, b: 2})).structuredContent.sum);')
+        self.assertTrue(summed.endswith('Output:\n3'), summed)
+        # One server, started by the first script and kept for the next.
+        self.assertEqual(len((self.path / 'starts').read_text().splitlines()), 1)
+        refused = json.loads(self.call('calc.lead', 'exec', '// @exec: {"wait": 1}\ntext(1);'))
+        self.assertEqual(refused['error'], 'exec_refused')
+        self.assertIn('`wait`', refused['detail'])
+
     def test_an_agent_saves_memory_through_the_lookout(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('memory')])
@@ -232,6 +257,30 @@ class ServedToolTests(ModelFixture):
         self.assertIn('Short replies.', shown['user']['index'])
         refused = json.loads(self.call('calc.lead', 'memory', {'save': dict(fact, name='x', type='mood')}))
         self.assertEqual(refused['error'], 'memory_refused')
+
+    def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
+        ws = self.path / 'ws'
+        (ws / '.agents').mkdir(parents=True)
+        (ws / '.agents/project.toml').write_text('name = "ws"\n')
+        (ws / 'api').mkdir()
+        memory = self.path / '.agents/memory/projects'
+        for name in ['ws', 'api']:
+            (memory / name).mkdir(parents=True)
+            (memory / name / 'MEMORY.md').write_text(f'# Memory of {name}\n')
+        self.daemon.request('create', bot='ws.lead', workspace=str(ws), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('new_project')])
+        self.lookout()
+        made = json.loads(self.call('ws.lead', 'new_project', {'folder': str(ws / 'api')}))
+        self.assertEqual((made['coordinator'], made['created']), ('api.lead', True), made)
+        # Its own project's memory, though the folder above is a project
+        # and the new one had no file when its lead was made.
+        lead = self.daemon.request('inspect', bot='api.lead')['result']
+        self.assertIn('# Memory of api', lead['instructions'])
+        self.assertNotIn('# Memory of ws', lead['instructions'])
+        # Sonny composed them, so the lead takes its folder's changes when
+        # it opens, as one made by opening Sonny there does.
+        [kept] = (self.path / '.agent/sonny/instructions').iterdir()
+        self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
