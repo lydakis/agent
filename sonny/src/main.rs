@@ -1715,6 +1715,11 @@ struct App {
     /// them; and when they were last read.
     references: HashMap<(String, String), margin::Reference>,
     references_read: Option<Instant>,
+    /// The tasks this agent started that have a turn running, as the
+    /// daemon says without windows for the project's agents; and when
+    /// they were last read.
+    tasks_running: Option<std::collections::HashSet<String>>,
+    tasks_running_read: Option<Instant>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -2417,6 +2422,8 @@ impl App {
             marked: HashMap::new(),
             references: HashMap::new(),
             references_read: None,
+            tasks_running: None,
+            tasks_running_read: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -2622,6 +2629,7 @@ impl App {
             self.follow_place().await;
             self.count_behind();
             self.read_tasks().await;
+            self.read_running_tasks().await;
             self.read_references().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
@@ -4080,15 +4088,42 @@ impl App {
         }
     }
 
+    /// The tasks this agent started with a turn running, read every few
+    /// seconds where no windows for the project's agents say it.
+    async fn read_running_tasks(&mut self) {
+        if self.fleet.is_some()
+            || (self.tasks_running_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.tasks_running_read = Some(Instant::now());
+        let asked = json!({"active": true, "limit": 256});
+        let Ok(page) = self.client.request("bots", asked).await else {
+            return;
+        };
+        self.tasks_running = Some(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter(|bot| bot["created_by"] == self.bot.as_str())
+                .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
+                .collect(),
+        );
+    }
+
     /// What `bot` did since `reference` was last read of its note `id`.
     async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
-        if reference.workspace.is_none() {
-            match self.client.request("inspect", json!({"bot": bot})).await {
-                Ok(record) => reference.workspace = record["workspace"].as_str().map(str::to_owned),
-                Err(error) => {
-                    reference.gone = error.code == "bot_not_found";
-                    return;
+        // The bot first read, every time: another given its name once it
+        // is gone is not the one shown, and what was read of it stays.
+        let asked = json!({"bot": bot, "bot_id": reference.bot_id});
+        match self.client.request("inspect", asked).await {
+            Ok(record) => {
+                reference.bot_id = record["bot_id"].as_i64();
+                if reference.workspace.is_none() {
+                    reference.workspace = record["workspace"].as_str().map(str::to_owned);
                 }
+            }
+            Err(error) => {
+                reference.gone = error.code == "bot_not_found";
+                return;
             }
         }
         // The newest nodes first, read back as far as the note's start,
@@ -6299,16 +6334,25 @@ impl App {
 
     /// The other agents at work, and what waits on the person: questions
     /// and calls here, and agents that need them. Without windows for the
-    /// project's agents, the tasks this one started, as their rosters
-    /// read them.
+    /// project's agents, the tasks this one started: those running as the
+    /// daemon says, drawn or not, and those that need the person as their
+    /// rosters read them.
     fn agents(&self) -> (usize, usize) {
         let doing: HashMap<&str, &str> = match &self.fleet {
             Some(fleet) => (fleet.doing.iter())
                 .map(|(bot, doing)| (bot.as_str(), *doing))
                 .collect(),
-            None => (self.tasks.values().flatten())
-                .map(|task| (task.bot.as_str(), task.state.as_str()))
-                .collect(),
+            None => {
+                let rostered = (self.tasks.values().flatten())
+                    .map(|task| (task.bot.as_str(), task.state.as_str()));
+                match &self.tasks_running {
+                    Some(running) => (running.iter())
+                        .map(|bot| (bot.as_str(), "working"))
+                        .chain(rostered.filter(|(_, state)| *state == "needs you"))
+                        .collect(),
+                    None => rostered.collect(),
+                }
+            }
         };
         let count = |state: &str| {
             (doing.iter())
@@ -10583,6 +10627,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_s_note_is_not_read_from_another_bot_given_its_name() {
+        let reused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let again = reused.clone();
+        let client = daemon_answering(move |asked| {
+            let reused = again.load(std::sync::atomic::Ordering::SeqCst);
+            let markdown = if reused { "theirs" } else { "ours" };
+            match asked["op"].as_str() {
+                Some("inspect") if reused && asked["bot_id"] == 7 => {
+                    json!({"error": "bot_not_found"})
+                }
+                Some("inspect") => {
+                    json!({"name": "calc.add", "bot_id": if reused { 8 } else { 7 },
+                        "workspace": "/nowhere"})
+                }
+                Some("history_nodes") => json!({"nodes": [{"node": if reused { 9 } else { 1 }}]}),
+                _ => json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                    .map(|node| json!({"node": node, "item": {"type": "function_call",
+                        "call_id": "t", "name": margin::TOOL, "arguments": json!({"id": "flow",
+                        "title": "Flow", "markdown": markdown}).to_string()}}))
+                    .collect::<Vec<_>>()}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("ours".into())));
+        // Removed, and another task given its name: what was read stays.
+        reused.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.references_read = None;
+        app.read_references().await;
+        assert!(app.references.values().all(|reference| reference.gone));
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("ours".into())));
+    }
+
+    #[tokio::test]
     async fn a_task_s_note_is_found_far_back_in_order_and_follows_its_title() {
         let call = |arguments: Value| {
             json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
@@ -10866,6 +10950,33 @@ mod tests {
         assert!(app.pane.is_none());
         app.key(click(10 + counter.start)).await;
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_tasks_at_work_whose_rosters_are_not_drawn() {
+        let client = daemon_answering(|asked| {
+            assert_eq!(asked["active"], true);
+            json!({"bots": [
+                {"name": "calc.add", "created_by": "calc"},
+                {"name": "calc.mul", "created_by": "calc"},
+                {"name": "calc.ask", "created_by": "calc"},
+                {"name": "other.fix", "created_by": "other"}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc".into();
+        // Only one roster still drawn: its task needs the person.
+        app.tasks.insert(
+            0,
+            vec![started::Task {
+                bot: "calc.ask".into(),
+                name: "ask".into(),
+                brief: "b".into(),
+                state: "needs you".into(),
+            }],
+        );
+        app.read_running_tasks().await;
+        assert_eq!(app.agents(), (2, 1));
     }
 
     #[tokio::test]

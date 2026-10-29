@@ -239,11 +239,13 @@ pub fn from(text: &str) -> Option<(String, String)> {
 }
 
 /// Another bot's note, as read from its history: the newest node read,
-/// the folder its files are read from, whether the bot is gone, and the
+/// the bot read, the folder its files are read from, whether the bot is gone, and the
 /// note as last posted there with its file's text, when it shows one.
 #[derive(Default)]
 pub struct Reference {
     pub node: Option<i64>,
+    /// The bot's identity, which a later bot given its name does not share.
+    pub bot_id: Option<i64>,
     pub workspace: Option<String>,
     pub gone: bool,
     title: String,
