@@ -195,7 +195,7 @@ impl Markdown {
         });
         let kept = kept.or(math.flatten().filter(|path| path.is_file()));
         let url = kept.and_then(|path| crate::links::file_url(&path));
-        match drawn.and_then(|drawn| crate::image::show_linked(&drawn, url)) {
+        match drawn.map(|drawn| crate::image::show_linked(drawn, url)) {
             Ok(rows) => rows,
             Err(error) => {
                 let mut out: Vec<Line<'static>> = source
@@ -489,7 +489,7 @@ fn picture_file(path: &std::path::Path, width: usize) -> Option<Vec<Line<'static
     };
     let url = crate::links::file_url(path);
     drawn
-        .and_then(|drawn| crate::image::show_linked(&drawn, url))
+        .map(|drawn| crate::image::show_linked(drawn, url))
         .ok()
 }
 
@@ -900,9 +900,10 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
             let png = crate::html::render(&path, crate::image::page_width(width))?;
             crate::image::page(&png, width)
         })
-        .and_then(|drawn| {
+        .map(|drawn| {
             let url = crate::links::file_url(&path);
-            Ok((crate::image::show_linked(&drawn, url)?, drawn.cut))
+            let cut = drawn.cut;
+            (crate::image::show_linked(drawn, url), cut)
         }),
         false => Err(String::new()),
     };
