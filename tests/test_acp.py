@@ -243,7 +243,8 @@ class AcpTests(ModelFixture):
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
         answered, updates = thread.answer_of(second)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        self.assertEqual(updates[-1]['state'], 'idle')
+        # Idle before the answer, which waited for the task's thread.
+        self.assertIn('idle', [u.get('state') for u in updates if u['sessionUpdate'] == 'state_update'])
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         self.assertEqual(sorted(t['status'] for t in turns), ['completed', 'steered'])
         # T3 Code would not take the task as a child: it opens as a thread of
