@@ -683,6 +683,17 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             # for an api_error after the stream began. An optional failure
             # count also models a transient outage with the same request,
             # and `unreadable_any` a failure whatever the request replays.
+            # The fallback model's pool closes long enough to park the turn.
+            if request['model'] == 'synthetic-claude-2' and getattr(self.server, 'limit_fallback', 0):
+                self.server.limit_fallback -= 1
+                body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+                self.send_response(429)
+                self.send_header('Retry-After', '1.2')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if getattr(self.server, 'rate_limits', 0):
                 self.server.rate_limits -= 1
                 body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
@@ -1131,19 +1142,24 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_a_refused_request_alone_goes_to_the_fallback_model(self):
         client, model, path = self.start()
+        # The fallback's pool parks the turn once: it resumes on the fallback.
+        model.limit_fallback = 1
         client.request('create', bot='Bob', workspace=str(path), effort='low',
                        fallback='anthropic/synthetic-claude-2')
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='refuse:once')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        refused, answered = model.requests.get(timeout=1), model.requests.get(timeout=1)
+        refused, limited, answered = (model.requests.get(timeout=1) for _ in range(3))
+        self.assertEqual((limited['model'], limited['fallback_credit_token']), ('synthetic-claude-2', 'credit-1'))
         # The same body on the fallback model, with the refusal's credit.
         self.assertEqual((refused['model'], answered['model']), ('synthetic-claude', 'synthetic-claude-2'))
         self.assertNotIn('fallback_credit_token', refused)
         self.assertEqual(answered['fallback_credit_token'], 'credit-1')
         self.assertEqual(answered['messages'], refused['messages'])
         retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
-        self.assertEqual([(r['error'], r['detail'], r['fallback']) for r in retried],
-                         [('provider_refusal', 'category cyber', 'anthropic/synthetic-claude-2')])
+        self.assertEqual([(r['error'], r.get('fallback'), r['parked']) for r in retried],
+                         [('provider_refusal', 'anthropic/synthetic-claude-2', False),
+                          ('provider_http_429', None, True)])
+        self.assertEqual(retried[0]['detail'], 'category cyber')
         fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
         self.assertEqual([(m['from'], m['to']) for m in fallback], [('synthetic-claude', 'synthetic-claude-2')])
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']

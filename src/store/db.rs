@@ -752,6 +752,18 @@ pub struct Waiting {
     /// tried again, so the turn resumed before then does not wait on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_retry_ms: Option<u64>,
+    /// The fallback a declined request went to, so the call parked on its
+    /// pool resumes there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<ParkedFallback>,
+}
+/// A declined request's fallback model, as `provider/model`, and the credit
+/// its retry redeems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ParkedFallback {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
 }
 /// The call a summary copies: the elision floor its window was read under,
 /// the node that window starts at, the node it ends at when the copy had
@@ -5941,6 +5953,7 @@ impl Database {
             answer: None,
             copied: None,
             summary_retry_ms,
+            fallback: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6054,6 +6067,7 @@ impl Database {
             answer: Some(tag.clone()),
             copied: None,
             summary_retry_ms,
+            fallback: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -7096,6 +7110,7 @@ impl Database {
             answer: None,
             copied: None,
             summary_retry_ms,
+            fallback: None,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -7128,6 +7143,7 @@ impl Database {
         copied: Option<CopiedCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
+        fallback: Option<ParkedFallback>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -7150,6 +7166,7 @@ impl Database {
             answer: None,
             copied,
             summary_retry_ms,
+            fallback,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;

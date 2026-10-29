@@ -295,6 +295,16 @@ struct Fallback {
     pending: bool,
 }
 
+impl Fallback {
+    /// As a call parked on its pool keeps it.
+    fn parked(&self) -> agent_runtime::store::ParkedFallback {
+        agent_runtime::store::ParkedFallback {
+            model: format!("{}/{}", self.name, self.model),
+            credit: self.credit.clone(),
+        }
+    }
+}
+
 /// The last model call of a turn, kept so its prompt cache can be refreshed
 /// while the calls it planned run: see [`Turn::run_tool`].
 struct Warm<'a> {
@@ -340,6 +350,8 @@ struct Accounting {
     /// Attempts and non-pacing time spent by the unfinished model call.
     call_attempts: u32,
     call_spent_ms: u64,
+    /// The fallback the unfinished call went to.
+    call_fallback: Option<agent_runtime::store::ParkedFallback>,
     /// Set when a call parked the turn on a closed pool.
     parked_until: u64,
     /// Persist the call's phase with its existing park transaction.
@@ -521,6 +533,7 @@ impl Turn {
         let turn = self.turn;
         let flushed = if let Ok(Round::Paced(at)) = &result {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
+            let fallback = accounting.call_fallback.take();
             let compaction = accounting.compaction;
             let copied = accounting.copied.take().filter(|_| compaction);
             let route = accounting.route.get().cloned();
@@ -539,6 +552,7 @@ impl Turn {
                         copied,
                         route.as_deref(),
                         summary_retry_ms,
+                        fallback,
                     )
                     .map(|_| ())
                 })
@@ -2005,6 +2019,7 @@ impl Turn {
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
+                accounting.call_fallback = waiting.fallback.clone();
                 resume_window = !waiting.compaction;
                 copied = waiting.copied.clone().filter(|_| waiting.compaction);
             } else {
@@ -2785,7 +2800,23 @@ impl Turn {
         let mut withheld = None;
         // The bot's fallback model, once a classifier declined this request:
         // it answers this request alone, and the next goes to the bot's model.
-        let mut fallback: Option<Fallback> = None;
+        // A call parked on the fallback's pool resumes there.
+        let mut fallback = match std::mem::take(&mut accounting.call_fallback) {
+            Some(parked) => {
+                let (name, to) = split_model(&parked.model)?;
+                match self.providers.get(name) {
+                    Some(known) => Some(Fallback {
+                        provider: Arc::new(shaped(known, self.settings())?.into_owned()),
+                        name: name.to_owned(),
+                        model: to.to_owned(),
+                        credit: parked.credit,
+                        pending: false,
+                    }),
+                    None => None,
+                }
+            }
+            None => None,
+        };
         let mut tool_calls = tool_calls;
         loop {
             // A billed attempt that failed counts as a round: the retry that
@@ -2809,6 +2840,8 @@ impl Turn {
             accounting.begin(attempt > 0);
             (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
             let sent = agent_runtime::provider::Sent::default();
+            // The call's own provider and model, and where this attempt goes.
+            let (own_provider, own_model) = (provider, model);
             let target = (fallback.as_ref()).map(|to| (to.provider.clone(), to.model.clone()));
             let (provider, model) = match &target {
                 Some((to, model)) => (to.as_ref(), model.as_str()),
@@ -2887,7 +2920,7 @@ impl Turn {
                             .map(|usage| priced_at(usage, &to.name, &to.model));
                         completion
                             .fallbacks
-                            .push((Some(record.model.clone()), to.model.clone()));
+                            .push((Some(own_model.to_owned()), to.model.clone()));
                     }
                     if let Some(usage) = &mut completion.usage {
                         usage.sent_ms = sent_ms;
@@ -2944,7 +2977,7 @@ impl Turn {
                     // A classifier declined: the bot's fallback model answers
                     // this request, on the same body. The refusal's credit
                     // prices the retry as if it had run there all along,
-                    // when it stays on the same provider.
+                    // when it goes to the endpoint that declined it.
                     if fallback.is_none()
                         && error.code == "provider_refusal"
                         && matches!(body, Body::Window(_))
@@ -2956,7 +2989,7 @@ impl Turn {
                                 provider: Arc::new(shaped(known, self.settings())?.into_owned()),
                                 name: name.to_owned(),
                                 model: to.to_owned(),
-                                credit: credit.filter(|_| name == record.provider),
+                                credit: credit.filter(|_| known.url() == own_provider.url()),
                                 pending: true,
                             });
                         }
@@ -2979,6 +3012,7 @@ impl Turn {
                 // No HTTP call took place. Keep its retry state without
                 // incrementing attempts or cumulative dispatched retries.
                 accounting.call_attempts = attempt;
+                accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                 accounting.call_spent_ms = spent.as_millis() as u64;
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
                 return Ok(None);
@@ -3105,6 +3139,7 @@ impl Turn {
                 };
                 accounting.call_attempts = attempt;
                 accounting.call_spent_ms = (spent + backoff).as_millis() as u64;
+                accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                 accounting.parked_until = now_ms() + block.as_millis() as u64;
                 return Ok(None);
             }
