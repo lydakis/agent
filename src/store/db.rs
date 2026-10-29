@@ -4620,13 +4620,16 @@ impl Database {
     }
 
     /// Search the histories of every bot whose name matches a GLOB
-    /// pattern, as `history_search` searches one, newest turn first by turn
-    /// ID across them all; each match names its bot and its turn handle. A
-    /// history two bots share, as a fork shares its source's, is searched
-    /// once, under the oldest of them. `skip` is the turn the search runs
-    /// in, left out. `before` is a turn ID; the search ends at a turn once
+    /// pattern, as `history_search` searches one, newest first across them
+    /// all; each match names its bot and its turn handle. The bots' walks
+    /// are merged by node ID, which only falls along a lineage, so a node
+    /// two histories share, as a fork shares its source's, comes up in
+    /// both at once and is searched once, under the oldest bot that has it;
+    /// a node only one has is that one's. Nothing is kept but each walk's
+    /// place and the matches. `skip` is the turn the search runs in, left
+    /// out. With `before`, only older nodes are searched. Once
     /// `HISTORY_MATCHES` matches are listed or `HISTORY_SEARCH_BYTES` of
-    /// items are searched, naming that turn's ID as `next_before`.
+    /// items searched, `next_before` says where to go on from.
     pub fn history_search_bots(
         &self,
         pattern: &str,
@@ -4654,53 +4657,53 @@ impl Database {
             )?
             .query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        // A turn's nodes and their sizes, newest first, under the bot whose
-        // walk reached its start first.
-        struct Turn {
-            bot: usize,
+        #[derive(Clone, Copy)]
+        struct Node {
             id: i64,
-            number: i64,
-            nodes: Vec<(i64, i64)>,
+            /// The turn a turn's first node starts, and its number in the
+            /// lineage.
+            starts: Option<(i64, i64)>,
+            size: i64,
         }
-        let mut turns: Vec<Turn> = Vec::new();
-        let mut owner: HashMap<i64, usize> = HashMap::new();
-        // The walk reads no item: only where each node is and how big.
-        let mut chain = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,turn,turn_seq,size) AS (
-                SELECT id,parent,depth,turn,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth,n.turn,n.turn_seq,COALESCE(length(n.item),0)
-                FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
-             SELECT id,turn,turn_seq,size FROM chain",
-        )?;
-        for (bot, (_, head)) in bots.iter().enumerate() {
-            let mut rows = chain.query([head])?;
-            let mut since: Vec<(i64, i64)> = Vec::new(); // Since the last turn's start.
-            while let Some(row) = rows.next()? {
-                let id: i64 = row.get(0)?;
-                if let Some(&at) = owner.get(&id) {
-                    // An earlier walk has the rest of this history: what this
-                    // one found since is the later part of the turn it met.
-                    for (node, _) in &since {
-                        owner.insert(*node, at);
-                    }
-                    turns[at].nodes.splice(0..0, since.drain(..));
-                    break;
-                }
-                since.push((id, row.get(3)?));
-                if let (Some(turn), Some(number)) = (row.get(1)?, row.get(2)?) {
-                    for (node, _) in &since {
-                        owner.insert(*node, turns.len());
-                    }
-                    turns.push(Turn {
-                        bot,
-                        id: turn,
-                        number,
-                        nodes: std::mem::take(&mut since),
-                    });
-                }
-            }
+        fn next(rows: &mut rusqlite::Rows<'_>) -> Result<Option<Node>> {
+            Ok(match rows.next()? {
+                Some(r) => Some(Node {
+                    id: r.get(0)?,
+                    starts: r.get::<_, Option<i64>>(1)?.zip(r.get::<_, Option<i64>>(2)?),
+                    size: r.get(3)?,
+                }),
+                None => None,
+            })
         }
-        turns.sort_unstable_by_key(|turn| std::cmp::Reverse(turn.id));
+        // Each walk is its own cursor, read from the head down only while
+        // the merge needs it; it reads no item.
+        let mut statements = Vec::with_capacity(bots.len());
+        for _ in &bots {
+            statements.push(self.conn.prepare(
+                "WITH RECURSIVE chain(id,parent,depth,turn,turn_seq,size) AS (
+                    SELECT id,parent,depth,turn,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,n.depth,n.turn,n.turn_seq,COALESCE(length(n.item),0)
+                    FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
+                 SELECT id,turn,turn_seq,size FROM chain",
+            )?);
+        }
+        struct Walk<'s> {
+            rows: rusqlite::Rows<'s>,
+            at: Option<Node>,
+            /// Its matches whose turn its walk has not reached the start of
+            /// yet, with their node IDs.
+            found: Vec<(i64, Value)>,
+        }
+        let mut walks = Vec::with_capacity(bots.len());
+        for (statement, (_, head)) in statements.iter_mut().zip(&bots) {
+            let mut rows = statement.query([head])?;
+            let at = next(&mut rows)?;
+            walks.push(Walk {
+                rows,
+                at,
+                found: Vec::new(),
+            });
+        }
         let needle = query.to_ascii_lowercase();
         // As `history_search` reads: the view decides what matches.
         let mut contains = self.conn.prepare_cached(
@@ -4713,36 +4716,71 @@ impl Database {
              FROM (SELECT {PICTURELESS} AS item FROM
                 (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
-        let mut left = turns
-            .iter()
-            .filter(|turn| before.is_none_or(|before| turn.id < before) && Some(turn.id) != skip)
-            .peekable();
-        let mut matches: Vec<Value> = Vec::new();
+        // A walk at a turn's start names the turn of the matches it found
+        // since; those of the turn being searched are dropped.
+        let mut listed = 0;
+        let mut matches: Vec<(i64, Value)> = Vec::new();
+        let mut name = |walk: &mut Walk<'_>, name: &str, listed: &mut usize| {
+            let Some((turn, number)) = walk.at.and_then(|at| at.starts) else {
+                return;
+            };
+            for (node, mut found) in walk.found.drain(..) {
+                if Some(turn) == skip {
+                    *listed -= 1;
+                    continue;
+                }
+                found["turn"] = json!(number);
+                found["handle"] = json!(format!("turn:{name}/{turn}"));
+                matches.push((node, found));
+            }
+        };
         let mut searched = 0_u64;
         let mut next_before = None;
-        while let Some(turn) = left.next() {
-            let name = &bots[turn.bot].0;
-            for (id, size) in &turn.nodes {
-                searched += *size as u64;
-                if matches.len() < HISTORY_MATCHES
-                    && contains.query_row(params![id, needle], |r| r.get::<_, bool>(0))?
-                {
-                    let (text, kind): (String, Option<String>) =
-                        reading.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                    if let Some(at) = text.to_ascii_lowercase().find(&needle) {
-                        matches.push(json!({"bot":name,"turn":turn.number,
-                            "handle":format!("turn:{name}/{}", turn.id),"type":kind,
-                            "text":around(&text, at, needle.len())}));
-                    }
-                }
-            }
-            if left.peek().is_some()
-                && (matches.len() >= HISTORY_MATCHES || searched >= HISTORY_SEARCH_BYTES)
-            {
-                next_before = Some(turn.id);
+        while let Some(top) = walks.iter().filter_map(|w| w.at.map(|at| at.id)).max() {
+            if listed >= HISTORY_MATCHES || searched >= HISTORY_SEARCH_BYTES {
+                next_before = Some(top + 1);
                 break;
             }
+            let mut credited = false;
+            for (walk, (bot, _)) in walks.iter_mut().zip(&bots) {
+                let Some(at) = walk.at.filter(|at| at.id == top) else {
+                    continue;
+                };
+                if !credited && before.is_none_or(|before| top < before) {
+                    searched += at.size as u64;
+                    if contains.query_row(params![top, needle], |r| r.get::<_, bool>(0))? {
+                        let (text, kind): (String, Option<String>) =
+                            reading.query_row([top], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                        if let Some(at) = text.to_ascii_lowercase().find(&needle) {
+                            walk.found.push((
+                                top,
+                                json!({"bot":bot,"type":kind,"text":around(&text, at, needle.len())}),
+                            ));
+                            listed += 1;
+                        }
+                    }
+                }
+                credited = true;
+                name(walk, bot, &mut listed);
+                walk.at = next(&mut walk.rows)?;
+            }
         }
+        // Matches whose turn starts further down: read on to its start.
+        for (walk, (bot, _)) in walks.iter_mut().zip(&bots) {
+            loop {
+                name(walk, bot, &mut listed);
+                if walk.found.is_empty() {
+                    break;
+                }
+                walk.at = next(&mut walk.rows)?;
+                // A history's first nodes may start no turn.
+                if walk.at.is_none() {
+                    walk.found.clear();
+                }
+            }
+        }
+        matches.sort_unstable_by_key(|(node, _)| std::cmp::Reverse(*node));
+        let matches: Vec<Value> = matches.into_iter().map(|(_, found)| found).collect();
         Ok(json!({"bots":pattern,"query":query,"matches":matches,
             "done":next_before.is_none(),"next_before":next_before}))
     }

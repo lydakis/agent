@@ -1870,10 +1870,13 @@ turn, item type and the JSON text around each, ignoring ASCII case. It stops at
 a turn boundary once it has listed 20 or read 64 MiB of items and names that
 turn as `next_before`. A search whose `bot` is a GLOB pattern (`*`, `proj.*`;
 no name holds `*`, `?` or `[`) searches every bot it matches at once, newest
-turn ID first: each walk reads only node sizes until it meets a node an
-earlier walk has, so a history a fork shares with its source is searched
-once, under the older bot. Each match adds its `bot` and turn `handle`, and
-`before` and `next_before` are turn IDs, as handles give them. The note then lists,
+first. It merges the bots' walks by node ID, which only falls along a
+lineage, so a node two histories share, as a fork shares its source's, comes
+up in both walks at once and is searched once, under the oldest bot that has
+it, while a node only a later fork has is credited to it. It keeps only each
+walk's place and its matches, and each match adds its `bot` and turn
+`handle`; `next_before` is where the merge stopped, passed back as `before`.
+The note then lists,
 newest first, the ordinal and the first line (up to 120 bytes) of each
 omitted turn's prompt, at most `note_turns` of them (default 48, 0 lists
 none), and a line naming the older turns the list left out. The optional

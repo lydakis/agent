@@ -5939,14 +5939,7 @@ fn history_search_of_a_pattern_searches_every_bot_it_matches_newest_first() {
     let handle = matches[1]["handle"].as_str().unwrap();
     assert!(handle.starts_with("turn:p.task/"), "{handle}");
     assert_eq!(found["done"], true);
-    // A handle's number continues the search before that turn, and the
-    // turn a search runs in is left out.
-    let id: i64 = handle.rsplit('/').next().unwrap().parse().unwrap();
-    let older = db
-        .history_search_bots("p.*", "needle", Some(id), None)
-        .unwrap();
-    assert_eq!(older["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(older["matches"][0]["bot"], "p.lead");
+    // The turn a search runs in is left out.
     let side: i64 = matches[0]["handle"]
         .as_str()
         .unwrap()
@@ -5981,7 +5974,63 @@ fn history_search_of_a_pattern_searches_every_bot_it_matches_newest_first() {
 }
 
 #[test]
-fn history_search_of_a_pattern_continues_at_a_turn_once_it_has_enough() {
+fn history_search_of_a_pattern_credits_a_fork_with_what_only_it_has() {
+    let mut db = db();
+    db.create("src", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "src",
+            "k1",
+            "the prompt",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let mut heads = Vec::new();
+    for text in ["alpha", "between", "omega"] {
+        db.append(turn, vec![assistant(text)], &[], None).unwrap();
+        heads.push(db.inspect("src").unwrap().head.unwrap());
+    }
+    db.finish(turn, None).unwrap();
+    // Two forks cut the same turn at different points; the source is not
+    // searched.
+    for (name, head) in [("f.one", heads[0]), ("f.two", heads[1])] {
+        db.fork(
+            "src",
+            name,
+            Fork {
+                checkpoint: Some(head),
+                workspace: Some("/synthetic"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    }
+    let bots = |query: &str| -> Vec<String> {
+        db.history_search_bots("f.*", query, None, None).unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["bot"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // What both have is listed once, under the older fork; what only the
+    // later one has, under it, where its handle reads it.
+    assert_eq!(bots("the prompt"), ["f.one"]);
+    assert_eq!(bots("alpha"), ["f.one"]);
+    assert_eq!(bots("between"), ["f.two"]);
+    assert!(bots("omega").is_empty());
+    let found = db
+        .history_search_bots("f.*", "between", None, None)
+        .unwrap();
+    assert_eq!(found["matches"][0]["handle"], format!("turn:f.two/{turn}"));
+    assert_eq!(found["matches"][0]["turn"], 1);
+}
+
+#[test]
+fn history_search_of_a_pattern_goes_on_from_where_it_had_enough() {
     let mut db = db();
     db.create("a", Some("/synthetic"), binding()).unwrap();
     db.create("b", Some("/synthetic"), binding()).unwrap();
