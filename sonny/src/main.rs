@@ -142,16 +142,12 @@ struct Options {
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
+     \x20      [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
-     open beside it in Rex or Herdr. Type /status for the project's agents.\n\
-     --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
-     worktrees (the default), or sandfs copies (experimental, built in), which take\n\
-     uncommitted changes along and work outside git too.\n\
+     open beside it in Rex or Herdr, each in a git worktree of its own. Type /status for\n\
+     the project's agents.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
      and subscribe to the lookout with tools Sonny gives them, which the lookout answers.\n\
-     sonny task changes NAME [--apply] lists (or writes here) what a sandfs copy of a\n\
-     plain folder changed.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon, wakes\n\
@@ -581,15 +577,6 @@ fn parse() -> Result<Options, String> {
             "--no-sound" => sound = false,
             // Unlisted: how `/side` opens a side chat.
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
-            "--copies" => {
-                let copies = value()?;
-                if !agent_client::project::COPIES.contains(&copies.as_str()) {
-                    return Err(usage());
-                }
-                let mut settings = settings::Settings::load();
-                settings.copies = copies;
-                settings.save()?;
-            }
             _ => return Err(usage()),
         }
     }
@@ -617,7 +604,7 @@ fn reopen() -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--copies" => {
+            "--workspace" => {
                 args.next();
             }
             _ => command.push(arg),
@@ -643,12 +630,8 @@ fn main() -> std::process::ExitCode {
         // SAFETY: nothing else runs yet: no thread is started before this.
         unsafe { std::env::set_var("AGENT_CLI", format!("\"{}\" agent", me.display())) };
     }
-    // sandfs serves task copies' mounts from this program run again as
-    // `sonny sandfs ...`, outside any runtime of Sonny's.
-    sandfs::handle_relaunch(&["sandfs"]);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        Some((task, rest)) if task == "task" => task::run(rest),
         // The lookout runs this for each call of a tool Sonny answers.
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
@@ -793,13 +776,6 @@ async fn run() -> Result<(), String> {
         ));
     }
     app.lead = project::lead(&app.options.socket, &bot);
-    // Task copies a restart unmounted are mounted again before any task
-    // works in its folder.
-    if project.is_some()
-        && let Some(error) = task::remount(&app.options.socket).pop()
-    {
-        app.notice = Some(error);
-    }
     // The lookout knows no leads: it watches a lead's tasks because Sonny
     // subscribes it to them, before the lookout starts so it reads the file.
     if let Some(project) = &project
@@ -1083,9 +1059,9 @@ struct Live {
 }
 
 impl Live {
-    fn new(gap: bool) -> Self {
+    fn new(gap: bool, workspace: &str) -> Self {
         Live {
-            markdown: Markdown::default(),
+            markdown: Markdown::in_folder(std::path::Path::new(workspace)),
             partial: String::new(),
             lines: 0,
             rows: Vec::new(),
@@ -1218,7 +1194,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
 /// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 14] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1243,10 +1219,6 @@ const COMMANDS: [(&str, &str); 15] = [
     (
         "/verbose",
         "every tool call, or only what moves the work on",
-    ),
-    (
-        "/copies",
-        "tasks in git worktrees or sandfs copies (experimental)",
     ),
     ("/react", "react to one of the agent's replies"),
     ("/copy", "the last reply, as Markdown"),
@@ -1321,8 +1293,7 @@ struct App {
     /// The project whose lead this is, when opened as the folder's coordinator.
     project: Option<String>,
     workspace: String,
-    /// The workspace's branch and what it is a sandfs copy of, as last
-    /// read, for the footer.
+    /// The workspace's branch, as last read, for the footer.
     place: place::Place,
     /// The read under way, of the workspace named, and when the last one
     /// began: the branch can change under a running turn.
@@ -1919,10 +1890,6 @@ impl Fleet {
                 _ => None,
             };
             self.alerts.extend(alert);
-            // A task that waits needs little of its copy's memory.
-            if bot != self.lead && matches!(doing, "done" | "failed" | "needs you") {
-                task::trim(bot);
-            }
         }
     }
 
@@ -3152,7 +3119,12 @@ impl App {
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            said = Some((node, transcript::reply(&reply, self.prose())));
+                            let lines = transcript::reply(
+                                &reply,
+                                self.prose(),
+                                std::path::Path::new(&self.workspace),
+                            );
+                            said = Some((node, lines));
                             self.saw_reply(node, &reply);
                             self.last_reply = reply;
                         }
@@ -3609,7 +3581,7 @@ impl App {
                         if let Some(closed) = closed {
                             self.write_words(closed, Words::Reply);
                         }
-                        Live::new(self.any_history)
+                        Live::new(self.any_history, &self.workspace)
                     }
                 };
                 live.partial.push_str(delta);
@@ -3662,8 +3634,12 @@ impl App {
                     self.close_live();
                 } else if let Some(item) = &item {
                     self.end_live(Words::Reply);
-                    let mut live = Live::new(self.any_history);
-                    let rows = transcript::reply(&text(item), self.prose());
+                    let mut live = Live::new(self.any_history, &self.workspace);
+                    let rows = transcript::reply(
+                        &text(item),
+                        self.prose(),
+                        std::path::Path::new(&self.workspace),
+                    );
                     self.live_rows(&mut live, rows);
                     live.closed = true;
                     self.live = Some(live);
@@ -5372,52 +5348,6 @@ impl App {
             });
             return;
         }
-        if prompt == "/copies" {
-            self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.copies = match settings.copies.as_str() {
-                "sandfs" => "worktree",
-                _ => "sandfs",
-            }
-            .into();
-            if let Err(error) = settings.save() {
-                self.notice = Some(error);
-                return;
-            }
-            self.notice = Some(match settings.copies.as_str() {
-                "sandfs" => "tasks get sandfs copies (experimental)".into(),
-                _ => "tasks get git worktrees".into(),
-            });
-            // The lead is told now when idle, else once its turn ends,
-            // unless its instructions were set some other way.
-            if self.project.is_some() {
-                let bot = match self
-                    .client
-                    .request("inspect", json!({"bot": self.bot}))
-                    .await
-                {
-                    Ok(bot) => bot,
-                    Err(error) => {
-                        self.notice = Some(format!("the lead's instructions: {error}"));
-                        return;
-                    }
-                };
-                let dir = std::path::Path::new(&self.workspace);
-                match project::review(dir, &bot, &self.lead, false) {
-                    Ok(project::Instructions::Stale(text)) => {
-                        self.instruct = Some(text);
-                        self.configure().await;
-                    }
-                    // A toggle back before the turn ended: nothing to send.
-                    Ok(project::Instructions::Current) => self.instruct = None,
-                    Ok(project::Instructions::Kept { missing }) => {
-                        self.notice = Some(project::Instructions::kept_notice(&missing))
-                    }
-                    Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
-                }
-            }
-            return;
-        }
         if prompt == "/quit" {
             self.input.clear();
             self.quit = true;
@@ -6418,11 +6348,7 @@ impl App {
             1 => format!("📎 · {right}"),
             n => format!("📎 {n} · {right}"),
         };
-        // The folder, and what it is a copy of; its branch is kept whole.
-        let folder = match &self.place.copy_of {
-            Some(source) => format!("{folder}, a sandfs copy of {}", tilde(source)),
-            None => folder,
-        };
+        // The folder, and its branch, which is kept whole.
         let branch = match &self.place.branch {
             Some(branch) => format!(" on {branch}"),
             None => String::new(),
@@ -7633,10 +7559,16 @@ mod tests {
     async fn a_reaction_to_an_older_reply_goes_under_that_reply() {
         let client = daemon_answering(|_| json!({"turn": 9})).await;
         let mut app = app(client);
-        app.commit_said(4, transcript::reply("Merged it.", 80));
+        app.commit_said(
+            4,
+            transcript::reply("Merged it.", 80, std::path::Path::new("/")),
+        );
         app.saw_reply(4, "Merged it.");
         app.land(6, "and tag it");
-        app.commit_said(8, transcript::reply("Tagged 0.4.0.", 80));
+        app.commit_said(
+            8,
+            transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
+        );
         app.saw_reply(8, "Tagged 0.4.0.");
         app.react_to = Some((4, "Merged it.".into()));
         app.input.set("🎉");
@@ -8124,25 +8056,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_footer_names_the_branch_and_what_a_copy_was_made_from() {
+    async fn the_footer_names_the_branch() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.workspace = "/work/tasks/fix-cart".into();
+        app.workspace = "/work/.agent/worktrees/fix-cart/packages/shop".into();
         app.model = "opus".into();
         app.place = place::Place {
             branch: Some("agent/fix-cart".into()),
-            copy_of: Some("/work/shop".into()),
         };
         let wide = app.footer_line(100).to_string();
         assert!(
-            wide.contains(
-                "opus · /work/tasks/fix-cart, a sandfs copy of /work/shop on agent/fix-cart"
-            ),
+            wide.contains("opus · /work/.agent/worktrees/fix-cart/packages/shop on agent/fix-cart"),
             "{wide}"
         );
         // A narrow footer cuts the folder from its start, never the branch.
         let narrow = app.footer_line(56).to_string();
         assert!(
-            narrow.contains("…") && narrow.contains("/work/shop on agent/fix-cart"),
+            narrow.contains("…") && narrow.contains("packages/shop on agent/fix-cart"),
             "{narrow}"
         );
         assert_eq!(narrow.trim_end().width(), 56 - 2);

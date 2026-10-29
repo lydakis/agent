@@ -1804,7 +1804,12 @@ window over the shared history.
 When turns are omitted, the request begins with one user item:
 `[context note] N earlier turn(s) with M messages are not shown.` When the
 bot has the `history` tool, the note adds `Use the history tool with a turn
-number from 1 to N to read any of them.` It then lists,
+number from 1 to N to read any of them, or with query to search them for
+text.` A search (`query`, optionally `before` a turn) walks the lineage newest
+first, leaves out the turn it runs in, and lists up to 20 matches with their
+turn, item type and the JSON text around each, ignoring ASCII case. It stops at
+a turn boundary once it has listed 20 or read 64 MiB of items and names that
+turn as `next_before`. It then lists,
 newest first, the ordinal and the first line (up to 120 bytes) of each
 omitted turn's prompt, at most `note_turns` of them (default 48, 0 lists
 none), and a line naming the older turns the list left out. The optional

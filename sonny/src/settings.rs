@@ -8,9 +8,6 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
-    /// How a lead's tasks get their own copy of its folder, one of
-    /// `agent_client::project::COPIES`: git worktrees, or sandfs copies.
-    pub copies: String,
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
@@ -20,7 +17,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             chime: true,
-            copies: "worktree".into(),
             verbose: false,
         }
     }
@@ -42,10 +38,6 @@ impl Settings {
         let defaults = Settings::default();
         Settings {
             chime: saved["chime"].as_bool().unwrap_or(defaults.chime),
-            copies: saved["copies"]
-                .as_str()
-                .filter(|c| agent_client::project::COPIES.contains(c))
-                .map_or(defaults.copies, str::to_owned),
             verbose: saved["verbose"].as_bool().unwrap_or(defaults.verbose),
         }
     }
@@ -57,7 +49,6 @@ impl Settings {
         }
         let text = serde_json::to_string_pretty(&json!({
             "chime": self.chime,
-            "copies": self.copies,
             "verbose": self.verbose,
         }))
         .map_err(|e| e.to_string())?;
@@ -76,13 +67,5 @@ mod tests {
         assert!(Settings::from(&json!({"chime": "no"})).chime);
         assert!(Settings::from(&json!({"verbose": true})).verbose);
         assert!(!Settings::from(&json!({"verbose": "yes"})).verbose);
-        assert_eq!(
-            Settings::from(&json!({"copies": "sandfs"})).copies,
-            "sandfs"
-        );
-        assert_eq!(
-            Settings::from(&json!({"copies": "rsync"})).copies,
-            "worktree"
-        );
     }
 }

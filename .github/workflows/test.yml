@@ -40,10 +40,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Rust tests
         run: |
-          # Sonny's SandFS task copies mount through FUSE, and sandboxed
-          # commands run in bubblewrap.
+          # Sandboxed commands run in bubblewrap.
           sudo apt-get update
-          sudo apt-get install -y fuse3 bubblewrap
+          sudo apt-get install -y bubblewrap
           # Ubuntu 24.04 keeps the unprivileged user namespaces bubblewrap
           # needs behind AppArmor.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
