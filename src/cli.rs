@@ -73,6 +73,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "usage",
+        about: "Tokens the bots spent: in all, by bot, by model, and over time",
+        usage: "usage [--name GLOB] [--since DURATION] [--bucket DURATION] [--limit N]",
+        flags: "--name --since --bucket --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "wait",
         about: "A turn's or command's result: status, text, usage; --timeout 0 polls",
         usage: "wait [--any] [--timeout DURATION] HANDLE... | wait --bot NAME [--bot-id N] [--timeout DURATION]",
@@ -405,6 +413,14 @@ fn print_flags(flags: &str) {
             "--active" => ("", "Only bots with a turn running"),
             "--newest" => ("", "Newest first, read from the end"),
             "--limit" => ("N", "List at most N"),
+            "--since" => (
+                "DURATION",
+                "Only turns started this long ago or since; default: all",
+            ),
+            "--bucket" => (
+                "DURATION",
+                "Add a series of what was spent every DURATION from --since",
+            ),
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
@@ -468,7 +484,7 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
     let refuse = || {
         Error::with(
             "usage",
-            format!("{flag} needs a duration such as 500ms, 30s, 5m or 1h"),
+            format!("{flag} needs a duration such as 500ms, 30s, 5m, 1h or 7d"),
         )
     };
     if value == "0" {
@@ -482,6 +498,7 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
         "s" => 1000,
         "m" => 60_000,
         "h" => 3_600_000,
+        "d" => 86_400_000,
         _ => return Err(refuse()),
     };
     value[..unit]
@@ -723,13 +740,14 @@ mod tests {
             assert_eq!(ms(value), Some(millis), "{value}");
         }
         assert_eq!(ms("1h"), Some(3_600_000));
+        assert_eq!(ms("7d"), Some(604_800_000));
         for refused in [
             "30",
             "s",
             "1.5s",
             "-1s",
             "5 m",
-            "1d",
+            "1w",
             "",
             "9999999999999999h",
         ] {

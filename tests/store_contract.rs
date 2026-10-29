@@ -12758,3 +12758,132 @@ fn a_pinned_prompt_under_the_floor_counts_as_its_stub() {
     let (_, bytes, _) = db.turn_usage("Bob", turn).unwrap();
     assert_eq!(bytes as i64, window.item_bytes);
 }
+
+#[test]
+fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
+    let path = std::env::temp_dir().join(format!("agent-usage-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let spend = |input, cached, output| Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cached,
+        cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
+        sent_ms: 0,
+        models: Vec::new(),
+        served_model: String::new(),
+    };
+    let hour = 3_600_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let since = now - 3 * hour;
+    // Each turn's spend and how long after `since` it started; the first
+    // started before the window.
+    let turns = [
+        ("p.lead", "1", spend(500, 0, 50), -hour),
+        ("p.lead", "2", spend(1000, 800, 100), 10),
+        ("p.task", "1", spend(400, 300, 40), hour + 5),
+        ("p.lead", "3", spend(200, 100, 20), hour + 10),
+        ("q.lead", "1", spend(9000, 0, 900), 2 * hour),
+    ];
+    for bot in ["p.lead", "p.task", "q.lead"] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    let mut started = Vec::new();
+    for (bot, request, usage, at) in &turns {
+        let turn = db
+            .begin(
+                bot,
+                request,
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![assistant("done")], &[], Some(usage))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+        started.push((turn, since + at));
+    }
+    let raw = Connection::open(&path).unwrap();
+    for (turn, at) in started {
+        raw.execute(
+            "UPDATE turns SET started_ms=? WHERE id=?",
+            rusqlite::params![at, turn],
+        )
+        .unwrap();
+    }
+
+    let usage = db.usage(Some("p.*"), since, Some(hour), 64).unwrap();
+    assert_eq!(
+        (
+            usage["turns"].as_i64(),
+            usage["input_tokens"].as_i64(),
+            usage["cached_input_tokens"].as_i64(),
+            usage["output_tokens"].as_i64()
+        ),
+        (Some(3), Some(1600), Some(1200), Some(160)),
+        "the turn started before the window and the other project's are out"
+    );
+    let bots: Vec<_> = usage["bots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["bot"].as_str().unwrap(),
+                b["input_tokens"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        bots,
+        [("p.lead", 1200), ("p.task", 400)],
+        "most spent first"
+    );
+    assert_eq!(usage["other_bots"], Value::Null);
+    assert_eq!(usage["models"].as_array().unwrap().len(), 1);
+    assert_eq!(usage["models"][0]["turns"], 3);
+    let series: Vec<_> = usage["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["at_ms"].as_i64().unwrap(),
+                s["input_tokens"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(series, [(since, 1000), (since + hour, 600)]);
+
+    // Every bot, the one that spent most listed and the rest summed.
+    let usage = db.usage(None, 0, None, 1).unwrap();
+    assert_eq!(usage["turns"], 5);
+    assert_eq!(usage["bots"][0]["bot"], "q.lead");
+    assert_eq!(usage["other_bots"]["bots"], 2);
+    assert_eq!(usage["other_bots"]["input_tokens"], 2100);
+    assert!(usage.get("series").is_none());
+
+    for (since, bucket) in [
+        (0, Some(hour)),
+        (since, Some(0)),
+        (now - 2000 * hour, Some(hour)),
+    ] {
+        assert_eq!(
+            db.usage(None, since, bucket, 64).unwrap_err().code,
+            "invalid_usage_window"
+        );
+    }
+    assert_eq!(
+        db.usage(Some(""), 0, None, 64).unwrap_err().code,
+        "invalid_bot_filter"
+    );
+    drop(raw);
+    let _ = std::fs::remove_file(&path);
+}
