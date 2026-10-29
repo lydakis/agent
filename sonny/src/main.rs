@@ -2547,9 +2547,12 @@ impl App {
             "origin": skills::UPGRADE_ORIGIN});
         match self.client.request("submit", asked).await {
             Ok(_) => upgrades.told(),
-            // Another Sonny told it just now.
+            // Told it already.
             Err(error) if error.code == "idempotency_conflict" => upgrades.told(),
-            Err(error) => self.notice = Some(format!("telling of Sonny's upgrade: {error}")),
+            Err(error) => {
+                upgrades.back();
+                self.notice = Some(format!("telling of Sonny's upgrade: {error}"));
+            }
         }
     }
 

@@ -106,9 +106,19 @@ fn install_in(home: &Path, name: &str, files: &[(&str, &str, u32)]) -> Option<Pa
     });
     let wrote = same || sonnys(home, name, &dir);
     let texts: Vec<(&str, &str)> = files.iter().map(|(file, text, _)| (*file, *text)).collect();
-    // The person's edit of a skill Sonny wrote: Sonny's new text goes
-    // beside it, for them to bring in.
-    if !wrote && record(home, name).is_some() {
+    // The person's edit of a skill Sonny wrote, and Sonny's text changed
+    // since: the new text goes beside it, for them to bring in.
+    let fingerprints = |files: Vec<(String, String)>| {
+        let mut files = files;
+        files.sort();
+        files
+    };
+    let shipping = fingerprints(
+        (texts.iter())
+            .map(|(file, text)| (file.to_string(), crate::project::fingerprint(text)))
+            .collect(),
+    );
+    if !wrote && record(home, name).is_some_and(|last| fingerprints(last) != shipping) {
         stage(home, Kind::Skill, name, &texts);
     }
     if !same && wrote {
@@ -227,9 +237,11 @@ fn install_role_in(home: &Path, name: &str, text: &str) -> Option<PathBuf> {
                 .is_ok_and(|key| key.trim() == crate::project::fingerprint(&now))
         });
     if !wrote {
-        // The person's edit of a role Sonny wrote: Sonny's new text goes
-        // beside it, for them to bring in.
-        if record.exists() {
+        // The person's edit of a role Sonny wrote, and Sonny's text changed
+        // since: the new text goes beside it, for them to bring in.
+        if std::fs::read_to_string(&record)
+            .is_ok_and(|key| key.trim() != crate::project::fingerprint(text))
+        {
             stage(home, Kind::Role, name, &[(&format!("{name}.md"), text)]);
         }
         return None;
@@ -355,14 +367,27 @@ fn stage(home: &Path, kind: Kind, name: &str, files: &[(&str, &str)]) {
     if !keep(&dir, files) {
         return;
     }
-    let line = format!("{} {name}", kind.word());
+    queue(home, &format!("{} {name}", kind.word()));
+}
+
+/// Each of `lines` in the pending ones, once.
+fn queue(home: &Path, lines: &str) {
     let path = pending(home);
-    let now = std::fs::read_to_string(&path).unwrap_or_default();
-    if !now.lines().any(|have| have == line) {
-        let _ =
-            agent_client::files::replace_mode(&path, format!("{now}{line}\n").as_bytes(), 0o644);
+    let mut now = std::fs::read_to_string(&path).unwrap_or_default();
+    let before = now.len();
+    for line in lines.lines().filter(|line| !line.is_empty()) {
+        if !now.lines().any(|have| have == line) {
+            now.push_str(&format!("{line}\n"));
+        }
+    }
+    if now.len() != before {
+        let _ = agent_client::files::replace_mode(&path, now.as_bytes(), 0o644);
     }
 }
+
+/// How long a Sonny's claim on the pending ones holds before another
+/// takes them back: it tells its bot within seconds of starting.
+const CLAIM: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Sonny's new text of `name` gone from beside it, as Sonny writes its own
 /// again.
@@ -378,7 +403,9 @@ fn unstage(home: &Path, kind: Kind, name: &str) {
 /// Sonny opens to tell the person of and offer to bring in.
 pub struct Upgrades {
     home: PathBuf,
-    told: Vec<(Kind, String)>,
+    /// The pending ones, moved aside so that one Sonny of several starting
+    /// at once tells its bot.
+    claim: PathBuf,
     note: String,
     key: String,
 }
@@ -390,8 +417,23 @@ pub fn upgraded() -> Option<Upgrades> {
 }
 
 fn upgraded_in(home: &Path) -> Option<Upgrades> {
-    let text = std::fs::read_to_string(pending(home)).ok()?;
-    let mut told = Vec::new();
+    // A claim left by a Sonny that stopped before telling goes back.
+    for entry in std::fs::read_dir(upgrades(home)).ok()?.flatten() {
+        let stale = entry.file_name().to_string_lossy().starts_with("pending.")
+            && (entry.metadata().and_then(|m| m.modified()).ok())
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > CLAIM);
+        if stale {
+            queue(
+                home,
+                &std::fs::read_to_string(entry.path()).unwrap_or_default(),
+            );
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let claim = upgrades(home).join(format!("pending.{}", std::process::id()));
+    std::fs::rename(pending(home), &claim).ok()?;
+    let text = std::fs::read_to_string(&claim).unwrap_or_default();
     let mut lines = Vec::new();
     let mut key = String::new();
     for line in text.lines() {
@@ -401,7 +443,6 @@ fn upgraded_in(home: &Path) -> Option<Upgrades> {
         let Some(kind) = Kind::parse(kind) else {
             continue;
         };
-        told.push((kind, name.to_owned()));
         let staged = named(&copy(&upgrades(home), kind, name), kind, name);
         let mine = theirs(home, kind, name);
         let new = staged_files(home, kind, name);
@@ -428,9 +469,6 @@ fn upgraded_in(home: &Path) -> Option<Upgrades> {
             staged.display(),
         ));
     }
-    if told.is_empty() {
-        return None;
-    }
     let note = (!lines.is_empty()).then(|| {
         format!(
             "{UPGRADED}this Sonny ships new text for skills or roles of its own that the person \
@@ -444,7 +482,7 @@ fn upgraded_in(home: &Path) -> Option<Upgrades> {
     });
     Some(Upgrades {
         home: home.to_owned(),
-        told,
+        claim,
         key: format!(
             "sonny-upgrade-{}",
             crate::project::fingerprint(&format!("{note:?}{key}"))
@@ -485,25 +523,16 @@ impl Upgrades {
     /// Each told of, so the next bot is not told again; one Sonny sets
     /// beside them from now is.
     pub fn told(&self) {
-        let path = pending(&self.home);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let left: String = text
-            .lines()
-            .filter(|line| {
-                !self
-                    .told
-                    .iter()
-                    .any(|(kind, name)| *line == format!("{} {name}", kind.word()))
-            })
-            .map(|line| format!("{line}\n"))
-            .collect();
-        if left.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else {
-            let _ = agent_client::files::replace_mode(&path, left.as_bytes(), 0o644);
-        }
+        let _ = std::fs::remove_file(&self.claim);
+    }
+
+    /// Each back for the next bot, as this one was not told.
+    pub fn back(&self) {
+        queue(
+            &self.home,
+            &std::fs::read_to_string(&self.claim).unwrap_or_default(),
+        );
+        let _ = std::fs::remove_file(&self.claim);
     }
 }
 
@@ -686,15 +715,21 @@ mod tests {
         // Nothing to tell while each is Sonny's.
         install_role_in(&home, "lead", "two");
         assert!(upgraded_in(&home).is_none());
-        // The person edits both; Sonny's next text goes beside them.
+        // The person edits both; the same Sonny starting again has nothing new.
         std::fs::write(&role, "two, mine").unwrap();
         std::fs::write(&skill, "one, mine").unwrap();
+        install_role_in(&home, "lead", "two");
+        install_in(&home, "plan", &files("one"));
+        assert!(upgraded_in(&home).is_none());
+        // Sonny's next text goes beside them.
         assert!(install_role_in(&home, "lead", "three").is_none());
         assert!(install_in(&home, "plan", &files("two")).is_none());
         assert_eq!(std::fs::read_to_string(&role).unwrap(), "two, mine");
         let staged = home.join(".agent/sonny/upgrades/agents/lead.md");
         assert_eq!(std::fs::read_to_string(&staged).unwrap(), "three");
         let upgrades = upgraded_in(&home).unwrap();
+        // Claimed: a second Sonny starting at once has none to tell.
+        assert!(upgraded_in(&home).is_none());
         let note = upgrades.note();
         assert!(note.starts_with(UPGRADED), "{note}");
         let before = home.join(".agent/sonny/shipped/agents/lead.md");
@@ -709,6 +744,10 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("- the plan skill: theirs at "), "{note}");
+        // Not told, they wait for the next bot.
+        upgrades.back();
+        let upgrades = upgraded_in(&home).unwrap();
+        assert!(upgrades.note().contains("the plan skill"));
         // Told once; the same text at the next start is not told again.
         upgrades.told();
         install_role_in(&home, "lead", "three");
@@ -720,12 +759,28 @@ mod tests {
         assert!(again.note().contains("the lead role"));
         assert!(!again.note().contains("the plan skill"));
         assert_ne!(again.request_id(), upgrades.request_id());
+        again.back();
         // Brought in before the bot heard: nothing to say, and cleared.
         std::fs::write(&role, "four").unwrap();
         let brought = upgraded_in(&home).unwrap();
         assert_eq!(brought.note(), "");
         brought.told();
         assert!(upgraded_in(&home).is_none());
+        // A claim a Sonny left as it stopped goes back after a while.
+        install_role_in(&home, "lead", "five, offered");
+        let left = home.join(".agent/sonny/upgrades/pending.1");
+        std::fs::rename(pending(&home), &left).unwrap();
+        assert!(upgraded_in(&home).is_none());
+        let old = std::time::SystemTime::now() - CLAIM * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&left)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        upgraded_in(&home).unwrap().told();
+        assert!(!left.exists());
+        std::fs::write(&role, "four").unwrap();
         // Sonny's own again at the next start, beside nothing, it takes
         // Sonny's next text.
         assert!(install_role_in(&home, "lead", "four").is_none());

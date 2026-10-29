@@ -420,7 +420,9 @@ The first bot Sonny opens after that (not a side chat) is sent a note,
 queued after any turn it runs, naming the person's copy, Sonny's new text
 and the text the person started from, and asking it to offer the person a
 merge. The transcript shows it as one row, `↳ Sonny upgraded · lead role
-edited`. Each new text is told once; a copy left the same as it is Sonny's
+edited`. Each new text is told once, by one Sonny of several starting at
+once, and nothing is told when the person edits a file Sonny's text has
+not changed since; a copy left the same as it is Sonny's
 again from the next start. A file of the person's own that Sonny never
 wrote, or a link, is not offered.
 
