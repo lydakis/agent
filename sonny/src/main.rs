@@ -3300,7 +3300,7 @@ impl App {
             self.commit(welcome);
         }
         let unpaired = self
-            .draw_nodes(&paged.nodes, &paged.turns, true, after)
+            .draw_nodes(&paged.nodes, &paged.turns, true, after, None)
             .await;
         let wrote = std::mem::replace(&mut self.any_history, any_history);
         self.rows_drawn = rows_drawn;
@@ -4481,11 +4481,12 @@ impl App {
         nodes.reverse();
         // What changed the margin while no window drew it: the calls and
         // closes between where it was brought up to and this page.
+        let mut caught_up = Some(HashMap::new());
         if !every
             && let (Some(through), Some(&first)) = (self.margin.through(), nodes.first())
             && first > through + 1
         {
-            self.margin_since(through, self.older).await;
+            caught_up = self.margin_since(through, self.older).await;
         }
         // Drawn from the start (attaching, or a repaint), the bot's
         // reactions are read again with the rest; after a gap, those it
@@ -4503,7 +4504,7 @@ impl App {
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
         }
-        let unpaired = self.draw_nodes(&nodes, &turns, false, Vec::new()).await;
+        let unpaired = (self.draw_nodes(&nodes, &turns, false, Vec::new(), caught_up)).await;
         if from_start {
             self.unpaired = unpaired;
         }
@@ -4512,14 +4513,19 @@ impl App {
     /// The margin brought up from node `through` to the page of history
     /// drawn, which starts before `from`: only its `margin` calls that ran
     /// and the person's closes are read again, oldest first, whatever the
-    /// conversation shows. Read short, it stays where it was.
-    async fn margin_since(&mut self, through: i64, mut from: Option<i64>) {
+    /// conversation shows. The calls whose outputs are on the page are
+    /// given back; read short, it stays where it was and gives back none.
+    async fn margin_since(
+        &mut self,
+        through: i64,
+        mut from: Option<i64>,
+    ) -> Option<HashMap<String, Value>> {
         let mut nodes: Vec<i64> = Vec::new();
         while let Some(at) = from {
             let asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS,
                 "min_node": through + 1, "from": at});
             let Ok(page) = self.client.request("history_nodes", asked).await else {
-                return;
+                return None;
             };
             nodes.extend(
                 (page["nodes"].as_array().into_iter().flatten())
@@ -4535,7 +4541,7 @@ impl App {
             let short = self.short_read.replace(false);
             let items = self.items_at(chunk).await;
             if self.short_read.replace(short) {
-                return;
+                return None;
             }
             for (node, item) in items {
                 let id = item["call_id"].as_str().unwrap_or("").to_owned();
@@ -4565,6 +4571,7 @@ impl App {
         if let Some(&last) = nodes.last() {
             self.margin.advance(last);
         }
+        Some(calls)
     }
 
     /// The items at `nodes`, then `after` (what a newer page's calls
@@ -4572,13 +4579,17 @@ impl App {
     /// returned from calls before them is given back. Those `older` than
     /// any drawn change nothing but what is drawn: the questions, replies
     /// to react to and calls still running are the newer items' to say.
+    /// The margin is brought up to them with the `margin` calls its catch-up
+    /// left running, unless that fell short (`None`) or these read short.
     async fn draw_nodes(
         &mut self,
         nodes: &[i64],
         turns: &HashMap<i64, i64>,
         older: bool,
         after: Vec<(i64, Value)>,
+        mut caught_up: Option<HashMap<String, Value>>,
     ) -> Vec<(i64, Value)> {
+        let short = self.short_read.replace(false);
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
         let mut unpaired = Vec::new();
         // The bot's words, quiet if a call follows them, as they were live.
@@ -4674,6 +4685,17 @@ impl App {
                             false => calls.remove(id).or_else(|| self.calls.remove(id)),
                         };
                         let Some((name, arguments)) = call else {
+                            // A note the catch-up saw start ends here.
+                            if !older
+                                && !self.margin.holds(node)
+                                && let Some(arguments) =
+                                    caught_up.as_mut().and_then(|c| c.remove(id))
+                                && !output(&item).1
+                                && denial(&item).is_none()
+                                && !reactions::refused(&item)
+                            {
+                                self.note_call(id, &arguments, turns.get(&node).copied());
+                            }
                             unpaired.push((node, item));
                             continue;
                         };
@@ -4720,12 +4742,17 @@ impl App {
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
         }
+        let cut = self.short_read.get();
+        self.short_read.set(short || cut);
         if older {
             self.draw_bot_reactions();
             return unpaired;
         }
         // The margin holds what these nodes did to it.
-        if let Some(&last) = nodes.iter().max() {
+        if let Some(&last) = nodes.iter().max()
+            && caught_up.is_some()
+            && !cut
+        {
             self.margin.advance(last);
         }
         // A running turn's reactions are drawn when it ends.
@@ -12131,6 +12158,48 @@ mod tests {
         assert_eq!(kept.body, margin::Body::Markdown("new".into()));
         assert!(app.margin.note("gone").is_none());
         assert_eq!(app.margin.through(), Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_note_whose_call_is_past_the_page_and_its_output_on_it_is_kept() {
+        let call = json!({"type": "function_call", "call_id": "c8", "name": "margin",
+            "arguments": json!({"id": "plan", "title": "Plan", "markdown": "x"}).to_string()});
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") if asked["min_node"].is_null() => json!({
+                "nodes": [{"node": 9}], "next_from": 8,
+            }),
+            Some("history_nodes") => json!({"nodes": [{"node": 8}], "next_from": null}),
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": match node.as_i64() {
+                    Some(8) => call.clone(),
+                    _ => json!({"type": "function_call_output", "call_id": "c8", "output": "In the margin."}),
+                }}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.margin.advance(2);
+        app.history().await;
+        assert!(app.margin.note("plan").is_some());
+        assert_eq!(app.margin.through(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn a_margin_whose_catch_up_fell_short_stays_where_it_was() {
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") if asked["min_node"].is_null() => json!({
+                "nodes": [{"node": 9}], "next_from": 8,
+            }),
+            Some("history_nodes") => json!({"error": "bot_busy", "detail": "busy"}),
+            _ => json!({"items": [{"node": 9, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}]}}]}),
+        })
+        .await;
+        let mut app = app(client);
+        app.margin.advance(2);
+        app.history().await;
+        // What it missed is read again next time.
+        assert_eq!(app.margin.through(), Some(2));
     }
 
     #[tokio::test]
