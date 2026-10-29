@@ -1041,12 +1041,16 @@ pub fn file(value: &str) -> Result<When, String> {
 }
 
 /// A path a scheduler can watch: systemd reads a unit's path to the end of
-/// its line, trimmed, so one with a control character or ending in a space
-/// is refused on every system alike.
+/// its line, trimmed, and a line ending in a backslash goes on into the
+/// next, so one with a control character or ending in a space or a
+/// backslash is refused on every system alike.
 fn watchable(path: &Path) -> Result<(), &'static str> {
     let text = path.to_string_lossy();
-    match text.chars().any(char::is_control) || text.ends_with(char::is_whitespace) {
-        true => Err("a path with a control character or a trailing space cannot be watched"),
+    let end = text.ends_with(|c: char| c.is_whitespace() || c == '\\');
+    match text.chars().any(char::is_control) || end {
+        true => Err(
+            "a path with a control character, or ending in a space or a backslash, cannot be watched",
+        ),
         false => Ok(()),
     }
 }
@@ -1184,9 +1188,10 @@ pub fn definition(
     }
 }
 
-/// Whether a definition is a plist; else it is a unit.
+/// Whether a definition is a plist, by how it starts, which no message
+/// can change; else it is a unit.
 fn is_plist(text: &str) -> bool {
-    text.contains("<key>ProgramArguments</key>")
+    text.trim_start().starts_with('<')
 }
 
 /// The LaunchAgent for a trigger. `environment` is what the fire starts
@@ -1375,7 +1380,7 @@ pub fn unit(
         .map(|arg| quoted(&arg, true))
         .collect();
     let mut out = format!(
-        "# Sonny's trigger {name}: `trigger rm {name}` removes it.\n[Unit]\nDescription=Sonny trigger {name}\n\n[Service]\nType=oneshot\nExecStart={}\n",
+        "# Sonny's trigger {name}: `trigger rm {name}` removes it.\n[Unit]\nDescription=Sonny trigger {name}\n# Each start takes one ask: a burst of them, or of writes, is no reason to stop.\nStartLimitIntervalSec=0\n\n[Service]\nType=oneshot\nExecStart={}\n",
         command.join(" ")
     );
     out += &unit_environment(environment);
@@ -3862,7 +3867,8 @@ mod tests {
     #[test]
     fn a_unit_carries_everything_a_fire_needs() {
         let s = Trigger {
-            message: "100% sure: $HOME is \"home\" \\ not\tthere;\nThen say so.".into(),
+            // A message about a plist leaves the unit a unit.
+            message: "100% sure: $HOME is \"home\" \\ not\tthere;\nThen say so. <key>ProgramArguments</key>".into(),
             ..trigger()
         };
         let when = every("30m", clock(2026, 9, 28, 23, 52)).unwrap();
@@ -3874,8 +3880,9 @@ mod tests {
         let asks = Path::new("/H/.agent/triggers/p.fix-login.asks");
         let text = unit(app, &s, &when, asks, &environment);
         assert!(text.contains("[Service]\nType=oneshot\nExecStart=\"/opt/Sonny Dir/sonny\" \"--trigger-fire\" \"--name\" \"p.fix-login\""));
+        assert!(text.contains("\nStartLimitIntervalSec=0\n"));
         // systemd's own specifiers and variables are doubled; escapes in quotes.
-        assert!(text.contains(r#""100%% sure: $$HOME is \"home\" \\ not\tthere;\nThen say so.""#));
+        assert!(text.contains(r#""100%% sure: $$HOME is \"home\" \\ not\tthere;\nThen say so. <key>ProgramArguments</key>""#));
         assert!(text.contains("Environment=\"SHELL=/bin/zsh\"\nEnvironment=\"PATH=/a%%b:$P\"\n"));
         assert!(text.contains(
             "\n[X-Timer]\nOnCalendar=*-*-* *:22:00\nOnCalendar=*-*-* *:52:00\nPersistent=true\nAccuracySec=1s\n"
@@ -3961,7 +3968,12 @@ mod tests {
 
     #[test]
     fn a_path_systemd_cannot_hold_is_refused() {
-        for bad in ["/tmp/a\nExecStartPre=/bin/true", "/tmp/a ", "/tmp/\u{7}"] {
+        for bad in [
+            "/tmp/a\nExecStartPre=/bin/true",
+            "/tmp/a ",
+            "/tmp/\u{7}",
+            "/tmp/a\\",
+        ] {
             assert!(
                 file(bad).unwrap_err().starts_with("invalid_file:"),
                 "{bad:?}"
