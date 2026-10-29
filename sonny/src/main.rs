@@ -909,7 +909,7 @@ async fn run() -> Result<(), String> {
         && let Some(mode) = app.mode.filter(|mode| *mode != "full")
         && !approvals::sandboxed_as(
             &bot,
-            &approvals::sandbox(mode, true, std::path::Path::new(&app.workspace)),
+            &approvals::sandbox(mode, std::path::Path::new(&app.workspace)),
         )
     {
         app.gating = Some(mode);
@@ -971,7 +971,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
     // Confined from the start, as the mode it is made with confines it.
-    let mut settings = approvals::sandbox(approvals::MODES[0].0, true, &workspace);
+    let mut settings = approvals::sandbox(approvals::MODES[0].0, &workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
@@ -2548,7 +2548,7 @@ impl App {
             // A lead's sandbox goes with its mode.
             if self.project.is_some() {
                 let workspace = std::path::Path::new(&self.workspace);
-                fields.extend(approvals::sandbox(mode, true, workspace));
+                fields.extend(approvals::sandbox(mode, workspace));
             }
         }
         match self.client.request("configure", asked).await {

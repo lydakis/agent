@@ -1375,10 +1375,7 @@ async fn setup_lead(
     let mut gating = lead.new.then_some(approvals::MODES[0].0);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(
-            &record,
-            &approvals::sandbox(mode, true, Path::new(&workspace)),
-        )
+        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
     {
         gating = Some(mode);
     }
@@ -1396,7 +1393,7 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.extend(approvals::sandbox(mode, true, Path::new(&workspace)));
+        fields.extend(approvals::sandbox(mode, Path::new(&workspace)));
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {

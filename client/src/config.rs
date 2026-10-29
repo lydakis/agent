@@ -19,6 +19,7 @@
 //! lead_profile = "my-lead"     # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
 //! suggest = false               # no guess at the next message, on by default
+//! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
@@ -83,6 +84,10 @@ pub struct Sonny {
     /// The profile every other agent Sonny starts is told, in place of
     /// `task`.
     pub task_profile: Option<String>,
+    /// Commands, by their first words, that its sandboxed agents run
+    /// outside their sandboxes without asking, as Codex's rules that allow
+    /// a command prefix do: a tool with a daemon of its own, such as mcpx.
+    pub unsandboxed: Vec<String>,
     /// The MCP servers Sonny's agents reach, by name.
     pub mcp_servers: BTreeMap<String, McpServer>,
     /// Whether a copy of the agent guesses the person's next message after
@@ -99,6 +104,7 @@ impl Default for Sonny {
             task_effort: None,
             lead_profile: None,
             task_profile: None,
+            unsandboxed: Vec::new(),
             mcp_servers: BTreeMap::new(),
             suggest: true,
             sources: Vec::new(),
@@ -330,6 +336,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "lead_profile",
                 "task_profile",
                 "suggest",
+                "unsandboxed",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -355,6 +362,18 @@ fn parse(text: &str) -> Result<Config, String> {
                 config.sonny.suggest = value
                     .as_bool()
                     .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
+                let invalid = || format!("{name}.{key} must be a list of commands");
+                let commands = value.as_array().ok_or_else(invalid)?;
+                config.sonny.unsandboxed = commands
+                    .iter()
+                    .map(|command| match command.as_str() {
+                        Some(command) if !command.trim().is_empty() => Ok(command.to_owned()),
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
                 continue;
             }
             let value = string(&format!("{name}.{key}"), value)?;
@@ -549,7 +568,7 @@ mod tests {
     fn the_file_sets_what_it_names_and_refuses_the_rest() {
         assert_eq!(parse("").unwrap(), Config::default());
         let config = parse(
-            "# mine\n[judge]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\n",
+            "# mine\n[judge]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
         )
         .unwrap();
         assert_eq!(config.judge.model.as_deref(), Some("openai/luna"));
@@ -557,6 +576,7 @@ mod tests {
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
+        assert_eq!(config.sonny.unsandboxed, ["mcpx", "docker compose"]);
         assert_eq!(config.web_search, WebSearch::Live);
         let roles =
             parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
@@ -586,6 +606,14 @@ mod tests {
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
             ("[judge]\neffort = 3", "judge.effort must be a string"),
             ("[judge]\nmodel = \"\"", "judge.model must not be empty"),
+            (
+                "[sonny]\nunsandboxed = \"mcpx\"",
+                "sonny.unsandboxed must be a list of commands",
+            ),
+            (
+                "[sonny]\nunsandboxed = [\" \"]",
+                "sonny.unsandboxed must be a list of commands",
+            ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
         }

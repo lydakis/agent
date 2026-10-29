@@ -413,6 +413,7 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1187,9 +1188,9 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable` and `network` (as `create`'s
-settings name them), replaces the bot's sandbox, and the two left out go back
-to none and off; a bot another bot made keeps no weaker a sandbox than its
+anything is written. `sandbox`, with `writable`, `network` and `unsandboxed`
+(as `create`'s settings name them), replaces the bot's sandbox, and those left
+out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
 bot's prompt-cache lifetime from its next model call. It answers `{bot, bot_id, changed}`, `changed` naming the fields
@@ -2248,10 +2249,27 @@ a policy that never asks, a command asking to escalate is refused with
 from its arguments and the folders' names alone, so the round that announces
 it and the run that starts it agree.
 
+A command its client trusts runs outside the sandbox without asking, as a
+Codex rule that allows a command prefix runs it: a shell call that doesn't
+ask to escalate, whose script runs nothing but commands that begin with the
+words of one of the bot's `unsandboxed` entries. So a tool with a daemon of
+its own, such as mcpx, which keeps its lock and socket under
+`~/.local/state` and starts its daemon on first use, works from a sandboxed
+bot once it is named: started in a sandbox, the daemon would keep the
+sandbox's limits, and on Linux die with the command. Only a plain script is
+read, as Codex reads one: words, quoted or not, in commands joined by `&&`,
+`||`, `;`, `|` or a newline. A script with anything that could run something
+else (`$`, a backquote, a redirection, parentheses, `&` alone, a comment)
+runs in the sandbox, and so does one with any other command in it, such as
+`mcpx … | jq`; it can still ask to escalate. The command is found on the
+daemon's `PATH`, so an `unsandboxed` command is only as trusted as the
+folders there.
+
 A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
-parent's sandbox.
+parent's sandbox. It runs outside the sandbox only commands its creator
+does.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds

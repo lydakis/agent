@@ -557,7 +557,7 @@ async fn make(
     };
     let declare = json!(crate::declared::tools(true));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
-    let mut settings = crate::approvals::sandbox(mode, true, dir);
+    let mut settings = crate::approvals::sandbox(mode, dir);
     if agent_client::config::load()?.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
