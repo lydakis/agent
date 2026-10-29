@@ -282,7 +282,6 @@ class ServedToolTests(ModelFixture):
         [kept] = (self.path / '.agent/sonny/instructions').iterdir()
         self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
-    @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def note_for(self, bot, having, timeout=30):
         """The first note the lookout gave `bot` that says `having`."""
         deadline = time.monotonic() + timeout
@@ -334,6 +333,7 @@ class ServedToolTests(ModelFixture):
                       note)
         self.assertIn('`false` still exits 1', note)
 
+    @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('triggers')])

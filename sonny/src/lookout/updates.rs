@@ -416,7 +416,7 @@ impl Updates {
                     .creator(name)
                     .and_then(|c| self.bots.get(c))
                     .and_then(|c| c.id);
-                if self.goaled.remove(&key(turn)) {
+                if self.goaled.contains(&key(turn)) {
                     // News once its goal's check says, or once a check
                     // could have run its longest.
                     self.forwarding
@@ -583,6 +583,7 @@ impl Updates {
             .map(|(key, _)| key.clone())
             .collect();
         for key in late {
+            self.goaled.remove(&key);
             if let Some((_, status, from, origin)) = self.forwarding.remove(&key) {
                 self.tell(&key.0, key.1, &status, from, None, origin);
             }
@@ -604,6 +605,12 @@ impl Updates {
         if self.live {
             self.goaled.insert((name.to_owned(), turn));
         }
+    }
+
+    /// Whether a turn waits for its goal's check: the replay after a
+    /// restart starts before it, so the check runs again.
+    pub fn goal_pending(&self) -> bool {
+        !self.goaled.is_empty()
     }
 
     /// The goal's check of a turn said: no news when the task works again
@@ -645,6 +652,8 @@ impl Updates {
         self.tasks.retain(|(_, news)| !news.empty());
         self.forwarding
             .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
+        self.goaled
+            .retain(|(name, turn)| !handles.contains(&format!("turn:{name}/{turn}")));
     }
 
     /// Whether there is news for the lead: its own, or `held` other news.

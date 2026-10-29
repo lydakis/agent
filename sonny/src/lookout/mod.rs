@@ -1488,6 +1488,7 @@ impl Service {
             lookout.checking = 0;
             lookout.judging = 0;
         }
+        self.goals.reconnected();
         // Often enough for a note whose news has settled; subscription
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);
@@ -1531,12 +1532,12 @@ impl Service {
                         self.lookouts.remove(name);
                     }
                     // A turn whose goal's check is to run is news only once
-                        // it says how the goal stands.
-                        if let Some((bot, turn)) = self.goals.event(&event, live, &client, &checked) {
-                            for lookout in self.lookouts.values_mut() {
-                                lookout.updates.goal_turn(&bot, turn);
-                            }
+                    // it says how the goal stands.
+                    if let Some((bot, turn)) = self.goals.event(&event, live, &client, &checked) {
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.updates.goal_turn(&bot, turn);
                         }
+                    }
                     for lookout in self.lookouts.values_mut() {
                         lookout.event(&event);
                         // The oldest event whose news is not told yet: a
@@ -1564,6 +1565,7 @@ impl Service {
                     }
                 }
                 Some(goals::Settled { bot, turn, outcome }) = settled.recv() => {
+                    self.goals.settled(&bot);
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
                     }
@@ -2755,6 +2757,7 @@ impl Lookout {
         !self.due.is_empty()
             || self.checking > 0
             || !self.held.is_empty()
+            || self.updates.goal_pending()
             || self.updates.news(self.urgent.is_some())
     }
 

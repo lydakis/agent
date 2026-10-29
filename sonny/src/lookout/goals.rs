@@ -13,7 +13,8 @@
 //! its `goal` tool writes (a lead's for its tasks too) and the lookout
 //! reads again when a call changed it, and removes when the goal ends. A
 //! check runs as the person, outside every sandbox, as a trigger's `if`
-//! does: setting one waits for a verdict where the agent's other calls do.
+//! does, without the provider keys in ~/.agent/env: setting one waits for
+//! a verdict where the agent's other calls do.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -150,11 +151,15 @@ pub async fn call(
 ) -> Result<Value, String> {
     let target = |bot: &Value| bot.as_str().unwrap_or(caller).to_owned();
     // A goal goes on the caller or on an agent it made, whose record says
-    // so: the record also gives its folder, id and spend.
+    // so by id, since a name can be another bot's since: the record also
+    // gives its folder, id and spend.
+    let inspect = async |bot: &str| -> Result<Value, String> {
+        (client.request("inspect", json!({"bot": bot})).await)
+            .map_err(|e| format!("bot_not_found: {bot}: {e}"))
+    };
     let record = async |bot: &str| -> Result<Value, String> {
-        let record = (client.request("inspect", json!({"bot": bot})).await)
-            .map_err(|e| format!("bot_not_found: {bot}: {e}"))?;
-        if bot != caller && record["created_by"].as_str() != Some(caller) {
+        let record = inspect(bot).await?;
+        if bot != caller && record["created_by_id"] != inspect(caller).await?["bot_id"] {
             return Err(format!(
                 "not_your_task: {bot} was not made by {caller}; a goal goes on you or on a task you made"
             ));
@@ -300,8 +305,9 @@ pub struct Goals {
     called: HashSet<String>,
     /// Agents whose running turn the goal started.
     continued: HashSet<String>,
-    /// Agents whose running turn called the goal tool.
-    asked: HashSet<String>,
+    /// Agents whose goal's check runs: a turn that ends meanwhile is
+    /// plain news, and the check's own turn is checked in its place.
+    checking: HashSet<String>,
     /// Turns in a row the goal started that called no tool.
     idle: HashMap<String, u32>,
 }
@@ -314,9 +320,19 @@ impl Goals {
             goals: all(store),
             called: HashSet::new(),
             continued: HashSet::new(),
-            asked: HashSet::new(),
+            checking: HashSet::new(),
             idle: HashMap::new(),
         }
+    }
+
+    /// The check of `bot` said how its goal stands.
+    pub fn settled(&mut self, bot: &str) {
+        self.checking.remove(bot);
+    }
+
+    /// Checks under way answer a connection since dropped, never the next.
+    pub fn reconnected(&mut self) {
+        self.checking.clear();
     }
 
     pub fn reread(&mut self) {
@@ -349,11 +365,6 @@ impl Goals {
             }
             "tool_started" => {
                 self.called.insert(bot.to_owned());
-                // A goal set in this turn is checked as it ends, before
-                // the lookout would read the files again.
-                if data["name"] == crate::served::GOAL {
-                    self.asked.insert(bot.to_owned());
-                }
                 None
             }
             // A new agent under the name has no goal of the last one's.
@@ -366,13 +377,16 @@ impl Goals {
             "turn_finished" if live => {
                 let turn = event["turn"].as_i64()?;
                 let status = data["status"].as_str().unwrap_or_default();
-                if self.asked.remove(bot) {
-                    match read(&self.store, bot) {
-                        Some(goal) => self.goals.insert(bot.to_owned(), goal),
-                        None => self.goals.remove(bot),
-                    };
-                }
+                // Its goal as it is now, which its lead may have set or
+                // cleared in the meantime.
+                match read(&self.store, bot) {
+                    Some(goal) => self.goals.insert(bot.to_owned(), goal),
+                    None => self.goals.remove(bot),
+                };
                 let goal = self.goals.get(bot)?.clone();
+                if self.checking.contains(bot) {
+                    return None;
+                }
                 // An interrupted or failed turn pauses it: the next turn
                 // that completes is checked. A steer's is part of another.
                 if status != "completed" && goal.blocked.is_none() {
@@ -391,6 +405,7 @@ impl Goals {
                 );
                 let held = (bot.to_owned(), turn);
                 let bot = bot.to_owned();
+                self.checking.insert(bot.clone());
                 tokio::spawn(async move {
                     let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
                     let _ = done.send(Settled { bot, turn, outcome }).await;
@@ -481,39 +496,68 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
         .stderr(std::process::Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let child = match command.spawn() {
+    // The provider keys in ~/.agent/env are the daemon's: no agent's own
+    // command has them, nor does its check.
+    if let Some(file) = agent_client::env_file::path() {
+        for (key, _) in agent_client::env_file::read(&file).unwrap_or_default() {
+            command.env_remove(key);
+        }
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return (None, format!("the check did not start: {error}")),
     };
     let group = child.id();
-    let waited = tokio::time::timeout(
-        Duration::from_secs(goal.timeout_s),
-        child.wait_with_output(),
-    )
-    .await;
-    let output = match waited {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return (None, format!("the check failed to run: {error}")),
-        Err(_) => {
-            if let Some(group) = group {
-                // SAFETY: a signal to the process group the check leads.
-                unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
-            }
-            return (
-                None,
-                format!("the check ran past {} s and was stopped", goal.timeout_s),
-            );
-        }
+    // Read as it prints, keeping only the end, so a check that prints
+    // without end holds a few KB, not all of it.
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let ran = async {
+        let (stdout, stderr) = tokio::join!(last(stdout), last(stderr));
+        (child.wait().await, stdout, stderr)
     };
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let errors = String::from_utf8_lossy(&output.stderr);
+    let (status, stdout, stderr) =
+        match tokio::time::timeout(Duration::from_secs(goal.timeout_s), ran).await {
+            Ok((Ok(status), stdout, stderr)) => (status, stdout, stderr),
+            Ok((Err(error), ..)) => return (None, format!("the check failed to run: {error}")),
+            Err(_) => {
+                if let Some(group) = group {
+                    // SAFETY: a signal to the process group the check leads.
+                    unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
+                }
+                return (
+                    None,
+                    format!("the check ran past {} s and was stopped", goal.timeout_s),
+                );
+            }
+        };
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    let errors = String::from_utf8_lossy(&stderr);
     if !errors.trim().is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(&errors);
     }
-    (output.status.code(), tail(&text))
+    (status.code(), tail(&text))
+}
+
+/// The last `OUTPUT_BYTES` a pipe gave, read until it closes.
+async fn last(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let (mut kept, mut chunk) = (Vec::new(), [0u8; 8192]);
+    while let Ok(read) = pipe.read(&mut chunk).await
+        && read > 0
+    {
+        kept.extend_from_slice(&chunk[..read]);
+        if kept.len() > 2 * OUTPUT_BYTES {
+            kept.drain(..kept.len() - OUTPUT_BYTES);
+        }
+    }
+    let from = kept.len().saturating_sub(OUTPUT_BYTES);
+    kept.split_off(from)
 }
 
 /// The end of a check's output: its last lines, within a few KB.
@@ -592,6 +636,16 @@ mod tests {
         assert_eq!(code, Some(3));
         assert!(output.starts_with("42\n"), "{output}");
         assert!(output.ends_with("100\n'''"), "{output}");
+        // One that prints without end keeps only the end of it.
+        let mut loud = goal(&store, "p.fix");
+        loud.check = "head -c 50000000 /dev/zero | tr '\\0' x; echo; echo last".into();
+        let (code, output) = runtime.block_on(run(&loud, &store, &store));
+        assert_eq!(code, Some(0));
+        assert!(
+            output.len() <= OUTPUT_BYTES && output.ends_with("\nlast"),
+            "{}",
+            output.len()
+        );
         let mut slow = goal(&store, "p.fix");
         slow.check = "sleep 30".into();
         slow.timeout_s = 1;
