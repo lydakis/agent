@@ -1295,8 +1295,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
     let mut callers: HashMap<u64, i64> = HashMap::new();
-    // The process at each session's other end, where the system says.
-    let mut peers: HashMap<u64, u32> = HashMap::new();
+    // Sessions a companion opened, known once as each opens: what they
+    // send is no client's activity.
+    let mut companion_sessions: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let (stdout, stdout_writer) = Output::stdout();
     let stdio_owner = config.socket.is_none();
     let mut socket_owner = None;
@@ -1462,7 +1463,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // running command. Parked turns are durable and resume on
                     // the next start.
                     let running = service.store.op("running_processes", |db| db.running_processes()).await?;
-                    let clients = sessions.keys().any(|id| !peers.get(id).is_some_and(|pid| service.companions.runs_pid(*pid)));
+                    let clients = sessions.keys().any(|id| !companion_sessions.contains(id));
                     if !clients && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
                         if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                     } else {
@@ -1503,22 +1504,25 @@ pub async fn run(config: Configuration) -> Result<()> {
                 message = inbound.recv() => {
                     let Some(message) = message else { break };
                     // What a companion sends is no client's activity.
-                    let session = match &message { Inbound::Open(id, ..) | Inbound::Request(id, _) | Inbound::Closed(id) => *id };
-                    if !peers.get(&session).is_some_and(|pid| service.companions.runs_pid(*pid)) {
+                    let companion = match &message {
+                        Inbound::Open(_, _, _, peer) => peer.is_some_and(|pid| service.companions.runs_pid(pid)),
+                        Inbound::Request(id, _) | Inbound::Closed(id) => companion_sessions.contains(id),
+                    };
+                    if !companion {
                         last_activity = std::time::Instant::now();
                     }
                     match message {
-                        Inbound::Open(id, output, caller, peer) => {
+                        Inbound::Open(id, output, caller, _) => {
                             let _ = output.try_send(ready.clone());
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
-                            if let Some(peer) = peer { peers.insert(id, peer); }
+                            if companion { companion_sessions.insert(id); }
                             service.sessions = sessions.len();
                         }
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
                             callers.remove(&id);
-                            peers.remove(&id);
+                            companion_sessions.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
