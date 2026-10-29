@@ -2693,9 +2693,11 @@ impl App {
             return;
         };
         self.first_node = Some(oldest);
-        // What the newer rows were drawn with is put by meanwhile.
-        let pending = std::mem::take(&mut self.pending);
-        let marks = std::mem::take(&mut self.marks);
+        // What the newer rows were drawn with is put by meanwhile, and the
+        // page is written on a screen of its own: a group of calls in it
+        // drawn again is found there, not among the newer rows.
+        self.flush();
+        let screen = std::mem::take(&mut self.screen);
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
         let bot_reactions = std::mem::take(&mut self.bot_reactions);
@@ -2705,18 +2707,18 @@ impl App {
         self.commit(welcome);
         let unpaired = std::mem::take(&mut self.unpaired);
         self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
-        let mut lines = std::mem::replace(&mut self.pending, pending);
-        let older_marks = std::mem::replace(&mut self.marks, marks);
-        self.any_history = any_history;
+        let wrote = std::mem::replace(&mut self.any_history, any_history);
         self.rows_drawn = rows_drawn;
         self.bot_reactions = bot_reactions;
         self.react_calls = react_calls;
         self.answering = answering;
         // A blank row apart from what was the first.
-        if !lines.is_empty() {
-            lines.push(Line::default());
+        if wrote {
+            self.pending.push(Line::default());
         }
-        self.screen.prepend(lines, older_marks);
+        self.flush();
+        let older = std::mem::replace(&mut self.screen, screen);
+        self.screen.prepend(older);
     }
 
     /// The connection is gone: the daemon drops a reader that falls

@@ -470,12 +470,14 @@ impl Screen {
         !self.trimmed && self.back + AHEAD * height >= self.most(height)
     }
 
-    /// `lines` drawn above the first row, older than any shown, each of
-    /// `marks` on its line's row as [`Screen::push_marked`] puts it, the
-    /// view left on the rows it shows.
-    pub fn prepend(&mut self, lines: Vec<Line<'static>>, marks: Vec<(usize, Mark)>) {
-        let mut older = Self::default();
-        older.push_marked(lines, marks);
+    /// The rows `older` was written with drawn above the first row, older
+    /// than any shown, their marks kept: the view left on the rows it
+    /// shows.
+    pub fn prepend(&mut self, older: Screen) {
+        let mut older = Screen {
+            rows: older.rows,
+            ..Self::default()
+        };
         let added = older.rows.len();
         if added == 0 {
             return;
@@ -1656,6 +1658,13 @@ mod tests {
         range.map(|i| Line::from(format!("row {i}"))).collect()
     }
 
+    /// A screen `lines` were written to.
+    fn written(lines: Vec<Line<'static>>) -> Screen {
+        let mut screen = Screen::default();
+        screen.push(lines);
+        screen
+    }
+
     #[test]
     fn older_rows_drawn_above_leave_the_view_where_it_was() {
         let (mut screen, _) = screen(rows(100..160), 20, 5);
@@ -1666,7 +1675,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
         let shown = row(&buf, 0);
-        screen.prepend(rows(0..100), Vec::new());
+        screen.prepend(written(rows(0..100)));
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0), shown);
         assert!(!screen.near_top());
@@ -1675,7 +1684,7 @@ mod tests {
     #[test]
     fn older_rows_drawn_above_stay_at_another_width() {
         let (mut screen, _) = screen(rows(13_000..13_100), 20, 5);
-        screen.prepend(rows(0..13_000), Vec::new());
+        screen.prepend(written(rows(0..13_000)));
         let area = Rect::new(0, 0, 30, 5);
         screen.render(area, &mut Buffer::empty(area), |_| None);
         assert_eq!(screen.height(30), 13_100);
@@ -1688,7 +1697,7 @@ mod tests {
         let (mut screen, _) = screen(rows(100..160), 20, 5);
         screen.find("row 15");
         assert_eq!(screen.found(), Some((10, 10)));
-        screen.prepend(rows(0..100), Vec::new());
+        screen.prepend(written(rows(0..100)));
         assert_eq!(screen.found(), Some((11, 11)));
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
@@ -1875,14 +1884,22 @@ mod tests {
     fn older_rows_drawn_above_keep_their_marks() {
         let mut screen = Screen::default();
         screen.push(vec![Line::from("newest")]);
-        screen.prepend(
+        let mut older = Screen::default();
+        older.push_marked(
             vec![Line::from("older"), Line::from("• Started a ▸")],
             vec![
                 (0, Mark::Tag(Tag::End(1))),
                 (1, Mark::Link(format!("{BUTTON}fold/1"))),
             ],
         );
-        assert_eq!(screen.texts(), ["older", "• Started a ▸", "newest"]);
+        // Changed while it was written on its own, as an older page is.
+        older.replace_tagged(
+            Tag::End(1),
+            vec![Line::from("older, again")],
+            vec![(0, Mark::Tag(Tag::End(1)))],
+        );
+        screen.prepend(older);
+        assert_eq!(screen.texts(), ["older, again", "• Started a ▸", "newest"]);
         assert!(screen.has(Tag::End(1)));
         assert_eq!(screen.links()[1].as_deref(), Some("sonny:fold/1"));
         assert!(screen.put_under(Tag::End(1), Tag::Reactions(1), Some(Line::from("  👍"))));
