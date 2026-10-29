@@ -830,6 +830,9 @@ mod tests {
         // One that prints without end keeps only the end of it.
         let mut loud = goal(&store, "p.fix");
         loud.check = "head -c 50000000 /dev/zero | tr '\\0' x; echo; echo last".into();
+        // What is kept is under test, not how fast 50 MB goes through `tr`:
+        // a slow runner takes more than the 5 s the others get.
+        loud.timeout_s = TIMEOUT_S;
         let (code, output) = runtime.block_on(run(&loud, &store, &store));
         assert_eq!(code, Some(0));
         assert!(

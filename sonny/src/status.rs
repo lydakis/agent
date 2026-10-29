@@ -72,7 +72,7 @@ pub fn group(state: &str, running: bool, asking: bool, pr: bool, resolved: bool)
         "needs you" | "failed" => Group::NeedsYou,
         _ if asking => Group::NeedsYou,
         _ if running => Group::Working,
-        "done" if pr => Group::Review,
+        "done" | crate::started::CHECKED if pr => Group::Review,
         _ => Group::Idle,
     }
 }
@@ -274,6 +274,8 @@ mod tests {
         assert_eq!(group("done", false, true, true, false), Group::NeedsYou);
         assert_eq!(group("failed", false, false, false, false), Group::NeedsYou);
         assert_eq!(group("done", false, false, true, false), Group::Review);
+        // A goal's check passed: the pull request still waits on review.
+        assert_eq!(group("checked", false, false, true, false), Group::Review);
         assert_eq!(group("stopped", false, false, true, false), Group::Idle);
         assert_eq!(group("done", false, false, false, false), Group::Idle);
         assert_eq!(group("failed", false, true, true, true), Group::Resolved);
