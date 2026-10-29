@@ -54,8 +54,10 @@ jobs:
 
   macos:
     # The release's package job runs these same tests on this runner before
-    # it builds anything.
+    # it builds anything. Advisory for now: a failure here is read before a
+    # release is tagged, but does not fail the run.
     runs-on: macos-26
+    continue-on-error: true
     timeout-minutes: 30
     defaults:
       run:
