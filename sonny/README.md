@@ -175,6 +175,32 @@ a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
+#### T3 Code
+
+`sonny acp` is Sonny for [T3 Code](https://github.com/pingdotgg/t3code): it
+speaks the Agent Client Protocol on stdio, so T3 Code runs it as a provider,
+one process for each thread. In T3 Code's Settings, add an "ACP Registry"
+provider, configure it by hand as a local command, and give it the
+executable `sonny` (or the full path `command -v sonny` prints) with the one
+argument `acp`. A thread opened in a folder is that folder's lead, the
+one `sonny` there opens, set up the same way: its rules, skills and memory,
+Sonny's tools, its approval mode and sandbox, and the lookout. A call that
+waits for you is asked in the thread (Allow or Deny); one the judge passes
+runs without asking. The turns the lead takes on its own, as when the lookout
+wakes it because a task finished, show in the thread between yours, as work
+the agent started (the protocol's version 2 draft, which T3 Code speaks).
+Each task the lead starts opens as a T3 Code thread of its own, in the task's
+worktree (in the project's folder when T3 Code does not take the worktree as
+one of the project's), with the task's brief as its first message; that
+thread is the task's, so it shows the task's work and steers it. Sonny opens
+it with the `t3_thread_launch` tool T3 Code gives each thread it runs, by the
+credential T3 Code scopes to that thread, which no program Sonny starts
+inherits. Sonny takes the person's words out of the instructions T3 Code
+wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
+Plan mode does not reach them; plan with the lead instead. What thread is
+which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
+same bot.
+
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing

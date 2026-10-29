@@ -8,6 +8,7 @@
 //! alternate screen, replies stream a line at a time, tool calls are one
 //! `• Ran …` line with a short `└` look at the result, and a status row
 //! says how long the turn has run and how to stop it.
+mod acp;
 mod approvals;
 mod asks;
 mod attach;
@@ -50,6 +51,7 @@ mod shell;
 mod skills;
 mod sound;
 mod status;
+mod t3;
 mod table;
 mod task;
 mod term;
@@ -175,7 +177,9 @@ fn usage() -> String {
      it when its tasks need it and answers its agents' calls of Sonny's tools; Sonny\n\
      starts one. sonny lookout --replay --judge SPEC[,SPEC]... [--limit N] runs its\n\
      checks over what the store kept.\n\
-     sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH."
+     sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
+     sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
+     for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
 }
 
@@ -663,6 +667,8 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
+        // T3 Code runs this as a provider, a process for each thread.
+        Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

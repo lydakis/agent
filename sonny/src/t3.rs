@@ -1,0 +1,308 @@
+//! T3 Code, as `sonny acp` meets it: the tools T3 Code gives the agents it
+//! runs, over an MCP endpoint it names in their environment, with which a
+//! lead's thread opens a thread for each task the lead starts; the tasks
+//! waiting for their thread, and the bot each thread is.
+use serde_json::{Value, json};
+use std::path::PathBuf;
+
+/// The MCP protocol version Sonny asks T3 Code's endpoint for, as T3
+/// Code's own terminal fallback does.
+const MCP_VERSION: &str = "2025-06-18";
+
+/// How long a task waits for its thread to claim it.
+const PENDING_SECS: u64 = 10 * 60;
+
+/// T3 Code's tools for the thread this process serves: the endpoint and the
+/// credential T3 Code scopes to that thread.
+pub struct T3 {
+    endpoint: String,
+    authorization: String,
+}
+
+impl T3 {
+    /// T3 Code's endpoint, when T3 Code started this process.
+    pub fn from_env() -> Option<T3> {
+        let var = |name| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Some(T3 {
+            endpoint: var("T3_ACP_MCP_ENDPOINT")?,
+            authorization: var("T3_ACP_MCP_AUTHORIZATION")?,
+        })
+    }
+
+    /// The variables `from_env` reads: the credential is this thread's, and
+    /// no program Sonny starts (the daemon, the lookout) takes it.
+    pub const VARS: [&str; 4] = [
+        "T3_ACP_MCP_ENDPOINT",
+        "T3_ACP_MCP_AUTHORIZATION",
+        "T3_ACP_MCP_NODE",
+        "T3_ACP_MCP_ENTRYPOINT",
+    ];
+
+    /// Call one of T3 Code's tools: what it returned, or why not.
+    pub async fn call(&self, tool: &str, arguments: Value) -> Result<Value, String> {
+        let http = reqwest::Client::new();
+        let mut session = Mcp {
+            http: &http,
+            t3: self,
+            id: None,
+            version: None,
+        };
+        session
+            .request(
+                "initialize",
+                json!({"protocolVersion": MCP_VERSION, "capabilities": {},
+                "clientInfo": {"name": "sonny", "version": env!("CARGO_PKG_VERSION")}}),
+            )
+            .await?;
+        let called = async {
+            session
+                .post(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await?;
+            session
+                .request("tools/call", json!({"name": tool, "arguments": arguments}))
+                .await
+        }
+        .await;
+        session.end().await;
+        result(tool, called?)
+    }
+}
+
+/// One MCP session on T3 Code's endpoint.
+struct Mcp<'a> {
+    http: &'a reqwest::Client,
+    t3: &'a T3,
+    id: Option<String>,
+    version: Option<String>,
+}
+
+impl Mcp<'_> {
+    fn headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut request = request
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", &self.t3.authorization);
+        if let Some(id) = &self.id {
+            request = request.header("mcp-session-id", id);
+        }
+        if let Some(version) = &self.version {
+            request = request.header("mcp-protocol-version", version);
+        }
+        request
+    }
+
+    /// Post one message: what came back, as JSON or as server-sent events.
+    async fn post(&mut self, message: &Value) -> Result<Vec<Value>, String> {
+        let response = self
+            .headers(self.http.post(&self.t3.endpoint))
+            .header("content-type", "application/json")
+            .body(message.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("T3 Code's tools: {e}"))?;
+        if let Some(id) = response.headers().get("mcp-session-id") {
+            self.id = id.to_str().ok().map(str::to_owned);
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("T3 Code's tools: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("T3 Code's tools answered HTTP {}", status.as_u16()));
+        }
+        Ok(payloads(&body))
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = format!("sonny-{method}");
+        let replies = self
+            .post(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await?;
+        let reply = replies
+            .into_iter()
+            .find(|reply| reply["id"] == id.as_str())
+            .ok_or_else(|| format!("T3 Code's tools did not answer {method}"))?;
+        if !reply["error"].is_null() {
+            return Err(format!("T3 Code's {method}: {}", reply["error"]));
+        }
+        if let Some(version) = reply["result"]["protocolVersion"].as_str() {
+            self.version = Some(version.to_owned());
+        }
+        Ok(reply["result"].clone())
+    }
+
+    async fn end(&self) {
+        if self.id.is_some() {
+            let _ = self
+                .headers(self.http.delete(&self.t3.endpoint))
+                .send()
+                .await;
+        }
+    }
+}
+
+/// The messages in a reply's body: one JSON value or a list of them, or
+/// the `data` of each server-sent event.
+fn payloads(body: &str) -> Vec<Value> {
+    let parsed = |text: &str| match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(all)) => all,
+        Ok(one) => vec![one],
+        Err(_) => Vec::new(),
+    };
+    let whole = parsed(body.trim());
+    if !whole.is_empty() {
+        return whole;
+    }
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .flat_map(|data| parsed(data.trim()))
+        .collect()
+}
+
+/// A tool's result: its structured content, else its text as JSON, else
+/// its text; or the error it reported.
+fn result(tool: &str, called: Value) -> Result<Value, String> {
+    let text: String = called["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .collect();
+    if called["isError"] == true {
+        return Err(format!("T3 Code's {tool}: {text}"));
+    }
+    if !called["structuredContent"].is_null() {
+        return Ok(called["structuredContent"].clone());
+    }
+    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+/// What the person wrote, out of a prompt T3 Code wrapped in its own
+/// instructions: those name tools the bot does not have.
+pub fn request(prompt: &str) -> &str {
+    const OPEN: &str = "<user_request>\n";
+    const CLOSE: &str = "\n</user_request>";
+    if !prompt.starts_with("<t3_code") {
+        return prompt;
+    }
+    match (prompt.find(OPEN), prompt.strip_suffix(CLOSE)) {
+        (Some(at), Some(inside)) if at + OPEN.len() <= inside.len() => &inside[at + OPEN.len()..],
+        _ => prompt,
+    }
+}
+
+/// Where Sonny keeps what threads are which bots, and the tasks waiting
+/// for theirs.
+fn dir(of: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".agent/sonny/t3").join(of))
+}
+
+fn file_name(bot: &str) -> String {
+    bot.replace('/', "%2F")
+}
+
+/// The task `bot` waits for the thread opened with `brief`.
+pub fn expect(bot: &str, brief: &str) -> Result<(), String> {
+    let dir = dir("pending").ok_or("HOME is not set")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = json!({"bot": bot, "brief": brief, "at": now});
+    std::fs::write(dir.join(file_name(bot)), record.to_string()).map_err(|e| e.to_string())
+}
+
+/// No thread comes for `bot`.
+pub fn forget(bot: &str) {
+    if let Some(dir) = dir("pending") {
+        let _ = std::fs::remove_file(dir.join(file_name(bot)));
+    }
+}
+
+/// The task a thread's first prompt opens: the one waiting with that
+/// brief, which no other thread then claims. Ones waiting too long go.
+pub fn claim(prompt: &str) -> Option<String> {
+    let dir = dir("pending")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut found = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if now.saturating_sub(record["at"].as_u64().unwrap_or(0)) > PENDING_SECS {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+        if found.is_none()
+            && record["brief"].as_str().map(str::trim) == Some(prompt.trim())
+            // Claimed by whoever removes it.
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            found = record["bot"].as_str().map(str::to_owned);
+        }
+    }
+    found
+}
+
+/// The bot the thread `session` is, for its next start.
+pub fn remember(session: &str, bot: &str) {
+    if let Some(dir) = dir("sessions") {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(file_name(session)), bot);
+    }
+}
+
+pub fn recall(session: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir("sessions")?.join(file_name(session))).ok()?;
+    Some(text.trim().to_owned()).filter(|bot| !bot.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_persons_words_come_out_of_t3_codes_wrapping() {
+        let wrapped = "<t3_code_instructions>\n## T3 Code interaction mode: Default\n\nUse delegate_task.\n</t3_code_instructions>\n\n<user_request>\nFix the cart.\nThen test it.\n</user_request>";
+        assert_eq!(request(wrapped), "Fix the cart.\nThen test it.");
+        let orchestration = "<t3_code_orchestration_instructions>x</t3_code_orchestration_instructions>\n\n<user_request>\nHi\n</user_request>";
+        assert_eq!(request(orchestration), "Hi");
+        // Words of the person's own that look like it stay.
+        assert_eq!(
+            request("<user_request>\nHi\n</user_request>"),
+            "<user_request>\nHi\n</user_request>"
+        );
+        assert_eq!(request("Fix it."), "Fix it.");
+    }
+
+    #[test]
+    fn a_reply_is_json_or_server_sent_events() {
+        assert_eq!(payloads(r#"{"id":1}"#), vec![json!({"id": 1})]);
+        assert_eq!(
+            payloads("event: message\ndata: {\"id\":1}\n\ndata: {\"id\":2}\n\n"),
+            vec![json!({"id": 1}), json!({"id": 2})]
+        );
+        assert!(payloads("").is_empty());
+    }
+
+    #[test]
+    fn a_result_is_structured_or_text() {
+        let structured = json!({"content": [{"type": "text", "text": "x"}], "structuredContent": {"threadId": "t"}});
+        assert_eq!(result("t", structured), Ok(json!({"threadId": "t"})));
+        let text = json!({"content": [{"type": "text", "text": "{\"threadId\":\"t\"}"}]});
+        assert_eq!(result("t", text), Ok(json!({"threadId": "t"})));
+        let failed = json!({"content": [{"type": "text", "text": "no project"}], "isError": true});
+        assert_eq!(
+            result("launch", failed),
+            Err("T3 Code's launch: no project".into())
+        );
+    }
+}
