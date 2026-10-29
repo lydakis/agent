@@ -560,8 +560,8 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     made
 }
 
-/// A lead made for another agent opens in a home of its own, a Herdr
-/// workspace or a Rex session beside the caller's, as the person would
+/// A lead made for another agent opens in a home of its own, a Herdr or
+/// cmux workspace or a Rex session beside the caller's, as the person would
 /// otherwise ask; `opened_in` says where, or `not_opened` why not.
 async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut Value) {
     let Some(project) = made["project"].as_str() else {

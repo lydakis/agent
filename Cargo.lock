@@ -2170,6 +2170,7 @@ version = "0.5.2"
 dependencies = [
  "agent-client",
  "base64",
+ "image",
  "libc",
  "portable-pty",
  "ratatui",

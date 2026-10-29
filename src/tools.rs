@@ -1817,6 +1817,10 @@ fn sh(
         "HERDR_WORKSPACE_ID",
         "HERDR_TAB_ID",
         "HERDR_PANE_ID",
+        "CMUX_WORKSPACE_ID",
+        "CMUX_SURFACE_ID",
+        "CMUX_TAB_ID",
+        "CMUX_PANEL_ID",
     ] {
         process.env_remove(name);
     }
