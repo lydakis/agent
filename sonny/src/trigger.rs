@@ -2374,7 +2374,7 @@ pub fn restamp(places: &Places, identity: &str, lineage: &str, launchd: Loader) 
             return;
         };
         // Read again under the lock: an `rm`, `add` or fire may have come first.
-        let path = places.plist(&trigger.name);
+        let path = places.job(&trigger.name);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
