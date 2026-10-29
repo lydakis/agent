@@ -1162,8 +1162,10 @@ mod tests {
         let closed = |id: &str| json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": closed_message(id)}]});
         // Taken away by the person there: no longer read, and put there
         // again with a title only, it shows nothing.
-        let mut reference = Reference::default();
-        reference.workspace = Some("/work/calc.add".into());
+        let mut reference = Reference {
+            workspace: Some("/work/calc.add".into()),
+            ..Default::default()
+        };
         reference.read(
             "flow",
             &[
