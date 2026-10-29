@@ -20,13 +20,19 @@ pub struct Sub {
 }
 
 impl Sub {
-    /// What Sonny subscribes a lead to: every bot it or its tasks made and
-    /// every bot named in the project's way.
+    /// What Sonny subscribes a lead to: every bot it or its tasks made;
+    /// and for the folder's first lead, `{project}.lead`, every bot named in
+    /// the project's way too, so a bot no agent made reaches a lead. Another
+    /// lead of the folder hears its own tasks only, never the others'.
     pub fn lead(lead: &str, project: &str) -> Sub {
+        let first = lead == format!("{project}.lead");
         Sub {
             name: "tasks".into(),
             tasks_of: vec![lead.to_owned()],
-            bots: vec![format!("{project}.*")],
+            bots: match first {
+                true => vec![format!("{project}.*")],
+                false => Vec::new(),
+            },
             sources: Vec::new(),
         }
     }
@@ -324,6 +330,14 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_lead_of_a_folder_hears_its_own_tasks_only() {
+        assert_eq!(Sub::lead("shop.lead", "shop").bots, ["shop.*"]);
+        let other = Sub::lead("shop.lead.billing", "shop");
+        assert!(other.bots.is_empty());
+        assert_eq!(other.tasks_of, ["shop.lead.billing"]);
+    }
 
     #[test]
     fn globs_match_whole_names() {

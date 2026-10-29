@@ -1,4 +1,4 @@
-"""`sonny acp`, as T3 Code runs it: a thread is its folder's lead, its turns
+"""`sonny acp`, as T3 Code runs it: a thread is a lead of its folder, its turns
 and calls are the thread's updates, a call waiting for the person is asked
 in the thread, and a task the lead starts opens as a thread of its own,
 through T3 Code's tools, which that thread then follows."""
@@ -150,6 +150,16 @@ class AcpTests(ModelFixture):
         self.opened = opened
         return thread, opened['result']['sessionId']
 
+    def adopt(self, thread, session, name='lead'):
+        """The thread's first words, `/lead NAME`: it is that lead of the
+        folder, which starts no turn."""
+        answered, updates = thread.answer_of(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': self.wrapped(f'/lead {name}')}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        bot = 'calc.lead' if name == 'lead' else f'calc.lead.{name}'
+        self.assertEqual([u['content']['text'] for u in updates if u['sessionUpdate'] == 'agent_message_chunk'],
+                         [f'This thread is {bot}.'])
+
     @staticmethod
     def wrapped(text):
         """A prompt as T3 Code sends it: in its own instructions, then its
@@ -165,6 +175,7 @@ class AcpTests(ModelFixture):
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
                             approve=['start_task'], approver='manual')
         thread, session = self.open(repo)
+        self.adopt(thread, session)
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
         prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
         # The call waits for the person, who is asked in the thread.
@@ -191,7 +202,7 @@ class AcpTests(ModelFixture):
         self.assertIn('Started calc.fix', ended['content'][0]['content']['text'])
         self.assertIn('done', ''.join(u['content']['text'] for u in updates
                                       if u['sessionUpdate'] == 'agent_message_chunk'))
-        # The thread was the folder's lead, which T3 Code's words never
+        # The thread was the lead it asked for, which T3 Code's words never
         # reached: Sonny took the person's out of them.
         [turn] = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         prompts = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
@@ -230,6 +241,7 @@ class AcpTests(ModelFixture):
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
                             approve=['start_task'], approver='manual')
         thread, session = self.open(repo)
+        self.adopt(thread, session)
         self.t3.delegating = False
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
         first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
@@ -260,6 +272,7 @@ class AcpTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.')
         thread, session = self.open(repo)
+        self.adopt(thread, session)
         # A model that reasons before it answers: the reply, which
         # streamed, is said once.
         self.model.history_reasoning = {'type': 'reasoning', 'id': 'rs_1',
@@ -333,8 +346,9 @@ class AcpTests(ModelFixture):
         self.assertEqual(raised['result']['configOptions'][1]['currentValue'], 'high')
         lead = self.daemon.request('inspect', bot='calc.lead')['result']
         self.assertEqual((lead['model'], lead['effort']), ('synthetic-model', 'high'))
-        # Another thread in the folder opens on T3 Code's last pick: the
-        # lead that is there keeps its own.
+        # Another thread in the folder is a lead of its own, named after its
+        # first words, which T3 Code's last pick makes: the lead that is
+        # there keeps its own.
         other, again = self.open(repo)
         for option, value in (('model', 'openai/other-model'), ('effort', 'low')):
             other.answer_of(other.ask('session/set_config_option', {
@@ -344,6 +358,24 @@ class AcpTests(ModelFixture):
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
         lead = self.daemon.request('inspect', bot='calc.lead')['result']
         self.assertEqual((lead['model'], lead['effort']), ('synthetic-model', 'high'))
+        made = self.daemon.request('inspect', bot='calc.lead.again')['result']
+        self.assertEqual((made['model'], made['effort']), ('other-model', 'low'))
+        # A thread whose first words are `/lead NAME` is that lead, and one
+        # asking for a lead the folder has not is refused.
+        third, session = self.open(repo)
+        self.adopt(third, session, 'again')
+        answered, _ = third.answer_of(third.ask('session/prompt', {'sessionId': session,
+                                                                    'prompt': self.wrapped('and more')}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(len(self.daemon.request('turns', bot='calc.lead.again')['result']['turns']), 2)
+        fourth, session = self.open(repo)
+        refused, _ = fourth.answer_of(fourth.ask('session/prompt', {'sessionId': session,
+                                                                     'prompt': self.wrapped('/lead gone')}))
+        self.assertIn('error', refused)
+        # Another lead outlives the folder's first.
+        self.assertIn('result', self.daemon.request('delete', bot='calc.lead'))
+        fifth, session = self.open(repo)
+        self.adopt(fifth, session, 'again')
 
     def test_a_thread_sonny_does_not_know_does_not_come_back(self):
         repo = self.repo()
