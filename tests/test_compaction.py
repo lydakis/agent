@@ -52,6 +52,58 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertFalse(any(m.get('event') == 'compaction_failed' for m in client.saved))
 
+    def test_an_hour_long_cache_pins_the_summary_for_an_hour_too(self):
+        # A pinned block at five minutes ahead of the request's own hour
+        # breakpoint is refused, so every turn after the first summary
+        # failed. Each later call marks the summary as the request does.
+        self.model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                        settings={'context_bytes': 8192, 'compact_at': 50, 'cache_ttl': '1h'})
+        self.addCleanup(client.close)
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               compaction_instructions='Summarize.', effort='low'))
+        for n in range(7):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        pinned = [b for r in requests for m in r['messages'] for b in m['content']
+                  if b.get('text', '').startswith('[compaction summary')]
+        self.assertTrue(pinned)
+        self.assertTrue(all(b['cache_control'] == {'type': 'ephemeral', 'ttl': '1h'} for b in pinned))
+
+    def test_a_bot_moved_to_an_hour_after_its_summary_keeps_working(self):
+        # The summary is stored as text and marked as each request is sent,
+        # so a bot that compacted before its move to an hour (or a daemon
+        # that marked it at five minutes) sends the next turn whole.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                        settings={'context_bytes': 8192, 'compact_at': 50})
+        self.addCleanup(client.close)
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               compaction_instructions='Summarize.', effort='low'))
+        for n in range(7):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        self.assertEqual(client.request('configure', bot='Bob', cache_ttl='1h')['result']['changed'], ['cache_ttl'])
+        self.model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
+        while not self.model.requests.empty():
+            self.model.requests.get()
+        turn = client.request('submit', bot='Bob', request_id='moved', prompt='after the move')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        call = self.model.requests.get(timeout=1)
+        summary = call['messages'][0]['content'][0]
+        self.assertTrue(summary['text'].startswith('[compaction summary'))
+        self.assertEqual(summary['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
+
     def test_a_summary_inside_a_turn_copies_the_call_before_it_whole(self):
         # Anthropic reads a cache where a breakpoint went, and the call put
         # its own at its end, so a summary inside a turn copies that call

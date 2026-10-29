@@ -4027,6 +4027,7 @@ impl Database {
             bot.tools.iter().any(|tool| tool == "history"),
             &listed,
             input_limit.bytes * 2 / 3,
+            bot.settings.cache_hour(),
         )?;
         Ok(super::ContextUsage {
             bytes: bytes as usize,
@@ -4327,6 +4328,8 @@ impl Database {
             history,
             &[],
             0,
+            // The longer marker, so the minimum is never under what is sent.
+            true,
         )?;
         Ok((
             family,

@@ -5,6 +5,17 @@ use crate::{Result, fail};
 use base64::Engine;
 use serde_json::{Value, json};
 
+/// An Anthropic cache breakpoint, an hour's or five minutes'. Every
+/// breakpoint in one request takes the same lifetime: the API refuses a
+/// longer one after a shorter one, and the request's own last breakpoint
+/// comes after every other.
+pub fn cache_control(hour: bool) -> Value {
+    match hour {
+        true => json!({"type":"ephemeral","ttl":"1h"}),
+        false => json!({"type":"ephemeral"}),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     /// OpenAI Responses API and compatible gateways.

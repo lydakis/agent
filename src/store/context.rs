@@ -1,6 +1,9 @@
 //! Encoded context accounting shared by request construction and compaction.
 use super::{CompactionView, Window};
-use crate::{Result, codec::Family};
+use crate::{
+    Result,
+    codec::{Family, cache_control},
+};
 use serde::Serialize;
 use serde_json::json;
 
@@ -48,7 +51,14 @@ impl Window {
         self.pictured.truncate(len);
     }
 
-    pub fn prefix(&self, listed: &[(i64, String)], prefix_budget: usize) -> Result<ContextPrefix> {
+    /// What goes ahead of the window, its pinned blocks cached for an hour
+    /// when `hour`, as the request that carries them is.
+    pub fn prefix(
+        &self,
+        listed: &[(i64, String)],
+        prefix_budget: usize,
+        hour: bool,
+    ) -> Result<ContextPrefix> {
         context_prefix(
             self.family,
             self.compaction.as_ref(),
@@ -59,6 +69,7 @@ impl Window {
             self.history,
             listed,
             prefix_budget,
+            hour,
         )
     }
 }
@@ -70,7 +81,8 @@ impl CompactionView {
     /// Count each prompt once instead of repeatedly encoding the entire prefix.
     pub(crate) fn bound_prompt_bytes(&mut self, family: Family, budget: usize) -> Result<()> {
         let mut prompts = std::mem::take(&mut self.prompts);
-        let base = context_prefix(family, Some(self), None, 0, 0, 0, false, &[], 0)?
+        // With the longer marker, so the bound holds at either lifetime.
+        let base = context_prefix(family, Some(self), None, 0, 0, 0, false, &[], 0, true)?
             .bytes
             .len();
         if base > budget {
@@ -134,6 +146,7 @@ pub(crate) fn context_prefix(
     history: bool,
     listed: &[(i64, String)],
     prefix_budget: usize,
+    hour: bool,
 ) -> Result<ContextPrefix> {
     let mut encoded = Vec::new();
     let mut count = 0;
@@ -160,12 +173,13 @@ pub(crate) fn context_prefix(
                 text.push_str(&format!("\n{ordinal}: {prompt}"));
             }
         }
-        push(pinned_item(family, &text)?);
+        push(pinned_item(family, &text, hour)?);
     }
     if let Some((version, text)) = note.filter(|(_, text)| !text.is_empty()) {
         push(pinned_item(
             family,
             &format!("[carry-forward note, version {version}]\n{text}"),
+            hour,
         )?);
     }
     let pinned_bytes = encoded.len();
@@ -568,11 +582,12 @@ pub fn declined(
     Ok(None)
 }
 
-/// Stable pinned blocks retain their own Anthropic cache breakpoints.
-pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
+/// Stable pinned blocks retain their own Anthropic cache breakpoints, at
+/// the lifetime of the request they go in (`hour`).
+pub fn pinned_item(family: Family, text: &str, hour: bool) -> Result<Vec<u8>> {
     match family {
         Family::Anthropic => Ok(serde_json::to_vec(&json!({
-            "role":"user","content":[{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]
+            "role":"user","content":[{"type":"text","text":text,"cache_control":cache_control(hour)}]
         }))?),
         _ => family.user_item(text),
     }
@@ -710,6 +725,7 @@ mod tests {
                 history,
                 &listed,
                 1 << 20,
+                false,
             )
             .unwrap();
             String::from_utf8(prefix.bytes.to_vec()).unwrap()
