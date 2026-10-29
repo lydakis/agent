@@ -346,7 +346,8 @@ struct State {
     /// Words since the last call, by kind, and the part of the turn they
     /// are in: a new message after each call.
     part: u32,
-    streamed: bool,
+    /// The words of this part sent as they streamed.
+    streamed: String,
     calls: HashMap<String, (String, Value)>,
     /// Calls put to the person, by call and request.
     asked: HashSet<String>,
@@ -355,6 +356,9 @@ struct State {
     cursor: i64,
     /// The person stopped the prompt before its turn was known.
     cancelled: bool,
+    /// The last steer a running turn took in, and that turn: for a prompt
+    /// whose steer went in before its turn was named.
+    steered: Option<(i64, i64)>,
 }
 
 struct Bound {
@@ -397,16 +401,43 @@ impl Session {
             .request("follow", json!({"bot": bot, "after": 0}))
             .await
             .map_err(|e| e.to_string())?;
-        let cursor = live(&mut events, |_| async {}).await;
+        // Calls started before this thread came and not done yet: a task a
+        // lead is starting still opens its thread when it is done.
+        let mut started = HashMap::new();
+        let cursor = live(&mut events, |event| {
+            let call = event["data"]["call_id"].as_str().unwrap_or("").to_owned();
+            match event["event"].as_str() {
+                Some("tool_started") => {
+                    started.insert(call, (event["turn"].as_i64(), event["data"].clone()));
+                }
+                Some("tool_completed") => {
+                    started.remove(&call);
+                }
+                _ => {}
+            }
+            async {}
+        })
+        .await;
         let record = client
             .request("inspect", json!({"bot": bot}))
             .await
             .map_err(|e| e.to_string())?;
         let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
+        let running = record["running_turn"].as_i64();
+        let mut calls = HashMap::new();
+        for (turn, data) in started.into_values() {
+            if running.is_some() && turn == running {
+                let (call, name, arguments) = started_call(&client, &bot, &data).await;
+                if name != reactions::TOOL && name != plan::TOOL {
+                    calls.insert(call, (name, arguments));
+                }
+            }
+        }
         t3::remember(&self.id, &bot);
         {
             let mut state = self.state.lock().await;
-            state.running = record["running_turn"].as_i64();
+            state.running = running;
+            state.calls = calls;
             state.cursor = cursor;
             state.bound = Some(Bound {
                 bot,
@@ -498,9 +529,9 @@ impl Session {
         }
         let client = bound.client.clone();
         // A prompt that steers joins the turn an earlier one waits on,
-        // which is answered now: its words are in.
-        let running = state.running;
-        if let Some((earlier, _)) = state.prompt.replace((id.clone(), running)) {
+        // which is answered now: its words are in. Its own turn is the one
+        // the daemon names for it, which the running turn may take in.
+        if let Some((earlier, _)) = state.prompt.replace((id.clone(), None)) {
             agent
                 .out
                 .answer(&earlier, json!({"stopReason": "end_turn"}));
@@ -522,8 +553,14 @@ impl Session {
                         .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
                         .await;
                 }
-                if let Some((_, turn @ None)) = &mut state.prompt {
-                    *turn = reply["turn"].as_i64();
+                let steered = state.steered;
+                if let Some((prompt, turn)) = &mut state.prompt
+                    && prompt == id
+                {
+                    *turn = match (reply["turn"].as_i64(), steered) {
+                        (Some(sent), Some((steer, into))) if sent == steer => Some(into),
+                        (sent, _) => sent,
+                    };
                 }
                 Ok(Value::Null)
             }
@@ -657,9 +694,10 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.cursor = state.cursor.max(cursor);
-            let waited = state.prompt.as_ref().and_then(|(_, turn)| *turn);
-            let ended = |turn: Option<i64>| turn.is_some() && running != turn;
-            if ended(state.running) || ended(waited) {
+            // The replay ended what it saw end; a turn it could not show
+            // (its events gone) ended if the daemon runs another.
+            let was = state.running;
+            if was.is_some() && running != was {
                 if agent.v2() {
                     agent.out.update(
                         &self.id,
@@ -667,7 +705,9 @@ impl Session {
                         "state": "idle", "stopReason": "end_turn"}),
                     );
                 }
-                if let Some((prompt, _)) = state.prompt.take() {
+                if matches!(&state.prompt, Some((_, at)) if *at == was)
+                    && let Some((prompt, _)) = state.prompt.take()
+                {
                     agent.out.answer(&prompt, json!({"stopReason": "end_turn"}));
                 }
                 state.calls.clear();
@@ -699,7 +739,7 @@ impl Session {
                 // A steer joins the running turn, whose calls go on.
                 if state.running != turn {
                     state.part = 0;
-                    state.streamed = false;
+                    state.streamed.clear();
                     state.calls.clear();
                 }
                 state.running = turn;
@@ -733,8 +773,8 @@ impl Session {
                 }
             }
             "text_delta" => {
-                state.streamed = true;
                 let text = event["text"].as_str().unwrap_or("");
+                state.streamed.push_str(text);
                 out.update(id, json!({"sessionUpdate": "agent_message_chunk",
                     "messageId": message_id(&bot, turn, state.part), "content": {"type": "text", "text": text}}));
             }
@@ -747,33 +787,28 @@ impl Session {
                     "content": {"type": "text", "text": text}}),
                 );
             }
-            // Words that did not stream, as from a thread that came late.
-            "message" if !state.streamed => {
+            // Words that did not stream, as from a thread that came late or
+            // whose stream dropped partway: what was not sent yet.
+            "message" => {
+                let streamed = std::mem::take(&mut state.streamed);
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = items(&client, &bot, &[node]).await.into_iter().next()
                     && item["role"] == "assistant"
-                    && !crate::text(&item).is_empty()
+                    && let Some(rest) = crate::text(&item).strip_prefix(streamed.as_str())
+                    && !rest.is_empty()
                 {
                     out.update(
                         id,
                         json!({"sessionUpdate": "agent_message_chunk",
                         "messageId": message_id(&bot, turn, state.part),
-                        "content": {"type": "text", "text": crate::text(&item)}}),
+                        "content": {"type": "text", "text": rest}}),
                     );
                 }
             }
             "tool_started" => {
-                let name = data["name"].as_str().unwrap_or("tool").to_owned();
-                let call = data["call_id"].as_str().unwrap_or("").to_owned();
-                let arguments: Value = match data["arguments_truncated"] == true {
-                    true => whole_arguments(&client, &bot, &call).await,
-                    false => data["arguments"]
-                        .as_str()
-                        .and_then(|a| serde_json::from_str(a).ok())
-                        .unwrap_or(Value::Null),
-                };
+                let (call, name, arguments) = started_call(&client, &bot, data).await;
                 state.part += 1;
-                state.streamed = false;
+                state.streamed.clear();
                 if name == reactions::TOOL {
                     return;
                 }
@@ -840,6 +875,20 @@ impl Session {
                 self.approvals(agent, &client, &bot, turn).await;
             }
             "turn_finished" => {
+                // A steer the running turn took in: the prompt waits on that
+                // turn now.
+                if data["status"] == "steered" {
+                    let into = data["into"].as_i64();
+                    if let (Some(steer), Some(into)) = (turn, into) {
+                        state.steered = Some((steer, into));
+                    }
+                    if let Some((_, at)) = &mut state.prompt
+                        && *at == turn
+                    {
+                        *at = into;
+                    }
+                    return;
+                }
                 if state.running.is_some() && state.running != turn {
                     return;
                 }
@@ -859,7 +908,9 @@ impl Session {
                 if agent.v2() {
                     out.update(id, ended);
                 }
-                let ours = matches!(&state.prompt, Some((_, at)) if at.is_none() || *at == turn);
+                // A prompt whose turn is not named yet waits: the turn that
+                // ended may be one it was sent behind.
+                let ours = matches!(&state.prompt, Some((_, at)) if at.is_some() && *at == turn);
                 if ours && let Some((prompt, _)) = state.prompt.take() {
                     let mut result = json!({"stopReason": reason});
                     if failed {
@@ -888,13 +939,29 @@ impl Session {
         bot: &str,
         turn: Option<i64>,
     ) {
-        let Ok(page) = client
-            .request("approvals", json!({"bot": bot, "limit": 64}))
-            .await
-        else {
-            return;
-        };
-        for call in page["approvals"].as_array().into_iter().flatten() {
+        // Every page: a round's calls are listed together, and the later
+        // ones are not announced again.
+        let mut listed = Vec::new();
+        let mut after = 0;
+        loop {
+            let Ok(mut page) = client
+                .request(
+                    "approvals",
+                    json!({"bot": bot, "after": after, "limit": 64}),
+                )
+                .await
+            else {
+                break;
+            };
+            if let Value::Array(calls) = page["approvals"].take() {
+                listed.extend(calls);
+            }
+            match page["next_after"].as_i64() {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        for call in &listed {
             let person = !call["asked"].is_null()
                 || (call["gates"].as_array())
                     .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
@@ -968,13 +1035,34 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
         Some(outcome) if outcome["outcome"] == "selected" => "deny",
         _ => return,
     };
-    let _ = client
-        .request(
-            "answer",
-            json!({"bot": bot, "turn": call["turn"], "call_id": id, "request": call["request"],
-                "tag": crate::person_gate(call), "decision": decision, "by": "acp"}),
-        )
-        .await;
+    // Through the thread's connection as it is now: the one the call was
+    // listed on may have dropped while the person chose.
+    let Some(session) = agent
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|s| s.get(session).cloned())
+    else {
+        return;
+    };
+    let client = (session.state.lock().await.bound.as_ref()).map(|b| b.client.clone());
+    let sent = match client {
+        Some(client) => client
+            .request(
+                "answer",
+                json!({"bot": bot, "turn": call["turn"], "call_id": id, "request": call["request"],
+                    "tag": crate::person_gate(call), "decision": decision, "by": "acp"}),
+            )
+            .await
+            .is_ok(),
+        None => false,
+    };
+    // Not delivered: the call is put to the person again once the thread
+    // follows its bot again.
+    if !sent {
+        let key = format!("{id}#{}", call["request"]);
+        session.state.lock().await.asked.remove(&key);
+    }
 }
 
 /// Handle the events a follow replays, until it is live: the cursor it is
@@ -1301,6 +1389,21 @@ async fn items(client: &Client, bot: &str, nodes: &[i64]) -> Vec<Value> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// A started call's id, name and arguments, read whole when its event
+/// carried only their start.
+async fn started_call(client: &Client, bot: &str, data: &Value) -> (String, String, Value) {
+    let name = data["name"].as_str().unwrap_or("tool").to_owned();
+    let call = data["call_id"].as_str().unwrap_or("").to_owned();
+    let arguments = match data["arguments_truncated"] == true {
+        true => whole_arguments(client, bot, &call).await,
+        false => data["arguments"]
+            .as_str()
+            .and_then(|a| serde_json::from_str(a).ok())
+            .unwrap_or(Value::Null),
+    };
+    (call, name, arguments)
 }
 
 /// Call `id`'s whole arguments, from the bot's newest items, for one whose

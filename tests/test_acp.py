@@ -210,6 +210,29 @@ class AcpTests(ModelFixture):
         self.assertEqual([b['name'] for b in self.daemon.request('bots')['result']['bots']],
                          ['calc.fix', 'calc.lead'])
 
+    def test_a_prompt_that_steers_is_answered_when_the_turn_it_joined_ends(self):
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        thread, session = self.open(repo)
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
+        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        # A second prompt while the turn runs steers it: the first prompt's
+        # words are in, and the second waits on the turn that takes it in.
+        second = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('and the tests')})
+        answered, _ = thread.answer_of(first)
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
+        answered, updates = thread.answer_of(second)
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(updates[-1]['state'], 'idle')
+        turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
+        self.assertEqual(sorted(t['status'] for t in turns), ['completed', 'steered'])
+        self.assertEqual(self.t3.calls.get(timeout=30)['name'], 't3_thread_launch')
+
     def test_a_turn_the_lead_takes_on_its_own_shows_in_the_thread(self):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
