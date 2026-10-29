@@ -736,8 +736,9 @@ fn source(
     let bot_id = bot["bot_id"]
         .as_i64()
         .ok_or("the daemon listed no bot_id")?;
-    let snapshot =
-        crate::snapshot::find(here, bot_id, start.turn).map_err(|e| format!("{name}: {e}"))?;
+    let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
+    let snapshot = crate::snapshot::find(here, &refs, bot_id, start.turn)
+        .map_err(|e| format!("{name}: {e}"))?;
     Ok(Source {
         name,
         workspace,
@@ -939,10 +940,6 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         }
         kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
     }
-    // Its snapshots go with it: only a worktree of its own has any.
-    if let Some(bot_id) = bot_id {
-        crate::snapshot::forget(here, bot_id)?;
-    }
     if let Some(path) = &worktree {
         let path = path.to_string_lossy();
         let mut args = vec!["worktree", "remove"];
@@ -951,6 +948,14 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         }
         args.push(&path);
         git(here, &args)?;
+    }
+    // Its snapshots go with it once its folder is gone, so one still being
+    // taken of it fails rather than lands after.
+    if let Some(bot_id) = bot_id {
+        let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
+        crate::snapshot::forget(here, &refs, bot_id)?;
+    }
+    if worktree.is_some() {
         let delete = if discard { "-D" } else { "-d" };
         if git(here, &["branch", delete, &branch]).is_err() {
             return Ok(format!(

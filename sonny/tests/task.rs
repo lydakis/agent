@@ -76,6 +76,7 @@ impl Lab {
             .env("HOME", &self.home)
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
+            .env("AGENT_STORE", self.store())
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -160,6 +161,21 @@ impl Lab {
     fn remove(&self, dir: &Path, discard: bool) -> (bool, String) {
         let call = serde_json::json!({"task": "demo.fix", "discard": discard});
         self.tool(dir, "remove_task", call, false)
+    }
+
+    /// The daemon's store the lookout and these calls name.
+    fn store(&self) -> PathBuf {
+        self.scratch.join("state.sqlite")
+    }
+
+    /// Where the store's snapshots are kept: under the FNV-1a hash of its
+    /// path, as snapshot.rs names it.
+    fn refs(&self) -> String {
+        let hash = (self.store().as_os_str().as_encoded_bytes().iter())
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+        format!("refs/agent/snapshots/{hash:016x}")
     }
 
     /// What `agent run` was given, one argument a line.
@@ -399,11 +415,7 @@ fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
     let commit = add(&["commit-tree", &tree, "-p", "HEAD", "-m", &message]);
     lab.git(
         worktree,
-        &[
-            "update-ref",
-            &format!("refs/agent/snapshots/5/{turn}"),
-            &commit,
-        ],
+        &["update-ref", &format!("{}/5/{turn}", lab.refs()), &commit],
     );
 }
 

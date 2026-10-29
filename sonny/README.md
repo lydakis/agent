@@ -478,7 +478,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   uncommitted changes. Its branch is kept unless it is merged.
 - **Forking a task with its files:** after each turn a task completes, the
   lookout keeps its worktree's files as a commit beside the repository's
-  history (`refs/agent/snapshots/BOT_ID/TURN`, through an index of its
+  history (`refs/agent/snapshots/STORE/BOT_ID/TURN`, through an index of its
   own, so no one's staging is touched; files git ignores are left out).
   `start_task` with `from` (a task) and optionally `turn` (the number in
   one of its turn handles, else its newest kept turn) forks that task at

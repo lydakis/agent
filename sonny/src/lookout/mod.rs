@@ -852,18 +852,21 @@ impl Service {
                 };
                 tokio::spawn(crate::snapshot::after_turn(
                     client.clone(),
+                    crate::snapshot::refs(&self.store),
                     workspace,
                     bot_id,
                     turn,
                     checkpoint,
                 ));
             }
-            // A task's own folder may be gone, and its removal drops its
-            // snapshots first.
+            // A task's own folder may be gone, and `remove_task` drops its
+            // snapshots once it is.
             Some("deleted") => {
-                tokio::task::spawn_blocking(move || {
-                    let _ = crate::snapshot::forget(&workspace, bot_id);
-                });
+                tokio::spawn(crate::snapshot::deleted(
+                    crate::snapshot::refs(&self.store),
+                    workspace,
+                    bot_id,
+                ));
             }
             _ => {}
         }
