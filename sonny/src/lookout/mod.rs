@@ -786,7 +786,7 @@ fn memory(workspace: &std::path::Path) -> String {
 }
 
 /// A bot's history items, newest first, each with the turn it belongs to.
-async fn recent(
+pub(crate) async fn recent(
     client: &Client,
     bot: &str,
     limit: usize,

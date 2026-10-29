@@ -39,7 +39,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -68,7 +68,7 @@ pub fn cli(args: &[String]) -> i32 {
 /// A `memory` call of an agent working in `cwd`, as a client's tool takes
 /// it: the script's commands but `schedule`, which is the person's, with
 /// the fact's text in the call. `read` NAME, `save {name, type,
-/// description, source, text}`, `remove` NAME, `index`, `check`, `changed`
+/// description, source, text, external}`, `remove` NAME, `index`, `check`, `changed`
 /// or `cleanup` (`start` or `finish`); with none, `show`. `user` or `project` picks the scope.
 pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
@@ -87,6 +87,9 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
             ("source", "--source"),
         ] {
             args.extend([flag.to_owned(), text(&save[key])]);
+        }
+        if save["external"] == true {
+            args.push("--external".to_owned());
         }
         args
     } else if let Some(name) = arguments["read"].as_str() {
@@ -159,9 +162,14 @@ fn run(
     let mut name = None;
     let mut fields = [None, None, None];
     let mut scope = None;
+    let mut external = false;
     let mut it = flags.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
+            "--external" if verb == "save" && !external => {
+                external = true;
+                continue;
+            }
             "--type" => &mut fields[0],
             "--description" => &mut fields[1],
             "--source" => &mut fields[2],
@@ -237,6 +245,7 @@ fn run(
                 description,
                 source,
                 verified: today(),
+                external,
             };
             save(&scope()?, &fact, &text)
         }
@@ -319,25 +328,37 @@ struct Fact {
     description: String,
     source: String,
     verified: String,
+    /// Saved in a turn that read outside content, a web page, a search or
+    /// an MCP server, so it may carry words no person wrote.
+    external: bool,
 }
 
 impl Fact {
     fn render(&self, body: &str) -> String {
         format!(
-            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n---\n\n{}\n",
+            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n{}---\n\n{}\n",
             self.name,
             self.description,
             self.kind,
             self.source,
             self.verified,
+            if self.external {
+                "external: true\n"
+            } else {
+                ""
+            },
             body.trim()
         )
     }
 
     fn line(&self) -> String {
         format!(
-            "- {} ({}, verified {}): {}\n",
-            self.name, self.kind, self.verified, self.description
+            "- {} ({}, verified {}{}): {}\n",
+            self.name,
+            self.kind,
+            self.verified,
+            if self.external { ", external" } else { "" },
+            self.description
         )
     }
 
@@ -368,6 +389,11 @@ impl Fact {
             description: field("description")?,
             source: field("source")?,
             verified: field("verified")?,
+            external: match fields.get("external") {
+                None => false,
+                Some(&"true") => true,
+                Some(other) => return Err(format!("external is true or absent, not {other}")),
+            },
         };
         if format!("{}.md", fact.name) != file {
             return Err(format!("its name is {}, not its file's", fact.name));
@@ -1552,6 +1578,7 @@ mod tests {
                 description: format!("old fact {name}"),
                 source: "the person, 2020-01-01".into(),
                 verified: verified.into(),
+                external: false,
             };
             std::fs::write(root.join(format!("{name}.md")), fact.render("old")).unwrap();
         };
@@ -1594,6 +1621,77 @@ mod tests {
         git(&root, &["commit", "-q", "-am", "older ignore file"]).unwrap();
         run_(&["read", "a", "--user"]).unwrap();
         assert_eq!(code(changed(&root)), "unchanged");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_fact_saved_after_outside_content_says_so_in_its_file_and_the_index() {
+        let home = temp("outside");
+        let root = home.join(".agents/memory");
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        let save = json!({"save": {"name": "pinned-version", "type": "reference",
+            "description": "The SDK pin a release note named", "source": "turn:shop.lead/4",
+            "text": "Pin the SDK at 2.3.", "external": true}, "user": true});
+        call(&home, &home, &save).unwrap();
+        let file = std::fs::read_to_string(root.join("pinned-version.md")).unwrap();
+        assert!(file.contains("\nverified: ") && file.contains("\nexternal: true\n---\n"));
+        let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        assert!(
+            index.contains(", external): The SDK pin a release note named"),
+            "{index}"
+        );
+        assert_eq!(check(&root)["problems"], json!([]));
+        // Saved again without it, from the person's word, it is theirs.
+        let mut plain = save.clone();
+        plain["save"]["external"] = json!(false);
+        plain["save"]["source"] = json!("the person, 2026-10-29");
+        call(&home, &home, &plain).unwrap();
+        let file = std::fs::read_to_string(root.join("pinned-version.md")).unwrap();
+        assert!(!file.contains("external"));
+        assert!(
+            !std::fs::read_to_string(root.join(INDEX))
+                .unwrap()
+                .contains("external")
+        );
+        // The script takes it as a flag, once.
+        let run_ = |line: &[&str]| run(&root, &home, &args(line), &no_stdin);
+        let line = |extra: &[&str]| {
+            let mut line = vec![
+                "save",
+                "x",
+                "--type",
+                "project",
+                "--description",
+                "d",
+                "--source",
+                "s",
+                "--user",
+            ];
+            line.extend_from_slice(extra);
+            line.extend_from_slice(&["--", "t"]);
+            line.iter().map(|w| w.to_string()).collect::<Vec<_>>()
+        };
+        fn refs(words: &[String]) -> Vec<&str> {
+            words.iter().map(String::as_str).collect()
+        }
+        run_(&refs(&line(&["--external"]))).unwrap();
+        assert!(
+            std::fs::read_to_string(root.join("x.md"))
+                .unwrap()
+                .contains("external: true")
+        );
+        assert_eq!(
+            code(run_(&refs(&line(&["--external", "--external"])))),
+            "usage"
+        );
+        assert_eq!(code(run_(&["rm", "x", "--external", "--user"])), "usage");
+        // Any other value is not a fact.
+        std::fs::write(
+            root.join("y.md"),
+            "---\nname: y\ndescription: d\ntype: project\nsource: s\nverified: 2026-10-29\nexternal: yes\n---\n\nt\n",
+        )
+        .unwrap();
+        assert_eq!(code(run_(&["index", "--user"])), "memory_invalid");
         std::fs::remove_dir_all(home).unwrap();
     }
 

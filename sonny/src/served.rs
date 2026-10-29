@@ -701,6 +701,43 @@ fn left(call: &Value) -> Duration {
     Duration::from_millis(expires.saturating_sub(now))
 }
 
+/// Whether turn `turn` of `bot` has read outside content so far, so a fact
+/// it saves may carry words no person wrote, as Codex leaves out of memory
+/// the sessions that used MCP or web search. Its newest items are looked at;
+/// a turn longer than one page of them counts as having read.
+async fn read_outside(client: &Client, bot: &str, turn: i64) -> bool {
+    const PAGE: usize = 400;
+    let items = crate::lookout::recent(client, bot, PAGE, false, None).await;
+    let mine: Vec<&Value> = items
+        .iter()
+        .take_while(|(of, _)| *of == Some(turn))
+        .map(|(_, item)| item)
+        .collect();
+    (items.len() == PAGE && mine.len() == PAGE) || mine.into_iter().any(outside)
+}
+
+/// A history item that brought in outside content: a provider's own web
+/// search or fetch, `web_fetch`, or an MCP server through `exec`.
+fn outside(item: &Value) -> bool {
+    match item["type"].as_str() {
+        Some("web_search_call") => true,
+        Some("function_call" | "custom_tool_call") => {
+            item["namespace"] == "web"
+                || matches!(
+                    item["name"].as_str(),
+                    Some("web_fetch" | "web_search" | crate::exec::NAME)
+                )
+        }
+        _ => item["content"].as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind == "server_tool_use" || kind.ends_with("_tool_result"))
+            })
+        }),
+    }
+}
+
 /// One call answered by `sonny tool NAME`, run as the calling agent's shell
 /// would run it, and stopped when the call's time is up.
 async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: &Path) -> Answer {
@@ -787,15 +824,20 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     if let Some(bin) = crate::agent_bin() {
         command.env("AGENT_BIN", bin);
     }
+    let mut arguments = call["arguments"].clone();
+    if call["name"] == MEMORY
+        && arguments["save"].is_object()
+        && read_outside(client, bot, turn).await
+    {
+        arguments["save"]["external"] = json!(true);
+    }
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
     let group = child.id().map(Group::new);
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        let _ = stdin
-            .write_all(call["arguments"].to_string().as_bytes())
-            .await;
+        let _ = stdin.write_all(arguments.to_string().as_bytes()).await;
     }
     let output = tokio::time::timeout(left(call), child.wait_with_output())
         .await
@@ -897,6 +939,34 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outside_content_is_a_search_a_fetched_page_or_an_mcp_server() {
+        let read = [
+            json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+            json!({"type": "function_call", "namespace": "web", "name": "run", "call_id": "c1"}),
+            json!({"type": "function_call", "name": "web_fetch", "call_id": "c2"}),
+            json!({"type": "custom_tool_call", "name": "exec", "call_id": "c3"}),
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"}]}),
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_2"}]}),
+        ];
+        for item in &read {
+            assert!(outside(item), "{item}");
+        }
+        let own = [
+            json!({"type": "function_call", "name": "shell", "call_id": "c4"}),
+            json!({"type": "function_call", "namespace": "other", "name": "run", "call_id": "c5"}),
+            json!({"type": "function_call_output", "call_id": "c2", "output": "page"}),
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1"}, {"type": "input_text", "text": "hi"}]}),
+            json!({"type": "reasoning"}),
+        ];
+        for item in &own {
+            assert!(!outside(item), "{item}");
+        }
+    }
 
     #[test]
     fn a_lead_answers_more_than_its_tasks_and_keeps_its_own() {
