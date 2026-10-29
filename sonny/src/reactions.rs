@@ -126,8 +126,8 @@ pub fn tool() -> Value {
             replaces an answer: when the person asked something, answer in words. When a reaction is all \
             their message needs, react and end your turn without words. `remove` takes off a reaction you \
             added, such as 👀 once you have answered. React only to the person, never to another agent's \
-            messages. With `bot`, it reacts to the person's newest message in that agent instead, such as 👀 \
-            on what they wrote in one of your tasks that you picked up.",
+            messages. With `bot`, it reacts to the person's newest message in that agent instead, such as \
+            what they wrote in one of your tasks that you picked up.",
         "parameters": {
             "type": "object",
             "properties": {
