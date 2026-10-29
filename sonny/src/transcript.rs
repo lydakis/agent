@@ -2050,6 +2050,16 @@ fn refusal(output: Option<&str>) -> Option<String> {
     Some(why.lines().next().unwrap_or("").to_owned())
 }
 
+/// A `plan` call's rows: the whole plan when it is the one that shows,
+/// else one row of how far it had got.
+pub fn plan_lines(steps: &[String], full: bool, width: usize) -> Vec<Line<'static>> {
+    let said = match full {
+        true => crate::calls::plan(steps),
+        false => crate::calls::plan_short(steps),
+    };
+    said_lines(said, width)
+}
+
 fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
