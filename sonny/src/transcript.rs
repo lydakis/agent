@@ -291,7 +291,8 @@ impl Markdown {
         }
         let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-            let style = Style::new().add_modifier(Modifier::BOLD);
+            // A heading is the agent's own voice: the agents' color.
+            let style = Style::new().add_modifier(Modifier::BOLD).fg(Color::Blue);
             return Some(Line::from(inline(trimmed[hashes + 1..].trim(), style)));
         }
         let indent = &text[..text.len() - trimmed.len()];
@@ -1206,10 +1207,11 @@ const RELAYED_HEAD: usize = 200;
 
 /// The shut row of words between agents, from [`relayed_head`].
 pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
-    let head = cut(&format!("↳ {head}"), width.saturating_sub(2));
+    // Cut apart from its arrow, which a narrow window would cut too.
+    let head = cut(head, width.saturating_sub(4));
     // Who said it in the agents' color.
     let mut spans = vec![Span::raw("↳ ")];
-    let rest = &head["↳ ".len()..];
+    let rest = head.as_str();
     match from.filter(|from| rest.starts_with(&format!("{from}:"))) {
         Some(from) => {
             spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
@@ -2379,6 +2381,10 @@ mod tests {
         assert_eq!(text(&rows), ["↳ calc.neg: Tests pass. ▸"]);
         let sender = rows[0].spans.iter().find(|s| s.content == "calc.neg");
         assert_eq!(sender.and_then(|s| s.style.fg), Some(Color::Blue));
+        // A window too narrow for any of it still draws the arrow.
+        for width in 0..8 {
+            relayed("Tests pass.", Some("calc.neg"), false, width);
+        }
     }
 
     #[test]

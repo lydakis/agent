@@ -6874,7 +6874,26 @@ impl App {
             Some(at) => {
                 spans.push(Span::raw(right[..at].to_owned()));
                 spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
-                spans.push(Span::raw(right[at + self.bot.len()..].to_owned()));
+                let rest = &right[at + self.bot.len()..];
+                // How full the context is: green, then yellow, then red.
+                let tokens = self.context.map(transcript::tokens);
+                match (
+                    tokens.as_ref().and_then(|t| rest.find(t.as_str())),
+                    self.context,
+                ) {
+                    (Some(from), Some(size)) => {
+                        let color = match size {
+                            0..100_000 => Color::Green,
+                            100_000..200_000 => Color::Yellow,
+                            _ => Color::Red,
+                        };
+                        let to = from + tokens.as_ref().map_or(0, String::len);
+                        spans.push(Span::raw(rest[..from].to_owned()));
+                        spans.push(Span::raw(rest[from..to].to_owned()).fg(color));
+                        spans.push(Span::raw(rest[to..].to_owned()));
+                    }
+                    _ => spans.push(Span::raw(rest.to_owned())),
+                }
             }
             None => spans.push(Span::raw(right)),
         }
