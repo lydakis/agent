@@ -133,7 +133,8 @@ Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlea
 written to `~/.agents/agents` beside the others and used by no lead
 unless a project sets `profile = "superlead"`. It builds on the lead's:
 the folder holds other projects, so the lead subscribes to their leads
-and routes work and answers between them as it does between tasks. Sonny
+and to every source you set up, and routes work and answers between
+them as it does between tasks. Sonny
 itself knows only leads and tasks.
 
 The project's wins, then the config's, then `lead` and `task`. A name that
@@ -491,8 +492,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   with those tasks listed, so work one of them holds goes to it. Every agent Sonny starts, leads and tasks
   alike, is told that the person it works for may be under pressure, and
   to care whether they succeed: take work off their plate, do or offer
-  what they will need next, and say once when a better way of working
-  would help them (in `lead.md`, and in `task.md` for the rest); so
+  what they will need next, and say plainly, as soon as they see it, what
+  they missed, a better way of working or a mistake, coaching a habit
+  once it repeats (in `lead.md`, and in `task.md` for the rest); so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
