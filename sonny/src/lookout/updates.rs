@@ -740,9 +740,11 @@ impl Updates {
     pub fn read(&mut self, handles: &HashSet<String>) {
         for (name, news) in &mut self.tasks {
             for kind in [&mut news.act, &mut news.theirs] {
+                // How a goal ended is no part of what the wait read.
                 if kind.as_ref().is_some_and(|t| {
                     t.status != APPROVAL
                         && t.status != QUIET
+                        && t.goal.is_none()
                         && handles.contains(&format!("turn:{name}/{}", t.turn))
                 }) {
                     *kind = None;
@@ -1385,6 +1387,20 @@ mod tests {
         updates.goal_settled("shop.fix", 9, Some(", and met its goal: its check exits 0"));
         let told = updates.take();
         assert!(text(&told).contains("turn:shop.fix/9 completed, asked by goal, and met its goal"));
+        updates.sent(told);
+        // Or read it once its check had said.
+        updates.goal_turn("shop.fix", 10);
+        turn(&mut updates, "shop.fix", 10, goal.clone(), "completed");
+        updates.goal_settled(
+            "shop.fix",
+            10,
+            Some(", and met its goal: its check exits 0"),
+        );
+        updates.read(&["turn:shop.fix/10".to_owned()].into());
+        let told = updates.take();
+        assert!(
+            text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
+        );
         updates.sent(told);
         // Cleared while its check ran: plain news.
         updates.goal_turn("shop.docs", 2);
