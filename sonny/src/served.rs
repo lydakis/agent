@@ -168,8 +168,10 @@ fn subscriptions() -> Value {
             with a note starting \"Task updates\" when one needs you. Each watches the tasks of a bot (every \
             agent it or its tasks made) or bots by name, and asks a judge model the lookout's built-in \
             questions about what they say and how their turns end, or what you look for in your own words, \
-            with what you do on a yes. A note that names a subscription means do what it says. Add one, or \
-            remove one by name; with neither, or after either, the result lists them all. Adding one again \
+            with what you do on a yes. It also hears the sources the person set up outside (a chat, a mailbox, \
+            a feed), each by name, in a note starting \"From your sources\": every event, unjudged, at once when \
+            the source marks it urgent. A note that names a subscription means do what it says. Add one, or remove one by name; with \
+            neither, or after either, the result lists them all, with the sources there are. Adding one again \
             changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
             "type": "object",
@@ -182,6 +184,9 @@ fn subscriptions() -> Value {
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters."},
+                        "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
+                            "description": "Sources it hears, by name: every event each says. A \
+                                subscription with sources looks for nothing."},
                         "on": {"type": "array", "items": {"type": "string", "enum": ["said", "ended"]},
                             "description": "What it watches: what the bots say, how their turns end; both \
                                 when left out."},
@@ -472,6 +477,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 &caller,
                 arguments.get("add"),
                 arguments["remove"].as_str(),
+                &crate::lookout::sources::names(),
             )
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))

@@ -2869,17 +2869,6 @@ impl Turn {
                 _ => call.await,
             };
             let sent_ms = sent.get().map_or(0, epoch_ms);
-            let result = match result {
-                Ok(completion)
-                    if completion.items.is_empty()
-                        && completion.calls.is_empty()
-                        && !summary
-                        && !accounting.answered =>
-                {
-                    Err(Error::new("empty_completion"))
-                }
-                result => result,
-            };
             let error = match result {
                 Ok(mut completion) => {
                     if let Some(usage) = &mut completion.usage {
@@ -3442,9 +3431,13 @@ impl Turn {
             // confined fails rather than run unconfined. An escape no gate
             // approved is refused, as Codex refuses one under a policy that
             // never asks: a command, or a write or edit held to the sandbox.
+            // A command its client lets out of the sandbox runs unconfined,
+            // as a Codex rule that allows it does.
             let mut sandbox = None;
-            let confined =
-                record.sandboxed() && agent_runtime::sandbox::confinable(&call.name) && !approved;
+            let confined = record.sandboxed()
+                && agent_runtime::sandbox::confinable(&call.name)
+                && !approved
+                && !record.unsandboxed(&call);
             let prepared = match prepared {
                 Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
                     if confined && !record.confines(&call, workspace) =>
@@ -3612,13 +3605,17 @@ impl Turn {
                 Ok(Prepared::History {
                     bot,
                     turn: wanted,
+                    handle,
                     offset,
                     limit,
-                }) => match Box::pin(self.history(&call.call_id, bot, wanted, offset, limit)).await
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => failure(error),
-                },
+                }) => {
+                    match Box::pin(self.history(&call.call_id, bot, wanted, handle, offset, limit))
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => failure(error),
+                    }
+                }
                 Ok(Prepared::HistorySearch { bot, query, before }) => {
                     match self.history_search(&call.call_id, bot, query, before).await {
                         Ok(outcome) => outcome,
@@ -3766,15 +3763,17 @@ impl Turn {
             .await?;
         // A sandboxed bot's commands all run in its one sandbox; when it
         // can't be had, each command fails with why.
-        let shells = batch
-            .iter()
-            .any(|(_, prepared)| matches!(prepared, Prepared::Shell { .. }));
+        // A command its client lets out of it runs unconfined.
+        let shells = batch.iter().any(|(call, prepared)| {
+            matches!(prepared, Prepared::Shell { .. }) && !record.unsandboxed(call)
+        });
         let sandbox = match shells && record.sandboxed() {
             true => self.sandbox(record, workspace).await,
             false => Ok(None),
         };
         let runs = batch.into_iter().map(|(call, prepared)| {
             let sandbox = match (&prepared, &sandbox) {
+                _ if record.unsandboxed(&call) => Ok(None),
                 (Prepared::Shell { .. }, Err(error)) => Err(error.clone()),
                 (_, sandbox) => Ok(sandbox.clone().unwrap_or_default()),
             };
@@ -4174,11 +4173,29 @@ impl Turn {
         call_id: &str,
         bot: Option<String>,
         wanted: Option<i64>,
+        handle: Option<String>,
         offset: u64,
         limit: usize,
     ) -> Result<Outcome> {
         let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
-        let bot = bot.unwrap_or_else(|| self.bot.clone());
+        // A handle names its bot and the store's number for the turn.
+        let (bot, wanted) = match handle.as_deref().map(Handle::parse).transpose()? {
+            Some(Handle::Turn { bot, turn }) => {
+                let named = bot.clone();
+                let number = self
+                    .store
+                    .read("history_number", move |db| db.history_number(&named, turn))
+                    .await?;
+                (bot, Some(number))
+            }
+            Some(Handle::Process(_)) => {
+                return Err(Error::with(
+                    "invalid_handle",
+                    "history reads turns, not commands",
+                ));
+            }
+            None => (bot.unwrap_or_else(|| self.bot.clone()), wanted),
+        };
         let Some(wanted) = wanted else {
             let listed = self
                 .store

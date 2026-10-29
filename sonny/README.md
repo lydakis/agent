@@ -139,6 +139,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -239,7 +240,12 @@ inherits. Sonny takes the person's words out of the instructions T3 Code
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
-same bot.
+same bot. T3 Code's model picker lists `~/.agent/models` (the list `agent
+models` shows) after "Default", the model the lead or task runs: a model
+picked before the first prompt is the one a new lead starts on, and one
+picked later is the lead's from its next turn. A thread offers only its
+bot's provider family, since a bot changes model only within it, and a task's
+thread keeps the model its lead gave the task.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
@@ -355,9 +361,19 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   `/tmp`), reach the network, and may commit to the folder's repository,
   whose hooks and config stay read-only; a call that leaves the sandbox
   waits for the verdict. In `full` the lead runs unconfined. Every task
-  is sandboxed the same way in its own folder, whatever the lead's mode.
+  is sandboxed the same way in its own folder, but in `full`, where
+  nothing would answer a call that asks to leave the sandbox, tasks run
+  unconfined too, as under Codex's full access; a pick sets the tasks'
+  sandboxes along with their gates.
   A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
-  it. On Linux sandboxes need bubblewrap.
+  it. On Linux sandboxes need bubblewrap. A tool that keeps a daemon of its
+  own, such as mcpx, can't run inside a sandbox: name it in
+  `~/.agent/config.toml`, `[sonny] unsandboxed = ["mcpx"]`, and every agent
+  runs it outside without asking, as a Codex rule that allows a command
+  does. Each entry is a command's first words (`"docker compose"`), and a
+  call runs outside only when everything it runs is named, so
+  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
+  it.
 - `/approve` lists the calls the judge denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
@@ -390,6 +406,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+- `/usage` shows, in the pane beside the conversation on the full screen,
+  the tokens the project's agents spent in the last 24 hours: in all, as
+  stacked bars over time (output, input read fresh, and input read from the
+  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  day, week or month, `a` every agent in the store, by project, and `c`
+  hides the cached reads, so what the provider charges most for stands out.
+  A turn counts where it started. It reads again every minute.
+
+  ![/usage in the pane](../docs/sonny/usage.gif)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
@@ -450,7 +475,8 @@ verdict wherever the agent's other calls do (`/approvals`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
 a pane runs a command outside the agent's sandbox, and a trigger is a
-LaunchAgent that runs as you. An agent whose
+job of the system's scheduler (a LaunchAgent, or a systemd user service)
+that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
@@ -472,8 +498,9 @@ At each start Sonny writes what every agent leans on: the
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
-and `sonny trigger ...` (launchd jobs that wake an agent, on a Mac), which
-other harnesses, scripts and launchd run too; Sonny's own agents use the
+and `sonny trigger ...` (jobs that wake an agent, kept by launchd on a Mac
+and systemd's user manager on Linux), which other harnesses, scripts and
+those schedulers run too; Sonny's own agents use the
 `memory` and `triggers` tools instead, which the lookout answers outside
 their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
@@ -494,7 +521,8 @@ note, with no sound. It judges with the config's `[judge] model`, the
 approver's setting, else the lead's own model, at `[judge] effort` when
 set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
-by name, questions of its own), and `/background` lists what it watches;
+by name, sources outside such as a chat you poll, questions of its own),
+and `/background` lists what it watches;
 see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout also answers
 Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are

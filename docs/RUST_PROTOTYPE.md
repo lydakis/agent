@@ -413,6 +413,7 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1018,6 +1019,7 @@ own path from the turn. Example requests:
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":22,"op":"bots","after":null,"limit":64,"name":"project.*","active":true}
 {"id":23,"op":"turns","bot":"Bob","newest":true,"limit":3}
+{"id":30,"op":"usage","name":"project.*","since_ms":1793000000000,"bucket_ms":21600000,"limit":64}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":29,"op":"compact","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
@@ -1186,12 +1188,13 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable` and `network` (as `create`'s
-settings name them), replaces the bot's sandbox, and the two left out go back
-to none and off; a bot another bot made keeps no weaker a sandbox than its
+anything is written. `sandbox`, with `writable`, `network` and `unsandboxed`
+(as `create`'s settings name them), replaces the bot's sandbox, and those left
+out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
-at all. It answers `{bot, bot_id, changed}`, `changed` naming the fields
-(`model`, `instructions`, `gates`, `declared`, `sandbox`) that differed; the same request again
+at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
+bot's prompt-cache lifetime from its next model call. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+(`model`, `instructions`, `gates`, `declared`, `sandbox`, `cache_ttl`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
@@ -1216,6 +1219,28 @@ prefix, and `active: true` keeps those with a turn running, read from a partial
 index of only them (`bots_running`). Filtered pages page and bound like any
 other. `bots` and `turns` run on the store's reader connection, so a listing
 never waits behind, or holds up, the writer.
+
+Protocol 23 adds `usage`, what bots' turns spent, also a read on the reader
+connection: one grouped statement over `turns`, so one snapshot. `name` keeps
+the bots a `bots` GLOB would (absent is every bot), and `since_ms` the turns
+started at or after it (absent or 0 is all of them); a turn counts wholly where
+it started, compaction and keep-warm calls included, since they are recorded on
+it. The answer has the totals (`turns`, `input_tokens`, `cached_input_tokens`,
+`output_tokens`; cached is part of input), `bots` with the `limit` (1 to 256,
+default 64) that spent most input plus output first and `other_bots` summing
+the rest with how many (`null` when none), and `models`, the turn's model as
+`turns` reports it: a different compaction model's or an Anthropic fallback's
+tokens count under the turn's model, since only the usage events keep that
+split and events are pruned. With `bucket_ms` it adds `series`, one row for each bucket
+of that width from `since_ms` that has turns, at its `at_ms`; it needs a
+`since_ms` and fewer than 1024 buckets to now (`invalid_usage_window`). Usage
+is read from `turns`, so a deleted bot's turns, and the judge's own copies once
+deleted, no longer count. Its cost grows with the turns it matches, so it is
+answered off the dispatch path, like `provider_models`, and other requests go
+on while it reads; it holds only the reader connection. As an observation, not
+a screen: the same statement in Python's SQLite over a synthetic store of 164k
+turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
+Sonny's `/usage` draws it, reading again once a minute while it is open.
 
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure
@@ -2224,10 +2249,27 @@ a policy that never asks, a command asking to escalate is refused with
 from its arguments and the folders' names alone, so the round that announces
 it and the run that starts it agree.
 
+A command its client trusts runs outside the sandbox without asking, as a
+Codex rule that allows a command prefix runs it: a shell call that doesn't
+ask to escalate, whose script runs nothing but commands that begin with the
+words of one of the bot's `unsandboxed` entries. So a tool with a daemon of
+its own, such as mcpx, which keeps its lock and socket under
+`~/.local/state` and starts its daemon on first use, works from a sandboxed
+bot once it is named: started in a sandbox, the daemon would keep the
+sandbox's limits, and on Linux die with the command. Only a plain script is
+read, as Codex reads one: words, quoted or not, in commands joined by `&&`,
+`||`, `;`, `|` or a newline. A script with anything that could run something
+else (`$`, a backquote, a redirection, parentheses, `&` alone, a comment)
+runs in the sandbox, and so does one with any other command in it, such as
+`mcpx … | jq`; it can still ask to escalate. The command is found on the
+daemon's `PATH`, so an `unsandboxed` command is only as trusted as the
+folders there.
+
 A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
-parent's sandbox.
+parent's sandbox. It runs outside the sandbox only commands its creator
+does.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds

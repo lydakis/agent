@@ -34,10 +34,10 @@ class ServedToolTests(ModelFixture):
         self.addCleanup(self.daemon.close)
         self.script = []
 
-    def lookout(self):
+    def lookout(self, **extra):
         env = {**clean_env(), 'HOME': str(self.path), 'AGENT_BIN': str(self.binary),
                'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com',
-               'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com'}
+               'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com', **extra}
         service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'off', '--store', str(self.store),
                                     '--socket', str(self.daemon.socket_path)],
                                    env=env, stdout=subprocess.PIPE, text=True)
@@ -74,9 +74,11 @@ class ServedToolTests(ModelFixture):
         (repo / 'calc.py').write_text('one\n')
         self.git(repo, 'add', '.')
         self.git(repo, 'commit', '-qm', 'one')
+        # A lead in `auto`.
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('start_task', inherit=False),
-                                                           declared('show_agent')])
+                                                           declared('show_agent')],
+                            approve=['show_agent'], approver='auto')
         self.lookout()
         output = self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': f'Fix {repo}/calc.py.'})
         self.assertTrue(output.startswith('Started calc.fix: '), output)
@@ -101,6 +103,13 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': 'Again.'}))
         self.assertEqual(refused['error'], 'task_not_started')
         self.assertTrue(worktree.is_dir())
+        # In `full`, with no gate to ask, a task runs unconfined, as its
+        # lead does.
+        self.daemon.request('configure', bot='calc.lead', approve=[])
+        output = self.call('calc.lead', 'start_task', {'name': 'free', 'brief': 'Go.'})
+        self.assertTrue(output.startswith('Started calc.free: '), output)
+        free = self.daemon.request('inspect', bot='calc.free')['result']['settings']
+        self.assertEqual((free['sandbox'], free['writable'], free['network']), ('danger-full-access', [], False))
 
     def test_a_turn_interrupted_mid_setup_stops_it_and_starts_no_task(self):
         repo = self.path / 'calc'
@@ -215,7 +224,7 @@ class ServedToolTests(ModelFixture):
             time.sleep(.05)
         self.lookout()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': []})
+        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': []})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_lookout_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')
@@ -283,14 +292,17 @@ class ServedToolTests(ModelFixture):
         self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
-    def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
+    def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('triggers')])
-        self.lookout()
+        # A runtime folder no user manager serves.
+        runtime = self.path / 'runtime'
+        runtime.mkdir()
+        self.lookout(XDG_RUNTIME_DIR=str(runtime))
         refused = json.loads(self.call('calc.lead', 'triggers', {'add': {'every': '30m', 'message': 'Check.'}}))
         self.assertEqual(refused['error'], 'trigger_refused')
         self.assertIn('triggers_unsupported', refused['detail'])
-        self.assertFalse((self.path / 'Library/LaunchAgents').exists())
+        self.assertEqual(list((self.path / '.config/systemd/user').glob('*.service')), [])
 
     def test_a_lookout_another_build_started_gives_way(self):
         old = self.lookout()

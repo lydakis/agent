@@ -1,4 +1,4 @@
-"""A trigger's fire against a real daemon: what launchd runs, sent to the bot it was made for."""
+"""A trigger's fire against a real daemon: what launchd or systemd runs, sent to the bot it was made for."""
 import html
 import json
 import os
@@ -21,6 +21,45 @@ ROOT = Path(__file__).resolve().parent.parent
 SONNY = next((p for p in (ROOT / '.local/target/debug/sonny', ROOT / '.local/target/release/sonny') if p.exists()), None)
 # What a fire puts before the message: `[trigger NAME · YYYY-MM-DD HH:MM · why]`.
 LINE = r'\[trigger {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
+LABEL = 'me.lydakis.agent.trigger.'
+
+
+def job(home, name):
+    """Where a trigger's definition is under `home`: its plist on a Mac, its systemd service elsewhere."""
+    if sys.platform == 'darwin':
+        return home / 'Library/LaunchAgents' / f'{LABEL}{name}.plist'
+    return home / '.config/systemd/user' / f'{LABEL}{name}.service'
+
+
+def definition(args):
+    """A definition running `args`, as Sonny writes one: all a fire reads of it."""
+    if sys.platform == 'darwin':
+        strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
+        return f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>'
+
+    def quoted(word):
+        for raw, escaped in (('\\', '\\\\'), ('"', '\\"'), ('\n', '\\n'), ('\t', '\\t'), ('\r', '\\r'),
+                             ('%', '%%'), ('$', '$$')):
+            word = word.replace(raw, escaped)
+        return f'"{word}"'
+    return '[Service]\nType=oneshot\nExecStart=' + ' '.join(map(quoted, args)) + '\n'
+
+
+def program(text):
+    """The arguments a definition runs."""
+    if sys.platform == 'darwin':
+        array = re.search(r'<key>ProgramArguments</key>\s*<array>(.*?)</array>', text, re.S).group(1)
+        return [html.unescape(a) for a in re.findall(r'<string>(.*?)</string>', array)]
+    line = next(line for line in text.splitlines() if line.startswith('ExecStart='))
+    words = re.findall(r'"((?:[^"\\]|\\.)*)"', line[len('ExecStart='):])
+    escapes = {'n': '\n', 't': '\t', 'r': '\r'}
+    return [re.sub(r'\\(.)', lambda m: escapes.get(m.group(1), m.group(1)), w).replace('%%', '%').replace('$$', '$')
+            for w in words]
+
+
+def jobs(home):
+    """Every trigger definition under `home`."""
+    return list(job(home, '*').parent.glob(job(home, '*').name))
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -49,9 +88,9 @@ class TriggerFireTests(ModelFixture):
         return next(b['bot_id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
     def store_identity(self):
-        # What the daemon announces in `ready`, and `add` keeps.
+        # The lineage the daemon announces in `ready`, which `add` keeps.
         if not hasattr(self, '_store_id'):
-            self._store_id = json.loads(self.agent('start', '--store', str(self.store)).stdout)['store']['identity']
+            self._store_id = json.loads(self.agent('start', '--store', str(self.store)).stdout)['store']['lineage']
         return self._store_id
 
     def bundle(self):
@@ -88,11 +127,10 @@ class TriggerFireTests(ModelFixture):
                 '--store-id', store_id or self.store_identity(),
                 *(['--not-before', str(not_before)] if not_before else []), '--', message]
         env = {**clean_env(), 'HOME': str(self.home), **(env or {})}
-        # A fire records and ends only the trigger its plist still holds.
-        plist = self.home / 'Library/LaunchAgents' / f'me.lydakis.agent.trigger.{name}.plist'
-        plist.parent.mkdir(parents=True, exist_ok=True)
-        strings = ''.join(f'<string>{xml_escape(a)}</string>' for a in args)
-        plist.write_text(f'<plist><dict><key>ProgramArguments</key><array>{strings}</array></dict></plist>')
+        # A fire records and ends only the trigger its definition still holds.
+        path = job(self.home, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(definition(args))
         return args, env
 
     def settle(self, bot):
@@ -130,8 +168,15 @@ class TriggerFireTests(ModelFixture):
         skipped = self.fire('p.task', 'Check the PR again.')
         self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
         self.model.release_headers.set()
-        self.settle('p.task')
-        self.assertEqual(len(self.turns('p.task')), 3)
+        busy = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'gate')
+        self.agent('wait', '--store', str(self.store), f'turn:p.task/{busy}')
+        # The skip starts no turn: the bot is told in its next model call.
+        told = self.turns('p.task')[-1]
+        self.assertGreater(told['turn'], busy)
+        self.assertIn(told['status'], ('attached', 'steered'))
+        self.assertRegex(told['prompt_preview'],
+                         r'^\[trigger p\.task · .* · every 30m not sent to p\.task: bot_busy')
+        self.assertEqual(len(self.turns('p.task')), 4)
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -149,7 +194,7 @@ class TriggerFireTests(ModelFixture):
             capture_output=True, text=True, timeout=30)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stderr)['error'], 'bot_not_found')
-        self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
+        self.assertEqual(jobs(self.home), [])
 
     def test_a_one_off_waits_for_a_working_bot_instead_of_skipping(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -159,12 +204,8 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
         fired = self.fire('p.task', 'Look again.', at=int(time.time()))
-        if sys.platform == 'darwin':
-            # Delivered, it leaves no row behind.
-            self.assertIsNone(fired)
-        else:
-            # No launchd to unload it: it stays, with what it did.
-            self.assertEqual(fired['last']['outcome'], 'sent', fired)
+        # Delivered, it leaves no row behind.
+        self.assertIsNone(fired)
         self.model.release_headers.set()
         self.settle('p.task')
         previews = [t['prompt_preview'] for t in self.turns('p.task')][1:]
@@ -195,10 +236,23 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_fire_never_reaches_another_stores_daemon(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        other = self.fire('p.task', 'x', store_id='0' * 32)
+        other = self.fire('p.task', 'x', store_id='0' * 16)
         self.assertEqual(other['last']['outcome'], 'failed', other)
         self.assertIn('store_mismatch', other['last']['detail'])
         self.assertEqual(len(self.turns('p.task')), 1)
+
+    def test_a_fire_finds_its_store_after_the_file_was_replaced(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        target = ['--bot', 'p.task', '--bot-id', str(self.bot_id('p.task'))]
+        self.store_identity()
+        self.agent('shutdown', '--store', str(self.store))
+        # A copy put back in its place: the same store in a new file.
+        copy = self.path / 'copy.sqlite'
+        shutil.copy2(self.store, copy)
+        os.replace(copy, self.store)
+        self.agent('start', *self.common[:4])
+        sent = self.fire('p.task', 'Still here.', target=target)
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
 
     def test_a_fire_never_reaches_a_bot_made_again_under_the_name(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -226,11 +280,10 @@ class TriggerFireTests(ModelFixture):
     def test_a_fire_records_nothing_for_a_trigger_replaced_or_removed_meanwhile(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         first = self.fire('p.task', 'first', generation='g1')
-        # The plist now holds another generation of the same message: the old job's fire leaves its result alone.
-        plist = self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist'
-        program = re.search(r'<key>ProgramArguments</key>\s*<array>(.*?)</array>', plist.read_text(), re.S).group(1)
-        args = [html.unescape(a) for a in re.findall(r'<string>(.*?)</string>', program)]
-        plist.write_text(plist.read_text().replace('<string>g1</string>', '<string>g2</string>'))
+        # The definition now holds another generation of the same message: the old job's fire leaves its result alone.
+        path = job(self.home, 'p.task')
+        args = program(path.read_text())
+        path.write_text(definition(['g2' if a == 'g1' else a for a in args]))
         last = self.home / '.agent/triggers/p.task.json'
         last.unlink()
         result = subprocess.run(args, env={**clean_env(), 'HOME': str(self.home)}, capture_output=True, text=True,
@@ -357,15 +410,9 @@ class TriggerFireTests(ModelFixture):
         first = self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
         self.settle('p.task')
         self.assertEqual(len(self.turns('p.task')), 2)
-        if sys.platform == 'darwin':
-            # Delivered to its limit, it ends leaving nothing.
-            self.assertIsNone(first)
-            self.assertFalse((self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist').exists())
-        else:
-            # Its end could not unload it (no launchd here): a later fire only ends it again.
-            self.assertEqual(first['last']['outcome'], 'sent', first)
-            self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
-            self.assertEqual(len(self.turns('p.task')), 2)
+        # Delivered to its limit, it ends leaving nothing.
+        self.assertIsNone(first)
+        self.assertFalse(job(self.home, 'p.task').exists())
 
     def test_a_fire_caps_the_turn_it_starts(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -377,12 +424,8 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         no = self.fire('p.task', 'x', at=int(time.time()), extra=['--if', 'exit 1', '--dir', str(self.path)])
         self.assertEqual(len(self.turns('p.task')), 1)
-        if sys.platform == 'darwin':
-            self.assertEqual(no['last']['outcome'], 'declined', no)
-            self.assertFalse((self.home / 'Library/LaunchAgents/me.lydakis.agent.trigger.p.task.plist').exists())
-        else:
-            # No launchd to unload it: it stays, with why.
-            self.assertEqual(no['last']['outcome'], 'declined', no)
+        self.assertEqual(no['last']['outcome'], 'declined', no)
+        self.assertFalse(job(self.home, 'p.task').exists())
 
     def test_a_gate_that_cannot_run_is_a_failed_fire(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -484,16 +527,19 @@ class TriggerFireTests(ModelFixture):
         self.assertTrue(ended['last']['detail'].startswith('invalid_file:'), ended)
         self.assertEqual(len(self.turns('p.task')), 1)
 
-    def test_add_from_an_agents_shell_needs_launchd(self):
-        # Here there is no launchd: the trigger is refused and nothing is left behind.
-        if os.uname().sysname == 'Darwin':
+    def test_add_from_an_agents_shell_needs_systemd_running(self):
+        # No user manager runs for this runtime folder: the trigger is refused and nothing is left behind.
+        if sys.platform == 'darwin':
             self.skipTest('would add a real LaunchAgent on macOS')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         out = self.path / 'added.json'
+        runtime = self.path / 'runtime'
+        runtime.mkdir()
         self.agent('run', '--store', str(self.store), '--bot', 'p.task',
-                   f"shell:HOME='{self.home}' '{SONNY}' trigger add --every 30m -- check > '{out}' 2>&1")
+                   f"shell:HOME='{self.home}' XDG_RUNTIME_DIR='{runtime}' '{SONNY}' trigger add --every 30m -- check"
+                   f" > '{out}' 2>&1")
         self.assertEqual(json.loads(out.read_text())['error'], 'triggers_unsupported')
-        self.assertEqual(list((self.home / 'Library/LaunchAgents').glob('*.plist')), [])
+        self.assertEqual(jobs(self.home), [])
 
     @unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('AGENT_TEST_LAUNCHD') == '1',
                          'real launchd: macOS with AGENT_TEST_LAUNCHD=1')
@@ -555,6 +601,98 @@ class TriggerFireTests(ModelFixture):
         trigger('rm', name)
         self.assertFalse(loaded())
         # Nothing left: bootout's not-loaded answer reads as that.
+        self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and os.environ.get('AGENT_TEST_SYSTEMD') == '1',
+                         'real systemd: Linux with a user manager and AGENT_TEST_SYSTEMD=1')
+    def test_real_systemd_fires_and_removes(self):
+        # Units go where the user manager reads them; the rest stays under this test's HOME.
+        real = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+        data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
+        runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+        name = f'ztest-{os.getpid()}'
+        label = f'{LABEL}{name}'
+        units = real / 'systemd/user'
+        service = units / f'{label}.service'
+        # The user manager gives no provider keys: a daemon a fire starts gets them from the login shell's profile.
+        shell = self.path / 'login-shell'
+        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
+        shell.chmod(0o755)
+        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store), 'SHELL': str(shell),
+               'XDG_CONFIG_HOME': str(real), 'XDG_DATA_HOME': str(data), 'XDG_RUNTIME_DIR': runtime}
+
+        def systemctl(*args):
+            return subprocess.run(['systemctl', '--user', *args], env=env, capture_output=True, text=True)
+
+        def cleanup():
+            systemctl('stop', f'{label}.timer', f'{label}.path', f'{label}.service')
+            for path in [*units.glob(f'{label}.*'), *units.glob(f'*.wants/{label}.*')]:
+                path.unlink()
+            systemctl('daemon-reload')
+        self.addCleanup(cleanup)
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        # Sonny with its agent beside it, so a fire can start the daemon it stopped.
+        sonny = self.bundle()
+
+        def trigger(*args, ok=True):
+            result = subprocess.run([str(sonny), 'trigger', *args], env=env, capture_output=True, text=True,
+                                    timeout=120, cwd=self.path)
+            if ok:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            return result
+
+        def loaded():
+            return systemctl('is-active', f'{label}.path').stdout.strip() == 'active'
+
+        def until(check, seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and not check():
+                time.sleep(1)
+            return check()
+
+        # A one-off: its timer fires at its minute, the bot gets the message, and it ends itself.
+        trigger('add', '--bot', 'p.task', '--name', name, '--in', '1m', '--', 'systemd says hi')
+        self.assertTrue(loaded())
+        self.assertEqual(systemctl('is-active', f'{label}.timer').stdout.strip(), 'active')
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 2, 150), 'the timer did not fire it')
+        self.assertTrue(until(lambda: not loaded() and not service.exists(), 30), 'it did not end itself')
+        self.assertEqual(list(units.glob(f'{label}.*')), [])
+        self.assertEqual(json.loads(trigger('ls').stdout)['triggers'], [])
+        # A file trigger: a write to the file fires it; the same add again is that trigger.
+        watched = self.path / 'notes.md'
+        trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched), '--', 'notes changed')
+        self.assertFalse((units / f'{label}.timer').exists())
+        self.assertTrue(json.loads(trigger('add', '--bot', 'p.task', '--name', name, '--file', str(watched),
+                                           '--', 'notes changed').stdout)['duplicate'])
+        other = trigger('add', '--bot', 'p.task', '--name', name, '--every', '1h', '--', 'b', ok=False)
+        self.assertEqual(json.loads(other.stderr)['field'], 'when')
+        watched.write_text('synthetic\n')
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 3, 60), 'the path unit did not fire on the write')
+        self.settle('p.task')
+        # Fire by name, with the daemon stopped: the fire starts it, and it outlives the fire.
+        self.agent('shutdown', '--store', str(self.store))
+        fired = json.loads(trigger('fire', name).stdout)
+        self.assertEqual((fired['name'], fired['fired'], fired['outcome']), (name, True, 'sent'), fired)
+        self.assertTrue(until(lambda: systemctl('is-active', f'{label}.service').stdout.strip() != 'activating', 30))
+        self.assertTrue(until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
+        self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
+        # The daemon it started runs in a scope of its own, not the fire's service, which took its own with it.
+        daemon = subprocess.run(['pgrep', '-f', f'serve --store {self.store}'], capture_output=True, text=True)
+        groups = Path(f'/proc/{daemon.stdout.split()[0]}/cgroup').read_text()
+        self.assertIn('.scope', groups)
+        self.assertNotIn(label, groups)
+        # Units the manager no longer has, as after a failed reload: rm still removes them.
+        systemctl('stop', f'{label}.path')
+        trigger('rm', name)
+        self.assertEqual(list(units.glob(f'{label}.*')) + list(units.glob(f'*.wants/{label}.*')), [])
+        # Units left without their service, as after an end cut short: rm reaches them by name.
+        trigger('add', '--bot', 'p.task', '--name', name, '--every', '30m', '--', 'c')
+        self.assertTrue((data / f'systemd/timers/stamp-{label}.timer').exists())
+        service.unlink()
+        trigger('rm', name)
+        self.assertFalse(loaded())
+        self.assertFalse((data / f'systemd/timers/stamp-{label}.timer').exists())
+        # Nothing left: not loaded reads as that.
         self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
 
 
