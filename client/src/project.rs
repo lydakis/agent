@@ -581,6 +581,7 @@ mod tests {
             (
                 &json!([
                     "shell",
+                    "write_stdin",
                     "read",
                     "write",
                     "apply_patch",

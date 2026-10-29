@@ -8,6 +8,7 @@
 //! stream a line at a time, tool calls are one `• Ran …` line with a
 //! short `└` look at the result, and a status row says how long the turn
 //! has run and how to stop it.
+mod acp;
 mod approvals;
 mod asks;
 mod attach;
@@ -54,6 +55,7 @@ mod skills;
 mod sound;
 mod started;
 mod status;
+mod t3;
 mod table;
 mod task;
 mod term;
@@ -72,6 +74,7 @@ use ratatui::{
         event::{
             self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
             EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
         },
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -107,6 +110,9 @@ const QUOTED: usize = 72;
 const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// How much older history is drawn at a time as the view nears its top:
+/// a page drawn while the wheel turns, so small enough not to stall it.
+const OLDER_ITEMS: u64 = 50;
 /// The widest the conversation is written, however wide the window: a
 /// reply reads as a column, not a band across the screen. Prose reads
 /// best at 45 to 90 characters a line, but replies carry code, paths and
@@ -118,11 +124,31 @@ const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Into the alternate screen with the mouse, which Sonny owns while it
-/// runs, or out of it.
+/// runs, or out of it, the keys told apart on the screen it is on.
 fn own_screen(own: bool) {
+    keys_apart(false);
     let _ = match own {
         true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
         false => execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen),
+    };
+    keys_apart(true);
+}
+
+/// Ask the terminal to tell apart keys it otherwise sends alike, Shift-Enter
+/// from Enter among them, as Codex does: the kitty keyboard protocol, its
+/// escape codes made unambiguous, without release events. A terminal that
+/// does not know it ignores it. The main and alternate screens each keep
+/// their own, so each push is popped on the screen it was made on.
+fn keys_apart(on: bool) {
+    let _ = match on {
+        true => execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        ),
+        false => execute!(std::io::stdout(), PopKeyboardEnhancementFlags),
     };
 }
 
@@ -164,7 +190,9 @@ fn usage() -> String {
      it when its tasks need it and answers its agents' calls of Sonny's tools; Sonny\n\
      starts one. sonny lookout --replay --judge SPEC[,SPEC]... [--limit N] runs its\n\
      checks over what the store kept.\n\
-     sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH."
+     sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
+     sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
+     for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
 }
 
@@ -653,6 +681,8 @@ fn main() -> std::process::ExitCode {
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
+        // T3 Code runs this as a provider, a process for each thread.
+        Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -739,6 +769,7 @@ async fn run() -> Result<(), String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     term::detect();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    keys_apart(true);
     own_screen(true);
     let mut terminal =
         Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| e.to_string())?;
@@ -850,6 +881,7 @@ async fn run() -> Result<(), String> {
     let result = app.main(&mut terminal, &mut events).await;
     let _ = terminal.clear();
     own_screen(false);
+    keys_apart(false);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     status_report("clear", &name);
@@ -1463,10 +1495,9 @@ struct App {
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
     older: Option<i64>,
-    /// The full screen was scrolled past its first row: older items are
-    /// read, and the view held where it was while all is drawn again.
-    want_older: bool,
-    hold_view: bool,
+    /// What calls older than the first node drawn returned, from the top
+    /// of the oldest page: drawn with the older page that has the calls.
+    unpaired: Vec<(i64, Value)>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -1478,6 +1509,17 @@ struct App {
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
+    /// Where the composer's text was last drawn on the full screen: its
+    /// area, the first of its rows shown there, and the width it was laid
+    /// out at; none while something else is drawn over it.
+    composer_at: Option<(Rect, usize, usize)>,
+    /// The mouse button went down on the composer's text, on what: a
+    /// spot, word or line a drag selects from, and where the text was
+    /// drawn then, kept while the button is down so a redraw that scrolls
+    /// the composer does not move the spot under the mouse. And the last
+    /// press, to count clicks.
+    composing: Option<(std::ops::Range<usize>, (Rect, usize, usize))>,
+    composer_click: Option<(Instant, u16, u16, u8)>,
     /// The agent's notes beside the conversation; the margin's pane while
     /// something opened is laid over it; a note to scroll the margin to
     /// once it is drawn, one just put there or clicked in the conversation.
@@ -1572,7 +1614,7 @@ struct App {
     /// group the last went into, with the rows drawn by then, as a fold
     /// has; and when what they do was last read, or
     /// none for all of them to be read now.
-    tasks: Vec<Vec<started::Task>>,
+    tasks: BTreeMap<usize, Vec<started::Task>>,
     starting: Option<(usize, usize)>,
     tasks_read: Option<Instant>,
     /// When every task started, ended ones too, was last read.
@@ -2136,13 +2178,15 @@ impl App {
             repaint: false,
             first_node: None,
             older: None,
-            want_older: false,
-            hold_view: false,
+            unpaired: Vec::new(),
             full_width: 0,
             pane: None,
             pane_keys: false,
             pane_mouse: false,
             closed: None,
+            composer_at: None,
+            composing: None,
+            composer_click: None,
             margin: margin::Margin::default(),
             under: None,
             margin_focus: None,
@@ -2188,7 +2232,7 @@ impl App {
             folds: BTreeMap::new(),
             folding: None,
             relayed: HashMap::new(),
-            tasks: Vec::new(),
+            tasks: BTreeMap::new(),
             starting: None,
             tasks_read: None,
             tasks_all_read: None,
@@ -2351,7 +2395,8 @@ impl App {
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
-            if std::mem::take(&mut self.want_older) {
+            // Older items drawn above before the view reaches the first row.
+            if self.older.is_some() && self.screen.near_top() {
                 self.older().await;
             }
             self.jumped().await;
@@ -2635,11 +2680,7 @@ impl App {
     /// in the view just picked, once no turn is running: the screen
     /// cleared, and the bot's items read again as on attach.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
-        let back = self.screen.back();
         self.screen.clear();
-        if std::mem::take(&mut self.hold_view) {
-            self.screen.hold(back);
-        }
         terminal.clear().map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
@@ -2665,13 +2706,14 @@ impl App {
         Ok(())
     }
 
-    /// The page of items before the oldest drawn, read by drawing the
-    /// conversation again from there once idle.
+    /// The page of items before the oldest drawn, drawn on its own and
+    /// put above the rest, the view left where it is: the conversation
+    /// drawn so far is not drawn again, and a turn running goes on.
     async fn older(&mut self) {
         let Some(from) = self.older else {
             return;
         };
-        let asked = json!({"bot": self.bot, "from": from, "limit": HISTORY_ITEMS});
+        let asked = json!({"bot": self.bot, "from": from, "limit": OLDER_ITEMS});
         let page = match self.client.request("history_nodes", asked).await {
             Ok(page) => page,
             Err(error) => {
@@ -2679,20 +2721,50 @@ impl App {
                 return;
             }
         };
-        let Some(oldest) = (page["nodes"].as_array())
-            .and_then(|nodes| nodes.last())
-            .and_then(|node| node["node"].as_i64())
-        else {
+        let mut nodes: Vec<i64> = Vec::new();
+        let mut turns: HashMap<i64, i64> = HashMap::new();
+        for n in page["nodes"].as_array().into_iter().flatten() {
+            let Some(node) = n["node"].as_i64() else {
+                continue;
+            };
+            nodes.push(node);
+            if let Some(turn) = n["turn"].as_i64() {
+                turns.insert(node, turn);
+            }
+        }
+        nodes.reverse();
+        self.older = page["next_from"].as_i64();
+        let Some(&oldest) = nodes.first() else {
             self.older = None;
             return;
         };
         self.first_node = Some(oldest);
-        self.older = page["next_from"].as_i64();
-        self.hold_view = true;
-        self.repaint = true;
-        if self.running.is_some() {
-            self.notice = Some("older messages once this turn ends".into());
+        // What the newer rows were drawn with is put by meanwhile, and the
+        // page is written on a screen of its own: a group of calls in it
+        // drawn again is found there, not among the newer rows.
+        self.flush();
+        let screen = std::mem::take(&mut self.screen);
+        let any_history = std::mem::replace(&mut self.any_history, false);
+        let rows_drawn = self.rows_drawn;
+        let bot_reactions = std::mem::take(&mut self.bot_reactions);
+        let react_calls = std::mem::take(&mut self.react_calls);
+        let answering = self.answering.take();
+        let welcome = self.welcome();
+        self.commit(welcome);
+        let unpaired = std::mem::take(&mut self.unpaired);
+        self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
+        let wrote = std::mem::replace(&mut self.any_history, any_history);
+        self.rows_drawn = rows_drawn;
+        self.bot_reactions = bot_reactions;
+        self.react_calls = react_calls;
+        self.answering = answering;
+        // A blank row apart from what was the first.
+        if wrote {
+            self.pending.push(Line::default());
         }
+        self.flush();
+        let older = std::mem::replace(&mut self.screen, screen);
+        self.screen.prepend(older);
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -2934,16 +3006,17 @@ impl App {
         self.tasks_read = None;
         if let Some((at, drawn)) = self.starting
             && drawn == self.rows_drawn
+            && let Some(tasks) = self.tasks.get_mut(&at)
         {
-            self.tasks[at].push(task.clone());
+            tasks.push(task.clone());
             if self.draw_started(at) {
                 return;
             }
             // Gone from the conversation: this task starts a group of its own.
-            self.tasks[at].pop();
+            self.tasks.remove(&at);
         }
-        let at = self.tasks.len();
-        self.tasks.push(vec![task]);
+        let at = self.tasks.keys().next_back().map_or(0, |at| at + 1);
+        self.tasks.insert(at, vec![task]);
         let (lines, marks) = self.started_lines(at);
         let count = lines.len();
         self.commit(lines);
@@ -2959,7 +3032,7 @@ impl App {
     /// The rows of the tasks started together as `at`, and the buttons
     /// on them that open each.
     fn started_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
-        let tasks = &self.tasks[at];
+        let tasks = self.tasks.get(&at).map_or(&[][..], Vec::as_slice);
         let rows = started::draw(tasks, self.prose());
         let mut marks = Vec::new();
         let lines = (rows.into_iter().enumerate())
@@ -2985,11 +3058,24 @@ impl App {
     /// What the tasks started are doing, read again every few seconds:
     /// those still at work, and every one when news of them came.
     async fn read_tasks(&mut self) {
+        // Rosters whose rows the conversation let go are neither kept nor
+        // read again.
+        let gone: Vec<usize> = (self.tasks.keys())
+            .copied()
+            .filter(|at| {
+                let tag = screen::Tag::Tasks(*at as u64);
+                !self.screen.has(tag)
+                    && !(self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+            })
+            .collect();
+        for at in gone {
+            self.tasks.remove(&at);
+        }
         // Drawn again at the width the conversation has now, as when the
         // pane opened beside it.
         if !self.tasks.is_empty() && self.tasks_width != self.prose() {
             self.tasks_width = self.prose();
-            for at in 0..self.tasks.len() {
+            for at in self.tasks.keys().copied().collect::<Vec<_>>() {
                 self.draw_started(at);
             }
         }
@@ -3010,7 +3096,7 @@ impl App {
         if all {
             self.tasks_all_read = self.tasks_read;
         }
-        let mut bots: Vec<String> = (self.tasks.iter().flatten())
+        let mut bots: Vec<String> = (self.tasks.values().flatten())
             .filter(|task| all || !started::settled(&task.state))
             .map(|task| task.bot.clone())
             .collect();
@@ -3030,9 +3116,9 @@ impl App {
             };
             states.insert(bot, state);
         }
-        for at in 0..self.tasks.len() {
+        for at in self.tasks.keys().copied().collect::<Vec<_>>() {
             let mut changed = false;
-            for task in &mut self.tasks[at] {
+            for task in self.tasks.get_mut(&at).into_iter().flatten() {
                 if let Some(state) = states.get(&task.bot)
                     && *state != task.state
                 {
@@ -3070,7 +3156,7 @@ impl App {
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
     /// talk to it.
     fn open_task(&mut self, bot: &str) {
-        let name = (self.tasks.iter().flatten())
+        let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
             .map_or(bot.to_owned(), |task| task.name.clone());
         let args = ["--no-sound", "--no-layout", "--embedded", "--bot", bot].map(str::to_owned);
@@ -3348,8 +3434,9 @@ impl App {
 
     /// The person's message at `node` landed: drawn as it reads, what
     /// they ran as it was when it ran, its last row tagged, and the
-    /// message the bot now answers.
-    fn land(&mut self, node: i64, said: &str, from: Option<&str>) {
+    /// message the bot now answers. Drawn `older` than the rest, what
+    /// they ran is no part of what this window ran.
+    fn land(&mut self, node: i64, said: &str, from: Option<&str>, older: bool) {
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
         // Words between agents are one quiet row a click opens.
@@ -3370,9 +3457,14 @@ impl App {
             self.marks.push((at, said_button(node)));
         } else {
             let prose = self.prose();
-            let lines = landed(said, &mut self.ran_here, prose);
-            self.commit(lines);
-            self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+            let lines = match older {
+                true => landed(said, &mut Vec::new(), prose),
+                false => landed(said, &mut self.ran_here, prose),
+            };
+            if !lines.is_empty() {
+                self.commit(lines);
+                self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+            }
         }
         self.answering = Some((first_words(said), self.rows_drawn, node));
     }
@@ -3384,7 +3476,7 @@ impl App {
         };
         match &relayed.text {
             Some(text) => transcript::relayed(text, relayed.from.as_deref(), true, self.prose()),
-            None => transcript::relayed_shut(&relayed.head, self.prose()),
+            None => transcript::relayed_shut(&relayed.head, relayed.from.as_deref(), self.prose()),
         }
     }
 
@@ -3578,7 +3670,8 @@ impl App {
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
         // The open questions are those the replay asks and does not answer.
-        if self.seen_node == 0 || after < self.seen_node {
+        let from_start = self.seen_node == 0 || after < self.seen_node;
+        if from_start {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
@@ -3589,11 +3682,40 @@ impl App {
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
         }
+        let unpaired = self.draw_nodes(&nodes, &turns, false, Vec::new()).await;
+        if from_start {
+            self.unpaired = unpaired;
+        }
+    }
+
+    /// The items at `nodes`, then `after` (what a newer page's calls
+    /// returned, its calls being here), drawn as they were live; what
+    /// returned from calls before them is given back. Those `older` than
+    /// any drawn change nothing but what is drawn: the questions, replies
+    /// to react to and calls still running are the newer items' to say.
+    async fn draw_nodes(
+        &mut self,
+        nodes: &[i64],
+        turns: &HashMap<i64, i64>,
+        older: bool,
+        after: Vec<(i64, Value)>,
+    ) -> Vec<(i64, Value)> {
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+        let mut unpaired = Vec::new();
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<(i64, Vec<Line<'static>>)> = None;
-        for chunk in nodes.chunks(100) {
-            for (node, item) in self.items_at(chunk).await {
+        // A chunk read at a time, what it held let go before the next.
+        let mut chunks = nodes.chunks(100);
+        let mut after = Some(after);
+        loop {
+            let items = match chunks.next() {
+                Some(chunk) => self.items_at(chunk).await,
+                None => match after.take() {
+                    Some(after) => after,
+                    None => break,
+                },
+            };
+            for (node, item) in items {
                 // A reaction leaves the words before it as they were.
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some((at, lines)) = said.take_if(|_| call || item["role"].is_string()) {
@@ -3614,8 +3736,10 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
-                        asks::close(&mut self.asks, &text(&item));
-                        self.land(node, &text(&item), item["from"].as_str());
+                        if !older {
+                            asks::close(&mut self.asks, &text(&item));
+                        }
+                        self.land(node, &text(&item), item["from"].as_str(), older);
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
@@ -3626,8 +3750,10 @@ impl App {
                                 std::path::Path::new(&self.workspace),
                             );
                             said = Some((node, lines));
-                            self.saw_reply(node, &reply);
-                            self.last_reply = reply;
+                            if !older {
+                                self.saw_reply(node, &reply);
+                                self.last_reply = reply;
+                            }
                         }
                     }
                     // Counted once it is known to have been taken.
@@ -3668,38 +3794,47 @@ impl App {
                         let id = item["call_id"].as_str().unwrap_or("");
                         // A call this window kept before it lost the daemon
                         // may end in what it reads on reconnecting.
-                        if let Some((name, arguments)) =
-                            calls.remove(id).or_else(|| self.calls.remove(id))
+                        let call = match older {
+                            true => calls.remove(id),
+                            false => calls.remove(id).or_else(|| self.calls.remove(id)),
+                        };
+                        let Some((name, arguments)) = call else {
+                            unpaired.push((node, item));
+                            continue;
+                        };
+                        let (output, mut failed) = output(&item);
+                        // A note as the call that ran left it; an older
+                        // page's calls are in the margin kept already.
+                        if name == margin::TOOL
+                            && !older
+                            && !failed
+                            && denial(&item).is_none()
+                            && !reactions::refused(&item)
                         {
-                            let (output, mut failed) = output(&item);
-                            // A note as the call that ran left it.
-                            if name == margin::TOOL
-                                && !failed
-                                && denial(&item).is_none()
-                                && !reactions::refused(&item)
-                            {
-                                self.note_call(id, &arguments, turns.get(&node).copied());
+                            self.note_call(id, &arguments, turns.get(&node).copied());
+                        }
+                        match denial(&item) {
+                            Some(reason) => {
+                                // It never ran: nothing it would have done follows.
+                                failed = true;
+                                self.commit_denied(&name, &arguments, &reason);
                             }
-                            match denial(&item) {
-                                Some(reason) => {
-                                    // It never ran: nothing it would have done follows.
-                                    failed = true;
-                                    self.commit_denied(&name, &arguments, &reason);
-                                }
-                                None => self.commit_call(id, &name, &arguments, &output, failed),
-                            }
-                            if name == resolved::TOOL && !failed && !reactions::refused(&item) {
-                                self.resolve(&arguments, id, turns.get(&node).copied(), false)
-                                    .await;
-                            }
-                            if name == asks::TOOL
-                                && !failed
-                                && !reactions::refused(&item)
-                                && let Some(ask) = asks::call(id, &arguments)
-                                && !self.asks.iter().any(|open| open.id == ask.id)
-                            {
-                                self.asks.push(ask);
-                            }
+                            None => self.commit_call(id, &name, &arguments, &output, failed),
+                        }
+                        if older {
+                            continue;
+                        }
+                        if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                            self.resolve(&arguments, id, turns.get(&node).copied(), false)
+                                .await;
+                        }
+                        if name == asks::TOOL
+                            && !failed
+                            && !reactions::refused(&item)
+                            && let Some(ask) = asks::call(id, &arguments)
+                            && !self.asks.iter().any(|open| open.id == ask.id)
+                        {
+                            self.asks.push(ask);
                         }
                     }
                     _ => {}
@@ -3709,12 +3844,17 @@ impl App {
         if let Some((at, lines)) = said {
             self.commit_said(at, lines);
         }
+        if older {
+            self.draw_bot_reactions();
+            return unpaired;
+        }
         // A running turn's reactions are drawn when it ends.
         if self.running.is_none() {
             self.draw_bot_reactions();
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        unpaired
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
@@ -4030,7 +4170,7 @@ impl App {
                     && !self.note_closed(node, &text(item), turn)
                     && !quiet_message(&text(item))
                 {
-                    self.land(node, &text(item), item["from"].as_str());
+                    self.land(node, &text(item), item["from"].as_str(), false);
                     self.answered(&text(item));
                 }
             }
@@ -4047,7 +4187,7 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    self.land(node, &text(item), item["from"].as_str());
+                    self.land(node, &text(item), item["from"].as_str(), false);
                     self.answered(&text(item));
                 }
             }
@@ -5082,6 +5222,16 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
+                if !in_pane && self.composer_mouse(mouse) {
+                    // A press here lets go of what was selected there.
+                    if down {
+                        self.screen.unselect();
+                        if let Some(pane) = &mut self.pane {
+                            pane.screen.unselect();
+                        }
+                    }
+                    return true;
+                }
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
                         // A button on its first row: the margin's glance, or
@@ -5116,13 +5266,12 @@ impl App {
                         pane.screen.mouse(*mouse)
                     }
                     _ => {
-                        let up = mouse.kind == MouseEventKind::ScrollUp;
-                        if up && self.screen.at_top() && self.older.is_some() {
-                            self.want_older = true;
-                        }
                         // A press here lets go of what was selected there.
-                        if down && let Some(pane) = &mut self.pane {
-                            pane.screen.unselect();
+                        if down {
+                            self.input.unselect();
+                            if let Some(pane) = &mut self.pane {
+                                pane.screen.unselect();
+                            }
                         }
                         self.screen.mouse(*mouse)
                     }
@@ -5294,7 +5443,12 @@ impl App {
                 self.copied(&text);
                 self.screen.unselect();
             }
-            KeyCode::Esc if self.screen.unselect() => {}
+            _ if copy && let Some(range) = self.input.selection() => {
+                let text = self.input[range].to_owned();
+                self.copied(&text);
+                self.input.unselect();
+            }
+            KeyCode::Esc if self.screen.unselect() || self.input.unselect() => {}
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.screen.page(false),
             // Sending goes back to the newest rows, where its answer comes.
@@ -5431,28 +5585,15 @@ impl App {
                 // covered it.
                 self.pane_keys = false;
                 let pin = screen::Tag::Note(margin::anchor(&note.call));
-                let after = note.after;
                 if self.screen.show_tagged(pin, 2) {
                     return;
                 }
-                // Drawn back to the message it answered, or a page further
-                // at a time.
-                if let (Some(after), Some(first)) = (after, self.first_node)
-                    && after < first
-                {
-                    self.first_node = Some(after);
-                    self.hold_view = true;
-                    self.repaint = true;
-                } else if self.older.is_some() {
-                    self.want_older = true;
-                } else {
+                // Older pages drawn above, a page at a time, until it is.
+                if self.older.is_none() {
                     self.notice = Some("that note's place is no longer in the conversation".into());
                     return;
                 }
                 self.jump = Some((pin, JUMP_PAGES));
-                if self.running.is_some() {
-                    self.notice = Some("going back once this turn ends".into());
-                }
             }
             "back" => self.close_pane(true),
             _ => self.pressed.push(what.to_owned()),
@@ -5507,7 +5648,7 @@ impl App {
         let Some((pin, pages)) = self.jump else {
             return;
         };
-        if self.repaint || self.want_older || self.running.is_some() {
+        if self.repaint {
             return;
         }
         if self.screen.show_tagged(pin, 2) {
@@ -5624,11 +5765,8 @@ impl App {
         (chat, Some(pane))
     }
 
-    /// A page up the full screen, or the page before its first row.
+    /// A page up the full screen.
     fn page_up(&mut self) {
-        if self.screen.at_top() && self.older.is_some() {
-            self.want_older = true;
-        }
         self.screen.page(true);
     }
 
@@ -5638,6 +5776,77 @@ impl App {
     }
 
     /// `text` put on the clipboard, and said so.
+    /// The mouse over the composer's text, as Codex's composer takes it:
+    /// a press puts the cursor there, a drag selects, which is copied,
+    /// two clicks select a word and three its line. Whether it took
+    /// `mouse`.
+    fn composer_mouse(&mut self, mouse: &event::MouseEvent) -> bool {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let held = matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        );
+        let drawn = match &self.composing {
+            Some((_, drawn)) if held => *drawn,
+            _ => match (self.composer_at, mouse.kind) {
+                (Some(drawn), MouseEventKind::Down(MouseButton::Left))
+                    if drawn.0.contains((mouse.column, mouse.row).into()) =>
+                {
+                    drawn
+                }
+                _ => return false,
+            },
+        };
+        let (area, first, width) = drawn;
+        let rows = self.input.layout(width);
+        // Above the rows shown, the one before them; below, the last.
+        let row = match mouse.row < area.y {
+            true => first.saturating_sub(1),
+            false => first + (mouse.row - area.y) as usize,
+        }
+        .min(rows.len() - 1);
+        let at = self
+            .input
+            .spot(&rows[row], mouse.column.saturating_sub(area.x) as usize);
+        match mouse.kind {
+            MouseEventKind::Down(_) => {
+                let now = Instant::now();
+                let clicks = match self.composer_click {
+                    Some((then, x, y, n))
+                        if now.duration_since(then) < screen::DOUBLE
+                            && (x, y) == (mouse.column, mouse.row) =>
+                    {
+                        n % 3 + 1
+                    }
+                    _ => 1,
+                };
+                self.composer_click = Some((now, mouse.column, mouse.row, clicks));
+                let origin = match clicks {
+                    2 => self.input.word_at(at),
+                    3 => self.input.line_at(at),
+                    _ => at..at,
+                };
+                self.input.select(origin.start, origin.end);
+                self.composing = Some((origin, drawn));
+            }
+            _ => {
+                let origin = self.composing.clone().map_or(at..at, |(origin, _)| origin);
+                match at < origin.start {
+                    true => self.input.select(origin.end, at),
+                    false => self.input.select(origin.start, at.max(origin.end)),
+                }
+                if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                    self.composing = None;
+                    if let Some(range) = self.input.selection() {
+                        let text = self.input[range].to_owned();
+                        self.copied(&text);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn copied(&mut self, text: &str) {
         term::copy(text);
         let count = text.chars().count();
@@ -6611,6 +6820,15 @@ impl App {
         // A short pane keeps the rows around the cursor, where typing goes on.
         let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
         let (composer_rows, cursor_row) = window(composer_rows, cursor_row, room.max(1));
+        // The first of the text's rows shown, for the mouse to find its spot.
+        let first_row = match &self.composing {
+            Some((_, (_, first, _))) => Some(*first),
+            None => (!self.input.is_empty()).then(|| {
+                let layout = self.input.layout(width.min(PROSE));
+                self.input.cursor(&layout).0 - cursor_row
+            }),
+        };
+        let mut composer_at = None;
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(PROSE));
@@ -6975,6 +7193,7 @@ impl App {
                 return;
             }
             frame.render_widget(Paragraph::new(composer_rows), composer);
+            composer_at = first_row.map(|first| (composer, first, width.min(PROSE)));
             // Keys in the pane: no cursor where they do not go.
             if !self.pane_keys {
                 frame.set_cursor_position((
@@ -6984,6 +7203,7 @@ impl App {
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
         })?;
+        self.composer_at = composer_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -7037,6 +7257,7 @@ impl App {
         let (row, col) = self.input.cursor(&layout);
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
+        let selected = self.input.selection();
         let rows: Vec<Line<'static>> = layout
             .iter()
             .enumerate()
@@ -7047,10 +7268,19 @@ impl App {
                     0 => Span::raw("› ").bold(),
                     _ => Span::raw("  "),
                 };
-                Line::from(vec![
-                    lead,
-                    Span::raw(self.input[part.start..part.end].to_owned()),
-                ])
+                let text = |range: std::ops::Range<usize>| Span::raw(self.input[range].to_owned());
+                match &selected {
+                    Some(sel) if sel.start < part.end && sel.end > part.start => {
+                        let (from, to) = (sel.start.max(part.start), sel.end.min(part.end));
+                        Line::from(vec![
+                            lead,
+                            text(part.start..from),
+                            text(from..to).reversed(),
+                            text(to..part.end),
+                        ])
+                    }
+                    _ => Line::from(vec![lead, text(part.start..part.end)]),
+                }
             })
             .collect();
         let keep = match self.choosing.is_some()
@@ -7062,7 +7292,16 @@ impl App {
             true => 1,
             false => COMPOSER_ROWS,
         };
-        let (rows, row) = window(rows, row, keep);
+        let (rows, row) = match &self.composing {
+            // While the mouse button is down the rows stay where the press
+            // found them, so the text under the mouse is what it selects.
+            Some((_, (_, first, _))) => {
+                let first = (*first).min(rows.len() - 1);
+                let row = row.saturating_sub(first).min(keep - 1);
+                (rows.into_iter().skip(first).take(keep).collect(), row)
+            }
+            None => window(rows, row, keep),
+        };
         (rows, (row, col))
     }
 
@@ -7176,12 +7415,45 @@ impl App {
         while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
-        left.push_str(&format!(
-            " · {}{folder}{branch}",
-            if cut { "…" } else { "" }
-        ));
-        let fill = width.saturating_sub(left.width() + right.width());
-        Line::from(format!("{left}{}{right}", " ".repeat(fill))).dim()
+        let place = format!(" · {}{folder}", if cut { "…" } else { "" });
+        let fill =
+            width.saturating_sub(left.width() + place.width() + branch.width() + right.width());
+        // The branch in green, as shells show it; the agent's name in the
+        // agents' color.
+        let mut spans = vec![Span::raw(left), Span::raw(place)];
+        if let Some(name) = branch.strip_prefix(" on ") {
+            spans.push(Span::raw(" on "));
+            spans.push(Span::raw(name.to_owned()).fg(Color::Green));
+        }
+        spans.push(Span::raw(" ".repeat(fill)));
+        match right.rfind(&self.bot) {
+            Some(at) => {
+                spans.push(Span::raw(right[..at].to_owned()));
+                spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
+                let rest = &right[at + self.bot.len()..];
+                // How full the context is: green, then yellow, then red.
+                let tokens = self.context.map(transcript::tokens);
+                match (
+                    tokens.as_ref().and_then(|t| rest.find(t.as_str())),
+                    self.context,
+                ) {
+                    (Some(from), Some(size)) => {
+                        let color = match size {
+                            0..100_000 => Color::Green,
+                            100_000..200_000 => Color::Yellow,
+                            _ => Color::Red,
+                        };
+                        let to = from + tokens.as_ref().map_or(0, String::len);
+                        spans.push(Span::raw(rest[..from].to_owned()));
+                        spans.push(Span::raw(rest[from..to].to_owned()).fg(color));
+                        spans.push(Span::raw(rest[to..].to_owned()));
+                    }
+                    _ => spans.push(Span::raw(rest.to_owned())),
+                }
+            }
+            None => spans.push(Span::raw(right)),
+        }
+        Line::from(spans).dim()
     }
 }
 
@@ -7354,6 +7626,17 @@ fn output(item: &Value) -> (String, bool) {
     };
     let failed = item["failed"] == true;
     match serde_json::from_str::<Value>(&raw) {
+        // A terminal's: what it wrote, while it runs or as it ended.
+        Ok(terminal)
+            if terminal["output"].is_string()
+                && (terminal["running"] == true || terminal.get("exit_code").is_some()) =>
+        {
+            let shown = terminal["output"].as_str().unwrap_or("").to_owned();
+            (
+                shown,
+                failed || terminal["exit_code"].as_i64().is_some_and(|code| code != 0),
+            )
+        }
         Ok(shell) if shell.get("exit_code").is_some() => {
             let mut shown = shell["stdout"].as_str().unwrap_or("").to_owned();
             shown.push_str(shell["stderr"].as_str().unwrap_or(""));
@@ -8406,7 +8689,7 @@ mod tests {
             transcript::reply("Merged it.", 80, std::path::Path::new("/")),
         );
         app.saw_reply(4, "Merged it.");
-        app.land(6, "and tag it", None);
+        app.land(6, "and tag it", None, false);
         app.commit_said(
             8,
             transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
@@ -8743,10 +9026,11 @@ mod tests {
             4,
             "The build is green.\nI pushed the fix to calc.add.",
             Some("calc.add"),
+            false,
         );
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, updates, None);
+        app.land(5, updates, None, false);
         assert_eq!(
             drawn(&mut app),
             [
@@ -8772,7 +9056,7 @@ mod tests {
         app.press("said/4").await;
         assert_eq!(drawn(&mut app)[0], "↳ calc.add: The build is green. ▸");
         // The person's own words are drawn as ever.
-        app.land(6, "thanks", None);
+        app.land(6, "thanks", None, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
     }
 
@@ -9043,6 +9327,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shift_enter_breaks_the_line_and_a_selection_is_typed_over() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.input.set("one two");
+        let key = |code, modifiers| Event::Key(event::KeyEvent::new(code, modifiers));
+        app.key(key(KeyCode::Enter, KeyModifiers::SHIFT)).await;
+        assert_eq!(&*app.input, "one two\n");
+        // Drawn on row 10 from column 0, its first row shown there.
+        app.input.set("one two three");
+        app.composer_at = Some((Rect::new(0, 10, 40, 3), 0, 40));
+        let mouse = |kind, column: usize, row| MouseEvent {
+            kind,
+            column: column as u16,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (down, drag) = (
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        );
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 4, 10)));
+        assert_eq!(
+            (
+                app.input.selection(),
+                app.input.cursor(&app.input.layout(40)).1
+            ),
+            (None, prompt::LEAD + 4)
+        );
+        assert!(app.composer_mouse(&mouse(drag, prompt::LEAD + 7, 10)));
+        assert_eq!(app.input.selection(), Some(4..7));
+        app.key(key(KeyCode::Backspace, KeyModifiers::NONE)).await;
+        assert_eq!(&*app.input, "one  three");
+        // Two clicks select a word, which typing replaces.
+        app.composing = None;
+        app.composer_click = None;
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 6, 10)));
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 6, 10)));
+        assert_eq!(app.input.selection(), Some(5..10));
+        app.key(key(KeyCode::Char('x'), KeyModifiers::NONE)).await;
+        assert_eq!(&*app.input, "one  x");
+        // A press off the composer is not its own.
+        assert!(!app.composer_mouse(&mouse(down, prompt::LEAD, 5)));
+        // A click whose press scrolled the composer still selects nothing:
+        // the release finds its spot where the press was drawn.
+        let lines: Vec<String> = (0..12).map(|n| format!("line {n}")).collect();
+        app.input.set(&lines.join("\n"));
+        app.composing = None;
+        app.composer_click = None;
+        app.composer_at = Some((Rect::new(0, 10, 40, 8), 0, 40));
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD + 1, 12)));
+        app.composer_at = Some((Rect::new(0, 10, 40, 8), 2, 40));
+        let up = MouseEventKind::Up(MouseButton::Left);
+        assert!(app.composer_mouse(&mouse(up, prompt::LEAD + 1, 12)));
+        assert_eq!(app.input.selection(), None);
+        assert_eq!(
+            app.input.cursor(&app.input.layout(40)),
+            (2, prompt::LEAD + 1)
+        );
+        // While dragging, the rows stay where the press found them.
+        app.composing = None;
+        app.composer_click = None;
+        app.input.home();
+        for _ in 0..2 {
+            app.input.up(40);
+        }
+        app.composer_at = Some((Rect::new(0, 10, 40, 8), 0, 40));
+        assert!(app.composer_mouse(&mouse(down, prompt::LEAD, 12)));
+        let (rows, _) = app.composer(40);
+        assert!(rows[0].to_string().ends_with("line 0"), "{}", rows[0]);
+        assert!(app.composer_mouse(&mouse(drag, prompt::LEAD + 6, 13)));
+        let line = |n: usize| lines[..n].iter().map(|l| l.len() + 1).sum::<usize>();
+        assert_eq!(app.input.selection(), Some(line(2)..line(3) + 6));
+    }
+
+    #[tokio::test]
     async fn ctrl_h_deletes_as_backspace_does() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.input.set("helo");
@@ -9248,6 +9607,13 @@ mod tests {
         );
         let done = json!({"type": "custom_tool_call_output", "call_id": "p", "output": "Success."});
         assert_eq!(output(&responses(&done)[0]), ("Success.".into(), false));
+        // A terminal's result shows what it wrote.
+        let typed = json!({"type": "function_call_output", "call_id": "t",
+            "output": r#"{"output":">>> ","handle":"proc:1","running":true}"#});
+        assert_eq!(output(&typed), (">>> ".into(), false));
+        let ended = json!({"type": "function_call_output", "call_id": "t",
+            "output": r#"{"output":"Traceback\n","exit_code":1}"#});
+        assert_eq!(output(&ended), ("Traceback\n".into(), true));
     }
 
     #[tokio::test]

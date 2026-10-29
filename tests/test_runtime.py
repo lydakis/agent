@@ -2131,6 +2131,41 @@ class RuntimeTests(ModelFixture):
             requests.append(self.model.requests.get())
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
 
+    def test_a_terminal_takes_input_across_turns_and_ends_on_its_handle(self):
+        client = self.client('shell,write_stdin,wait')
+        for bot in ('Bob', 'Eve'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           tools=['shell', 'write_stdin', 'wait'])
+
+        def call(bot, request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            turn = client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, bot, turn)['result']['text'][5:])
+
+        started = call('Bob', 't1', 'shell', {'command': "read -p 'name? ' n; echo \"hi $n\"",
+                                              'tty': True, 'yield_time_ms': 1000})
+        self.assertTrue(started['running'])
+        self.assertEqual(started['output'], 'name? ')
+        handle = started['handle']
+        # Only the bot that started it types into it.
+        prompt = 'calls:' + json.dumps([['write_stdin', {'handle': handle, 'chars': 'x\n'}]])
+        turn = client.request('submit', bot='Eve', request_id='e1', prompt=prompt)['result']['turn']
+        client.finished(turn)
+        self.assertIn('terminal_not_running', poll(client, 'Eve', turn)['result']['text'])
+        # A later turn types into it, and sees it end.
+        typed = call('Bob', 't2', 'write_stdin', {'handle': handle, 'chars': 'bob\n', 'yield_time_ms': 5000})
+        self.assertEqual(typed['output'], 'bob\nhi bob\n')
+        self.assertEqual(typed['exit_code'], 0)
+        ended = call('Bob', 't3', 'wait', {'handles': [handle]})
+        self.assertEqual(ended['results'][handle]['exit_code'], 0)
+        # One still running ends with the daemon, which stops at once.
+        self.assertTrue(call('Bob', 't4', 'shell', {'command': 'sleep 600', 'tty': True,
+                                                    'yield_time_ms': 0})['running'])
+        started = time.monotonic()
+        client.close()
+        self.assertLess(time.monotonic() - started, 3)
+
     def test_retention_prunes_records_and_deletes_idle_bots(self):
         client = self.client(settings={'keep_turns': 2})
         client.request('create', bot='Bob', workspace=str(self.path))

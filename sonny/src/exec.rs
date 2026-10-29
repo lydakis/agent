@@ -32,6 +32,10 @@ const PRAGMA: &str = "// @exec:";
 /// expiry say less.
 const MEMORY: usize = 256 << 20;
 pub const TIMEOUT: Duration = Duration::from_secs(600);
+/// Scripts that run at once in the lookout, so that agents' scripts at the
+/// memory cap hold at most a gigabyte; the rest wait their turn.
+const SCRIPTS: usize = 4;
+static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SCRIPTS);
 /// The output a script returns, in tokens of about four bytes, unless its
 /// options line says otherwise.
 const OUTPUT_TOKENS: usize = 10_000;
@@ -448,6 +452,9 @@ async fn run(
     left: Duration,
 ) -> Result<String, String> {
     let script = parse(input)?;
+    let waiting = Instant::now();
+    let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
+    let left = left.saturating_sub(waiting.elapsed());
     let mut nested: BTreeMap<String, Nested> = BTreeMap::new();
     let mut listed = Vec::new();
     let mut failed = Vec::new();
@@ -496,6 +503,9 @@ async fn run(
     let deadline = started + timeout;
     let (said, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
     let ended = tokio::task::spawn_blocking(move || {
+        // Held until the script's runtime is gone, so an interrupted turn
+        // frees its place only once its script has stopped.
+        let _running = running;
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -548,8 +558,9 @@ fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
         return body;
     }
     let saved = dir.and_then(|dir| {
-        let file = dir.join("output").join(format!("{}.txt", stamp()));
-        std::fs::create_dir_all(file.parent()?).ok()?;
+        let file = fresh(&dir.join("output"))
+            .ok()?
+            .join(format!("{}.txt", stamp()));
         std::fs::write(&file, &body).ok()?;
         Some(file)
     });
@@ -575,6 +586,24 @@ fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
 }
 
 /// A name no other file of this lookout's takes.
+/// How long the outputs and images scripts save are kept.
+const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// `dir`, made, with what was saved there over `KEPT` ago removed, so
+/// saved outputs and images hold a week's worth rather than ever more.
+fn fresh(dir: &Path) -> Result<&Path, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let old = (entry.metadata().and_then(|m| m.modified()).ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > KEPT);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(dir)
+}
+
 fn stamp() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
@@ -948,8 +977,7 @@ fn image(dir: &Path, item: &str) -> Result<String, String> {
         "image/svg+xml" => "svg",
         _ => "img",
     };
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let file = dir.join(format!("{}.{extension}", stamp()));
+    let file = fresh(dir)?.join(format!("{}.{extension}", stamp()));
     std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
     Ok(format!("[image saved to {}]", file.display()))
 }
@@ -1139,19 +1167,19 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             "{said}"
         );
         assert!(said.ends_with("mcp__test__echo,mcp__test__add,mcp__test__fail,mcp__test__slow"));
-        // Fan-out runs at once: four calls of 300 ms in well under 1.2 s.
-        let started = Instant::now();
-        ran(
+        // Fan-out runs at once: four calls of 300 ms in well under 1.2 s,
+        // by the script's own clock, which starts once it may run.
+        let fanned = ran(
             &hub,
             &dir,
             "await Promise.all([1,2,3,4].map(() => tools.mcp__test__slow({ms: 300})));",
         )
         .await;
-        assert!(
-            started.elapsed() < Duration::from_millis(1000),
-            "{:?}",
-            started.elapsed()
-        );
+        let wall: f64 = (fanned.split("Wall time ").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap();
+        assert!(wall < 1.0, "{fanned}");
         // One server process served every call, kept up between scripts.
         let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
         assert_eq!(starts.lines().count(), 1, "{starts}");
@@ -1250,6 +1278,34 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
     }
 
     #[tokio::test]
+    async fn scripts_past_the_running_limit_wait_their_turn() {
+        let dir = scratch("running");
+        let hub = hub(&dir).await;
+        let slept = "await tools.mcp__test__slow({ms: 400}); text('done');";
+        let started = Instant::now();
+        assert_eq!(SCRIPTS, 4);
+        let (a, b, c, d, e) = tokio::join!(
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept),
+            ran(&hub, &dir, slept)
+        );
+        let all = [a, b, c, d, e];
+        assert!(
+            all.iter().all(|said| said.ends_with("Output:\ndone")),
+            "{all:?}"
+        );
+        // One more than may run at once ran after the first finished.
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
+        hub.stop().await;
+    }
+
+    #[tokio::test]
     async fn helpers_keep_values_find_tools_save_images_and_cut_long_output() {
         let dir = scratch("helpers");
         let hub = hub(&dir).await;
@@ -1290,6 +1346,58 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             "{long}"
         );
         assert!(long.len() < 700, "{}", long.len());
+        hub.stop().await;
+    }
+
+    #[test]
+    fn saved_outputs_and_images_are_kept_a_week() {
+        let dir = scratch("kept").join("output");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));
+        for file in [&old, &new] {
+            std::fs::write(file, "x").unwrap();
+        }
+        let week_ago = std::time::SystemTime::now() - KEPT - Duration::from_secs(60);
+        (std::fs::File::options().write(true).open(&old).unwrap())
+            .set_modified(week_ago)
+            .unwrap();
+        budgeted("y".repeat(100), 1, dir.parent());
+        let left: Vec<String> = (std::fs::read_dir(&dir).unwrap().flatten())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!left.contains(&"old.txt".to_owned()), "{left:?}");
+        assert!(
+            left.contains(&"new.txt".to_owned()) && left.len() == 2,
+            "{left:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_server_stops_and_the_next_call_starts_it_again() {
+        let dir = scratch("idle");
+        let hub = hub(&dir).await;
+        ran(&hub, &dir, "await tools.mcp__test__echo({text: 'a'});").await;
+        let first = std::fs::read_to_string(dir.join("starts")).unwrap();
+        let alive = |pid: &str| {
+            (std::process::Command::new("kill").args(["-0", pid.trim()]))
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive(&first));
+        // Used within the idle time, it stays.
+        hub.reap(Duration::from_secs(60)).await;
+        assert!(alive(&first));
+        hub.reap(Duration::ZERO).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(&first) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(&first), "server {first} outlived its idle time");
+        ran(&hub, &dir, "await tools.mcp__test__echo({text: 'b'});").await;
+        let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 2, "{starts}");
         hub.stop().await;
     }
 }

@@ -392,7 +392,8 @@ A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
 `tool_timeout_sec` and `description`. `sonny mcp add NAME -- COMMAND ARGS`
 (or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
 drops it, and `sonny mcp list` starts each and says what it offers or why
-it did not start. `/mcp` in Sonny shows the same from the last listings.
+it did not start. `/mcp` in Sonny shows the same from the last listings,
+and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
 
 Agents do not get a tool per MCP tool. While any server is on, every agent
 Sonny opens has one tool, `exec`, with Codex's code mode contract
@@ -405,8 +406,10 @@ later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, and returns at most 10,000 tokens, longer output keeping its
-start and end and saving the whole to a file. A first line such as
+10 minutes, four at once in the lookout (more wait their turn), and returns
+at most 10,000 tokens, longer output keeping its start and end and saving
+the whole to a file; saved outputs and images are kept a week. A first
+line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
 
 The lookout runs the scripts and keeps the servers
