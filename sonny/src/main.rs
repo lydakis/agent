@@ -1175,6 +1175,16 @@ fn context_after(event: &Value) -> Option<u64> {
     })
 }
 
+/// What a page of older items was drawn from: its nodes, the turn each
+/// was made in, what newer pages' calls returned that it has the calls
+/// of, and whether it is the first page, the welcome over it.
+struct Paged {
+    nodes: Vec<i64>,
+    turns: HashMap<i64, i64>,
+    after: Vec<i64>,
+    first: bool,
+}
+
 /// What the bot is saying: its rows stay in the viewport until what comes
 /// next tells whether they were a step on the way, before a call, or its
 /// reply, at the turn's end. Rows past what the viewport holds are written
@@ -1551,6 +1561,11 @@ struct App {
     /// What calls older than the first node drawn returned, from the top
     /// of the oldest page: drawn with the older page that has the calls.
     unpaired: Vec<(i64, Value)>,
+    /// What each page of older items drawn above was drawn from, by its
+    /// id on the screen, to draw it again once let go.
+    pages: HashMap<u64, Paged>,
+    /// The id the next page takes.
+    next_page: u64,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2206,6 +2221,8 @@ impl App {
             first_node: None,
             older: None,
             unpaired: Vec::new(),
+            pages: HashMap::new(),
+            next_page: 0,
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2424,6 +2441,12 @@ impl App {
             // Older items drawn above before the view reaches the first row.
             if full() && self.older.is_some() && self.screen.near_top() {
                 self.older().await;
+            }
+            // A page let go drawn again before the view reaches it.
+            if full()
+                && let Some(page) = self.screen.wanted()
+            {
+                self.draw_again(page).await;
             }
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && !self.watching() && self.side.is_none() {
@@ -2716,6 +2739,7 @@ impl App {
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
+        self.pages.clear();
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2781,17 +2805,54 @@ impl App {
             return;
         };
         self.first_node = Some(oldest);
-        // What the newer rows were drawn with is put by meanwhile.
+        let paged = Paged {
+            nodes,
+            turns,
+            after: self.unpaired.iter().map(|(node, _)| *node).collect(),
+            first: self.older.is_none(),
+        };
+        let after = std::mem::take(&mut self.unpaired);
+        let (lines, unpaired) = self.draw_page(&paged, after).await;
+        self.unpaired = unpaired;
+        let id = self.next_page;
+        self.next_page += 1;
+        self.pages.insert(id, paged);
+        self.screen.prepend(id, lines);
+    }
+
+    /// The page `id`, let go as the view moved away, drawn again as it
+    /// nears it.
+    async fn draw_again(&mut self, id: u64) {
+        let Some(paged) = self.pages.remove(&id) else {
+            return;
+        };
+        let after = self.items_at(&paged.after).await;
+        let (lines, _) = self.draw_page(&paged, after).await;
+        self.pages.insert(id, paged);
+        self.screen.fill(id, lines);
+    }
+
+    /// The rows of a page of older items, and what calls older than it
+    /// returned: drawn on their own, what the newer rows were drawn with
+    /// put by meanwhile.
+    async fn draw_page(
+        &mut self,
+        paged: &Paged,
+        after: Vec<(i64, Value)>,
+    ) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
         let pending = std::mem::take(&mut self.pending);
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
         let bot_reactions = std::mem::take(&mut self.bot_reactions);
         let react_calls = std::mem::take(&mut self.react_calls);
         let answering = self.answering.take();
-        let welcome = self.welcome();
-        self.commit(welcome);
-        let unpaired = std::mem::take(&mut self.unpaired);
-        self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
+        if paged.first {
+            let welcome = self.welcome();
+            self.commit(welcome);
+        }
+        let unpaired = self
+            .draw_nodes(&paged.nodes, &paged.turns, true, after)
+            .await;
         let mut lines = std::mem::replace(&mut self.pending, pending);
         self.any_history = any_history;
         self.rows_drawn = rows_drawn;
@@ -2802,7 +2863,7 @@ impl App {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        self.screen.prepend(lines);
+        (lines, unpaired)
     }
 
     /// The connection is gone: the daemon drops a reader that falls
