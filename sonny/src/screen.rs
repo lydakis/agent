@@ -55,6 +55,8 @@ pub enum Tag {
     Reactions(i64),
     /// A group of calls, by the client's number for it.
     Group(u64),
+    /// The rows of the message at this node that one bot sent another.
+    Relayed(i64),
 }
 
 /// What a line pushed is besides its text: a [`Tag`], or a link its row

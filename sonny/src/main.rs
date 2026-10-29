@@ -1100,6 +1100,18 @@ struct Fold {
     open: bool,
 }
 
+/// The button that opens or shuts the message between agents at `node`.
+fn said_button(node: i64) -> screen::Mark {
+    screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
+}
+
+/// A message one bot sent another, drawn quiet until a click opens it.
+struct Relayed {
+    text: String,
+    from: Option<String>,
+    open: bool,
+}
+
 /// The most denials `/approve` offers.
 const DENIALS: usize = 8;
 
@@ -1485,6 +1497,9 @@ struct App {
     /// it joins while nothing else was drawn.
     folds: Vec<Fold>,
     folding: Option<(usize, usize)>,
+    /// Words between agents drawn quiet, by node: what was said, who
+    /// said it, and whether a click opened it.
+    relayed: HashMap<i64, Relayed>,
     /// A button clicked in the conversation, which [`App::press`] takes.
     pressed: Option<String>,
     /// How many triggers and subscriptions run for this agent, as the
@@ -2162,6 +2177,7 @@ impl App {
             screen: screen::Screen::default(),
             folds: Vec::new(),
             folding: None,
+            relayed: HashMap::new(),
             pressed: None,
         }
     }
@@ -2604,6 +2620,7 @@ impl App {
         self.marks.clear();
         self.folds.clear();
         self.folding = None;
+        self.relayed.clear();
         self.held.clear();
         self.live = None;
         self.any_history = false;
@@ -2844,7 +2861,8 @@ impl App {
     }
 
     /// What a button clicked in the conversation does: `fold/N` opens or
-    /// folds the calls folded as N; `answer/N/ID` answers the question
+    /// folds the calls folded as N; `said/NODE` opens or shuts the message
+    /// between agents at NODE; `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press(&mut self, button: &str) {
         if let Some(at) = button
@@ -2854,6 +2872,18 @@ impl App {
         {
             self.folds[at].open = !self.folds[at].open;
             self.draw_fold(at);
+        }
+        if let Some(node) = button
+            .strip_prefix("said/")
+            .and_then(|node| node.parse::<i64>().ok())
+            && let Some(relayed) = self.relayed.get_mut(&node)
+        {
+            relayed.open = !relayed.open;
+            let lines = self.relayed_lines(node);
+            self.flush();
+            let tag = screen::Tag::Relayed(node);
+            self.screen
+                .replace_tagged(tag, lines, vec![(0, said_button(node))]);
         }
         if let Some((at, id)) = button
             .strip_prefix("answer/")
@@ -2888,14 +2918,46 @@ impl App {
     /// The person's message at `node` landed: drawn as it reads, what
     /// they ran as it was when it ran, its last row tagged, and the
     /// message the bot now answers.
-    fn land(&mut self, node: i64, said: &str) {
+    fn land(&mut self, node: i64, said: &str, from: Option<&str>) {
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
-        let prose = self.prose();
-        let lines = landed(said, &mut self.ran_here, prose);
-        self.commit(lines);
-        self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+        // Words between agents are one quiet row a click opens.
+        if transcript::relays(said, from) {
+            let (text, from) = (said.to_owned(), from.map(str::to_owned));
+            let relayed = Relayed {
+                text,
+                from,
+                open: false,
+            };
+            self.relayed.insert(node, relayed);
+            let lines = self.relayed_lines(node);
+            let count = lines.len();
+            self.commit(lines);
+            let at = self.pending.len() - count;
+            let tag = screen::Mark::Tag(screen::Tag::Relayed(node));
+            self.marks
+                .extend((at..at + count).map(|line| (line, tag.clone())));
+            self.marks.push((at, said_button(node)));
+        } else {
+            let prose = self.prose();
+            let lines = landed(said, &mut self.ran_here, prose);
+            self.commit(lines);
+            self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+        }
         self.answering = Some((first_words(said), self.rows_drawn, node));
+    }
+
+    /// The rows of the message between agents at `node`, open or shut.
+    fn relayed_lines(&self, node: i64) -> Vec<Line<'static>> {
+        let Some(relayed) = self.relayed.get(&node) else {
+            return Vec::new();
+        };
+        transcript::relayed(
+            &relayed.text,
+            relayed.from.as_deref(),
+            relayed.open,
+            self.prose(),
+        )
     }
 
     /// The bot's words at `node`, as replayed: their last row tagged,
@@ -2998,9 +3060,14 @@ impl App {
             rest = &rest[entries.len().min(rest.len())..];
             items.extend(entries.iter().flat_map(|entry| {
                 let node = entry["node"].as_i64().unwrap_or(0);
-                responses(&entry["item"])
-                    .into_iter()
-                    .map(move |item| (node, item))
+                // Who sent a prompt, when another bot did.
+                let from = entry["from"]["bot"].clone();
+                responses(&entry["item"]).into_iter().map(move |mut item| {
+                    if from.is_string() && item["role"] == "user" {
+                        item["from"] = from.clone();
+                    }
+                    (node, item)
+                })
             }));
         }
         items
@@ -3114,7 +3181,7 @@ impl App {
                         // were drawn live.
                         self.draw_bot_reactions();
                         asks::close(&mut self.asks, &text(&item));
-                        self.land(node, &text(&item));
+                        self.land(node, &text(&item), item["from"].as_str());
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
@@ -3522,7 +3589,7 @@ impl App {
                     && let Some(item) = self.items(&[node]).await.first()
                     && !reactions::is_reaction(&text(item))
                 {
-                    self.land(node, &text(item));
+                    self.land(node, &text(item), item["from"].as_str());
                     self.answered(&text(item));
                 }
             }
@@ -3538,7 +3605,7 @@ impl App {
                     // What the bot reacted with so far answered the
                     // message before this one.
                     self.draw_bot_reactions();
-                    self.land(node, &text(item));
+                    self.land(node, &text(item), item["from"].as_str());
                     self.answered(&text(item));
                 }
             }
@@ -5590,7 +5657,8 @@ impl App {
         }
         let row = (!self.bot_reactions.is_empty())
             .then(|| transcript::reacted(&self.bot_reactions.join(" ")));
-        self.put_under(screen::Tag::End(node), tag, row)
+        self.put_under(screen::Tag::End(node), tag, row.clone())
+            || self.put_under(screen::Tag::Relayed(node), tag, row)
     }
 
     /// The person's reactions to the reply at `node`, as its row.
@@ -7564,7 +7632,7 @@ mod tests {
             transcript::reply("Merged it.", 80, std::path::Path::new("/")),
         );
         app.saw_reply(4, "Merged it.");
-        app.land(6, "and tag it");
+        app.land(6, "and tag it", None);
         app.commit_said(
             8,
             transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
@@ -7884,6 +7952,48 @@ mod tests {
         );
         assert!(rows.iter().all(|row| !row.contains("Ran")), "{rows:?}");
         assert_eq!(rows.last().map(String::as_str), Some("• Done."));
+    }
+
+    #[tokio::test]
+    async fn words_between_agents_are_one_quiet_row_a_click_opens() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.land(
+            4,
+            "The build is green.\nI pushed the fix to calc.add.",
+            Some("calc.add"),
+        );
+        let updates = "Task updates: what happened in your tasks since you last heard.\n\
+            - calc.neg: turn:calc.neg/3 completed";
+        app.land(5, updates, None);
+        assert_eq!(
+            drawn(&mut app),
+            [
+                "↳ calc.add: The build is green. ▸",
+                "",
+                "↳ Task updates · calc.neg completed ▸"
+            ]
+        );
+        // A click on one opens it whole, and again shuts it.
+        app.follow("sonny:said/4");
+        let button = app.pressed.take().unwrap();
+        app.press(&button).await;
+        assert_eq!(
+            drawn(&mut app),
+            [
+                "↳ from calc.add ▾",
+                "  The build is green.",
+                "  I pushed the fix to calc.add.",
+                "",
+                "↳ Task updates · calc.neg completed ▸"
+            ]
+        );
+        app.press("said/4").await;
+        assert_eq!(drawn(&mut app)[0], "↳ calc.add: The build is green. ▸");
+        // The person's own words are drawn as ever.
+        app.land(6, "thanks", None);
+        assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
     }
 
     #[tokio::test]

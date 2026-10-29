@@ -1132,6 +1132,40 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     out
 }
 
+/// Whether a message is from another bot or tells the lead of its tasks:
+/// words between agents, drawn [`relayed`] and not as the person's.
+pub fn relays(text: &str, from: Option<&str>) -> bool {
+    from.is_some() || news(text).is_some()
+}
+
+/// Words between agents, kept quiet: one dim row, who sent it and its
+/// first words (or the news it brings), `▸` to open it; open, the same
+/// row with `▾` and the whole message under it.
+pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<Line<'static>> {
+    let news = news(text);
+    let head = match (&news, from, open) {
+        (Some(parts), _, false) => parts.join(" · "),
+        (Some(parts), _, true) => parts[0].clone(),
+        (None, Some(from), false) => format!("{from}: {}", text.lines().next().unwrap_or("")),
+        (None, Some(from), true) => format!("from {from}"),
+        (None, None, _) => text.lines().next().unwrap_or("").to_owned(),
+    };
+    let sign = if open { "▾" } else { "▸" };
+    let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
+    let mut out = vec![Line::from(format!("{head} {sign}"))];
+    if open {
+        for line in text.lines() {
+            out.extend(wrap(
+                Line::from(line.to_string()),
+                width,
+                Span::raw("  "),
+                Span::raw("  "),
+            ));
+        }
+    }
+    out.into_iter().map(|line| line.dim()).collect()
+}
+
 /// The most lines of a prompt shown above its reply.
 const PROMPT_LINES: usize = 6;
 
