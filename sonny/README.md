@@ -251,8 +251,9 @@ off again never shows.
   the agent may retry it once; the retry is still reviewed, and the judge
   reads your words as consent. This is Codex's `/approve`.
 - `/status` shows the project's agents in the pane beside the
-  conversation on the full screen. The lead comes first; its tasks follow grouped by where they stand: **Needs
-  you** (waiting on your approval, asking you a question, or failed),
+  conversation on the full screen. The lead comes first; its tasks
+  follow grouped by where they stand: **Needs you** (waiting on your
+  approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
   tasks), **Ready for review** (finished, its last reply linking a pull
   request), **Idle** (finished or stopped with nothing open), and
