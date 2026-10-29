@@ -343,9 +343,10 @@ impl Reference {
         }
     }
 
-    /// The file the note shows, its path in the bot's folder.
+    /// The file the note shows, its path in the bot's folder: none once
+    /// the note is taken away there, what was read of it kept as it was.
     pub fn file(&self) -> Option<PathBuf> {
-        let Some(Body::File(path)) = &self.body else {
+        let Some(Body::File(path)) = &self.body.as_ref().filter(|_| !self.removed) else {
             return None;
         };
         Some(Path::new(self.workspace.as_deref()?).join(path))
@@ -1171,6 +1172,15 @@ mod tests {
         );
         reference.file_read(Some("fn flow() {}".into()));
         reference.file_read(None);
+        // Taken away there, the file is no longer read; posted again, it is.
+        let removed = [call(json!({"id": "flow", "remove": true}))];
+        reference.read("flow", &removed);
+        assert_eq!(reference.file(), None);
+        reference.read(
+            "flow",
+            &[call(json!({"id": "flow", "file": "src/flow.rs"}))],
+        );
+        assert!(reference.file().is_some());
         let (_, body, folder) = reference.shown().unwrap();
         assert_eq!(body, Body::Markdown("```rs\nfn flow() {}\n```".into()));
         let changes = margin.changes();

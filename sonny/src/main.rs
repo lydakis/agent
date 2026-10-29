@@ -4097,16 +4097,25 @@ impl App {
             return;
         }
         self.tasks_running_read = Some(Instant::now());
-        let asked = json!({"active": true, "limit": 256});
-        let Ok(page) = self.client.request("bots", asked).await else {
-            return;
-        };
-        self.tasks_running = Some(
-            (page["bots"].as_array().into_iter().flatten())
-                .filter(|bot| bot["created_by"] == self.bot.as_str())
-                .filter_map(|bot| bot["name"].as_str().map(str::to_owned))
-                .collect(),
-        );
+        // Every page of them, or the count stays as it was.
+        let mut running = std::collections::HashSet::new();
+        let mut after = Value::Null;
+        loop {
+            let asked = json!({"active": true, "limit": 256, "after": after});
+            let Ok(page) = self.client.request("bots", asked).await else {
+                return;
+            };
+            running.extend(
+                (page["bots"].as_array().into_iter().flatten())
+                    .filter(|bot| bot["created_by"] == self.bot.as_str())
+                    .filter_map(|bot| bot["name"].as_str().map(str::to_owned)),
+            );
+            after = page["next_after"].clone();
+            if !after.is_string() {
+                break;
+            }
+        }
+        self.tasks_running = Some(running);
     }
 
     /// What `bot` did since `reference` was last read of its note `id`,
@@ -11011,11 +11020,15 @@ mod tests {
     async fn the_footer_counts_tasks_at_work_whose_rosters_are_not_drawn() {
         let client = daemon_answering(|asked| {
             assert_eq!(asked["active"], true);
-            json!({"bots": [
-                {"name": "calc.add", "created_by": "calc"},
-                {"name": "calc.mul", "created_by": "calc"},
-                {"name": "calc.ask", "created_by": "calc"},
-                {"name": "other.fix", "created_by": "other"}]})
+            // Two pages of them.
+            match asked["after"].as_str() {
+                None => json!({"next_after": "calc.ask", "bots": [
+                    {"name": "calc.add", "created_by": "calc"},
+                    {"name": "calc.ask", "created_by": "calc"}]}),
+                Some(_) => json!({"next_after": null, "bots": [
+                    {"name": "calc.mul", "created_by": "calc"},
+                    {"name": "other.fix", "created_by": "other"}]}),
+            }
         })
         .await;
         let mut app = app(client);
