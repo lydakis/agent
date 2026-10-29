@@ -506,18 +506,38 @@ impl Credentials {
     }
     /// How many of `text`'s last bytes could begin a credential that more
     /// output would finish: what a stream holds back until it can redact.
+    /// What it shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
         let set = self.0.read().unwrap_or_else(|e| e.into_inner());
-        set.values
-            .iter()
-            .filter_map(|credential| {
-                let value = credential.value.as_bytes();
+        let values = || {
+            set.values
+                .iter()
+                .map(|credential| credential.value.as_bytes())
+        };
+        let started = values()
+            .filter_map(|value| {
                 (1..value.len().min(text.len() + 1))
                     .rev()
                     .find(|&n| text.ends_with(&value[..n]))
             })
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // A whole credential across the cut, as one that ends with its own
+        // start, is shown whole.
+        let mut cut = text.len() - started;
+        while let Some(end) = values()
+            .filter_map(|value| {
+                let from = (cut + 1).saturating_sub(value.len());
+                let to = (cut + value.len() - 1).min(text.len());
+                let window = text.get(from..to)?;
+                let start = window.windows(value.len()).position(|w| w == value)?;
+                Some(from + start + value.len())
+            })
+            .max()
+        {
+            cut = end;
+        }
+        text.len() - cut
     }
 }
 

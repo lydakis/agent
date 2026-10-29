@@ -513,6 +513,14 @@ mod tests {
         unread.extend_from_slice(b"ret-1234\r\n> ");
         let read = text(&mut unread, Some(&credentials));
         assert_eq!(credentials.redact(read), "[REDACTED]\n> ");
+        // A whole credential that ends with its own start is not split.
+        credentials.set("OTHER", "sk-example-s");
+        unread.extend_from_slice(b"sk-example-s");
+        assert_eq!(
+            credentials.redact(text(&mut unread, Some(&credentials))),
+            "[REDACTED]"
+        );
+        assert!(unread.is_empty());
         // A command's end holds nothing back.
         unread.extend_from_slice(b"sk-");
         assert_eq!(text(&mut unread, None), "sk-");
