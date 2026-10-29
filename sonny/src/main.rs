@@ -1495,6 +1495,7 @@ struct App {
     /// The `plan` calls drawn, by the number each is tagged with, and the
     /// one drawn in full: the newest, where the margin cannot show it.
     plans: HashMap<u64, Vec<String>>,
+    plan_count: u64,
     plan_full: Option<u64>,
     /// Where a note was put, to show in the conversation once it is drawn
     /// back that far; and how many more older pages may be read for it.
@@ -2149,6 +2150,7 @@ impl App {
             folded: None,
             refold: false,
             plans: HashMap::new(),
+            plan_count: 0,
             plan_full: None,
             jump: None,
             pressed: Vec::new(),
@@ -2835,7 +2837,8 @@ impl App {
             && !failed
             && let Some(steps) = plan::steps(arguments)
         {
-            let at = self.plans.len() as u64;
+            let at = self.plan_count;
+            self.plan_count += 1;
             let lines = transcript::plan_lines(&steps, false, self.prose());
             let from = self.pending.len() + usize::from(self.any_history);
             let rows = lines.len();
@@ -3280,10 +3283,20 @@ impl App {
     /// was set when the margin is not `beside` the conversation; every
     /// other plan call a row of how far it had got.
     fn fold_plan(&mut self, beside: bool) {
-        let newest = (self.plans.keys())
-            .filter_map(|at| Some((self.screen.row_of(screen::Tag::Plan(*at))?, *at)))
-            .max()
-            .map(|(_, at)| at);
+        // Those the screen no longer keeps are forgotten.
+        let kept: std::collections::HashSet<u64> = (self.screen.tags())
+            .filter_map(|tag| match tag {
+                screen::Tag::Plan(at) => Some(at),
+                _ => None,
+            })
+            .collect();
+        self.plans.retain(|at, _| kept.contains(at));
+        let newest = (self.screen.tags())
+            .filter_map(|tag| match tag {
+                screen::Tag::Plan(at) => Some(at),
+                _ => None,
+            })
+            .last();
         let steps = newest.and_then(|at| self.plans.get(&at)).cloned();
         self.margin.set_plan(steps.as_deref().unwrap_or_default());
         let full = newest.filter(|_| !beside);
@@ -9426,6 +9439,11 @@ mod tests {
         let rows = texts(&app);
         assert_eq!(rows[2], "• Updated the plan · 1/3 · → Fix");
         assert!(rows.iter().any(|r| r.contains("✔ Test")), "{rows:?}");
+        // Gone from the screen, they are forgotten.
+        app.screen.clear();
+        app.refold = true;
+        app.fold_notes(false);
+        assert!(app.plans.is_empty());
     }
 
     #[tokio::test]

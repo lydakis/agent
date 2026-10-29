@@ -281,9 +281,10 @@ impl Screen {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
     }
 
-    /// Which line of those pushed is tagged `tag`, the newest if more are.
-    pub fn row_of(&self, tag: Tag) -> Option<usize> {
-        self.tagged(tag)
+    /// The tags the lines kept carry, oldest first: what is still there
+    /// of what was tagged.
+    pub fn tags(&self) -> impl Iterator<Item = Tag> + '_ {
+        self.rows.iter().filter_map(|row| row.tag)
     }
 
     /// Whether a row is tagged `tag`.
