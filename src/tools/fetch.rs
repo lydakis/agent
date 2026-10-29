@@ -107,19 +107,19 @@ pub async fn fetch(url: Url) -> Result<Page> {
         mime.is_empty() && looks_like_html(&String::from_utf8_lossy(&body[..body.len().min(1024)]));
     let html = mime == "text/html" || mime == "application/xhtml+xml" || sniffed;
     let named = charset(&content_type, html.then_some(&body));
-    let body = decoded(body, named)?;
-    let (title, text) = if html {
-        // Converting a large page takes a while: off the runtime's thread.
-        let base = Url::parse(&url).ok();
-        let (title, text, over) =
-            tokio::task::spawn_blocking(move || markdown(&body, base.as_ref()))
-                .await
-                .map_err(|_| Error::new("web_fetch_failed"))?;
-        cut |= over;
-        (title, text)
-    } else {
-        (None, body)
-    };
+    // Decoding and converting a large page take a while: off the runtime's
+    // thread.
+    let base = Url::parse(&url).ok();
+    let (title, text, over) = tokio::task::spawn_blocking(move || {
+        let body = decoded(body, named)?;
+        Ok::<_, Error>(match html {
+            true => markdown(&body, base.as_ref()),
+            false => (None, body, false),
+        })
+    })
+    .await
+    .map_err(|_| Error::new("web_fetch_failed"))??;
+    cut |= over;
     Ok(Page {
         url,
         status,
@@ -315,32 +315,42 @@ fn tag_end(text: &str) -> Option<usize> {
     None
 }
 
-/// The value of attribute `name` in a tag's text.
+/// The value of attribute `name` in a tag's text. Attributes are read
+/// one by one, so another attribute's value is never taken for a name.
 fn attribute(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(found) = lower[from..].find(name) {
-        let at = from + found;
-        from = at + name.len();
-        let before = lower[..at].chars().next_back();
-        if !before.is_some_and(|c| c.is_ascii_whitespace()) {
-            continue;
+    let mut rest = tag
+        .trim_start_matches('/')
+        .trim_start_matches(|c: char| !c.is_ascii_whitespace() && c != '/');
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+        if rest.is_empty() {
+            return None;
         }
-        let after = tag[from..].trim_start();
-        let Some(value) = after.strip_prefix('=') else {
-            continue;
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '/'))
+            .unwrap_or(rest.len());
+        let (key, after) = rest.split_at(end);
+        let after = after.trim_start();
+        let (value, next) = match after.strip_prefix('=').map(str::trim_start) {
+            Some(quoted) if quoted.starts_with(['"', '\'']) => {
+                let quote = &quoted[..1];
+                let inner = &quoted[1..];
+                let close = inner.find(quote).unwrap_or(inner.len());
+                (&inner[..close], inner.get(close + 1..).unwrap_or(""))
+            }
+            Some(bare) => {
+                let close = bare
+                    .find(|c: char| c.is_ascii_whitespace())
+                    .unwrap_or(bare.len());
+                bare.split_at(close)
+            }
+            None => ("", after),
         };
-        let value = value.trim_start();
-        let raw = match value.chars().next() {
-            Some(q @ ('"' | '\'')) => value[1..].split(q).next().unwrap_or(""),
-            _ => value
-                .split(|c: char| c.is_ascii_whitespace() || c == '>')
-                .next()
-                .unwrap_or(""),
-        };
-        return Some(decode(raw));
+        if key.eq_ignore_ascii_case(name) {
+            return Some(decode(value));
+        }
+        rest = next;
     }
-    None
 }
 
 /// Replace character references with the characters they name.
@@ -690,6 +700,12 @@ mod tests {
             attribute(r#"a data-href="x" href='y'"#, "href").as_deref(),
             Some("y")
         );
+        assert_eq!(
+            attribute(r#"a title="see href=wrong" HREF=/right/"#, "href").as_deref(),
+            Some("/right/")
+        );
+        assert_eq!(attribute("a hidden href", "href").as_deref(), Some(""));
+        assert_eq!(attribute("a", "href"), None);
     }
 
     #[test]

@@ -1397,7 +1397,11 @@ impl Registry {
             let head = boundary(&text, KEPT_END);
             let tail = boundary(&text, text.len() - KEPT_END);
             dropped = (tail - head) as u64;
-            text = format!("{}{}", &text[..head], &text[tail..]);
+            text = format!(
+                "{}\n[... {dropped} bytes dropped: past 1 MiB only the first and last {KEPT_END} bytes of this page are kept ...]\n{}",
+                &text[..head],
+                &text[tail..]
+            );
         }
         let shown = if text.len() <= PREVIEW_BYTES {
             text
