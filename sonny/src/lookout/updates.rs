@@ -355,7 +355,19 @@ impl Updates {
                     if let (Some(task), Some(of)) =
                         (data["from"]["bot"].as_str(), data["from"]["turn"].as_i64())
                     {
-                        self.forwarding.remove(&(task.to_owned(), of));
+                        let key = (task.to_owned(), of);
+                        // How its goal ends is still to tell: only its
+                        // answer went on.
+                        match self.goaled.contains(&key) {
+                            true => {
+                                if let Some(forward) = self.forwarding.get_mut(&key) {
+                                    forward.reply = None;
+                                }
+                            }
+                            false => {
+                                self.forwarding.remove(&key);
+                            }
+                        }
                     }
                 } else if let Some(origin) = data["origin"].as_str() {
                     self.origin.insert(key(turn), origin.to_owned());
@@ -1402,6 +1414,28 @@ mod tests {
             text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
         );
         updates.sent(told);
+        // A trigger passed its answer on while its check ran: how the goal
+        // ended is still news, without the answer.
+        updates.goal_turn("shop.fix", 11);
+        let fire = json!({"origin": "goal", "request_id": "trigger_t1.to.1"});
+        turn(&mut updates, "shop.fix", 11, fire, "completed");
+        updates.replied("shop.fix", 11, "passed on");
+        let passed = json!({"from": {"bot": "shop.fix", "turn": 11}});
+        updates.event(
+            &ev("shop.lead", Some(10), "accepted", passed),
+            Instant::now(),
+        );
+        updates.goal_settled(
+            "shop.fix",
+            11,
+            Some(", and met its goal: its check exits 0"),
+        );
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.fix/11 completed"), "{told}");
+        assert!(
+            told.contains("met its goal") && !told.contains("passed on"),
+            "{told}"
+        );
         // Cleared while its check ran: plain news.
         updates.goal_turn("shop.docs", 2);
         turn(&mut updates, "shop.docs", 2, lead, "completed");
