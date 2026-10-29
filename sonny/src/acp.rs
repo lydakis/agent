@@ -77,6 +77,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         rex_host: None,
         sound: false,
         side: None,
+        embedded: false,
     };
     let agent = Arc::new(Agent {
         out: Arc::new(Out::default()),

@@ -1,4 +1,4 @@
-//! The pane beside the conversation on the full screen, where what the
+//! The pane beside the conversation, where what the
 //! person opens to look at goes instead of over the conversation: a file
 //! they clicked, as a preview, `/status`, or a side chat. Its rows are a [`Screen`] of
 //! their own, so they scroll, select, copy and follow links as the
@@ -231,7 +231,7 @@ impl Pane {
     }
 
     /// `program` drawn in the pane under `title`, every key going to it
-    /// but Shift+Tab, which goes back to the conversation.
+    /// but Ctrl+\, which goes back to the conversation.
     pub fn program(title: &str, program: crate::embed::Embedded) -> Self {
         Self {
             title: title.to_owned(),
@@ -240,7 +240,7 @@ impl Pane {
             screen: Screen::default(),
             area: Rect::default(),
             card: None,
-            keys: "shift+tab back",
+            keys: "ctrl+\\ chat",
             program: Some(program),
             foot: None,
             prose: false,
@@ -288,14 +288,16 @@ impl Pane {
     }
 
     /// The pane in `area`: its title over its rows, the title bright
-    /// while keys go to the pane. `file` is where a word that may be a
-    /// path opens, as in the conversation. Where a program's cursor is,
-    /// when it shows one.
+    /// while keys go to the pane, else naming `switch`, the key that
+    /// sends them there. `file` is where a word that may be a path opens,
+    /// as in the conversation. Where a program's cursor is, when it shows
+    /// one.
     pub fn render(
         &mut self,
         area: Rect,
         buf: &mut Buffer,
         focused: bool,
+        switch: &str,
         file: impl Fn(&str) -> Option<String>,
     ) -> Option<(u16, u16)> {
         self.area = area;
@@ -305,7 +307,7 @@ impl Pane {
         let keys = match focused {
             true if !self.back.is_empty() => format!("  ← back  {} ", self.keys),
             true => format!("  {} ", self.keys),
-            false => "  tab ".to_owned(),
+            false => format!("  {switch} "),
         };
         let mut style = Style::new();
         // A file's name is a link to it.
@@ -569,7 +571,7 @@ mod tests {
     fn rows(pane: &mut Pane, width: u16, height: u16) -> Vec<String> {
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, true, |_| None);
+        pane.render(area, &mut buf, true, "tab", |_| None);
         (0..height)
             .map(|y| {
                 (0..width)
@@ -689,7 +691,7 @@ mod tests {
         let mut pane = Pane::preview(&format!("file://{}", dir.display()), &dir, 80).unwrap();
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, true, |_| None);
+        pane.render(area, &mut buf, true, "tab", |_| None);
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let ev = |kind| MouseEvent {
             kind,
@@ -778,7 +780,7 @@ mod tests {
         let mut pane = Pane::preview(&format!("file://{}", dir.display()), &dir, 80).unwrap();
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, true, |_| None);
+        pane.render(area, &mut buf, true, "tab", |_| None);
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let ev = |kind| MouseEvent {
             kind,

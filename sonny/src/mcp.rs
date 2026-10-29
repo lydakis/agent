@@ -551,20 +551,6 @@ pub fn card() -> Vec<ratatui::text::Line<'static>> {
     lines
 }
 
-/// `/mcp` in one line, for the inline screen.
-pub fn summary() -> String {
-    match shown() {
-        Ok(servers) if servers.is_empty() => "no MCP servers; add one with sonny mcp add".into(),
-        Ok(servers) => {
-            let each: Vec<String> = (servers.iter())
-                .map(|server| format!("{} ({})", server.name, server.state))
-                .collect();
-            format!("MCP servers: {}", each.join(", "))
-        }
-        Err(error) => error,
-    }
-}
-
 const USAGE: &str = "sonny mcp list [--json]
 sonny mcp add NAME [--env KEY=VALUE]... [--description TEXT] -- COMMAND [ARG]...
 sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]

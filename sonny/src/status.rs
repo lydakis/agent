@@ -104,6 +104,7 @@ pub fn mark(state: &str) -> Span<'static> {
         "working" => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("◐ ").fg(Color::Magenta),
         "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
             Span::raw("◌ ").fg(Color::Yellow)
