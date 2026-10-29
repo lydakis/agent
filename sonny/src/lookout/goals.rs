@@ -317,7 +317,7 @@ pub struct Goals {
     /// plain news, and the check's own turn is checked in its place.
     checking: HashSet<String>,
     /// Turns in a row the goal started that called no tool.
-    idle: HashMap<String, u32>,
+    idle: HashMap<String, (u64, u32)>,
 }
 
 impl Goals {
@@ -411,10 +411,14 @@ impl Goals {
                     return None;
                 }
                 let idle = match self.continued.contains(bot) && !self.called.contains(bot) {
-                    true => self.idle.get(bot).copied().unwrap_or(0) + 1,
+                    // Counted for this goal only: one set since starts at 0.
+                    true => match self.idle.get(bot) {
+                        Some((set_ms, idle)) if *set_ms == goal.set_ms => idle + 1,
+                        _ => 1,
+                    },
                     false => 0,
                 };
-                self.idle.insert(bot.to_owned(), idle);
+                self.idle.insert(bot.to_owned(), (goal.set_ms, idle));
                 let (client, done, store, socket) = (
                     client.clone(),
                     done.clone(),
