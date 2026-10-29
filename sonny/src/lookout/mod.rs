@@ -473,9 +473,6 @@ impl Service {
             }
             lookout.updates.seated(&listed);
             lookout.lineage.insert(lookout.lead.clone());
-            // Reads a dropped connection left under way answer the old
-            // channel, never this one.
-            lookout.reading = 0;
         }
         let mut live = false;
         self.live = false;
@@ -483,6 +480,11 @@ impl Service {
         // a message whose read the dropped connection cut short is read
         // again.
         self.resume = self.floor().or(self.resume);
+        for lookout in self.lookouts.values_mut() {
+            // Reads a dropped connection left under way answer the old
+            // channel, never this one.
+            lookout.reading = 0;
+        }
         let (done, mut results) = tokio::sync::mpsc::channel(64);
         // Often enough for a note whose news has settled; subscription
         // files less often.
@@ -1160,14 +1162,15 @@ impl Lookout {
             Ok(_) => {
                 self.refused = None;
                 self.since = None;
-                self.urgent = false;
+                // The person's words a bounded note left out still cut in.
+                self.urgent &= self.updates.quoting();
                 self.updates.sent(told);
                 self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead, "woke": key,
                     "delivery": delivery}));
             }
             // The same news twice is one note.
             Err(error) if error.code == "idempotency_conflict" => {
-                self.urgent = false;
+                self.urgent &= self.updates.quoting();
                 self.updates.sent(told);
             }
             Err(error) => {

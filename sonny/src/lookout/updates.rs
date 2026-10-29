@@ -101,6 +101,11 @@ impl News {
         self.theirs = one(self.theirs.take(), news.theirs);
     }
 
+    /// It holds the person's words.
+    fn quotes(&self) -> bool {
+        self.said.iter().any(|said| said.words.is_some())
+    }
+
     fn empty(&self) -> bool {
         self.said.is_empty() && self.act.is_none() && self.theirs.is_none()
     }
@@ -589,6 +594,11 @@ impl Updates {
         self.live && !self.tasks.is_empty()
     }
 
+    /// Whether news not told yet holds the person's words.
+    pub fn quoting(&self) -> bool {
+        self.live && self.tasks.iter().any(|(_, news)| news.quotes())
+    }
+
     /// Whether the lead is to hear now: there is news and it rests.
     pub fn due(&self) -> bool {
         self.news()
@@ -632,11 +642,11 @@ impl Updates {
         Some(std::mem::replace(&mut lead.status, "idle".into()))
     }
 
-    /// The news for the next note, taken: every task's, those with news to
-    /// act on first.
+    /// The news for the next note, taken: every task's, those with the
+    /// person's words first, then those with news to act on.
     pub fn take(&mut self) -> Told {
         let mut tasks = std::mem::take(&mut self.tasks);
-        tasks.sort_by_key(|(_, news)| news.said.is_empty() && news.act.is_none());
+        tasks.sort_by_key(|(_, news)| (!news.quotes(), news.said.is_empty() && news.act.is_none()));
         let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
@@ -1163,17 +1173,39 @@ mod tests {
         let first = updates.take();
         let told = first.items.len();
         assert!((20..50).contains(&told), "{told}");
+        // The person's words left for the next note still wait.
+        assert!(updates.quoting());
         assert!(first.items.iter().map(|i| i.text.len()).sum::<usize>() <= NOTE_BYTES);
         assert_eq!(first.more, 1);
         updates.sent(first);
         let second = updates.take();
         assert_eq!(second.items.len(), 50 - told);
+        assert!(!updates.quoting());
         let next = format!("- shop.fix: turn:shop.fix/{},", told + 1);
         assert!(
             second.items[0].text.starts_with(&next),
             "{}",
             second.items[0].text
         );
+    }
+
+    #[test]
+    fn the_person_s_words_go_first_in_a_bounded_note() {
+        let mut updates = fleet();
+        for n in 0..WAKE_TASKS + 8 {
+            let name = format!("shop.t{n}");
+            updates.seat(&json!({"name": name, "bot_id": 10 + n, "status": "idle"}));
+            updates.watched.insert(name.clone());
+            updates.said(&name, 1, "shop.docs", None);
+        }
+        updates.said("shop.fix", 2, "the person", Some("stop"));
+        let told = updates.take();
+        assert_eq!(
+            told.items[0].text,
+            "- shop.fix: turn:shop.fix/2, the person wrote: \"stop\""
+        );
+        assert_eq!(told.more, 9);
+        assert!(!updates.quoting());
     }
 
     #[test]
