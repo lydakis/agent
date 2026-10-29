@@ -317,7 +317,9 @@ pub struct Goals {
     /// plain news, and the check's own turn is checked in its place.
     checking: HashMap<String, tokio::task::AbortHandle>,
     /// Turns in a row the goal started that called no tool.
-    idle: HashMap<String, (u64, u32)>,
+    /// Keyed by the goal's `set_ms` and the last turn counted, so a turn
+    /// replayed after a reconnect is not counted again.
+    idle: HashMap<String, (u64, i64, u32)>,
 }
 
 impl Goals {
@@ -416,12 +418,13 @@ impl Goals {
                 let idle = match self.continued.contains(bot) && !self.called.contains(bot) {
                     // Counted for this goal only: one set since starts at 0.
                     true => match self.idle.get(bot) {
-                        Some((set_ms, idle)) if *set_ms == goal.set_ms => idle + 1,
+                        Some((set_ms, at, idle)) if *set_ms == goal.set_ms && *at == turn => *idle,
+                        Some((set_ms, _, idle)) if *set_ms == goal.set_ms => idle + 1,
                         _ => 1,
                     },
                     false => 0,
                 };
-                self.idle.insert(bot.to_owned(), (goal.set_ms, idle));
+                self.idle.insert(bot.to_owned(), (goal.set_ms, turn, idle));
                 let (client, done, store, socket) = (
                     client.clone(),
                     done.clone(),
@@ -540,7 +543,9 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
         Ok(child) => child,
         Err(error) => return (None, format!("the check did not start: {error}")),
     };
-    let group = child.id();
+    // Whatever the check started goes with it, however it ends: done, past
+    // its timeout, or its pursuit stopped.
+    let _group = child.id().map(|id| Group(id as i32));
     // Read as it prints, keeping only the end, so a check that prints
     // without end holds a few KB, not all of it.
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
@@ -553,10 +558,6 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
             Ok((Ok(status), stdout, stderr)) => (status, stdout, stderr),
             Ok((Err(error), ..)) => return (None, format!("the check failed to run: {error}")),
             Err(_) => {
-                if let Some(group) = group {
-                    // SAFETY: a signal to the process group the check leads.
-                    unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
-                }
                 return (
                     None,
                     format!("the check ran past {} s and was stopped", goal.timeout_s),
@@ -572,6 +573,16 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
         text.push_str(&errors);
     }
     (status.code(), tail(&text))
+}
+
+/// A check's process group, killed when dropped.
+struct Group(i32);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        // SAFETY: a signal to the process group the check leads.
+        unsafe { libc::killpg(self.0, libc::SIGKILL) };
+    }
 }
 
 /// The last `OUTPUT_BYTES` a pipe gave, read until it closes.
