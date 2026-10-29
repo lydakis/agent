@@ -229,13 +229,18 @@ waits for you is asked in the thread (Allow or Deny); one the judge passes
 runs without asking. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
-Each task the lead starts opens as a T3 Code thread of its own, in the task's
-worktree (in the project's folder when T3 Code does not take the worktree as
-one of the project's), with the task's brief as its first message; that
-thread is the task's, so it shows the task's work and steers it. Sonny opens
-it with the `t3_thread_launch` tool T3 Code gives each thread it runs, by the
-credential T3 Code scopes to that thread, which no program Sonny starts
-inherits. Sonny takes the person's words out of the instructions T3 Code
+Each task the lead starts opens as a T3 Code thread with the task's brief as
+its first message; that thread is the task's, so it shows the task's work and
+steers it. A task started while your prompt runs is the lead thread's child,
+nested under it, opened with T3 Code's `delegate_task` (T3 Code opens it in
+the lead's folder; the task still works in its own worktree), and your
+prompt's answer waits until it is open. T3 Code's message that a child ended
+starts no turn: the lead hears of its tasks from the lookout. A task started
+in a turn the lead took on its own, which T3 Code takes no child of, opens as
+a thread of its own with `t3_thread_launch`, in the task's worktree (in the
+project's folder when T3 Code does not take the worktree as one of the
+project's). Sonny calls these tools by the credential T3 Code scopes to the
+lead's thread, which no program Sonny starts inherits. Sonny takes the person's words out of the instructions T3 Code
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the

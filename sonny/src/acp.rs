@@ -3,8 +3,8 @@
 //! thread. A thread in a folder is that folder's lead, as `sonny` there
 //! finds or makes it, set up the same way: its rules and skills, its tools,
 //! its approval mode, and the lookout. Each task the lead starts opens as a
-//! thread of its own, through T3 Code's tools, and that thread is the
-//! task's.
+//! thread through T3 Code's tools, the lead thread's child while the
+//! person's prompt runs, and that thread is the task's.
 //!
 //! It speaks the protocol's version 2 draft as T3 Code does: the turns a
 //! bot takes on its own, as when the lookout wakes a lead because a task
@@ -406,6 +406,10 @@ struct State {
     /// The model the person picked, which the bot takes when it is next
     /// idle; a new lead starts on it.
     picked: Option<String>,
+    /// Tasks whose threads are opening, as children of the person's prompt
+    /// while it runs, and that prompt's answer, held until they are open.
+    opening: usize,
+    held: Option<(Value, Value)>,
 }
 
 struct Bound {
@@ -683,6 +687,9 @@ impl Session {
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
         let (text, images) = words(&params["prompt"]);
+        if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
+            return Ok(json!({"stopReason": "end_turn"}));
+        }
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;
@@ -1088,13 +1095,27 @@ impl Session {
                         .as_ref()
                         .map(|b| b.workspace.clone())
                         .unwrap_or_default();
-                    let (agent, session) = (agent.clone(), self.id.clone());
-                    tokio::spawn(async move {
-                        open_task(
-                            &agent, &session, &client, &project, &arguments, &workspace, &call,
-                        )
-                        .await
-                    });
+                    let this = (agent.sessions.lock().ok())
+                        .and_then(|sessions| sessions.get(&self.id).cloned());
+                    if let Some(session) = this {
+                        state.opening += 1;
+                        let agent = agent.clone();
+                        tokio::spawn(async move {
+                            let at = Where {
+                                project: &project,
+                                workspace: &workspace,
+                                thread: &session.cwd,
+                            };
+                            open_task(&agent, &session.id, &client, &at, &arguments, &call).await;
+                            let mut state = session.state.lock().await;
+                            state.opening -= 1;
+                            if state.opening == 0
+                                && let Some((prompt, result)) = state.held.take()
+                            {
+                                agent.out.answer(&prompt, result);
+                            }
+                        });
+                    }
                 }
             }
             "approval_requested" | "approval_asked" => {
@@ -1144,7 +1165,13 @@ impl Session {
                         result["error"] = json!({"code": FAILED,
                             "message": data["error"].as_str().unwrap_or("the turn failed")});
                     }
-                    out.answer(&prompt, result);
+                    // A task T3 Code opens as a child of this prompt opens
+                    // while its run is on.
+                    if state.opening > 0 {
+                        state.held = Some((prompt, result));
+                    } else {
+                        out.answer(&prompt, result);
+                    }
                 }
             }
             "deleted" => {
@@ -1430,18 +1457,28 @@ async fn setup_lead(
     Ok(())
 }
 
+/// Where a lead's thread is: its project, the lead's workspace, and the
+/// folder T3 Code opened the thread in.
+struct Where<'a> {
+    project: &'a str,
+    workspace: &'a str,
+    thread: &'a Path,
+}
+
 /// Open the task a lead's `start_task` call started as a thread of its
 /// own, with the task's brief as its first message; the thread is the
-/// task's when that message reaches it. The lead's call says where.
+/// task's when that message reaches it. While the person's prompt runs it
+/// is the lead thread's child, which T3 Code opens in the lead's folder;
+/// otherwise a thread of its own, where the lead's call says.
 async fn open_task(
     agent: &Agent,
     session: &str,
     client: &Client,
-    project: &str,
+    at: &Where<'_>,
     arguments: &Value,
-    lead_workspace: &str,
     call: &str,
 ) {
+    let (project, lead_workspace) = (at.project, at.workspace);
     let Some(t3) = &agent.t3 else { return };
     let Some(name) = arguments["name"].as_str() else {
         return;
@@ -1472,6 +1509,17 @@ async fn open_task(
             .ok_or("the task has no brief")?
             .to_owned();
         let workspace = record["workspace"].as_str().unwrap_or_default();
+        let message = t3::expect(&bot, &brief, at.thread)?;
+        let child = json!({"task": message, "title": name, "clientRequestId": bot});
+        // The person's prompt waits for it: not for ever. One that is late
+        // may open yet, so its task still waits for it and no other thread
+        // is opened for it.
+        let delegating = t3.call("delegate_task", child);
+        match tokio::time::timeout(std::time::Duration::from_secs(30), delegating).await {
+            Ok(Ok(delegated)) => return Ok(delegated),
+            Ok(Err(_)) => {}
+            Err(_) => return Ok(Value::Null),
+        }
         let message = t3::expect(&bot, &brief, Path::new(workspace))?;
         let mut launch = json!({"title": name, "message": message, "clientRequestId": bot});
         if workspace != lead_workspace {
