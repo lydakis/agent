@@ -568,7 +568,8 @@ pub fn summary() -> String {
 const USAGE: &str = "sonny mcp list [--json]
 sonny mcp add NAME [--env KEY=VALUE]... [--description TEXT] -- COMMAND [ARG]...
 sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
-sonny mcp remove NAME";
+sonny mcp remove NAME
+sonny mcp tool";
 
 /// `sonny mcp`: the person's servers, as `codex mcp` keeps Codex's, in
 /// `[sonny.mcp_servers]` of ~/.agent/config.toml.
@@ -611,6 +612,15 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        // The `exec` tool as agents opened now are given it, its
+        // description listing each server's tools from the last listing.
+        Some((verb, [])) if verb == "tool" => match crate::exec::tool() {
+            Some(tool) => {
+                println!("{tool}");
+                Ok(())
+            }
+            None => Err("no MCP servers on, so agents get no exec tool".into()),
+        },
         Some((verb, [name])) if verb == "remove" => {
             let servers = agent_client::config::read(&path)?.sonny.mcp_servers;
             if !servers.contains_key(name) {

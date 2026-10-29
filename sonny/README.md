@@ -291,7 +291,7 @@ off again never shows.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
-  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list`), each with
+  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`

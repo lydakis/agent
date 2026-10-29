@@ -392,7 +392,8 @@ A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
 `tool_timeout_sec` and `description`. `sonny mcp add NAME -- COMMAND ARGS`
 (or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
 drops it, and `sonny mcp list` starts each and says what it offers or why
-it did not start. `/mcp` in Sonny shows the same from the last listings.
+it did not start. `/mcp` in Sonny shows the same from the last listings,
+and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
 
 Agents do not get a tool per MCP tool. While any server is on, every agent
 Sonny opens has one tool, `exec`, with Codex's code mode contract
