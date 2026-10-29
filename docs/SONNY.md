@@ -359,7 +359,7 @@ every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
 as a file; `memory`, what to save for later agents; `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
 Triggers); and, depending on where it runs, `pictures`, `rex-windows` or
-`herdr-panes`, and `errand`. They are normal skills, real files
+`herdr-panes`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
 while it is as Sonny last wrote it: one the person edited, or one of that

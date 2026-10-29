@@ -250,9 +250,8 @@ off again never shows.
   Enter sends your approval of that exact call as your own message, so
   the agent may retry it once; the retry is still reviewed, and the judge
   reads your words as consent. This is Codex's `/approve`.
-- `/status` shows the project's agents, and its running Errand jobs, in
-  the pane beside the conversation on the full screen. The
-  lead comes first; its tasks follow grouped by where they stand: **Needs
+- `/status` shows the project's agents in the pane beside the
+  conversation on the full screen. The lead comes first; its tasks follow grouped by where they stand: **Needs
   you** (waiting on your approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
   tasks), **Ready for review** (finished, its last reply linking a pull
@@ -358,10 +357,6 @@ a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 [docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory and
 skills.
-When `errand` is installed, Sonny writes an `errand` skill so any agent can
-run a command on another machine, draws those runs as `Ran COMMAND on
-PEER`, and in Rex opens a window following each detached job.
-
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
 subscribes each lead to its tasks. As soon as the lead rests, it tells it
