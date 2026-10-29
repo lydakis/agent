@@ -708,6 +708,10 @@ pictures, and code in syntax colors.
 
 ![/status laid over the margin: its title's ← goes back, and the footer counts the note the margin holds](../docs/sonny/margin-status.png)
 
+![The margin opened by itself with the lead's first notes, two tasks' tables shown as the tasks keep them](../docs/sonny/margin-opens-with-a-note.png)
+
+![Both notes taken away with ×: the margin goes and the conversation has the window back](../docs/sonny/margin-gone-once-empty.png)
+
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
 ![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)

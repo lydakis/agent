@@ -1677,6 +1677,9 @@ struct App {
     pane: Option<pane::Pane>,
     pane_keys: bool,
     pane_mouse: bool,
+    /// Whether the margin held anything when last looked at: emptied, it
+    /// goes, keys or not.
+    margin_held: bool,
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
@@ -2400,6 +2403,7 @@ impl App {
             full_width: 0,
             pane: None,
             pane_keys: false,
+            margin_held: false,
             pane_mouse: false,
             closed: None,
             composer_at: None,
@@ -6229,7 +6233,7 @@ impl App {
 
     /// The margin back beside the conversation when nothing else is
     /// there and it holds something, unless the person closed it: out of
-    /// the way again once it holds nothing, unless the keys are in it.
+    /// the way again once it holds nothing, unless it was asked for so.
     fn margin_back(&mut self) {
         if self.margin.closed() {
             self.under = None;
@@ -6238,8 +6242,13 @@ impl App {
             }
         }
         let empty = self.margin.is_empty();
-        if empty && !self.pane_keys && self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
+        let emptied = std::mem::replace(&mut self.margin_held, !empty) && empty;
+        if empty
+            && (emptied || !self.pane_keys)
+            && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
+        {
             self.pane = None;
+            self.pane_keys = false;
         }
         if self.pane.is_none() && !self.margin.closed() && (!empty || self.pane_keys) {
             self.pane = Some(self.under.take().unwrap_or_else(pane::Pane::margin));
@@ -11187,10 +11196,12 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(margin(&app));
+        // Its last note taken away, with the keys in it, it goes.
+        app.pane_keys = true;
         app.margin
             .apply("m2", &json!({"id": "repro", "remove": true}), None, None);
         app.margin_back();
-        assert!(!margin(&app) && !app.margin.closed());
+        assert!(!margin(&app) && !app.pane_keys && !app.margin.closed());
         // Asked for, it shows with nothing in it.
         app.toggle_margin();
         app.margin_back();
