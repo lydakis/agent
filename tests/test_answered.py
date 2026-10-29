@@ -60,7 +60,9 @@ class AnsweredToolTests(ModelFixture):
                                     'required': ['input']},
                      'answered_by': 'sonny'}
         for parameters in ({'type': 'object'}, {'type': 'object', 'properties': {'input': {'type': 'string'}}},
-                           {'type': 'object', 'properties': {'input': {'type': 'integer'}}, 'required': ['input']}):
+                           {'type': 'object', 'properties': {'input': {'type': 'integer'}}, 'required': ['input']},
+                           {'type': 'object', 'properties': {'input': {'type': 'string'}, 'language': {'type': 'string'}},
+                            'required': ['input', 'language']}):
             refused = client.request('create', bot='Bad', workspace=str(self.path),
                                      declare=[dict(exec_tool, parameters=parameters)])
             self.assertEqual(refused['error'], 'invalid_declare', parameters)

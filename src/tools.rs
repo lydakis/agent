@@ -266,13 +266,15 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
         }
         if let Some(grammar) = &tool.grammar {
             let input = &tool.parameters["properties"]["input"];
-            let required = (tool.parameters["required"].as_array().into_iter().flatten())
-                .any(|field| field == "input");
+            // Its call is the text alone, so nothing else may be required.
+            let required = tool.parameters["required"]
+                .as_array()
+                .is_some_and(|fields| fields.len() == 1 && fields[0] == "input");
             if grammar.is_empty() || input["type"] != "string" || !required {
                 return fail_with(
                     "invalid_declare",
                     format!(
-                        "{name}: a tool with a grammar takes its text as a required string input"
+                        "{name}: a tool with a grammar takes its text as `input`, a string and its only required field"
                     ),
                 );
             }
