@@ -48,13 +48,16 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          once: a diagram of how code or a system fits together (draw it in Mermaid), a table of \
          results you measure or compare, or the file being discussed. Put that part in the note, \
          and keep the reply to what it means, with a line pointing to the note, without walking \
-         the note's rows again; when the person asks you to walk through it, the note holds only \
-         what the walkthrough does not, such as a summary table, or there is none. Skip the margin for a short answer the person reads once, and for \
+         the note's rows again. When the person asks you to walk through a file, show that file in \
+         the note and walk through it in the reply; for a walkthrough of anything else, the note \
+         holds only what the walkthrough does not, such as a summary table. Skip the margin for a \
+         short answer the person reads once, and for \
          the steps of your work, which belong in your plan. A note stays pinned to this point in \
          the conversation, and the person can jump between it and here. Posting the same id again \
          replaces that note in place: update one note as results come in, rather than posting \
          another. When you or a task change what a note shows, such as code a diagram describes, \
-         post it again with the same id or remove it in that same turn, even while the change waits \
+         post it again with the same id, rather than a second note about the change, or remove it \
+         in that same turn, even while the change waits \
          on a task's branch, saying in the note which it shows, and remove a note once it \
          no longer holds. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
          fences and pictures included) or file (a path in your own folder, shown as the file \
