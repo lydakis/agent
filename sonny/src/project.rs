@@ -734,7 +734,7 @@ mod tests {
         .unwrap();
         let lead = role(&dir).unwrap();
         assert!(lead.body.starts_with(&base));
-        assert!(lead.body.contains("they report to you"));
+        assert!(lead.body.contains("you lead their leads"));
         assert!(!instructions(&dir).unwrap().contains("- superlead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
