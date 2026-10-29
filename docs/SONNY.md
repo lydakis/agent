@@ -10,18 +10,22 @@ client itself.
 Triggers are Sonny's ([trigger.rs](../sonny/src/trigger.rs)). A trigger wakes an agent with a
 message when something happens: a time comes, a file is written, a
 repository's HEAD moves, or someone fires it by name. The message is a new turn in the agent's own conversation; a trigger
-may also start the agent it names on its first fire. launchd watches, so a
-trigger fires with Sonny closed, and a time the Mac slept through fires
-once when it wakes (`StartCalendarInterval` coalesces missed times;
-`StartInterval` and cron skip them). The daemon has no clock or watcher of
-its own, and no process of a trigger runs between its fires: while nothing
-happens a trigger costs its plist and launchd's watch, and no model call.
+may also start the agent it names on its first fire. The system's own
+scheduler watches, launchd on a Mac and systemd's user manager on Linux
+([On Linux](#on-linux)), so a trigger fires with Sonny closed, and a time
+the machine slept through fires once when it wakes (`StartCalendarInterval`
+coalesces missed times, as a `Persistent=true` timer does; `StartInterval`
+and cron skip them). The daemon has no clock or watcher of its own, and no
+process of a trigger runs between its fires: while nothing happens a
+trigger costs its definition and the scheduler's watch, and no model call.
+Below, launchd and the plist stand for either system's scheduler and
+definition, which keep a trigger alike.
 A lead hears of its tasks' turns from Sonny's task updates and lookout, not
 from triggers.
 
 Sonny's agents add and change triggers with the `triggers` tool, which
 Sonny's lookout answers outside the agent's sandbox, since a trigger is a
-LaunchAgent: `add` (the fields below, as `every`, `cron`, `start {name,
+job of the system's scheduler: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
 It waits for a verdict wherever the agent's other calls do (`/approvals`),
@@ -158,10 +162,14 @@ Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.p
 and that file is its definition: its program arguments carry the agent and
 its id (or the agent to start, its model and effort, and who added it), the
 store and the socket of the shell it was made from (an agent's shell has
-both), the store identity its daemon announced, the one-off's time, the
+both), the store lineage its daemon announced, the one-off's time, the
 repository, the folder, the reply agent and its id, the gate, the run limit,
-and the message. A fire whose daemon announces another store (a reused
-socket) sends nothing and records `store_mismatch`. When it fires, Sonny
+and the message. The lineage is drawn when the store is made and kept when
+its file is replaced or copied, so a store put back from a copy keeps its
+triggers. A fire whose daemon announces another store (a reused
+socket) sends nothing and records `store_mismatch`. A trigger made when
+triggers kept the store file's identity, which a replaced file loses, is
+rewritten to the lineage when Sonny next opens on that store. When it fires, Sonny
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
@@ -176,7 +184,10 @@ after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
-which `ls` and `show` return. Triggers are local to this machine. Only
+which `ls` and `show` return. A fire the daemon took no turn for (`skipped`,
+or `failed` once the daemon answered) also tells the reply agent, else the
+agent it messages, with `delivery: attach`: one line naming the trigger and
+why, which that agent reads in its next model call without a turn starting. Triggers are local to this machine. Only
 launchd runs a fire, so no two of one trigger ever run at once.
 
 A trigger's state is three things: its plist, launchd's loaded copy, and
@@ -226,8 +237,42 @@ changes, and the refresh reads each plist again under it.
 Sonny starts from a new place, it writes its path into every trigger and
 loads it again, on a thread of its own so its screen does not wait (a Sonny
 in Homebrew's Cellar goes by its `opt` path, which an upgrade keeps); one launchd refuses keeps its old path and is tried again at the
-next start. Only macOS
-has launchd; elsewhere `add` refuses with `triggers_unsupported`.
+next start.
+
+### On Linux
+
+systemd's user manager keeps triggers, through `systemctl --user`. Each is
+one service, `~/.config/systemd/user/me.lydakis.agent.trigger.NAME.service`
+(under `XDG_CONFIG_HOME` when set, where the manager reads units), and that
+file is its definition as the plist is on a Mac: its `ExecStart=` is the
+fire's arguments, quoted as systemd reads them back, and two sections
+systemd itself skips, `[X-Timer]` and `[X-Path]`, hold what starts it.
+Loading it writes `NAME.timer` and `NAME.path` beside it from those
+sections, and enables and starts both, so the manager starts them again at
+the next login. The timer has the calendar entries as `OnCalendar=`, with
+`Persistent=true`, so a time missed while the machine slept or was off
+fires once when it is back, and `AccuracySec=1s`. The path unit has
+`PathChanged=` for `--file` and `--commit`, and `DirectoryNotEmpty=` for the
+asks and the ask being taken, which starts the service while an ask waits
+and again when the service ends with one still there, as `QueueDirectories`
+does. The service is `Type=oneshot`, so the manager starts no second fire
+while one runs. Unloading stops the timer, the path unit and the service
+(unless the service is the fire ending its own trigger, which then finishes
+on its own, as nothing starts it again), removes the two units, the links
+that enable them and the timer's stamp, so a trigger made again under the
+name does not catch up from it, and reloads the manager. A service takes
+every process left in it when it ends, so a daemon a fire starts runs in a
+scope of its own (`systemd-run --user --scope`), as a desktop starts an
+app, and outlives the fire. The fire runs with `XDG_CONFIG_HOME` and
+`XDG_DATA_HOME` as `add` had them, besides `HOME`, `SHELL` and `PATH`.
+
+The user manager runs while you are logged in, as LaunchAgents do; for
+triggers to fire while you are logged out, `loginctl enable-linger`. With no
+user manager running (no `systemd/private` in `XDG_RUNTIME_DIR`, or in
+`/run/user/UID` when that is unset), `add` refuses with
+`triggers_unsupported`. A watched path a unit cannot hold, one with a
+control character or ending in a space, is refused for `--file` and
+`--commit` on every system.
 
 Earlier apps called these schedules (`me.lydakis.agent.schedule.NAME`).
 They are not converted: remove them by hand (`launchctl bootout
@@ -471,4 +516,10 @@ test, which loads real jobs (under a scratch `HOME`, so nothing loads at the
 next login) and checks that launchd fires a one-off, which ends itself,
 fires a file trigger on a write (the same `add` again being that trigger, a
 different one refused naming `when`), runs `fire` by name, and that `rm`
-removes a job whose plist or load is already gone.
+removes a job whose plist or load is already gone. On Linux with a user
+manager running, `AGENT_TEST_SYSTEMD=1` adds the same for systemd: it writes
+real units where the manager reads them (its name `ztest-PID`, removed
+after), checks that a one-off's timer fires it and that it ends itself, a
+write fires a file trigger, `fire` by name starts the stopped daemon in a
+scope of its own, and `rm` removes units the manager no longer has or left
+without their service, the timer's stamp with them.

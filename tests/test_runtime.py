@@ -1063,6 +1063,18 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([(u['cache_write_tokens'], u['cache_write_1h_tokens']) for u in usage], [(3, 3)] * 2)
 
+    def test_configure_moves_a_bot_to_the_hour_long_cache(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        moved = client.request('configure', bot='Bob', cache_ttl='1h')['result']
+        self.assertEqual(moved['changed'], ['cache_ttl'])
+        self.assertEqual(client.request('configure', bot='Bob', cache_ttl='1h')['result']['changed'], [])
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['cache_ttl'], '1h')
+        # Its next call marks the cache for an hour.
+        model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
+        turn = client.request('submit', bot='Bob', request_id='c1', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), effort='low')
@@ -1127,7 +1139,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
         self.assertFalse([e for e in events if e['event'].startswith('tool_')])
 
-    def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_fails_one_to_a_prompt(self):
+    def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_after_a_prompt(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path))
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:silent')['result']['turn']
@@ -1137,8 +1149,14 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # The history it left takes the next prompt.
         turn = client.request('submit', bot='Bob', request_id='r2', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # A reply of nothing to a prompt is the bot choosing to say nothing.
         turn = client.request('submit', bot='Bob', request_id='r3', prompt='silent')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['error'], 'empty_completion')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        waited = client.request('wait', handles=[f'turn:Bob/{turn}'], timeout_ms=0)['result']
+        self.assertEqual(waited['results'][f'turn:Bob/{turn}']['text'], '')
+        # And the next prompt still goes.
+        turn = client.request('submit', bot='Bob', request_id='r4', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_an_empty_reply_after_a_call_that_parked_ends_the_turn(self):
         # The call waits on the person's verdict, so the turn parks and

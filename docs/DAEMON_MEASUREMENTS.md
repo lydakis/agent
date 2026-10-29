@@ -5669,3 +5669,26 @@ The batch path's gain is wall time: in `tests/test_wait.py`, two commands
 that each sleep 0.6 s finish in under 1.1 s. Results of a batch are queued
 to the store in call order without waiting on each other, so calls that
 finish together share a commit.
+
+## A cut write or edit names its file (#318)
+
+The Perf workflow's matched screen, base main 4b20a9a against the PR head
+be0c699, on the GitHub runner (2026-10-29):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 23.098 | 23.332 | +1.0% |
+| admission | burst submit p99, ms | 2.929 | 2.954 | +0.8% |
+| completion | release to terminal p99, ms | 6.713 | 6.69 | -0.3% |
+| footprint | idle RSS, MiB | 18.932 | 18.924 | -0.0% |
+| footprint | per idle bot, KiB | 1.454 | 1.384 | -4.8% |
+| footprint | RSS after a turn each, MiB | 30.312 | 29.758 | -1.8% |
+| footprint | CPU per turn, ms | 0.599 | 0.628 | +4.8% |
+| lifecycle | CPU, s | 0.6 | 0.62 | +3.3% |
+| lifecycle | p95 turn, ms | 570.186 | 598.011 | +4.9% |
+| lifecycle | peak RSS, MiB | 24.953 | 25.256 | +1.2% |
+
+Store jobs per turn did not change (7.5 on both). Every change is within the
+gate's 15%. The benches' calls are short, so `tool_started` takes its old path:
+the new parse runs only for a write or edit past the 2 KiB preview, once, on
+arguments the daemon already holds, as a cut patch's parse already did.

@@ -121,6 +121,17 @@ pub enum Failure {
         path: PathBuf,
         reason: String,
     },
+    /// A profile or skill another names (or the one asked for) is in
+    /// neither folder. `kind` is `profile` or `skill`.
+    Missing {
+        name: String,
+        kind: &'static str,
+    },
+    /// A profile whose `extends` or `skills` cannot be followed.
+    Invalid {
+        path: PathBuf,
+        reason: String,
+    },
 }
 impl Failure {
     /// A stable code for programs, in the daemon's error style.
@@ -128,6 +139,9 @@ impl Failure {
         match self {
             Failure::TooLong { .. } | Failure::TooMany { .. } => "instructions_limit",
             Failure::Unreadable { .. } => "instructions_unreadable",
+            Failure::Missing { kind: "skill", .. } => "skill_not_found",
+            Failure::Missing { .. } => "profile_not_found",
+            Failure::Invalid { .. } => "profile_invalid",
         }
     }
 }
@@ -147,6 +161,18 @@ impl std::fmt::Display for Failure {
             Failure::Unreadable { path, reason } => {
                 write!(f, "cannot read {}: {reason}", path.display())
             }
+            Failure::Missing {
+                name,
+                kind: "skill",
+            } => write!(
+                f,
+                "no .agents/skills/{name}/SKILL.md in the workspace or ~/.agents/skills"
+            ),
+            Failure::Missing { name, .. } => write!(
+                f,
+                "no .agents/agents/{name}.md in the workspace or ~/.agents/agents"
+            ),
+            Failure::Invalid { path, reason } => write!(f, "{}: {reason}", path.display()),
         }
     }
 }
@@ -243,6 +269,12 @@ pub struct Front {
     pub description: Option<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
+    /// A profile this one builds on: its body comes first, and its model,
+    /// tools and skills stand where this one names none.
+    pub extends: Option<String>,
+    /// Skills whose whole text a profile carries, as a Claude Code
+    /// subagent's `skills` preloads them.
+    pub skills: Option<Vec<String>>,
 }
 
 fn unquote(value: &str) -> String {
@@ -275,8 +307,8 @@ fn uncomment(value: &str) -> &str {
 
 /// Split front matter from the body, reading the subset of YAML agent files
 /// use. Scalars are one line or a `|`/`>` block below the key, joined by
-/// spaces; `tools` is a comma-separated line, a `[a, b]` flow list, or `- a`
-/// items below it. Comments are dropped.
+/// spaces; `tools` and `skills` are a comma-separated line, a `[a, b]` flow
+/// list, or `- a` items below it. Comments are dropped.
 pub fn front_matter(text: &str) -> (Front, &str) {
     let mut front = Front::default();
     let Some(rest) = text
@@ -293,20 +325,22 @@ pub fn front_matter(text: &str) -> (Front, &str) {
         // Unclosed: the whole head is front matter; a cut head has no body.
         None => (rest, ""),
     };
-    let mut in_tools = false;
+    // The list whose `- a` items the lines below its key hold.
+    let mut in_list: Option<&mut Option<Vec<String>>> = None;
+    let (mut tools, mut skills) = (None, None);
     let mut lines = block.lines().peekable();
     while let Some(line) = lines.next() {
         if uncomment(line).trim().is_empty() {
             continue;
         }
-        if in_tools && let Some(item) = line.trim_start().strip_prefix("- ") {
-            front
-                .tools
-                .get_or_insert_with(Vec::new)
+        if let Some(list) = in_list.as_mut()
+            && let Some(item) = line.trim_start().strip_prefix("- ")
+        {
+            list.get_or_insert_with(Vec::new)
                 .push(unquote(uncomment(item)));
             continue;
         }
-        in_tools = false;
+        in_list = None;
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -328,26 +362,43 @@ pub fn front_matter(text: &str) -> (Front, &str) {
             }
             text.join(" ")
         };
-        match key.trim() {
-            "name" => front.name = Some(scalar(&mut lines)),
-            "description" => front.description = Some(scalar(&mut lines)),
-            "model" => front.model = Some(scalar(&mut lines)),
-            "tools" if value.is_empty() => {
-                in_tools = true;
-                front.tools = Some(Vec::new());
+        let list = match key.trim() {
+            "name" => {
+                front.name = Some(scalar(&mut lines));
+                continue;
             }
-            "tools" => {
-                let list = value.trim_start_matches('[').trim_end_matches(']');
-                front.tools = Some(
-                    list.split(',')
-                        .map(unquote)
-                        .filter(|t| !t.is_empty())
-                        .collect(),
-                );
+            "description" => {
+                front.description = Some(scalar(&mut lines));
+                continue;
             }
-            _ => {}
+            "model" => {
+                front.model = Some(scalar(&mut lines));
+                continue;
+            }
+            "extends" => {
+                front.extends = Some(scalar(&mut lines));
+                continue;
+            }
+            "tools" => &mut tools,
+            "skills" => &mut skills,
+            _ => continue,
+        };
+        if value.is_empty() {
+            *list = Some(Vec::new());
+            in_list = Some(list);
+        } else {
+            let items = value.trim_start_matches('[').trim_end_matches(']');
+            *list = Some(
+                items
+                    .split(',')
+                    .map(unquote)
+                    .filter(|t| !t.is_empty())
+                    .collect(),
+            );
         }
     }
+    front.tools = tools;
+    front.skills = skills;
     (front, body)
 }
 
@@ -366,7 +417,9 @@ pub type Skill = Entry;
 /// Roles a client starts its own bots in: Sonny's lead, and the task
 /// text Sonny tells every other agent it starts. A `.agents/agents` file
 /// of one of these names replaces the client's text for that role, so it
-/// is not a role to start a peer in, and the Profiles index leaves it out.
+/// is not a role to start a peer in, and the Profiles index leaves it out,
+/// as it leaves out a profile that `extends` one: a variant a lead or its
+/// tasks are set to run as.
 pub const CLIENT_ROLES: [&str; 2] = ["lead", "task"];
 
 /// Whether a profile file's stem is a client role. Case is ignored: on a
@@ -650,6 +703,11 @@ fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
 
 fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Failure> {
     let mut found = std::collections::BTreeMap::<String, Entry>::new();
+    // Profiles that build on a client role: that role's variants, set as
+    // a lead's or task's role, not roles to start a peer in.
+    let mut hidden = std::collections::BTreeSet::<String>::new();
+    // What each indexed profile extends, to hide variants of variants.
+    let mut bases = std::collections::BTreeMap::<String, String>::new();
     let mut used = 0usize;
     let mut visited = 0usize;
     for dir in dirs {
@@ -684,7 +742,7 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             let Some(name) = kind.name(&path) else {
                 continue;
             };
-            if found.contains_key(&name) {
+            if found.contains_key(&name) || hidden.contains(&name) {
                 continue;
             }
             let Some(file) = kind.file(&path)? else {
@@ -719,6 +777,13 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                 }
             };
             let (front, body) = front_matter(&text);
+            if matches!(kind, Kind::Profiles) && front.extends.as_deref().is_some_and(client_role) {
+                hidden.insert(entry.name);
+                continue;
+            }
+            if let Some(base) = front.extends.filter(|b| *b != entry.name) {
+                bases.insert(entry.name.clone(), base);
+            }
             let summary = front.description.filter(|d| !d.is_empty()).or_else(|| {
                 body.lines()
                     .map(|l| l.trim().trim_start_matches('#').trim())
@@ -735,11 +800,27 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
             found.insert(entry.name.clone(), entry);
         }
     }
+    // A profile that extends a hidden one is a client role's variant too.
+    loop {
+        let more: Vec<String> = (bases.iter())
+            .filter(|(name, base)| found.contains_key(*name) && hidden.contains(*base))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for name in more {
+            found.remove(&name);
+            hidden.insert(name);
+        }
+    }
     Ok(found.into_values().collect())
 }
 
 /// A role a bot is started in: the body of `.agents/agents/<name>.md`, and
-/// the model and tools its front matter names, if any.
+/// the model and tools its front matter names, if any. A profile that
+/// `extends` another has that one's body first and its model and tools
+/// where it names none; the skills either names follow, each whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
@@ -750,6 +831,7 @@ pub struct Profile {
     pub body: String,
 }
 impl Profile {
+    /// One file's role as it reads, its `extends` and `skills` not followed.
     pub fn parse(name: &str, path: Option<PathBuf>, text: &str) -> Profile {
         let (front, body) = front_matter(text);
         Profile {
@@ -764,7 +846,7 @@ impl Profile {
 
 /// A profile name is one file name, nothing that could reach another folder,
 /// and a word a shell passes unquoted.
-fn profile_name(name: &str) -> bool {
+pub fn profile_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && name
@@ -772,39 +854,183 @@ fn profile_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// The most profiles one role is made of, itself included.
+const MAX_EXTENDS: usize = 8;
+
 /// The profile named `name` for a bot in `workspace`: the workspace's own
 /// file, else the user's; `None` when neither exists.
 pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure> {
-    if !profile_name(name) {
-        return Err(Failure::Unreadable {
-            path: PathBuf::from(name),
-            reason: "a profile name is letters, digits, '-', '_' and '.'".into(),
-        });
+    profile_with(workspace, name, &[])
+}
+
+/// [`profile`], with the roles a client ships (`(name, text)`) after the
+/// person's: one of these names is never `None`.
+///
+/// A profile builds on another with `extends: NAME` in its front matter.
+/// Extending its own name builds on the file of that name it shadows: a
+/// folder's `lead.md` on the person's, the person's on the client's.
+/// `skills: [a, b]` adds each skill's whole text after the body.
+pub fn profile_with(
+    workspace: &Path,
+    name: &str,
+    builtins: &[(&str, &str)],
+) -> Result<Option<Profile>, Failure> {
+    let mut layers: Vec<Option<PathBuf>> = search(workspace, Kind::Profiles)
+        .into_iter()
+        .map(Some)
+        .collect();
+    // The client's own roles: the layer below the person's.
+    layers.push(None);
+    let mut chain: Vec<(Profile, Front)> = Vec::new();
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    // What the role's files hold so far: none is read past what could
+    // still fit in a bot's instructions.
+    let mut used = 0usize;
+    let (mut want, mut from) = (name.to_owned(), 0);
+    loop {
+        if !profile_name(&want) {
+            return Err(Failure::Invalid {
+                path: chain
+                    .last()
+                    .and_then(|(p, _)| p.path.clone())
+                    .unwrap_or_else(|| want.clone().into()),
+                reason: format!(
+                    "{want:?} is not a profile name: letters, digits, '-', '_' and '.'"
+                ),
+            });
+        }
+        let room = MAX_INSTRUCTIONS.saturating_sub(used);
+        let Some((layer, profile, front)) = find(&layers, &want, from, builtins, room)? else {
+            if chain.is_empty() {
+                return Ok(None);
+            }
+            return Err(Failure::Missing {
+                name: want,
+                kind: "profile",
+            });
+        };
+        if seen.contains(&(want.clone(), layer)) || chain.len() == MAX_EXTENDS {
+            let mut names: Vec<_> = chain.iter().map(|(p, _)| p.name.as_str()).collect();
+            names.push(&want);
+            return Err(Failure::Invalid {
+                path: profile.path.clone().unwrap_or_else(|| want.clone().into()),
+                reason: format!(
+                    "extends goes round or deeper than {MAX_EXTENDS}: {}",
+                    names.join(" -> ")
+                ),
+            });
+        }
+        seen.push((want.clone(), layer));
+        used += profile.body.len();
+        let base = front.extends.clone().filter(|b| !b.is_empty());
+        chain.push((profile, front));
+        match base {
+            None => break,
+            // Its own name: the file it shadows.
+            Some(base) if base == want => from = layer + 1,
+            Some(base) => (want, from) = (base, 0),
+        }
     }
-    for dir in search(workspace, Kind::Profiles) {
+    // The base first: each profile adds to what it extends.
+    let mut role = chain[0].0.clone();
+    role.name = name.to_owned();
+    role.model = None;
+    role.tools = None;
+    let mut bodies = Vec::new();
+    let mut skills: Vec<String> = Vec::new();
+    for (profile, front) in chain.iter().rev() {
+        if !profile.body.is_empty() {
+            bodies.push(profile.body.clone());
+        }
+        role.model = profile.model.clone().or(role.model);
+        role.tools = profile.tools.clone().or(role.tools);
+        for skill in front.skills.iter().flatten() {
+            if !skills.contains(skill) {
+                skills.push(skill.clone());
+            }
+        }
+    }
+    for skill in &skills {
+        let text = skill_text(workspace, skill, MAX_INSTRUCTIONS.saturating_sub(used))?;
+        used += text.len();
+        bodies.push(format!("## Skill: {skill}\n\n{text}"));
+    }
+    role.body = bodies.join("\n\n");
+    Ok(Some(role))
+}
+
+/// The first profile named `name` at `from` or a later layer, with the layer
+/// it is in and its front matter.
+fn find(
+    layers: &[Option<PathBuf>],
+    name: &str,
+    from: usize,
+    builtins: &[(&str, &str)],
+    room: usize,
+) -> Result<Option<(usize, Profile, Front)>, Failure> {
+    for (at, layer) in layers.iter().enumerate().skip(from) {
+        let Some(dir) = layer else {
+            let Some((_, text)) = builtins.iter().find(|(n, _)| *n == name) else {
+                continue;
+            };
+            return Ok(Some((
+                at,
+                Profile::parse(name, None, text),
+                front_matter(text).0,
+            )));
+        };
         let path = dir.join(format!("{name}.md"));
         if !is_file(&path)? {
             continue;
         }
-        let Some(text) = read_bounded(&path, MAX_INSTRUCTIONS)? else {
-            return Err(Failure::TooLong {
-                total: std::fs::metadata(&path).map_or(MAX_INSTRUCTIONS + 1, |m| m.len() as usize),
-                path,
-            });
-        };
-        // An unclosed head would read the whole role as front matter and
-        // start the bot without it.
-        if (text.starts_with("---\n") || text.starts_with("---\r\n"))
-            && !text[3..].contains("\n---")
-        {
-            return Err(Failure::Unreadable {
-                path,
-                reason: "front matter opened with --- is not closed".into(),
-            });
-        }
-        return Ok(Some(Profile::parse(name, Some(path), &text)));
+        let text = role_file(&path, room)?;
+        let front = front_matter(&text).0;
+        return Ok(Some((at, Profile::parse(name, Some(path), &text), front)));
     }
     Ok(None)
+}
+
+/// A profile's or skill's whole file, if it fits in `room`. An unclosed
+/// head would read the whole file as front matter and start the bot
+/// without its text.
+fn role_file(path: &Path, room: usize) -> Result<String, Failure> {
+    let Some(text) = read_bounded(path, room)? else {
+        return Err(Failure::TooLong {
+            total: MAX_INSTRUCTIONS - room
+                + std::fs::metadata(path).map_or(room + 1, |m| m.len() as usize),
+            path: path.to_path_buf(),
+        });
+    };
+    if (text.starts_with("---\n") || text.starts_with("---\r\n")) && !text[3..].contains("\n---") {
+        return Err(Failure::Unreadable {
+            path: path.to_path_buf(),
+            reason: "front matter opened with --- is not closed".into(),
+        });
+    }
+    Ok(text)
+}
+
+/// The body of the skill `name` a profile carries, if it fits in `room`:
+/// the workspace's, else the user's.
+fn skill_text(workspace: &Path, name: &str, room: usize) -> Result<String, Failure> {
+    if !profile_name(name) {
+        return Err(Failure::Invalid {
+            path: name.into(),
+            reason: format!("{name:?} is not a skill name"),
+        });
+    }
+    for dir in search(workspace, Kind::Skills) {
+        let path = dir.join(name).join("SKILL.md");
+        if !is_file(&path)? {
+            continue;
+        }
+        let text = role_file(&path, room)?;
+        return Ok(front_matter(&text).1.trim().to_owned());
+    }
+    Err(Failure::Missing {
+        name: name.to_owned(),
+        kind: "skill",
+    })
 }
 
 /// Append `path` to `text` under `header`, unless it is empty. Reads no
@@ -1478,11 +1704,130 @@ mod tests {
         );
         assert_eq!(profile(&root, "missing").unwrap(), None);
         for bad in ["", "../x", ".hidden", "a/b"] {
-            assert_eq!(
-                profile(&root, bad).unwrap_err().code(),
-                "instructions_unreadable"
-            );
+            assert_eq!(profile(&root, bad).unwrap_err().code(), "profile_invalid");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_profile_builds_on_another_and_carries_skills() {
+        let root = temp("extends");
+        let agents = root.join(".agents/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills/triage")).unwrap();
+        std::fs::write(
+            root.join(".agents/skills/triage/SKILL.md"),
+            "---\nname: triage\ndescription: Sort asks\n---\nSort every ask by owner.\n",
+        )
+        .unwrap();
+        let builtins = [("lead", "---\nmodel: a/lead\n---\nBe the lead.")];
+        // A lead variant on the client's lead: the lead's text first, its
+        // model where the variant names none, then the skill whole.
+        std::fs::write(
+            agents.join("my-lead.md"),
+            "---\nextends: lead\ndescription: A careful lead\nskills: [triage]\n---\nReview each change before it lands.\n",
+        )
+        .unwrap();
+        let role = profile_with(&root, "my-lead", &builtins).unwrap().unwrap();
+        assert_eq!(role.name, "my-lead");
+        assert_eq!(role.path, Some(agents.join("my-lead.md")));
+        assert_eq!(role.model.as_deref(), Some("a/lead"));
+        assert_eq!(
+            role.body,
+            "Be the lead.\n\nReview each change before it lands.\n\n## Skill: triage\n\nSort every ask by owner."
+        );
+        // Without the client's lead to build on, the base is missing.
+        assert_eq!(
+            profile(&root, "my-lead").unwrap_err().code(),
+            "profile_not_found"
+        );
+        // A folder's lead.md on the lead it shadows, here the client's.
+        std::fs::write(
+            agents.join("lead.md"),
+            "---\nextends: lead\nmodel: b/mine\n---\nAlso: be brief.",
+        )
+        .unwrap();
+        let lead = profile_with(&root, "lead", &builtins).unwrap().unwrap();
+        assert_eq!(lead.body, "Be the lead.\n\nAlso: be brief.");
+        assert_eq!(lead.model.as_deref(), Some("b/mine"));
+        // The variant now builds on that one, which builds on the client's.
+        let role = profile_with(&root, "my-lead", &builtins).unwrap().unwrap();
+        assert!(
+            role.body.starts_with(
+                "Be the lead.\n\nAlso: be brief.\n\nReview each change before it lands."
+            )
+        );
+        assert_eq!(role.model.as_deref(), Some("b/mine"));
+        // Neither variant is offered as a role to start a peer in.
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nextends: careful\nskills:\n  - triage\n  - triage\n---\nReview.",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("careful.md"),
+            "---\ntools: [read]\n---\nBe careful.",
+        )
+        .unwrap();
+        let names: Vec<_> = instructions(&root, None, &[])
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["careful", "reviewer"]);
+        // So is a variant of a variant.
+        std::fs::write(
+            agents.join("strict-lead.md"),
+            "---\nextends: my-lead\n---\nStricter still.",
+        )
+        .unwrap();
+        let names: Vec<_> = instructions(&root, None, &[])
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["careful", "reviewer"]);
+        // Any profile builds on another; a skill named twice comes once.
+        let reviewer = profile(&root, "reviewer").unwrap().unwrap();
+        assert_eq!(reviewer.tools, Some(vec!["read".to_owned()]));
+        assert_eq!(
+            reviewer.body,
+            "Be careful.\n\nReview.\n\n## Skill: triage\n\nSort every ask by owner."
+        );
+        // A circle, a missing skill and a bad name are each reported.
+        std::fs::write(
+            agents.join("careful.md"),
+            "---\nextends: reviewer\n---\nBe careful.",
+        )
+        .unwrap();
+        let circle = profile(&root, "reviewer").unwrap_err();
+        assert_eq!(circle.code(), "profile_invalid");
+        assert!(
+            circle
+                .to_string()
+                .contains("reviewer -> careful -> reviewer"),
+            "{circle}"
+        );
+        std::fs::write(
+            agents.join("careful.md"),
+            "---\nskills: [nothing]\n---\nBe careful.",
+        )
+        .unwrap();
+        assert_eq!(
+            profile(&root, "careful").unwrap_err().code(),
+            "skill_not_found"
+        );
+        std::fs::write(
+            agents.join("careful.md"),
+            "---\nextends: ../lead\n---\nBe careful.",
+        )
+        .unwrap();
+        assert_eq!(
+            profile(&root, "careful").unwrap_err().code(),
+            "profile_invalid"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

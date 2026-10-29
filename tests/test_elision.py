@@ -227,7 +227,9 @@ class ElisionTests(ModelFixture):
         self.model.compaction_refusals = 1
         turn = client.request('submit', bot='Bob', request_id='1',
                               prompt='long:1x600,35x40,1x700,2x1')['result']['turn']
-        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        # The pause comes after some forty rounds, slower than the default
+        # wait when four modules share the runner.
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn, timeout=30)
         client.close(kill=True)
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
                         settings={'context_bytes': 65536}, tools='shell,read')

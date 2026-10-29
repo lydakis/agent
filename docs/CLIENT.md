@@ -42,6 +42,25 @@ Implemented 2026-09-19.
    roles (`lead` and `task`, the client roles in `policy.rs`) are left
    out of the index: a file of either name replaces Sonny's text for it,
    not a role to start a peer in, so no agent is offered a nested lead.
+   A profile that `extends` one of them is left out too: it is a variant
+   a lead or its tasks are set to run as.
+
+   Two more keys compose a profile from others. `extends: NAME` builds on
+   another profile: its body comes first, then this one's, and its
+   `model` and `tools` stand where this one names none; chains are
+   followed up to 8 deep, and a circle is `profile_invalid`. Extending
+   its own name builds on the file of that name it shadows, so a folder's
+   `lead.md` with `extends: lead` adds to the person's, and the person's
+   to the one Sonny ships, which keeps Sonny's updates coming.
+   `skills: [a, b]` is Claude Code's subagent key: each skill's whole
+   `SKILL.md` body follows the role under `## Skill: NAME`, rather than
+   only its index line. A name either key gives that is in neither
+   folder is `profile_not_found` or `skill_not_found`. No harness has a
+   key for one agent file building on another (Claude Code's and Codex's
+   subagent files each stand alone, checked 2026-10-28), so `extends`
+   takes the name tsconfig and ESLint use. Skills have no such key: the
+   agent opens a skill itself, so a skill that builds on another says so
+   in its text, which names the other's line in the index.
 5. **Memory.** The person's `~/.agents/memory/MEMORY.md` and, when the
    workspace is in a project, `~/.agents/memory/projects/NAME/MEMORY.md`,
    each as it is (an index carries its own `# Memory in DIR` heading); one
@@ -59,7 +78,9 @@ Implemented 2026-09-19.
    `task` one ([sonny/agents/task.md](../sonny/agents/task.md)), whose
    body follows the rest for every agent Sonny starts but a lead, and
    writes both to `~/.agents/agents` until the person edits them; a
-   folder's file of the same name comes first.
+   folder's file of the same name comes first. Either can be set to
+   another profile, as Claude Code's `agent` setting picks the profile its
+   main session runs as ([sonny/README.md](../sonny/README.md#roles-for-leads-and-tasks)).
 
 Everything a client reads lives under `.agents`, the folder Codex, OpenCode
 and Pi already read skills from (sources read 2026-09-27: Codex 9db8162,

@@ -53,6 +53,7 @@ mod shell;
 mod skills;
 mod sound;
 mod status;
+mod suggest;
 mod t3;
 mod table;
 mod task;
@@ -62,6 +63,7 @@ mod testing;
 mod transcript;
 mod tree;
 mod trigger;
+mod usage;
 mod user_shell;
 
 use agent_client::{Client, Events};
@@ -121,6 +123,8 @@ const OLDER_ITEMS: u64 = 50;
 /// width), so they stay whole at 100 and prose stays near the measure.
 const PROSE: usize = 100;
 /// How long a side chat's copy stays once idle.
+/// What follows a guess at the next message in the composer.
+const TAB: &str = "  tab";
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -548,7 +552,8 @@ impl From<String> for NotStarted {
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
 /// wait for it to be ready. With `login`, it gets the login shell's
-/// environment, for a start from launchd, which gives no provider keys.
+/// environment, for a start from a trigger's fire, which launchd or systemd
+/// gives no provider keys.
 fn start_daemon(
     store: &std::path::Path,
     socket: &std::path::Path,
@@ -557,9 +562,26 @@ fn start_daemon(
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
-    let mut command = std::process::Command::new(&bin);
+    // A trigger's fire runs as a systemd service, which takes every process
+    // left in it when it ends: the daemon is started in a scope of its own,
+    // as a desktop starts an app, so it outlives the fire.
+    let scoped = login && cfg!(target_os = "linux") && std::env::var_os("INVOCATION_ID").is_some();
+    let mut command = match scoped {
+        true => {
+            let mut command = std::process::Command::new("systemd-run");
+            command
+                .args(["--user", "--scope", "--quiet", "--collect", "--"])
+                .arg(&bin);
+            command
+        }
+        false => std::process::Command::new(&bin),
+    };
     if let Some(environment) = login.then(login::environment).flatten() {
         command.env_clear().envs(environment);
+    }
+    // systemd-run finds the user manager by its runtime folder.
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|_| scoped) {
+        command.env("XDG_RUNTIME_DIR", runtime);
     }
     apply_env_file(&mut command)?;
     let out = command
@@ -689,7 +711,7 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
         }
-        // launchd runs this for a trigger's fire.
+        // launchd or systemd runs this for a trigger's fire.
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
@@ -729,6 +751,7 @@ async fn run() -> Result<(), String> {
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
     let (client, mut events) = connect(&options).await?;
+    trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
@@ -891,6 +914,11 @@ async fn run() -> Result<(), String> {
     {
         app.gating = Some(mode);
     }
+    // A bot made before Sonny gave its model a prompt-cache lifetime takes
+    // it, so an idle gap of over five minutes no longer rereads it all.
+    if options.side.is_none() {
+        app.cache = cache_to_take(&bot);
+    }
     app.project = project;
     // Sonny's welcome heads a lead's conversation, though not a side chat.
     app.welcome = options.side.is_none();
@@ -933,7 +961,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let instructions = project::as_task(&workspace, &composed.text)?;
+    let info = agent_client::project::read(&workspace)?;
+    let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let declare = json!(declared::tools(false));
     let config = agent_client::config::load()?;
     let tools = agent_client::default_tools(client.providers(), &model, config.web_search);
@@ -960,6 +989,17 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The prompt-cache lifetime Sonny gives the model of `bot`, as `inspect`
+/// gives it, when the bot has another.
+fn cache_to_take(bot: &Value) -> Option<&'static str> {
+    let model = format!(
+        "{}/{}",
+        bot["provider"].as_str().unwrap_or_default(),
+        bot["model"].as_str().unwrap_or_default()
+    );
+    agent_client::policy::cache_ttl(&model).filter(|ttl| bot["settings"]["cache_ttl"] != *ttl)
 }
 
 /// A link, file or page, opened as the system opens it.
@@ -1276,7 +1316,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
 /// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 16] = [
+const COMMANDS: [(&str, &str); 17] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1297,6 +1337,7 @@ const COMMANDS: [(&str, &str); 16] = [
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
     ),
+    ("/usage", "the tokens the agents spent, over time"),
     ("/mcp", "the MCP servers agents' scripts call"),
     ("/sound", "the chime when work ends, on or off"),
     (
@@ -1370,6 +1411,8 @@ struct Watch {
     resolved: bool,
     /// `/background` holds the screen instead of the card.
     background: Option<background::View>,
+    /// `/usage` holds it instead.
+    usage: Option<usage::View>,
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
@@ -1546,6 +1589,9 @@ struct App {
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
+    /// The prompt-cache lifetime a bot made before Sonny gave its model
+    /// one takes, set once no turn runs.
+    cache: Option<&'static str>,
     /// The bot's tools, which an approval mode gates.
     tools: Vec<String>,
     /// The tools its client declared, of which a mode gates Sonny's that
@@ -1593,6 +1639,13 @@ struct App {
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
+    /// The turn the person's words last went to from this window: only
+    /// its end is followed by a guess at their next message.
+    yours: Option<i64>,
+    /// That guess, being made.
+    suggesting: Option<tokio::task::JoinHandle<Option<String>>>,
+    /// The guess, shown in the empty composer for Tab to take.
+    suggestion: Option<String>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -2122,6 +2175,9 @@ impl App {
             pick: 0,
             watch: None,
             behind: (0, None),
+            yours: None,
+            suggesting: None,
+            suggestion: None,
             asks_seen: HashMap::new(),
             redraw: false,
             sounds: sound::Sounds::new(false),
@@ -2166,6 +2222,7 @@ impl App {
             picker: None,
             listing: None,
             switch: None,
+            cache: None,
             tools: record["tools"]
                 .as_array()
                 .into_iter()
@@ -2339,11 +2396,10 @@ impl App {
                     }
                 }
             }
-            if self
-                .watch
-                .as_ref()
-                .is_some_and(|w| w.read.elapsed() > Duration::from_secs(2))
-            {
+            if self.watch.as_ref().is_some_and(|w| {
+                w.read.elapsed() > Duration::from_secs(2)
+                    || w.usage.as_ref().is_some_and(usage::View::due)
+            }) {
                 self.reread().await;
             }
             if self.retry.is_some_and(|at| at <= Instant::now()) {
@@ -2360,6 +2416,7 @@ impl App {
                 }
             }
             self.side_closed();
+            self.suggested_now().await;
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
@@ -2446,6 +2503,7 @@ impl App {
             && self.switch.is_none()
             && self.gating.is_none()
             && self.declare.is_none()
+            && self.cache.is_none()
         {
             return true;
         }
@@ -2453,6 +2511,7 @@ impl App {
             return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
+        let cache = self.cache.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
@@ -2476,6 +2535,9 @@ impl App {
         if let Some((model, effort)) = &switch {
             asked["model"] = json!(model);
             asked["effort"] = json!(effort);
+        }
+        if let Some(ttl) = cache {
+            asked["cache_ttl"] = json!(ttl);
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
@@ -2529,6 +2591,7 @@ impl App {
                 self.switch = switch;
                 self.gating = gating;
                 self.declare = declare;
+                self.cache = cache;
                 return false;
             }
             Err(error) => {
@@ -3888,6 +3951,9 @@ impl App {
                 self.draw_bot_reactions();
                 self.approvals.clear();
                 self.notice = None;
+                if status == "completed" && !quiet && turn.is_some() && turn == self.yours {
+                    self.suggest();
+                }
                 status_report(
                     match status {
                         _ if quiet => "idle",
@@ -3998,12 +4064,13 @@ impl App {
                 lookout: self.lookout_line(),
                 resolved: false,
                 background: None,
+                usage: None,
                 picked: None,
             });
             self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
             return;
         }
-        self.watch(project, rows, None);
+        self.watch(project, rows, None, None);
     }
 
     /// What runs for the project's agents with no one typing. Open
@@ -4027,12 +4094,49 @@ impl App {
                 lookout: String::new(),
                 resolved: false,
                 background: Some(view),
+                usage: None,
                 picked: None,
             });
             self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
             return;
         }
-        self.watch(project, Vec::new(), Some(view));
+        self.watch(project, Vec::new(), Some(view), None);
+    }
+
+    /// The tokens the project's agents spent, or every agent's, over
+    /// time. Open `/usage`: its own screen, as `/status` has, until Esc.
+    async fn usage(&mut self) {
+        let scope = self.scope();
+        let project = scope.project.clone();
+        let mut view = usage::View::new(scope);
+        self.read_usage(&mut view).await;
+        if full() {
+            self.watch = Some(Watch {
+                screen: None,
+                project,
+                rows: Vec::new(),
+                read: Instant::now(),
+                lookout: String::new(),
+                resolved: false,
+                background: None,
+                usage: Some(view),
+                picked: None,
+            });
+            self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
+            return;
+        }
+        self.watch(project, Vec::new(), None, Some(view));
+    }
+
+    /// `view` read from the daemon again.
+    async fn read_usage(&self, view: &mut usage::View) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let (query, window) = view.query(now);
+        let read = self.client.request("usage", query).await;
+        view.loaded(window, read.map_err(|error| error.to_string()));
     }
 
     /// Give `/status`, or `/background`, the screen.
@@ -4041,6 +4145,7 @@ impl App {
         project: String,
         rows: Vec<status::Row>,
         background: Option<background::View>,
+        usage: Option<usage::View>,
     ) {
         // The full screen is the alternate screen already.
         if !full() {
@@ -4060,6 +4165,7 @@ impl App {
                     lookout: self.lookout_line(),
                     resolved: false,
                     background,
+                    usage,
                     picked: None,
                 })
             }
@@ -4078,6 +4184,16 @@ impl App {
         {
             view.reload();
             watch.read = Instant::now();
+            return;
+        }
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.usage.take()) {
+            if view.due() {
+                self.read_usage(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.usage = Some(view);
+                watch.read = Instant::now();
+            }
             return;
         }
         let lookout = self.lookout_line();
@@ -4720,6 +4836,32 @@ impl App {
                 }
                 return true;
             }
+            // `/usage` takes its own keys: the period, whose, cached reads.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.usage.as_mut())
+            {
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Up => pane.screen.scroll(1),
+                    KeyCode::Down => pane.screen.scroll(-1),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => {
+                        if view.key(*key) == usage::Key::Close {
+                            self.pane = None;
+                            self.pane_keys = false;
+                        }
+                    }
+                }
+                return true;
+            }
             if self.pane_keys {
                 match key.code {
                     KeyCode::Esc => {
@@ -5008,6 +5150,20 @@ impl App {
             key.code = code;
             key.modifiers -= KeyModifiers::CONTROL;
         }
+        // Tab takes the guess at the next message into the composer, as
+        // Claude Code and Codex take theirs; it is not sent. Tab does what
+        // it does otherwise when none shows.
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Tab
+            && !self.pane_keys
+            && let Some(guess) = self.suggested()
+        {
+            let guess = guess.to_owned();
+            self.input.set(&guess);
+            self.suggestion = None;
+            return;
+        }
         if full() && !self.watching() && self.full_screen(&event) {
             return;
         }
@@ -5018,6 +5174,19 @@ impl App {
                 if let Event::Key(key) = event
                     && key.kind != KeyEventKind::Release
                     && view.key(key) == background::Key::Close
+                {
+                    self.watch = None;
+                    if !full() {
+                        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                    }
+                    self.redraw = true;
+                }
+                return;
+            }
+            if let Some(view) = &mut watch.usage {
+                if let Event::Key(key) = event
+                    && key.kind != KeyEventKind::Release
+                    && view.key(key) == usage::Key::Close
                 {
                     self.watch = None;
                     if !full() {
@@ -5381,6 +5550,15 @@ impl App {
             }
             return;
         }
+        if prompt == "/usage" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/usage is for the agent itself, not a side chat".into());
+            } else {
+                self.usage().await;
+            }
+            return;
+        }
         if matches!(prompt.as_str(), "/background" | "/triggers" | "/lookout") {
             self.input.clear();
             if self.options.side.is_some() {
@@ -5666,6 +5844,16 @@ impl App {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(turn) = reply["turn"].as_i64() {
+            // A steer is a submission of its own that ends as steered; the
+            // person's is the turn it joins: the running one, or the one the
+            // message before it started.
+            if origin.is_none() {
+                self.yours = match delivery {
+                    None => Some(turn),
+                    Some(_) => (self.running.as_ref().map(|r| r.turn))
+                        .or_else(|| self.staged.last().map(|(started, _)| *started)),
+                };
+            }
             self.staged.push((turn, prompt));
         }
         if workspace.is_some() {
@@ -5872,6 +6060,58 @@ impl App {
             Span::raw("    "),
         );
         self.commit(transcript::quiet(rows));
+    }
+
+    /// A guess at the person's next message, after a turn of theirs ended
+    /// well, made by a copy of this bot on this window's model; unless the
+    /// config's `[sonny] suggest` is off, or the bot asked a question,
+    /// which its own card answers.
+    fn suggest(&mut self) {
+        self.suggestion = None;
+        if !self.asks.is_empty() || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest) {
+            return;
+        }
+        self.suggesting = Some(tokio::spawn(suggest::guess(
+            self.client.clone(),
+            self.bot.clone(),
+            self.turn_model.clone(),
+        )));
+    }
+
+    /// The guess, once made. A turn started since lets it go; a copy
+    /// still guessing finishes and is deleted on its own.
+    async fn suggested_now(&mut self) {
+        if self.running.is_some() || !self.staged.is_empty() {
+            self.suggesting = None;
+            self.suggestion = None;
+            return;
+        }
+        if self
+            .suggesting
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            let job = self.suggesting.take().unwrap();
+            self.suggestion = job.await.ok().flatten();
+        }
+    }
+
+    /// The guess, while the composer shows it: empty, with nothing running
+    /// and nothing open over it.
+    fn suggested(&self) -> Option<&str> {
+        let open = self.picker.is_some()
+            || self.choosing.is_some()
+            || self.approving.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
+            || self.react_to.is_some();
+        let shows = self.input.is_empty()
+            && self.running.is_none()
+            && self.asks.is_empty()
+            && self.approvals.is_empty()
+            && !open
+            && !self.watching();
+        self.suggestion.as_deref().filter(|_| shows)
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -6199,6 +6439,18 @@ impl App {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
+            } else if let Some(view) = &watch.usage {
+                let lines = view
+                    .card(width)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, STATUS_KEYS);
+                pane.foot = Some(view.footer());
             } else {
                 let (lines, any_resolved) = watch_card(watch, width);
                 let keys = match any_resolved && watch.resolved {
@@ -6554,6 +6806,20 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         // What is sent answers the lead's first open question.
         let answering = (!self.chatting).then(|| self.asks.first()).flatten();
+        // The guess at the next message, for Tab to take.
+        if let Some(guess) = self.suggested() {
+            let room = width.saturating_sub(prompt::LEAD + TAB.width());
+            return (
+                vec![Line::from(vec![
+                    Span::raw("› ").bold(),
+                    // Italic too: a side chat's screen, read through vt100,
+                    // loses the dim.
+                    Span::raw(transcript::cut(guess, room)).dim().italic(),
+                    Span::raw(TAB).dim(),
+                ])],
+                (0, prompt::LEAD),
+            );
+        }
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
@@ -6739,6 +7005,9 @@ fn draw_watch(watch: &mut Watch) -> std::io::Result<()> {
     if watch.background.is_some() {
         return draw_background(watch);
     }
+    if watch.usage.is_some() {
+        return draw_usage(watch);
+    }
     let Some(screen) = &mut watch.screen else {
         return Ok(());
     };
@@ -6822,6 +7091,40 @@ fn draw_background(watch: &mut Watch) -> std::io::Result<()> {
         let skip = (at + 3).saturating_sub(height);
         let mut lines = vec![Line::default()];
         lines.extend(card.into_iter().skip(skip).map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        }));
+        let body = ratatui::layout::Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let foot = ratatui::layout::Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(lines), body);
+        frame.render_widget(Paragraph::new(view.footer()), foot);
+    })?;
+    Ok(())
+}
+
+/// `/usage` on its own screen: its card and the keys it takes.
+fn draw_usage(watch: &mut Watch) -> std::io::Result<()> {
+    let (Some(view), Some(screen)) = (&mut watch.usage, &mut watch.screen) else {
+        return Ok(());
+    };
+    screen.autoresize()?;
+    screen.draw(|frame| {
+        let area = frame.area();
+        let width = area.width.saturating_sub(2) as usize;
+        let card = view.card(width);
+        // Scrolled no further than shows its last row above the footer.
+        let room = area.height.saturating_sub(2) as usize;
+        view.scroll = view.scroll.min(card.len().saturating_sub(room));
+        let mut lines = vec![Line::default()];
+        lines.extend(card.into_iter().skip(view.scroll).map(|line| {
             let mut spans = vec![Span::raw(" ")];
             spans.extend(line.spans);
             Line::from(spans).style(line.style)
@@ -7149,6 +7452,124 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn after_a_turn_of_the_persons_a_copy_guesses_their_next_message_for_tab() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |asked| {
+            seen.lock().unwrap().push(asked.clone());
+            match (asked["op"].as_str(), asked["bot"].as_str()) {
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("submit"), Some("b")) => json!({"turn": 1}),
+                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
+                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                    {"status": "completed", "text": "Suggestion: run the tests"}}}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("fix the bug and run tests");
+        app.submit().await;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        for _ in 0..200 {
+            app.suggested_now().await;
+            if app.suggestion.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(app.suggested(), Some("run the tests"));
+        let (rows, _) = app.composer(80);
+        let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row, "› run the tests  tab");
+        // The copy forked from the bot, allowed no call, and was deleted.
+        let ops = asked.lock().unwrap().clone();
+        let fork = ops.iter().find(|op| op["op"] == "fork").unwrap();
+        assert_eq!(fork["source"], "b");
+        assert_eq!(fork["allow"], json!([]));
+        assert!(fork["expire_ms"].is_u64());
+        let copy = fork["bot"].as_str().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| op["op"] == "delete" && op["bot"] == copy)
+        );
+        // Something typed hides it; emptied again, it is back.
+        app.input.set("x");
+        assert_eq!(app.suggested(), None);
+        app.input.clear();
+        // Tab takes it into the composer, unsent.
+        app.key(Event::Key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert_eq!(&*app.input, "run the tests");
+        assert_eq!(app.suggestion, None);
+        assert_eq!(
+            ops.iter().filter(|op| op["op"] == "submit").count(),
+            2,
+            "the person's and the copy's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_person_steered_from_here_is_theirs() {
+        let next = std::sync::atomic::AtomicI64::new(2);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        // The lead's turn 1 runs; the person steers it, a submission of its own.
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.input.set("and the reversed range too");
+        app.submit().await;
+        assert_eq!(app.yours, Some(1));
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
+            .await;
+        assert!(app.suggesting.is_none());
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(app.suggesting.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_person_did_not_start_here_is_not_followed_by_a_guess() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        // Started by the lead, the lookout, or another window.
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(app.suggesting.is_none());
+        // Nor one of the person's that failed or was stopped.
+        for status in ["failed", "interrupted"] {
+            app.yours = Some(4);
+            app.daemon(turn_event("accepted", 4, json!({}))).await;
+            app.daemon(turn_event("turn_finished", 4, json!({"status": status})))
+                .await;
+            assert!(app.suggesting.is_none(), "{status}");
+        }
     }
 
     #[tokio::test]
@@ -8082,6 +8503,31 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_claude_bot_made_on_the_five_minute_cache_takes_the_hour() {
+        let bot = |provider: &str, ttl: &str| json!({"provider": provider, "model": "m", "settings": {"cache_ttl": ttl}});
+        assert_eq!(cache_to_take(&bot("anthropic", "5m")), Some("1h"));
+        assert_eq!(cache_to_take(&bot("bedrock", "5m")), Some("1h"));
+        assert_eq!(cache_to_take(&bot("anthropic", "1h")), None);
+        assert_eq!(cache_to_take(&bot("openai", "5m")), None);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["cache_ttl"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.cache = Some("1h");
+        assert!(app.configure().await);
+        let sent = asked.lock().unwrap()[0].clone();
+        assert_eq!(
+            (&sent["op"], &sent["cache_ttl"]),
+            (&json!("configure"), &json!("1h"))
+        );
+        assert!(app.cache.is_none());
     }
 
     #[tokio::test]

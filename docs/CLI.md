@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`inspect`, `turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
+`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -155,6 +155,12 @@ identity is `bot_not_found`.
   `ls --active` those with a turn running; the daemon filters, so neither
   pages through every bot. `turns --newest` lists newest first, read from the
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
+- `usage` prints what the bots' turns spent as one JSON object: tokens in
+  all, by bot (the `--limit` that spent most, 64 by default, the rest summed),
+  and by model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
+  counts only turns started that long ago or since, and `--bucket 6h` adds a
+  `series` of what was spent every six hours from then. Durations take `ms`,
+  `s`, `m`, `h` or `d`.
 - `--keep-turns N` means the same on `prune` and `run`: keep the newest N
   turns' records. `prune` applies it once; on `run --new` it is the bot's
   setting, applied after each of its turns.
