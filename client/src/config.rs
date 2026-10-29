@@ -6,7 +6,7 @@
 //! ```toml
 //! model = "anthropic/claude-opus-5-5"  # a new agent's, with none named
 //! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER
-//! web_search = "disabled"       # "live", the default, lets new agents search
+//! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
@@ -33,8 +33,8 @@ pub struct Config {
     /// The daemon's `--provider` specs, as AGENT_PROVIDER takes them.
     pub provider: Option<String>,
     /// Whether a new agent gets web search where its provider offers it,
-    /// as Codex's `web_search` key says: `"live"`, the default, or
-    /// `"disabled"`.
+    /// and `web_fetch`, as Codex's `web_search` key says: `"live"`, the
+    /// default, or `"disabled"`.
     pub web_search: WebSearch,
     pub judge: Judge,
     pub sonny: Sonny,

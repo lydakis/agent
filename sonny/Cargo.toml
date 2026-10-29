@@ -28,10 +28,9 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-fan
 # terminal of its own, whose screen is read as a terminal would draw it.
 portable-pty = "0.9"
 vt100 = "0.15"
-# Task copies (`sonny copy`), built in so nothing needs installing; its
-# mounts are served by Sonny itself, run again as `sonny sandfs daemon`.
-sandfs = "0.9"
 resvg = "0.45"
+# Picture files in the pane and in Markdown, as the runtime reads them.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde_json = "1"
 # Checks an edited project file before it replaces the person's, as the
 # client reads it.

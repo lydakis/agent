@@ -1,7 +1,7 @@
 //! Where a project's work is laid out: a terminal multiplexer the person
-//! watches. Each project has a home there (a Rex session), with a window
-//! per task and a block labelled with each bot's name, so it can be found
-//! again by that name; a command a bot asked for is labelled `BOT/NAME` and
+//! watches (Rex, Herdr or cmux). Each project has a home there (a Rex
+//! session, a Herdr or cmux workspace), with a window per task and a block
+//! labelled with each bot's name, so it can be found again by that name; a command a bot asked for is labelled `BOT/NAME` and
 //! closes with its owner. `Layout` keeps what Sonny does there; a `Backend`
 //! says how, in its multiplexer's CLI.
 use std::{
@@ -86,6 +86,9 @@ pub enum Place {
     Herdr {
         workspace: String,
     },
+    Cmux {
+        workspace: String,
+    },
     Rex {
         session: String,
         host: Option<String>,
@@ -106,6 +109,9 @@ impl Place {
             Self::Herdr { workspace } => {
                 serde_json::json!({"multiplexer": "herdr", "workspace": workspace})
             }
+            Self::Cmux { workspace } => {
+                serde_json::json!({"multiplexer": "cmux", "workspace": workspace})
+            }
             Self::Rex { session, host } => {
                 serde_json::json!({"multiplexer": "rex", "session": session, "host": host})
             }
@@ -125,6 +131,9 @@ impl Place {
         let text = |key: &str| json[key].as_str().map(str::to_owned);
         match json["multiplexer"].as_str()? {
             "herdr" => Some(Self::Herdr {
+                workspace: text("workspace")?,
+            }),
+            "cmux" => Some(Self::Cmux {
                 workspace: text("workspace")?,
             }),
             "rex" => Some(Self::Rex {
@@ -333,13 +342,18 @@ impl Layout {
 enum Kind {
     Rex(PathBuf),
     Herdr(PathBuf),
+    Cmux(PathBuf),
 }
 
 /// The multiplexer this terminal is in: Herdr when Sonny runs in a Herdr
-/// pane, Rex when in a Rex block or `host` names a Rex server.
+/// pane (even one in a cmux tab, as the innermost), cmux when in a cmux
+/// tab, Rex when in a Rex block or `host` names a Rex server.
 fn current(host: Option<&str>) -> Option<Kind> {
     if host.is_none() && crate::herdr::pane().is_some() {
         return crate::herdr::find().map(Kind::Herdr);
+    }
+    if host.is_none() && crate::cmux::surface().is_some() {
+        return crate::cmux::find().map(Kind::Cmux);
     }
     let rex = std::env::var_os("REX_SESSION").is_some() || host.is_some();
     rex.then(crate::rex::find).flatten().map(Kind::Rex)
@@ -355,6 +369,10 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
             let pane = crate::herdr::pane();
             Box::new(crate::herdr::Herdr::open(bin, project, pane.as_deref(), None).ok()?)
         }
+        Kind::Cmux(bin) => {
+            let surface = crate::cmux::surface();
+            Box::new(crate::cmux::Cmux::open(bin, project, surface.as_deref(), None).ok()?)
+        }
     };
     if let Some(file) = Place::file(socket, project) {
         backend.place().keep(&file);
@@ -365,68 +383,78 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
 /// The project's home, for an agent's call, from the lookout answering it,
 /// whose multiplexer variables would name the terminal Sonny started it
 /// in: where the lead's Sonny last laid the project out, in that
-/// multiplexer; without one, in Herdr when the project's lead is in a
-/// Herdr pane, else in the multiplexer project `like`'s home is in, else
-/// in Rex (or Herdr, without Rex), made when needed.
+/// multiplexer; without one, in Herdr or cmux when the project's lead is in
+/// a Herdr pane or a cmux tab, else in the multiplexer project `like`'s
+/// home is in, else in Rex (or Herdr, or cmux, without Rex), made when
+/// needed.
 pub fn for_agent(socket: &Path, project: &str, like: Option<&str>) -> Result<Layout, String> {
     let herdr = crate::herdr::find();
+    let cmux = crate::cmux::find();
     let rex = crate::rex::find();
     let recall = |project| Place::file(socket, project).and_then(|file| Place::recall(&file));
     let kept = recall(project);
     let like = like.and_then(recall);
-    let backend: Box<dyn Backend> = match (kept, herdr, rex) {
-        (Some(Place::Herdr { workspace }), Some(herdr), _) => Box::new(crate::herdr::Herdr::open(
-            herdr,
-            project,
-            None,
-            Some(&workspace),
-        )?),
-        (Some(Place::Rex { session, host }), _, Some(rex)) => Box::new(crate::rex::Rex::open(
-            rex,
-            host.as_deref(),
-            project,
-            false,
-            Some(&session),
-        )?),
-        (_, Some(herdr), _)
-            if crate::herdr::has_lead(&herdr, project)
-                || matches!(like, Some(Place::Herdr { .. })) =>
-        {
-            Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
-        }
-        (_, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
-            crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
-        ),
-        (_, _, Some(rex)) => Box::new(crate::rex::Rex::open(rex, None, project, false, None)?),
-        (_, Some(herdr), None) => Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?),
-        (_, None, None) => return Err("neither rex nor herdr was found".into()),
-    };
+    let backend: Box<dyn Backend> =
+        match (kept, herdr, cmux, rex) {
+            (Some(Place::Herdr { workspace }), Some(herdr), _, _) => Box::new(
+                crate::herdr::Herdr::open(herdr, project, None, Some(&workspace))?,
+            ),
+            (Some(Place::Cmux { workspace }), _, Some(cmux), _) => Box::new(
+                crate::cmux::Cmux::open(cmux, project, None, Some(&workspace))?,
+            ),
+            (Some(Place::Rex { session, host }), _, _, Some(rex)) => Box::new(
+                crate::rex::Rex::open(rex, host.as_deref(), project, false, Some(&session))?,
+            ),
+            (_, Some(herdr), _, _)
+                if crate::herdr::has_lead(&herdr, project)
+                    || matches!(like, Some(Place::Herdr { .. })) =>
+            {
+                Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
+            }
+            (_, _, Some(cmux), _)
+                if crate::cmux::has_lead(&cmux, project)
+                    || matches!(like, Some(Place::Cmux { .. })) =>
+            {
+                Box::new(crate::cmux::Cmux::open(cmux, project, None, None)?)
+            }
+            (_, _, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
+                crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
+            ),
+            (_, _, _, Some(rex)) => {
+                Box::new(crate::rex::Rex::open(rex, None, project, false, None)?)
+            }
+            (_, Some(herdr), _, None) => {
+                Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
+            }
+            (_, None, Some(cmux), None) => {
+                Box::new(crate::cmux::Cmux::open(cmux, project, None, None)?)
+            }
+            (_, None, None, None) => return Err("none of rex, herdr or cmux was found".into()),
+        };
     Ok(Layout::new(backend))
 }
 
 /// The skills that let any agent run long work where the person can see
-/// it, for the multiplexer this terminal is in (the other's taken out, so
+/// it, for the multiplexer this terminal is in (the others' taken out, so
 /// agents read one), and show the person pictures. Each names this
 /// machine's multiplexer CLI.
 pub fn install_skill(host: Option<&str>) {
     crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
     let quoted = |path: &Path| format!("\"{}\"", path.to_string_lossy());
-    let rex = |bin: PathBuf| {
+    let skill =
+        |name, text: &str, bin: &str, path: PathBuf| (name, text.replace(bin, &quoted(&path)));
+    let rex = |bin| {
         let text = include_str!("../skills/rex-windows/SKILL.md");
-        (
-            "rex-windows",
-            "herdr-panes",
-            text.replace("REX_BIN", &quoted(&bin)),
-        )
+        skill("rex-windows", text, "REX_BIN", bin)
     };
-    let (name, other, text) = match current(host) {
+    let (name, text) = match current(host) {
         Some(Kind::Herdr(bin)) => {
             let text = include_str!("../skills/herdr-panes/SKILL.md");
-            (
-                "herdr-panes",
-                "rex-windows",
-                text.replace("HERDR_BIN", &quoted(&bin)),
-            )
+            skill("herdr-panes", text, "HERDR_BIN", bin)
+        }
+        Some(Kind::Cmux(bin)) => {
+            let text = include_str!("../skills/cmux-tabs/SKILL.md");
+            skill("cmux-tabs", text, "CMUX_BIN", bin)
         }
         Some(Kind::Rex(bin)) => rex(bin),
         // Out of sight, Rex is the default.
@@ -436,7 +464,11 @@ pub fn install_skill(host: Option<&str>) {
         },
     };
     crate::skills::install(name, &text);
-    crate::skills::remove(other);
+    for other in ["rex-windows", "herdr-panes", "cmux-tabs"] {
+        if other != name {
+            crate::skills::remove(other);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -544,6 +576,11 @@ mod tests {
         };
         herdr.keep(&file);
         assert_eq!(Place::recall(&file), Some(herdr));
+        let cmux = Place::Cmux {
+            workspace: "8F2C".into(),
+        };
+        cmux.keep(&file);
+        assert_eq!(Place::recall(&file), Some(cmux));
         let rex = Place::Rex {
             session: "s7".into(),
             host: Some("mini".into()),

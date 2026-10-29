@@ -197,7 +197,7 @@ pub(crate) fn context_prefix(
             };
             if history && omitted_turns > 0 {
                 text.push_str(&format!(
-                    " Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
+                    " Use the history tool with a turn number from 1 to {omitted_turns} to read any of them, or with query to search them for text."
                 ));
             }
             if !listed.is_empty() {

@@ -1,27 +1,58 @@
 //! Where the bot works, as the footer names it beside the folder: the git
-//! branch checked out there, and the folder a sandfs copy was made from.
-//! Read off the screen's thread, since both ask outside programs or files.
-use std::path::Path;
+//! branch checked out there. Read off the screen's thread, every few
+//! seconds, from the checkout's own `HEAD` file: no git to run each time.
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Place {
     /// The branch checked out, or the commit a detached checkout is on.
     pub branch: Option<String>,
-    /// What the folder is a sandfs copy of, when it is one, as sandfs
-    /// names its source: the folder it was made from, usually.
-    pub copy_of: Option<String>,
 }
 
 pub fn read(dir: &Path) -> Place {
+    let Some(git) = git_dir(dir) else {
+        return Place::default();
+    };
+    let head = std::fs::read_to_string(git.join("HEAD")).unwrap_or_default();
+    let head = head.trim();
+    let branch = match head.strip_prefix("ref: ") {
+        // A reftable store keeps a stand-in here, and git knows the rest.
+        Some("refs/heads/.invalid") => None,
+        Some(name) => name.strip_prefix("refs/heads/").map(str::to_owned),
+        None => is_commit(head).then(|| head[..7].to_owned()),
+    };
+    match branch {
+        Some(_) => Place { branch },
+        None => asked(dir),
+    }
+}
+
+/// The git folder of the checkout holding `dir`: the nearest `.git` above
+/// it, or the folder a `.git` file names, as a worktree's or submodule's does.
+fn git_dir(dir: &Path) -> Option<PathBuf> {
+    let found = dir
+        .ancestors()
+        .map(|at| at.join(".git"))
+        .find(|git| git.exists())?;
+    if found.is_dir() {
+        return Some(found);
+    }
+    let text = std::fs::read_to_string(&found).ok()?;
+    let named = Path::new(text.trim().strip_prefix("gitdir: ")?);
+    Some(found.parent()?.join(named))
+}
+
+fn is_commit(head: &str) -> bool {
+    matches!(head.len(), 40 | 64) && head.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The branch as git says it, for a `HEAD` this cannot read.
+fn asked(dir: &Path) -> Place {
     let branch = crate::task::git(dir, &["branch", "--show-current"])
         .ok()
         .filter(|branch| !branch.is_empty())
         .or_else(|| crate::task::git(dir, &["rev-parse", "--short", "HEAD"]).ok());
-    let copy_of = crate::task::mount_of(dir)
-        .ok()
-        .flatten()
-        .map(|workspace| workspace.source);
-    Place { branch, copy_of }
+    Place { branch }
 }
 
 #[cfg(test)]
@@ -57,9 +88,32 @@ mod tests {
             "-m",
             "a",
         ]);
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        assert_eq!(
+            read(&dir.join("src/deep")).branch.as_deref(),
+            Some("agent/fix-cart")
+        );
+        let tree = dir.with_extension("tree");
+        let _ = std::fs::remove_dir_all(&tree);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/other",
+            tree.to_str().unwrap(),
+        ]);
+        assert_eq!(read(&tree).branch.as_deref(), Some("agent/other"));
         git(&["checkout", "-q", "--detach"]);
-        let detached = read(&dir).branch.unwrap();
-        assert!(detached.len() >= 7 && detached.chars().all(|c| c.is_ascii_hexdigit()));
+        let short = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "--short=7", "HEAD"])
+            .output()
+            .unwrap();
+        let short = String::from_utf8(short.stdout).unwrap();
+        assert_eq!(read(&dir).branch.as_deref(), Some(short.trim()));
+        std::fs::remove_dir_all(&tree).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -79,7 +79,7 @@ client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
 `--tools` or `shell,read,write,wait,history` with `apply_patch` for a
 Responses model and `edit` otherwise, plus `web_search` where the provider
-offers it unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
+offers it and `web_fetch` for any, unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
 other tool is answered with a `tool_not_available` result, whatever the
 model was told. Tool definitions live once in the daemon and their request
@@ -111,7 +111,7 @@ for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
 daemon. Default tools are `shell,read,write,wait,history` and the file editor
 the model's family is trained on, `apply_patch` (Responses) or `edit`, and
-`web_search` where the provider offers it; `note`, the
+`web_search` where the provider offers it, and `web_fetch`; `note`, the
 carry-forward note, is in the universe and chosen per bot.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
@@ -1804,7 +1804,12 @@ window over the shared history.
 When turns are omitted, the request begins with one user item:
 `[context note] N earlier turn(s) with M messages are not shown.` When the
 bot has the `history` tool, the note adds `Use the history tool with a turn
-number from 1 to N to read any of them.` It then lists,
+number from 1 to N to read any of them, or with query to search them for
+text.` A search (`query`, optionally `before` a turn) walks the lineage newest
+first, leaves out the turn it runs in, and lists up to 20 matches with their
+turn, item type and the JSON text around each, ignoring ASCII case. It stops at
+a turn boundary once it has listed 20 or read 64 MiB of items and names that
+turn as `next_before`. It then lists,
 newest first, the ordinal and the first line (up to 120 bytes) of each
 omitted turn's prompt, at most `note_turns` of them (default 48, 0 lists
 none), and a line naming the older turns the list left out. The optional
@@ -2039,7 +2044,7 @@ which is future work, or deleting the bot.
 ## Tools and validation scope
 
 The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
-`wait`, `history`, `note` and `web_search`; each bot is created with the subset it may call (`run --tools`),
+`wait`, `history`, `note`, `web_search` and `web_fetch`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -2266,6 +2271,15 @@ lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. An interrupt ends the call as cancelled, like any
 running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
+
+Protocol version 22 lets a declared tool take free-form text, as
+`apply_patch` does: a tool declared with `grammar`, a Lark grammar its
+input follows, is declared on Responses as a custom tool whose call is the
+text itself, and elsewhere as a function of that text, so its `parameters`
+must take `input` as a required string (`invalid_declare` otherwise).
+Either way the call's `arguments` are `{"input": TEXT}` and its answer is
+the provider's custom tool output where it has one. The grammar counts
+toward the 64 KiB. A client's code-running tool is one.
 
 ### Tool approval
 
@@ -2854,6 +2868,19 @@ and a `pause_turn` stop asks again without a new message. A ChatGPT plan login,
 Claude on Bedrock and any other gateway offer none: `create` refuses the tool
 there with `web_search_unavailable`, and `ready` says per provider whether it
 searches (`web_search`). It runs without approval, as Codex's does.
+
+`web_fetch` reads one public http or https URL from the daemon, so it works on
+every provider, Claude on Bedrock and a ChatGPT login included. It follows up
+to ten redirects within 30 seconds, reads at most 4 MiB of the body, and
+refuses a type that is not text (`web_fetch_not_text`). Text is read as UTF-8,
+or as windows-1252 when the response or an HTML page's `meta` names Latin-1;
+another charset is refused (`web_fetch_charset`) rather than misread. An HTML
+page comes back as Markdown with its title and links made absolute, converted
+off the runtime's thread and cut at 8 MiB; other text as it is. Text
+past 64 KiB is shown as its start and end and kept whole as the call's `text`
+artifact, up to 1 MiB, which `read` pages. A status outside 2xx marks the
+result failed. Unlike search, it is gated like any other tool, and `auto`
+judges it, since the URL it is given leaves the machine.
 
 Shell children inherit the service environment except the provider key
 variables, plus the CLI location/context variables described above. Exact occurrences of provider key

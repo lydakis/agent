@@ -78,7 +78,7 @@ pub struct ToolSchema {
     /// A Lark grammar its input follows. On Responses such a tool is a
     /// custom tool whose call is the free-form text itself; elsewhere a
     /// function taking that text as `input`.
-    pub grammar: Option<&'static str>,
+    pub grammar: Option<std::borrow::Cow<'static, str>>,
 }
 
 impl Family {
@@ -209,7 +209,7 @@ impl Family {
         let encoded: Vec<Value> = tools
             .iter()
             .map(|tool| match self {
-                Family::Responses if let Some(grammar) = tool.grammar => json!({"type":"custom",
+                Family::Responses if let Some(grammar) = &tool.grammar => json!({"type":"custom",
                     "name":tool.name,"description":tool.description,
                     "format":{"type":"grammar","syntax":"lark","definition":grammar}}),
                 Family::Responses => json!({"type":"function","name":tool.name,
@@ -539,7 +539,7 @@ mod tests {
             name: "apply_patch".into(),
             description: "d".into(),
             parameters: json!({"type":"object","properties":{"input":{"type":"string"}}}),
-            grammar: Some("start: \"x\""),
+            grammar: Some("start: \"x\"".into()),
         };
         let declared = Family::Responses.tools(std::slice::from_ref(&patch));
         assert_eq!(declared[0]["type"], "custom");

@@ -32,11 +32,6 @@ pub const THREADS_IN: [&str; 2] = ["worktree", "project"];
 /// What a folder below the project's is when no project file of its own
 /// says otherwise: a project of its own, or this project's.
 pub const SUBFOLDERS: [&str; 2] = ["own", "project"];
-/// How a task that works apart from the project folder gets its own copy
-/// of it: a git worktree, or a sandfs copy (of the checkout as it is,
-/// uncommitted changes included, or of a folder outside git). The client's
-/// preference, not the project's, so any folder can use either.
-pub const COPIES: [&str; 2] = ["worktree", "sandfs"];
 
 /// A name that is also a bot-name prefix: the daemon's name characters,
 /// short enough that `NAME.lead` and its task names fit.
@@ -179,25 +174,20 @@ pub fn read(dir: &Path) -> Result<Value, String> {
 }
 
 /// Where a project's tasks work, as its coordinator is told it; the client
-/// that starts them picks their model and effort from the file. `copies` is
-/// one of `COPIES`.
-pub fn tasks_rule(in_project: bool, copies: &str) -> String {
-    match (in_project, copies) {
-        (true, _) => "Every task works in this folder, with no worktree of its own.",
-        (false, "sandfs") => {
-            "Every task works in its own sandfs copy, git repository or not, so tasks do not collide: only you work in this folder."
-        }
-        (false, _) => {
+/// that starts them picks their model and effort from the file.
+pub fn tasks_rule(in_project: bool) -> String {
+    match in_project {
+        true => "Every task works in this folder, with no worktree of its own.",
+        false => {
             "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."
         }
     }
     .to_owned()
 }
 
-/// The task rule a project's file sets, with the client's `copies`, as
-/// its coordinator is told it.
-pub fn rule(info: &Value, copies: &str) -> String {
-    tasks_rule(info["threads_in"] == "project", copies)
+/// The task rule a project's file sets, as its coordinator is told it.
+pub fn rule(info: &Value) -> String {
+    tasks_rule(info["threads_in"] == "project")
 }
 
 /// What a new project's threads run on and where they work.
@@ -333,7 +323,7 @@ impl Requests for crate::Client {
 
 /// Make the project in `dir` (a canonical directory): its coordinator in
 /// its role (`policy`, as composed for the folder), told its tasks'
-/// settings with the client's `copies` and then `after`, the client's own
+/// settings and then `after`, the client's own
 /// word, then the folder's file when it had none, once the daemon took
 /// the coordinator. A project that already exists in this folder is
 /// returned with `created: false`, its coordinator's row as the record, and
@@ -346,7 +336,6 @@ pub async fn create(
     policy: &Value,
     providers: &Value,
     picks: &Picks,
-    copies: &str,
     after: Option<&str>,
 ) -> Result<Value, String> {
     let info = read(dir)?;
@@ -396,8 +385,8 @@ pub async fn create(
         false => picks.effort.as_deref(),
     };
     let rule = match file {
-        true => rule(&info, copies),
-        false => tasks_rule(picks.threads.as_ref().is_some_and(|t| t.in_project), copies),
+        true => rule(&info),
+        false => tasks_rule(picks.threads.as_ref().is_some_and(|t| t.in_project)),
     };
     let mut instructions = format!(
         "{}\n\n{rule}",
@@ -489,18 +478,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_rule_says_how_tasks_get_their_copies() {
+    fn the_rule_says_where_tasks_work() {
         let info = json!({"threads_in": "worktree"});
         assert!(
-            rule(&info, "worktree")
+            rule(&info)
                 .ends_with("every task works in its own worktree, so tasks do not collide: only you work in this folder.")
         );
-        assert!(rule(&info, "sandfs").ends_with(
-            "Every task works in its own sandfs copy, git repository or not, so tasks do not collide: only you work in this folder."
-        ));
         let shared = json!({"threads_in": "project"});
         assert!(
-            rule(&shared, "sandfs")
+            rule(&shared)
                 .ends_with("Every task works in this folder, with no worktree of its own.")
         );
     }
@@ -555,7 +541,6 @@ mod tests {
                 policy,
                 &json!({"alpha": {"family": "responses"}}),
                 picks,
-                "worktree",
                 None,
             ))
     }
@@ -611,7 +596,15 @@ mod tests {
         assert_eq!(
             (&create["tools"], &create["compaction_instructions"]),
             (
-                &json!(["shell", "read", "write", "apply_patch", "wait", "history"]),
+                &json!([
+                    "shell",
+                    "read",
+                    "write",
+                    "apply_patch",
+                    "wait",
+                    "history",
+                    "web_fetch"
+                ]),
                 &json!("keep")
             )
         );
