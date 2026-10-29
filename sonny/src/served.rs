@@ -67,9 +67,10 @@ const SPLIT: [&str; 4] = crate::mux::SIDES;
 pub fn tools(lead: bool) -> Vec<Value> {
     let mut tools = Vec::new();
     if lead {
-        tools.extend([start(), remove(), project(), subscriptions()]);
+        tools.extend([start(), remove(), project()]);
     }
     tools.extend([
+        subscriptions(),
         show(),
         run(),
         triggers(),
@@ -215,8 +216,7 @@ fn subscriptions() -> Value {
             },
             "additionalProperties": false
         },
-        "answered_by": TAG,
-        "inherit": false
+        "answered_by": TAG
     })
 }
 
@@ -1026,7 +1026,10 @@ mod tests {
                 .filter(|name| name != EXEC)
                 .collect()
         };
-        assert_eq!(names(tools(false)), [SHOW, RUN, TRIGGERS, MEMORY, GOAL]);
+        assert_eq!(
+            names(tools(false)),
+            [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, GOAL]
+        );
         assert_eq!(
             names(tools(true)),
             [

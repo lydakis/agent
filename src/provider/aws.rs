@@ -23,6 +23,31 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// The error codes AWS's SDKs read as the request's clock, not its keys:
+/// signed again with the time now, the request goes through. A request
+/// signed before the machine slept and received minutes later is refused
+/// with one of these. The list is the AWS SDK for Java's clock-skew codes
+/// (`AwsErrorCode`), which it retries.
+const CLOCK_SKEW: [&str; 6] = [
+    "RequestTimeTooSkewed",
+    "RequestExpired",
+    "RequestInTheFuture",
+    "InvalidSignatureException",
+    "SignatureDoesNotMatch",
+    "AuthFailure",
+];
+
+/// Whether a refusal's error type, as AWS services name it in
+/// `x-amzn-ErrorType` (`Code:namespace`), says the signature's time was
+/// wrong.
+pub fn clock_skewed(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(':').next())
+        .is_some_and(|code| CLOCK_SKEW.contains(&code.trim()))
+}
+
 /// Re-resolve temporary keys this long before they expire, as AWS SDKs do.
 const REFRESH_AHEAD: Duration = Duration::from_secs(300);
 /// Bound on one `aws` credential resolution; an SSO login that needs a
@@ -778,6 +803,26 @@ fn sign(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_for_the_signature_s_time_is_told_from_one_for_its_keys() {
+        let refused = |kind: Option<&str>| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(kind) = kind {
+                headers.insert("x-amzn-errortype", kind.parse().unwrap());
+            }
+            clock_skewed(&headers)
+        };
+        assert!(refused(Some(
+            "InvalidSignatureException:http://internal.example/"
+        )));
+        assert!(refused(Some("RequestExpired")));
+        assert!(!refused(Some(
+            "AccessDeniedException:http://internal.example/"
+        )));
+        assert!(!refused(Some("UnrecognizedClientException")));
+        assert!(!refused(None));
+    }
 
     fn at(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)

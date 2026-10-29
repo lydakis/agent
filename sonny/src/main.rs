@@ -1042,21 +1042,15 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
     agent_client::policy::cache_ttl(&model).filter(|ttl| bot["settings"]["cache_ttl"] != *ttl)
 }
 
-/// A link, file or page, opened as the system opens it.
+/// A link, file or page, opened as the system opens it, by the first of
+/// the openers the `open` crate knows that is installed; with none, the
+/// link goes on the clipboard instead, as a login that can't open a
+/// browser prints its URL.
 fn open(target: &str) -> Result<(), String> {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    std::process::Command::new(opener)
-        .arg(target)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(drop)
-        .map_err(|error| format!("{opener}: {error}"))
+    open::that_detached(target).map_err(|error| {
+        term::copy(target);
+        format!("couldn't open it ({error}); copied {target}")
+    })
 }
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
@@ -7536,7 +7530,7 @@ impl App {
             .map_err(|error| error.to_string())?;
         // The lead the folder opens next time.
         if origin.is_none() && self.options.side.is_none() {
-            project::wrote_to(&self.workspace, &self.bot);
+            project::wrote_to(self.client.store(), &self.workspace, &self.bot);
         }
         if let Some(turn) = reply["turn"].as_i64() {
             // A steer is a submission of its own that ends as steered; the

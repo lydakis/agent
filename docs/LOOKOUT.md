@@ -84,6 +84,11 @@ lead's file already holds one by that name, which it keeps as it is:
 {"name": "tasks", "tasks_of": ["shop.lead"], "bots": ["shop.*"]}
 ```
 
+That is the folder's first lead's. Another lead of the folder,
+`shop.lead.billing`, gets `tasks_of` alone, so it hears only of its own
+tasks; the first lead's `shop.*` skips the other leads and every bot they or
+theirs made.
+
 A lead subscribes to more with its `subscriptions` tool, whose `add` takes
 a subscription in the file's shape, and whose `remove` takes a name; each
 call answers with all of them:

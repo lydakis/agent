@@ -5,7 +5,7 @@
 //! keeps its plan where they see it, keeps notes in the margin beside the
 //! conversation, and puts windows and panes where they look; a lead also starts, removes and resolves its tasks, makes
 //! projects and subscribes to the lookout, and a task resolves itself.
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 /// The most tools a bot may have declared, and the most bytes they take,
 /// as the daemon counts them.
@@ -74,6 +74,43 @@ pub fn declare(record: &Value, lead: bool) -> Option<Value> {
     (declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES).then_some(Value::Array(declared))
 }
 
+/// The `configure` fields that bring a bot Sonny declared on before up
+/// to this build's tools, as opening its window would, or `None` when it
+/// has them or never had Sonny's (a tool Sonny's lookout answers): so an agent no one opens since an
+/// upgrade, such as a task out of sight, gets a tool added since. A lead
+/// stays a lead, by the tool only a lead has, and a tool Sonny gates is
+/// gated as the bot's mode gates the rest.
+pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
+    // Sonny's own by a tool its lookout answers, not by a name another
+    // client's tool could share.
+    let declared = record["declared"].as_array()?;
+    if !declared
+        .iter()
+        .any(|tool| tool["answered_by"] == crate::served::TAG)
+    {
+        return None;
+    }
+    let lead = declared
+        .iter()
+        .any(|tool| tool["name"] == crate::served::START);
+    let declare = declare(record, lead)?;
+    let mut fields = Map::new();
+    if let Some(mode) = crate::approvals::mode(record).filter(|mode| *mode != "full") {
+        let tools: Vec<String> = (record["tools"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        fields.extend(crate::approvals::gate(
+            mode,
+            &crate::approvals::gateable(&tools, &declare),
+        ));
+    }
+    fields.insert("declare".into(), declare);
+    fields.insert("bot".into(), record["name"].clone());
+    fields.insert("bot_id".into(), json!(record["bot_id"]));
+    Some(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +166,46 @@ mod tests {
         let big = json!({"name": "big", "description": "d".repeat(63 * 1024),
             "parameters": {"type": "object"}, "result": "ok"});
         assert_eq!(declare(&json!({"declared": [big]}), false), None);
+    }
+
+    #[test]
+    fn an_agent_sonny_declared_on_before_takes_this_build_s_tools() {
+        let names = |fields: &Map<String, Value>| -> Vec<String> {
+            (fields["declare"].as_array().unwrap().iter())
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Another client's bot, or one with no tools declared, is left alone.
+        let other = json!({"name": "x", "declared": [{"name": "theirs"}]});
+        assert_eq!(refresh(&other), None);
+        // Nor is one whose tool only shares a name with one of Sonny's.
+        let named =
+            json!({"name": "x", "declared": [{"name": crate::served::MEMORY, "result": "ok"}]});
+        assert_eq!(refresh(&named), None);
+        assert_eq!(refresh(&json!({"name": "x"})), None);
+        // A lead from an older build, missing a tool: it stays a lead.
+        let mut old: Vec<Value> = tools(true);
+        old.pop();
+        let lead = json!({"name": "calc.lead", "bot_id": 7, "declared": old});
+        let fields = refresh(&lead).unwrap();
+        assert_eq!(fields["bot"], "calc.lead");
+        assert_eq!(fields["bot_id"], 7);
+        assert!(names(&fields).contains(&crate::served::START.to_owned()));
+        assert!(!fields.contains_key("approve"));
+        let mut current = lead.clone();
+        current["declared"] = fields["declare"].clone();
+        assert_eq!(refresh(&current), None);
+        // A task under auto: its new tools are gated as the rest are.
+        let mut old: Vec<Value> = tools(false);
+        old.retain(|tool| tool["name"] != crate::served::RUN);
+        let task = json!({"name": "calc.fix", "bot_id": 8, "created_by": "calc.lead",
+            "tools": ["shell", "read"], "declared": old,
+            "gates": [{"tag": "auto", "tools": ["shell"]}]});
+        let fields = refresh(&task).unwrap();
+        assert!(!names(&fields).contains(&crate::served::START.to_owned()));
+        let approve = fields["approve"].as_array().unwrap();
+        assert!(approve.iter().any(|tool| tool == "shell"));
+        assert!(approve.iter().any(|tool| tool == crate::served::RUN));
     }
 
     #[test]
