@@ -660,7 +660,9 @@ chat) takes them back to the composer, and Ctrl+\, or Tab with nothing
 typed and no guess showing, puts them in the pane again; the pane's title
 names the key that does. Sonny binds no Shift+Tab: multiplexers
 switch tabs with it. A window too narrow for
-both shows the one the keys are in. Ctrl+F finds text in
+both shows the one the keys are in. With nothing typed, Home goes up to
+the conversation's first turn, drawing the turns over it on the way, and
+End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are.
 
