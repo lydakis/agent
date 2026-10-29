@@ -61,6 +61,13 @@ pub struct Pane {
     /// at however wide the pane: Markdown and plain text. Code, pictures,
     /// diagrams and pages go as wide as the pane.
     prose: bool,
+    /// What the pane showed before, as a browser keeps it, the latest
+    /// last, each as it was left; and what it went back from.
+    back: Vec<Pane>,
+    forward: Vec<Pane>,
+    /// A folder, drawn as a tree its folders open and close in.
+    tree: Option<crate::tree::Tree>,
+    width: usize,
 }
 
 impl Pane {
@@ -69,12 +76,37 @@ impl Pane {
     /// `workspace` when they are in it.
     pub fn preview(url: &str, workspace: &Path, width: usize) -> Result<Self, String> {
         let (path, line) = file_url(url).ok_or_else(|| format!("{url} is no file"))?;
+        // `docs/../a.md`, as a link between files may name it, is `a.md`.
+        let path = path.components().fold(PathBuf::new(), |mut path, part| {
+            match part {
+                std::path::Component::ParentDir => _ = path.pop(),
+                std::path::Component::CurDir => {}
+                part => path.push(part),
+            }
+            path
+        });
         let title = match path.strip_prefix(workspace) {
             Ok(inside) if !inside.as_os_str().is_empty() => inside.display().to_string(),
             _ => path.display().to_string(),
         };
         let mut screen = Screen::default();
-        let (target, prose) = preview(&path, width, line, &mut screen)?;
+        let tree = std::fs::metadata(&path)
+            .is_ok_and(|meta| meta.is_dir())
+            .then(|| crate::tree::Tree::new(&path));
+        // A tree reads at the conversation's width, its marks near its names.
+        let width = match tree {
+            Some(_) => width.min(crate::PROSE),
+            None => width,
+        };
+        let (target, prose) = match &tree {
+            Some(tree) => {
+                for (line, url) in tree.lines(width) {
+                    list(&mut screen, line, url);
+                }
+                (0, true)
+            }
+            None => preview(&path, width, line, &mut screen)?,
+        };
         screen.show_row(target, ABOVE);
         // Its escapes kept, as the path read back may hold `#` or `%`;
         // the line left off.
@@ -93,7 +125,88 @@ impl Pane {
             program: None,
             foot: None,
             prose,
+            back: Vec::new(),
+            forward: Vec::new(),
+            tree,
+            width,
         })
+    }
+
+    /// Shown in place of `before`, after it as a browser goes: what was
+    /// gone back from left behind.
+    pub fn after(mut self, mut before: Pane) -> Self {
+        self.back = std::mem::take(&mut before.back);
+        before.forward.clear();
+        self.back.push(before);
+        if self.back.len() > HISTORY {
+            self.back.remove(0);
+        }
+        self
+    }
+
+    /// Whether there is something to go back (`back`) or forward to.
+    pub fn can_go(&self, back: bool) -> bool {
+        match back {
+            true => !self.back.is_empty(),
+            false => !self.forward.is_empty(),
+        }
+    }
+
+    /// What the pane showed before (`back`), or went back from, as it was
+    /// left, this kept to come back to; or this again, with nowhere to go.
+    pub fn go(mut self, back: bool) -> Self {
+        let Some(mut next) = (match back {
+            true => self.back.pop(),
+            false => self.forward.pop(),
+        }) else {
+            return self;
+        };
+        next.back = std::mem::take(&mut self.back);
+        next.forward = std::mem::take(&mut self.forward);
+        match back {
+            true => next.forward.push(self),
+            false => next.back.push(self),
+        }
+        next
+    }
+
+    /// A folder in its tree opened or closed, if `url` names one; the
+    /// view kept where it was.
+    pub fn toggle(&mut self, url: &str) -> bool {
+        let Some(tree) = &mut self.tree else {
+            return false;
+        };
+        let Some((path, _)) = file_url(url) else {
+            return false;
+        };
+        if !tree.toggle(&path) {
+            return false;
+        }
+        // A tree reads at the conversation's width, as it is drawn.
+        let width = (self.area.width as usize).min(crate::PROSE);
+        let back = self.screen.back();
+        let before = self.screen.height(width);
+        self.screen = Screen::default();
+        for (line, url) in tree.lines(self.width) {
+            list(&mut self.screen, line, url);
+        }
+        // Rows open and close under the view: its top stays put.
+        let after = self.screen.height(width);
+        self.screen.hold((back + after).saturating_sub(before));
+        true
+    }
+
+    /// Whether `(column, row)` is on the title's ‹ (true) or › (false),
+    /// shown while there is somewhere to go back or forward to.
+    pub fn on_arrow(&self, column: u16, row: u16) -> Option<bool> {
+        if row != self.area.y || (self.back.is_empty() && self.forward.is_empty()) {
+            return None;
+        }
+        match column.checked_sub(self.area.x)? {
+            1 => Some(true),
+            3 => Some(false),
+            _ => None,
+        }
     }
 
     /// A card titled `title` whose lines the app sets as they change,
@@ -110,6 +223,10 @@ impl Pane {
             program: None,
             foot: None,
             prose: false,
+            back: Vec::new(),
+            forward: Vec::new(),
+            tree: None,
+            width: 0,
         }
     }
 
@@ -127,6 +244,10 @@ impl Pane {
             program: Some(program),
             foot: None,
             prose: false,
+            back: Vec::new(),
+            forward: Vec::new(),
+            tree: None,
+            width: 0,
         }
     }
 
@@ -182,11 +303,10 @@ impl Pane {
             return None;
         }
         let keys = match focused {
+            true if !self.back.is_empty() => format!("  ← back  {} ", self.keys),
             true => format!("  {} ", self.keys),
             false => "  tab ".to_owned(),
         };
-        let room = (area.width as usize).saturating_sub(keys.width() + 1);
-        let title = crate::transcript::cut(&self.title, room);
         let mut style = Style::new();
         // A file's name is a link to it.
         if self.link.is_some() {
@@ -197,13 +317,26 @@ impl Pane {
         } else {
             style = style.add_modifier(Modifier::BOLD);
         }
-        let gap = (area.width as usize).saturating_sub(title.width() + keys.width() + 1);
-        let head = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(title, style),
-            Span::raw(" ".repeat(gap)),
-            Span::raw(keys).dim(),
-        ]);
+        // ‹ › go back and forward, while there is somewhere to go.
+        let mut head = vec![Span::raw(" ")];
+        if !self.back.is_empty() || !self.forward.is_empty() {
+            let arrow = |text, there: bool| match there {
+                true => Span::raw(text),
+                false => Span::raw(text).dark_gray(),
+            };
+            head.push(arrow("‹", !self.back.is_empty()));
+            head.push(Span::raw(" "));
+            head.push(arrow("›", !self.forward.is_empty()));
+            head.push(Span::raw(" "));
+        }
+        let used: usize = head.iter().map(|s| s.content.width()).sum();
+        let room = (area.width as usize).saturating_sub(used + keys.width());
+        let title = crate::transcript::cut(&self.title, room);
+        let gap = (area.width as usize).saturating_sub(used + title.width() + keys.width());
+        head.push(Span::styled(title, style));
+        head.push(Span::raw(" ".repeat(gap)));
+        head.push(Span::raw(keys).dim());
+        let head = Line::from(head);
         buf.set_line(area.x, area.y, &head, area.width);
         // A row between the name and what it holds, and above the foot.
         let mut rows = Rect {
@@ -271,9 +404,8 @@ pub fn file_url(url: &str) -> Option<(PathBuf, Option<usize>)> {
     Some((PathBuf::from(String::from_utf8(out).ok()?), line))
 }
 
-/// `path` written into `screen` at `width`: a folder's entries, a
-/// picture drawn, Markdown as replies read, code in its colors with its
-/// line numbers. The row to show first: that of `line`, if any; and
+/// `path` written into `screen` at `width`: a picture drawn, Markdown
+/// as replies read, code in its colors with its line numbers. The row to show first: that of `line`, if any; and
 /// whether its rows are prose, to be read no wider than the conversation.
 fn preview(
     path: &Path,
@@ -282,15 +414,6 @@ fn preview(
     screen: &mut Screen,
 ) -> Result<(usize, bool), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if meta.is_dir() {
-        for (line, url) in folder(path)? {
-            match url {
-                Some(url) => screen.push_linked(line, url),
-                None => screen.push(vec![line]),
-            }
-        }
-        return Ok((0, false));
-    }
     // A pipe, socket or device may never end, or never start.
     if !meta.is_file() {
         screen.push(vec![note(
@@ -381,11 +504,10 @@ fn preview(
         // A document reads at the conversation's width, its pictures too.
         prose = true;
         let mut markdown = crate::transcript::Markdown::document(folder);
-        let mut rows = Vec::new();
-        for text in &lines[..shown] {
-            rows.extend(markdown.feed(text, width.min(crate::PROSE), false));
-        }
-        rows.extend(markdown.end(width.min(crate::PROSE), false));
+        let leads = (Line::from("  "), Line::from("  "));
+        let text = lines[..shown].join("\n");
+        let rows =
+            crate::transcript::markdown(&mut markdown, &text, width.min(crate::PROSE), leads);
         screen.push(rows);
     } else {
         let mut code = crate::highlight::Code::file(path, lines.first().unwrap_or(&""));
@@ -418,33 +540,15 @@ fn preview(
     Ok((first_row, prose))
 }
 
-/// A folder's entries, folders first, each with the address it opens.
-fn folder(path: &Path) -> Result<Vec<(Line<'static>, Option<String>)>, String> {
-    let mut entries: Vec<(bool, String)> = std::fs::read_dir(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let dir = entry.file_type().ok()?.is_dir();
-            Some((!dir, entry.file_name().to_string_lossy().into_owned()))
-        })
-        .collect();
-    entries.sort();
-    if entries.is_empty() {
-        return Ok(vec![(note("an empty folder"), None)]);
+/// The most the pane keeps to go back to.
+const HISTORY: usize = 50;
+
+/// A row of a list that opens `url` when there is one.
+fn list(screen: &mut Screen, line: Line<'static>, url: Option<String>) {
+    match url {
+        Some(url) => screen.push_linked(line, url),
+        None => screen.push(vec![line]),
     }
-    Ok(entries
-        .into_iter()
-        .map(|(file, name)| {
-            let full = path.join(&name);
-            let url = crate::links::file_url(&full);
-            let full = full.display().to_string();
-            let line = match file {
-                true => Line::from(format!(" {full}")),
-                false => Line::from(vec![Span::raw(format!(" {full}")), Span::raw("/").dim()]),
-            };
-            (line, url)
-        })
-        .collect())
 }
 
 fn note(text: &str) -> Line<'static> {
@@ -587,6 +691,28 @@ mod tests {
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         pane.render(area, &mut buf, true, |_| None);
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind| MouseEvent {
+            kind,
+            column: 117,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        println!(
+            "down {:?}",
+            pane.screen
+                .mouse(ev(MouseEventKind::Down(MouseButton::Left)))
+                .is_some()
+        );
+        println!(
+            "up {:?}",
+            pane.screen
+                .mouse(ev(MouseEventKind::Up(MouseButton::Left)))
+                .map(|a| match a {
+                    crate::screen::Action::Open(u) => u,
+                    _ => "copy".into(),
+                })
+        );
         let cells = pane.screen.link_cells(&buf);
         let url = format!("file://{}/a%20b.rs", dir.display());
         // One link, over the whole name, spaces and all.
@@ -602,6 +728,50 @@ mod tests {
     }
 
     #[test]
+    fn the_pane_goes_back_and_forward_as_a_browser_does() {
+        let dir = std::env::temp_dir().join(format!("sonny-back-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn b() {}\n").unwrap();
+        let url = |name: &str| format!("file://{}", dir.join(name).display());
+        let mut folder = Pane::preview(&url(""), &dir, 60).unwrap();
+        // A folder opened in its tree stays open when it is come back to.
+        assert!(folder.toggle(&url("src")));
+        let a = Pane::preview(&url("a.md"), &dir, 60).unwrap().after(folder);
+        let b = Pane::preview(&url("src/b.rs"), &dir, 60).unwrap().after(a);
+        assert!(b.can_go(true) && !b.can_go(false));
+        let mut shown = b.go(true).go(true);
+        assert!(!shown.can_go(true) && shown.can_go(false));
+        let shown_rows = rows(&mut shown, 60, 6);
+        assert!(
+            shown_rows[2..5].contains(&" ▾ src/".to_owned()),
+            "{shown_rows:?}"
+        );
+        assert!(
+            shown_rows[2..5].contains(&" │   b.rs".to_owned()),
+            "{shown_rows:?}"
+        );
+        // The title's arrows: ‹ dim with nowhere back to go, › forward.
+        assert!(shown_rows[0].starts_with(" ‹ › "), "{shown_rows:?}");
+        assert_eq!(shown.on_arrow(1, 0), Some(true));
+        assert_eq!(shown.on_arrow(3, 0), Some(false));
+        assert_eq!(shown.on_arrow(5, 0), None);
+        let mut a = shown.go(false);
+        assert_eq!(a.title, "a.md");
+        // Somewhere new from here: forward is gone, as a browser forgets it.
+        let c = Pane::preview(&url("src/b.rs"), &dir, 60).unwrap().after(a);
+        assert!(!c.can_go(false));
+        a = c.go(true);
+        assert_eq!(a.title, "a.md");
+        assert!(rows(&mut a, 60, 3)[0].contains("← back"));
+        // A pane with nowhere to go has no arrows.
+        let mut card = Pane::card("/status", "esc closes");
+        assert!(!rows(&mut card, 30, 2)[0].contains('‹'));
+        assert_eq!(card.on_arrow(1, 0), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_wide_name_is_written_again_a_character_at_a_time() {
         let dir = std::env::temp_dir().join(format!("sonny-wide-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -610,6 +780,28 @@ mod tests {
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         pane.render(area, &mut buf, true, |_| None);
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind| MouseEvent {
+            kind,
+            column: 117,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        println!(
+            "down {:?}",
+            pane.screen
+                .mouse(ev(MouseEventKind::Down(MouseButton::Left)))
+                .is_some()
+        );
+        println!(
+            "up {:?}",
+            pane.screen
+                .mouse(ev(MouseEventKind::Up(MouseButton::Left)))
+                .map(|a| match a {
+                    crate::screen::Action::Open(u) => u,
+                    _ => "copy".into(),
+                })
+        );
         let cells = pane.screen.link_cells(&buf);
         // No cell a wide character goes on into is written over.
         for (x, y, _) in &cells {

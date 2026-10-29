@@ -1,50 +1,32 @@
-//! The welcome at the top of a new project's empty transcript: Sonny, the
-//! robot the client is named for, as a portrait the first time Sonny ever
-//! runs and as a small icon after that. Drawn with half blocks, two pixels
-//! a cell, and never above a conversation that already has history.
+//! The welcome at the top of every lead's transcript, as Claude Code heads
+//! its own: Sonny, the robot the client is named for, as a portrait drawn
+//! with half blocks, two pixels a cell, above the conversation's first item.
 use ratatui::{
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Style, Stylize},
     text::{Line, Span},
 };
 
-/// The welcome for a new project's lead `bot` in `folder`, on `model`, at
-/// `width` columns: the portrait when Sonny has never welcomed anyone
-/// (noted in `~/.agent/sonny/welcomed`), else the icon. Too narrow for
-/// the picture, the words alone.
-pub fn welcome(bot: &str, folder: &str, model: &str, width: usize) -> Vec<Line<'static>> {
-    let first = first_time();
+/// The welcome for the lead in `folder`, on `model`, at `width` columns:
+/// the portrait beside its words, or, too narrow for the picture, the
+/// words alone.
+pub fn welcome(folder: &str, model: &str, width: usize) -> Vec<Line<'static>> {
     let version = env!("CARGO_PKG_VERSION");
     let accent = Style::new().fg(Color::Rgb(255, 190, 60));
-    let (art, words) = match first {
-        true => (
-            pixels(&PORTRAIT, &PORTRAIT_COLORS),
-            vec![
-                Line::from(vec![
-                    "Welcome to Sonny".bold(),
-                    format!("  {version}").dim(),
-                ]),
-                Line::default(),
-                Line::from("This folder's lead. Ask for anything:".dim()),
-                Line::from("it plans, starts tasks in their own copies,".dim()),
-                Line::from("and tells you when they need you.".dim()),
-                Line::default(),
-                Line::from(format!("{folder} · {model}").dim()),
-                Line::default(),
-                hints(accent),
-            ],
-        ),
-        false => (
-            pixels(&ICON, &ICON_COLORS),
-            vec![
-                Line::from(vec![
-                    Span::styled("sonny", accent.add_modifier(Modifier::BOLD)),
-                    format!(" {version}").dim(),
-                ]),
-                Line::from(format!("{bot} · {model} · {folder}").dim()),
-                hints(accent),
-            ],
-        ),
-    };
+    let art = pixels(&PORTRAIT, &PORTRAIT_COLORS);
+    let words = vec![
+        Line::from(vec![
+            "Welcome to Sonny".bold(),
+            format!("  {version}").dim(),
+        ]),
+        Line::default(),
+        Line::from("This folder's lead. Ask for anything:".dim()),
+        Line::from("it plans, starts tasks in their own copies,".dim()),
+        Line::from("and tells you when they need you.".dim()),
+        Line::default(),
+        Line::from(format!("{folder} · {model}").dim()),
+        Line::default(),
+        hints(accent),
+    ];
     let art_width = art.first().map_or(0, Line::width);
     let words_width = words.iter().map(Line::width).max().unwrap_or(0);
     if width < 2 + art_width + GAP + words_width {
@@ -81,21 +63,6 @@ fn hints(accent: Style) -> Line<'static> {
         Span::styled("/status", accent),
         " tasks".dim(),
     ])
-}
-
-/// Whether this is the first welcome: true once, as it is noted.
-fn first_time() -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
-        return false;
-    };
-    let noted = std::path::PathBuf::from(home).join(".agent/sonny/welcomed");
-    if noted.exists() {
-        return false;
-    }
-    if let Some(dir) = noted.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    std::fs::write(&noted, "").is_ok()
 }
 
 /// Rows of `art`, two pixel rows to a line: the upper pixel as the half
@@ -236,54 +203,23 @@ const PORTRAIT_COLORS: [(u8, u8, u8); 62] = [
     (183, 202, 223),
 ];
 
-/// The icon, 13 by 14 pixels, indexed into [`ICON_COLORS`].
-const ICON: [&str; 14] = [
-    "....00000....",
-    "...00000011..",
-    "..0000000111.",
-    "..0000000011.",
-    "..0000000001.",
-    "..0022000220.",
-    "..0000000000.",
-    "...00000000..",
-    "....000000...",
-    ".....0000....",
-    "......33.....",
-    ".....4334....",
-    "..0000330033.",
-    ".000000003333",
-];
-
-const ICON_COLORS: [(u8, u8, u8); 5] = [
-    (232, 235, 238),
-    (122, 170, 226),
-    (110, 168, 230),
-    (34, 35, 40),
-    (200, 202, 208),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn every_pixel_names_a_color_and_rows_are_even() {
-        for (art, colors) in [
-            (&PORTRAIT[..], &PORTRAIT_COLORS[..]),
-            (&ICON[..], &ICON_COLORS[..]),
-        ] {
-            let width = art[0].len();
-            for row in art {
-                assert_eq!(row.len(), width);
-                for key in row.chars().filter(|c| *c != '.') {
-                    let index = key.to_digit(36).unwrap() as usize
-                        + if key.is_ascii_uppercase() { 26 } else { 0 };
-                    assert!(index < colors.len(), "{key}");
-                }
+        let width = PORTRAIT[0].len();
+        for row in PORTRAIT {
+            assert_eq!(row.len(), width);
+            for key in row.chars().filter(|c| *c != '.') {
+                let index = key.to_digit(36).unwrap() as usize
+                    + if key.is_ascii_uppercase() { 26 } else { 0 };
+                assert!(index < PORTRAIT_COLORS.len(), "{key}");
             }
-            let lines = pixels(art, colors);
-            assert_eq!(lines.len(), art.len().div_ceil(2));
-            assert!(lines.iter().all(|line| line.width() == width));
         }
+        let lines = pixels(&PORTRAIT, &PORTRAIT_COLORS);
+        assert_eq!(lines.len(), PORTRAIT.len().div_ceil(2));
+        assert!(lines.iter().all(|line| line.width() == width));
     }
 }

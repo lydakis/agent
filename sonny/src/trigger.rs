@@ -2600,18 +2600,22 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
         .as_ref()
         .ok_or("invalid_trigger: --start has no folder")?;
     let instructions = crate::project::plain(dir)?;
-    let search = agent_client::config::load()?.web_search;
+    let config = agent_client::config::load()?;
+    let mut settings =
+        agent_client::policy::cache_ttl(model).map_or(json!({}), |ttl| json!({"cache_ttl": ttl}));
+    if config.hide_senders {
+        settings["hide_senders"] = json!(true);
+    }
     let made = client
         .request(
             "create",
             json!({"bot": name, "workspace": dir, "model": model, "effort": effort,
                 "instructions": instructions,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-                "tools": agent_client::default_tools(client.providers(), model, search),
+                "tools": agent_client::default_tools(client.providers(), model, config.web_search),
                 "created_by": by.as_ref().map(|(bot, _)| bot),
                 "created_by_id": by.as_ref().map(|(_, id)| id),
-                "settings": agent_client::policy::cache_ttl(model)
-                    .map_or(json!({}), |ttl| json!({"cache_ttl": ttl})),
+                "settings": settings,
                 "request_id": format!("trigger-{}", trigger.generation)}),
         )
         .await

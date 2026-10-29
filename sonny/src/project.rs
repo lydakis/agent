@@ -557,6 +557,10 @@ async fn make(
     };
     let declare = json!(crate::declared::tools(true));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
+    let mut settings = crate::approvals::sandbox(mode, true, dir);
+    if agent_client::config::load()?.hide_senders {
+        settings.insert("hide_senders".into(), json!(true));
+    }
     let policy = json!({
         "instructions": instructions,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
@@ -564,7 +568,7 @@ async fn make(
         "tools": role.tools,
         "declare": declare,
         "gate": gate,
-        "settings": crate::approvals::sandbox(mode, true, dir),
+        "settings": settings,
     });
     agent_client::project::create(client, dir, &policy, client.providers(), picks, None).await
 }

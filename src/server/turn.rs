@@ -3446,7 +3446,7 @@ impl Turn {
             let confined =
                 record.sandboxed() && agent_runtime::sandbox::confinable(&call.name) && !approved;
             let prepared = match prepared {
-                Ok(Prepared::Shell { .. } | Prepared::Detach(_))
+                Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
                     if confined && !record.confines(&call, workspace) =>
                 {
                     Err(Error::with(
@@ -3533,6 +3533,50 @@ impl Turn {
                         Ok(outcome) => outcome,
                         Err(error) if error.code == "capacity_exhausted" => failure(error),
                         Err(error) => return Err(error),
+                    }
+                }
+                Ok(Prepared::Terminal { command, yield_ms }) => {
+                    let (turn, started) = (self.turn, call.call_id.clone());
+                    let id = self
+                        .store
+                        .op("process_start", move |db| db.process_start(turn, &started))
+                        .await?;
+                    let (sender, receiver) = oneshot::channel();
+                    self.collect(id, &call.call_id, receiver);
+                    let start = self.registry.terminal(
+                        record.bot_id,
+                        id,
+                        command,
+                        workspace.to_path_buf(),
+                        yield_ms,
+                        environment.to_vec(),
+                        sandbox,
+                        sender,
+                    );
+                    match self.run_tool(start, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
+                Ok(Prepared::WriteStdin {
+                    handle,
+                    chars,
+                    yield_ms,
+                    kill,
+                }) => {
+                    let typed = self.registry.write_stdin(
+                        record.bot_id,
+                        handle,
+                        &chars,
+                        yield_ms,
+                        kill,
+                        sandbox,
+                    );
+                    match self.run_tool(typed, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
                 }
                 Ok(Prepared::Read {

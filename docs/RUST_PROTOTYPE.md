@@ -77,7 +77,7 @@ It supplies no agent behavior: `create` names the bot's model, instructions,
 and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
 `--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
-`--tools` or `shell,read,write,wait,history` with `apply_patch` for a
+`--tools` or `shell,write_stdin,read,write,wait,history` with `apply_patch` for a
 Responses model and `edit` otherwise, plus `web_search` where the provider
 offers it and `web_fetch` for any, unless `web_search = "disabled"` in `~/.agent/config.toml`, before it asks. A bot's
 tools are what the model is shown and what dispatch allows: a call to any
@@ -109,7 +109,7 @@ of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
 for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,read,write,wait,history` and the file editor
+daemon. Default tools are `shell,write_stdin,read,write,wait,history` and the file editor
 the model's family is trained on, `apply_patch` (Responses) or `edit`, and
 `web_search` where the provider offers it, and `web_fetch`; `note`, the
 carry-forward note, is in the universe and chosen per bot.
@@ -251,7 +251,8 @@ Parked turns survive a daemon restart: they are re-registered at
 startup, peer handles resolve from durable state (a peer interrupted by the
 restart reports `interrupted`), and commands that were still running resolve
 to `process_lost`: their supervision ended with the daemon, whether or not the
-OS process did. Interrupting a parked
+OS process did. A daemon that stops cleanly does not wait for them: it kills
+each one's process group and records `process_lost` itself. Interrupting a parked
 turn ends it as `interrupted`: the wait and any planned calls behind it get a
 `cancelled` tool result in the same transaction, so the conversation stays
 valid and the bot is not left uncertain. A bot whose turn is parked reports
@@ -411,6 +412,7 @@ keep-warm when it sets any of them.
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
+| `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1284,7 +1286,12 @@ else `invalid_origin`), mutually exclusive with `from`, stored and reported the 
 no meaning, but a prompt with an `origin` is no person's word to the
 approver. The sender's identity is resolved at submit and kept on the turn
 (`turns.from_id`), so a queued message whose sender is deleted before it
-starts still names it.
+starts still names it. The model reads the sender too, as a text part after
+the prompt's words and before its pictures, so it does not take another
+agent's words for a person's: `[Written by the agent NAME in
+turn:NAME/TURN, not by a person.]` for `from`, `[Sent by ORIGIN.]` for
+`origin`, and nothing for a person's prompt. `content[0]` stays the words.
+A bot made with `hide_senders` reads the words alone.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
@@ -2044,7 +2051,7 @@ which is future work, or deleting the bot.
 ## Tools and validation scope
 
 The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
-`wait`, `history`, `note`, `web_search` and `web_fetch`; each bot is created with the subset it may call (`run --tools`),
+`wait`, `history`, `note`, `web_search`, `web_fetch` and `write_stdin`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -2095,7 +2102,28 @@ handle applies to it, so it outlives the turn and the daemon and is outside
 reaps it on exit, and a new detach refuses with `detached_limit` while all
 slots are held. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
-command. Turn cancellation requests the same kill for a
+command. `tty: true` runs the command in a terminal instead, for a REPL or a
+program that prompts, as Codex's `exec_command` does: the command gets a
+pseudo-terminal as its stdin, stdout and stderr and its own session, and the
+call returns what it wrote within `yield_time_ms` (default 1 s, at most 30 s)
+with a `proc:N` handle while it runs. `write_stdin` types into that handle
+(`chars`, with a control key as its character, such as `\u0003` for Ctrl-C)
+and returns what the command wrote since the last read, after waiting
+`yield_time_ms` (250 ms after typing, 5 s when only reading); `kill: true` ends
+the command's process group. Output merges stdout and stderr, as a terminal
+does, keeps its last 64 KiB unread, counting what it drops, and is redacted
+like any other. A terminal takes no process slot and no timeout: it runs until
+it exits or is killed, across turns, and `wait` on its handle reports how it
+ended, with what no write read. Each bot keeps at most 16; starting another
+kills the one it used least recently, as Codex prunes its sessions. Only the
+bot that started a terminal types into it (`terminal_not_running` for any
+other, and for one that ended), and terminals end when the daemon stops. A
+terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
+refused), so input to a sandboxed bot's terminal runs without review, as its
+commands do; an unsandboxed bot's `write_stdin` is gated like `shell`.
+Commands see the same environment, `TERM=dumb` included, which keeps REPLs to
+plain prompts. Under bubblewrap the command runs in a session of its own, so
+Ctrl-C does not reach it there; `kill` does. Turn cancellation requests the same kill for a
 foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
