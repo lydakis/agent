@@ -7049,7 +7049,7 @@ impl Database {
                 .and_then(Value::as_str);
             let family = bot.family()?;
             let mut added = Vec::new();
-            let mut node = head;
+            let (mut node, mut child) = (head, None::<i64>);
             while let Some(id) = node {
                 let (parent, item, first): (Option<i64>, Vec<u8>, Option<i64>) = tx
                     .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
@@ -7057,11 +7057,24 @@ impl Database {
                 if super::context::model_output(&item) {
                     break;
                 }
+                // A node another bot reaches, as a fork taken while the
+                // request was out does, is its history too: it and what
+                // came before it stay as they are.
+                let shared: bool = tx
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR closed=?1
+                                OR context_start=?1 OR note=?1 OR compaction=?1 OR elision=?1))
+                            OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1 AND id IS NOT ?3)",
+                    )?
+                    .query_row(params![id, bot.name, child], |r| r.get(0))?;
+                if shared {
+                    break;
+                }
                 added.push((id, item));
                 if first == Some(turn) {
                     break;
                 }
-                node = parent;
+                (node, child) = (parent, Some(id));
             }
             let mut noted = false;
             for (id, item) in added.iter().rev() {

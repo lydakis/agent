@@ -1234,6 +1234,22 @@ class AnthropicRuntimeTests(unittest.TestCase):
         again = client.request('submit', bot='Bob', request_id='d1', prompt=words)
         self.assertEqual(again['result']['turn'], turns[0]['turn'], again)
 
+    def test_a_fork_taken_while_a_request_is_out_keeps_what_it_declined(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        # The fork takes the prompt while the request is out; the refusal
+        # that follows is Bob's, not the fork's.
+        model.generate_delay = 1
+        words = 'refuse:all ' + 'word ' * 40
+        turn = client.request('submit', bot='Bob', request_id='d1', prompt=words)['result']['turn']
+        model.requests.get(timeout=5)
+        self.assertIn('result', client.request('fork', source='Bob', bot='Branch'))
+        self.assertEqual(client.finished(turn)['data']['error'], 'provider_refusal')
+        turn = client.request('submit', bot='Branch', request_id='b1', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        sent = model.requests.get(timeout=1)
+        self.assertEqual(sent['messages'][0]['content'], [{'type': 'text', 'text': words}])
+
     def test_a_hosted_search_is_declared_kept_and_its_paused_turn_resumed(self):
         client, model, path = self.start()
         self.assertTrue(client.ready['providers']['anthropic']['web_search'])
