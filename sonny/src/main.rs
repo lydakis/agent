@@ -27,6 +27,8 @@ mod js;
 mod links;
 mod login;
 mod lookout;
+#[cfg(target_os = "macos")]
+mod mac;
 mod math;
 mod mermaid;
 mod models;
