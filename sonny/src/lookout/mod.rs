@@ -1896,6 +1896,7 @@ impl Service {
             let mut held = std::mem::take(&mut lookout.held);
             held.retain_mut(|item| lookout.still_asked(item));
             lookout.held = held;
+            lookout.rehear();
         }
     }
 
@@ -2740,13 +2741,32 @@ impl Lookout {
         self.write(&line);
     }
 
+    /// The subscriptions that hear a source now.
+    fn hearing(&self, source: &str) -> Vec<String> {
+        (self.subs.iter())
+            .filter(|sub| sub.sources.iter().any(|name| name == source))
+            .map(|sub| sub.name.clone())
+            .collect()
+    }
+
+    /// Events still waiting, told through the subscriptions that hear
+    /// them now: a source no longer heard is dropped.
+    fn rehear(&mut self) {
+        let mut heard = std::mem::take(&mut self.heard);
+        heard.retain_mut(|heard| {
+            heard.subs = self.hearing(&heard.event.source);
+            !heard.subs.is_empty()
+        });
+        self.heard = heard;
+        if self.heard.is_empty() {
+            self.heard_since = None;
+        }
+    }
+
     /// A source's event, held for the next note when a subscription
     /// hears that source.
     fn heard_from(&mut self, event: &sources::Event) {
-        let subs: Vec<String> = (self.subs.iter())
-            .filter(|sub| sub.sources.contains(&event.source))
-            .map(|sub| sub.name.clone())
-            .collect();
+        let subs = self.hearing(&event.source);
         if subs.is_empty() {
             return;
         }
@@ -4905,6 +4925,14 @@ mod tests {
         }
         assert_eq!(lookout.heard.len(), HEARD);
         assert_eq!(lookout.heard[HEARD - 1].event.text, (HEARD + 4).to_string());
+        // Events still waiting follow the subscriptions as they change.
+        lookout.subs.retain(|sub| sub.name == "eng");
+        lookout.rehear();
+        assert_eq!(lookout.heard.len(), HEARD);
+        assert!(lookout.heard.iter().all(|heard| heard.subs == ["eng"]));
+        lookout.subs.clear();
+        lookout.rehear();
+        assert!(lookout.heard.is_empty() && lookout.heard_since.is_none());
     }
 
     /// A daemon that greets, answers each request with `{}` and sends each
