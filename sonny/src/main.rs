@@ -2731,15 +2731,28 @@ impl App {
     }
 
     /// The conversation drawn again in the background's new colours, or
-    /// in the view just picked, once no turn is running: the screen and scrollback cleared, and the
-    /// bot's items read again as on attach.
+    /// in the view just picked, once no turn is running: the screen and
+    /// scrollback cleared, and the bot's items read again as on attach.
+    /// On the full screen the pages of older items above are drawn again
+    /// only as the view nears them.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
         if std::mem::take(&mut self.switch_screen) {
             own_screen(!full());
         }
+        // The pages of older items above stay, as blank rows drawn again
+        // as the view nears them: only the newest rows are drawn now.
+        let pages = match full() {
+            true => self.screen.pages(),
+            false => Vec::new(),
+        };
+        let newest = (pages.last())
+            .and_then(|(id, _)| self.pages.get(id))
+            .and_then(|paged| paged.nodes.last().copied());
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
-        self.pages.clear();
+        if newest.is_none() {
+            self.pages.clear();
+        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2762,6 +2775,14 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        if let Some(newest) = newest {
+            // What calls older than the oldest page returned stays its own.
+            let unpaired = std::mem::take(&mut self.unpaired);
+            self.history_since(newest, true).await;
+            self.unpaired = unpaired;
+            self.screen.blank(pages);
+            return Ok(());
+        }
         let welcome = self.welcome();
         self.commit(welcome);
         // Back to the first node this window drew, not only the newest page.

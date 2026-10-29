@@ -330,6 +330,51 @@ impl Screen {
         self.let_go();
     }
 
+    /// The pages of older items, from the first, and how many rows each
+    /// is drawn on: to stand in for them once the rows are drawn anew.
+    pub fn pages(&mut self) -> Vec<(u64, usize)> {
+        let placed = self.placed();
+        (self.pages.iter().enumerate())
+            .map(|(p, page)| (page.id, placed.get(p).map_or(page.rows, |at| at.len())))
+            .collect()
+    }
+
+    /// Blank rows over the rest for each of `pages`, as tall as it was,
+    /// to be drawn again as the view nears it: the view stays as many
+    /// rows up from the newest.
+    pub fn blank(&mut self, pages: Vec<(u64, usize)>) {
+        let blank = Arc::new(Line::default());
+        let rows: usize = pages.iter().map(|(_, rows)| rows).sum();
+        self.rows.splice(
+            0..0,
+            (0..rows).map(|_| Row {
+                line: blank.clone(),
+                rest: None,
+                link: None,
+            }),
+        );
+        // Rows wrapped already are wrapped again under them.
+        self.shown.clear();
+        self.wrapped = 0;
+        self.relaid = 0;
+        self.selection = None;
+        self.linked = None;
+        for spot in [&mut self.go_to, &mut self.keep].into_iter().flatten() {
+            spot.0 += rows;
+        }
+        if let Some(top) = &mut self.top_row {
+            *top += rows;
+        }
+        let pages = pages.into_iter().map(|(id, rows)| Page {
+            id,
+            rows,
+            drawn: false,
+        });
+        self.pages.splice(0..0, pages);
+        self.placed = None;
+        self.laid += 1;
+    }
+
     /// A page let go that the view is near, the nearest: to draw again.
     pub fn wanted(&mut self) -> Option<u64> {
         let height = self.area.height as usize;
@@ -1884,6 +1929,39 @@ mod tests {
         let buf = drawn(&mut screen, area);
         assert_eq!(screen.found(), Some((1, 1)));
         assert!((0..5).any(|y| row(&buf, y).trim_end() == "row 20049"));
+    }
+
+    #[test]
+    fn drawn_anew_the_pages_stand_as_blank_rows_until_the_view_nears() {
+        let area = Rect::new(0, 0, 20, 5);
+        let (mut screen, _) = screen(rows(20_000..20_050), 20, 5);
+        screen.prepend(1, lines(10_000..13_000, "a line long enough to wrap"));
+        screen.prepend(2, rows(0..3_000));
+        drawn(&mut screen, area);
+        let pages = screen.pages();
+        assert_eq!(pages, vec![(2, 3_000), (1, 6_000)]);
+        // Only the newest rows are drawn again; the pages stand as blank
+        // rows as tall as they were, the view on the newest.
+        screen.clear();
+        screen.push(lines(20_000..20_050, "new"));
+        screen.blank(pages);
+        let buf = drawn(&mut screen, area);
+        assert_eq!(row(&buf, 4).trim_end(), "new 20049");
+        assert_eq!(screen.height(20), 9_050);
+        assert_eq!(screen.wanted(), None);
+        // Up near a page, it is wanted and drawn again in its place.
+        screen.scroll(6_000);
+        drawn(&mut screen, area);
+        assert_eq!(screen.wanted(), Some(1));
+        screen.fill(1, rows(10_000..13_000));
+        let buf = drawn(&mut screen, area);
+        assert!(row(&buf, 0).starts_with("row 1"));
+        screen.scroll(isize::MAX);
+        drawn(&mut screen, area);
+        assert_eq!(screen.wanted(), Some(2));
+        screen.fill(2, rows(0..3_000));
+        let buf = drawn(&mut screen, area);
+        assert_eq!(row(&buf, 0).trim_end(), "row 0");
     }
 
     #[test]
