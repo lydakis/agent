@@ -40,20 +40,42 @@ const SEEN: usize = 1024;
 /// How often a file a note shows is looked at for changes.
 const FRESH: Duration = Duration::from_secs(1);
 
+/// What the tool says to the bot: when a note earns its place, kept up
+/// to date, and on a lead that the person sees its margin, not its
+/// tasks'.
+fn description(lead: bool) -> String {
+    let mut text = String::from(
+        "Keep something beside the conversation, in the margin the person sees next to your \
+         replies. Post a note whenever your answer has a part the person will look at more than \
+         once: a diagram of how code or a system fits together (draw it in Mermaid), a table of \
+         results you measure or compare, or the file being discussed. Put that part in the note, \
+         and keep the reply to what it means, with a line pointing to the note, without walking \
+         the note's rows again. Skip the margin for a short answer the person reads once, and for \
+         the steps of your work, which belong in your plan. A note stays pinned to this point in \
+         the conversation, and the person can jump between it and here. Posting the same id again \
+         replaces that note in place: update one note as results come in, rather than posting \
+         another. When you or a task change what a note shows, such as code a diagram describes, \
+         post it again with the same id or remove it in that same turn, and remove a note once it \
+         no longer holds. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
+         fences and pictures included) or file (a path in your own folder, shown as the file \
+         stands and kept fresh as it changes; for a file in a task's copy, put its content in \
+         markdown instead, since that copy goes away with the task). Never put a question or \
+         anything the person must answer in a note.",
+    );
+    if lead {
+        text.push_str(
+            " The person sees your margin, not your tasks': when a task brings back a result \
+             worth keeping, such as a diagram, a table or what changed, put it in your margin.",
+        );
+    }
+    text
+}
+
 /// The `margin` tool as Sonny declares it on a bot.
-pub fn tool() -> Value {
+pub fn tool(lead: bool) -> Value {
     json!({
         "name": TOOL,
-        "description": "Keep something beside the conversation, in the margin the person sees next to it: \
-            a diagram, a table of findings, the file you are discussing, or a live view you update while \
-            you work. Use it for what the person will want to look at again as the conversation goes on, \
-            not for your answer itself. A note stays pinned to this point in the conversation, and the \
-            person can jump between it and here. Posting an id again replaces that note in place, so \
-            update one note rather than posting many; remove takes it away, and take away a note that \
-            no longer holds. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
-            fences and pictures included) or file (a path, shown as the file stands and kept fresh as it \
-            changes). Never put a question or anything the person must answer there, and never say the \
-            same thing in your reply: point to the note instead.",
+        "description": description(lead),
         "parameters": {
             "type": "object",
             "properties": {
@@ -594,7 +616,7 @@ pub fn closed(text: &str) -> Option<&str> {
 /// the tool's fields, each of its type. Applied as the call starts, a
 /// call it would refuse changes nothing.
 fn fits(arguments: &Value) -> bool {
-    let tool = tool();
+    let tool = tool(false);
     let properties = &tool["parameters"]["properties"];
     arguments.as_object().is_some_and(|fields| {
         fields
@@ -752,6 +774,14 @@ mod tests {
         // The conversation drawn again reads both calls once more.
         assert_eq!(margin.apply("c1", &post, None, None), None);
         assert!(margin.notes().is_empty());
+    }
+
+    #[test]
+    fn a_lead_hears_that_the_person_sees_its_margin_not_its_tasks() {
+        let said = |lead| tool(lead)["description"].as_str().unwrap().to_owned();
+        assert!(said(true).contains("not your tasks'"));
+        assert!(!said(false).contains("not your tasks'"));
+        assert_eq!(tool(true)["parameters"], tool(false)["parameters"]);
     }
 
     #[test]

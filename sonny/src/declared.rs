@@ -18,7 +18,7 @@ pub fn tools(lead: bool) -> Vec<Value> {
         crate::reactions::tool(),
         crate::asks::tool(),
         crate::plan::tool(),
-        crate::margin::tool(),
+        crate::margin::tool(lead),
     ];
     if lead {
         tools.push(crate::resolved::tool());
