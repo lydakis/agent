@@ -663,11 +663,16 @@ pub async fn open(
             .filter(|bot| lead_project(bot) == Some(project.as_str()))
             .unwrap_or_else(|| first.clone()),
     };
-    let found = match bot == first {
-        true => Some(found),
-        false => find(client, &bot).await?,
+    let (bot, found) = match bot == first {
+        true => (bot, found),
+        false => match find(client, &bot).await? {
+            Some(other) => (bot, other),
+            // The lead last written to is gone, or of another store: the
+            // first one opens.
+            None if *pick == Pick::Last => (first, found),
+            None => return Err(format!("lead_missing: {bot} is gone")),
+        },
     };
-    let found = found.ok_or_else(|| format!("lead_missing: {bot} is gone"))?;
     let there = found["workspace"].as_str().unwrap_or("");
     // One moved anywhere else is still this folder's, and comes back with
     // the next message, history and all.

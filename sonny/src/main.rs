@@ -2080,12 +2080,14 @@ impl Fleet {
         // lead opens there and its tasks are its own.
         let names = bots.iter().filter_map(|bot| bot["name"].as_str());
         self.leads.extend(inner_projects(names, &self.project));
-        // With other leads in the folder, their tasks are theirs.
+        // With other leads in the folder, their tasks are theirs; and to
+        // a lead other than the first, the first's are, gone or not.
         let first = self.lead == format!("{}.lead", self.project);
-        let shared = (bots.iter()).any(|bot| {
-            let name = bot["name"].as_str().unwrap_or("");
-            name != self.lead && project::lead_project(name) == Some(self.project.as_str())
-        });
+        let shared = !first
+            || (bots.iter()).any(|bot| {
+                let name = bot["name"].as_str().unwrap_or("");
+                name != self.lead && project::lead_project(name) == Some(self.project.as_str())
+            });
         let mine = shared.then(|| lineage_of(&bots, &self.lead, first));
         for bot in &bots {
             // Side chats are never tasks, as when they are made.
@@ -5437,10 +5439,11 @@ impl App {
         // With other leads in the folder, their tasks are theirs: each
         // lead shows as a row of its own.
         let listed = page["bots"].as_array().cloned().unwrap_or_default();
-        let shared = (listed.iter()).any(|bot| {
-            let name = bot["name"].as_str().unwrap_or("");
-            name != lead && project::lead_project(name) == Some(project.as_str())
-        });
+        let shared = lead != format!("{project}.lead")
+            || (listed.iter()).any(|bot| {
+                let name = bot["name"].as_str().unwrap_or("");
+                name != lead && project::lead_project(name) == Some(project.as_str())
+            });
         let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
             .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
         // Side chats are not the project's agents.
