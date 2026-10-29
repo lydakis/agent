@@ -798,6 +798,26 @@ counted as a binding drop; only `prefix_binding_mismatch` is. A live refusal
 was not reproduced, so the fallback path is covered by parser and
 synthetic-endpoint tests.
 
+A turn that ends with `provider_refusal` leaves what the declined request
+added since the model last answered (the prompt, when it was the turn's first
+request, or the latest tool results and any steer) out of later requests, as
+Anthropic's [streaming refusals](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/handle-streaming-refusals)
+guidance says to: "you must reset the conversation context before
+continuing... Attempting to continue without resetting will result in
+continued refusals." Each item becomes a note naming the refusal's category,
+so the model knows something was declined: a tool result keeps its call with
+`[This tool result is left out: ...]`, and a message becomes `[A message here
+is left out: ...]`. A note is padded with spaces to the size of the item it
+replaces, so the context's byte accounting does not change; a shorter wording
+is used where the full one does not fit, and an item too small for any keeps
+its own. Everything before it is unchanged, so no thinking binding or prompt
+cache is touched. The originals stay in the `declined` table (schema 61):
+turn listings and the history reads (`history_items`, `history_read`,
+`history_search`, `result`) show them, and a retry with the same request id
+still matches the person's prompt. A node another bot also reaches, as a fork taken while the
+request was out does, is that bot's history too: it and what came before it
+stay as they are.
+
 `effort` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`.
