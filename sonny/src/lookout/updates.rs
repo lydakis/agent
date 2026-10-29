@@ -33,6 +33,8 @@ const PENDING: usize = 128;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
+/// How long a goal's turn waits for its check, which says sooner.
+const GOAL_HOLD: Duration = Duration::from_secs(super::goals::TIMEOUT_MAX_S + 60);
 const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
@@ -55,6 +57,8 @@ struct Turn {
     which: Option<String>,
     /// The turn resolved the task, with the task's own `resolve_task`.
     resolved: bool,
+    /// How the task's goal ended with this turn.
+    goal: Option<String>,
 }
 
 /// A message written in a task: who wrote it, and the words, only when
@@ -175,6 +179,8 @@ pub struct Updates {
     /// Turns whose answer a trigger passes to the lead: when they become
     /// news if it does not, and the news.
     forwarding: HashMap<Key, (Instant, String, Option<String>, Option<String>)>,
+    /// Turns whose end waits for their goal's check, until it says.
+    goaled: HashSet<Key>,
     /// Approvals not yet answered: when they become news, and the call.
     approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Each task's news, in the order it first came.
@@ -212,6 +218,7 @@ impl Updates {
             origin: HashMap::new(),
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
+            goaled: HashSet::new(),
             approvals: HashMap::new(),
             tasks: Vec::new(),
             quiet: HashMap::new(),
@@ -409,7 +416,12 @@ impl Updates {
                     .creator(name)
                     .and_then(|c| self.bots.get(c))
                     .and_then(|c| c.id);
-                if answered.is_some() && answered == creator {
+                if self.goaled.remove(&key(turn)) {
+                    // News once its goal's check says, or once a check
+                    // could have run its longest.
+                    self.forwarding
+                        .insert(key(turn), (now + GOAL_HOLD, status, from, origin));
+                } else if answered.is_some() && answered == creator {
                     self.forwarding
                         .insert(key(turn), (now + FORWARD, status, from, origin));
                 } else {
@@ -533,6 +545,7 @@ impl Updates {
             count: 1,
             which,
             resolved,
+            goal: None,
         };
         news.merge(match theirs {
             true => News {
@@ -581,6 +594,36 @@ impl Updates {
         for key in waited {
             if let Some((_, call)) = self.approvals.remove(&key) {
                 self.tell(&key.0, key.1, APPROVAL, None, call, None);
+            }
+        }
+    }
+
+    /// A turn about to end whose goal's check runs once it does: its end
+    /// waits for `goal_settled`.
+    pub fn goal_turn(&mut self, name: &str, turn: i64) {
+        if self.live {
+            self.goaled.insert((name.to_owned(), turn));
+        }
+    }
+
+    /// The goal's check of a turn said: no news when the task works again
+    /// (`None`), else the turn, with how its goal ended after its status.
+    pub fn goal_settled(&mut self, name: &str, turn: i64, outcome: Option<&str>) {
+        self.goaled.remove(&(name.to_owned(), turn));
+        let Some((_, status, from, origin)) = self.forwarding.remove(&(name.to_owned(), turn))
+        else {
+            return;
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        self.tell(name, turn, &status, from, None, origin);
+        let news = (self.tasks.iter_mut()).find(|(task, _)| task == name);
+        if let Some((_, news)) = news {
+            for told in [&mut news.act, &mut news.theirs].into_iter().flatten() {
+                if told.turn == turn && !outcome.is_empty() {
+                    told.goal = Some(outcome.to_owned());
+                }
             }
         }
     }
@@ -753,6 +796,7 @@ impl Updates {
     pub fn forget(&mut self) {
         self.tasks.clear();
         self.forwarding.clear();
+        self.goaled.clear();
         self.approvals.clear();
     }
 
@@ -790,6 +834,7 @@ impl Updates {
     fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
+        self.goaled.retain(|(task, _)| task != name);
         self.approvals.retain(|(task, _), _| task != name);
         self.noted.retain(|(task, _)| task != name);
     }
@@ -867,6 +912,9 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     }
     if t.resolved {
         text.push_str(", and resolved itself");
+    }
+    if let Some(goal) = &t.goal {
+        text.push_str(goal);
     }
     if t.count > 1 {
         text.push_str(&format!(
@@ -1163,6 +1211,47 @@ mod tests {
             "completed",
         );
         assert!(updates.due(false));
+    }
+
+    #[test]
+    fn a_goal_s_turns_are_news_only_once_it_ends() {
+        let mut updates = fleet();
+        let lead = json!({"from": {"bot": "shop.lead", "turn": 9}});
+        let goal = json!({"origin": "goal"});
+        // The check failed and the task works again: no news.
+        updates.goal_turn("shop.fix", 4);
+        turn(&mut updates, "shop.fix", 4, lead.clone(), "completed");
+        assert!(!updates.due(false), "held for its check");
+        updates.goal_settled("shop.fix", 4, None);
+        assert!(!updates.due(false), "it works again");
+        // The check passed: the turn, with how the goal ended.
+        updates.goal_turn("shop.fix", 5);
+        turn(&mut updates, "shop.fix", 5, goal.clone(), "completed");
+        updates.goal_settled(
+            "shop.fix",
+            5,
+            Some(", and met its goal: `make test` exits 0"),
+        );
+        let told = updates.take();
+        assert_eq!(
+            text(&told),
+            "- shop.fix: turn:shop.fix/5 completed, asked by goal, and met its goal: `make test` exits 0"
+        );
+        updates.sent(told);
+        // Cleared while its check ran: plain news.
+        updates.goal_turn("shop.docs", 2);
+        turn(&mut updates, "shop.docs", 2, lead, "completed");
+        updates.goal_settled("shop.docs", 2, Some(""));
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.docs: turn:shop.docs/2 completed, asked by you"
+        );
+        // A check that never says lets the turn go once it could have run
+        // its longest.
+        updates.goal_turn("shop.docs", 3);
+        turn(&mut updates, "shop.docs", 3, goal, "completed");
+        updates.expire(Instant::now() + GOAL_HOLD);
+        assert!(text(&updates.take()).starts_with("- shop.docs: turn:shop.docs/3 completed"));
     }
 
     #[test]

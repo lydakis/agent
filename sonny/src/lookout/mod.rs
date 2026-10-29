@@ -15,6 +15,7 @@
 //! tools Sonny answers (`served`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
+pub(crate) mod goals;
 pub(crate) mod subs;
 mod updates;
 
@@ -1225,7 +1226,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         store: settings.store.clone(),
         records: HashMap::new(),
         subscribers: HashMap::new(),
-        socket: settings.socket,
+        socket: settings.socket.clone(),
         judge: settings.judge,
         lookouts: HashMap::new(),
         judges: HashMap::new(),
@@ -1234,6 +1235,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         live: false,
         cursor: None,
         saved: None,
+        goals: goals::Goals::new(&settings.store, &settings.socket),
         resume: std::fs::read_to_string(cursor_path(&settings.store))
             .ok()
             .and_then(|text| text.trim().parse().ok()),
@@ -1294,6 +1296,8 @@ struct Service {
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
     saved: Option<i64>,
+    /// The agents' goals, whose turns it holds until their checks say.
+    goals: goals::Goals,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
 }
@@ -1402,6 +1406,7 @@ impl Service {
         // again.
         self.resume = self.floor().or(self.resume);
         let (done, mut results) = tokio::sync::mpsc::channel(64);
+        let (checked, mut settled) = tokio::sync::mpsc::channel(64);
         // Checks a dropped connection left under way answer the old
         // channel, never this one: none is under way here yet.
         for lookout in self.lookouts.values_mut() {
@@ -1445,6 +1450,13 @@ impl Service {
                         self.records.remove(name);
                         self.lookouts.remove(name);
                     }
+                    // A turn whose goal's check is to run is news only once
+                        // it says how the goal stands.
+                        if let Some((bot, turn)) = self.goals.event(&event, live, &client, &checked) {
+                            for lookout in self.lookouts.values_mut() {
+                                lookout.updates.goal_turn(&bot, turn);
+                            }
+                        }
                     for lookout in self.lookouts.values_mut() {
                         lookout.event(&event);
                         // The oldest event whose news is not told yet: a
@@ -1469,6 +1481,11 @@ impl Service {
                             self.go_live(&client).await;
                         }
                         continue;
+                    }
+                }
+                Some(goals::Settled { bot, turn, outcome }) = settled.recv() => {
+                    for lookout in self.lookouts.values_mut() {
+                        lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
                     }
                 }
                 Some((lead, id, seen, step)) = results.recv() => {
@@ -1511,6 +1528,7 @@ impl Service {
                     // one this lookout answered, else now and then.
                     if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
+                        self.goals.reread();
                         let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
                         if read != self.subscribers {
                             self.subscribers = read;
@@ -3727,6 +3745,7 @@ mod tests {
             live: false,
             cursor: None,
             saved: None,
+            goals: goals::Goals::new(&store, Path::new("")),
             resume: None,
         };
         service.lookouts.insert("calc.lead".into(), lookout());
@@ -3790,6 +3809,7 @@ mod tests {
             live: true,
             cursor: None,
             saved: None,
+            goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             resume: None,
         };
         // Named like a lead, it is a bot like any other.

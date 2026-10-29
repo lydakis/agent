@@ -283,6 +283,57 @@ class ServedToolTests(ModelFixture):
         self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
+    def note_for(self, bot, having, timeout=30):
+        """The first note the lookout gave `bot` that says `having`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
+                text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
+                if text and text[0]['text'].startswith('Task updates: ') and having in text[0]['text']:
+                    return text[0]['text']
+            time.sleep(.2)
+        self.fail(f'{bot} heard nothing saying {having!r}')
+
+    def goal_run(self, check):
+        """calc.fix sets itself a goal with `check`, watched by a lead that
+        hears its turns: the lead's note once the goal ends, and the
+        prompts of calc.fix's turns."""
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.')
+        self.daemon.request('create', bot='calc.fix', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Task.', declare=[declared('goal')])
+        folder = self.path / 'state.sqlite.lookout'
+        folder.mkdir(exist_ok=True)
+        watch = {'name': 'tasks', 'tasks_of': [], 'bots': ['calc.fix'], 'on': ['said', 'ended'], 'updates': True}
+        (folder / 'calc.lead.json').write_text(json.dumps({'subscriptions': [watch]}))
+        self.lookout()
+        set_ = json.loads(self.call('calc.fix', 'goal', {'set': {'done_when': 'the flag exists', 'check': check}}))
+        self.assertIn('goal', set_, set_)
+        self.assertEqual(set_['goal']['check'], check)
+        note = self.note_for('calc.lead', 'its goal')
+        prompts = [self.daemon.request('prompts', bot='calc.fix', turn=t['turn'])['result']['prompts'][0]['text']
+                   for t in self.daemon.request('turns', bot='calc.fix')['result']['turns']]
+        return note, prompts
+
+    def test_a_goal_keeps_its_agent_working_until_its_check_passes(self):
+        # Fails once, leaving the flag that passes it the next time.
+        note, prompts = self.goal_run('test -f flag || { touch flag; echo not yet; exit 1; }')
+        self.assertEqual(len(prompts), 2, prompts)
+        self.assertTrue(prompts[1].startswith('Your goal is not met yet: `test -f flag'), prompts[1])
+        self.assertIn('exits 1.\n```\nnot yet\n```\nKeep working until the flag exists.', prompts[1])
+        # The lead hears the turn that met it, and nothing of the one before.
+        self.assertIn('- calc.fix: turn:calc.fix/2 completed, asked by goal, and met its goal:', note)
+        self.assertNotIn('calc.fix/1', note)
+        self.assertFalse((self.path / 'state.sqlite.lookout/goals/calc.fix.json').exists())
+
+    def test_a_goal_whose_agent_only_answers_stops(self):
+        note, prompts = self.goal_run('false')
+        # The turn that set it called the tool; two that only answered end it.
+        self.assertEqual(len(prompts), 3, prompts)
+        self.assertIn('turn:calc.fix/3 completed, asked by goal, and stopped pursuing its goal: 2 turns in a row',
+                      note)
+        self.assertIn('`false` still exits 1', note)
+
     def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('triggers')])
