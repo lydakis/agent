@@ -3398,6 +3398,10 @@ impl App {
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
                     self.said_at.insert(node, first_words(&text(item)));
+                    // A lead's reaction read before the message landed.
+                    for (by, emoji) in self.picked.on(node).to_vec() {
+                        self.draw_picked(node, &by, &emoji);
+                    }
                     self.answered(&text(item));
                 }
             }
@@ -3418,6 +3422,10 @@ impl App {
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
                     self.said_at.insert(node, first_words(&text(item)));
+                    // A lead's reaction read before the message landed.
+                    for (by, emoji) in self.picked.on(node).to_vec() {
+                        self.draw_picked(node, &by, &emoji);
+                    }
                     self.answered(&text(item));
                 }
             }
