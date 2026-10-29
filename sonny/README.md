@@ -82,8 +82,13 @@ each start, as it writes its skills: it rewrites a file when its text
 changes, and writes it again once it is deleted, but never over an edit,
 since it notes a fingerprint of what it wrote in `~/.agent/sonny/agents`,
 and a file that no longer matches, or one Sonny never wrote, is the
-person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
-first. The task settings from `.agents/project.toml` are composed after
+person's. When a new Sonny brings new text for a role or skill you
+edited, it sets that text beside yours in `~/.agent/sonny/upgrades`, with
+what you started from in `~/.agent/sonny/shipped` when it kept it, and
+the first bot you open after the upgrade tells you and offers to bring
+Sonny's changes into your copy. A copy left the same as Sonny's new text
+is Sonny's again from the next start. A folder's own
+`.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
 #### Roles for leads and tasks
@@ -526,7 +531,8 @@ those schedulers run too; Sonny's own agents use the
 `memory` and `triggers` tools instead, which the lookout answers outside
 their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
-it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
+it alone, offering its new text through the first bot you open after an
+upgrade, as for its roles. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 [docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,

@@ -1175,6 +1175,15 @@ fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return Some(sourced(rest));
     }
+    // "- the lead role: theirs at …" is the lead role.
+    if let Some(rest) = text.strip_prefix(crate::skills::UPGRADED) {
+        let mut parts = vec!["Sonny upgraded".to_owned()];
+        parts.extend(rest.lines().filter_map(|line| {
+            let what = line.strip_prefix("- the ")?.split_once(": ")?.0;
+            Some(format!("{what} edited"))
+        }));
+        return Some(parts);
+    }
     let rest = text.strip_prefix(TASK_UPDATES)?;
     let kind = "Task updates";
     let mut parts = vec![kind.to_owned()];
@@ -2410,6 +2419,21 @@ mod tests {
             [
                 "↳ Task updates · shop.fix turn failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
             ]
+        );
+    }
+
+    #[test]
+    fn sonnys_upgrade_note_reads_as_one_quiet_row() {
+        let note = format!(
+            "{}this Sonny ships new text for skills or roles of its own that the person edited.\n\
+             - the lead role: theirs at /h/.agents/agents/lead.md; Sonny's new text at /u/lead.md; Sonny's previous text was not kept\n\
+             - the plan skill: theirs at /h/.agents/skills/plan; Sonny's new text at /u/plan; Sonny's previous text was not kept\n\
+             Tell the person, and ask whether they want you to bring Sonny's changes into their copies.",
+            crate::skills::UPGRADED
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 90)),
+            ["↳ Sonny upgraded · lead role edited · plan skill edited"]
         );
     }
 

@@ -935,6 +935,11 @@ async fn run() -> Result<(), String> {
     app.project = project;
     // Sonny's welcome heads a lead's conversation, though not a side chat.
     app.welcome = options.side.is_none();
+    // The first bot opened since an upgrade tells the person what it left
+    // beside their edits; a side chat leaves it to its agent.
+    if options.side.is_none() {
+        app.upgrades = skills::upgraded();
+    }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
@@ -1653,6 +1658,9 @@ struct App {
     verbose: bool,
     /// The lead's instructions as composed now, sent once no turn runs.
     instruct: Option<String>,
+    /// What Sonny's upgrade set beside the person's own edits, told to the
+    /// bot once it is set up.
+    upgrades: Option<skills::Upgrades>,
     /// The folder the next message moves the bot to: its lead moved away.
     move_to: Option<String>,
     /// The name under which Sonny notes the instructions it wrote.
@@ -2297,6 +2305,7 @@ impl App {
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
+            upgrades: None,
             move_to: None,
             lead: String::new(),
             retry: None,
@@ -2376,6 +2385,7 @@ impl App {
             status_report("idle", &self.bot);
         }
         self.configure().await;
+        self.tell_upgrades().await;
         let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel();
         let paused = self.keys_paused.clone();
         // Poll, not a bare read: a blocked read holds crossterm's reader
@@ -2578,6 +2588,30 @@ impl App {
                 move || place::read(std::path::Path::new(&dir))
             });
             self.place_job = Some((dir, job));
+        }
+    }
+
+    /// What Sonny's upgrade set beside the person's edits, told to the bot
+    /// after any turn it runs, so it asks the person whether to bring it in.
+    async fn tell_upgrades(&mut self) {
+        let Some(upgrades) = self.upgrades.take() else {
+            return;
+        };
+        if upgrades.note().is_empty() {
+            upgrades.told();
+            return;
+        }
+        let asked = json!({"bot": self.bot, "prompt": upgrades.note(),
+            "request_id": upgrades.request_id(), "delivery": "queue",
+            "origin": skills::UPGRADE_ORIGIN});
+        match self.client.request("submit", asked).await {
+            Ok(_) => upgrades.told(),
+            // Told it already.
+            Err(error) if error.code == "idempotency_conflict" => upgrades.told(),
+            Err(error) => {
+                upgrades.back();
+                self.notice = Some(format!("telling of Sonny's upgrade: {error}"));
+            }
         }
     }
 
