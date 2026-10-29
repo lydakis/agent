@@ -230,6 +230,28 @@ fn body_read(json: &Value) -> Option<Body> {
     }
 }
 
+/// The note a bot's history `item` changes in its margin, and how: a
+/// `margin` call its margin takes, or the person's message taking one
+/// away, read as a call that does.
+fn changed(item: &Value) -> Option<(String, Value)> {
+    if item["role"] == "user" {
+        let said = match &item["content"] {
+            Value::Array(parts) => parts.iter().find_map(|part| part["text"].as_str()),
+            content => content.as_str(),
+        };
+        let id = closed(said?)?;
+        return Some((id.to_owned(), json!({"id": id, "remove": true})));
+    }
+    if item["type"] != "function_call" || item["name"] != TOOL {
+        return None;
+    }
+    let arguments = (item["arguments"].as_str())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(fits)?;
+    let id = arguments["id"].as_str()?.trim().to_owned();
+    Some((id, arguments))
+}
+
 /// The bot and the note a `from` names, as `bot/id`.
 pub fn from(text: &str) -> Option<(String, String)> {
     let (bot, id) = text.trim().rsplit_once('/')?;
@@ -253,6 +275,9 @@ pub struct Reference {
     file: Option<String>,
     /// Taken away there since it was last posted.
     removed: bool,
+    /// The notes its margin holds, oldest first, as far as read: one
+    /// put there past [`MOST_NOTES`] takes the oldest away.
+    held: Vec<String>,
     /// The note it shows of another bot's, when it shows one, as read
     /// from there: one step on, no further.
     pub through: Option<Box<Reference>>,
@@ -265,19 +290,24 @@ impl Reference {
     /// `id` change what is shown.
     pub fn read(&mut self, id: &str, items: &[Value]) {
         for item in items {
-            if item["type"] != "function_call" || item["name"] != TOOL {
+            let Some((at, arguments)) = changed(item) else {
                 continue;
-            }
-            let arguments = (item["arguments"].as_str())
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .unwrap_or_default();
-            // Only what its own margin takes.
-            if !fits(&arguments) || arguments["id"].as_str().map(str::trim) != Some(id) {
-                continue;
-            }
-            // Taken away there, it stays here, and a new one starts untitled.
+            };
+            // Taken away there, by the bot, the person or one put there
+            // past the most it holds, it stays here, and a new one starts
+            // untitled.
             if arguments["remove"] == true {
-                self.removed = true;
+                self.held.retain(|held| *held != at);
+                self.removed |= at == id;
+                continue;
+            }
+            if !self.held.contains(&at) {
+                self.held.push(at.clone());
+                if self.held.len() > MOST_NOTES {
+                    self.removed |= self.held.remove(0) == id;
+                }
+            }
+            if at != id {
                 continue;
             }
             // Kept, as there, when changed without one.
@@ -317,14 +347,8 @@ impl Reference {
     /// once, or take it away: what is shown from there on can be read
     /// without older ones.
     pub fn starts(id: &str, items: &[Value]) -> bool {
-        items.iter().any(|item| {
-            let arguments = (item["arguments"].as_str())
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .unwrap_or_default();
-            item["type"] == "function_call"
-                && item["name"] == TOOL
-                && fits(&arguments)
-                && arguments["id"].as_str().map(str::trim) == Some(id)
+        items.iter().filter_map(changed).any(|(at, arguments)| {
+            at == id
                 && (arguments["remove"] == true
                     || arguments["title"]
                         .as_str()
@@ -1130,6 +1154,51 @@ mod tests {
         assert_eq!(again.notes, margin.kept.notes);
         assert_eq!(again.seen, margin.kept.seen);
         assert!(again.closed);
+    }
+
+    #[test]
+    fn a_task_s_note_taken_away_by_the_person_or_by_newer_ones_starts_again_empty() {
+        let call = |arguments: Value| json!({"type": "function_call", "name": TOOL, "arguments": arguments.to_string()});
+        let closed = |id: &str| json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": closed_message(id)}]});
+        // Taken away by the person there: no longer read, and put there
+        // again with a title only, it shows nothing.
+        let mut reference = Reference::default();
+        reference.workspace = Some("/work/calc.add".into());
+        reference.read(
+            "flow",
+            &[
+                call(json!({"id": "flow", "title": "Flow", "file": "src/flow.rs"})),
+                closed("other"),
+            ],
+        );
+        assert!(reference.file().is_some());
+        let taken = [closed("flow")];
+        assert!(Reference::starts("flow", &taken));
+        reference.read("flow", &taken);
+        assert!(reference.removed());
+        assert_eq!(reference.file(), None);
+        reference.read("flow", &[call(json!({"id": "flow", "title": "Again"}))]);
+        let (title, body, _) = reference.shown().unwrap();
+        assert_eq!((title, body), ("Again", Body::Markdown(String::new())));
+        // Put out by as many newer ones as its margin holds, it goes as
+        // there; one fewer, taken away or changed again, keeps it.
+        let mut reference = Reference::default();
+        let mut items = vec![call(
+            json!({"id": "flow", "title": "Flow", "markdown": "one"}),
+        )];
+        items.push(call(json!({"id": "n0", "markdown": "-"})));
+        items.push(call(json!({"id": "n0", "remove": true})));
+        for n in 1..MOST_NOTES {
+            items.push(call(json!({"id": format!("n{n}"), "markdown": "-"})));
+            items.push(call(json!({"id": format!("n{n}"), "markdown": "again"})));
+        }
+        reference.read("flow", &items);
+        assert!(!reference.removed());
+        reference.read("flow", &[call(json!({"id": "last", "markdown": "-"}))]);
+        assert!(reference.removed());
+        reference.read("flow", &[call(json!({"id": "flow", "title": "New"}))]);
+        let (title, body, _) = reference.shown().unwrap();
+        assert_eq!((title, body), ("New", Body::Markdown(String::new())));
     }
 
     #[test]
