@@ -14,6 +14,8 @@ use ratatui::{
 pub struct Row {
     /// The agent's name in its project: `lead`, or the task's.
     pub name: String,
+    /// The agent's own name, which a click on its row opens.
+    pub bot: String,
     pub state: String,
     /// Whether a turn of its runs.
     pub running: bool,
@@ -137,8 +139,8 @@ pub fn plain_line(text: &str) -> String {
 }
 
 /// The lead, then its tasks by group, resolved ones only counted unless
-/// `resolved` shows them; and the line each agent's rows start on, by
-/// its name, for a click there to open it.
+/// `resolved` shows them; and the line each agent's rows start on, with
+/// its bot, for a click there to open it.
 pub fn card(
     project: &str,
     rows: &[Row],
@@ -164,7 +166,7 @@ pub fn card(
     }
     let mut out = vec![Line::from(head).bold()];
     for row in rows.iter().filter(|r| r.name == "lead") {
-        named.push((out.len(), row.name.clone()));
+        named.push((out.len(), row.bot.clone()));
         out.extend(row_lines(row, width));
     }
     for group in [
@@ -188,7 +190,7 @@ pub fn card(
             Span::raw(format!(" · {n}")).dim(),
         ]));
         for row in tasks.iter().filter(|r| r.group == group) {
-            named.push((out.len(), row.name.clone()));
+            named.push((out.len(), row.bot.clone()));
             out.extend(row_lines(row, width));
         }
     }
@@ -313,6 +315,7 @@ mod tests {
     fn the_card_puts_the_lead_first_and_groups_its_tasks() {
         let row = |name: &str, state: &str, group: Group| Row {
             name: name.into(),
+            bot: format!("calc.{name}"),
             state: state.into(),
             running: matches!(group, Group::Working | Group::NeedsYou),
             seconds: Some(42),
@@ -353,7 +356,10 @@ mod tests {
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
         let (_, named) = card("calc", &rows, 100, false);
         let named: Vec<(usize, &str)> = named.iter().map(|(at, n)| (*at, n.as_str())).collect();
-        assert_eq!(named, [(1, "lead"), (5, "zero"), (9, "equal")]);
+        assert_eq!(
+            named,
+            [(1, "calc.lead"), (5, "calc.zero"), (9, "calc.equal")]
+        );
         let shown = text(true);
         assert_eq!(shown[shown.len() - 3], "Resolved · 1");
         assert_eq!(shown[shown.len() - 2], " ✓ old done · took 42s");

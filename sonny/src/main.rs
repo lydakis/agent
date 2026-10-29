@@ -4280,11 +4280,20 @@ impl App {
         (self.screen).replace_tagged(screen::Tag::Group(at as u64), lines, marks)
     }
 
-    /// The cluster the message between agents at `node` is in.
+    /// The cluster the message between agents at `node` is in: the one
+    /// drawn, when a page drawn again put it in a newer one too.
     fn cluster_of(&self, node: i64) -> Option<usize> {
-        (self.clusters.iter())
-            .find(|(_, cluster)| cluster.messages.iter().any(|m| m.node == node))
-            .map(|(at, _)| *at)
+        let holding = (self.clusters.iter().rev())
+            .filter(|(_, cluster)| cluster.messages.iter().any(|m| m.node == node))
+            .map(|(at, _)| *at);
+        let mut newest = None;
+        for at in holding {
+            if self.kept(screen::Tag::Group(at as u64)) {
+                return Some(at);
+            }
+            newest.get_or_insert(at);
+        }
+        newest
     }
 
     /// Commit a quiet row of what went on around the work (a fold of
@@ -6067,6 +6076,7 @@ impl App {
             };
             rows.push(status::Row {
                 name: short(name, &project, &lead),
+                bot: name.to_owned(),
                 state,
                 running,
                 seconds,
@@ -9069,8 +9079,7 @@ fn watch_card(
         card.insert(1, Line::from(watch.lookout.clone()).dim());
     }
     let marks = (named.into_iter())
-        .map(|(at, name)| (at + usize::from(lookout && at >= 1), name))
-        .map(|(at, name)| (at, format!("{}.{name}", watch.project)))
+        .map(|(at, bot)| (at + usize::from(lookout && at >= 1), bot))
         .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
@@ -11100,6 +11109,25 @@ mod tests {
         // The person's own words are drawn as ever.
         app.land(7, "thanks", None, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
+        // A message a page drawn again put in a newer cluster opens there,
+        // not in the cluster its rows were let go from.
+        app.next_group = 9;
+        app.land(8, updates, None, false);
+        let stale = Cluster {
+            messages: vec![Clustered {
+                node: 8,
+                kind: "task update",
+                names: Vec::new(),
+                calls: Vec::new(),
+            }],
+            open: false,
+        };
+        app.clusters.insert(1, stale);
+        app.press("said/8").await;
+        assert_eq!(
+            drawn(&mut app).last().unwrap(),
+            "  - calc.neg: turn:calc.neg/3 completed"
+        );
     }
 
     #[tokio::test]
@@ -11704,8 +11732,9 @@ mod tests {
 
     #[test]
     fn status_links_each_agent_but_this_one_to_open_it() {
-        let row = |name: &str, group| status::Row {
+        let row = |name: &str, bot: &str, group| status::Row {
             name: name.into(),
+            bot: bot.into(),
             state: "working".into(),
             group,
             ..Default::default()
@@ -11713,8 +11742,9 @@ mod tests {
         let watch = Watch {
             project: "calc".into(),
             rows: vec![
-                row("lead", status::Group::Working),
-                row("neg", status::Group::Working),
+                row("lead", "calc.lead.review", status::Group::Working),
+                row("first lead", "calc.lead", status::Group::Working),
+                row("neg", "calc.neg", status::Group::Working),
             ],
             read: Instant::now(),
             lookout: "Lookout · on".into(),
@@ -11723,7 +11753,9 @@ mod tests {
             usage: None,
             picked: None,
         };
-        let (lines, _, marks) = watch_card(&watch, 80, "calc.lead");
+        // A named lead's window: its own row opens nothing, and the
+        // folder's other lead opens by its own name, not its label.
+        let (lines, _, marks) = watch_card(&watch, 80, "calc.lead.review");
         let link = |at: usize| {
             (marks.iter())
                 .find(|(on, _)| *on == at)
@@ -11739,8 +11771,18 @@ mod tests {
                 screen::BUTTON
             )))
         );
+        let first = (lines.iter())
+            .position(|line| line.to_string().contains("first lead working"))
+            .unwrap();
+        assert_eq!(
+            link(first),
+            Some(screen::Mark::Link(format!(
+                "{}task/calc.lead",
+                screen::BUTTON
+            )))
+        );
         // This window's own agent opens nothing.
-        assert_eq!(marks.len(), 1);
+        assert_eq!(marks.len(), 2);
     }
 
     #[tokio::test]
