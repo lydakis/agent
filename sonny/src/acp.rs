@@ -29,6 +29,9 @@ const VERSION: i64 = 2;
 /// The most of a call's output a thread is shown.
 const OUTPUT_BYTES: usize = 8 * 1024;
 
+/// The longest the person's prompt waits for its tasks' threads to open.
+const OPENING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// JSON-RPC's codes for what Sonny refuses.
 const INVALID_PARAMS: i64 = -32602;
 const NOT_FOUND: i64 = -32601;
@@ -407,9 +410,10 @@ struct State {
     /// idle; a new lead starts on it.
     picked: Option<String>,
     /// Tasks whose threads are opening, as children of the person's prompt
-    /// while it runs, and that prompt's answer, held until they are open.
+    /// while it runs, and the answers of the prompts whose turns ended
+    /// meanwhile, held until they are open.
     opening: usize,
-    held: Option<(Value, Value)>,
+    held: Vec<(Value, Value)>,
 }
 
 struct Bound {
@@ -1099,20 +1103,28 @@ impl Session {
                         .and_then(|sessions| sessions.get(&self.id).cloned());
                     if let Some(session) = this {
                         state.opening += 1;
+                        let session_id = session.id.clone();
                         let agent = agent.clone();
                         tokio::spawn(async move {
-                            let at = Where {
-                                project: &project,
-                                workspace: &workspace,
-                                thread: &session.cwd,
-                            };
-                            open_task(&agent, &session.id, &client, &at, &arguments, &call).await;
+                            let (opener, thread) = (agent.clone(), session.cwd.clone());
+                            let opening = tokio::spawn(async move {
+                                let at = Where {
+                                    project: &project,
+                                    workspace: &workspace,
+                                    thread: &thread,
+                                };
+                                let session = &session_id;
+                                open_task(&opener, session, &client, &at, &arguments, &call).await;
+                            });
+                            // The person's prompt waits for its tasks' threads,
+                            // not for ever: one still opening opens on its own.
+                            let _ = tokio::time::timeout(OPENING, opening).await;
                             let mut state = session.state.lock().await;
                             state.opening -= 1;
-                            if state.opening == 0
-                                && let Some((prompt, result)) = state.held.take()
-                            {
-                                agent.out.answer(&prompt, result);
+                            if state.opening == 0 {
+                                for (prompt, result) in std::mem::take(&mut state.held) {
+                                    agent.out.answer(&prompt, result);
+                                }
                             }
                         });
                     }
@@ -1168,7 +1180,7 @@ impl Session {
                     // A task T3 Code opens as a child of this prompt opens
                     // while its run is on.
                     if state.opening > 0 {
-                        state.held = Some((prompt, result));
+                        state.held.push((prompt, result));
                     } else {
                         out.answer(&prompt, result);
                     }
@@ -1515,7 +1527,7 @@ async fn open_task(
         // may open yet, so its task still waits for it and no other thread
         // is opened for it.
         let delegating = t3.call("delegate_task", child);
-        match tokio::time::timeout(std::time::Duration::from_secs(30), delegating).await {
+        match tokio::time::timeout(OPENING, delegating).await {
             Ok(Ok(delegated)) => return Ok(delegated),
             Ok(Err(_)) => {}
             Err(_) => return Ok(Value::Null),
