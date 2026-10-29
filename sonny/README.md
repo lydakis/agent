@@ -225,7 +225,7 @@ yours to an older reply goes under that reply.
   the conversation.
   The copy answers from the agent's history and may call no tool;
   follow-ups stay with it, and Esc goes back. In the pane, every key goes
-  to the side chat but Ctrl+], which goes back to the main composer
+  to the side chat but Ctrl+\, which goes back to the main composer
   while the side chat stays open. The agent carries on meanwhile, in
   view. The daemon
   deletes the copy once it has been idle 15 minutes (`fork --expires`), and
@@ -433,8 +433,9 @@ The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
 working, needs you, done, failed), read again every few seconds. A click
 on a task opens it in the pane: its own Sonny, live, to watch and to talk
-to, as a side chat is. Ctrl+] takes the keys back to the conversation and
-gives them to the pane again; Esc in the conversation closes the pane.
+to, as a side chat is. Ctrl+\ takes the keys back to the conversation and
+gives them to the pane again; from the conversation Ctrl+[ hides the task
+and Ctrl+] shows it again.
 
 ![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
 
@@ -466,15 +467,19 @@ row's end (M changed, A added, D deleted, R renamed, U new, a dot on a
 folder that holds a change, ignored ones dim). A click on a picture,
 diagram or page in the conversation opens it in the pane, bigger. A
 link in what the pane shows opens there too, and the pane goes back and
-forward as a browser does: ‹ and › in its title, or ← and → (Backspace
-back) while keys go to it, each page as it was left. The pane scrolls,
+forward as a browser does: ‹ and › in its title, Ctrl+[ and Ctrl+]
+wherever the keys are, or ← and → (Backspace back) while keys go to it,
+each page as it was left. Back from the first page closes the pane, and
+Ctrl+] opens again the pane closed last, Esc's included. Without the
+kitty keyboard protocol Ctrl+[ is Esc itself, and a program in the pane
+keeps both brackets. The pane scrolls,
 selects and copies as the conversation does; a click on its name opens
 the file in the app the system opens it with, and Esc closes it. Links
 are the terminal's own links too, so its link click (Cmd+click, or
 Shift+Cmd+click in Ghostty) opens a file outside Sonny from the
 conversation. Keys go
-to the pane after a click in it; Ctrl+] (or Tab, in a pane that is not a
-chat) takes them back to the composer, and Ctrl+], or Tab with nothing
+to the pane after a click in it; Ctrl+\ (or Tab, in a pane that is not a
+chat) takes them back to the composer, and Ctrl+\, or Tab with nothing
 typed, puts them in the pane again. Sonny binds no Shift+Tab: multiplexers
 switch tabs with it. A window too narrow for
 both shows the one the keys are in. Ctrl+F finds text in

@@ -1127,11 +1127,25 @@ struct Relayed {
     text: Option<String>,
 }
 
-/// Ctrl+], which moves the keys between the conversation and the pane:
+/// Ctrl+\, which moves the keys between the conversation and the pane:
 /// no terminal or multiplexer takes it, as many take Shift+Tab. Without
-/// the keyboard protocol it arrives as Ctrl+5.
+/// the keyboard protocol it arrives as Ctrl+4.
 fn switches(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']' | '5'))
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
+}
+
+/// Whether `key` steps the pane back (Ctrl+[) or forward (Ctrl+]), as a
+/// browser's keys do. Without the keyboard protocol Ctrl+[ is Esc, and
+/// Ctrl+] arrives as Ctrl+5.
+fn steps(key: &KeyEvent) -> Option<bool> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('[') => Some(true),
+        KeyCode::Char(']' | '5') => Some(false),
+        _ => None,
+    }
 }
 
 /// The most denials `/approve` offers.
@@ -1456,6 +1470,9 @@ struct App {
     pane: Option<pane::Pane>,
     pane_keys: bool,
     pane_mouse: bool,
+    /// The pane closed last, with its `/status` or `/background`, which
+    /// Ctrl+] opens again.
+    closed: Option<(pane::Pane, Option<Watch>)>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2097,6 +2114,7 @@ impl App {
             pane: None,
             pane_keys: false,
             pane_mouse: false,
+            closed: None,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -4836,13 +4854,28 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return false,
         };
+        // Ctrl+[ and Ctrl+] step the pane, but for a program that has them.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let program = self.pane_keys && self.pane.as_ref().is_some_and(|p| p.program.is_some());
+        if self.finding.is_none()
+            && !program
+            && let Some(back) = steps(key)
+            && (self.step_pane(back) || !back)
+        {
+            return true;
+        }
+        // Ctrl+[ with nowhere to step is Esc, as it is without the protocol.
+        let key = match steps(key) {
+            Some(true) if !program => &esc,
+            _ => key,
+        };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
         if self.finding.is_none()
             && let Some(pane) = &mut self.pane
         {
-            // A program has every key but Ctrl+], which comes back here.
+            // A program has every key but Ctrl+\, which comes back here.
             if self.pane_keys
                 && let Some(program) = &pane.program
             {
@@ -4882,8 +4915,7 @@ impl App {
                     KeyCode::End => pane.screen.latest(),
                     _ => {
                         if view.key(*key) == background::Key::Close {
-                            self.pane = None;
-                            self.pane_keys = false;
+                            self.close_pane();
                         }
                     }
                 }
@@ -4891,10 +4923,7 @@ impl App {
             }
             if self.pane_keys {
                 match key.code {
-                    KeyCode::Esc => {
-                        self.pane = None;
-                        self.pane_keys = false;
-                    }
+                    KeyCode::Esc => self.close_pane(),
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -4924,7 +4953,7 @@ impl App {
                 }
                 return true;
             }
-            // Ctrl+], or Tab with nothing typed, puts the keys in the pane.
+            // Ctrl+\, or Tab with nothing typed, puts the keys in the pane.
             if switches(key)
                 || key.code == KeyCode::Tab
                     && self.input.is_empty()
@@ -4994,6 +5023,7 @@ impl App {
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
     fn open_pane(&mut self, pane: pane::Pane) {
+        self.closed = None;
         self.pane = Some(pane);
         self.pane_keys = true;
         self.screen.unselect();
@@ -5030,6 +5060,36 @@ impl App {
         let workspace = std::path::Path::new(&self.workspace);
         let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
         pane::Pane::preview(link, workspace, width)
+    }
+
+    /// The pane put aside, with its card, for Ctrl+] to open again.
+    fn close_pane(&mut self) {
+        if let Some(pane) = self.pane.take() {
+            self.closed = Some((pane, self.watch.take()));
+        }
+        self.pane_keys = false;
+    }
+
+    /// Ctrl+[ (`back`) or Ctrl+]: the pane back or forward through what
+    /// it showed, the keys staying where they are; back from the first
+    /// thing it showed closes it, and forward with it closed opens again
+    /// the one closed last. Whether there was somewhere to go.
+    fn step_pane(&mut self, back: bool) -> bool {
+        match &self.pane {
+            Some(pane) if pane.can_go(back) => {
+                let keys = self.pane_keys;
+                self.go(back);
+                self.pane_keys = keys;
+            }
+            Some(_) if back => self.close_pane(),
+            None if !back && self.closed.is_some() => {
+                let (pane, watch) = self.closed.take().expect("a closed pane");
+                self.open_pane(pane);
+                self.watch = watch;
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// The pane back (`back`) or forward to what it showed, as it was left.
@@ -8402,6 +8462,60 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn ctrl_brackets_step_the_pane_back_and_forward_and_close_and_open_it_at_the_ends() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let dir = std::env::temp_dir().join(unique("sonny-steps"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("# {name}\n")).unwrap();
+            format!("file://{}", path.display())
+        };
+        let (a, b) = (url("a.md"), url("b.md"));
+        app.workspace = dir.to_string_lossy().into_owned();
+        app.full_width = 200;
+        let ctrl = |c| {
+            Event::Key(event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        let shown = |app: &App| app.pane.as_ref().and_then(|p| p.url());
+        app.follow(&a);
+        app.follow(&b);
+        assert_eq!(shown(&app), Some(b.clone()));
+        // Ctrl+\ gives the keys back; stepping leaves them there.
+        app.key(ctrl('\\')).await;
+        assert!(!app.pane_keys);
+        app.key(ctrl('[')).await;
+        assert_eq!(shown(&app), Some(a.clone()));
+        assert!(!app.pane_keys);
+        app.key(ctrl(']')).await;
+        assert_eq!(shown(&app), Some(b.clone()));
+        // Back past the first page closes the pane; forward opens it again.
+        app.key(ctrl('[')).await;
+        app.key(ctrl('[')).await;
+        assert_eq!(shown(&app), None);
+        app.key(ctrl(']')).await;
+        assert_eq!(shown(&app), Some(a.clone()));
+        app.key(ctrl('5')).await;
+        assert_eq!(shown(&app), Some(b.clone()), "Ctrl+] without the protocol");
+        // Esc closes too, and Ctrl+] opens what it closed.
+        app.key(Event::Key(KeyCode::Esc.into())).await;
+        assert_eq!(shown(&app), None, "Esc closes from the pane");
+        app.key(ctrl(']')).await;
+        assert_eq!(shown(&app), Some(b));
+        // With no pane at all, Ctrl+[ is Esc, as without the protocol.
+        app.pane = None;
+        app.closed = None;
+        app.input.set("draft");
+        app.key(ctrl('[')).await;
+        app.key(ctrl(']')).await;
+        assert_eq!(shown(&app), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
