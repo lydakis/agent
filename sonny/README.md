@@ -447,6 +447,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   shows `↻ 2 triggers` beside its model. A click on an agent's name opens
   it in the pane, as a click on a task in a roster does; ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`.
+
+  ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the triggers that wake them, with
@@ -623,6 +625,12 @@ failure.
 ![A message from calc.neg, the task updates and a steer, each one row](../docs/sonny/agent-calls-folded.png)
 
 ![The steer opened to what it told calc.neg](../docs/sonny/agent-call-opened.png)
+
+![Three task updates in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
+
+![That row opened: each update one row of its own](../docs/sonny/task-updates-listed.png)
+
+![One update opened: what it said, and the steer the lead sent about it](../docs/sonny/task-update-opened.png)
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
