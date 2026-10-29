@@ -133,27 +133,35 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
             ));
         }
     }
-    let lead = (
+    let lead_picks = (
         std::env::var("AGENT_MODEL").ok(),
         std::env::var("AGENT_EFFORT").ok(),
     );
     let flags: Vec<&String> = flags.iter().collect();
-    let flags = with_defaults(&info, &flags, lead, config.sonny.task_effort);
+    let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
     let mut flags = match told(&place.dir, &info, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
     with_cache(&mut flags);
-    // Every task works in a sandbox, whatever its lead's mode, and may
-    // commit to its repository.
-    flags.extend(["--sandbox", "workspace-write", "--network"].map(String::from));
-    if let Some(git) = crate::approvals::repository(&place.dir) {
-        flags.extend(["--writable".to_owned(), git]);
-    }
-    // And runs outside it the commands the person's config lets out.
-    for command in &config.sonny.unsandboxed {
-        flags.extend(["--unsandboxed".to_owned(), command.clone()]);
+    // A task works in its lead's mode's sandbox: confined to its folder,
+    // committing to its repository and running the commands the config
+    // lets out of it, or, in `full`, unconfined, as nothing would answer a
+    // call that asks to leave.
+    let mode = lead_mode(&agent, lead).unwrap_or(crate::approvals::MODES[0].0);
+    for (key, value) in crate::approvals::sandbox(mode, &place.dir) {
+        let flag = format!("--{key}");
+        match value {
+            Value::String(value) => flags.extend([flag, value]),
+            Value::Bool(true) => flags.push(flag),
+            Value::Array(values) => {
+                for value in values.iter().filter_map(Value::as_str) {
+                    flags.extend([flag.clone(), value.to_owned()]);
+                }
+            }
+            _ => {}
+        }
     }
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
@@ -511,6 +519,18 @@ fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
         Some('.' | ',') => chars.next().is_none_or(char::is_whitespace),
         Some(c) => !part_of_name(c),
     }
+}
+
+/// The approvals mode of the lead `name`, from its gates.
+fn lead_mode(agent: &Path, name: &str) -> Option<&'static str> {
+    let output = Command::new(agent)
+        .args(["inspect", "--bot", name])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let record: Value = serde_json::from_slice(&output.stdout).ok()?;
+    crate::approvals::mode(&record)
 }
 
 /// Whether the daemon has a task `name`: one whose start failed after it

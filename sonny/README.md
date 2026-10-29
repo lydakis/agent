@@ -357,7 +357,10 @@ off again never shows.
   `/tmp`), reach the network, and may commit to the folder's repository,
   whose hooks and config stay read-only; a call that leaves the sandbox
   waits for the verdict. In `full` the lead runs unconfined. Every task
-  is sandboxed the same way in its own folder, whatever the lead's mode.
+  is sandboxed the same way in its own folder, but in `full`, where
+  nothing would answer a call that asks to leave the sandbox, tasks run
+  unconfined too, as under Codex's full access; a pick sets the tasks'
+  sandboxes along with their gates.
   A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
   it. On Linux sandboxes need bubblewrap. A tool that keeps a daemon of its
   own, such as mcpx, can't run inside a sandbox: name it in
