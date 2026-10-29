@@ -780,9 +780,13 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 # as a reply after a reaction with nothing to add.
                 if last['content'][0]['content'].startswith('silent'):
                     blocks = []
+                elif last['content'][0]['content'].startswith('refuse:all'):
+                    # What a tool read sets the classifier off.
+                    stop = 'refusal'
+                    details = {'type': 'refusal', 'category': 'cyber', 'explanation': None}
                 else:
                     blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
-                stop = 'end_turn'
+                stop = 'refusal' if details else 'end_turn'
             else:
                 user = last['content'][0]['text']
                 if user == 'think-only':
@@ -1192,6 +1196,43 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # A fallback is a known provider's model in the bot's family.
         self.assertEqual(client.request('create', bot='Bad', workspace=str(path),
                                         fallback='openai/x')['error'], 'provider_unavailable')
+
+    def test_what_a_declined_request_added_goes_on_as_a_note(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        why = "the provider's safety classifier declined the request that carried it (category: cyber)"
+        # Declined at its first request: the prompt is what it added.
+        words = 'refuse:all ' + 'word ' * 40
+        turn = client.request('submit', bot='Bob', request_id='d1', prompt=words)['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual(finished['error'], 'provider_refusal')
+        turn = client.request('submit', bot='Bob', request_id='d2', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        model.requests.get(timeout=1)
+        after = model.requests.get(timeout=1)
+        self.assertEqual(after['messages'][0]['content'],
+                         [{'type': 'text', 'text': f'[A message here is left out: {why}.]'}])
+        self.assertEqual(after['messages'][1]['content'], [{'type': 'text', 'text': 'hello'}])
+        # Declined after a tool ran: only its result goes as a note; the
+        # prompt and the call the model made stay.
+        read = 'tool:refuse:all ' + 'line ' * 40
+        turn = client.request('submit', bot='Bob', request_id='d3', prompt=read)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['error'], 'provider_refusal')
+        turn = client.request('submit', bot='Bob', request_id='d4', prompt='again')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while not model.requests.empty():
+            last = model.requests.get(timeout=1)
+        sent = [m['content'] for m in last['messages']]
+        self.assertEqual(sent[-4][0]['text'], read)
+        self.assertEqual(sent[-3][1]['input'], {'text': read[5:]})
+        self.assertEqual(sent[-2], [{'type': 'tool_result', 'tool_use_id': 'toolu_1',
+                                     'content': f'[This tool result is left out: {why}.]'}])
+        self.assertEqual(sent[-1], [{'type': 'text', 'text': 'again'}])
+        # The person's words stay in the record, and a retry still matches them.
+        turns = client.request('turns', bot='Bob', after=0, limit=8)['result']['turns']
+        self.assertEqual(turns[0]['prompt_preview'], words[:200])
+        again = client.request('submit', bot='Bob', request_id='d1', prompt=words)
+        self.assertEqual(again['result']['turn'], turns[0]['turn'], again)
 
     def test_a_hosted_search_is_declared_kept_and_its_paused_turn_resumed(self):
         client, model, path = self.start()

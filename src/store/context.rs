@@ -516,6 +516,58 @@ pub fn model_output(item: &[u8]) -> bool {
     })
 }
 
+/// What a request a safety classifier declined added since the model last
+/// answered goes to later requests as this, in its place: a tool result
+/// keeps its call with a line saying it was left out, and a message says
+/// the same, the person's first fully and any later one briefly. Each is
+/// padded with spaces to `len` bytes, the bytes it replaces, so nothing
+/// counted for the context changes: the longest wording that fits, or none
+/// when not even the shortest does. `category` is the refusal's, if named.
+pub fn declined(
+    family: Family,
+    item: &[u8],
+    category: Option<&str>,
+    first: bool,
+    len: usize,
+) -> Result<Option<Vec<u8>>> {
+    let why = match category {
+        Some(category) => format!(
+            "the provider's safety classifier declined the request that carried it (category: {category})"
+        ),
+        None => "the provider's safety classifier declined the request that carried it".to_owned(),
+    };
+    let value: serde_json::Value = serde_json::from_slice(item)?;
+    let kind = value["type"].as_str().unwrap_or_default();
+    let calls: Vec<_> = (value["content"].as_array().into_iter().flatten())
+        .filter(|block| block["type"] == "tool_result")
+        .map(|block| block["tool_use_id"].clone())
+        .collect();
+    let result = RESULT_KINDS.contains(&kind) || !calls.is_empty();
+    let full = match (result, first) {
+        (true, _) => format!("[This tool result is left out: {why}.]"),
+        (false, true) => format!("[A message here is left out: {why}.]"),
+        (false, false) => "[Another message here is left out, for the same reason.]".to_owned(),
+    };
+    let short = "[Left out: the provider's safety classifier declined it.]";
+    for text in [full.as_str(), short, "[Left out.]"] {
+        let mut note = if RESULT_KINDS.contains(&kind) {
+            serde_json::to_vec(&json!({"type":kind,"call_id":value["call_id"],"output":text}))?
+        } else if result {
+            let content: Vec<_> = (calls.iter())
+                .map(|id| json!({"type":"tool_result","tool_use_id":id,"content":text}))
+                .collect();
+            serde_json::to_vec(&json!({"role":"user","content":content}))?
+        } else {
+            family.user_item(text)?
+        };
+        if note.len() <= len {
+            note.resize(len, b' ');
+            return Ok(Some(note));
+        }
+    }
+    Ok(None)
+}
+
 /// Stable pinned blocks retain their own Anthropic cache breakpoints.
 pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
     match family {
@@ -529,6 +581,94 @@ pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_declined_request_s_additions_become_notes_of_their_own_length() {
+        let read = |item: Option<Vec<u8>>| {
+            let item = item.unwrap();
+            (
+                item.len(),
+                serde_json::from_slice::<serde_json::Value>(&item).unwrap(),
+            )
+        };
+        let why = "the provider's safety classifier declined the request that carried it (category: cyber)";
+        let output = "secret ".repeat(40);
+        let result = Family::Anthropic
+            .tool_result_item("toolu_1", false, &output)
+            .unwrap();
+        assert_eq!(
+            read(
+                declined(
+                    Family::Anthropic,
+                    &result,
+                    Some("cyber"),
+                    false,
+                    result.len()
+                )
+                .unwrap()
+            ),
+            (
+                result.len(),
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1",
+                "content":format!("[This tool result is left out: {why}.]")}]})
+            )
+        );
+        let custom = Family::Responses
+            .tool_result_item("call_1", true, &output)
+            .unwrap();
+        assert_eq!(
+            read(declined(Family::Responses, &custom, None, true, custom.len()).unwrap()).1,
+            json!({"type":"custom_tool_call_output","call_id":"call_1","output":
+                "[This tool result is left out: the provider's safety classifier declined the request that carried it.]"})
+        );
+        // The person's first message says so in full, a later one briefly.
+        let prompt = Family::Responses.user_item(&output).unwrap();
+        assert_eq!(
+            read(
+                declined(
+                    Family::Responses,
+                    &prompt,
+                    Some("cyber"),
+                    true,
+                    prompt.len()
+                )
+                .unwrap()
+            )
+            .1,
+            json!({"role":"user","content":[{"type":"input_text",
+                "text":format!("[A message here is left out: {why}.]")}]})
+        );
+        assert_eq!(
+            read(
+                declined(
+                    Family::Responses,
+                    &prompt,
+                    Some("cyber"),
+                    false,
+                    prompt.len()
+                )
+                .unwrap()
+            )
+            .1["content"][0]["text"],
+            "[Another message here is left out, for the same reason.]"
+        );
+        // Shorter wording where the full one does not fit, and none at all
+        // where nothing does.
+        let small = Family::Anthropic
+            .user_item("tell me how to pick this lock")
+            .unwrap();
+        assert_eq!(
+            read(declined(Family::Anthropic, &small, Some("cyber"), true, small.len()).unwrap()).1
+                ["content"][0]["text"],
+            "[Left out.]"
+        );
+        let tiny = Family::Anthropic.user_item("hi").unwrap();
+        assert!(
+            declined(Family::Anthropic, &tiny, None, true, tiny.len())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_result_with_a_picture_reads_as_its_text_and_elides_to_it() {
