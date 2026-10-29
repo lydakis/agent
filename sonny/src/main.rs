@@ -394,7 +394,16 @@ fn pass_to_agent(args: &[String]) -> Result<(), String> {
 /// Agent's binary to run, with the provider keys kept in ~/.agent/env
 /// over this shell's own; an empty value unsets one.
 fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String> {
+    agent_command_as(bin, false)
+}
+
+/// `bin` with Agent's env file, over the login shell's environment with
+/// `login`, where people export their keys, since launchd's has none.
+fn agent_command_as(bin: &std::path::Path, login: bool) -> Result<std::process::Command, String> {
     let mut command = std::process::Command::new(bin);
+    if let Some(environment) = login.then(login::environment).flatten() {
+        command.env_clear().envs(environment);
+    }
     apply_env_file(&mut command)?;
     Ok(command)
 }
@@ -414,12 +423,14 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
 
 /// An `auto` gate needs an approver serving it: when none does, one is
 /// started the way the CLI starts it, detached, logging beside the store,
-/// judged by `model` unless a judge is set.
+/// judged by `model` unless a judge is set, with the login shell's
+/// environment under `login`.
 pub(crate) async fn serve_auto(
     client: &Client,
     store: &Path,
     socket: &Path,
     model: &str,
+    login: bool,
 ) -> Result<(), String> {
     let stats = client
         .request("stats", json!({}))
@@ -439,7 +450,7 @@ pub(crate) async fn serve_auto(
         .append(true)
         .open(&log)
         .map_err(|e| e.to_string())?;
-    let mut command = agent_command(&bin)?;
+    let mut command = agent_command_as(&bin, login)?;
     agent_client::own_session(&mut command);
     command
         .env("AGENT_MODEL", model)
@@ -460,7 +471,7 @@ pub(crate) async fn serve_auto(
 /// them and answers Sonny's tools: started detached, logging beside the
 /// store. One already watching this daemon keeps it, and the new one
 /// exits.
-pub(crate) fn start_lookout(store: &Path, socket: &Path) -> Result<(), String> {
+pub(crate) fn start_lookout(store: &Path, socket: &Path, login: bool) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut log = store.as_os_str().to_owned();
     log.push(".lookout.log");
@@ -471,7 +482,7 @@ pub(crate) fn start_lookout(store: &Path, socket: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     // The judge's settings and keys are in Agent's env file, as for the
     // approver.
-    let mut command = agent_command(&me)?;
+    let mut command = agent_command_as(&me, login)?;
     agent_client::own_session(&mut command);
     let mut child = command
         .arg("lookout")
@@ -555,12 +566,7 @@ fn start_daemon(store: &Path, socket: &Path, login: bool) -> Result<(), NotStart
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
-    let mut command = std::process::Command::new(&bin);
-    if let Some(environment) = login.then(login::environment).flatten() {
-        command.env_clear().envs(environment);
-    }
-    apply_env_file(&mut command)?;
-    let out = command
+    let out = agent_command_as(&bin, login)?
         .arg("start")
         .arg("--store")
         .arg(store)
@@ -845,7 +851,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(format!("the lookout: {error}"));
     }
     // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.options.store, &app.options.socket) {
+    if let Err(error) = start_lookout(&app.options.store, &app.options.socket, false) {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -900,6 +906,7 @@ async fn run() -> Result<(), String> {
             &app.options.store,
             &app.options.socket,
             &app.model,
+            false,
         )
         .await
     {
@@ -2500,6 +2507,7 @@ impl App {
                             &self.options.store,
                             &self.options.socket,
                             &self.model,
+                            false,
                         )
                         .await
                     {
@@ -2794,7 +2802,7 @@ impl App {
                 .await;
             // A daemon that restarted took the approver and the lookout
             // Sonny started with it.
-            if let Err(error) = start_lookout(&self.options.store, &self.options.socket) {
+            if let Err(error) = start_lookout(&self.options.store, &self.options.socket, false) {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
@@ -2803,6 +2811,7 @@ impl App {
                     &self.options.store,
                     &self.options.socket,
                     &self.model,
+                    false,
                 )
                 .await
             {

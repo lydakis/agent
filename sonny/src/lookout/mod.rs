@@ -1200,8 +1200,14 @@ fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
         .open(&path)
         .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
-    // released when the process exits.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+    // released when the process exits. Tried twice, since `running` holds
+    // it for an instant.
+    let take = || unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    let taken = take() || {
+        std::thread::sleep(Duration::from_millis(50));
+        take()
+    };
+    if taken {
         // Its process, which `/status` asks after.
         use std::io::Write;
         let _ = file.set_len(0);
@@ -1794,15 +1800,18 @@ fn cursor_path(store: &Path) -> PathBuf {
 /// The most of the check log `status` reads, from its end.
 const STATUS_BYTES: u64 = 1 << 20;
 
-/// Whether a lookout watches `store`'s daemon: the process its lock file
-/// names lives. Read without taking the lock, which a lookout starting at
-/// that moment would find held, and exit.
+/// Whether a lookout watches `store`'s daemon: one holds its lock. The pid
+/// the file names is no answer, since after a restart another process may
+/// have it. The lock is tried shared and let go at once; a lookout
+/// starting meanwhile tries again (`lock`).
 pub fn running(store: &std::path::Path) -> bool {
-    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
-        .ok()
-        .and_then(|pid| pid.trim().parse().ok());
-    // SAFETY: signal 0 sends nothing; it only asks whether the process lives.
-    pid.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(beside(store, ".lookout.lock")) else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor `file` owns; closing it lets go.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0;
+    !taken && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
 /// One line on the lookout for a lead, as `/status` shows it: whether one
@@ -3903,6 +3912,24 @@ mod tests {
         assert_eq!(counts.get("tasks"), Some(&2));
         assert_eq!(counts.get("ops"), Some(&1));
         assert!(checks(&store, "reviewer").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lookout_runs_while_one_holds_its_lock_whatever_pid_it_names() {
+        let dir = std::env::temp_dir().join(format!("lookout-running-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        assert!(!running(&store));
+        // A lookout gone before a restart, its pid now another process's.
+        std::fs::write(dir.join("state.sqlite.lookout.lock"), "1").unwrap();
+        assert!(!running(&store));
+        let held = lock(&store).unwrap().unwrap();
+        assert!(running(&store));
+        // Asking leaves it held.
+        assert!(lock(&store).unwrap().is_none());
+        drop(held);
+        assert!(!running(&store));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

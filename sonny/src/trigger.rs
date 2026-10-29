@@ -2757,7 +2757,7 @@ async fn attend(client: &Client, trigger: &Trigger, bot: &str, id: Option<i64>) 
         return;
     };
     if !crate::lookout::running(store)
-        && let Err(error) = crate::start_lookout(store, &socket)
+        && let Err(error) = crate::start_lookout(store, &socket, true)
     {
         log(format!("lookout_not_started: {error}"));
     }
@@ -2776,7 +2776,7 @@ async fn attend(client: &Client, trigger: &Trigger, bot: &str, id: Option<i64>) 
         record["provider"].as_str().unwrap_or_default(),
         record["model"].as_str().unwrap_or_default()
     );
-    if let Err(error) = crate::serve_auto(client, store, &socket, &model).await {
+    if let Err(error) = crate::serve_auto(client, store, &socket, &model, true).await {
         log(format!("approver_not_started: {error}"));
     }
 }

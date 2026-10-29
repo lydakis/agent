@@ -169,7 +169,9 @@ on that socket as Sonny does, with the `agent` Sonny finds and the login shell's
 started beside the agent, since no window may be open, as after the Mac
 restarted: the lookout, when none watches that daemon, and for an agent in
 `auto`, the approver, when none serves it, judging on the agent's model
-unless `[judge]` names another. A repeating trigger submits with `delivery: reject`: a bot
+unless `[judge]` names another. Both start with the same login
+environment and `~/.agent/env` as the daemon, so a judge finds the keys the
+person's profile exports. A repeating trigger submits with `delivery: reject`: a bot
 that is working, or has work waiting, skips that fire rather than having it
 cut in or pile up. A one-off, and a fire `fire` asked for, submits with
 `delivery: queue`, so a working bot gets it after its turn. A one-off's

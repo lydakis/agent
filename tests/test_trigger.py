@@ -184,7 +184,9 @@ class TriggerFireTests(ModelFixture):
                                                 '--socket', str(socket)], env=clean_env(), capture_output=True, timeout=35))
         # launchd gives no provider keys: the daemon gets them from the login shell's profile.
         shell = short / 'login-shell'
-        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
+        # Keys exported only by the login profile, as people keep them.
+        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\n"
+                         "export LOGIN_ONLY_KEY=from-profile\nexec /bin/sh -c \"$4\"\n")
         shell.chmod(0o755)
         sent = self.fire('p.task', 'Morning check.', target=target, app=self.bundle(), socket=socket,
                          env={'SHELL': str(shell)})
@@ -201,7 +203,9 @@ class TriggerFireTests(ModelFixture):
         self.agent('shutdown', '--store', str(self.store))
         lock = Path(f'{self.store}.lookout.lock')
         shell = self.path / 'login-shell'
-        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
+        # Keys exported only by the login profile, as people keep them.
+        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\n"
+                         "export LOGIN_ONLY_KEY=from-profile\nexec /bin/sh -c \"$4\"\n")
         shell.chmod(0o755)
         sent = self.fire('p.lead', 'Morning check.', target=target, app=self.bundle(), env={'SHELL': str(shell)})
         self.assertEqual(sent['last']['outcome'], 'sent', sent)
@@ -223,6 +227,19 @@ class TriggerFireTests(ModelFixture):
             time.sleep(0.2)
         self.assertTrue(lookout(), 'no lookout watches the daemon the fire started')
         self.assertIn('auto', approvers())
+        # Both judge with the login profile's keys, as the daemon does.
+        if Path('/proc').is_dir():
+            def environment(*words):
+                for proc in Path('/proc').iterdir():
+                    try:
+                        line = (proc / 'cmdline').read_bytes().split(b'\0')
+                        if all(word.encode() in line for word in words):
+                            return (proc / 'environ').read_bytes().split(b'\0')
+                    except OSError:
+                        continue
+                self.fail(f'no process runs {words}')
+            self.assertIn(b'LOGIN_ONLY_KEY=from-profile', environment('lookout', str(self.store)))
+            self.assertIn(b'LOGIN_ONLY_KEY=from-profile', environment('approver', str(self.store)))
         # The next fire finds both and starts neither again.
         pid = lock.read_text().strip()
         self.settle('p.lead')
