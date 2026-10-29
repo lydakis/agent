@@ -310,7 +310,9 @@ fn memory() -> Value {
                 "source": {"type": "string", "minLength": 1,
                     "description": "Where it comes from: turn:BOT/N, a commit, path:line, or the person and a date."},
                 "text": {"type": "string", "minLength": 1,
-                    "description": "The fact, then Why: and, where it helps, How to apply:."}
+                    "description": "The fact, then Why: and, where it helps, How to apply:."},
+                "external": {"type": "boolean",
+                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
@@ -710,12 +712,13 @@ fn left(call: &Value) -> Duration {
 
 /// Whether turn `turn` of `bot` has read outside content so far, so a fact
 /// it saves may carry words no person wrote, as Codex leaves out of memory
-/// the sessions that used MCP or web search. A turn whose history cannot be
-/// read counts as having read.
+/// the sessions that used MCP or web search. A turn whose history, or an
+/// item of it, cannot be read counts as having read.
 async fn read_outside(client: &Client, bot: &str, turn: i64) -> bool {
     let mut read = false;
     let walked = crate::said::walk(client, bot, turn, |_, entry| {
-        read = outside(&entry["item"]);
+        // An item too large to read back may be what came in.
+        read = entry["item"].is_null() || outside(&entry["item"]);
         read
     })
     .await;

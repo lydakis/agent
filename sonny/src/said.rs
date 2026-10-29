@@ -5,11 +5,12 @@
 //! left out, so the cleanup learns nothing from text no person wrote.
 use agent_client::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-/// The most of the person's words one call returns; the newest are kept.
-const BYTES: usize = 96 * 1024;
+/// The most of the person's words one call returns, the answer whole; the
+/// newest are kept. Within the 60 KiB a served tool's answer may take.
+const BYTES: usize = 56 * 1024;
 /// The most of one message returned; the rest is cut.
 const MESSAGE_BYTES: usize = 4 * 1024;
 /// How far back the cleanup looks when no earlier one finished.
@@ -20,7 +21,7 @@ pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// project whose memory the turn's folder reads (null for none).
 pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
     let failed = |e: agent_client::Error| format!("said_unread: {e}");
-    let mut said = Vec::new();
+    let mut said = Newest::default();
     let mut after = Value::Null;
     loop {
         let page = client
@@ -37,10 +38,10 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
                 if let Some(node) = crate::lookout::said_by_person(entry) {
                     let text = cut(crate::text(&entry["item"]));
                     let project = projects.get(&turn).cloned().flatten();
-                    said.push((
+                    said.add(
                         node,
                         json!({"bot": name, "turn": turn, "text": text, "project": project}),
-                    ));
+                    );
                 }
                 false
             })
@@ -52,20 +53,49 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
             break;
         }
     }
-    // Node ids grow as history is written, across agents too.
-    said.sort_by_key(|(node, _)| std::cmp::Reverse(*node));
-    let mut kept = Vec::new();
-    let mut bytes = 0;
-    let mut cut = false;
-    for (_, entry) in said {
-        bytes += entry.to_string().len();
-        if bytes > BYTES {
-            cut = true;
-            break;
+    let kept: Vec<Value> = said
+        .kept
+        .into_values()
+        .rev()
+        .map(|(_, entry)| entry)
+        .collect();
+    Ok(json!({"since_ms": since_ms, "said": kept, "cut": said.left_out}))
+}
+
+/// The newest messages that fit in `BYTES`, by node: node ids grow as
+/// history is written, across agents too. Older ones are dropped as they
+/// come, so a long interval holds no more than the answer.
+#[derive(Default)]
+struct Newest {
+    kept: BTreeMap<i64, (usize, Value)>,
+    bytes: usize,
+    /// The newest node dropped; no older one is kept after it.
+    floor: Option<i64>,
+    left_out: bool,
+}
+
+impl Newest {
+    /// What the answer takes besides its messages.
+    const FRAME: usize = 128;
+
+    fn add(&mut self, node: i64, entry: Value) {
+        if self.floor.is_some_and(|floor| node <= floor) {
+            self.left_out = true;
+            return;
         }
-        kept.push(entry);
+        // Its bytes and the comma before it.
+        let size = entry.to_string().len() + 1;
+        self.bytes += size;
+        self.kept.insert(node, (size, entry));
+        while self.bytes + Self::FRAME > BYTES {
+            let Some((oldest, (size, _))) = self.kept.pop_first() else {
+                break;
+            };
+            self.bytes -= size;
+            self.floor = self.floor.max(Some(oldest));
+            self.left_out = true;
+        }
     }
-    Ok(json!({"since_ms": since_ms, "said": kept, "cut": cut}))
 }
 
 /// The turns of `bot` that were running at or after `since_ms`, each with
@@ -226,5 +256,29 @@ pub fn cli(args: &[String]) -> i32 {
             eprintln!("{}", json!({"error": code, "detail": detail}));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_newest_words_that_fit_are_held_while_collecting() {
+        let entry = |text: &str| json!({"text": text});
+        let mut said = Newest::default();
+        // Four of these are just over what fits.
+        let quarter = "x".repeat(BYTES / 4);
+        said.add(5, entry(&quarter));
+        said.add(9, entry(&quarter));
+        said.add(7, entry(&quarter));
+        assert!(!said.left_out);
+        // A fourth drops the oldest, and nothing older is kept after it,
+        // though a small one would fit.
+        said.add(8, entry(&quarter));
+        said.add(2, entry("small"));
+        assert!(said.left_out);
+        assert_eq!(said.kept.keys().copied().collect::<Vec<_>>(), [7, 8, 9]);
+        assert!(said.bytes + Newest::FRAME <= BYTES);
     }
 }
