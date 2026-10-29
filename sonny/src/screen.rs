@@ -730,6 +730,7 @@ impl Screen {
     /// The next place the text found is: older, or newer, round to the
     /// other end past the last.
     pub fn find_next(&mut self, older: bool) {
+        let bottom = self.shown.len() - self.back.min(self.shown.len());
         let Some(finding) = &mut self.finding else {
             return;
         };
@@ -737,9 +738,14 @@ impl Screen {
         if count == 0 {
             return;
         }
-        finding.at = match older {
-            true => (finding.at + count - 1) % count,
-            false => (finding.at + 1) % count,
+        let above = (finding.hits).partition_point(|(start, _)| start.0 < bottom);
+        finding.at = match (older, finding.at < count) {
+            (true, true) => (finding.at + count - 1) % count,
+            (false, true) => (finding.at + 1) % count,
+            // No place yet, as when none was until pages were drawn: the
+            // nearest the view, that way.
+            (true, false) => (above + count - 1) % count,
+            (false, false) => above % count,
         };
         self.reveal();
     }
@@ -753,25 +759,32 @@ impl Screen {
         let bottom = self.shown.len() - self.back.min(self.shown.len());
         let starts: Vec<usize> = finding.hits.iter().map(|(start, _)| start.0).collect();
         let at = finding.at;
-        let here = starts.get(at).copied().unwrap_or(bottom);
+        // The place shown and those either side; with none, the view's.
+        let (here, prev, next) = match starts.get(at) {
+            Some(&here) => (
+                here,
+                at.checked_sub(1).map(|at| starts[at]),
+                starts.get(at + 1).copied(),
+            ),
+            None => (
+                bottom,
+                starts.iter().rev().find(|s| **s < bottom).copied(),
+                starts.iter().find(|s| **s >= bottom).copied(),
+            ),
+        };
         let end = self.shown.len();
         // Up to the next place; past the last, round from the other end.
         let ranges = match older {
             true => [
-                (
-                    at.checked_sub(1)
-                        .and_then(|at| starts.get(at))
-                        .map_or(0, |s| *s),
-                    here,
-                ),
-                match at.checked_sub(1) {
+                (prev.unwrap_or(0), here),
+                match prev {
                     Some(_) => (end, end),
                     None => (starts.last().copied().unwrap_or(here), end),
                 },
             ],
             false => [
-                (here, starts.get(at + 1).copied().unwrap_or(end)),
-                match starts.get(at + 1) {
+                (here, next.unwrap_or(end)),
+                match next {
                     Some(_) => (0, 0),
                     None => (0, starts.first().copied().unwrap_or(here)),
                 },
@@ -2055,6 +2068,28 @@ mod tests {
         assert!((0..200).any(|y| row(&buf, y).starts_with("old 1")));
         // Looked through already, a page let go again is not again.
         assert_eq!(screen.find_gap(true, &[2]), None);
+    }
+
+    #[test]
+    fn find_from_nothing_found_lands_on_the_nearest_place_that_way() {
+        let area = Rect::new(0, 0, 20, 200);
+        for (older, place) in [(false, 1), (true, 11)] {
+            let (mut screen, _) = screen(lines(0..50, "tail"), 20, 200);
+            screen.prepend(1, lines(0..7_000, "middle"));
+            screen.prepend(2, lines(0..7_000, "old"));
+            drawn(&mut screen, area);
+            screen.find("old 699");
+            drawn(&mut screen, area);
+            assert_eq!(screen.found(), Some((0, 0)));
+            assert_eq!(screen.find_gap(older, &[]), Some(2));
+            screen.fill(2, lines(0..7_000, "old"));
+            drawn(&mut screen, area);
+            assert_eq!(screen.find_gap(older, &[2]), None);
+            // Newer than the view, round from the first row: the oldest
+            // place; older, the newest above it.
+            screen.find_next(older);
+            assert_eq!(screen.found(), Some((place, 11)));
+        }
     }
 
     #[test]
