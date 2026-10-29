@@ -732,6 +732,7 @@ async fn run() -> Result<(), String> {
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
     let (client, mut events) = connect(&options).await?;
+    trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
@@ -894,6 +895,11 @@ async fn run() -> Result<(), String> {
     {
         app.gating = Some(mode);
     }
+    // A bot made before Sonny gave its model a prompt-cache lifetime takes
+    // it, so an idle gap of over five minutes no longer rereads it all.
+    if options.side.is_none() {
+        app.cache = cache_to_take(&bot);
+    }
     app.project = project;
     // Sonny's welcome heads a lead's conversation, though not a side chat.
     app.welcome = options.side.is_none();
@@ -964,6 +970,17 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The prompt-cache lifetime Sonny gives the model of `bot`, as `inspect`
+/// gives it, when the bot has another.
+fn cache_to_take(bot: &Value) -> Option<&'static str> {
+    let model = format!(
+        "{}/{}",
+        bot["provider"].as_str().unwrap_or_default(),
+        bot["model"].as_str().unwrap_or_default()
+    );
+    agent_client::policy::cache_ttl(&model).filter(|ttl| bot["settings"]["cache_ttl"] != *ttl)
 }
 
 /// A link, file or page, opened as the system opens it.
@@ -1550,6 +1567,9 @@ struct App {
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
+    /// The prompt-cache lifetime a bot made before Sonny gave its model
+    /// one takes, set once no turn runs.
+    cache: Option<&'static str>,
     /// The bot's tools, which an approval mode gates.
     tools: Vec<String>,
     /// The tools its client declared, of which a mode gates Sonny's that
@@ -2180,6 +2200,7 @@ impl App {
             picker: None,
             listing: None,
             switch: None,
+            cache: None,
             tools: record["tools"]
                 .as_array()
                 .into_iter()
@@ -2461,6 +2482,7 @@ impl App {
             && self.switch.is_none()
             && self.gating.is_none()
             && self.declare.is_none()
+            && self.cache.is_none()
         {
             return true;
         }
@@ -2468,6 +2490,7 @@ impl App {
             return false;
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
+        let cache = self.cache.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
@@ -2491,6 +2514,9 @@ impl App {
         if let Some((model, effort)) = &switch {
             asked["model"] = json!(model);
             asked["effort"] = json!(effort);
+        }
+        if let Some(ttl) = cache {
+            asked["cache_ttl"] = json!(ttl);
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
@@ -2544,6 +2570,7 @@ impl App {
                 self.switch = switch;
                 self.gating = gating;
                 self.declare = declare;
+                self.cache = cache;
                 return false;
             }
             Err(error) => {
@@ -8308,6 +8335,31 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_claude_bot_made_on_the_five_minute_cache_takes_the_hour() {
+        let bot = |provider: &str, ttl: &str| json!({"provider": provider, "model": "m", "settings": {"cache_ttl": ttl}});
+        assert_eq!(cache_to_take(&bot("anthropic", "5m")), Some("1h"));
+        assert_eq!(cache_to_take(&bot("bedrock", "5m")), Some("1h"));
+        assert_eq!(cache_to_take(&bot("anthropic", "1h")), None);
+        assert_eq!(cache_to_take(&bot("openai", "5m")), None);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["cache_ttl"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.cache = Some("1h");
+        assert!(app.configure().await);
+        let sent = asked.lock().unwrap()[0].clone();
+        assert_eq!(
+            (&sent["op"], &sent["cache_ttl"]),
+            (&json!("configure"), &json!("1h"))
+        );
+        assert!(app.cache.is_none());
     }
 
     #[tokio::test]

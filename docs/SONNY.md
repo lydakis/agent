@@ -158,10 +158,14 @@ Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.p
 and that file is its definition: its program arguments carry the agent and
 its id (or the agent to start, its model and effort, and who added it), the
 store and the socket of the shell it was made from (an agent's shell has
-both), the store identity its daemon announced, the one-off's time, the
+both), the store lineage its daemon announced, the one-off's time, the
 repository, the folder, the reply agent and its id, the gate, the run limit,
-and the message. A fire whose daemon announces another store (a reused
-socket) sends nothing and records `store_mismatch`. When it fires, Sonny
+and the message. The lineage is drawn when the store is made and kept when
+its file is replaced or copied, so a store put back from a copy keeps its
+triggers. A fire whose daemon announces another store (a reused
+socket) sends nothing and records `store_mismatch`. A trigger made when
+triggers kept the store file's identity, which a replaced file loses, is
+rewritten to the lineage when Sonny next opens on that store. When it fires, Sonny
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
@@ -176,7 +180,10 @@ after it is that entry's next year: it sends nothing and ends as `missed`.
 What the fire did (`sent` with the turn and any `reply`, `skipped`, `gone`,
 `missed` or `failed` with why), with the messages sent so far, the agent it
 started and the commit it saw, is kept in `~/.agent/triggers/NAME.json`,
-which `ls` and `show` return. Triggers are local to this machine. Only
+which `ls` and `show` return. A fire the daemon took no turn for (`skipped`,
+or `failed` once the daemon answered) also tells the reply agent, else the
+agent it messages, with `delivery: attach`: one line naming the trigger and
+why, which that agent reads in its next model call without a turn starting. Triggers are local to this machine. Only
 launchd runs a fire, so no two of one trigger ever run at once.
 
 A trigger's state is three things: its plist, launchd's loaded copy, and

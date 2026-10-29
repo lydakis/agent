@@ -23,7 +23,10 @@ class SiblingTests(ModelFixture):
             turns.append(client.request('submit', bot='Ann', request_id=str(n), prompt=prompt)['result']['turn'])
             self.assertEqual(client.finished(turns[-1])['data']['status'], 'completed')
         self.model.call_script = [('history', {'bot': 'Ann'}), ('history', {'bot': 'Ann', 'turn': 1}),
-                                  ('history', {'bot': 'Nobody'}), ('history', {})]
+                                  ('history', {'bot': 'Nobody'}), ('history', {}),
+                                  ('history', {'handle': f'turn:Ann/{turns[1]}'}),
+                                  ('history', {'handle': 'turn:Ann/999999'}),
+                                  ('history', {'handle': f'turn:Ann/{turns[1]}', 'bot': 'Ann'})]
         turn = client.request('submit', bot='Bob', request_id='b', prompt='script')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # Newest first, numbered as Ann's history numbers them.
@@ -39,6 +42,12 @@ class SiblingTests(ModelFixture):
         self.assertEqual(self.output(client, 'Bob', 'script-2')['error'], 'bot_not_found')
         # Its own turns are in its context: only a turn of them is read.
         self.assertEqual(self.output(client, 'Bob', 'script-3')['error'], 'invalid_tool_arguments')
+        # A handle, as run and wait give one, reads the turn it names.
+        page = self.output(client, 'Bob', 'script-4')
+        self.assertEqual(page['turn'], 2)
+        self.assertIn('second look', page['text'])
+        self.assertEqual(self.output(client, 'Bob', 'script-5')['error'], 'turn_not_in_history')
+        self.assertEqual(self.output(client, 'Bob', 'script-6')['error'], 'invalid_tool_arguments')
 
 
 if __name__ == '__main__':
