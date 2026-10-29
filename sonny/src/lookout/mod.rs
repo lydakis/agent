@@ -1794,19 +1794,21 @@ fn cursor_path(store: &Path) -> PathBuf {
 /// The most of the check log `status` reads, from its end.
 const STATUS_BYTES: u64 = 1 << 20;
 
-/// One line on the lookout for a lead, as `/status` shows it: whether one
-/// runs, who judges, and today's checks and notes.
-pub fn status(store: &std::path::Path, lead: &str) -> String {
-    let beside = |suffix: &str| {
-        let mut path = store.as_os_str().to_owned();
-        path.push(suffix);
-        PathBuf::from(path)
-    };
-    let pid: Option<i32> = std::fs::read_to_string(beside(".lookout.lock"))
+/// Whether a lookout watches `store`'s daemon: the process its lock file
+/// names lives. Read without taking the lock, which a lookout starting at
+/// that moment would find held, and exit.
+pub fn running(store: &std::path::Path) -> bool {
+    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
         .ok()
         .and_then(|pid| pid.trim().parse().ok());
     // SAFETY: signal 0 sends nothing; it only asks whether the process lives.
-    if !pid.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0) {
+    pid.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
+}
+
+/// One line on the lookout for a lead, as `/status` shows it: whether one
+/// runs, who judges, and today's checks and notes.
+pub fn status(store: &std::path::Path, lead: &str) -> String {
+    if !running(store) {
         return "Lookout · not running".to_owned();
     }
     let (mut judge, mut checks, mut notes) = (None, 0, 0);

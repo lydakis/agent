@@ -89,7 +89,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -264,7 +264,7 @@ async fn show(
 /// is there already is left as it is. Returns the home, and whether it
 /// was opened now.
 fn open_lead(
-    socket: &std::path::Path,
+    socket: &Path,
     store: Option<&std::path::Path>,
     project: &str,
     like: &str,
@@ -415,7 +415,12 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
 /// An `auto` gate needs an approver serving it: when none does, one is
 /// started the way the CLI starts it, detached, logging beside the store,
 /// judged by `model` unless a judge is set.
-async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(), String> {
+pub(crate) async fn serve_auto(
+    client: &Client,
+    store: &Path,
+    socket: &Path,
+    model: &str,
+) -> Result<(), String> {
     let stats = client
         .request("stats", json!({}))
         .await
@@ -427,7 +432,7 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
         return Ok(());
     }
     let bin = agent_bin().ok_or("Agent's binary was not found to judge calls; set AGENT_BIN")?;
-    let mut log = options.store.clone().into_os_string();
+    let mut log = store.as_os_str().to_owned();
     log.push(".approver.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -440,9 +445,9 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
         .env("AGENT_MODEL", model)
         .arg("approver")
         .arg("--store")
-        .arg(&options.store)
+        .arg(store)
         .arg("--socket")
-        .arg(&options.socket)
+        .arg(socket)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log)
@@ -455,9 +460,9 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
 /// them and answers Sonny's tools: started detached, logging beside the
 /// store. One already watching this daemon keeps it, and the new one
 /// exits.
-fn start_lookout(options: &Options) -> Result<(), String> {
+pub(crate) fn start_lookout(store: &Path, socket: &Path) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut log = options.store.clone().into_os_string();
+    let mut log = store.as_os_str().to_owned();
     log.push(".lookout.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -471,9 +476,9 @@ fn start_lookout(options: &Options) -> Result<(), String> {
     let mut child = command
         .arg("lookout")
         .arg("--store")
-        .arg(&options.store)
+        .arg(store)
         .arg("--socket")
-        .arg(&options.socket)
+        .arg(socket)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log)
@@ -546,11 +551,7 @@ impl From<String> for NotStarted {
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
 /// wait for it to be ready. With `login`, it gets the login shell's
 /// environment, for a start from launchd, which gives no provider keys.
-fn start_daemon(
-    store: &std::path::Path,
-    socket: &std::path::Path,
-    login: bool,
-) -> Result<(), NotStarted> {
+fn start_daemon(store: &Path, socket: &Path, login: bool) -> Result<(), NotStarted> {
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
@@ -844,7 +845,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(format!("the lookout: {error}"));
     }
     // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.options) {
+    if let Err(error) = start_lookout(&app.options.store, &app.options.socket) {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -894,7 +895,13 @@ async fn run() -> Result<(), String> {
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
-        && let Err(error) = serve_auto(&app.client, &app.options, &app.model).await
+        && let Err(error) = serve_auto(
+            &app.client,
+            &app.options.store,
+            &app.options.socket,
+            &app.model,
+        )
+        .await
     {
         app.notice = Some(error);
     }
@@ -2488,8 +2495,13 @@ impl App {
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
                     if mode == "auto"
-                        && let Err(error) =
-                            serve_auto(&self.client, &self.options, &self.model).await
+                        && let Err(error) = serve_auto(
+                            &self.client,
+                            &self.options.store,
+                            &self.options.socket,
+                            &self.model,
+                        )
+                        .await
                     {
                         self.notice = Some(error);
                     }
@@ -2782,11 +2794,17 @@ impl App {
                 .await;
             // A daemon that restarted took the approver and the lookout
             // Sonny started with it.
-            if let Err(error) = start_lookout(&self.options) {
+            if let Err(error) = start_lookout(&self.options.store, &self.options.socket) {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
-                && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
+                && let Err(error) = serve_auto(
+                    &self.client,
+                    &self.options.store,
+                    &self.options.socket,
+                    &self.model,
+                )
+                .await
             {
                 self.notice = Some(error);
             }

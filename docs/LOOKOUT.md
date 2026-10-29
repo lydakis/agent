@@ -18,7 +18,9 @@ and the rest, `sonny/src/served.rs`).
 ## One lookout a daemon
 
 Sonny starts `sonny lookout --store STORE --socket SOCKET` detached when it
-opens a project, and again after the daemon restarts. A lookout holds
+opens a project, and again after the daemon restarts; a trigger's fire
+starts one too when none runs, so a lead a fire wakes with no window open
+still hears from its tasks. A lookout holds
 `STORE.lookout.lock` while it runs, so a second one prints
 `{"event":"already_watching"}` and exits, unless another build of Sonny
 started the one running, as an upgrade leaves it: that one is stopped, and

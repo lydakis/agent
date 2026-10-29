@@ -193,6 +193,44 @@ class TriggerFireTests(ModelFixture):
         turns = json.loads(self.agent('turns', '--store', str(self.store), '--socket', str(socket), '--bot', 'p.task').stdout)
         self.assertTrue(turns[-1]['prompt_preview'].endswith(']\nMorning check.'))
 
+    def test_a_fire_that_starts_its_daemon_brings_up_the_lookout_and_the_approver(self):
+        # No window is open after a restart: the fire starts what a window would.
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', '--approval', 'auto', 'hello')
+        target = ['--bot', 'p.lead', '--bot-id', str(self.bot_id('p.lead'))]
+        self.store_identity()
+        self.agent('shutdown', '--store', str(self.store))
+        lock = Path(f'{self.store}.lookout.lock')
+        shell = self.path / 'login-shell'
+        shell.write_text(f"#!/bin/sh\nexport AGENT_PROVIDER='openai=responses,{self.url}'\nexec /bin/sh -c \"$4\"\n")
+        shell.chmod(0o755)
+        sent = self.fire('p.lead', 'Morning check.', target=target, app=self.bundle(), env={'SHELL': str(shell)})
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
+
+        def lookout():
+            try:
+                pid = int(lock.read_text().strip())
+                os.kill(pid, 0)
+                return True
+            except (OSError, ValueError):
+                return False
+
+        def approvers():
+            stats = self.agent('stats', '--store', str(self.store), '--no-spawn')
+            return json.loads(stats.stdout)['approvers']
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (lookout() and 'auto' in approvers()):
+            time.sleep(0.2)
+        self.assertTrue(lookout(), 'no lookout watches the daemon the fire started')
+        self.assertIn('auto', approvers())
+        # The next fire finds both and starts neither again.
+        pid = lock.read_text().strip()
+        self.settle('p.lead')
+        again = self.fire('p.lead', 'Again.', target=target, app=self.bundle(),
+                          env={'SHELL': str(shell)})
+        self.assertEqual(again['last']['outcome'], 'sent', again)
+        self.assertEqual(lock.read_text().strip(), pid)
+
     def test_a_fire_never_reaches_another_stores_daemon(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         other = self.fire('p.task', 'x', store_id='0' * 32)

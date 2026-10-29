@@ -165,7 +165,11 @@ socket) sends nothing and records `store_mismatch`. When it fires, Sonny
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
-`~/.agent/env`. A repeating trigger submits with `delivery: reject`: a bot
+`~/.agent/env`. Before it sends, it starts what a Sonny window would have
+started beside the agent, since no window may be open, as after the Mac
+restarted: the lookout, when none watches that daemon, and for an agent in
+`auto`, the approver, when none serves it, judging on the agent's model
+unless `[judge]` names another. A repeating trigger submits with `delivery: reject`: a bot
 that is working, or has work waiting, skips that fire rather than having it
 cut in or pile up. A one-off, and a fire `fire` asked for, submits with
 `delivery: queue`, so a working bot gets it after its turn. A one-off's

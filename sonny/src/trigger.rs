@@ -2744,6 +2744,43 @@ fn sent_for(ask: &Asked, trigger: &Trigger) -> Option<(Value, Trigger)> {
     Some((submit.clone(), sender))
 }
 
+/// What a Sonny window brings up beside its lead, brought up for the agent
+/// a fire wakes, since no window may be open, as after the Mac restarted:
+/// the lookout, which tells a lead of its tasks and answers Sonny's tools,
+/// and, for an agent in `auto`, the approver that judges its calls. Each
+/// is started only when none runs; one that cannot be is logged, and the
+/// message still goes.
+async fn attend(client: &Client, trigger: &Trigger, bot: &str, id: Option<i64>) {
+    let log = |error: String| eprintln!("{}", error_json(&error));
+    // A shell that named only its daemon's socket has no store to watch.
+    let (Some(store), Ok(socket)) = (&trigger.daemon.store, trigger.daemon.socket()) else {
+        return;
+    };
+    if !crate::lookout::running(store)
+        && let Err(error) = crate::start_lookout(store, &socket)
+    {
+        log(format!("lookout_not_started: {error}"));
+    }
+    let Ok(record) = client.request("inspect", json!({"bot": bot})).await else {
+        return;
+    };
+    // Another agent under its name is not the one this fire is for.
+    if id.is_some_and(|id| record["bot_id"].as_i64().is_some_and(|it| it != id)) {
+        return;
+    }
+    if crate::approvals::mode(&record) != Some("auto") {
+        return;
+    }
+    let model = format!(
+        "{}/{}",
+        record["provider"].as_str().unwrap_or_default(),
+        record["model"].as_str().unwrap_or_default()
+    );
+    if let Err(error) = crate::serve_auto(client, store, &socket, &model).await {
+        log(format!("approver_not_started: {error}"));
+    }
+}
+
 /// Send a fire's turn, and its answer on to `--reply-to`.
 async fn submit(
     client: &Client,
@@ -2753,6 +2790,7 @@ async fn submit(
     started: bool,
     ask: Option<&Asked>,
 ) -> Value {
+    attend(client, trigger, bot, asking["bot_id"].as_i64()).await;
     let submitted = client.request("submit", asking).await;
     let outcome = match submitted {
         Ok(turn) => {
