@@ -148,9 +148,12 @@ class AcpTests(ModelFixture):
 
     @staticmethod
     def wrapped(text):
-        """A prompt as T3 Code sends it, in its own instructions."""
+        """A prompt as T3 Code sends it: in its own instructions, then its
+        note as a block of its own."""
         return [{'type': 'text', 'text': '<t3_code_instructions>\nUse delegate_task.\n</t3_code_instructions>\n\n'
-                                         f'<user_request>\n{text}\n</user_request>'}]
+                                         f'<user_request>\n{text}\n</user_request>'},
+                {'type': 'text', 'text': "<runtime_info>In case you're asked: you are running in T3 Code.</runtime_info>"
+                                         '\n\n<pull_request_linking>Link pull requests.</pull_request_linking>'}]
 
     def test_a_thread_is_its_folders_lead_and_a_task_it_starts_opens_as_a_thread_of_its_own(self):
         repo = self.repo()

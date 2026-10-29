@@ -1239,6 +1239,8 @@ async fn serve(settings: Settings) -> Result<(), String> {
         resume: std::fs::read_to_string(cursor_path(&settings.store))
             .ok()
             .and_then(|text| text.trim().parse().ok()),
+        reacting: HashMap::new(),
+        taken: HashMap::new(),
     };
     println!(
         "{}",
@@ -1300,6 +1302,13 @@ struct Service {
     goals: goals::Goals,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
+    /// Lead `react` calls naming another agent, by bot, turn and call,
+    /// until they end: the agent named, the emoji, whether it comes off,
+    /// and the newest message that agent had taken when the call began.
+    reacting: HashMap<Call, (String, String, bool, Option<i64>)>,
+    /// The newest message each bot took, by the stream: a reaction is on
+    /// what was there when it was made, not what came after.
+    taken: HashMap<String, i64>,
 }
 
 /// Every bot that one of `made` made, and what those made, as the daemon
@@ -1319,6 +1328,72 @@ fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
             return;
         }
     }
+}
+
+/// A tool call: its bot, turn and id.
+type Call = (String, i64, String);
+
+/// The person's newest message in `bot`: one no agent or client sent,
+/// with words of theirs, not only tool results, and no reaction of theirs.
+/// Read newest first, as far back as a long turn of tool calls reaches;
+/// an error when the daemon did not answer.
+async fn newest_said(client: &Client, bot: &str, upto: Option<i64>) -> Result<Option<i64>, ()> {
+    const READ: usize = 2000;
+    let (mut from, mut read) = (Value::Null, 0);
+    while read < READ {
+        let page = client
+            .request(
+                "history_nodes",
+                json!({"bot": bot, "from": from, "limit": 200}),
+            )
+            .await
+            .map_err(drop)?;
+        let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        read += nodes.len();
+        let paged = nodes.is_empty();
+        // Newest first: what came after the bound is passed over.
+        let after = |node: &i64| upto.is_some_and(|upto| *node > upto);
+        let nodes: Vec<i64> = nodes.iter().copied().skip_while(after).collect();
+        let mut next = 0;
+        while next < nodes.len() {
+            let wanted = &nodes[next..(next + 100).min(nodes.len())];
+            let items = client
+                .request("history_items", json!({"bot": bot, "nodes": wanted}))
+                .await
+                .map_err(drop)?;
+            // Fewer than asked when they are large; at least one.
+            let items = items["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                return Ok(None);
+            }
+            next += items.len();
+            if let Some(node) = items.iter().find_map(said_by_person) {
+                return Ok(Some(node));
+            }
+        }
+        from = page["next_from"].clone();
+        if from.is_null() || paged {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+/// The node of a history entry the person wrote: words of theirs, as an
+/// Anthropic tool result is a user message too.
+fn said_by_person(entry: &Value) -> Option<i64> {
+    let item = &entry["item"];
+    let words = crate::responses(item)
+        .into_iter()
+        .any(|said| said["role"] == "user" && !crate::text(&said).trim().is_empty());
+    (entry["from"].is_null()
+        && entry["origin"].is_null()
+        && words
+        && !crate::reactions::is_reaction(&crate::text(item)))
+    .then(|| entry["node"].as_i64())
+    .flatten()
 }
 
 /// Whether the bot listed under a name is another than the one seated.
@@ -1423,13 +1498,18 @@ impl Service {
                     let Some(event) = event else { return };
                     served.event(&event);
                     let cursor = event["cursor"].as_i64();
+                    // A call is read from the replay too, so one that ends
+                    // after the lookout last watched still lands.
+                    let news =
+                        live || cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen));
+                    let held = self.picked(&client, &event, news).await;
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
                     if !live && cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen)) {
                         live = true;
                         self.go_live(&client).await;
                     }
-                    if live && cursor > self.cursor {
+                    if live && !held && cursor > self.cursor {
                         self.cursor = cursor;
                     }
                     if let (Some("created" | "forked"), Some(name)) =
@@ -1610,6 +1690,87 @@ impl Service {
                 lookout.due.extend(later);
                 lookout.wake(&client).await;
             }
+        }
+    }
+
+    /// A lead's `react` call naming one of its project's agents: once it
+    /// succeeds as news, its reaction kept under the person's newest message
+    /// there, for that agent's window to draw. Whether it waits on the
+    /// daemon still, so the event is read again after a restart.
+    async fn picked(&mut self, client: &Client, event: &Value, news: bool) -> bool {
+        let Some((by, bot, id, emoji, remove, upto)) = self.reacted(event, news) else {
+            return false;
+        };
+        let store = std::fs::canonicalize(&self.store).unwrap_or_else(|_| self.store.clone());
+        let key = crate::reactions::key(&store, id);
+        match newest_said(client, &bot, upto).await {
+            Ok(node) => {
+                if let Some(node) = node {
+                    let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
+                }
+                false
+            }
+            Err(()) => true,
+        }
+    }
+
+    /// The project a bot is in: the longest start of its name whose lead
+    /// the daemon lists.
+    fn project<'a>(&self, bot: &'a str) -> Option<&'a str> {
+        (bot.match_indices('.').rev())
+            .map(|(at, _)| &bot[..at])
+            .find(|start| self.records.contains_key(&format!("{start}.lead")))
+    }
+
+    /// A targeted `react` call that ended well as news: who called, the
+    /// agent named and its id, the emoji, whether it comes off, and the
+    /// newest message that agent had taken when the call began.
+    fn reacted(
+        &mut self,
+        event: &Value,
+        news: bool,
+    ) -> Option<(String, String, i64, String, bool, Option<i64>)> {
+        let data = &event["data"];
+        let by = event["bot"].as_str()?;
+        if let (Some("accepted" | "steered"), Some(node)) =
+            (event["event"].as_str(), data["node"].as_i64())
+        {
+            self.taken.insert(by.to_owned(), node);
+            return None;
+        }
+        let call = (
+            by.to_owned(),
+            event["turn"].as_i64()?,
+            data["call_id"].as_str()?.to_owned(),
+        );
+        match event["event"].as_str() {
+            Some("tool_started") if data["name"] == crate::reactions::TOOL => {
+                let arguments = (data["arguments"].as_str())
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())?;
+                let bot = crate::reactions::target(&arguments)?.to_owned();
+                let (emoji, remove) = crate::reactions::call(&arguments)?;
+                let upto = self.taken.get(&bot).copied();
+                self.reacting.insert(call, (bot, emoji, remove, upto));
+                None
+            }
+            // The daemon refuses a call that does not fit, or that the bot
+            // may not make.
+            Some("tool_completed") => {
+                let (bot, emoji, remove, upto) = self.reacting.remove(&call)?;
+                if !news || data["failed"] == true || data["denied"] == true {
+                    return None;
+                }
+                let id = (self.records.get(&bot))
+                    .filter(|_| {
+                        bot != by
+                            && self
+                                .project(&bot)
+                                .is_some_and(|p| self.project(by) == Some(p))
+                    })
+                    .and_then(|record| record["bot_id"].as_i64())?;
+                Some((by.to_owned(), bot, id, emoji, remove, upto))
+            }
+            _ => None,
         }
     }
 
@@ -3003,6 +3164,125 @@ mod tests {
     }
 
     #[test]
+    fn a_lead_s_reaction_in_a_task_lands_once_its_own_call_ends_well_as_news() {
+        let record = |name: &str, id: i64, by: Option<&str>| json!({"name": name, "bot_id": id, "created_by": by});
+        let mut service = Service {
+            store: PathBuf::new(),
+            records: [
+                record("calc.lead", 1, None),
+                record("calc.speed", 2, Some("calc.lead")),
+                record("ws.lead", 3, None),
+                record("ws.fix", 4, Some("ws.lead")),
+                record("ws.web.lead", 5, None),
+                record("ws.web.fix", 6, Some("ws.web.lead")),
+            ]
+            .into_iter()
+            .map(|r| (r["name"].as_str().unwrap().to_owned(), r))
+            .collect(),
+            subscribers: HashMap::new(),
+            socket: PathBuf::new(),
+            judge: None,
+            lookouts: HashMap::new(),
+            judges: HashMap::new(),
+            log: PathBuf::new(),
+            seated: 0,
+            live: true,
+            cursor: None,
+            saved: None,
+            resume: None,
+            reacting: HashMap::new(),
+            taken: HashMap::new(),
+        };
+        let started = |bot: &str, arguments: Value| {
+            json!({"event": "tool_started", "bot": bot, "turn": 3, "data": {"call_id": "c1",
+                "name": crate::reactions::TOOL, "arguments": arguments.to_string()}})
+        };
+        let ended = |bot: &str, failed: bool| {
+            json!({"event": "tool_completed", "bot": bot, "turn": 3,
+                "data": {"call_id": "c1", "failed": failed}})
+        };
+        let eyes = json!({"emoji": "👀", "bot": "calc.speed"});
+        let took = |node: i64| json!({"event": "accepted", "bot": "calc.speed", "turn": 2, "data": {"node": node}});
+        service.reacted(&took(9), true);
+        // Another bot's call of the same id leaves the lead's waiting.
+        assert!(
+            service
+                .reacted(&started("calc.lead", eyes.clone()), true)
+                .is_none()
+        );
+        // What the person wrote there after the lead reacted is not what it
+        // reacted to.
+        service.reacted(&took(12), true);
+        assert!(service.reacted(&ended("calc.speed", false), true).is_none());
+        assert_eq!(
+            service.reacted(&ended("calc.lead", false), true),
+            Some((
+                "calc.lead".into(),
+                "calc.speed".into(),
+                2,
+                "👀".into(),
+                false,
+                Some(9)
+            ))
+        );
+        // A refused call, or one that ended before the lookout last watched.
+        service.reacted(&started("calc.lead", eyes.clone()), true);
+        assert!(service.reacted(&ended("calc.lead", true), true).is_none());
+        service.reacted(&started("calc.lead", eyes), false);
+        assert!(service.reacted(&ended("calc.lead", false), false).is_none());
+        // Not on itself, nor outside its project.
+        service.reacted(
+            &started("calc.lead", json!({"emoji": "👀", "bot": "calc.lead"})),
+            true,
+        );
+        assert!(service.reacted(&ended("calc.lead", false), true).is_none());
+        // A project inside another is a project of its own.
+        let across = |by: &str, bot: &str, service: &mut Service| {
+            service.reacted(&started(by, json!({"emoji": "👀", "bot": bot})), true);
+            service
+                .reacted(&ended(by, false), true)
+                .map(|landed| landed.2)
+        };
+        assert_eq!(across("ws.web.lead", "ws.fix", &mut service), None);
+        assert_eq!(across("ws.lead", "ws.web.fix", &mut service), None);
+        assert_eq!(across("ws.web.lead", "ws.web.fix", &mut service), Some(6));
+        assert_eq!(across("ws.lead", "ws.fix", &mut service), Some(4));
+        assert!(service.reacting.is_empty());
+    }
+
+    #[test]
+    fn a_lead_s_reaction_lands_on_words_the_person_wrote() {
+        let said = |item: Value, extra: Value| {
+            let mut entry = json!({"node": 7, "item": item});
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            said_by_person(&entry)
+        };
+        let words =
+            json!({"role": "user", "content": [{"type": "input_text", "text": "add color"}]});
+        assert_eq!(said(words.clone(), json!({})), Some(7));
+        // An Anthropic tool result is a user message with no words of theirs.
+        let result = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]});
+        assert_eq!(said(result, json!({})), None);
+        // Another agent's prompt, or a client's, is not the person's.
+        assert_eq!(
+            said(words.clone(), json!({"from": {"bot": "calc.lead"}})),
+            None
+        );
+        assert_eq!(said(words, json!({"origin": "lookout"})), None);
+        assert_eq!(
+            said(
+                json!({"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}),
+                json!({})
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn news_the_lead_read_before_its_note_leaves_a_log_line() {
         let mut lookout = lookout();
         let log = std::env::temp_dir().join(format!("lookout-read-{}.jsonl", std::process::id()));
@@ -3747,6 +4027,8 @@ mod tests {
             saved: None,
             goals: goals::Goals::new(&store, Path::new("")),
             resume: None,
+            reacting: HashMap::new(),
+            taken: HashMap::new(),
         };
         service.lookouts.insert("calc.lead".into(), lookout());
         service.lookouts.insert(
@@ -3811,6 +4093,8 @@ mod tests {
             saved: None,
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             resume: None,
+            reacting: HashMap::new(),
+            taken: HashMap::new(),
         };
         // Named like a lead, it is a bot like any other.
         assert!(!service.place(&lead));

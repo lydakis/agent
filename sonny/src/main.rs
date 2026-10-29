@@ -1476,6 +1476,13 @@ struct App {
     bot_reactions: Vec<String>,
     /// The bot's `react` calls not yet completed, by call id.
     react_calls: HashMap<String, (String, bool)>,
+    /// What other agents, such as its lead, reacted with to the person's
+    /// messages here, and when that was last looked at.
+    picked: reactions::Picked,
+    picked_read: Instant,
+    /// The first words of each message of the person's drawn, by node, for
+    /// a reaction that comes after.
+    said_at: HashMap<i64, String>,
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
@@ -2130,6 +2137,9 @@ impl App {
             declare: None,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
+            picked: reactions::Picked::default(),
+            picked_read: Instant::now(),
+            said_at: HashMap::new(),
             answering: None,
             rows_drawn: 0,
             thought: String::new(),
@@ -2189,6 +2199,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
         // Known to start the conversation only once its newest page is
         // read, the welcome goes above it.
@@ -2311,6 +2322,22 @@ impl App {
                 }
                 _ = tick.tick() => {}
                 _ = self.woken.notified() => {}
+            }
+            if self.picked_read.elapsed() > Duration::from_secs(1) {
+                self.picked_read = Instant::now();
+                for (node, by, emoji, added) in self.picked.refresh() {
+                    if added {
+                        self.draw_picked(node, &by, &emoji);
+                    } else if let Some(first) = self.said_at.get(&node).cloned() {
+                        let rows = transcript::wrap(
+                            Line::from(format!("↳ {by} took back {emoji} on “{first}”")),
+                            self.prose(),
+                            Span::raw("  "),
+                            Span::raw("    "),
+                        );
+                        self.commit(transcript::quiet(rows));
+                    }
+                }
             }
             if self
                 .watch
@@ -3075,6 +3102,11 @@ impl App {
                         };
                         self.commit(lines);
                         self.answering = Some((first_words(&text(&item)), self.rows_drawn));
+                        self.said_at.insert(node, first_words(&text(&item)));
+                        let picked: Vec<(String, String)> = self.picked.on(node).to_vec();
+                        for (by, emoji) in picked {
+                            self.draw_picked(node, &by, &emoji);
+                        }
                     }
                     (_, Some("assistant")) => {
                         let reply = text(&item);
@@ -3093,10 +3125,12 @@ impl App {
                         }
                     }
                     // Counted once it is known to have been taken.
+                    // One naming another agent is drawn in that agent's window.
                     (Some("function_call"), _) if item["name"] == reactions::TOOL => {
                         if let Some(reaction) = item["arguments"]
                             .as_str()
                             .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                            .filter(|arguments| reactions::target(arguments).is_none())
                             .as_ref()
                             .and_then(reactions::call)
                         {
@@ -3491,6 +3525,11 @@ impl App {
                     let lines = landed(&text(item), &mut self.ran_here, prose);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
+                    self.said_at.insert(node, first_words(&text(item)));
+                    // A lead's reaction read before the message landed.
+                    for (by, emoji) in self.picked.on(node).to_vec() {
+                        self.draw_picked(node, &by, &emoji);
+                    }
                     self.answered(&text(item));
                 }
             }
@@ -3510,6 +3549,11 @@ impl App {
                     let lines = landed(&text(item), &mut self.ran_here, prose);
                     self.commit(lines);
                     self.answering = Some((first_words(&text(item)), self.rows_drawn));
+                    self.said_at.insert(node, first_words(&text(item)));
+                    // A lead's reaction read before the message landed.
+                    for (by, emoji) in self.picked.on(node).to_vec() {
+                        self.draw_picked(node, &by, &emoji);
+                    }
                     self.answered(&text(item));
                 }
             }
@@ -3643,10 +3687,12 @@ impl App {
             }
             "tool_started" if data["name"] == reactions::TOOL => {
                 // Counted once it completes, and drawn when the turn ends,
-                // so one taken off again is never drawn.
+                // so one taken off again is never drawn; one naming another
+                // agent is drawn in that agent's window.
                 if let Some(reaction) = data["arguments"]
                     .as_str()
                     .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .filter(|arguments| reactions::target(arguments).is_none())
                     .as_ref()
                     .and_then(reactions::call)
                 {
@@ -5704,6 +5750,32 @@ impl App {
     /// The bot's reactions so far to the person's message: right under it
     /// when nothing was drawn since, else a row of their own that says
     /// which message.
+    /// Another agent's reaction to the person's message at `node`: under
+    /// it while nothing is drawn after it, else a line naming it.
+    fn draw_picked(&mut self, node: i64, by: &str, emoji: &str) {
+        let Some(first) = self.said_at.get(&node).cloned() else {
+            return;
+        };
+        let last = self.said_at.keys().max() == Some(&node);
+        match &self.answering {
+            Some((_, at)) if last && *at == self.rows_drawn => {
+                self.commit_after(vec![transcript::reacted(&format!("{emoji} {by}"))], false);
+                if let Some((_, at)) = &mut self.answering {
+                    *at = self.rows_drawn;
+                }
+            }
+            _ => {
+                let rows = transcript::wrap(
+                    Line::from(format!("↳ {by} reacted {emoji} to “{first}”")),
+                    self.prose(),
+                    Span::raw("  "),
+                    Span::raw("    "),
+                );
+                self.commit(transcript::quiet(rows));
+            }
+        }
+    }
+
     fn draw_bot_reactions(&mut self) {
         let on = std::mem::take(&mut self.bot_reactions);
         if on.is_empty() {
@@ -6082,6 +6154,7 @@ impl App {
                 let workspace = std::path::Path::new(&self.workspace);
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
+                    image::send_shown(buf);
                     linked = links::cells(buf, &cut, |word| links::file(workspace, word));
                 })?;
                 // The rows sit just above the viewport now; those still on
@@ -6139,7 +6212,7 @@ impl App {
         let mut linked = Vec::new();
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
-        terminal.draw(|frame| {
+        let paint = |frame: &mut ratatui::Frame| {
             // The full screen: the conversation above the rows that move,
             // which sit right under it until it fills the screen, as inline.
             let view = match full() {
@@ -6449,6 +6522,11 @@ impl App {
                 ));
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+        };
+        terminal.draw(|frame| {
+            paint(frame);
+            // The pictures it shows, sent before it is written.
+            image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at.filter(|_| full());
         // Over themselves, the cursor kept where the frame left it.
