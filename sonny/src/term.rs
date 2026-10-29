@@ -105,16 +105,14 @@ pub fn detect() {
 }
 
 /// The Mac's appearance: light unless `AppleInterfaceStyle` says Dark.
+#[cfg(target_os = "macos")]
 fn appearance() -> Option<bool> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    let out = std::process::Command::new("defaults")
-        .args(["read", "-g", "AppleInterfaceStyle"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    Some(!String::from_utf8_lossy(&out.stdout).contains("Dark"))
+    Some(!crate::mac::dark())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn appearance() -> Option<bool> {
+    None
 }
 
 /// The colour scheme a terminal reports (mode 2031): `CSI ? 997 ; 1 n`

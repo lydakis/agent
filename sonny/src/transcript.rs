@@ -24,8 +24,9 @@ pub struct Markdown {
     hang: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
-    /// Inside `$$` display math, gathered in `picture`.
-    math: bool,
+    /// Inside display math, gathered in `picture`: what closes it,
+    /// `$$` or `\]`.
+    math: Option<&'static str>,
     /// The open fence's code, in its language's colors when known.
     code: Option<crate::highlight::Code>,
     /// The folder a picture's relative path is read from: the file's,
@@ -60,7 +61,7 @@ impl Markdown {
     /// says nothing of the reply is shown yet, so it gets the bullet.
     pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
         let mut text = text;
-        if !self.fence && !self.math {
+        if !self.fence && self.math.is_none() {
             // An HTML comment over lines says nothing; what follows it does.
             if self.comment {
                 match text.split_once("-->") {
@@ -210,26 +211,37 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        // $$ display math $$, on one line or around several.
-        if !self.fence && trimmed.trim_end().starts_with("$$") {
-            let inner = trimmed.trim_end().trim_start_matches("$$");
-            if let Some(math) = inner.strip_suffix("$$") {
-                self.ready = Some(("math".into(), math.to_owned()));
-                return None;
-            }
-            match self.picture.take() {
-                Some((lang, math)) if lang == "math" && self.math => {
-                    self.math = false;
-                    self.ready = Some((lang, math));
+        // $$ display math $$, on one line or around several, and the
+        // \[ display math \] many models write.
+        let line = trimmed.trim_end();
+        if !self.fence && self.math.is_none() {
+            let open = [("$$", "$$"), ("\\[", "\\]")]
+                .into_iter()
+                .find(|(open, _)| line.starts_with(open));
+            if let Some((open, close)) = open {
+                let inner = &line[open.len()..];
+                if let Some(math) = inner.strip_suffix(close) {
+                    self.ready = Some(("math".into(), math.to_owned()));
+                    return None;
                 }
-                held => {
+                // `\[` opens display math only alone on its line: one that
+                // runs on is an escaped bracket.
+                if open == "$$" || inner.is_empty() {
+                    let held = self.picture.take();
                     self.picture = held.or(Some(("math".into(), format!("{inner}\n"))));
-                    self.math = true;
+                    self.math = Some(close);
+                    return None;
                 }
             }
+        }
+        if let Some(close) = self.math
+            && line.starts_with(close)
+        {
+            self.math = None;
+            self.ready = self.picture.take();
             return None;
         }
-        if self.math
+        if self.math.is_some()
             && let Some((_, math)) = &mut self.picture
         {
             math.push_str(text);
@@ -679,6 +691,17 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         }
     };
     while let Some(c) = rest.chars().next() {
+        // \(math\), as many models write it.
+        if let Some(after) = rest.strip_prefix("\\(")
+            && let Some(end) = after.find("\\)")
+            && end > 0
+        {
+            flush(&mut plain, &mut spans);
+            let math = crate::math::unicode(after[..end].trim());
+            spans.push(Span::styled(math, base.italic()));
+            rest = &after[end + 2..];
+            continue;
+        }
         // A mark and its closer, with the style of what is between.
         let pairs: [(&str, &str, Style, bool); 11] = [
             ("`", "`", base.fg(Color::Cyan), false),
@@ -1436,7 +1459,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 28] = [
+const KEPT: [&str; 26] = [
     "Started",
     "Messaged",
     "Steered",
@@ -1463,8 +1486,6 @@ const KEPT: [&str; 28] = [
     "Unsubscribed from",
     "Opened a tab",
     "Opened a split",
-    "Stopped Errand job",
-    "Applied the changes of Errand job",
 ];
 
 fn kept(said: &crate::calls::Said) -> bool {
@@ -1762,6 +1783,7 @@ fn drawn(
                 .join(", "),
         ),
         "echo" | "note" => ("Noted", field("text")),
+        "exec" => ("Ran", scripted(output.unwrap_or(""))),
         _ => ("Called", format!("{name} {arguments}")),
     };
     let mut header = Line::from(vec![
@@ -1831,9 +1853,38 @@ fn drawn(
             }
         }
         "shell" | "wait" => out.extend(preview(output.unwrap_or(""), width)),
+        "exec" => {
+            let output = output.unwrap_or("");
+            let printed = output
+                .split_once("Output:\n")
+                .map_or(output, |(_, printed)| printed);
+            out.extend(preview(printed, width));
+        }
         _ => {}
     }
     out
+}
+
+/// An `exec` call as one line: the MCP calls its script made, by server,
+/// from the head of its result, and how it ended when not well.
+fn scripted(output: &str) -> String {
+    let head = output.split_once("Output:\n").map_or("", |(head, _)| head);
+    let mut line = match head.lines().find_map(|l| l.strip_prefix("MCP calls: ")) {
+        Some(calls) => {
+            let total: usize = (calls.split(", "))
+                .filter_map(|each| each.rsplit_once(' ')?.1.parse::<usize>().ok())
+                .sum();
+            let noun = if total == 1 { "call" } else { "calls" };
+            format!("a script: {total} MCP {noun} ({calls})")
+        }
+        None => "a script".to_owned(),
+    };
+    if let Some(status) = head.lines().next().filter(|l| *l != "Script completed")
+        && let Some(how) = status.strip_prefix("Script ")
+    {
+        line.push_str(&format!(", {how}"));
+    }
+    line
 }
 
 /// The most rows an edit's diff, or a diff a command printed, takes.
@@ -2448,6 +2499,24 @@ mod tests {
     }
 
     #[test]
+    fn math_in_brackets_reads_as_math_in_dollars_does() {
+        let folder = std::path::Path::new(".");
+        let dollars = reply("$$\nx^2\n$$\nafter", 40, folder);
+        let brackets = reply("\\[\nx^2\n\\]\nafter", 40, folder);
+        assert_eq!(text(&brackets), text(&dollars));
+        assert_eq!(
+            text(&reply("\\[ x^2 \\]", 40, folder)),
+            text(&reply("$$ x^2 $$", 40, folder))
+        );
+        assert_eq!(
+            text(&reply("so \\(x^2\\) holds", 40, folder)),
+            text(&reply("so $x^2$ holds", 40, folder))
+        );
+        // An escaped bracket that runs on is words.
+        assert_eq!(text(&reply("\\[not math", 40, folder)), ["• \\[not math"]);
+    }
+
+    #[test]
     fn a_long_shell_output_shows_its_head_and_the_count_left() {
         let output = (1..=9)
             .map(|n| format!("line {n}"))
@@ -2575,6 +2644,21 @@ mod tests {
         std::fs::write(dir.join("f"), "a\n").unwrap();
         assert_eq!(current(&dir.join("f")).as_deref(), Some("a\n"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_script_is_one_line_of_its_mcp_calls_over_what_it_printed() {
+        let input = serde_json::json!({"input": "await tools.mcp__github__a({});"});
+        let output = "Script completed\nWall time 1.2 seconds\nMCP calls: github 10, linear 2\nOutput:\n3 open issues";
+        let rows = text(&tool("exec", &input, Some(output), false, "/", 80));
+        assert_eq!(
+            rows[0],
+            "• Ran a script: 12 MCP calls (github 10, linear 2)"
+        );
+        assert!(rows[1].contains("3 open issues"), "{rows:#?}");
+        let failed = "Script terminated: it ran out of time\nWall time 600.0 seconds\nOutput:\n";
+        let rows = text(&tool("exec", &input, Some(failed), true, "/", 80));
+        assert_eq!(rows[0], "• Ran a script, terminated: it ran out of time");
     }
 
     #[test]

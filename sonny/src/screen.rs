@@ -382,7 +382,8 @@ impl Screen {
     }
 
     /// A line whose text opens `url`, a name that may hold spaces or
-    /// anything else a link read from words would stop at.
+    /// anything else a link read from words would stop at: a row of a
+    /// list each row of opens, as a folder's entries, so not underlined.
     pub fn push_linked(&mut self, line: Line<'static>, url: String) {
         let mut row = Row::new(line);
         row.link = Some(url);
@@ -718,11 +719,18 @@ impl Screen {
             self.linked = Some((top, bottom, self.width, area));
             self.links = self.find_links(drawn, &file);
         }
-        for (y, from, to, _) in self
-            .links
-            .iter()
-            .filter(|(.., url)| !url.starts_with(BUTTON))
-        {
+        for (y, from, to, url) in &self.links {
+            if url.starts_with(BUTTON) {
+                continue;
+            }
+            let row = top + (y - area.y) as usize;
+            if self
+                .shown
+                .get(row)
+                .is_some_and(|shown| shown.link.is_some())
+            {
+                continue;
+            }
             for x in *from..*to {
                 let cell = &mut buf[(x, *y)];
                 // A picture is not underlined: the line would cross it.

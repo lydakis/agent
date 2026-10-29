@@ -3233,6 +3233,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         inherit: true,
         answered_by: None,
         expire_ms: None,
+        grammar: None,
     };
     // The lead's own tool, which a bot it creates does not take.
     let resolve = Declared {
@@ -3243,6 +3244,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         inherit: false,
         answered_by: None,
         expire_ms: None,
+        grammar: None,
     };
     let declared = [react.clone()];
     let leads = [react.clone(), resolve];
@@ -3339,6 +3341,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         result: "ok".into(),
         answered_by: Some("sonny".into()),
         expire_ms: None,
+        grammar: None,
         inherit: true,
     };
     db.create(
