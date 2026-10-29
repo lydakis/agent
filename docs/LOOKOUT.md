@@ -217,7 +217,7 @@ subscriptions of their own:
   not silent;
 - a task's turns its goal (SONNY.md) held, once the goal ends: only the
   last, with how it ended (``turn:calc.fix/4 completed, asked by goal,
-  and met its goal: `cargo test` exits 0``);
+  and met its goal: its check exits 0``);
 - turns the person asked for in a task themselves, listed apart as theirs;
 - what was saved to or removed from the person's and the project's memory,
   by path, less what the subscriber saved itself: the folders its own

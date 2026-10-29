@@ -331,7 +331,7 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(len(prompts), 3, prompts)
         self.assertIn('turn:calc.fix/3 completed, asked by goal, and stopped pursuing its goal: 2 turns in a row',
                       note)
-        self.assertIn('`false` still exits 1', note)
+        self.assertIn('its check still exits 1', note)
 
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):

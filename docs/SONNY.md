@@ -318,7 +318,10 @@ the goal started call no tool, since the agent only answers and another
 turn would too; the agent calls `blocked`; or someone clears it or the
 agent is deleted. A turn that fails or is stopped ends nothing and starts
 nothing: the lead hears it as any turn. Its lead hears none of the turns
-the goal held until the last, told with how the goal ended (below).
+the goal held until the last, told with how the goal ended (below). That
+line is the lookout's own words only: the agent's reason for giving up,
+and a check it set itself, are its text, which the lead reads in the turn
+or with `goal`.
 
 ## Memory
 

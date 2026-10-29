@@ -456,9 +456,12 @@ async fn pursue(
     turn: i64,
     idle: u32,
 ) -> Option<String> {
-    if let Some(why) = &goal.blocked {
+    // What the lead hears is the lookout's own words only: the reason an
+    // agent gives and the check it may have set are its text, which the
+    // lead reads in the turn itself.
+    if goal.blocked.is_some() {
         end(store, goal);
-        return Some(format!(", and gave up its goal: {why}"));
+        return Some(GAVE_UP.to_owned());
     }
     let check = format!("`{}`", goal.check);
     let (code, output) = run(goal, store, socket).await;
@@ -466,16 +469,16 @@ async fn pursue(
     // given up meanwhile, it ends so.
     match read(store, &goal.bot) {
         Some(now) if now.set_ms == goal.set_ms => {
-            if let Some(why) = &now.blocked {
+            if now.blocked.is_some() {
                 end(store, &now);
-                return Some(format!(", and gave up its goal: {why}"));
+                return Some(GAVE_UP.to_owned());
             }
         }
         _ => return Some(String::new()),
     }
     if code == Some(0) {
         end(store, goal);
-        return Some(format!(", and met its goal: {check} exits 0"));
+        return Some(", and met its goal: its check exits 0".to_owned());
     }
     let exits = match code {
         Some(code) => format!("exits {code}"),
@@ -489,7 +492,7 @@ async fn pursue(
         if used.saturating_sub(goal.tokens_at_set) >= budget {
             end(store, goal);
             return Some(format!(
-                ", and stopped at its goal's budget of {budget} tokens: {check} still {exits}"
+                ", and stopped at its goal's budget of {budget} tokens: its check still {exits}"
             ));
         }
     }
@@ -497,7 +500,7 @@ async fn pursue(
         end(store, goal);
         return Some(format!(
             ", and stopped pursuing its goal: {IDLE_TURNS} turns in a row it started called no tool, \
-             and {check} still {exits}"
+             and its check still {exits}"
         ));
     }
     let prompt = format!(
@@ -515,6 +518,8 @@ async fn pursue(
         )),
     }
 }
+
+const GAVE_UP: &str = ", and gave up its goal, saying why in that turn";
 
 /// The check, in its own process group in the agent's folder, for up to
 /// its timeout: its exit code, `None` when it did not finish, and the end

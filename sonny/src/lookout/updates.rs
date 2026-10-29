@@ -1241,15 +1241,11 @@ mod tests {
         // The check passed: the turn, with how the goal ended.
         updates.goal_turn("shop.fix", 5);
         turn(&mut updates, "shop.fix", 5, goal.clone(), "completed");
-        updates.goal_settled(
-            "shop.fix",
-            5,
-            Some(", and met its goal: `make test` exits 0"),
-        );
+        updates.goal_settled("shop.fix", 5, Some(", and met its goal: its check exits 0"));
         let told = updates.take();
         assert_eq!(
             text(&told),
-            "- shop.fix: turn:shop.fix/5 completed, asked by goal, and met its goal: `make test` exits 0"
+            "- shop.fix: turn:shop.fix/5 completed, asked by goal, and met its goal: its check exits 0"
         );
         updates.sent(told);
         // Cleared while its check ran: plain news.
