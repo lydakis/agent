@@ -671,10 +671,11 @@ impl Updates {
             }
         }
         self.tasks.retain(|(_, news)| !news.empty());
-        self.forwarding
-            .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
-        self.goaled
-            .retain(|(name, turn)| !handles.contains(&format!("turn:{name}/{turn}")));
+        // A turn its goal's check holds stays: the wait read how it ended,
+        // not how its goal did.
+        self.forwarding.retain(|key, _| {
+            self.goaled.contains(key) || !handles.contains(&format!("turn:{}/{}", key.0, key.1))
+        });
     }
 
     /// Whether there is news for the lead: its own, or `held` other news.
@@ -1273,6 +1274,15 @@ mod tests {
         turn(&mut updates, "shop.fix", 8, lead.clone(), "completed");
         let told = updates.take();
         assert!(text(&told).contains("met its goal"), "{}", text(&told));
+        updates.sent(told);
+        // The lead's wait read the turn while its check ran: how the goal
+        // ended is still news.
+        updates.goal_turn("shop.fix", 9);
+        turn(&mut updates, "shop.fix", 9, goal.clone(), "completed");
+        updates.read(&["turn:shop.fix/9".to_owned()].into());
+        updates.goal_settled("shop.fix", 9, Some(", and met its goal: its check exits 0"));
+        let told = updates.take();
+        assert!(text(&told).contains("turn:shop.fix/9 completed, asked by goal, and met its goal"));
         updates.sent(told);
         // Cleared while its check ran: plain news.
         updates.goal_turn("shop.docs", 2);
