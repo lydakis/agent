@@ -1,7 +1,7 @@
 //! T3 Code, as `sonny acp` meets it: the tools T3 Code gives the agents it
 //! runs, over an MCP endpoint it names in their environment, with which a
-//! lead's thread opens a thread for each task the lead starts; the tasks
-//! waiting for their thread, and the bot each thread is.
+//! lead's thread opens a child thread for each task the lead starts; the
+//! tasks waiting for their thread, and the bot each thread is.
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -184,6 +184,15 @@ pub fn is_note(block: &str) -> bool {
     block.starts_with("<runtime_info>")
 }
 
+/// The message T3 Code sends a thread when a task it delegated ends,
+/// which asks it to read the task's result with T3 Code's tools: a lead
+/// hears of its tasks from the lookout instead.
+pub fn is_completion(prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    (prompt.starts_with("Delegated task ") && prompt.contains(" reached a terminal state."))
+        || (prompt.starts_with("Delegated tasks ") && prompt.contains(" reached terminal states."))
+}
+
 /// What the person wrote, out of a prompt T3 Code wrapped in its own
 /// instructions: those name tools the bot does not have.
 pub fn request(prompt: &str) -> &str {
@@ -328,6 +337,17 @@ mod tests {
             "<user_request>\nHi\n</user_request>"
         );
         assert_eq!(request("Fix it."), "Fix it.");
+    }
+
+    #[test]
+    fn a_delegated_tasks_end_is_t3_codes_message() {
+        assert!(is_completion(
+            "Delegated task node-1 reached a terminal state. Use task_status with taskId node-1 to read the result."
+        ));
+        assert!(is_completion(
+            "Delegated tasks node-1, node-2 reached terminal states. Use task_status with each taskId to read the results."
+        ));
+        assert!(!is_completion("Delegated task review: is it done?"));
     }
 
     #[test]

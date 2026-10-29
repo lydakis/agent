@@ -18,7 +18,9 @@ from tests.test_served import declared
 
 
 class T3Tools(http.server.BaseHTTPRequestHandler):
-    """T3 Code's MCP endpoint, as small as `t3_thread_launch` needs."""
+    """T3 Code's MCP endpoint, as small as `delegate_task` and
+    `t3_thread_launch` need. `delegate_task` fails, as when the lead's
+    thread has no run on, while `server.delegating` is false."""
 
     def log_message(self, *_):
         pass
@@ -43,7 +45,12 @@ class T3Tools(http.server.BaseHTTPRequestHandler):
         if 'id' not in message:
             return self.reply(202)
         self.server.calls.put(message['params'])
+        if message['params']['name'] == 'delegate_task' and not self.server.delegating:
+            refused = {'content': [{'type': 'text', 'text': 'parent_not_active'}], 'isError': True}
+            return self.reply(200, {'jsonrpc': '2.0', 'id': message['id'], 'result': refused})
         result = {'threadId': 'thread-2', 'link': 't3://thread/thread-2', 'status': 'started'}
+        if message['params']['name'] == 'delegate_task':
+            result = {'taskId': 'node-1', 'childThreadId': 'thread-2', 'status': 'running'}
         self.reply(200, {'jsonrpc': '2.0', 'id': message['id'],
                          'result': {'content': [{'type': 'text', 'text': json.dumps(result)}],
                                     'structuredContent': result}})
@@ -114,7 +121,7 @@ class AcpTests(ModelFixture):
         self.daemon = SocketClient(self.binary, self.store, self.url, 'echo')
         self.addCleanup(self.daemon.close)
         self.t3 = http.server.ThreadingHTTPServer(('127.0.0.1', 0), T3Tools)
-        self.t3.calls, self.t3.headers = queue.Queue(), []
+        self.t3.calls, self.t3.headers, self.t3.delegating = queue.Queue(), [], True
         threading.Thread(target=self.t3.serve_forever, daemon=True).start()
         self.addCleanup(self.t3.server_close)
         self.addCleanup(self.t3.shutdown)
@@ -172,6 +179,8 @@ class AcpTests(ModelFixture):
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
         answered, updates = thread.answer_of(prompt)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        # The task was T3 Code's child of this prompt before it was answered.
+        delegated = self.t3.calls.get_nowait()
         kinds = [u['sessionUpdate'] for u in updates]
         self.assertEqual(kinds[-1], 'state_update')
         self.assertEqual(updates[-1]['state'], 'idle')
@@ -188,23 +197,18 @@ class AcpTests(ModelFixture):
         prompts = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
         self.assertEqual(prompts[0]['text'], 'script')
 
-        # The task opens as a thread of its own, in its worktree, with its
-        # brief as the first message, through this thread's own tools.
-        launch = self.t3.calls.get(timeout=30)
-        self.assertEqual(launch['name'], 't3_thread_launch')
-        worktree = self.path / '.agent/worktrees/calc.fix'
+        # The task opens as the lead thread's child, with its brief as the
+        # first message, through this thread's own tools.
+        self.assertEqual(delegated['name'], 'delegate_task')
         turns = self.daemon.request('turns', bot='calc.fix')['result']['turns']
         brief = self.daemon.request('prompts', bot='calc.fix', turn=turns[0]['turn'])['result']['prompts'][0]['text']
-        self.assertEqual(launch['arguments']['title'], 'fix')
-        self.assertEqual(launch['arguments']['message'], brief)
-        self.assertEqual(launch['arguments']['workspaceStrategy'],
-                         {'type': 'existing_worktree', 'worktreePath': str(worktree)})
+        self.assertEqual(delegated['arguments'], {'task': brief, 'title': 'fix', 'clientRequestId': 'calc.fix'})
         self.assertTrue(all(h.get('authorization') == 'Bearer thread-1'
                             or h.get('Authorization') == 'Bearer thread-1' for h in self.t3.headers))
 
-        # That thread is the task's, not a lead made for its folder: it
-        # answers with the task's work.
-        child, child_session = self.open(worktree)
+        # That thread, which T3 Code opens in the lead's folder, is the
+        # task's, not the folder's lead: it answers with the task's work.
+        child, child_session = self.open(repo)
         answered, updates = child.answer_of(child.ask('session/prompt', {
             'sessionId': child_session, 'prompt': self.wrapped(brief)}))
         self.assertEqual(answered['result']['stopReason'], 'end_turn')
@@ -213,6 +217,12 @@ class AcpTests(ModelFixture):
         self.assertEqual(kept.read_text(), 'calc.fix')
         self.assertEqual([b['name'] for b in self.daemon.request('bots')['result']['bots']],
                          ['calc.fix', 'calc.lead'])
+        # T3 Code tells the lead's thread its child ended; the lead hears of
+        # its task from the lookout, so that message starts no turn.
+        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped(
+            'Delegated task node-1 reached a terminal state. Use task_status with taskId node-1 to read the result.')}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(len(self.daemon.request('turns', bot='calc.lead')['result']['turns']), 1)
 
     def test_a_prompt_that_steers_is_answered_when_the_turn_it_joined_ends(self):
         repo = self.repo()
@@ -220,6 +230,7 @@ class AcpTests(ModelFixture):
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
                             approve=['start_task'], approver='manual')
         thread, session = self.open(repo)
+        self.t3.delegating = False
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
         first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
         [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
@@ -232,10 +243,17 @@ class AcpTests(ModelFixture):
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
         answered, updates = thread.answer_of(second)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
-        self.assertEqual(updates[-1]['state'], 'idle')
+        # Idle before the answer, which waited for the task's thread.
+        self.assertIn('idle', [u.get('state') for u in updates if u['sessionUpdate'] == 'state_update'])
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         self.assertEqual(sorted(t['status'] for t in turns), ['completed', 'steered'])
-        self.assertEqual(self.t3.calls.get(timeout=30)['name'], 't3_thread_launch')
+        # T3 Code would not take the task as a child: it opens as a thread of
+        # its own, in its worktree.
+        self.assertEqual(self.t3.calls.get(timeout=30)['name'], 'delegate_task')
+        launch = self.t3.calls.get(timeout=30)
+        self.assertEqual(launch['name'], 't3_thread_launch')
+        self.assertEqual(launch['arguments']['workspaceStrategy'],
+                         {'type': 'existing_worktree', 'worktreePath': str(self.path / '.agent/worktrees/calc.fix')})
 
     def test_a_turn_the_lead_takes_on_its_own_shows_in_the_thread(self):
         repo = self.repo()
