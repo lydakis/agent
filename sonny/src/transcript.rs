@@ -1061,6 +1061,19 @@ pub fn wrap_lines(
         .collect()
 }
 
+/// `line` drawn `by` columns further right, its marks for a copy kept:
+/// whether it goes on with the line above, and that its lead, now wider,
+/// is left out.
+pub fn indent(line: Line<'static>, by: usize) -> Line<'static> {
+    let (lead, joins) = mark(&line).unwrap_or((0, false));
+    let text = (line.spans.into_iter()).skip_while(|span| span.content.is_empty());
+    let spans = [goes_on(lead + by, joins), Span::raw(" ".repeat(by))];
+    Line {
+        spans: spans.into_iter().chain(text).collect(),
+        ..line
+    }
+}
+
 /// How a wrapped row tells a copy what to leave out and join: an empty
 /// first span, which draws nothing, whose underline colour is how many
 /// columns the row's lead takes (a bullet or an indent, not the text), and

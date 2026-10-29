@@ -414,11 +414,10 @@ impl Margin {
                 Body::Markdown(text) => markdown(text, inner, Markdown::in_folder(workspace)),
                 Body::File(path) => self.file_lines(workspace, path, inner),
             };
-            lines.extend(body.into_iter().map(|line| {
-                let mut spans = vec![Span::raw("   ")];
-                spans.extend(line.spans);
-                Line::from(spans).style(line.style)
-            }));
+            lines.extend(
+                body.into_iter()
+                    .map(|line| crate::transcript::indent(line, 3)),
+            );
         }
         (lines, marks)
     }

@@ -1339,6 +1339,30 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_indented_further_still_copies_as_one_line() {
+        let text = "The stub answers after the 2s timeout, see https://example.com/a/very/long/path/to/the/stub";
+        let reply = crate::transcript::reply(text, 27, std::path::Path::new("."));
+        let cut = reply
+            .iter()
+            .any(|line| line.alignment == Some(crate::transcript::CUT));
+        let rows: Vec<_> = (reply.into_iter())
+            .map(|line| crate::transcript::indent(line, 3))
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .any(|line| line.alignment == Some(crate::transcript::CUT)),
+            cut
+        );
+        let (mut screen, buf) = screen(rows, 30, 10);
+        assert!(row(&buf, 1).starts_with("     "), "{:?}", row(&buf, 1));
+        let last = screen.shown.len() as u16 - 1;
+        assert_eq!(
+            drag(&mut screen, (0, 0), (29, last)),
+            Some(Action::Copy(text.into()))
+        );
+    }
+
+    #[test]
     fn lines_keep_their_breaks_and_the_indent_they_do_not_share() {
         let lines = vec![
             Line::from("  fn main() {"),
