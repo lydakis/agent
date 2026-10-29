@@ -139,9 +139,11 @@ command (`cmux surface resume set`, shown as `Sonny: NAME`), so after cmux
 relaunches the tab runs `sonny` on the same bot again, once you allow
 commands starting with `sonny` from the tab's Resume Commands menu (until
 then cmux offers it to run by hand); quitting Sonny clears it. cmux lets
-only programs started in its tabs reach it, by default: the lookout Sonny
-starts there is one, and one started outside cmux needs Settings >
-Automation set to allow local automation.
+only programs started in its tabs reach it, by default; agents' shells run
+in the daemon, not in cmux, so set cmux's Settings > Automation to
+"Automation mode" (your own programs, no ancestry check) for agents to run
+commands in tabs and read them. The lookout Sonny starts in cmux reaches it
+either way; one started outside cmux needs Automation mode too.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
