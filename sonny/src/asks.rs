@@ -394,7 +394,11 @@ mod tests {
             }),
         )
         .unwrap();
-        let shown: Vec<String> = lines(&ask, 80).iter().map(|row| row.to_string()).collect();
+        let shown: Vec<String> = lines(&ask, 80)
+            .0
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
         assert_eq!(shown[0], "? Ship 0.5 with --fast on?");
         assert_eq!(
             shown[3],
@@ -402,7 +406,7 @@ mod tests {
         );
         // The question stays bold, past what its words make bold.
         assert!(
-            lines(&ask, 80)[0]
+            lines(&ask, 80).0[0]
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD)

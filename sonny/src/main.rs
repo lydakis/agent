@@ -8239,7 +8239,7 @@ mod tests {
                 Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
                 Some("calc.gone") => json!({"error": "bot_not_found"}),
                 // The daemon not there for a moment, then there again.
-                _ if n >= 3 && n < 5 => json!({"error": "daemon_unavailable"}),
+                _ if (3..5).contains(&n) => json!({"error": "daemon_unavailable"}),
                 _ => json!({"turns": [{"turn": 1, "status": "running"}]}),
             }
         })
