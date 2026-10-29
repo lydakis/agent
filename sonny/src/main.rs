@@ -15,11 +15,11 @@ mod background;
 mod banner;
 mod cache;
 mod calls;
+mod cmux;
 mod config;
 mod declared;
 mod diff;
 mod embed;
-mod errand;
 mod herdr;
 mod highlight;
 mod html;
@@ -28,6 +28,8 @@ mod js;
 mod links;
 mod login;
 mod lookout;
+#[cfg(target_os = "macos")]
+mod mac;
 mod math;
 mod mermaid;
 mod models;
@@ -318,14 +320,6 @@ async fn project_of(client: &Client, bot: &str) -> String {
 
 /// How many lines of transcript wait while `/status` holds the screen.
 const KEPT_UNDER_STATUS: usize = 5_000;
-
-/// A program on PATH.
-fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-}
 
 /// Agent's own binary: the one the daemon gave this shell, else the one
 /// installed beside Sonny (`libexec/agent`, as the Linux tarball lays it
@@ -721,7 +715,8 @@ async fn run() -> Result<(), String> {
                 return Err(usage());
             }
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
-            skills::install_errand();
+            // Sonny no longer writes an `errand` skill: one it wrote, unedited, goes.
+            skills::remove("errand");
             if options.layout {
                 mux::install_skill(options.rex_host.as_deref());
             }
@@ -735,6 +730,7 @@ async fn run() -> Result<(), String> {
     // A side chat borrows its agent's pane, and Herdr keeps the agent.
     if options.side.is_none() {
         herdr::announce(&name, reopen());
+        cmux::announce(&name, reopen());
     }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
@@ -1033,8 +1029,8 @@ fn unique(prefix: &str) -> String {
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
-/// (Ghostty, Rex) can mark this pane working, blocked or done; and the
-/// same to Herdr, which takes it from its own CLI instead.
+/// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
+/// the same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
@@ -1043,6 +1039,9 @@ fn status_report(state: &str, bot: &str) {
         return;
     }
     herdr::report(state);
+    if state == "clear" {
+        cmux::release();
+    }
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
@@ -1332,8 +1331,6 @@ struct Watch {
     screen: Option<Tui>,
     project: String,
     rows: Vec<status::Row>,
-    /// This project's active Errand jobs.
-    jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
     /// The lookout's line for the lead.
@@ -1580,13 +1577,6 @@ struct Fleet {
     named: HashMap<String, String>,
     /// What to ring for, taken by the app after each event.
     alerts: Vec<(sound::Alert, String)>,
-    /// Detached Errand runs the project's bots started, by bot and call
-    /// (call ids are only unique within a bot): the command, until the
-    /// call's output names the job.
-    errands: HashMap<(String, String), String>,
-    /// Finished calls whose output names a job to follow in a window:
-    /// the bot, the output's node, and the command.
-    jobs: Vec<(String, i64, String, String)>,
     /// Tasks whose last turn completed, and that turn: its window closes
     /// once a wait has taken the result.
     ended: HashMap<String, i64>,
@@ -1687,8 +1677,6 @@ impl Fleet {
             doing: HashMap::new(),
             named: HashMap::new(),
             alerts: Vec::new(),
-            errands: HashMap::new(),
-            jobs: Vec::new(),
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
@@ -1753,32 +1741,6 @@ impl Fleet {
         let opened = self.layout.show(bot, &name, &command)?;
         self.doing(bot, "working");
         Ok(opened)
-    }
-
-    /// Note a detached Errand run as it starts, and its job once the call
-    /// finishes, to follow it in a window of its own.
-    fn errand(&mut self, bot: &str, kind: &str, data: &Value) {
-        let call = data["call_id"].as_str().unwrap_or("").to_owned();
-        match kind {
-            "tool_started" if data["name"] == "shell" => {
-                let command = data["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                    .and_then(|a| a["command"].as_str().and_then(calls::errand_detached));
-                if let Some(command) = command {
-                    self.errands.insert((bot.to_owned(), call), command);
-                }
-            }
-            "tool_completed" => {
-                if let Some(command) = self.errands.remove(&(bot.to_owned(), call.clone()))
-                    && let Some(node) = data["node"].as_i64()
-                    && data["failed"] != true
-                {
-                    self.jobs.push((bot.to_owned(), node, call, command));
-                }
-            }
-            _ => {}
-        }
     }
 
     /// A finished task's window closes once its result is taken: its turn
@@ -1873,49 +1835,6 @@ impl Fleet {
         }
     }
 
-    /// A window for each Errand job started since: `errand attach` on its
-    /// handle, named after its command.
-    async fn follow_jobs(&mut self) {
-        let Some(errand) = which("errand") else {
-            self.jobs.clear();
-            return;
-        };
-        for (bot, node, call, command) in std::mem::take(&mut self.jobs) {
-            let Ok(read) = self
-                .client
-                .request("history_items", json!({"bot": bot, "nodes": [node]}))
-                .await
-            else {
-                continue;
-            };
-            // An Anthropic node holds every result of its turn's calls.
-            let Some(result) = responses(&read["items"][0]["item"])
-                .into_iter()
-                .find(|item| item["call_id"] == call.as_str())
-            else {
-                continue;
-            };
-            let (printed, _) = output(&result);
-            let Some(handle) = printed
-                .lines()
-                .map(str::trim)
-                .find(|line| line.contains('/') && !line.contains(' '))
-            else {
-                continue;
-            };
-            let label = format!("errand:{handle}");
-            let name = format!("errand · {}", first_line(&command));
-            let attach = vec![
-                errand.to_string_lossy().into_owned(),
-                "attach".into(),
-                handle.to_owned(),
-            ];
-            let _ = self
-                .layout
-                .place(&label, &name, &attach, &mux::Placement::Window);
-        }
-    }
-
     /// A bot's name in its project's session: `lead`, or the task's name.
     fn short<'a>(&self, bot: &'a str) -> &'a str {
         if bot == self.lead {
@@ -1992,11 +1911,11 @@ impl Fleet {
         }
     }
 
-    /// Whether a block is the project's: a bot's, a command one asked for
-    /// (`BOT/NAME`), or an Errand job's.
+    /// Whether a block is the project's: a bot's, or a command one asked
+    /// for (`BOT/NAME`).
     fn owns(&self, label: &str) -> bool {
         let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
-        label.starts_with("errand:") || self.doing.contains_key(bot) || self.lineage.contains(bot)
+        self.doing.contains_key(bot) || self.lineage.contains(bot)
     }
 
     /// Follow every bot again on a new connection; what changed while
@@ -2030,7 +1949,6 @@ impl Fleet {
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
         if self.lineage.contains(bot) {
-            self.errand(bot, kind, data);
             self.taken(bot, kind, event);
             self.resolving.event(event, &self.lead);
             match kind {
@@ -2323,11 +2241,6 @@ impl App {
                         continue;
                     };
                     let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
-                    if let Some(fleet) = &mut self.fleet
-                        && !fleet.jobs.is_empty()
-                    {
-                        fleet.follow_jobs().await;
-                    }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -3907,14 +3820,12 @@ impl App {
                 return;
             }
         };
-        let jobs = errand::jobs(self.folder_name()).await;
         // The full screen shows it beside the conversation.
         if full() {
             self.watch = Some(Watch {
                 screen: None,
                 project,
                 rows,
-                jobs,
                 read: Instant::now(),
                 lookout: self.lookout_line(),
                 resolved: false,
@@ -3924,7 +3835,7 @@ impl App {
             self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
             return;
         }
-        self.watch(project, rows, jobs, None);
+        self.watch(project, rows, None);
     }
 
     /// What runs for the project's agents with no one typing. Open
@@ -3944,7 +3855,6 @@ impl App {
                 screen: None,
                 project,
                 rows: Vec::new(),
-                jobs: Vec::new(),
                 read: Instant::now(),
                 lookout: String::new(),
                 resolved: false,
@@ -3954,7 +3864,7 @@ impl App {
             self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
             return;
         }
-        self.watch(project, Vec::new(), Vec::new(), Some(view));
+        self.watch(project, Vec::new(), Some(view));
     }
 
     /// Give `/status`, or `/background`, the screen.
@@ -3962,7 +3872,6 @@ impl App {
         &mut self,
         project: String,
         rows: Vec<status::Row>,
-        jobs: Vec<status::Row>,
         background: Option<background::View>,
     ) {
         // The full screen is the alternate screen already.
@@ -3979,7 +3888,6 @@ impl App {
                     screen: Some(screen),
                     project,
                     rows,
-                    jobs,
                     read: Instant::now(),
                     lookout: self.lookout_line(),
                     resolved: false,
@@ -4004,13 +3912,11 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        let jobs = errand::jobs(self.folder_name()).await;
         let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
-            watch.jobs = jobs;
             watch.read = Instant::now();
             watch.lookout = lookout;
         }
@@ -4039,14 +3945,6 @@ impl App {
             Some(_) => lookout::status(&self.options.store, &self.bot),
             None => String::new(),
         }
-    }
-
-    /// The lead's folder's own name, which Errand names its jobs' project by.
-    fn folder_name(&self) -> String {
-        std::path::Path::new(&self.workspace)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
@@ -6593,17 +6491,8 @@ fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
             row
         })
         .collect();
-    let jobs: Vec<status::Row> = watch
-        .jobs
-        .iter()
-        .cloned()
-        .map(|mut job| {
-            job.seconds = job.seconds.map(|s| s + since);
-            job
-        })
-        .collect();
     let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    let mut card = status::card(&watch.project, &rows, &jobs, width, watch.resolved);
+    let mut card = status::card(&watch.project, &rows, width, watch.resolved);
     if !watch.lookout.is_empty() {
         card.insert(1, Line::from(watch.lookout.clone()).dim());
     }

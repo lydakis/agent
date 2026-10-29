@@ -1,7 +1,6 @@
 //! Shell commands Sonny knows the meaning of, said as what they do: an
 //! `agent` call starts, messages, waits on or removes an agent; a `rex` call
-//! opens, reads or types into a window; an `errand` call runs a command on
-//! another machine or acts on its job; Sonny's memory and the trigger
+//! opens, reads or types into a window; Sonny's memory and the trigger
 //! scripts save facts and schedule jobs. A command line is read a command
 //! at a time; a pipe is said with its command and what came out of it.
 //! The tools Sonny declares are said here too: a question to the person
@@ -73,7 +72,6 @@ pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
     let printed = if piped.is_some() { "" } else { output };
     let mut said = match name {
         "$AGENT_BIN" | "${AGENT_BIN}" | "agent" => agent(args, stdin, printed, failed),
-        "errand" => errand(args, printed, failed),
         "$REX" | "${REX}" | "rex" => rex(args, printed, failed),
         "memory" if program.contains(".agent/memory") => Some(memory(args, printed, failed)),
         "trigger" if program.contains(".agent/trigger") => trigger(args, printed, failed),
@@ -662,74 +660,6 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
     Some(said)
 }
 
-/// The command an `errand -d -- COMMAND` call starts, detached.
-pub fn errand_detached(command: &str) -> Option<String> {
-    let simple = crate::shell::simple(command)?;
-    let (program, words) = simple.words.split_first()?;
-    if program.rsplit('/').next() != Some("errand") {
-        return None;
-    }
-    let args = Args::new(words);
-    (args.has("-d") || args.has("--detach"))
-        .then(|| args.rest.clone())
-        .flatten()
-}
-
-/// An Errand call: a command run on another machine, or a look at or
-/// action on a job, by its `peer/ULID` handle.
-fn errand(words: &[String], output: &str, failed: bool) -> Option<Said> {
-    let args = Args::new(words);
-    let mut said = Said {
-        verb: String::new(),
-        what: String::new(),
-        under: Vec::new(),
-        failed,
-        output: None,
-    };
-    if let Some(command) = &args.rest {
-        // Where it runs: the runner named, what it needs, or the default.
-        let place = match (args.value(&["--on"]), args.value(&["--where"])) {
-            (Some("local"), _) => "on a local copy".to_owned(),
-            (Some(peer), _) => format!("on {peer}"),
-            (None, Some(facts)) => format!("where {facts}"),
-            (None, None) => "on Errand".to_owned(),
-        };
-        said.what = format!("{} {place}", first_line(command));
-        if args.has("-d") || args.has("--detach") {
-            said.verb = "Started".into();
-            if let Some(handle) = output.lines().map(str::trim).find(|l| l.contains('/')) {
-                said.under.push(dim(handle.to_owned()));
-            }
-        } else {
-            said.verb = "Ran".into();
-            said.output = Some(output.to_owned());
-        }
-        return Some(said);
-    }
-    let (verb, rest) = args.words.split_first()?;
-    let handle = rest
-        .iter()
-        .find(|w| !w.starts_with('-') && w.contains('/'))
-        .cloned()
-        .unwrap_or_default();
-    said.what = handle;
-    said.verb = match verb.as_str() {
-        "ps" => "Listed Errand jobs",
-        "peers" => "Listed Errand runners",
-        "status" => "Checked Errand job",
-        "attach" => "Read the output of Errand job",
-        "fetch" if args.has("--apply") => "Applied the changes of Errand job",
-        "fetch" => "Fetched the changes of Errand job",
-        "kill" => "Stopped Errand job",
-        _ => return None,
-    }
-    .into();
-    if matches!(verb.as_str(), "attach" | "ps" | "peers") {
-        said.output = Some(output.to_owned());
-    }
-    Some(said)
-}
-
 /// A call of a tool Sonny declares, said as what it does: a question to
 /// the person with its choices, the plan it sets, a task it started,
 /// removed or resolved, where a window or pane went, the project it made,
@@ -1119,29 +1049,6 @@ Keep the rest.'"#,
     }
 
     #[test]
-    fn errand_calls_say_where_they_ran() {
-        let ran = said_or_none("errand --on mac-mini -- cargo test --workspace", "ok\n");
-        assert_eq!(
-            (ran.verb.as_str(), ran.what.as_str()),
-            ("Ran", "cargo test --workspace on mac-mini")
-        );
-        assert_eq!(ran.output.as_deref(), Some("ok\n"));
-        let started = said_or_none(
-            "errand -d --where 'os=linux,gpu' -- python train.py",
-            "gpu-box/01JB2Q8W3V4K\n",
-        );
-        assert_eq!(started.verb, "Started");
-        assert_eq!(started.what, "python train.py where os=linux,gpu");
-        assert_eq!(started.under.len(), 1);
-        let fetched = said_or_none("errand fetch --apply mini/01JB2Q8W3V4K", "");
-        assert_eq!(
-            (fetched.verb.as_str(), fetched.what.as_str()),
-            ("Applied the changes of Errand job", "mini/01JB2Q8W3V4K")
-        );
-        assert!(said("errand doctor", "", false).is_none());
-    }
-
-    #[test]
     fn a_wait_returns_only_the_turns_that_completed() {
         let tool = r#"{"results":{"turn:shop.fix/7":{"bot":"shop.fix","status":"completed","text":"ok"},"turn:shop.docs/12":{"pending":true},"turn:shop.bad/3":{"status":"failed"}},"pending":["turn:shop.docs/12"]}"#;
         assert_eq!(returned(tool), [("shop.fix".to_owned(), 7)]);
@@ -1190,16 +1097,6 @@ Keep the rest.'"#,
         assert!(listed.what.starts_with("| python3 -c"));
         assert!(listed.under.is_empty());
         assert_eq!(listed.output.as_deref(), Some("42\n"));
-    }
-
-    #[test]
-    fn a_detached_errand_run_is_found() {
-        assert_eq!(
-            errand_detached("errand -d --on mini -- make test").as_deref(),
-            Some("make test")
-        );
-        assert_eq!(errand_detached("errand --on mini -- make test"), None);
-        assert_eq!(errand_detached("errand -d ps"), None);
     }
 
     fn said_or_none(command: &str, output: &str) -> Said {

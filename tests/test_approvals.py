@@ -846,16 +846,19 @@ class PromptReadTests(ModelFixture):
     def test_the_daemons_own_terminal_never_reaches_a_tool(self):
         env = {**clean_env(), 'REX_SESSION': 'session:daemons', 'REX_BLOCK': 'block:daemons',
                'TMUX': '/tmp/tmux-0/default,1,0', 'TMUX_PANE': '%0', 'HERDR_ENV': '1',
-               'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1'}
+               'HERDR_WORKSPACE_ID': 'w1', 'HERDR_TAB_ID': 'w1:t1', 'HERDR_PANE_ID': 'w1:p1',
+               'CMUX_WORKSPACE_ID': 'ws-1', 'CMUX_SURFACE_ID': 'sf-1', 'CMUX_TAB_ID': 'ws-1',
+               'CMUX_PANEL_ID': 'sf-1'}
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell', env=env)
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='a',
                               prompt='shell:printf "${REX_SESSION-unset}${REX_BLOCK-unset}${TMUX-unset}${TMUX_PANE-unset}'
-                              '${HERDR_ENV-unset}${HERDR_WORKSPACE_ID-unset}${HERDR_TAB_ID-unset}${HERDR_PANE_ID-unset}" > seen'
+                              '${HERDR_ENV-unset}${HERDR_WORKSPACE_ID-unset}${HERDR_TAB_ID-unset}${HERDR_PANE_ID-unset}'
+                              '${CMUX_WORKSPACE_ID-unset}${CMUX_SURFACE_ID-unset}${CMUX_TAB_ID-unset}${CMUX_PANEL_ID-unset}" > seen'
                               )['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual((self.path / 'seen').read_text(), 'unset' * 8)
+        self.assertEqual((self.path / 'seen').read_text(), 'unset' * 12)
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')

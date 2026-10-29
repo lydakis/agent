@@ -1402,7 +1402,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 28] = [
+const KEPT: [&str; 26] = [
     "Started",
     "Messaged",
     "Steered",
@@ -1429,8 +1429,6 @@ const KEPT: [&str; 28] = [
     "Unsubscribed from",
     "Opened a tab",
     "Opened a split",
-    "Stopped Errand job",
-    "Applied the changes of Errand job",
 ];
 
 fn kept(said: &crate::calls::Said) -> bool {
