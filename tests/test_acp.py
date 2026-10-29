@@ -227,3 +227,12 @@ class AcpTests(ModelFixture):
         [said] = [u for u in updates if u['sessionUpdate'] == 'user_message']
         self.assertEqual(said['content'], [{'type': 'text', 'text': 'fix finished'}])
         self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
+
+    def test_a_thread_sonny_does_not_know_does_not_come_back(self):
+        repo = self.repo()
+        thread = Thread(self, self.env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        refused, _ = thread.answer_of(thread.ask('session/resume', {'sessionId': 'sonny-gone', 'cwd': str(repo),
+                                                                     'mcpServers': []}))
+        self.assertIn('sonny-gone', refused['error']['message'])
+        self.assertEqual(self.daemon.request('bots')['result']['bots'], [])

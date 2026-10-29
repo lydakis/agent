@@ -284,9 +284,15 @@ impl Agent {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.insert(id.clone(), session.clone());
         }
-        if let Some(bot) = resumed.and_then(t3::recall)
-            && let Err(error) = session.bind(self, Some(bot), false).await
-        {
+        // A thread comes back as the bot it was, or not at all.
+        let bound = match resumed {
+            Some(id) => match t3::recall(id) {
+                Some(bot) => session.bind(self, Some(bot), false).await,
+                None => Err(format!("Sonny does not know thread {id}")),
+            },
+            None => Ok(()),
+        };
+        if let Err(error) = bound {
             if let Ok(mut sessions) = self.sessions.lock() {
                 sessions.remove(&id);
             }
@@ -389,7 +395,18 @@ impl Session {
             }
         }
         let (session, agent) = (self.clone(), agent.clone());
-        tokio::spawn(async move { session.follow(&agent, events).await });
+        // Calls already waiting for the person, whose events were before
+        // this thread came, are put to it too.
+        let waiting = {
+            let state = self.state.lock().await;
+            (state.bound.as_ref()).map(|b| (b.client.clone(), b.bot.clone(), state.running))
+        };
+        tokio::spawn(async move {
+            if let Some((client, bot, turn @ Some(_))) = waiting {
+                session.approvals(&agent, &client, &bot, turn).await;
+            }
+            session.follow(&agent, events).await
+        });
         Ok(())
     }
 
@@ -400,7 +417,7 @@ impl Session {
         if !bound {
             // The first prompt of a thread T3 Code opened for a task is
             // that task's brief.
-            let claimed = t3::claim(&text);
+            let claimed = t3::claim(&text, &self.cwd);
             let task = claimed.is_some();
             // A task's thread stands for the turn the task runs already.
             if task {
@@ -603,10 +620,13 @@ impl Session {
             "tool_started" => {
                 let name = data["name"].as_str().unwrap_or("tool").to_owned();
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
-                let arguments: Value = data["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str(a).ok())
-                    .unwrap_or(Value::Null);
+                let arguments: Value = match data["arguments_truncated"] == true {
+                    true => whole_arguments(&client, &bot, &call).await,
+                    false => data["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(Value::Null),
+                };
                 state.part += 1;
                 state.streamed = false;
                 if name == reactions::TOOL {
@@ -915,9 +935,9 @@ async fn open_task(
             .as_str()
             .ok_or("the task has no brief")?
             .to_owned();
-        t3::expect(&bot, &brief)?;
         let workspace = record["workspace"].as_str().unwrap_or_default();
-        let mut launch = json!({"title": name, "message": brief, "clientRequestId": bot});
+        let message = t3::expect(&bot, &brief, Path::new(workspace))?;
+        let mut launch = json!({"title": name, "message": message, "clientRequestId": bot});
         if workspace != lead_workspace {
             launch["workspaceStrategy"] =
                 json!({"type": "existing_worktree", "worktreePath": workspace});
@@ -926,9 +946,8 @@ async fn open_task(
             // A folder T3 Code does not take as one of the project's: the
             // thread works in the project's, as the task's still says.
             Err(_) if !launch["workspaceStrategy"].is_null() => {
-                if let Some(fields) = launch.as_object_mut() {
-                    fields.remove("workspaceStrategy");
-                }
+                let message = t3::expect(&bot, &brief, Path::new(lead_workspace))?;
+                let launch = json!({"title": name, "message": message, "clientRequestId": bot});
                 t3.call("t3_thread_launch", launch).await
             }
             launched => launched,
@@ -1057,10 +1076,33 @@ async fn items(client: &Client, bot: &str, nodes: &[i64]) -> Vec<Value> {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|entry| entry["item"].clone())
+            .flat_map(|entry| crate::responses(&entry["item"]))
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Call `id`'s whole arguments, from the bot's newest items, for one whose
+/// event carried only their start.
+async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
+    let Ok(page) = client
+        .request("history_nodes", json!({"bot": bot, "limit": 64}))
+        .await
+    else {
+        return Value::Null;
+    };
+    let nodes: Vec<i64> = page["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node["node"].as_i64())
+        .collect();
+    items(client, bot, &nodes)
+        .await
+        .into_iter()
+        .find(|item| item["type"] == "function_call" && item["call_id"] == id)
+        .and_then(|call| serde_json::from_str(call["arguments"].as_str()?).ok())
+        .unwrap_or(Value::Null)
 }
 
 #[cfg(test)]

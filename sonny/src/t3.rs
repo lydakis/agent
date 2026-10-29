@@ -3,7 +3,7 @@
 //! lead's thread opens a thread for each task the lead starts; the tasks
 //! waiting for their thread, and the bot each thread is.
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The MCP protocol version Sonny asks T3 Code's endpoint for, as T3
 /// Code's own terminal fallback does.
@@ -202,16 +202,68 @@ fn file_name(bot: &str) -> String {
     bot.replace('/', "%2F")
 }
 
-/// The task `bot` waits for the thread opened with `brief`.
-pub fn expect(bot: &str, brief: &str) -> Result<(), String> {
-    let dir = dir("pending").ok_or("HOME is not set")?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let now = std::time::SystemTime::now()
+fn now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    let record = json!({"bot": bot, "brief": brief, "at": now});
-    std::fs::write(dir.join(file_name(bot)), record.to_string()).map_err(|e| e.to_string())
+        .as_secs()
+}
+
+/// A folder as T3 Code and the daemon may each spell it.
+fn same_folder(a: &str, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    real(Path::new(a)) == real(b)
+}
+
+/// The tasks waiting for their thread, oldest first; ones waiting too
+/// long go.
+fn pending(dir: &Path) -> Vec<(PathBuf, Value)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let now = now();
+    let mut all: Vec<(PathBuf, Value)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let record =
+                serde_json::from_str::<Value>(&std::fs::read_to_string(entry.path()).ok()?).ok()?;
+            Some((entry.path(), record))
+        })
+        .filter(|(path, record)| {
+            let fresh = now.saturating_sub(record["at"].as_u64().unwrap_or(0)) <= PENDING_SECS;
+            if !fresh {
+                let _ = std::fs::remove_file(path);
+            }
+            fresh
+        })
+        .collect();
+    all.sort_by_key(|(_, record)| record["at"].as_u64());
+    all
+}
+
+/// The task `bot` waits for the thread T3 Code opens in `cwd`: the first
+/// message to open it with, the brief, told apart by the task's name from
+/// another task's waiting with the same brief in the same folder.
+pub fn expect(bot: &str, brief: &str, cwd: &Path) -> Result<String, String> {
+    expect_in(&dir("pending").ok_or("HOME is not set")?, bot, brief, cwd)
+}
+
+fn expect_in(dir: &Path, bot: &str, brief: &str, cwd: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let taken = pending(dir).into_iter().any(|(_, record)| {
+        record["bot"] != bot
+            && record["message"].as_str() == Some(brief)
+            && record["cwd"]
+                .as_str()
+                .is_some_and(|at| same_folder(at, cwd))
+    });
+    let message = match taken {
+        true => format!("{brief}\n\n({bot})"),
+        false => brief.to_owned(),
+    };
+    let record = json!({"bot": bot, "message": message, "cwd": cwd, "at": now()});
+    std::fs::write(dir.join(file_name(bot)), record.to_string()).map_err(|e| e.to_string())?;
+    Ok(message)
 }
 
 /// No thread comes for `bot`.
@@ -221,35 +273,23 @@ pub fn forget(bot: &str) {
     }
 }
 
-/// The task a thread's first prompt opens: the one waiting with that
-/// brief, which no other thread then claims. Ones waiting too long go.
-pub fn claim(prompt: &str) -> Option<String> {
-    let dir = dir("pending")?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut found = None;
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        if now.saturating_sub(record["at"].as_u64().unwrap_or(0)) > PENDING_SECS {
-            let _ = std::fs::remove_file(entry.path());
-            continue;
-        }
-        if found.is_none()
-            && record["brief"].as_str().map(str::trim) == Some(prompt.trim())
-            // Claimed by whoever removes it.
-            && std::fs::remove_file(entry.path()).is_ok()
-        {
-            found = record["bot"].as_str().map(str::to_owned);
-        }
-    }
-    found
+/// The task a thread in `cwd` opens with its first prompt: the one waiting
+/// for that message there, which no other thread then claims.
+pub fn claim(prompt: &str, cwd: &Path) -> Option<String> {
+    claim_in(&dir("pending")?, prompt, cwd)
+}
+
+fn claim_in(dir: &Path, prompt: &str, cwd: &Path) -> Option<String> {
+    pending(dir).into_iter().find_map(|(path, record)| {
+        let ours = record["message"].as_str().map(str::trim) == Some(prompt.trim())
+            && record["cwd"]
+                .as_str()
+                .is_some_and(|at| same_folder(at, cwd));
+        // Claimed by whoever removes it.
+        (ours && std::fs::remove_file(&path).is_ok())
+            .then(|| record["bot"].as_str().map(str::to_owned))
+            .flatten()
+    })
 }
 
 /// The bot the thread `session` is, for its next start.
@@ -281,6 +321,30 @@ mod tests {
             "<user_request>\nHi\n</user_request>"
         );
         assert_eq!(request("Fix it."), "Fix it.");
+    }
+
+    #[test]
+    fn a_thread_claims_the_task_waiting_for_its_message_in_its_folder() {
+        let home = std::env::temp_dir().join(format!("sonny-t3-{}", std::process::id()));
+        let (dir, one, two) = (home.join("pending"), home.join("one"), home.join("two"));
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        assert_eq!(
+            expect_in(&dir, "a.fix", "Fix it.", &one).unwrap(),
+            "Fix it."
+        );
+        assert_eq!(
+            expect_in(&dir, "b.fix", "Fix it.", &two).unwrap(),
+            "Fix it."
+        );
+        // The same brief in the same folder is told apart by its name.
+        let other = expect_in(&dir, "a.other", "Fix it.", &one).unwrap();
+        assert_eq!(other, "Fix it.\n\n(a.other)");
+        assert_eq!(claim_in(&dir, "Fix it.", &two).as_deref(), Some("b.fix"));
+        assert_eq!(claim_in(&dir, "Fix it.", &two), None);
+        assert_eq!(claim_in(&dir, &other, &one).as_deref(), Some("a.other"));
+        assert_eq!(claim_in(&dir, " Fix it.\n", &one).as_deref(), Some("a.fix"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
