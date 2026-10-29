@@ -1664,6 +1664,15 @@ pub fn folds(
     if failed {
         return None;
     }
+    // The wait tool, said as `drawn` says it.
+    if name == "wait" {
+        let bots = crate::calls::once(
+            (arguments["handles"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .map(crate::calls::handle_bot),
+        );
+        return (!bots.is_empty()).then(|| ("Waited for".to_owned(), bots.join(", ")));
+    }
     let said = match name {
         "shell" => crate::calls::said(arguments["command"].as_str()?, output.unwrap_or(""), false)?,
         _ => crate::calls::declared(name, arguments, false)?,
@@ -2499,6 +2508,9 @@ mod tests {
                 "    calc.add steered"
             ]
         );
+        let wait = serde_json::json!({"handles": handles});
+        let fold = folds("wait", &wait, Some(&output.to_string()), false);
+        assert_eq!(fold, Some(("Waited for".into(), "calc.add".into())));
     }
 
     #[test]
