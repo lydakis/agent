@@ -361,8 +361,17 @@ impl Registry {
                 let status = child.wait().await;
                 // What the command wrote last is still on its way; a process
                 // it left running may hold the terminal open, so this waits
-                // only a moment before the rest of its group is killed.
-                let _ = tokio::time::timeout(Duration::from_millis(100), reader).await;
+                // only a moment before the rest of its group is killed. One
+                // in another session outlives that, so the reader stops
+                // here and lets the terminal go.
+                let mut reader = reader;
+                if tokio::time::timeout(Duration::from_millis(100), &mut reader)
+                    .await
+                    .is_err()
+                {
+                    reader.abort();
+                    let _ = reader.await;
+                }
                 // SAFETY: kill takes no pointers; the group is this command's own.
                 unsafe {
                     libc::kill(-group, libc::SIGKILL);
