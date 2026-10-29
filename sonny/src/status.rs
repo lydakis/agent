@@ -137,8 +137,15 @@ pub fn plain_line(text: &str) -> String {
 }
 
 /// The lead, then its tasks by group, resolved ones only counted unless
-/// `resolved` shows them.
-pub fn card(project: &str, rows: &[Row], width: usize, resolved: bool) -> Vec<Line<'static>> {
+/// `resolved` shows them; and the line each agent's rows start on, by
+/// its name, for a click there to open it.
+pub fn card(
+    project: &str,
+    rows: &[Row],
+    width: usize,
+    resolved: bool,
+) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
+    let mut named = Vec::new();
     let tasks: Vec<&Row> = rows.iter().filter(|r| r.name != "lead").collect();
     let count = |group: Group| tasks.iter().filter(|r| r.group == group).count();
     let mut head = format!(
@@ -157,6 +164,7 @@ pub fn card(project: &str, rows: &[Row], width: usize, resolved: bool) -> Vec<Li
     }
     let mut out = vec![Line::from(head).bold()];
     for row in rows.iter().filter(|r| r.name == "lead") {
+        named.push((out.len(), row.name.clone()));
         out.extend(row_lines(row, width));
     }
     for group in [
@@ -180,10 +188,11 @@ pub fn card(project: &str, rows: &[Row], width: usize, resolved: bool) -> Vec<Li
             Span::raw(format!(" · {n}")).dim(),
         ]));
         for row in tasks.iter().filter(|r| r.group == group) {
+            named.push((out.len(), row.name.clone()));
             out.extend(row_lines(row, width));
         }
     }
-    out
+    (out, named)
 }
 
 /// One agent's lines: its mark, name, state and time; its model, place and
@@ -204,7 +213,8 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
     let mut spans = vec![
         Span::raw(" "),
         mark,
-        Span::raw(row.name.clone()).bold(),
+        // In the agents' color: a click opens it.
+        Span::raw(row.name.clone()).bold().fg(Color::Blue),
         Span::raw(format!(" {}", row.state)),
     ];
     if !time.is_empty() {
@@ -323,6 +333,7 @@ mod tests {
         ];
         let text = |resolved| -> Vec<String> {
             card("calc", &rows, 100, resolved)
+                .0
                 .iter()
                 .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect()
@@ -340,6 +351,9 @@ mod tests {
             "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9 · ↻ 1 trigger"
         );
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
+        let (_, named) = card("calc", &rows, 100, false);
+        let named: Vec<(usize, &str)> = named.iter().map(|(at, n)| (*at, n.as_str())).collect();
+        assert_eq!(named, [(1, "lead"), (5, "zero"), (9, "equal")]);
         let shown = text(true);
         assert_eq!(shown[shown.len() - 3], "Resolved · 1");
         assert_eq!(shown[shown.len() - 2], " ✓ old done · took 42s");

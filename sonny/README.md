@@ -444,7 +444,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
-  shows `↻ 2 triggers` beside its model.
+  shows `↻ 2 triggers` beside its model. A click on an agent's name opens
+  it in the pane, as a click on a task in a roster does; ‹ in its title,
+  or Ctrl+[ from the conversation, goes back to `/status`.
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the triggers that wake them, with
@@ -587,7 +589,8 @@ The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a li
 short `└` look at its result, edits show as a diff, and a status row says
 `Working (12s • esc to interrupt)`. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
-turn's `Worked for …` line.
+turn's `Worked for …` line. A reply right under its message, from a turn
+of under a minute, has no line: there are no steps to set it apart from.
 
 The view is clean by default: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, messaged or
@@ -606,7 +609,13 @@ agent asks you lists its options, and a click on one answers with it.
 What agents tell each other stays quiet too: a message from another agent
 is one dim row naming who sent it (`↳ From calc.neg ▸`), the lead's task
 updates one row with what happened in them, and a click opens the whole
-message. A turn that ends
+message. Such messages that come one after another, with nothing the agent
+said between them, gather into one row that counts them (`↳ 3 task
+updates ▸`): a click lists them, a click on one opens it, and what the
+agent did about it while saying nothing, such as a task steered or a
+memory saved, is under it there rather than a row of its own. Quiet rows
+one after another (calls folded, notes put in the margin, messages
+between agents) sit together, with no blank row between. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 

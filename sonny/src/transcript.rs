@@ -1226,6 +1226,61 @@ pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'s
     vec![Line::from(spans).dim()]
 }
 
+/// What a message between agents is, as the row that gathers several
+/// counts them: `task update`, `message`.
+pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
+    match (news(text), from) {
+        (Some(parts), _) => match parts[0].as_str() {
+            "Task updates" => "task update",
+            "From your sources" => "source update",
+            "Sonny upgraded" => "upgrade",
+            _ => "update",
+        },
+        _ => "message",
+    }
+}
+
+/// The row that gathers messages between agents that came one after
+/// another, each `kinds`' [`relayed_kind`]: how many of each, `▸` to
+/// list them; open, `▾`, each one's own row under it.
+pub fn gathered(kinds: &[&str], open: bool, width: usize) -> Line<'static> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for kind in kinds {
+        match counts.iter_mut().find(|(k, _)| k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let said: Vec<String> = (counts.into_iter())
+        .map(|(kind, n)| match n {
+            1 => format!("1 {kind}"),
+            n => format!("{n} {kind}s"),
+        })
+        .collect();
+    let head = cut(&format!("↳ {}", said.join(", ")), width.saturating_sub(2));
+    Line::from(format!("{head} {}", if open { "▾" } else { "▸" })).dim()
+}
+
+/// `lines` moved `columns` to the right, a wrapped row still known for
+/// one, so a copy joins it as before.
+pub fn indented(lines: Vec<Line<'static>>, columns: usize) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let marks = (line.spans.iter())
+                .take_while(|span| span.content.is_empty())
+                .count();
+            let mut spans: Vec<Span<'static>> = match mark(&line) {
+                Some((lead, joins)) => vec![goes_on(lead + columns, joins)],
+                None => line.spans[..marks].to_vec(),
+            };
+            spans.push(Span::raw(" ".repeat(columns)));
+            spans.extend(line.spans[marks..].iter().cloned());
+            Line { spans, ..line }
+        })
+        .collect()
+}
+
 /// The most lines of a prompt shown above its reply.
 const PROMPT_LINES: usize = 6;
 
@@ -1273,6 +1328,14 @@ fn news(text: &str) -> Option<Vec<String>> {
             // in it", "3 messages in it since turn:…, from a, b".
             if status.starts_with("the person wrote") {
                 parts.push(format!("you wrote in {name}"));
+            } else if status.starts_with("put the note") {
+                parts.push(format!("{name} noted"));
+            } else if status.starts_with("took its margin note") {
+                parts.push(format!("{name} took a note away"));
+            } else if status.starts_with("waiting for the person") {
+                parts.push(format!("{name} needs you"));
+            } else if status.starts_with("has printed nothing") {
+                parts.push(format!("{name} quiet"));
             } else if let Some(who) = status.strip_suffix(" wrote in it") {
                 parts.push(format!("{who} wrote in {name}"));
             } else if let Some((count, _)) = status.split_once(" messages in it")
@@ -2680,6 +2743,59 @@ mod tests {
                 "↳ Task updates · shop.fix failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
             ]
         );
+    }
+
+    #[test]
+    fn a_task_update_says_each_thing_in_a_few_words() {
+        let note = "Task updates: what happened in your tasks since you last heard.\n\
+             - shop.fix: turn:shop.fix/3, put the note \"bench\" in its own margin; the margin tool with from \"shop.fix/bench\" shows it in yours\n\
+             - shop.web: turn:shop.web/2, took its margin note \"old\" away\n\
+             - shop.docs: turn:shop.docs/2 waiting for the person's approval\n\
+             - shop.api: turn:shop.api/3 has printed nothing for 30 minutes";
+        assert_eq!(
+            text(&super::prompt(note, None, 160)),
+            [
+                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet"
+            ]
+        );
+    }
+
+    #[test]
+    fn messages_in_a_row_are_counted_by_kind() {
+        let updates = "Task updates: since you last heard.\n- a.b: turn:a.b/1 completed";
+        assert_eq!(relayed_kind(updates, None), "task update");
+        assert_eq!(relayed_kind("Look at this", Some("a.b")), "message");
+        let kinds = [
+            relayed_kind(updates, None),
+            "message",
+            "task update",
+            "task update",
+        ];
+        assert_eq!(
+            gathered(&kinds, false, 80).to_string(),
+            "↳ 3 task updates, 1 message ▸"
+        );
+        assert_eq!(
+            gathered(&kinds[..2], true, 80).to_string(),
+            "↳ 1 task update, 1 message ▾"
+        );
+    }
+
+    #[test]
+    fn rows_moved_right_still_join_as_they_were_wrapped() {
+        let rows = wrap(
+            Line::from("one two three four five six"),
+            14,
+            Span::raw("• "),
+            Span::raw("  "),
+        );
+        let moved = indented(rows.clone(), 4);
+        assert_eq!(
+            text(&moved),
+            ["    • one two ", "      three four ", "      five six"]
+        );
+        assert_eq!(lead(&moved[1]), lead(&rows[1]).map(|lead| lead + 4));
+        assert_eq!(opens(&moved[0]), opens(&rows[0]).map(|lead| lead + 4));
     }
 
     #[test]

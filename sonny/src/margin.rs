@@ -59,13 +59,16 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          post it again with the same id, rather than a second note about the change, or remove it \
          in that same turn, even while the change waits \
          on a task's branch, saying in the note which it shows, and remove a note once it \
-         no longer holds. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
+         no longer holds. Where whether a note is still current matters, such as a pull \
+         request's state or a check you ran, say when it was last checked, in the person's \
+         time zone, and change that as you check again; a note whose content does not age, \
+         such as a design, needs no date. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
          fences and pictures included) or file (a path in your own folder, shown as the file \
          stands and kept fresh as it changes; for a file in a task's copy, put its content in \
          markdown instead, since that copy goes away with the task), or from (a task's note as \
          \"task/id\", as your task updates name it, shown here as the task keeps it and kept once \
-         the task is gone, rather than copied). Never put a question or anything the person must \
-         answer in a note.";
+         the task is gone, rather than copied). Never ask a question or for a decision only in a \
+         note: ask it where the person answers, and the note may point to it.";
 
 /// The `margin` tool as Sonny declares it on a bot.
 pub fn tool() -> Value {

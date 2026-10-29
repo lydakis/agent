@@ -1340,6 +1340,22 @@ struct Relayed {
     text: Option<String>,
 }
 
+/// Messages between agents that came one after another, with nothing of
+/// the agent's own words between them, drawn as one row that counts them
+/// and a click opens to list them; one alone is drawn as itself.
+struct Cluster {
+    messages: Vec<Clustered>,
+    open: bool,
+}
+
+/// A message in a [`Cluster`]: its node, what it is, and the calls the
+/// agent made about it while it said nothing, shown under it once open.
+struct Clustered {
+    node: i64,
+    kind: &'static str,
+    calls: Vec<Vec<Line<'static>>>,
+}
+
 /// Ctrl+\, which moves the keys between the conversation and the pane:
 /// no terminal or multiplexer takes it, as many take Shift+Tab. Without
 /// the keyboard protocol it arrives as Ctrl+4.
@@ -1853,6 +1869,16 @@ struct App {
     /// Words between agents drawn quiet, by node: what was said, who
     /// said it, and whether a click opened it.
     relayed: HashMap<i64, Relayed>,
+    /// Those messages gathered as they came, by group number; and the one
+    /// the last went into, with the rows drawn by then, which the next
+    /// message, or a call the agent makes about it, joins while nothing
+    /// else was drawn.
+    clusters: BTreeMap<usize, Cluster>,
+    clustering: Option<(usize, usize)>,
+    /// The rows drawn by the end of the last quiet row (a fold of calls,
+    /// a note's marker, messages between agents), which the next one
+    /// goes right under while nothing else was drawn.
+    stacked: Option<usize>,
     /// The tasks the lead started, by the group they were started in; the
     /// group the last went into, with the rows drawn by then, as a fold
     /// has; and when what they do was last read, or
@@ -2594,6 +2620,9 @@ impl App {
             newer: None,
             folding: None,
             relayed: HashMap::new(),
+            clusters: BTreeMap::new(),
+            clustering: None,
+            stacked: None,
             tasks: BTreeMap::new(),
             starting: None,
             tasks_read: None,
@@ -2727,10 +2756,12 @@ impl App {
                     self.place_picked(node);
                 }
             }
-            if self.watch.as_ref().is_some_and(|w| {
-                w.read.elapsed() > Duration::from_secs(2)
-                    || w.usage.as_ref().is_some_and(usage::View::due)
-            }) {
+            if self.pane.as_ref().is_some_and(pane::Pane::is_card)
+                && self.watch.as_ref().is_some_and(|w| {
+                    w.read.elapsed() > Duration::from_secs(2)
+                        || w.usage.as_ref().is_some_and(usage::View::due)
+                })
+            {
                 self.reread().await;
             }
             if self.retry.is_some_and(|at| at <= Instant::now()) {
@@ -3128,6 +3159,9 @@ impl App {
         self.folds.clear();
         self.folding = None;
         self.relayed.clear();
+        self.clusters.clear();
+        self.clustering = None;
+        self.stacked = None;
         self.plans.clear();
         self.plan_full = None;
         self.refold = true;
@@ -3289,6 +3323,8 @@ impl App {
         let answering = self.answering.take();
         let folding = self.folding.take();
         let starting = self.starting.take();
+        let clustering = self.clustering.take();
+        let stacked = self.stacked.take();
         if paged.first {
             let welcome = self.welcome();
             self.commit(welcome);
@@ -3303,6 +3339,8 @@ impl App {
         self.answering = answering;
         self.folding = folding;
         self.starting = starting;
+        self.clustering = clustering;
+        self.stacked = stacked;
         // A blank row apart from what was the first.
         if wrote {
             self.pending.push(Line::default());
@@ -3492,6 +3530,22 @@ impl App {
             self.commit(lines);
             return;
         };
+        // What the agent did about messages from other agents while it
+        // said nothing goes under them, opened with them: an agent it
+        // made stands out still.
+        if !self.verbose
+            && !matches!(verb.as_str(), "Started" | "Forked")
+            && let Some((at, drawn)) = self.clustering
+            && drawn == self.rows_drawn
+            && let Some(message) = (self.clusters.get_mut(&at)).and_then(|c| c.messages.last_mut())
+        {
+            message.calls.push(lines.clone());
+            if self.draw_cluster(at) {
+                return;
+            }
+            self.clusters.remove(&at);
+            self.clustering = None;
+        }
         if let Some((at, drawn)) = self.folding
             && drawn == self.rows_drawn
             && let Some(fold) = self.folds.get_mut(&at)
@@ -3533,8 +3587,7 @@ impl App {
             false,
             self.prose(),
         ));
-        let from = self.pending.len() + usize::from(self.any_history);
-        self.commit(lines);
+        let from = self.commit_quiet(lines);
         let tag = screen::Mark::Tag(screen::Tag::Group(at as u64));
         self.marks
             .extend((from..self.pending.len()).map(|line| (line, tag.clone())));
@@ -3791,7 +3844,17 @@ impl App {
         let woken = self.woken.clone();
         let drawn = move || woken.notify_one();
         let program = embed::Embedded::spawn(program, height, width, term::light(), drawn)?;
-        self.open_pane(pane::Pane::program(title, program));
+        let pane = pane::Pane::program(title, program);
+        // Opened from `/status`, it goes back there, as a browser goes back.
+        match self.pane.take() {
+            Some(shown) if shown.is_card() && self.watch.is_some() => {
+                self.open_pane(pane.after(shown))
+            }
+            shown => {
+                self.pane = shown;
+                self.open_pane(pane);
+            }
+        }
         Ok(())
     }
 
@@ -3823,10 +3886,14 @@ impl App {
         if let Some(at) = button
             .strip_prefix("fold/")
             .and_then(|at| at.parse::<usize>().ok())
-            && let Some(fold) = self.folds.get_mut(&at)
         {
-            fold.open = !fold.open;
-            self.draw_fold(at);
+            if let Some(fold) = self.folds.get_mut(&at) {
+                fold.open = !fold.open;
+                self.draw_fold(at);
+            } else if let Some(cluster) = self.clusters.get_mut(&at) {
+                cluster.open = !cluster.open;
+                self.draw_cluster(at);
+            }
         }
         if let Some(bot) = button.strip_prefix("task/") {
             self.open_task(bot);
@@ -3849,11 +3916,9 @@ impl App {
             if let Some(relayed) = self.relayed.get_mut(&node) {
                 relayed.text = text;
             }
-            let lines = self.relayed_lines(node);
-            self.flush();
-            let tag = screen::Tag::Relayed(node);
-            self.screen
-                .replace_tagged(tag, lines, vec![(0, said_button(node))]);
+            if let Some(at) = self.cluster_of(node) {
+                self.draw_cluster(at);
+            }
         }
         if let Some((at, id)) = button
             .strip_prefix("answer/")
@@ -3897,7 +3962,7 @@ impl App {
             (_, true) => format!("took {id} away"),
             _ => format!("changed {id}"),
         };
-        self.commit(vec![note_marker(what, true)]);
+        self.commit_quiet(vec![note_marker(what, true)]);
         // Drawn out where it was put, when the margin cannot show it.
         self.refold = true;
         if let Some(note) = note {
@@ -4072,20 +4137,7 @@ impl App {
         self.bot_reactions.clear();
         // Words between agents are one quiet row a click opens.
         if transcript::relays(said, from) {
-            let relayed = Relayed {
-                head: transcript::relayed_head(said, from),
-                from: from.map(str::to_owned),
-                text: None,
-            };
-            self.relayed.insert(node, relayed);
-            let lines = self.relayed_lines(node);
-            let count = lines.len();
-            self.commit(lines);
-            let at = self.pending.len() - count;
-            let tag = screen::Mark::Tag(screen::Tag::Relayed(node));
-            self.marks
-                .extend((at..at + count).map(|line| (line, tag.clone())));
-            self.marks.push((at, said_button(node)));
+            self.land_relayed(node, said, from);
         } else {
             let prose = self.prose();
             let lines = match older {
@@ -4104,15 +4156,141 @@ impl App {
         self.answering = Some((first_words(said), self.rows_drawn, node));
     }
 
-    /// The rows of the message between agents at `node`, open or shut.
-    fn relayed_lines(&self, node: i64) -> Vec<Line<'static>> {
+    /// The message between agents at `node`: one quiet row a click opens,
+    /// gathered with those right before it into one that lists them.
+    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>) {
+        let relayed = Relayed {
+            head: transcript::relayed_head(said, from),
+            from: from.map(str::to_owned),
+            text: None,
+        };
+        self.relayed.insert(node, relayed);
+        let message = Clustered {
+            node,
+            kind: transcript::relayed_kind(said, from),
+            calls: Vec::new(),
+        };
+        if let Some((at, drawn)) = self.clustering
+            && drawn == self.rows_drawn
+            && let Some(cluster) = self.clusters.get_mut(&at)
+        {
+            cluster.messages.push(message);
+            if self.draw_cluster(at) {
+                return;
+            }
+            // Gone from the conversation: this one starts a cluster of
+            // its own.
+            let message = (self.clusters.remove(&at))
+                .and_then(|mut cluster| cluster.messages.pop())
+                .expect("the message just put in");
+            return self.new_cluster(message);
+        }
+        self.new_cluster(message);
+    }
+
+    /// `message` drawn as a cluster of its own, which those after it join.
+    fn new_cluster(&mut self, message: Clustered) {
+        // Clusters whose rows the conversation let go keep nothing.
+        while let Some(&first) = self.clusters.keys().next() {
+            if self.kept(screen::Tag::Group(first as u64)) {
+                break;
+            }
+            self.clusters.remove(&first);
+        }
+        let at = self.group();
+        self.clusters.insert(
+            at,
+            Cluster {
+                messages: vec![message],
+                open: false,
+            },
+        );
+        let (lines, marks) = self.cluster_lines(at);
+        let from = self.commit_quiet(lines);
+        let tag = screen::Mark::Tag(screen::Tag::Group(at as u64));
+        self.marks
+            .extend((from..self.pending.len()).map(|line| (line, tag.clone())));
+        self.marks
+            .extend(marks.into_iter().map(|(line, mark)| (from + line, mark)));
+        self.clustering = Some((at, self.rows_drawn));
+    }
+
+    /// The rows of the message between agents at `node`, open or shut,
+    /// at `width`; open, the calls the agent made about it under it.
+    fn relayed_lines(
+        &self,
+        node: i64,
+        calls: &[Vec<Line<'static>>],
+        width: usize,
+    ) -> Vec<Line<'static>> {
         let Some(relayed) = self.relayed.get(&node) else {
             return Vec::new();
         };
         match &relayed.text {
-            Some(text) => transcript::relayed(text, relayed.from.as_deref(), true, self.prose()),
-            None => transcript::relayed_shut(&relayed.head, relayed.from.as_deref(), self.prose()),
+            Some(text) => {
+                let mut lines = transcript::relayed(text, relayed.from.as_deref(), true, width);
+                let calls = calls.iter().flatten().cloned().collect();
+                lines.extend(transcript::indented(calls, 2));
+                lines
+            }
+            None => transcript::relayed_shut(&relayed.head, relayed.from.as_deref(), width),
         }
+    }
+
+    /// The rows of the cluster `at`, and the buttons on them: one message
+    /// as itself; several as a row that counts them, and once open each
+    /// one's own rows under it.
+    fn cluster_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
+        let Some(cluster) = self.clusters.get(&at) else {
+            return (Vec::new(), Vec::new());
+        };
+        let width = self.prose();
+        if let [message] = cluster.messages.as_slice() {
+            let lines = self.relayed_lines(message.node, &message.calls, width);
+            return (lines, vec![(0, said_button(message.node))]);
+        }
+        let kinds: Vec<&str> = cluster.messages.iter().map(|m| m.kind).collect();
+        let mut lines = vec![transcript::gathered(&kinds, cluster.open, width)];
+        let mut marks = vec![(
+            0,
+            screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON)),
+        )];
+        if cluster.open {
+            for message in &cluster.messages {
+                marks.push((lines.len(), said_button(message.node)));
+                let rows =
+                    self.relayed_lines(message.node, &message.calls, width.saturating_sub(2));
+                lines.extend(transcript::indented(rows, 2));
+            }
+        }
+        (lines, marks)
+    }
+
+    /// The cluster `at` drawn again where it is; whether it is still in
+    /// the conversation.
+    fn draw_cluster(&mut self, at: usize) -> bool {
+        let (lines, marks) = self.cluster_lines(at);
+        self.flush();
+        (self.screen).replace_tagged(screen::Tag::Group(at as u64), lines, marks)
+    }
+
+    /// The cluster the message between agents at `node` is in.
+    fn cluster_of(&self, node: i64) -> Option<usize> {
+        (self.clusters.iter())
+            .find(|(_, cluster)| cluster.messages.iter().any(|m| m.node == node))
+            .map(|(at, _)| *at)
+    }
+
+    /// Commit a quiet row of what went on around the work (a fold of
+    /// calls, a note's marker, messages between agents) right under the
+    /// one before it when that was one too, so they read as one block;
+    /// where its first line is among the lines waiting.
+    fn commit_quiet(&mut self, lines: Vec<Line<'static>>) -> usize {
+        let count = lines.len();
+        let gap = self.stacked != Some(self.rows_drawn);
+        self.commit_after(lines, gap);
+        self.stacked = Some(self.rows_drawn);
+        self.pending.len() - count
     }
 
     /// The bot's words at `node`, as replayed: their last row tagged,
@@ -5438,6 +5616,12 @@ impl App {
                 let words =
                     (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
                 let ended = matches!(status, "completed" | "steered");
+                // The line sets a reply apart from the steps drawn above
+                // it, or says how long a long turn took: a reply right
+                // under its message, from a short turn, needs none.
+                let ruled = (self.answering.as_ref())
+                    .is_none_or(|(_, at, _)| *at != self.rows_drawn)
+                    || seconds.is_some_and(|s| s >= 60);
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
                     && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
@@ -5454,7 +5638,9 @@ impl App {
                 match self.live.take() {
                     _ if (only_reacted || quiet) && ended => {}
                     Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
-                        self.commit(vec![line]);
+                        if ruled {
+                            self.commit(vec![line]);
+                        }
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
                     }
                     live => {
@@ -7764,8 +7950,13 @@ impl App {
         }
         let row = (!self.bot_reactions.is_empty())
             .then(|| transcript::reacted(&self.bot_reactions.join(" ")));
-        self.put_under(screen::Tag::End(node), tag, row.clone())
-            || self.put_under(screen::Tag::Relayed(node), tag, row)
+        if self.put_under(screen::Tag::End(node), tag, row.clone()) {
+            return true;
+        }
+        match self.cluster_of(node) {
+            Some(at) => self.put_under(screen::Tag::Group(at as u64), tag, row),
+            None => false,
+        }
     }
 
     /// What other agents, such as its lead, reacted with to the person's
@@ -8088,7 +8279,7 @@ impl App {
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
-        if self.watch.is_some() && !self.pane.as_ref().is_some_and(|p| p.is_card()) {
+        if self.watch.is_some() && !self.pane.as_ref().is_some_and(|p| p.keeps_card()) {
             self.watch = None;
         }
         terminal.autoresize()?;
@@ -8193,12 +8384,12 @@ impl App {
                 pane.set_card(lines, STATUS_KEYS);
                 pane.foot = Some(view.footer());
             } else {
-                let (lines, any_resolved) = watch_card(watch, width);
+                let (lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
                 let keys = match any_resolved && watch.resolved {
                     true => "r hides resolved · esc closes",
                     false => STATUS_KEYS,
                 };
-                pane.set_card(lines, keys);
+                pane.set_card_marked(lines, marks, keys);
             }
         }
         // The links drawn, to be written again as hyperlinks.
@@ -8852,9 +9043,14 @@ impl App {
 const STATUS_KEYS: &str = "esc closes";
 
 /// `/status`'s card at `width`, each line after a space, its times
-/// running turns counted on from when its rows were read; and whether any task in it
-/// is resolved.
-fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
+/// running turns counted on from when its rows were read; whether any task in it
+/// is resolved; and the line each agent but `me` starts on, which a click
+/// opens in the pane.
+fn watch_card(
+    watch: &Watch,
+    width: usize,
+    me: &str,
+) -> (Vec<Line<'static>>, bool, Vec<(usize, screen::Mark)>) {
     let since = watch.read.elapsed().as_secs();
     let rows: Vec<status::Row> = watch
         .rows
@@ -8868,10 +9064,23 @@ fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
         })
         .collect();
     let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    let mut card = status::card(&watch.project, &rows, width, watch.resolved);
-    if !watch.lookout.is_empty() {
+    let (mut card, named) = status::card(&watch.project, &rows, width, watch.resolved);
+    // The lookout's line goes under the heading, the agents' under it.
+    let lookout = !watch.lookout.is_empty();
+    if lookout {
         card.insert(1, Line::from(watch.lookout.clone()).dim());
     }
+    let marks = (named.into_iter())
+        .map(|(at, name)| (at + usize::from(lookout && at >= 1), name))
+        .map(|(at, name)| (at, format!("{}.{name}", watch.project)))
+        .filter(|(_, bot)| bot != me)
+        .map(|(at, bot)| {
+            (
+                at,
+                screen::Mark::Link(format!("{}task/{bot}", screen::BUTTON)),
+            )
+        })
+        .collect();
     let lines = card
         .into_iter()
         .map(|line| {
@@ -8880,7 +9089,7 @@ fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
             Line::from(spans).style(line.style)
         })
         .collect();
-    (lines, any_resolved)
+    (lines, any_resolved, marks)
 }
 
 /// Codex's sweep: a brighter band moving across the phase every two seconds.
@@ -10241,6 +10450,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_right_under_its_message_has_no_line_above_it() {
+        let client = daemon_answering(|asked| {
+            let node = asked["nodes"][0].as_i64().unwrap_or(0);
+            let item = match node {
+                1 => json!({"type": "message", "role": "user", "content": "status?"}),
+                _ => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "All green."}]}),
+            };
+            json!({"items": [{"node": node, "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        let lines = |app: &App| -> Vec<String> {
+            app.pending.iter().map(|line| line.to_string()).collect()
+        };
+        app.daemon(turn_event("accepted", 1, json!({"node": 1})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "All green."}))
+            .await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(lines(&app), ["› status?", "", "• All green."]);
+    }
+
+    #[tokio::test]
     async fn an_empty_completion_ends_the_turn_with_no_failure_shown() {
         let client = daemon_answering(|_| {
             json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
@@ -10495,9 +10735,11 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[2..5], ["", "› and the notes?", "   🎉 "]);
-        assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
-        assert_eq!(rows[7..], ["", "• Updated."]);
+        // With no steps above it, the reply needs no line setting it apart.
+        assert_eq!(
+            rows[2..],
+            ["", "› and the notes?", "   🎉 ", "", "• Updated."]
+        );
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
         app.seen_node = 0;
@@ -10802,10 +11044,20 @@ mod tests {
     #[tokio::test]
     async fn words_between_agents_are_one_quiet_row_a_click_opens() {
         // Opened, the message is read again from the history.
-        let client = daemon_answering(|asked| match asked["op"].as_str() {
-            Some("history_items") => json!({"items": [{"node": 4, "item": {"type": "message",
-                "role": "user", "content": "The build is green.\nI pushed the fix to calc.add."}}]}),
-            _ => json!({}),
+        let client = daemon_answering(|asked| {
+            let node = asked["nodes"][0].as_i64().unwrap_or(0);
+            let content = match node {
+                4 => "The build is green.\nI pushed the fix to calc.add.",
+                _ => {
+                    "Task updates: what happened in your tasks since you last heard.\n\
+                      - calc.neg: turn:calc.neg/3 completed"
+                }
+            };
+            match asked["op"].as_str() {
+                Some("history_items") => json!({"items": [{"node": node, "item":
+                    {"type": "message", "role": "user", "content": content}}]}),
+                _ => json!({}),
+            }
         })
         .await;
         let mut app = app(client);
@@ -10816,17 +11068,7 @@ mod tests {
             Some("calc.add"),
             false,
         );
-        let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, updates, None, false);
-        assert_eq!(
-            drawn(&mut app),
-            [
-                "↳ From calc.add ▸",
-                "",
-                "↳ Task updates · calc.neg completed ▸"
-            ]
-        );
+        assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
         // A click on one opens it whole, and again shuts it.
         app.follow("sonny:said/4");
         let button = app.pressed.pop().unwrap();
@@ -10837,14 +11079,55 @@ mod tests {
                 "↳ From calc.add ▾",
                 "  The build is green.",
                 "  I pushed the fix to calc.add.",
+            ]
+        );
+        app.press("said/4").await;
+        assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
+        // Those that come one after another are one row that counts them,
+        // with what the agent did about them while it said nothing.
+        let updates = "Task updates: what happened in your tasks since you last heard.\n\
+            - calc.neg: turn:calc.neg/3 completed";
+        app.land(5, updates, None, false);
+        let steer =
+            r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
+        app.commit_call(
+            "c1",
+            "shell",
+            &json!({"command": steer}),
+            "turn:calc.neg/4",
+            false,
+        );
+        assert_eq!(drawn(&mut app), ["↳ 1 message, 1 task update ▸"]);
+        // A click lists them; a click on one opens it, the calls under it.
+        app.press("fold/0").await;
+        assert_eq!(
+            drawn(&mut app),
+            [
+                "↳ 1 message, 1 task update ▾",
+                "  ↳ From calc.add ▸",
+                "  ↳ Task updates · calc.neg completed ▸",
+            ]
+        );
+        app.press("said/5").await;
+        let open = drawn(&mut app);
+        assert_eq!(open[2], "  ↳ Task updates ▾");
+        assert_eq!(open[4], "    - calc.neg: turn:calc.neg/3 completed");
+        assert!(open[5].starts_with("    • Steered calc.neg"), "{open:?}");
+        app.press("fold/0").await;
+        assert_eq!(drawn(&mut app), ["↳ 1 message, 1 task update ▸"]);
+        // The agent's words end it: what comes after starts anew.
+        app.commit(vec![Line::from("• calc.neg is done.")]);
+        app.land(6, updates, None, false);
+        assert_eq!(
+            drawn(&mut app)[2..],
+            [
+                "• calc.neg is done.",
                 "",
                 "↳ Task updates · calc.neg completed ▸"
             ]
         );
-        app.press("said/4").await;
-        assert_eq!(drawn(&mut app)[0], "↳ From calc.add ▸");
         // The person's own words are drawn as ever.
-        app.land(6, "thanks", None, false);
+        app.land(7, "thanks", None, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
     }
 
@@ -10946,8 +11229,9 @@ mod tests {
             rows[2],
             "• Messaged calc.add, calc.neg, calc.div and calc.mul ▸"
         );
-        assert_eq!(rows[4], "• Removed calc.add");
-        assert_eq!(rows[8], "• Messaged calc.sub ▸");
+        // Quiet rows one after another sit together.
+        assert_eq!(rows[3], "• Removed calc.add");
+        assert_eq!(rows[7], "• Messaged calc.sub ▸");
     }
 
     #[tokio::test]
@@ -11445,6 +11729,47 @@ mod tests {
         assert!(app.pane.is_none());
         app.key(click(10 + counter.start)).await;
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+    }
+
+    #[test]
+    fn status_links_each_agent_but_this_one_to_open_it() {
+        let row = |name: &str, group| status::Row {
+            name: name.into(),
+            state: "working".into(),
+            group,
+            ..Default::default()
+        };
+        let watch = Watch {
+            project: "calc".into(),
+            rows: vec![
+                row("lead", status::Group::Working),
+                row("neg", status::Group::Working),
+            ],
+            read: Instant::now(),
+            lookout: "Lookout · on".into(),
+            resolved: false,
+            background: None,
+            usage: None,
+            picked: None,
+        };
+        let (lines, _, marks) = watch_card(&watch, 80, "calc.lead");
+        let link = |at: usize| {
+            (marks.iter())
+                .find(|(on, _)| *on == at)
+                .map(|(_, mark)| mark.clone())
+        };
+        let neg = (lines.iter())
+            .position(|line| line.to_string().contains("neg working"))
+            .unwrap();
+        assert_eq!(
+            link(neg),
+            Some(screen::Mark::Link(format!(
+                "{}task/calc.neg",
+                screen::BUTTON
+            )))
+        );
+        // This window's own agent opens nothing.
+        assert_eq!(marks.len(), 1);
     }
 
     #[tokio::test]
