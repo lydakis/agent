@@ -7536,7 +7536,7 @@ impl App {
             .map_err(|error| error.to_string())?;
         // The lead the folder opens next time.
         if origin.is_none() && self.options.side.is_none() {
-            project::wrote_to(&self.workspace, &self.bot);
+            project::wrote_to(self.client.store(), &self.workspace, &self.bot);
         }
         if let Some(turn) = reply["turn"].as_i64() {
             // A steer is a submission of its own that ends as steered; the

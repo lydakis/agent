@@ -166,22 +166,25 @@ pub enum Pick {
     Thread(String),
 }
 
-/// Where Sonny notes which lead of a folder the person last wrote to.
-fn last_path(dir: &Path) -> Option<PathBuf> {
+/// Where Sonny notes which lead of a folder the person last wrote to, in
+/// the store of that lineage: two stores under one home have their own.
+fn last_path(store: Option<&str>, dir: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".agent/sonny/last-lead")
-            .join(fingerprint(&dir.to_string_lossy())),
-    )
+    let dir = dir.to_string_lossy();
+    let key = match store {
+        Some(store) => fingerprint(&format!("{store}\n{dir}")),
+        None => fingerprint(&dir),
+    };
+    Some(PathBuf::from(home).join(".agent/sonny/last-lead").join(key))
 }
 
-/// Note that the person wrote to `bot`, a lead working in `dir`.
-pub fn wrote_to(dir: &str, bot: &str) {
+/// Note that the person wrote to `bot`, a lead working in `dir`, in the
+/// store of lineage `store`.
+pub fn wrote_to(store: Option<&str>, dir: &str, bot: &str) {
     if !is_lead(bot) || dir.is_empty() {
         return;
     }
-    let Some(path) = last_path(Path::new(dir)) else {
+    let Some(path) = last_path(store, Path::new(dir)) else {
         return;
     };
     if std::fs::read_to_string(&path).is_ok_and(|had| had.trim() == bot) {
@@ -196,8 +199,8 @@ pub fn wrote_to(dir: &str, bot: &str) {
     }
 }
 
-fn last_lead(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(last_path(dir)?).ok()?;
+fn last_lead(store: Option<&str>, dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(last_path(store, dir)?).ok()?;
     Some(text.trim().to_owned()).filter(|bot| is_lead(bot))
 }
 
@@ -543,7 +546,8 @@ pub async fn open(
         // the one last written to.
         let other = match pick {
             Pick::Named(name) => Some(lead_bot(&project, name)),
-            Pick::Last => last_lead(&dir).filter(|bot| lead_project(bot) == Some(project.as_str())),
+            Pick::Last => last_lead(client.store(), &dir)
+                .filter(|bot| lead_project(bot) == Some(project.as_str())),
             _ => None,
         };
         if let Some(bot) = other.filter(|bot| *bot != first) {
@@ -666,7 +670,7 @@ pub async fn open(
             let bot = lead_bot(&project, &stem);
             return fresh(stem, Some(bot)).await;
         }
-        Pick::Last => last_lead(&dir)
+        Pick::Last => last_lead(client.store(), &dir)
             .filter(|bot| lead_project(bot) == Some(project.as_str()))
             .unwrap_or_else(|| first.clone()),
     };
@@ -984,6 +988,19 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_store_notes_its_own_last_lead_in_a_folder() {
+        let dir = Path::new("/work/shop");
+        let a = last_path(Some("store-a"), dir).unwrap();
+        let b = last_path(Some("store-b"), dir).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a, last_path(Some("store-a"), dir).unwrap());
+        assert_ne!(
+            a,
+            last_path(Some("store-a"), Path::new("/work/web")).unwrap()
+        );
+    }
 
     #[test]
     fn a_folder_has_a_first_lead_and_others_named_after_it() {

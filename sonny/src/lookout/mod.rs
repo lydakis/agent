@@ -1274,7 +1274,7 @@ impl Lookout {
                         made.insert(bot.to_owned());
                     }
                 }
-                if self.sibling(bot) || self.theirs.contains(by) {
+                if self.sibling(bot) || self.sibling(by) || self.theirs.contains(by) {
                     self.theirs.insert(bot.to_owned());
                 }
                 if self.globs(bot) {
@@ -1481,9 +1481,16 @@ impl Lookout {
             grow(&mut made, records);
             self.others.insert(root, made);
         }
-        self.theirs = (records.keys())
-            .filter(|name| self.sibling(name))
-            .cloned()
+        // Another lead's tasks stay theirs once that lead is gone: their
+        // maker is still named as one.
+        self.theirs = (records.iter())
+            .filter(|(name, record)| {
+                self.sibling(name)
+                    || record["created_by"]
+                        .as_str()
+                        .is_some_and(|by| self.sibling(by))
+            })
+            .map(|(name, _)| name.clone())
             .collect();
         grow(&mut self.theirs, records);
         self.globbed = (records.iter())
@@ -2520,6 +2527,33 @@ mod tests {
         ]));
         assert!(lookout.watches("shop.lead.billing"));
         assert!(!lookout.watches("shop.invoices"));
+    }
+
+    #[test]
+    fn a_gone_leads_tasks_stay_off_the_first_lead() {
+        let mut lookout = lookout();
+        lookout.subs = vec![subs::Sub::lead("shop.lead", "shop")];
+        lookout.lead = "shop.lead".into();
+        // shop.lead.billing was deleted; its task and the task's own task
+        // live on.
+        lookout.roots(&HashMap::from([
+            (
+                "shop.invoices".to_owned(),
+                json!({"created_by": "shop.lead.billing"}),
+            ),
+            (
+                "shop.invoices-pdf".to_owned(),
+                json!({"created_by": "shop.invoices"}),
+            ),
+            ("shop.stray".to_owned(), json!({})),
+        ]));
+        assert!(lookout.watches("shop.stray"));
+        assert!(!lookout.watches("shop.invoices"));
+        assert!(!lookout.watches("shop.invoices-pdf"));
+        // One the gone lead's name makes later is theirs too.
+        lookout.lineage_of(&json!({"event": "created", "bot": "shop.receipts",
+            "data": {"created_by": "shop.lead.billing"}}));
+        assert!(!lookout.watches("shop.receipts"));
     }
 
     /// The lead as `bots` lists it mid-turn.
