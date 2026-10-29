@@ -1111,6 +1111,9 @@ struct Lookout {
     others: HashMap<String, HashSet<String>>,
     /// Bots a subscription's `--bot` glob names, as listed and made since.
     globbed: HashSet<String>,
+    /// The other leads of the lead's folder and every bot they or theirs
+    /// made: theirs, which the lead's tasks subscription never names.
+    theirs: HashSet<String>,
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
     /// or `None` for the subscriber.
     steers: HashMap<(String, i64), Option<String>>,
@@ -1153,6 +1156,7 @@ impl Lookout {
             subs: Vec::new(),
             others: HashMap::new(),
             globbed: HashSet::new(),
+            theirs: HashSet::new(),
             steers: HashMap::new(),
             queued: HashSet::new(),
             noted: HashSet::new(),
@@ -1208,6 +1212,9 @@ impl Lookout {
                         made.insert(bot.to_owned());
                     }
                 }
+                if self.sibling(bot) || self.theirs.contains(by) {
+                    self.theirs.insert(bot.to_owned());
+                }
                 if self.globs(bot) {
                     self.globbed.insert(bot.to_owned());
                 }
@@ -1215,6 +1222,7 @@ impl Lookout {
             "deleted" if bot != self.lead => {
                 self.lineage.remove(bot);
                 self.globbed.remove(bot);
+                self.theirs.remove(bot);
                 // A root keeps its place under its name, so what it makes
                 // once made again is still watched.
                 for (root, made) in self.others.iter_mut() {
@@ -1411,6 +1419,11 @@ impl Lookout {
             grow(&mut made, records);
             self.others.insert(root, made);
         }
+        self.theirs = (records.keys())
+            .filter(|name| self.sibling(name))
+            .cloned()
+            .collect();
+        grow(&mut self.theirs, records);
         self.globbed = (records.iter())
             .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
             .map(|(name, _)| name.clone())
@@ -1418,10 +1431,23 @@ impl Lookout {
         self.sync();
     }
 
-    /// Whether a subscription's `--bot` glob names this bot.
-    fn globs(&self, bot: &str) -> bool {
+    /// Whether `bot` is another lead of this lead's folder.
+    fn sibling(&self, bot: &str) -> bool {
         bot != self.lead
-            && (self.subs.iter()).any(|sub| sub.bots.iter().any(|glob| subs::matches(glob, bot)))
+            && crate::project::lead_project(bot).is_some()
+            && crate::project::lead_project(bot) == crate::project::lead_project(&self.lead)
+    }
+
+    /// Whether a subscription's `--bot` glob names this bot. The tasks
+    /// subscription Sonny gives a lead never names another lead's: one the
+    /// lead asked for may.
+    fn globs(&self, bot: &str) -> bool {
+        let theirs = self.theirs.contains(bot);
+        bot != self.lead
+            && (self.subs.iter()).any(|sub| {
+                !(theirs && sub.name == "tasks")
+                    && sub.bots.iter().any(|glob| subs::matches(glob, bot))
+            })
     }
 
     /// A message read: news for the next note. The person's own words cut
@@ -2359,6 +2385,36 @@ mod tests {
         assert!(lookout.watches("shop.fix"));
         assert!(!lookout.watches("shop.fix.side-1a2b3c"));
         assert!(!lookout.watches("shop.lead.side-4d5e6f"));
+    }
+
+    #[test]
+    fn another_lead_and_its_tasks_are_heard_only_when_asked_for() {
+        let mut lookout = lookout();
+        lookout.subs = vec![subs::Sub::lead("shop.lead", "shop")];
+        lookout.lead = "shop.lead".into();
+        lookout.lineage_of(&json!({"event": "created", "bot": "shop.lead.billing", "data": {}}));
+        lookout.lineage_of(&json!({"event": "created", "bot": "shop.invoices",
+            "data": {"created_by": "shop.lead.billing"}}));
+        lookout.lineage_of(&json!({"event": "created", "bot": "shop.stray", "data": {}}));
+        // The project's names, as the first lead hears them: not the other
+        // lead's, nor its task's.
+        assert!(lookout.watches("shop.stray"));
+        assert!(!lookout.watches("shop.lead.billing"));
+        assert!(!lookout.watches("shop.invoices"));
+        // A subscription that names it is heard.
+        lookout
+            .subs
+            .push(sub("billing", &[], &["shop.lead.billing"]));
+        lookout.roots(&HashMap::from([
+            ("shop.lead.billing".to_owned(), json!({})),
+            (
+                "shop.invoices".to_owned(),
+                json!({"created_by": "shop.lead.billing"}),
+            ),
+            ("shop.stray".to_owned(), json!({})),
+        ]));
+        assert!(lookout.watches("shop.lead.billing"));
+        assert!(!lookout.watches("shop.invoices"));
     }
 
     /// The lead as `bots` lists it mid-turn.

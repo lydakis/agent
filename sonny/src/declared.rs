@@ -35,7 +35,7 @@ fn resolves(record: &Value) -> bool {
             .any(|tool| tool["name"] == crate::resolved::TOOL)
     };
     match record["created_by"].as_str() {
-        Some(by) => by.ends_with(".lead") || inherited(),
+        Some(by) => crate::project::is_lead(by) || inherited(),
         None => false,
     }
 }

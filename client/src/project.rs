@@ -179,7 +179,7 @@ pub fn tasks_rule(in_project: bool) -> String {
     match in_project {
         true => "Every task works in this folder, with no worktree of its own.",
         false => {
-            "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."
+            "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only this folder's leads work in it."
         }
     }
     .to_owned()
@@ -325,9 +325,9 @@ impl Requests for crate::Client {
 
 /// Make the project in `dir` (a canonical directory): its coordinator in
 /// its role (`policy`, as composed for the folder), told its tasks'
-/// settings and then `after`, the client's own
-/// word, then the folder's file when it had none, once the daemon took
-/// the coordinator. A project that already exists in this folder is
+/// settings, then the folder's file when it had none, once the daemon took
+/// the coordinator. `lead` names another lead to make in place of the
+/// coordinator, for a folder with several. A project that already exists in this folder is
 /// returned with `created: false`, its coordinator's row as the record, and
 /// nothing changed; a name another
 /// folder's coordinator holds is refused. A role that names no tools gets
@@ -338,12 +338,12 @@ pub async fn create(
     policy: &Value,
     providers: &Value,
     picks: &Picks,
-    after: Option<&str>,
+    lead: Option<&str>,
 ) -> Result<Value, String> {
     let info = read(dir)?;
     let (name, coordinator) = (
         info["name"].as_str().unwrap_or_default(),
-        info["coordinator"].as_str().unwrap_or_default(),
+        lead.unwrap_or(info["coordinator"].as_str().unwrap_or_default()),
     );
     let at = dir
         .to_str()
@@ -390,14 +390,10 @@ pub async fn create(
         true => rule(&info),
         false => tasks_rule(picks.threads.as_ref().is_some_and(|t| t.in_project)),
     };
-    let mut instructions = format!(
+    let instructions = format!(
         "{}\n\n{rule}",
         policy["instructions"].as_str().unwrap_or_default()
     );
-    if let Some(after) = after {
-        instructions.push_str("\n\n");
-        instructions.push_str(after);
-    }
     let mut params = json!({
         "bot": coordinator, "workspace": at, "model": model,
         "instructions": instructions,
@@ -487,7 +483,7 @@ mod tests {
         let info = json!({"threads_in": "worktree"});
         assert!(
             rule(&info)
-                .ends_with("every task works in its own worktree, so tasks do not collide: only you work in this folder.")
+                .ends_with("every task works in its own worktree, so tasks do not collide: only this folder's leads work in it.")
         );
         let shared = json!({"threads_in": "project"});
         assert!(
@@ -733,7 +729,7 @@ mod tests {
             create.get("effort").is_none(),
             "no effort picked sends none"
         );
-        assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only you work in this folder."));
+        assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only this folder's leads work in it."));
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
         // A client's gate and settings go with the lead it makes.
         let dir = root("gated");

@@ -42,8 +42,14 @@ pub struct Start {
 /// Start the task `start` asks for of the lead `lead`, whose folder is
 /// `here`, and say what started and how its work comes back.
 pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
-    let project = lead.strip_suffix(".lead").unwrap_or(lead);
+    let project = crate::project::lead_project(lead).unwrap_or(lead);
     let short = start.name.trim();
+    // A lead's name is never a task's.
+    if short == "lead" || short.starts_with("lead.") || crate::project::is_lead(short) {
+        return Err(format!(
+            "{short:?} names a lead; give the task a name of its own"
+        ));
+    }
     let name = match short.strip_prefix(&format!("{project}.")) {
         Some(_) => short.to_owned(),
         None => format!("{project}.{short}"),
