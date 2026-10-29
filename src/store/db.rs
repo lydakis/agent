@@ -7062,8 +7062,8 @@ impl Database {
                 // came before it stay as they are.
                 let shared: bool = tx
                     .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR closed=?1
-                                OR context_start=?1 OR note=?1 OR compaction=?1 OR elision=?1))
+                        "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1
+                                OR note=?1 OR compaction=?1 OR elision=?1))
                             OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1 AND id IS NOT ?3)",
                     )?
                     .query_row(params![id, bot.name, child], |r| r.get(0))?;
