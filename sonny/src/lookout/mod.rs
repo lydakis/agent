@@ -523,7 +523,7 @@ async fn newest_said(client: &Client, bot: &str, upto: Option<i64>) -> Result<Op
 
 /// The node of a history entry the person wrote: words of theirs, as an
 /// Anthropic tool result is a user message too.
-fn said_by_person(entry: &Value) -> Option<i64> {
+pub(crate) fn said_by_person(entry: &Value) -> Option<i64> {
     let item = &entry["item"];
     let words = crate::responses(item)
         .into_iter()
