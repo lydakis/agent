@@ -138,7 +138,10 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
+| What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -229,17 +232,27 @@ waits for you is asked in the thread (Allow or Deny); one the judge passes
 runs without asking. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
-Each task the lead starts opens as a T3 Code thread of its own, in the task's
-worktree (in the project's folder when T3 Code does not take the worktree as
-one of the project's), with the task's brief as its first message; that
-thread is the task's, so it shows the task's work and steers it. Sonny opens
-it with the `t3_thread_launch` tool T3 Code gives each thread it runs, by the
-credential T3 Code scopes to that thread, which no program Sonny starts
-inherits. Sonny takes the person's words out of the instructions T3 Code
+Each task the lead starts opens as a T3 Code thread with the task's brief as
+its first message; that thread is the task's, so it shows the task's work and
+steers it. A task started while your prompt runs is the lead thread's child,
+nested under it, opened with T3 Code's `delegate_task` (T3 Code opens it in
+the lead's folder; the task still works in its own worktree), and your
+prompt's answer waits until it is open. T3 Code's message that a child ended
+starts no turn: the lead hears of its tasks from the lookout. A task started
+in a turn the lead took on its own, which T3 Code takes no child of, opens as
+a thread of its own with `t3_thread_launch`, in the task's worktree (in the
+project's folder when T3 Code does not take the worktree as one of the
+project's). Sonny calls these tools by the credential T3 Code scopes to the
+lead's thread, which no program Sonny starts inherits. Sonny takes the person's words out of the instructions T3 Code
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
-same bot.
+same bot. T3 Code's model picker lists `~/.agent/models` (the list `agent
+models` shows) after "Default", the model the lead or task runs: a model
+picked before the first prompt is the one a new lead starts on, and one
+picked later is the lead's from its next turn. A thread offers only its
+bot's provider family, since a bot changes model only within it, and a task's
+thread keeps the model its lead gave the task.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
@@ -321,14 +334,28 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
   window, taken where it is now, mid-turn included, in the pane beside
   the conversation.
-  The copy answers from the agent's history and may call no tool;
-  follow-ups stay with it, and Esc goes back. In the pane, every key goes
-  to the side chat but Ctrl+\, which goes back to the main composer
-  while the side chat stays open. The agent carries on meanwhile, in
-  view. The daemon
-  deletes the copy once it has been idle 15 minutes (`fork --expires`), and
-  no copy shows among the project's agents, in `/status`, or to the
-  lookout.
+  The copy answers from the agent's history and may call no tool, unless
+  `~/.agent/config.toml` sets `[sonny] side_chat = "fork"`: then it is a
+  full fork that can do anything the agent can, with its tools, in its
+  folder, under its approvals. Follow-ups stay with it, and Esc goes
+  back. In the pane, every key goes to the side chat but Ctrl+\, which
+  goes back to the main composer while the side chat stays open. The agent
+  carries on meanwhile, in view. The daemon deletes the copy once it has been idle 15
+  minutes (`fork --expires`), and no copy shows among the project's
+  agents, in `/status`, or to the lookout.
+
+  ![A side chat forked with every tool writes a file beside the lead](../docs/sonny/side-fork.png)
+- `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
+  with its value or what its default is, over the composer. ↑/↓ picks
+  one; ←/→ steps a key with a few values (efforts, `web_search`,
+  `senders`, `side_chat`, `chime`, `verbose`, `suggest`) through them
+  and its default; Enter types one that takes a name (`model`, `provider`,
+  `judge.model`, the profiles), empty for its default; ⌫
+  takes a key back to its default. Each change is written at once, the
+  file's comments and order kept, and a file that does not read is
+  refused by name, as every reader refuses it.
+
+  ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
   lists, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
@@ -355,9 +382,19 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   `/tmp`), reach the network, and may commit to the folder's repository,
   whose hooks and config stay read-only; a call that leaves the sandbox
   waits for the verdict. In `full` the lead runs unconfined. Every task
-  is sandboxed the same way in its own folder, whatever the lead's mode.
+  is sandboxed the same way in its own folder, but in `full`, where
+  nothing would answer a call that asks to leave the sandbox, tasks run
+  unconfined too, as under Codex's full access; a pick sets the tasks'
+  sandboxes along with their gates.
   A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
-  it. On Linux sandboxes need bubblewrap.
+  it. On Linux sandboxes need bubblewrap. A tool that keeps a daemon of its
+  own, such as mcpx, can't run inside a sandbox: name it in
+  `~/.agent/config.toml`, `[sonny] unsandboxed = ["mcpx"]`, and every agent
+  runs it outside without asking, as a Codex rule that allows a command
+  does. Each entry is a command's first words (`"docker compose"`), and a
+  call runs outside only when everything it runs is named, so
+  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
+  it.
 - `/approve` lists the calls the judge denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
@@ -390,6 +427,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+- `/usage` shows, in the pane beside the conversation,
+  the tokens the project's agents spent in the last 24 hours: in all, as
+  stacked bars over time (output, input read fresh, and input read from the
+  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  day, week or month, `a` every agent in the store, by project, and `c`
+  hides the cached reads, so what the provider charges most for stands out.
+  A turn counts where it started. It reads again every minute.
+
+  ![/usage in the pane](../docs/sonny/usage.gif)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
@@ -451,7 +497,8 @@ verdict wherever the agent's other calls do (`/approvals`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
 work, a subscription sends other bots' words to the subscriber's judge,
 a pane runs a command outside the agent's sandbox, and a trigger is a
-LaunchAgent that runs as you. An agent whose
+job of the system's scheduler (a LaunchAgent, or a systemd user service)
+that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
@@ -467,14 +514,18 @@ turn of the task numbered after that one reopens it.
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
-Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
+Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
+`[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
+the view (`verbose`, off by default), besides the efforts and the side chat
+above.
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/trigger`, scripts that run this Sonny as
 `sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
-and `sonny trigger ...` (launchd jobs that wake an agent, on a Mac), which
-other harnesses, scripts and launchd run too; Sonny's own agents use the
+and `sonny trigger ...` (jobs that wake an agent, kept by launchd on a Mac
+and systemd's user manager on Linux), which other harnesses, scripts and
+those schedulers run too; Sonny's own agents use the
 `memory` and `triggers` tools instead, which the lookout answers outside
 their sandbox. A skill Sonny wrote is rewritten when Sonny's
 text changes, until you edit it: from then on it is yours, and Sonny leaves
@@ -495,7 +546,8 @@ note, with no sound. It judges with the config's `[judge] model`, the
 approver's setting, else the lead's own model, at `[judge] effort` when
 set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
-by name, questions of its own), and `/background` lists what it watches;
+by name, sources outside such as a chat you poll, questions of its own),
+and `/background` lists what it watches;
 see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout also answers
 Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are

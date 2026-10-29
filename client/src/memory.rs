@@ -7,9 +7,10 @@
 //! save that would pass that is refused until facts are merged or removed.
 //! The daemon knows nothing of memory.
 //!
-//! `~/.agent/memory`, a script Sonny writes, shows the indexes and saves,
-//! removes, indexes and checks facts; the `memory` skill Sonny installs says
-//! what to save. `schedule` adds a nightly trigger, through
+//! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
+//! saves, removes, indexes and checks facts; the `memory` skill Sonny
+//! installs says what to save. A read is recorded beside the facts, so the
+//! cleanup can find facts no agent has opened in a while. `schedule` adds a nightly trigger, through
 //! `~/.agent/trigger`, whose agent follows the `memory-cleanup` skill
 //! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
@@ -29,7 +30,16 @@ const LIMIT: usize = 16 * 1024;
 const MAX_ENTRIES: usize = 1024;
 const INDEX: &str = "MEMORY.md";
 const TYPES: [&str; 4] = ["user", "feedback", "project", "reference"];
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+/// Each folder's record of when agents last read each of its facts, and
+/// how often, by name. It is kept apart from the facts and out of git, so a
+/// read changes no fact, no index, no agent's cached instructions, and no
+/// night's `changed`.
+const READS: &str = ".reads";
+/// Days since a fact was last read or saved after which the cleanup is
+/// asked to check that it still holds: Codex drops a memory unused for 30,
+/// Copilot one unused for 28.
+const UNREAD_DAYS: i64 = 30;
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -57,9 +67,9 @@ pub fn cli(args: &[String]) -> i32 {
 
 /// A `memory` call of an agent working in `cwd`, as a client's tool takes
 /// it: the script's commands but `schedule`, which is the person's, with
-/// the fact's text in the call. `save {name, type, description, source,
-/// text}`, `remove` NAME, `index`, `check`, `changed` or `cleanup` (`start`
-/// or `finish`); with none, `show`. `user` or `project` picks the scope.
+/// the fact's text in the call. `read` NAME, `save {name, type,
+/// description, source, text}`, `remove` NAME, `index`, `check`, `changed`
+/// or `cleanup` (`start` or `finish`); with none, `show`. `user` or `project` picks the scope.
 pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
     let mut scope = Vec::new();
@@ -79,6 +89,8 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
             args.extend([flag.to_owned(), text(&save[key])]);
         }
         args
+    } else if let Some(name) = arguments["read"].as_str() {
+        vec!["read".to_owned(), name.to_owned()]
     } else if let Some(name) = arguments["remove"].as_str() {
         vec!["rm".to_owned(), name.to_owned()]
     } else if let Some(step) = arguments["cleanup"].as_str() {
@@ -159,7 +171,7 @@ fn run(
                 continue;
             }
             flag if flag.starts_with('-') => return Err(usage()),
-            _ if name.is_none() && matches!(verb.as_str(), "save" | "rm") => {
+            _ if name.is_none() && matches!(verb.as_str(), "save" | "rm" | "read") => {
                 name = Some(arg.clone());
                 continue;
             }
@@ -228,6 +240,7 @@ fn run(
             };
             save(&scope()?, &fact, &text)
         }
+        ("read", Some(name), [None, None, None], None) => read(&scope()?, &name),
         ("rm", Some(name), [None, None, None], None) => remove(&scope()?, &name),
         ("index", None, [None, None, None], None) => {
             let dir = scope()?;
@@ -264,7 +277,7 @@ fn project_of(cwd: &Path) -> Result<String, String> {
     }
 }
 
-/// The local date, for a fact's `verified`.
+/// The local date, for a fact's `verified` and its last read.
 fn today() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -281,6 +294,22 @@ fn today() -> String {
         day.tm_mon + 1,
         day.tm_mday
     )
+}
+
+/// Days from 1970-01-01 to a `YYYY-MM-DD` date, for how long ago a fact
+/// was read (Howard Hinnant's `days_from_civil`).
+fn day_number(date: &str) -> Option<i64> {
+    let mut parts = date.splitn(3, '-').map(|part| part.parse::<i64>().ok());
+    let (year, month, day) = (parts.next()??, parts.next()??, parts.next()??);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let of_cycle = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    Some(era * 146_097 + of_cycle - 719_468)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -492,6 +521,51 @@ fn save(dir: &Path, fact: &Fact, body: &str) -> Result<Value, String> {
     )
 }
 
+/// A folder's reads. Reads are bookkeeping, not memory: a record that is
+/// missing or unreadable counts as none rather than failing the read.
+fn reads(dir: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(dir.join(READS))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// One fact's whole file, recorded as read today.
+fn read(dir: &Path, name: &str) -> Result<Value, String> {
+    valid_name(name)?;
+    let file = format!("{name}.md");
+    let path = dir.join(&file);
+    let mut text = String::new();
+    match std::fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "fact_not_found: {name}: no such fact in {}",
+                dir.display()
+            ));
+        }
+        opened => opened
+            .and_then(|f| f.take(LIMIT as u64 + 1).read_to_string(&mut text))
+            .map_err(|e| format!("memory_failed: {}: {e}", path.display()))?,
+    };
+    let invalid = |why: String| format!("memory_invalid: {}: {why}", path.display());
+    if text.len() > LIMIT {
+        return Err(invalid(format!("larger than {LIMIT} bytes")));
+    }
+    Fact::parse(&file, &text).map_err(invalid)?;
+    // Locked only to record it, so a read of no fact makes no folder.
+    let _lock = lock(dir)?;
+    let mut all = reads(dir);
+    let count = all
+        .get(name)
+        .and_then(|read| read["count"].as_u64())
+        .unwrap_or(0)
+        + 1;
+    let last = today();
+    all.insert(name.to_owned(), json!({"last": last, "count": count}));
+    write(&dir.join(READS), &Value::Object(all).to_string())?;
+    Ok(json!({"read": name, "path": path, "text": text, "reads": count}))
+}
+
 fn remove(dir: &Path, name: &str) -> Result<Value, String> {
     valid_name(name)?;
     let _lock = lock(dir)?;
@@ -506,6 +580,10 @@ fn remove(dir: &Path, name: &str) -> Result<Value, String> {
         Err(e) => return Err(format!("memory_failed: {}: {e}", path.display())),
     };
     write(&dir.join(INDEX), &index)?;
+    let mut all_reads = reads(dir);
+    if all_reads.remove(name).is_some() {
+        write(&dir.join(READS), &Value::Object(all_reads).to_string())?;
+    }
     Ok(
         json!({"removed": name, "duplicate": duplicate, "index_bytes": index.len(), "facts": all.len()}),
     )
@@ -544,7 +622,7 @@ fn check(dir: &Path) -> Value {
 /// saved since, and `finish` commits the cleanup, or reverts it when it
 /// removed more facts than the loss guard allows.
 const CLEANUP: &str = ".cleanup";
-const IGNORE: &str = ".lock\n/.cleanup\n.DS_Store\n";
+const IGNORE: &str = ".lock\n.reads\n/.cleanup\n.DS_Store\n";
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
@@ -637,21 +715,67 @@ fn private(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Facts in every scope: the person's and each project's.
-fn all_facts(root: &Path) -> Result<usize, String> {
-    let mut count = facts(root)?.len();
+/// Every scope's folder: the person's, then each project's.
+fn scopes(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = vec![root.to_path_buf()];
     let projects = root.join("projects");
     let entries = match std::fs::read_dir(&projects) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(count),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
         entries => entries.map_err(|e| format!("memory_failed: {}: {e}", projects.display()))?,
     };
     for entry in entries {
         let entry = entry.map_err(|e| format!("memory_failed: {}: {e}", projects.display()))?;
         if entry.path().is_dir() {
-            count += facts(&entry.path())?.len();
+            dirs.push(entry.path());
         }
     }
+    Ok(dirs)
+}
+
+/// Facts in every scope: the person's and each project's.
+fn all_facts(root: &Path) -> Result<usize, String> {
+    let mut count = 0;
+    for dir in scopes(root)? {
+        count += facts(&dir)?.len();
+    }
     Ok(count)
+}
+
+/// Facts in every scope that no agent has read or saved for
+/// [`UNREAD_DAYS`], oldest first, by their path under `root` as a cleanup
+/// lists the facts saved since the last one.
+fn unread(root: &Path) -> Result<Vec<Value>, String> {
+    let Some(now) = day_number(&today()) else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for dir in scopes(root)? {
+        let reads = reads(&dir);
+        for fact in facts(&dir)? {
+            let last_read = reads
+                .get(&fact.name)
+                .and_then(|read| read["last"].as_str())
+                .map(str::to_owned);
+            let Some(last) = [Some(fact.verified.as_str()), last_read.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(day_number)
+                .max()
+            else {
+                continue;
+            };
+            if now - last >= UNREAD_DAYS {
+                let path = dir.join(format!("{}.md", fact.name));
+                let path = path.strip_prefix(root).unwrap_or(&path);
+                found.push((
+                    last,
+                    json!({"path": path, "last_read": last_read, "verified": fact.verified}),
+                ));
+            }
+        }
+    }
+    found.sort_by_key(|(last, _)| *last);
+    Ok(found.into_iter().map(|(_, fact)| fact).collect())
 }
 
 /// Whether anything was saved or removed since the last cleanup, or a
@@ -662,9 +786,11 @@ fn changed(root: &Path) -> Result<Value, String> {
     let saved = if root.join(CLEANUP).exists() {
         true
     } else if root.join(".git").exists() {
-        !git(root, &["status", "--porcelain", "--untracked-files=all"])?
-            .trim()
-            .is_empty()
+        // Reads are not changes, also in a repository whose ignore file
+        // predates them.
+        git(root, &["status", "--porcelain", "--untracked-files=all"])?
+            .lines()
+            .any(|line| Path::new(line.get(3..).unwrap_or("")).file_name() != Some(READS.as_ref()))
     } else {
         all_facts(root)? > 0
     };
@@ -704,7 +830,8 @@ fn cleanup_start(root: &Path) -> Result<Value, String> {
 }
 
 /// A started cleanup, with the facts saved and removed since the last one,
-/// which are what it reads first.
+/// which are what it reads first, and those no agent has read in a while,
+/// which it checks still hold.
 fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Value, String> {
     let since = git(
         root,
@@ -714,7 +841,7 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
     let saved: Vec<_> = added.into_iter().chain(changed).collect();
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
-        "duplicate": duplicate}),
+        "unread": unread(root)?, "duplicate": duplicate}),
     )
 }
 
@@ -1379,6 +1506,107 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_read_is_recorded_beside_the_facts_and_the_cleanup_hears_of_old_unread_ones() {
+        let home = temp("reads");
+        let root = home.join(".agents/memory");
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        let run_ = |line: &[&str]| run(&root, &root, &args(line), &no_stdin);
+        save_user(&root, "a", "fact a", "the text of a").unwrap();
+        let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        let first = run_(&["read", "a", "--user"]).unwrap();
+        assert_eq!(
+            (first["read"].clone(), first["reads"].clone()),
+            (json!("a"), json!(1))
+        );
+        assert!(first["text"].as_str().unwrap().contains("the text of a"));
+        assert!(
+            first["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("---\nname: a\n")
+        );
+        // The tool's call is the script's.
+        let second = call(&home, &home, &json!({"read": "a", "user": true})).unwrap();
+        assert_eq!(second["reads"], 2);
+        // A read changes no fact and no index, and its record is no fact.
+        assert_eq!(std::fs::read_to_string(root.join(INDEX)).unwrap(), index);
+        assert_eq!(check(&root)["problems"], json!([]));
+        assert_eq!(reads(&root)["a"], json!({"last": today(), "count": 2}));
+        assert_eq!(code(run_(&["read", "zz", "--user"])), "fact_not_found");
+        // Reading a fact of no project makes no folder for it.
+        assert_eq!(
+            code(run_(&["read", "zz", "--project", "none"])),
+            "fact_not_found"
+        );
+        assert!(!root.join("projects/none").exists());
+        assert_eq!(code(run_(&["read", "--user"])), "usage");
+        // Facts nobody read or saved for 30 days are listed, oldest first;
+        // a read takes a fact off the list.
+        let old = |name: &str, verified: &str| {
+            let fact = Fact {
+                name: name.into(),
+                kind: "project".into(),
+                description: format!("old fact {name}"),
+                source: "the person, 2020-01-01".into(),
+                verified: verified.into(),
+            };
+            std::fs::write(root.join(format!("{name}.md")), fact.render("old")).unwrap();
+        };
+        old("c", "2020-01-01");
+        old("d", "2020-01-01");
+        old("e", "2020-03-01");
+        let mut record = reads(&root);
+        record.insert("d".into(), json!({"last": "2020-02-01", "count": 1}));
+        write(&root.join(READS), &Value::Object(record).to_string()).unwrap();
+        assert_eq!(
+            unread(&root).unwrap(),
+            json!([
+                {"path": "c.md", "last_read": null, "verified": "2020-01-01"},
+                {"path": "d.md", "last_read": "2020-02-01", "verified": "2020-01-01"},
+                {"path": "e.md", "last_read": null, "verified": "2020-03-01"}
+            ])
+            .as_array()
+            .unwrap()
+            .clone()
+        );
+        run_(&["index", "--user"]).unwrap();
+        run_(&["read", "c", "--user"]).unwrap();
+        let started = run_(&["cleanup", "start"]).unwrap();
+        assert_eq!(
+            started["unread"],
+            json!([
+                {"path": "d.md", "last_read": "2020-02-01", "verified": "2020-01-01"},
+                {"path": "e.md", "last_read": null, "verified": "2020-03-01"}
+            ])
+        );
+        // Removing a fact forgets its reads.
+        run_(&["rm", "d", "--user"]).unwrap();
+        assert!(reads(&root).get("d").is_none());
+        run_(&["cleanup", "finish"]).unwrap();
+        // Reads are not changes to clean up, also where the ignore file
+        // was written before they were recorded.
+        run_(&["read", "a", "--user"]).unwrap();
+        assert_eq!(code(changed(&root)), "unchanged");
+        write(&root.join(".gitignore"), ".lock\n/.cleanup\n.DS_Store\n").unwrap();
+        git(&root, &["commit", "-q", "-am", "older ignore file"]).unwrap();
+        run_(&["read", "a", "--user"]).unwrap();
+        assert_eq!(code(changed(&root)), "unchanged");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn dates_count_days_from_1970() {
+        assert_eq!(day_number("1970-01-01"), Some(0));
+        assert_eq!(day_number("2000-03-01"), Some(11_017));
+        assert_eq!(
+            day_number("2026-10-29").unwrap() - day_number("2026-09-29").unwrap(),
+            30
+        );
+        assert_eq!(day_number("2026-13-01"), None);
+        assert_eq!(day_number("today"), None);
     }
 
     #[test]

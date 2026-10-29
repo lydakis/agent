@@ -143,9 +143,9 @@ impl Tool {
                 "required":["input"],"additionalProperties":false}),
             ),
             Tool::History => (
-                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns.",
+                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a turn handle as run, wait and the listing give it (turn:BOT/N), to read that turn. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
-                "turn":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536},
+                "turn":{"type":"integer","minimum":1},"handle":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536},
                 "query":{"type":"string","minLength":1,"maxLength":256},"before":{"type":"integer","minimum":1}},
                 "additionalProperties":false}),
             ),
@@ -739,6 +739,8 @@ pub enum Prepared {
         bot: Option<String>,
         /// `None` lists the agent's newest turns.
         turn: Option<i64>,
+        /// A turn handle, `turn:BOT/N`, in place of `bot` and `turn`.
+        handle: Option<String>,
         offset: u64,
         limit: usize,
     },
@@ -1088,6 +1090,7 @@ impl Registry {
         struct HistoryArgs {
             bot: Option<String>,
             turn: Option<i64>,
+            handle: Option<String>,
             #[serde(default)]
             offset: u64,
             limit: Option<usize>,
@@ -1237,6 +1240,7 @@ impl Registry {
                     // A search names no turn to page; the store checks the
                     // query's length.
                     if args.turn.is_some()
+                        || args.handle.is_some()
                         || args.offset != 0
                         || args.limit.is_some()
                         || args.before.is_some_and(|before| before < 1)
@@ -1253,7 +1257,12 @@ impl Registry {
                 // Only another agent's turns are listed: a bot's own are in
                 // its context, and the context note numbers those left out.
                 if args.turn.is_some_and(|turn| turn < 1)
-                    || (args.turn.is_none() && args.bot.is_none())
+                    || (args.turn.is_none() && args.bot.is_none() && args.handle.is_none())
+                    || (args.handle.is_some() && (args.turn.is_some() || args.bot.is_some()))
+                    || args
+                        .handle
+                        .as_ref()
+                        .is_some_and(|handle| handle.len() > 256)
                     || args.before.is_some()
                     || !(4..=64 * 1024).contains(&limit)
                 {
@@ -1262,6 +1271,7 @@ impl Registry {
                 Prepared::History {
                     bot: args.bot,
                     turn: args.turn,
+                    handle: args.handle,
                     offset: args.offset,
                     limit,
                 }

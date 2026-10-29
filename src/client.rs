@@ -87,6 +87,9 @@ struct Options {
     newest: bool,
     /// The most a listing prints.
     limit: Option<usize>,
+    /// `usage --since`: how far back, and `--bucket`: the series' step.
+    since_ms: Option<u64>,
+    bucket_ms: Option<u64>,
     pretty: bool,
     new: bool,
     agents: bool,
@@ -173,6 +176,8 @@ fn parse(args: &[String]) -> Result<Options> {
         no_spawn: false,
         timeout_ms: None,
         grace_ms: 0,
+        since_ms: None,
+        bucket_ms: None,
         budget_tokens: None,
         turn_budget_tokens: None,
         images: Vec::new(),
@@ -323,6 +328,8 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.settings_flags.push(flag.to_owned());
                     }
                     "--grace" => options.grace_ms = crate::cli::duration_ms(flag, &value)?,
+                    "--since" => options.since_ms = Some(crate::cli::duration_ms(flag, &value)?),
+                    "--bucket" => options.bucket_ms = Some(crate::cli::duration_ms(flag, &value)?),
                     "--timeout" => {
                         options.timeout_ms = Some(crate::cli::duration_ms(flag, &value)?)
                     }
@@ -394,6 +401,18 @@ fn parse(args: &[String]) -> Result<Options> {
                             .or_insert_with(|| json!([]));
                         if let Value::Array(paths) = writable {
                             paths.push(json!(path));
+                        }
+                        if !options.settings_flags.iter().any(|f| f == flag) {
+                            options.settings_flags.push(flag.to_owned());
+                        }
+                    }
+                    "--unsandboxed" => {
+                        let unsandboxed = options
+                            .settings
+                            .entry("unsandboxed".to_owned())
+                            .or_insert_with(|| json!([]));
+                        if let Value::Array(commands) = unsandboxed {
+                            commands.push(json!(value));
                         }
                         if !options.settings_flags.iter().any(|f| f == flag) {
                             options.settings_flags.push(flag.to_owned());
@@ -1094,6 +1113,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "wait" => wait(&options),
         "inspect" => inspect(&options),
         "turns" => turns(&options),
+        "usage" => usage(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
         "compact" => compact(&options),
@@ -1977,6 +1997,27 @@ fn inspect(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     let record = connection.request("inspect", json!({"bot":bot,"bot_id":options.bot_id}))?;
     print_json(&record, options.pretty)?;
+    Ok(0)
+}
+
+/// What the bots' turns spent, from `--since` ago: in all, by bot, by
+/// model, and every `--bucket`.
+fn usage(options: &Options) -> Result<i32> {
+    let since_ms = match options.since_ms {
+        Some(ago) => (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::new("clock_before_epoch"))?
+            .as_millis() as u64)
+            .saturating_sub(ago),
+        None => 0,
+    };
+    let mut connection = ensure_existing_daemon(options)?;
+    let usage = connection.request(
+        "usage",
+        json!({"name":options.name,"since_ms":since_ms,"bucket_ms":options.bucket_ms,
+            "limit":options.limit}),
+    )?;
+    print_json(&usage, options.pretty)?;
     Ok(0)
 }
 

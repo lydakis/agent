@@ -168,8 +168,10 @@ fn subscriptions() -> Value {
             with a note starting \"Task updates\" when one needs you. Each watches the tasks of a bot (every \
             agent it or its tasks made) or bots by name, and asks a judge model the lookout's built-in \
             questions about what they say and how their turns end, or what you look for in your own words, \
-            with what you do on a yes. A note that names a subscription means do what it says. Add one, or \
-            remove one by name; with neither, or after either, the result lists them all. Adding one again \
+            with what you do on a yes. It also hears the sources the person set up outside (a chat, a mailbox, \
+            a feed), each by name, in a note starting \"From your sources\": every event, unjudged, at once when \
+            the source marks it urgent. A note that names a subscription means do what it says. Add one, or remove one by name; with \
+            neither, or after either, the result lists them all, with the sources there are. Adding one again \
             changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
             "type": "object",
@@ -182,6 +184,9 @@ fn subscriptions() -> Value {
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters."},
+                        "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
+                            "description": "Sources it hears, by name: every event each says. A \
+                                subscription with sources looks for nothing."},
                         "on": {"type": "array", "items": {"type": "string", "enum": ["said", "ended"]},
                             "description": "What it watches: what the bots say, how their turns end; both \
                                 when left out."},
@@ -310,6 +315,8 @@ fn memory() -> Value {
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
         },
+        "read": {"type": "string", "minLength": 1,
+            "description": "The name of a fact to open: its whole file. The read is recorded, so the nightly cleanup can check facts no agent has read in 30 days."},
         "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
         "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
         "check": {"type": "boolean",
@@ -323,7 +330,7 @@ fn memory() -> Value {
     json!({
         "name": MEMORY,
         "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
-            says how to read and what to save. Save one fact, or remove one; index or check a folder's facts; \
+            says how to read and what to save. Read one fact, save one, or remove one; index or check a folder's facts; \
             with none of these, the result shows both indexes (the person's and this project's), each with its \
             folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
             nothing: merge or remove facts first.",
@@ -472,6 +479,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 &caller,
                 arguments.get("add"),
                 arguments["remove"].as_str(),
+                &crate::lookout::sources::names(),
             )
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
@@ -705,6 +713,27 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .get(0)
         .filter(|record| record["name"] == bot)
         .ok_or(("caller_unknown", format!("{bot} is gone")))?;
+    // A side chat forked with its agent's tools calls them as that agent:
+    // its tasks, panes and projects are the agent's, not the copy's.
+    let caller = match crate::side_copy(record) {
+        Some(source) => {
+            let page = client
+                .request("bots", json!({"name": source, "limit": 1}))
+                .await
+                .map_err(|e| ("caller_unknown", e.to_string()))?;
+            page["bots"]
+                .get(0)
+                .filter(|found| {
+                    found["name"] == source && found["bot_id"] == record["created_by_id"]
+                })
+                .cloned()
+                .ok_or((
+                    "caller_unknown",
+                    format!("{source}, which {bot} copies, is gone"),
+                ))?
+        }
+        None => record.clone(),
+    };
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -739,8 +768,8 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .arg(call["name"].as_str().unwrap_or_default())
         .current_dir(workspace)
         .env("PWD", workspace)
-        .env("AGENT_BOT", bot)
-        .env("AGENT_BOT_ID", record["bot_id"].to_string())
+        .env("AGENT_BOT", str_of(&caller["name"]))
+        .env("AGENT_BOT_ID", caller["bot_id"].to_string())
         .env("AGENT_TURN", call["turn"].to_string())
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
@@ -901,6 +930,22 @@ mod tests {
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
         assert_eq!(project_of("shop.fix"), "shop");
+        // A lead's side chat acts as the lead; a task named side-… is no copy.
+        assert_eq!(
+            crate::side_source("shop.web.lead.side-1a2b3c"),
+            Some("shop.web.lead")
+        );
+        assert_eq!(crate::side_source("shop.side-panel"), None);
+        assert_eq!(crate::side_source("shop.side-"), None);
+        assert_eq!(crate::side_source("shop.side-1A2B"), None);
+        let copy = json!({"name": "shop.web.lead.side-1a2b3c", "created_by": "shop.web.lead",
+            "expire_ms": 900_000});
+        assert_eq!(crate::side_copy(&copy), Some("shop.web.lead"));
+        // `feed` is hex: a task under that name is still its own caller.
+        let task = json!({"name": "shop.side-feed", "created_by": "shop.lead"});
+        assert_eq!(crate::side_copy(&task), None);
+        let named = json!({"name": "shop.side-feed", "created_by": "shop", "expire_ms": null});
+        assert_eq!(crate::side_copy(&named), None);
     }
 
     #[test]

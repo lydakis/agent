@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
         startup: true,
     },
     Command {
@@ -69,6 +69,14 @@ const COMMANDS: &[Command] = &[
         about: "A bot's turns and how each ended",
         usage: "turns --bot NAME [--after TURN] [--newest] [--limit N]",
         flags: "--bot --after --newest --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
+        name: "usage",
+        about: "Tokens the bots spent: in all, by bot, by model, and over time",
+        usage: "usage [--name GLOB] [--since DURATION] [--bucket DURATION] [--limit N]",
+        flags: "--name --since --bucket --limit --pretty --no-spawn",
         settings: "",
         startup: true,
     },
@@ -380,6 +388,10 @@ fn print_flags(flags: &str) {
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",
             ),
+            "--unsandboxed" => (
+                "COMMAND",
+                "A command, by its first words, a sandboxed bot runs outside its sandbox without asking; repeat for more",
+            ),
             "--fallbacks" => (
                 "",
                 "A new bot's declined Anthropic requests rerun on the recommended model",
@@ -405,6 +417,14 @@ fn print_flags(flags: &str) {
             "--active" => ("", "Only bots with a turn running"),
             "--newest" => ("", "Newest first, read from the end"),
             "--limit" => ("N", "List at most N"),
+            "--since" => (
+                "DURATION",
+                "Only turns started this long ago or since; default: all",
+            ),
+            "--bucket" => (
+                "DURATION",
+                "Add a series of what was spent every DURATION from --since",
+            ),
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
@@ -468,7 +488,7 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
     let refuse = || {
         Error::with(
             "usage",
-            format!("{flag} needs a duration such as 500ms, 30s, 5m or 1h"),
+            format!("{flag} needs a duration such as 500ms, 30s, 5m, 1h or 7d"),
         )
     };
     if value == "0" {
@@ -482,6 +502,7 @@ pub fn duration_ms(flag: &str, value: &str) -> Result<u64> {
         "s" => 1000,
         "m" => 60_000,
         "h" => 3_600_000,
+        "d" => 86_400_000,
         _ => return Err(refuse()),
     };
     value[..unit]
@@ -547,7 +568,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             return fail_with("usage", format!("{} does not accept {flag}", c.name));
         }
         if flags.iter().any(|f| f == flag)
-            && !matches!(flag, "--provider" | "--image" | "--writable")
+            && !matches!(
+                flag,
+                "--provider" | "--image" | "--writable" | "--unsandboxed"
+            )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
         }
@@ -698,6 +722,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--writable",
             "--network",
             "--hide-senders",
+            "--unsandboxed",
             "--approval",
             "--approve",
         ]
@@ -723,13 +748,14 @@ mod tests {
             assert_eq!(ms(value), Some(millis), "{value}");
         }
         assert_eq!(ms("1h"), Some(3_600_000));
+        assert_eq!(ms("7d"), Some(604_800_000));
         for refused in [
             "30",
             "s",
             "1.5s",
             "-1s",
             "5 m",
-            "1d",
+            "1w",
             "",
             "9999999999999999h",
         ] {

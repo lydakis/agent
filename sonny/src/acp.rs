@@ -3,8 +3,8 @@
 //! thread. A thread in a folder is that folder's lead, as `sonny` there
 //! finds or makes it, set up the same way: its rules and skills, its tools,
 //! its approval mode, and the lookout. Each task the lead starts opens as a
-//! thread of its own, through T3 Code's tools, and that thread is the
-//! task's.
+//! thread through T3 Code's tools, the lead thread's child while the
+//! person's prompt runs, and that thread is the task's.
 //!
 //! It speaks the protocol's version 2 draft as T3 Code does: the turns a
 //! bot takes on its own, as when the lookout wakes a lead because a task
@@ -29,10 +29,17 @@ const VERSION: i64 = 2;
 /// The most of a call's output a thread is shown.
 const OUTPUT_BYTES: usize = 8 * 1024;
 
+/// The longest the person's prompt waits for its tasks' threads to open.
+const OPENING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// JSON-RPC's codes for what Sonny refuses.
 const INVALID_PARAMS: i64 = -32602;
 const NOT_FOUND: i64 = -32601;
 const FAILED: i64 = -32603;
+
+/// The model picker's first choice: the model the thread's bot runs, or
+/// the one Sonny gives a new lead.
+const DEFAULT_MODEL: &str = "default";
 
 /// `sonny acp [--store PATH] [--socket PATH]`.
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -143,8 +150,10 @@ struct Agent {
     options: crate::Options,
     t3: Option<t3::T3>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// The daemon, reached once, with Sonny's skills installed first.
-    ready: OnceCell<Result<(), String>>,
+    /// The daemon, reached once, with Sonny's skills installed first. A
+    /// failure is not kept: the next thread tries again, so a daemon
+    /// restarted under a running T3 is reached without restarting T3.
+    ready: OnceCell<()>,
     /// The version the client asked for, when older.
     version: AtomicI64,
 }
@@ -195,6 +204,10 @@ impl Agent {
             },
             "session/prompt" => match self.session(params) {
                 Some(session) => session.prompt(&self, id, params).await,
+                None => Err((INVALID_PARAMS, "no such session".into())),
+            },
+            "session/set_config_option" => match self.session(params) {
+                Some(session) => session.set_option(&self, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
             },
             "session/close" => {
@@ -253,17 +266,49 @@ impl Agent {
         self.version.load(Ordering::Relaxed) >= 2
     }
 
+    /// A thread's options: its model, picked from `~/.agent/models` as
+    /// `agent models` lists it, with Sonny's own choice first. A bot's
+    /// thread offers only its family's, since a bot changes model only
+    /// within it; `bound` is the model the bot runs and the daemon's
+    /// providers.
+    fn options(&self, value: &str, bound: Option<(&str, &Value)>) -> Value {
+        let listed = agent_client::models::path()
+            .and_then(|path| agent_client::models::read(&path).ok())
+            .unwrap_or_default();
+        let mut choices = vec![json!({"value": DEFAULT_MODEL, "name": "Default",
+            "description": "The model the lead or task runs, or the one Sonny gives a new lead"})];
+        for model in listed {
+            if let Some((current, providers)) = bound
+                && family(providers, &model.id) != family(providers, current)
+            {
+                continue;
+            }
+            let mut choice = json!({"value": model.id, "name": model.id});
+            if let Some(note) = model.note {
+                choice["description"] = json!(note);
+            }
+            choices.push(choice);
+        }
+        if !choices.iter().any(|choice| choice["value"] == value) {
+            choices.push(json!({"value": value, "name": value}));
+        }
+        // Both names: version 2's schema says `configId`, but T3 Code finds
+        // the model option by `id` whatever the version.
+        json!([{"id": "model", "configId": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": value, "options": choices}])
+    }
+
     /// The daemon, started as `sonny` starts it, with Sonny's skills
     /// installed before any lead is made, so its instructions list them.
     async fn ready(&self) -> Result<(), String> {
         self.ready
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 crate::skills::install_own();
                 crate::trigger::at_start();
                 crate::connect(&self.options).await.map(drop)
             })
             .await
-            .clone()
+            .map(drop)
     }
 
     /// A thread starts (`session/new`) or comes back (`session/resume`).
@@ -285,6 +330,7 @@ impl Agent {
             cwd,
             state: AsyncMutex::new(State::default()),
             follower: Mutex::new(None),
+            switching: AsyncMutex::new(()),
         });
         // Open before it follows its bot; one it replaces stops following.
         let replaced = self
@@ -309,9 +355,10 @@ impl Agent {
             }
             return Err((FAILED, error));
         }
+        let options = session.options(self).await;
         Ok(match resumed {
-            Some(_) => json!({}),
-            None => json!({"sessionId": id}),
+            Some(_) => json!({"configOptions": options}),
+            None => json!({"sessionId": id, "configOptions": options}),
         })
     }
 }
@@ -326,6 +373,8 @@ struct Session {
     state: AsyncMutex<State>,
     /// What follows its bot, stopped when the thread closes.
     follower: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Held while the bot's model changes: one change at a time.
+    switching: AsyncMutex<()>,
 }
 
 impl Session {
@@ -360,6 +409,14 @@ struct State {
     /// The last steer a running turn took in, and that turn: for a prompt
     /// whose steer went in before its turn was named.
     steered: Option<(i64, i64)>,
+    /// The model the person picked, which the bot takes when it is next
+    /// idle; a new lead starts on it.
+    picked: Option<String>,
+    /// Tasks whose threads are opening, as children of the person's prompt
+    /// while it runs, and the answers of the prompts whose turns ended
+    /// meanwhile, held until they are open.
+    opening: usize,
+    held: Vec<(Value, Value)>,
 }
 
 struct Bound {
@@ -370,6 +427,9 @@ struct Bound {
     workspace: String,
     /// The folder a moved lead comes back to with its next turn.
     moving: Option<String>,
+    /// `provider/model`, as the daemon names it, and its effort.
+    model: String,
+    effort: Option<String>,
 }
 
 impl Session {
@@ -392,7 +452,8 @@ impl Session {
                 (bot, project, None)
             }
             None => {
-                let lead = project::open(&client, &self.cwd, None).await?;
+                let picked = self.state.lock().await.picked.clone();
+                let lead = project::open(&client, &self.cwd, picked.as_deref()).await?;
                 let moving = lead.moving.as_ref().map(|dir| dir.display().to_string());
                 setup_lead(agent, &self.id, &client, &lead, moving.as_deref()).await?;
                 (lead.bot, Some(lead.project), moving)
@@ -425,6 +486,12 @@ impl Session {
             .map_err(|e| e.to_string())?;
         let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
         let running = record["running_turn"].as_i64();
+        let model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or(""),
+            record["model"].as_str().unwrap_or("")
+        );
+        let effort = record["effort"].as_str().map(str::to_owned);
         let mut calls = HashMap::new();
         for (turn, data) in started.into_values() {
             if running.is_some() && turn == running {
@@ -440,12 +507,19 @@ impl Session {
             state.running = running;
             state.calls = calls;
             state.cursor = cursor;
+            // A task keeps the model its lead gave it, whatever T3 Code
+            // picked for the thread it opened.
+            if claimed || state.picked.as_ref() == Some(&model) {
+                state.picked = None;
+            }
             state.bound = Some(Bound {
                 bot,
                 client,
                 project,
                 workspace,
                 moving,
+                model,
+                effort,
             });
             // The thread T3 Code opened for a task stands for its first
             // turn, which runs already.
@@ -453,6 +527,7 @@ impl Session {
                 state.prompt = state.prompt.take().map(|(id, _)| (id, Some(turn)));
             }
         }
+        self.show_options(agent).await;
         let (session, agent) = (self.clone(), agent.clone());
         // Calls already waiting for the person, whose events were before
         // this thread came, are put to it too.
@@ -475,8 +550,151 @@ impl Session {
         Ok(())
     }
 
+    /// The thread's options as they are now.
+    async fn options(&self, agent: &Agent) -> Value {
+        let state = self.state.lock().await;
+        let bound = state.bound.as_ref();
+        let value = (state.picked.as_deref())
+            .or(bound.map(|bound| bound.model.as_str()))
+            .unwrap_or(DEFAULT_MODEL);
+        agent.options(
+            value,
+            bound.map(|bound| (bound.model.as_str(), bound.client.providers())),
+        )
+    }
+
+    async fn show_options(&self, agent: &Agent) {
+        let options = self.options(agent).await;
+        agent.out.update(
+            &self.id,
+            json!({"sessionUpdate": "config_option_update", "configOptions": options}),
+        );
+    }
+
+    /// The person picks a model. A bot's thread takes one of its family
+    /// only, at once when the bot is idle and with its next turn when it
+    /// is not; a thread that is no bot yet keeps it for the lead it makes.
+    async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
+        let option = params.get("configId").unwrap_or(&params["id"]);
+        if option != "model" {
+            return Err((INVALID_PARAMS, format!("Sonny has no option {option}")));
+        }
+        let Some(value) = params["value"].as_str() else {
+            return Err((INVALID_PARAMS, "a model is picked by its id".into()));
+        };
+        let _one = self.switching.lock().await;
+        {
+            let mut state = self.state.lock().await;
+            let picked = match &state.bound {
+                Some(bound) if value != DEFAULT_MODEL && value != bound.model => {
+                    let providers = bound.client.providers();
+                    let wanted = family(providers, value);
+                    if wanted.is_null() {
+                        return Err((INVALID_PARAMS, format!("no provider serves {value}")));
+                    }
+                    if wanted != family(providers, &bound.model) {
+                        return Err((
+                            INVALID_PARAMS,
+                            format!(
+                                "{} stays in {}'s family: its history is in that family's shape",
+                                bound.bot, bound.model
+                            ),
+                        ));
+                    }
+                    Some(value.to_owned())
+                }
+                Some(_) => None,
+                None => (value != DEFAULT_MODEL).then(|| value.to_owned()),
+            };
+            state.picked = picked;
+        }
+        self.switch(agent)
+            .await
+            .map_err(|error| (INVALID_PARAMS, error))?;
+        Ok(json!({"configOptions": self.options(agent).await}))
+    }
+
+    /// Once the bot is idle, as before a prompt's turn or after a turn:
+    /// the model the person picked meanwhile, and the model it runs, as
+    /// another client may have changed it.
+    async fn settle(&self, agent: &Agent) {
+        let _one = self.switching.lock().await;
+        if let Err(error) = self.switch(agent).await {
+            agent.out.update(
+                &self.id,
+                json!({"sessionUpdate": "notice", "severity": "warning",
+                "title": "Sonny kept the model", "description": error}),
+            );
+        }
+        let Some((client, bot)) = (self.state.lock().await.bound.as_ref())
+            .map(|bound| (bound.client.clone(), bound.bot.clone()))
+        else {
+            return;
+        };
+        let Ok(record) = client.request("inspect", json!({"bot": bot})).await else {
+            return;
+        };
+        let model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or(""),
+            record["model"].as_str().unwrap_or("")
+        );
+        let changed = {
+            let mut state = self.state.lock().await;
+            match &mut state.bound {
+                Some(bound) if bound.bot == bot && bound.model != model => {
+                    bound.model = model;
+                    bound.effort = record["effort"].as_str().map(str::to_owned);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.show_options(agent).await;
+        }
+    }
+
+    /// Give an idle bot the model the person picked. The caller holds
+    /// `switching`.
+    async fn switch(&self, agent: &Agent) -> Result<(), String> {
+        let (client, asked, model) = {
+            let state = self.state.lock().await;
+            let (Some(bound), Some(model), None) = (&state.bound, &state.picked, state.running)
+            else {
+                return Ok(());
+            };
+            let asked = json!({"bot": bound.bot, "model": model, "effort": bound.effort});
+            (bound.client.clone(), asked, model.clone())
+        };
+        let answer = client.request("configure", asked).await;
+        let mut state = self.state.lock().await;
+        match answer {
+            Ok(_) => {
+                state.picked = None;
+                if let Some(bound) = &mut state.bound {
+                    bound.model = model;
+                }
+                drop(state);
+                self.show_options(agent).await;
+                Ok(())
+            }
+            // It took a turn meanwhile: the pick waits for the next.
+            Err(error) if error.code == "bot_busy" => Ok(()),
+            Err(error) => {
+                state.picked = None;
+                drop(state);
+                self.show_options(agent).await;
+                Err(error.to_string())
+            }
+        }
+    }
+
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
         let (text, images) = words(&params["prompt"]);
+        if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
+            return Ok(json!({"stopReason": "end_turn"}));
+        }
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;
@@ -519,6 +737,9 @@ impl Session {
                 return Ok(Value::Null);
             }
         }
+        // A model picked while the bot worked, or before a lead that was
+        // there already: the bot takes it before this turn.
+        self.settle(agent).await;
         let mut state = self.state.lock().await;
         if std::mem::take(&mut state.cancelled) {
             return Ok(json!({"stopReason": "cancelled"}));
@@ -641,6 +862,9 @@ impl Session {
                     break;
                 }
                 self.on(agent, &event).await;
+                if event["event"] == "turn_finished" {
+                    self.settle(agent).await;
+                }
             }
             let mut failed = false;
             events = loop {
@@ -876,13 +1100,35 @@ impl Session {
                         .as_ref()
                         .map(|b| b.workspace.clone())
                         .unwrap_or_default();
-                    let (agent, session) = (agent.clone(), self.id.clone());
-                    tokio::spawn(async move {
-                        open_task(
-                            &agent, &session, &client, &project, &arguments, &workspace, &call,
-                        )
-                        .await
-                    });
+                    let this = (agent.sessions.lock().ok())
+                        .and_then(|sessions| sessions.get(&self.id).cloned());
+                    if let Some(session) = this {
+                        state.opening += 1;
+                        let session_id = session.id.clone();
+                        let agent = agent.clone();
+                        tokio::spawn(async move {
+                            let (opener, thread) = (agent.clone(), session.cwd.clone());
+                            let opening = tokio::spawn(async move {
+                                let at = Where {
+                                    project: &project,
+                                    workspace: &workspace,
+                                    thread: &thread,
+                                };
+                                let session = &session_id;
+                                open_task(&opener, session, &client, &at, &arguments, &call).await;
+                            });
+                            // The person's prompt waits for its tasks' threads,
+                            // not for ever: one still opening opens on its own.
+                            let _ = tokio::time::timeout(OPENING, opening).await;
+                            let mut state = session.state.lock().await;
+                            state.opening -= 1;
+                            if state.opening == 0 {
+                                for (prompt, result) in std::mem::take(&mut state.held) {
+                                    agent.out.answer(&prompt, result);
+                                }
+                            }
+                        });
+                    }
                 }
             }
             "approval_requested" | "approval_asked" => {
@@ -932,7 +1178,13 @@ impl Session {
                         result["error"] = json!({"code": FAILED,
                             "message": data["error"].as_str().unwrap_or("the turn failed")});
                     }
-                    out.answer(&prompt, result);
+                    // A task T3 Code opens as a child of this prompt opens
+                    // while its run is on.
+                    if state.opening > 0 {
+                        state.held.push((prompt, result));
+                    } else {
+                        out.answer(&prompt, result);
+                    }
                 }
             }
             "deleted" => {
@@ -1163,10 +1415,7 @@ async fn setup_lead(
     let mut gating = lead.new.then_some(approvals::MODES[0].0);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(
-            &record,
-            &approvals::sandbox(mode, true, Path::new(&workspace)),
-        )
+        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
     {
         gating = Some(mode);
     }
@@ -1184,7 +1433,7 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.extend(approvals::sandbox(mode, true, Path::new(&workspace)));
+        fields.extend(approvals::sandbox(mode, Path::new(&workspace)));
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {
@@ -1218,18 +1467,28 @@ async fn setup_lead(
     Ok(())
 }
 
+/// Where a lead's thread is: its project, the lead's workspace, and the
+/// folder T3 Code opened the thread in.
+struct Where<'a> {
+    project: &'a str,
+    workspace: &'a str,
+    thread: &'a Path,
+}
+
 /// Open the task a lead's `start_task` call started as a thread of its
 /// own, with the task's brief as its first message; the thread is the
-/// task's when that message reaches it. The lead's call says where.
+/// task's when that message reaches it. While the person's prompt runs it
+/// is the lead thread's child, which T3 Code opens in the lead's folder;
+/// otherwise a thread of its own, where the lead's call says.
 async fn open_task(
     agent: &Agent,
     session: &str,
     client: &Client,
-    project: &str,
+    at: &Where<'_>,
     arguments: &Value,
-    lead_workspace: &str,
     call: &str,
 ) {
+    let (project, lead_workspace) = (at.project, at.workspace);
     let Some(t3) = &agent.t3 else { return };
     let Some(name) = arguments["name"].as_str() else {
         return;
@@ -1260,6 +1519,17 @@ async fn open_task(
             .ok_or("the task has no brief")?
             .to_owned();
         let workspace = record["workspace"].as_str().unwrap_or_default();
+        let message = t3::expect(&bot, &brief, at.thread)?;
+        let child = json!({"task": message, "title": name, "clientRequestId": bot});
+        // The person's prompt waits for it: not for ever. One that is late
+        // may open yet, so its task still waits for it and no other thread
+        // is opened for it.
+        let delegating = t3.call("delegate_task", child);
+        match tokio::time::timeout(OPENING, delegating).await {
+            Ok(Ok(delegated)) => return Ok(delegated),
+            Ok(Err(_)) => {}
+            Err(_) => return Ok(Value::Null),
+        }
         let message = t3::expect(&bot, &brief, Path::new(workspace))?;
         let mut launch = json!({"title": name, "message": message, "clientRequestId": bot});
         if workspace != lead_workspace {
@@ -1383,6 +1653,15 @@ fn text_content(text: &str) -> Value {
 }
 
 /// At most `OUTPUT_BYTES` of a call's output, on a character boundary.
+/// The family a `provider/model` belongs to, as the daemon's providers
+/// say: null for a provider it does not serve.
+fn family<'a>(providers: &'a Value, model: &str) -> &'a Value {
+    let provider = model
+        .split_once('/')
+        .map_or(model, |(provider, _)| provider);
+    &providers[provider]["family"]
+}
+
 fn cut(text: &str) -> String {
     if text.len() <= OUTPUT_BYTES {
         return text.to_owned();
