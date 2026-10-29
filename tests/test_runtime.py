@@ -280,16 +280,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # inside the turn keeps at least its newest call in view. A
                 # step is a call, or a list of calls made in one round.
                 done = max((int(i['call_id'][7:].split('.')[0]) + 1 for i in request['input']
-                            if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
+                            if i.get('type') in ('function_call', 'custom_tool_call')
+                            and i['call_id'].startswith('script-')),
                            default=0)
                 text = ''
                 if done < len(self.server.call_script):
                     step = self.server.call_script[done]
                     calls = step if isinstance(step, list) else [step]
-                    output = [{'type': 'function_call', 'name': name,
-                               'call_id': f'script-{done}' + (f'.{n}' if n else ''),
-                               'arguments': json.dumps(arguments)}
-                              for n, (name, arguments) in enumerate(calls)]
+                    # Text arguments make a custom tool's call.
+                    output = [{'type': 'custom_tool_call', 'name': name, 'input': arguments}
+                              if isinstance(arguments, str) else
+                              {'type': 'function_call', 'name': name, 'arguments': json.dumps(arguments)}
+                              for name, arguments in calls]
+                    for n, item in enumerate(output):
+                        item['call_id'] = f'script-{done}' + (f'.{n}' if n else '')
                 else:
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',

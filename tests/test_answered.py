@@ -53,6 +53,35 @@ class AnsweredToolTests(ModelFixture):
             refused = client.request('create', bot='Bad', workspace=str(self.path), declare=[tool])
             self.assertEqual(refused['error'], 'invalid_declare', detail)
 
+    def test_a_tool_with_a_grammar_takes_free_text_and_is_answered_as_custom(self):
+        client = self.client('echo')
+        exec_tool = {'name': 'exec', 'description': 'Run a script.', 'grammar': 'start: /[\\s\\S]+/',
+                     'parameters': {'type': 'object', 'properties': {'input': {'type': 'string'}},
+                                    'required': ['input']},
+                     'answered_by': 'sonny'}
+        for parameters in ({'type': 'object'}, {'type': 'object', 'properties': {'input': {'type': 'string'}}},
+                           {'type': 'object', 'properties': {'input': {'type': 'integer'}}, 'required': ['input']}):
+            refused = client.request('create', bot='Bad', workspace=str(self.path),
+                                     declare=[dict(exec_tool, parameters=parameters)])
+            self.assertEqual(refused['error'], 'invalid_declare', parameters)
+        refused = client.request('create', bot='Bad', workspace=str(self.path), declare=[dict(exec_tool, grammar='')])
+        self.assertEqual(refused['error'], 'invalid_declare')
+        client = self.lead(tool=exec_tool, client=client)
+        self.model.call_script = [('exec', 'text("hi")')]
+        turn = self.submit(client)
+        self.started(client, turn)
+        [call] = client.request('tool_calls', tag='sonny')['result']['calls']
+        self.assertEqual((call['name'], call['arguments']), ('exec', {'input': 'text("hi")'}))
+        self.answer(client, turn, output='hi')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        [declared] = [t for t in requests[0]['tools'] if t['name'] == 'exec']
+        self.assertEqual((declared['type'], declared['format']['definition']), ('custom', 'start: /[\\s\\S]+/'))
+        [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
+        self.assertEqual((answered['type'], answered['output']), ('custom_tool_call_output', 'hi'))
+
     def test_an_answer_within_the_hold_is_the_result_and_the_turn_never_parks(self):
         client = self.lead()
         turn = self.submit(client)
