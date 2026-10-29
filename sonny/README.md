@@ -50,7 +50,9 @@ folder under `~/.agent`.
 
 `~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
 keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
-the daemon, the approver and the lookout. Settings go in
+the daemon it starts; the approver and the lookout run as that daemon's
+companions, with its environment, so they live as long as it does whether
+or not a window is open. Settings go in
 `~/.agent/config.toml`, as Codex keeps them: `provider` (the daemon's
 `--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
 agent's when none is named) and the efforts below. When no provider is named
@@ -176,7 +178,7 @@ notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 0.9.2 lists Sonny but takes no command to restart it). Sonny reports from a
 pane of the Herdr server on its own machine: one reached by plain `ssh` from a
 Herdr pane is not listed, one in a remote machine Herdr itself connects to is.
-The daemon, lookout and approver Sonny starts run in a session of their own,
+The daemon Sonny starts, and the lookout and approver it keeps, run in a session of their own,
 so closing their pane or stopping Herdr leaves them and their turns running.
 In cmux, which reads OSC 7501 and OSC 777 itself, the workspace's sidebar row
 shows which task is working, waiting on an approval or done, and a
@@ -188,8 +190,9 @@ then cmux offers it to run by hand); quitting Sonny clears it. cmux lets
 only programs started in its tabs reach it, by default; agents' shells run
 in the daemon, not in cmux, so set cmux's Settings > Automation to
 "Automation mode" (your own programs, no ancestry check) for agents to run
-commands in tabs and read them. The lookout Sonny starts in cmux reaches it
-either way; one started outside cmux needs Automation mode too.
+commands in tabs and read them. The lookout, the daemon's companion, reaches it
+either way when the daemon started from a cmux tab; otherwise it needs
+Automation mode too.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or

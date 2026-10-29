@@ -76,7 +76,7 @@ class Connection:
 
 
 class SocketClient:
-    def __init__(self, binary, path, url, tools, extra=(), settings=None):
+    def __init__(self, binary, path, url, tools, extra=(), settings=None, env=None):
         # Keep AF_UNIX paths short even in deep remote snapshot directories.
         self.directory = tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp')
         self.socket_path = Path(self.directory.name) / 'daemon.sock'
@@ -85,7 +85,7 @@ class SocketClient:
         self.process = subprocess.Popen(
             [str(binary), *serve_args(path, url, extra=extra), '--socket', str(self.socket_path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, env=clean_env())
+            start_new_session=True, env=env or clean_env())
         try:
             deadline = time.monotonic() + 5
             while True:

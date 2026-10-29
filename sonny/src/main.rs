@@ -92,7 +92,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -417,74 +417,70 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
     Ok(())
 }
 
-/// An `auto` gate needs an approver serving it: when none does, one is
-/// started the way the CLI starts it, detached, logging beside the store,
-/// judged by `model` unless a judge is set.
-async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(), String> {
-    let stats = client
-        .request("stats", json!({}))
+/// The daemon's companion that answers an `auto` gate: `agent approver`,
+/// judged by `model` unless a judge is set, which the daemon then keeps
+/// running for as long as it runs, as it does the lookout. One kept already
+/// keeps the judge it was given first, so leads on other models do not
+/// start it again.
+async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
+    let bin = agent_bin().ok_or("Agent's binary was not found to judge calls; set AGENT_BIN")?;
+    let args = daemon_args("approver");
+    let kept = client
+        .request("companions", json!({}))
         .await
         .map_err(|e| e.to_string())?;
-    if stats["approvers"]
-        .as_array()
-        .is_some_and(|tags| tags.iter().any(|tag| tag == "auto"))
+    if (kept["companions"].as_array().into_iter().flatten())
+        .any(|c| c["name"] == APPROVER && c["command"] == json!(bin) && c["args"] == json!(args))
     {
         return Ok(());
     }
-    let bin = agent_bin().ok_or("Agent's binary was not found to judge calls; set AGENT_BIN")?;
-    let mut log = options.store.clone().into_os_string();
-    log.push(".approver.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(|e| e.to_string())?;
-    let mut command = agent_command(&bin)?;
-    agent_client::own_session(&mut command);
-    command
-        .env("AGENT_MODEL", model)
-        .arg("approver")
-        .arg("--store")
-        .arg(&options.store)
-        .arg("--socket")
-        .arg(&options.socket)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .spawn()
-        .map_err(|e| format!("{}: {e}", bin.display()))?;
-    Ok(())
+    keep(client, APPROVER, &bin, args, json!({"AGENT_MODEL": model})).await
 }
 
 /// The lookout, `sonny lookout`, which tells leads what happens in their
-/// tasks and answers Sonny's tools: started detached, logging beside the
-/// store. One already watching this daemon keeps it, and the new one
-/// exits.
-fn start_lookout(options: &Options) -> Result<(), String> {
+/// tasks and answers Sonny's tools: the daemon's companion, so it runs for
+/// as long as the daemon does, whether or not a window is open, and comes
+/// back with the next daemon. This Sonny's own build replaces another's:
+/// the build is part of what the daemon keeps, so a Sonny upgraded in
+/// place has the daemon start the new one.
+async fn start_lookout(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut log = options.store.clone().into_os_string();
-    log.push(".lookout.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(|e| e.to_string())?;
-    let mut command = agent_command(&me)?;
-    agent_client::own_session(&mut command);
-    let mut child = command
-        .arg("lookout")
-        .arg("--store")
-        .arg(&options.store)
-        .arg("--socket")
-        .arg(&options.socket)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .spawn()
-        .map_err(|e| format!("{}: {e}", me.display()))?;
-    // Reaped when it exits, as it does at once when another one watches.
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    keep(
+        client,
+        LOOKOUT,
+        &me,
+        daemon_args("lookout"),
+        json!({"SONNY_BUILD": lookout::identity()}),
+    )
+    .await
+}
+
+/// What Sonny names its companions in the daemon.
+const LOOKOUT: &str = "sonny-lookout";
+const APPROVER: &str = "approver-auto";
+
+/// A companion's arguments: its store and socket come from the daemon
+/// that runs it (`AGENT_STORE`, `AGENT_SOCKET`), which may serve the store
+/// on another socket later.
+fn daemon_args(command: &str) -> Vec<String> {
+    vec![command.to_owned()]
+}
+
+/// Ask the daemon to keep `name` running `bin` with `args`; the same again
+/// changes nothing.
+async fn keep(
+    client: &Client,
+    name: &str,
+    bin: &Path,
+    args: Vec<String>,
+    env: Value,
+) -> Result<(), String> {
+    let add = json!({"name": name, "command": bin, "args": args, "env": env});
+    client
+        .request("companions", json!({"add": add}))
+        .await
+        .map(drop)
+        .map_err(|e| format!("{name}: {e}"))
 }
 
 /// The daemon, started the way the CLI starts it when it is not running.
@@ -893,7 +889,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(format!("the lookout: {error}"));
     }
     // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.options) {
+    if let Err(error) = start_lookout(&app.client).await {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -953,7 +949,7 @@ async fn run() -> Result<(), String> {
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
-        && let Err(error) = serve_auto(&app.client, &app.options, &app.model).await
+        && let Err(error) = serve_auto(&app.client, &app.model).await
     {
         app.notice = Some(error);
     }
@@ -2986,8 +2982,7 @@ impl App {
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
                     if mode == "auto"
-                        && let Err(error) =
-                            serve_auto(&self.client, &self.options, &self.model).await
+                        && let Err(error) = serve_auto(&self.client, &self.model).await
                     {
                         self.notice = Some(error);
                     }
@@ -3410,13 +3405,13 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
-            // A daemon that restarted took the approver and the lookout
-            // Sonny started with it.
-            if let Err(error) = start_lookout(&self.options) {
+            // A daemon that restarted brings back its companions; one
+            // started anew, as by another store's Sonny, gets them now.
+            if let Err(error) = start_lookout(&self.client).await {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
-                && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
+                && let Err(error) = serve_auto(&self.client, &self.model).await
             {
                 self.notice = Some(error);
             }
