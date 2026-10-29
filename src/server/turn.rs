@@ -3126,7 +3126,13 @@ impl Turn {
                     backoff(attempt + 1, turn as u64)
                 }
                 None if paced => std::time::Duration::ZERO,
-                None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
+                None if matches!(
+                    error.code.as_str(),
+                    "provider_login_refreshed" | "provider_signature_expired"
+                ) =>
+                {
+                    std::time::Duration::ZERO
+                }
                 None if error.code == "provider_stream_stalled" => {
                     backoff(attempt + STALL_START, turn as u64)
                 }
@@ -4641,6 +4647,7 @@ fn retryable(code: &str) -> bool {
             | "provider_stream_failed"
             | "provider_stream_stalled"
             | "provider_login_refreshed"
+            | "provider_signature_expired"
             | "provider_login_throttled"
             | "provider_plan_unavailable"
             | "truncated_sse_frame"
