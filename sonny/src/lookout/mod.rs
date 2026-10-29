@@ -3192,6 +3192,7 @@ mod tests {
             resume: None,
             reacting: HashMap::new(),
             taken: HashMap::new(),
+            goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
         };
         let started = |bot: &str, arguments: Value| {
             json!({"event": "tool_started", "bot": bot, "turn": 3, "data": {"call_id": "c1",
