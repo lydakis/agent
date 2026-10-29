@@ -101,9 +101,10 @@ pub fn pull_request(text: &str) -> Option<String> {
 /// The mark and colour a state reads with.
 pub fn mark(state: &str) -> Span<'static> {
     match state {
-        "working" => Span::raw("● ").fg(Color::Cyan),
+        "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("◐ ").fg(Color::Magenta),
         "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::CHECKED => Span::raw("✔ ").fg(Color::Green).bold(),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {

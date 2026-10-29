@@ -3696,7 +3696,11 @@ impl App {
                             };
                             match seen.ask.is_some() && !seen.itself {
                                 true => "needs you".to_owned(),
-                                false => state,
+                                // One with a goal says whether that turn met it.
+                                false => {
+                                    lookout::goals::standing(&self.options.store, &bot, Some(last))
+                                        .map_or(state, str::to_owned)
+                                }
                             }
                         }
                         _ => state,
@@ -5704,7 +5708,12 @@ impl App {
                 (true, Some("paced")) => "rate limited".into(),
                 (true, Some("queued")) => "queued".into(),
                 (true, _) => "working".into(),
-                (false, Some("completed" | "steered")) => "done".into(),
+                // One with a goal says whether that turn met it.
+                (false, Some("completed" | "steered")) => {
+                    lookout::goals::standing(&self.options.store, name, ran["turn"].as_i64())
+                        .unwrap_or("done")
+                        .into()
+                }
                 (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
                 (false, Some("interrupted")) => "stopped".into(),
                 (false, Some(other)) => other.to_owned(),
