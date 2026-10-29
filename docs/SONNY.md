@@ -286,6 +286,43 @@ its folder rather than trusting a compacted conversation for ids and times,
 report a source it could not read by name, re-check items right before
 posting, and record a post only once the destination confirms it.
 
+## Goals
+
+A goal keeps an agent working until a command says its work is done, with
+no judge and nothing in the daemon ([goals.rs](../sonny/src/lookout/goals.rs)).
+An agent sets one with the `goal` tool, on itself or on a task it made:
+`set {done_when, check, bot, budget_tokens, timeout_s}`, `blocked` WHY to
+give its own up, `clear` NAME, or nothing to list them. The check is a
+shell command (`cargo test`, `make lint`, `test -z "$(git status --short)"`)
+that exits 0 once done; the lookout runs it in the agent's folder, as the
+person and outside any sandbox like a trigger's `if`, though without the
+provider keys an agent's shell goes without, so `set` waits for a verdict wherever the
+agent's other calls do (`/approvals`). Each goal is
+`STORE.lookout/goals/BOT.json`; setting the same goal again changes
+nothing.
+
+Each time a turn of that agent completes, the lookout runs the check, for
+up to `timeout_s` (600 when left out, at most 3,600), killing its process
+group past that. While it fails, it queues the agent a turn (origin
+`goal`) with its exit code and the last 60 lines (8 KiB) it printed:
+
+```
+Your goal is not met yet: `cargo test` exits 101.
+...
+Keep working until the tests pass. When no way remains, give the goal up with the goal tool's blocked, saying why.
+```
+
+The goal ends, and its file goes, at the first of: the check exits 0; the
+agent's tokens since `set` reach `budget_tokens`; two turns in a row that
+the goal started call no tool, since the agent only answers and another
+turn would too; the agent calls `blocked`; or someone clears it or the
+agent is deleted. A turn that fails or is stopped ends nothing and starts
+nothing: the lead hears it as any turn. Its lead hears none of the turns
+the goal held until the last, told with how the goal ended (below). That
+line is the lookout's own words only: the agent's reason for giving up,
+and a check it set itself, are its text, which the lead reads in the turn
+or with `goal`.
+
 ## Memory
 
 Memory is what earlier agents learned that a later one needs: decisions,
