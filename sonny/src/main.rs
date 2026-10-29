@@ -2381,16 +2381,7 @@ impl App {
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
-        // Known to start the conversation only once its newest page is
-        // read, the welcome goes above it.
-        let mut welcome = self.welcome();
-        if !welcome.is_empty() {
-            if self.any_history {
-                welcome.push(Line::default());
-            }
-            self.any_history = true;
-            self.pending.splice(0..0, welcome);
-        }
+        self.welcome_above();
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             status_report("working", &self.bot);
@@ -2550,9 +2541,10 @@ impl App {
             }
             if self.to_first {
                 self.screen.scroll(isize::MAX);
-                self.to_first = full() && self.older.is_some() && self.screen.near_top();
+                self.to_first =
+                    full() && (self.repaint || self.older.is_some() && self.screen.near_top());
                 // The next page asked for once this one is drawn, not a tick on.
-                if self.to_first {
+                if self.to_first && !self.repaint {
                     self.woken.notify_one();
                 }
             }
@@ -2921,12 +2913,17 @@ impl App {
             self.screen.prepend_blank(pages);
             return Ok(());
         }
-        let welcome = self.welcome();
-        self.commit(welcome);
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
-            Some(first) => self.history_since(first - 1, true).await,
-            None => self.history().await,
+            Some(first) => {
+                let welcome = self.welcome();
+                self.commit(welcome);
+                self.history_since(first - 1, true).await;
+            }
+            None => {
+                self.history().await;
+                self.welcome_above();
+            }
         }
         Ok(())
     }
@@ -3220,6 +3217,19 @@ impl App {
     /// Commit a finished cell, a blank line apart from the one before.
     /// The welcome, when this window has one and draws the conversation
     /// from its first item: none above a page with older ones before it.
+    /// The welcome over the newest page just read, known to start the
+    /// conversation only once it is.
+    fn welcome_above(&mut self) {
+        let mut welcome = self.welcome();
+        if !welcome.is_empty() {
+            if self.any_history {
+                welcome.push(Line::default());
+            }
+            self.any_history = true;
+            self.pending.splice(0..0, welcome);
+        }
+    }
+
     fn welcome(&self) -> Vec<Line<'static>> {
         match self.welcome && self.older.is_none() {
             true => banner::welcome(&tilde(&self.workspace), &self.model, self.width),
@@ -5258,6 +5268,14 @@ impl App {
             {
                 self.to_first = key.code == KeyCode::Home;
                 match self.to_first {
+                    // The oldest rows went to make room: drawn anew from
+                    // the newest page, the way up starts over.
+                    true if self.screen.trimmed() => {
+                        self.first_node = None;
+                        self.older = None;
+                        self.unpaired.clear();
+                        self.repaint = true;
+                    }
                     true => self.screen.scroll(isize::MAX),
                     false => self.screen.latest(),
                 }

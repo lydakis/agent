@@ -294,6 +294,11 @@ impl Screen {
         self.back = back;
     }
 
+    /// The oldest rows went to make room, and those above are not drawn.
+    pub fn trimmed(&self) -> bool {
+        self.trimmed
+    }
+
     /// The view is a few screens from the first row, or nearer, and the
     /// rows above it can still be drawn: time to ask for older ones.
     pub fn near_top(&self) -> bool {
