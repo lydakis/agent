@@ -497,9 +497,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`resolve_task`, `show_agent` and
+`resolve_task`, `subscriptions`, `show_agent` and
 `run_in_pane`; a lead's own, which its tasks don't take, are `start_task`,
-`remove_task`, `new_project` and `subscriptions`. The daemon shows them to
+`remove_task` and `new_project`. The daemon shows them to
 the model and records each call: `react`, `ask`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
 those, running each call in the calling agent's folder, so they work with
