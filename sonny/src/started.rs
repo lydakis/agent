@@ -22,25 +22,6 @@ pub struct Task {
     pub state: String,
 }
 
-/// How tasks started are drawn. A prototype picks one by
-/// `SONNY_TASKS=cards`; the roster is the default.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Style {
-    /// One row each under a header that counts them.
-    Roster,
-    /// A box each, its state in the corner.
-    Cards,
-}
-
-impl Style {
-    pub fn chosen() -> Self {
-        match std::env::var("SONNY_TASKS").as_deref() {
-            Ok("cards") => Style::Cards,
-            _ => Style::Roster,
-        }
-    }
-}
-
 /// What a task is doing, from its newest turn as `turns` lists it.
 pub fn state(turn: &Value) -> String {
     match turn["status"].as_str() {
@@ -81,17 +62,10 @@ fn first(brief: &str) -> &str {
 }
 
 /// The rows of `tasks` started together, `width` wide, each with the
-/// task a click on it opens, if any.
-pub fn draw(style: Style, tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
-    match style {
-        Style::Roster => roster(tasks, width),
-        Style::Cards => cards(tasks, width),
-    }
-}
-
-/// `◆ Started 3 tasks`, then a row for each: its state's mark, its name,
-/// what it is doing, and its brief cut to fit.
-fn roster(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
+/// task a click on it opens, if any: `◆ Started 3 tasks`, then a row for
+/// each with its state's mark, its name, what it is doing, and its brief
+/// cut to fit.
+pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
     let count = match tasks.len() {
         1 => "1 task".to_owned(),
         n => format!("{n} tasks"),
@@ -119,53 +93,6 @@ fn roster(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
                 Span::raw(format!("{:<states$}", task.state)).dim(),
                 Span::raw("  "),
                 Span::raw(cut(first(&task.brief), room)),
-            ]),
-            Some(at),
-        ));
-    }
-    out
-}
-
-/// A box for each task: its name and state on the top edge, its brief
-/// inside, `open ›` on the bottom edge.
-fn cards(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
-    let width = width.clamp(24, 72);
-    let inner = width - 4;
-    let mut out = Vec::new();
-    for (at, task) in tasks.iter().enumerate() {
-        let state = format!(" {} ", task.state);
-        let name = format!(" {} ", task.name);
-        let rule = width.saturating_sub(6 + name.width() + state.width());
-        out.push((
-            Line::from(vec![
-                Span::raw("╭─").fg(Color::Magenta),
-                Span::raw(name).bold(),
-                Span::raw("─".repeat(rule)).fg(Color::Magenta),
-                Span::raw(" "),
-                sign(&task.state),
-                Span::raw(state).dim(),
-                Span::raw("─╮").fg(Color::Magenta),
-            ]),
-            Some(at),
-        ));
-        let brief = cut(first(&task.brief), inner);
-        let pad = inner.saturating_sub(brief.width());
-        out.push((
-            Line::from(vec![
-                Span::raw("│ ").fg(Color::Magenta),
-                Span::raw(brief),
-                Span::raw(" ".repeat(pad)),
-                Span::raw(" │").fg(Color::Magenta),
-            ]),
-            Some(at),
-        ));
-        let open = " open › ";
-        out.push((
-            Line::from(vec![
-                Span::raw("╰".to_owned() + &"─".repeat(width - 3 - open.width()))
-                    .fg(Color::Magenta),
-                Span::raw(open).dim(),
-                Span::raw("─╯").fg(Color::Magenta),
             ]),
             Some(at),
         ));
@@ -211,30 +138,17 @@ mod tests {
             task("divide", "Fix division by zero", "done"),
         ];
         assert_eq!(
-            texts(roster(&tasks, 60)),
+            texts(draw(&tasks, 60)),
             [
                 "◆ Started 2 tasks · click one to open it",
                 "  ● add     working  Fix the add bug: 2+2 returns 5",
                 "  ✓ divide  done     Fix division by zero",
             ]
         );
-        let rows = roster(&tasks, 60);
+        let rows = draw(&tasks, 60);
         assert_eq!(
             rows.iter().map(|(_, at)| *at).collect::<Vec<_>>(),
             [None, Some(0), Some(1)]
-        );
-    }
-
-    #[test]
-    fn a_card_boxes_the_task_with_its_state_on_top() {
-        let rows = texts(cards(&[task("add", "Fix the add bug", "needs you")], 40));
-        assert_eq!(
-            rows,
-            [
-                "╭─ add ────────────────── ● needs you ─╮",
-                "│ Fix the add bug                      │",
-                "╰───────────────────────────── open › ─╯",
-            ]
         );
     }
 }

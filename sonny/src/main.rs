@@ -1510,11 +1510,10 @@ struct App {
     relayed: HashMap<i64, Relayed>,
     /// The tasks the lead started, by the group they were started in; the
     /// group the last went into, with the rows drawn by then, as a fold
-    /// has; how they are drawn; and when what they do was last read, or
+    /// has; and when what they do was last read, or
     /// none for all of them to be read now.
     tasks: Vec<Vec<started::Task>>,
     starting: Option<(usize, usize)>,
-    task_style: started::Style,
     tasks_read: Option<Instant>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
@@ -2119,7 +2118,6 @@ impl App {
             relayed: HashMap::new(),
             tasks: Vec::new(),
             starting: None,
-            task_style: started::Style::chosen(),
             tasks_read: None,
             tasks_width: 0,
             pressed: None,
@@ -2841,7 +2839,7 @@ impl App {
     /// on them that open each.
     fn started_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
         let tasks = &self.tasks[at];
-        let rows = started::draw(self.task_style, tasks, self.prose());
+        let rows = started::draw(tasks, self.prose());
         let mut marks = Vec::new();
         let lines = (rows.into_iter().enumerate())
             .map(|(line, (row, task))| {
@@ -8188,7 +8186,6 @@ mod tests {
         .await;
         let mut app = app(client);
         app.width = 80;
-        app.task_style = started::Style::Roster;
         let start = |app: &mut App, name: &str| {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
             let output = format!("turn:calc.{name}/1");
