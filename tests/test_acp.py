@@ -144,6 +144,7 @@ class AcpTests(ModelFixture):
         self.assertEqual(initialized['result']['protocolVersion'], 2)
         self.assertEqual(initialized['result']['agentInfo']['name'], 'sonny')
         opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(cwd), 'mcpServers': []}))
+        self.opened = opened
         return thread, opened['result']['sessionId']
 
     @staticmethod
@@ -260,6 +261,43 @@ class AcpTests(ModelFixture):
         [said] = [u for u in updates if u['sessionUpdate'] == 'user_message']
         self.assertEqual(said['content'], [{'type': 'text', 'text': 'fix finished'}])
         self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
+
+    def test_the_model_picked_in_the_thread_is_the_leads(self):
+        repo = self.repo()
+        (self.path / '.agent').mkdir(exist_ok=True)
+        (self.path / '.agent' / 'models').write_text(
+            'openai/synthetic-model\nopenai/other-model # faster\nanthropic/claude-x\n')
+        self.model.models = ('synthetic-model', 'other-model')
+        thread, session = self.open(repo)
+        [option] = self.opened['result']['configOptions']
+        self.assertEqual((option['configId'], option['category'], option['currentValue']),
+                         ('model', 'model', 'default'))
+        self.assertEqual([c['value'] for c in option['options']],
+                         ['default', 'openai/synthetic-model', 'openai/other-model', 'anthropic/claude-x'])
+        self.assertEqual(option['options'][2]['description'], 'faster')
+        # Picked before there is a lead: the lead Sonny makes runs it.
+        picked, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'openai/other-model'}))
+        self.assertEqual(picked['result']['configOptions'][0]['currentValue'], 'openai/other-model')
+        answered, updates = thread.answer_of(thread.ask('session/prompt', {'sessionId': session,
+                                                                            'prompt': self.wrapped('hello')}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        lead = self.daemon.request('inspect', bot='calc.lead')['result']
+        self.assertEqual((lead['provider'], lead['model']), ('openai', 'other-model'))
+        # A lead's thread offers its family's models only.
+        [shown] = [u for u in updates if u['sessionUpdate'] == 'config_option_update']
+        [option] = shown['configOptions']
+        self.assertEqual(option['currentValue'], 'openai/other-model')
+        self.assertEqual([c['value'] for c in option['options']],
+                         ['default', 'openai/synthetic-model', 'openai/other-model'])
+        refused, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'anthropic/claude-x'}))
+        self.assertEqual(refused['error']['code'], -32602)
+        # Picked while the lead is idle: it runs it at once.
+        switched, updates = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'openai/synthetic-model'}))
+        self.assertEqual(switched['result']['configOptions'][0]['currentValue'], 'openai/synthetic-model')
+        self.assertEqual(self.daemon.request('inspect', bot='calc.lead')['result']['model'], 'synthetic-model')
 
     def test_a_thread_sonny_does_not_know_does_not_come_back(self):
         repo = self.repo()
