@@ -315,7 +315,7 @@ pub struct Goals {
     continued: HashSet<String>,
     /// Agents whose goal's check runs: a turn that ends meanwhile is
     /// plain news, and the check's own turn is checked in its place.
-    checking: HashSet<String>,
+    checking: HashMap<String, tokio::task::AbortHandle>,
     /// Turns in a row the goal started that called no tool.
     idle: HashMap<String, (u64, u32)>,
 }
@@ -328,7 +328,7 @@ impl Goals {
             goals: all(store),
             called: HashSet::new(),
             continued: HashSet::new(),
-            checking: HashSet::new(),
+            checking: HashMap::new(),
             idle: HashMap::new(),
         }
     }
@@ -338,9 +338,12 @@ impl Goals {
         self.checking.remove(bot);
     }
 
-    /// Checks under way answer a connection since dropped, never the next.
+    /// Checks under way answer a connection since dropped, never the next:
+    /// they stop, and the replay runs them again.
     pub fn reconnected(&mut self) {
-        self.checking.clear();
+        for (_, check) in self.checking.drain() {
+            check.abort();
+        }
     }
 
     pub fn reread(&mut self) {
@@ -402,7 +405,7 @@ impl Goals {
                     self.goals.remove(bot);
                     return None;
                 }
-                if self.checking.contains(bot) {
+                if self.checking.contains_key(bot) {
                     return None;
                 }
                 // An interrupted or failed turn pauses it: the next turn
@@ -427,11 +430,12 @@ impl Goals {
                 );
                 let held = (bot.to_owned(), turn);
                 let bot = bot.to_owned();
-                self.checking.insert(bot.clone());
-                tokio::spawn(async move {
+                let checking = bot.clone();
+                let pursuit = tokio::spawn(async move {
                     let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
                     let _ = done.send(Settled { bot, turn, outcome }).await;
                 });
+                self.checking.insert(checking, pursuit.abort_handle());
                 Some(held)
             }
             _ => None,
