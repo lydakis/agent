@@ -3,7 +3,10 @@
 //!
 //! The cursor moves, and rows break, between graphemes: what the terminal
 //! draws as one character, such as an emoji made of several.
-use std::ops::Deref;
+//!
+//! The full screen selects text with the mouse, as Codex's composer does:
+//! typing replaces the selection, and the deletions take it out.
+use std::ops::{Deref, Range};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -21,6 +24,8 @@ pub struct Prompt {
     goal: Option<usize>,
     /// What the last word or line deletion took, for Ctrl-Y to put back.
     killed: String,
+    /// Where a selection began; it runs to the cursor.
+    anchor: Option<usize>,
 }
 
 /// One drawn row: the bytes of the text it shows.
@@ -40,6 +45,7 @@ impl Deref for Prompt {
 impl Prompt {
     pub fn clear(&mut self) {
         self.goal = None;
+        self.anchor = None;
         self.text.clear();
         self.at = 0;
     }
@@ -47,12 +53,70 @@ impl Prompt {
     /// Replace the text, with the cursor at its end.
     pub fn set(&mut self, text: &str) {
         self.goal = None;
+        self.anchor = None;
         self.text = text.to_owned();
         self.at = self.text.len();
     }
 
+    /// The selected bytes, when any are.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        let range = anchor.min(self.at)..anchor.max(self.at);
+        (!range.is_empty()).then_some(range)
+    }
+
+    /// Select from `anchor` to `at`, the cursor's end; both are put on
+    /// grapheme boundaries.
+    pub fn select(&mut self, anchor: usize, at: usize) {
+        self.goal = None;
+        self.at = anchor.min(self.text.len());
+        self.settle();
+        let anchor = self.at;
+        self.at = at.min(self.text.len());
+        self.settle();
+        self.anchor = Some(anchor);
+    }
+
+    /// Let go of the selection; whether there was one.
+    pub fn unselect(&mut self) -> bool {
+        let had = self.selection().is_some();
+        self.anchor = None;
+        had
+    }
+
+    /// Take the selection out, the cursor where it began; whether there
+    /// was one.
+    fn cut(&mut self) -> bool {
+        let Some(range) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.anchor = None;
+        self.at = range.start;
+        self.text.drain(range);
+        self.settle();
+        true
+    }
+
+    /// Kill the selection, kept for Ctrl-Y; whether there was one.
+    fn kill_selection(&mut self) -> bool {
+        match self.selection() {
+            Some(range) => {
+                self.anchor = None;
+                self.kill(range);
+                true
+            }
+            None => {
+                self.anchor = None;
+                false
+            }
+        }
+    }
+
+    /// Typing over a selection replaces it.
     pub fn insert(&mut self, text: &str) {
         self.goal = None;
+        self.cut();
         self.text.insert_str(self.at, text);
         self.at += text.len();
         self.settle();
@@ -60,6 +124,9 @@ impl Prompt {
 
     pub fn backspace(&mut self) {
         self.goal = None;
+        if self.cut() {
+            return;
+        }
         let start = self.before(self.at);
         self.text.drain(start..self.at);
         self.at = start;
@@ -68,24 +135,38 @@ impl Prompt {
 
     pub fn delete(&mut self) {
         self.goal = None;
+        if self.cut() {
+            return;
+        }
         let end = self.after(self.at);
         self.text.drain(self.at..end);
         self.settle();
     }
 
+    /// Left from a selection goes to its start.
     pub fn left(&mut self) {
         self.goal = None;
-        self.at = self.before(self.at);
+        self.at = match self.selection() {
+            Some(range) => range.start,
+            None => self.before(self.at),
+        };
+        self.anchor = None;
     }
 
+    /// Right from a selection goes to its end.
     pub fn right(&mut self) {
         self.goal = None;
-        self.at = self.after(self.at);
+        self.at = match self.selection() {
+            Some(range) => range.end,
+            None => self.after(self.at),
+        };
+        self.anchor = None;
     }
 
     /// The start of the cursor's line.
     pub fn home(&mut self) {
         self.goal = None;
+        self.anchor = None;
         self.at = self.line_start();
         self.settle();
     }
@@ -93,17 +174,20 @@ impl Prompt {
     /// The end of the cursor's line.
     pub fn end(&mut self) {
         self.goal = None;
+        self.anchor = None;
         self.at = self.line_end();
     }
 
     pub fn word_left(&mut self) {
         self.goal = None;
+        self.anchor = None;
         self.at = self.word_start();
         self.settle();
     }
 
     pub fn word_right(&mut self) {
         self.goal = None;
+        self.anchor = None;
         let rest = &self.text[self.at..];
         let spaces = rest.len() - rest.trim_start().len();
         let word = rest[spaces..]
@@ -116,6 +200,9 @@ impl Prompt {
     /// Delete back to the start of the word before the cursor.
     pub fn delete_word(&mut self) {
         self.goal = None;
+        if self.kill_selection() {
+            return;
+        }
         let start = self.word_start();
         self.kill(start..self.at);
     }
@@ -123,6 +210,9 @@ impl Prompt {
     /// Delete to the end of the word after the cursor.
     pub fn delete_word_forward(&mut self) {
         self.goal = None;
+        if self.kill_selection() {
+            return;
+        }
         let start = self.at;
         self.word_right();
         self.kill(start..self.at);
@@ -154,6 +244,9 @@ impl Prompt {
     /// cursor when it is already there.
     pub fn delete_to_start(&mut self) {
         self.goal = None;
+        if self.kill_selection() {
+            return;
+        }
         let start = match self.line_start() {
             start if start == self.at => self.before(self.at),
             start => start,
@@ -165,6 +258,9 @@ impl Prompt {
     /// when it is already there.
     pub fn delete_to_end(&mut self) {
         self.goal = None;
+        if self.kill_selection() {
+            return;
+        }
         let end = match self.line_end() {
             end if end == self.at => self.after(self.at),
             end => end,
@@ -195,6 +291,7 @@ impl Prompt {
     }
 
     fn vertical(&mut self, width: usize, down: bool) -> bool {
+        self.anchor = None;
         let rows = self.layout(width);
         let (row, col) = self.cursor(&rows);
         let col = *self.goal.get_or_insert(col);
@@ -203,9 +300,15 @@ impl Prompt {
             false if row > 0 => row - 1,
             _ => return false,
         };
-        let Row { start, end } = rows[target];
-        // The last column at or before the cursor's, but never past the
-        // row's end, where the next row starts.
+        self.at = self.spot(&rows[target], col);
+        true
+    }
+
+    /// Where a drawn `row` has column `col`, the lead counted.
+    pub fn spot(&self, row: &Row, col: usize) -> usize {
+        let Row { start, end } = *row;
+        // The last column at or before `col`, but never past the row's
+        // end, where the next row starts.
         let mut at = start;
         let mut cols = LEAD;
         for (i, g) in self.text[start..end].grapheme_indices(true) {
@@ -219,8 +322,32 @@ impl Prompt {
         if at == end && end < self.text.len() && !self.text[end..].starts_with('\n') {
             at = self.before(end);
         }
-        self.at = at.max(start);
-        true
+        at.max(start)
+    }
+
+    /// The word at `at`, or the spaces there, for a double click.
+    pub fn word_at(&self, at: usize) -> Range<usize> {
+        let space = |c: char| c.is_whitespace();
+        let on_space = self.text[at..].chars().next().is_some_and(space);
+        let start = self.text[..at]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| space(c) != on_space || c == '\n')
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = self.text[at..]
+            .char_indices()
+            .find(|&(_, c)| space(c) != on_space || c == '\n')
+            .map_or(self.text.len(), |(i, _)| at + i);
+        start..end
+    }
+
+    /// The line at `at`, for a triple click.
+    pub fn line_at(&self, at: usize) -> Range<usize> {
+        let start = self.text[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |i| at + i);
+        start..end
     }
 
     /// The text as the composer draws it at `width`: each line wrapped at
@@ -472,6 +599,65 @@ mod tests {
         let rows = prompt.layout(13);
         assert_eq!(rows.len(), 2);
         assert_eq!(prompt.cursor(&rows), (1, LEAD + 6));
+    }
+
+    #[test]
+    fn typing_and_deleting_take_the_selection() {
+        let mut prompt = typed("one two three");
+        prompt.select(4, 7);
+        assert_eq!(prompt.selection(), Some(4..7));
+        prompt.backspace();
+        assert_eq!(&*prompt, "one  three");
+        assert_eq!((prompt.at, prompt.selection()), (4, None));
+        // Selected backwards, the cursor at its start.
+        prompt.select(10, 5);
+        prompt.delete();
+        assert_eq!(&*prompt, "one  ");
+        prompt.select(0, 3);
+        prompt.insert("1");
+        assert_eq!(&*prompt, "1  ");
+        // A word or line deletion takes the selection, for Ctrl-Y.
+        let mut prompt = typed("keep cut keep");
+        prompt.select(5, 9);
+        prompt.delete_word();
+        assert_eq!(&*prompt, "keep keep");
+        prompt.end();
+        prompt.yank();
+        assert_eq!(&*prompt, "keep keepcut ");
+    }
+
+    #[test]
+    fn moving_lets_go_of_the_selection() {
+        let mut prompt = typed("one two three");
+        prompt.select(4, 7);
+        prompt.left();
+        assert_eq!((prompt.at, prompt.selection()), (4, None));
+        prompt.select(7, 4);
+        prompt.right();
+        assert_eq!((prompt.at, prompt.selection()), (7, None));
+        prompt.select(4, 7);
+        prompt.home();
+        prompt.backspace();
+        assert_eq!(&*prompt, "one two three");
+        prompt.select(4, 7);
+        assert!(prompt.unselect());
+        assert!(!prompt.unselect());
+    }
+
+    #[test]
+    fn clicks_find_their_spot_word_and_line() {
+        let prompt = typed("alpha beta gamma\nd");
+        let rows = prompt.layout(14);
+        // Past a wrapped row's end: its last character, not the next row.
+        assert_eq!(prompt.spot(&rows[0], 40), "alpha beta".len());
+        assert_eq!(prompt.spot(&rows[1], LEAD + 2), "alpha beta ga".len());
+        assert_eq!(prompt.spot(&rows[1], 0), "alpha beta ".len());
+        assert_eq!(prompt.spot(&rows[2], 40), prompt.len());
+        assert_eq!(prompt.word_at(7), 6..10);
+        assert_eq!(prompt.word_at(5), 5..6);
+        assert_eq!(prompt.word_at(12), 11..16);
+        assert_eq!(prompt.line_at(7), 0..16);
+        assert_eq!(prompt.line_at(17), 17..18);
     }
 
     #[test]
