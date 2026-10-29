@@ -1375,10 +1375,7 @@ async fn setup_lead(
     let mut gating = lead.new.then_some(approvals::MODES[0].0);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(
-            &record,
-            &approvals::sandbox(mode, Path::new(&workspace)),
-        )
+        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
     {
         gating = Some(mode);
     }
