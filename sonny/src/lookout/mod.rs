@@ -1488,12 +1488,12 @@ impl Service {
                     {
                         let mut record = event["data"].clone();
                         record["name"] = json!(name);
-                        // The same bot as listed now is where it is now, not
-                        // where the replay says it was made.
-                        let listed = (self.records.get(name))
-                            .filter(|had| had["bot_id"].is_i64() && had["bot_id"] == record["bot_id"]);
-                        if let Some(listed) = listed {
-                            record = listed.clone();
+                        // The same bot as listed now is in the folder it is in
+                        // now, not where the replay says it was made.
+                        if let Some(listed) = (self.records.get(name))
+                            .filter(|had| had["bot_id"].is_i64() && had["bot_id"] == record["bot_id"])
+                        {
+                            record["workspace"] = listed["workspace"].clone();
                         }
                         self.records.insert(name.to_owned(), record.clone());
                         // A project's lead made below a subscriber's folder.
