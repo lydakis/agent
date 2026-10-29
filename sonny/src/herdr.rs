@@ -284,7 +284,7 @@ pub struct Herdr {
 
 /// A word as a POSIX shell reads it back, for `pane run`, which types its
 /// command into the pane's shell.
-fn quote(word: &str) -> String {
+pub(crate) fn quote(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .bytes()

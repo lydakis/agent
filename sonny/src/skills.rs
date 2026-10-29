@@ -3,15 +3,6 @@
 //! edit them, and the scripts in `~/.agent` they run.
 use std::path::{Path, PathBuf};
 
-/// The `errand` skill, for every agent, when Errand is installed.
-pub fn install_errand() {
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("errand").is_file()));
-    if on_path {
-        install("errand", include_str!("../skills/errand/SKILL.md"));
-    }
-}
-
 /// What every agent of Sonny's leans on: the lead's and tasks' roles, the
 /// memory, plan and automation skills, the nightly cleanup's, and
 /// `~/.agent/memory` and `~/.agent/trigger`, which run this Sonny. Written
@@ -356,18 +347,18 @@ mod tests {
         remove_in(&home, "plan");
         assert_eq!(read(), "mine");
         // A skill of the person's own of that name, which Sonny never wrote, too.
-        let theirs = home.join(".agents/skills/errand/SKILL.md");
+        let theirs = home.join(".agents/skills/notes/SKILL.md");
         std::fs::create_dir_all(theirs.parent().unwrap()).unwrap();
         std::fs::write(&theirs, "theirs").unwrap();
-        assert!(install_in(&home, "errand", &files("sonny's")).is_none());
+        assert!(install_in(&home, "notes", &files("sonny's")).is_none());
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
-        remove_in(&home, "errand");
+        remove_in(&home, "notes");
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
         // Once it is gone, Sonny's is written, and an unedited one goes on a remove.
         std::fs::remove_dir_all(theirs.parent().unwrap()).unwrap();
-        assert!(install_in(&home, "errand", &files("sonny's")).is_some());
+        assert!(install_in(&home, "notes", &files("sonny's")).is_some());
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "sonny's");
-        remove_in(&home, "errand");
+        remove_in(&home, "notes");
         assert!(!theirs.exists());
         let _ = std::fs::remove_dir_all(&home);
     }

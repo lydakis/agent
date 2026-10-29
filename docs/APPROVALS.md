@@ -603,9 +603,9 @@ so only one instance runs at a time, and answers in layers:
    without its gates, or touching the daemon's database or socket directly
    rather than through `agent` or the scripts under `~/.agent`? Listing
    approvals, managing the bot's own triggers, plan and memory, and task
-   folders (worktrees under `~/.agent/worktrees`, sandfs copies under
-   `~/.agent/tasks`) do not count. The earlier wording ("store") denied
-   every call under `~/.agent`, so no bot could save memory in `auto`,
+   folders (worktrees under `~/.agent/worktrees`) do not count. The
+   earlier wording ("store") denied every call under `~/.agent`, so no
+   bot could save memory in `auto`,
    and the 2026-10-26 graft session was denied `agent approvals`, its own
    `trigger rm` and `plan --clear`, all of which the shipped role text and
    skills prescribe. A high answer is denied whatever the prompt says.

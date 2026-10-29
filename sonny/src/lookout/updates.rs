@@ -165,6 +165,11 @@ pub struct Updates {
     /// The bots whose news this is, as the lookout's subscriptions with
     /// task updates name them.
     pub watched: HashSet<String>,
+    /// The bots a subscription with task updates names as they are:
+    /// subscribers of their own among them are tasks here too.
+    pub named: HashSet<String>,
+    /// Turns a lookout's note started in one of those: its own work, no news.
+    noted: HashSet<Key>,
     pub live: bool,
     bots: HashMap<String, Bot>,
     from: HashMap<Key, String>,
@@ -228,6 +233,8 @@ impl Updates {
             memory,
             subscribers: HashSet::new(),
             watched: HashSet::new(),
+            named: HashSet::new(),
+            noted: HashSet::new(),
             live: false,
             bots: HashMap::new(),
             from: HashMap::new(),
@@ -324,6 +331,9 @@ impl Updates {
             }
             "accepted" | "queued" => {
                 let Some(turn) = turn else { return };
+                if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
+                    self.noted.insert(key(turn));
+                }
                 if let Some(by) = data["from"]["bot"].as_str() {
                     self.from.insert(key(turn), by.to_owned());
                     // The answer a trigger was to pass on, passed on.
@@ -406,6 +416,7 @@ impl Updates {
                 let from = self.from.remove(&key(turn));
                 let origin = self.origin.remove(&key(turn));
                 let answered = self.answer_to.remove(&key(turn));
+                let noted = self.noted.remove(&key(turn));
                 if let Some(bot) = self.bots.get_mut(name)
                     && bot.running.is_none_or(|running| running == turn)
                 {
@@ -420,7 +431,7 @@ impl Updates {
                     self.resolving.ended(name, turn);
                 }
                 // A steer's turn is part of the turn it joined.
-                if !self.live || status == "steered" {
+                if !self.live || status == "steered" || noted {
                     return;
                 }
                 let creator = self
@@ -480,10 +491,10 @@ impl Updates {
 
     /// Whether the bot is one of the lead's tasks: one a subscription with
     /// task updates watches, not a fork of the lead nor a subscriber of its
-    /// own.
+    /// own, unless a subscription names it.
     fn task(&self, name: &str) -> bool {
         self.watched.contains(name)
-            && !self.subscribers.contains(name)
+            && (!self.subscribers.contains(name) || self.named.contains(name))
             && !name.starts_with(&format!("{}-", self.lead))
     }
 
@@ -842,6 +853,7 @@ impl Updates {
     /// them is no longer.
     pub fn subscribed(&mut self, subscribers: HashSet<String>) {
         let new: Vec<String> = (subscribers.difference(&self.subscribers))
+            .filter(|name| !self.named.contains(*name))
             .cloned()
             .collect();
         for name in new {
@@ -864,6 +876,7 @@ impl Updates {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.approvals.retain(|(task, _), _| task != name);
+        self.noted.retain(|(task, _)| task != name);
     }
 
     /// What was saved to or removed from the person's and the project's

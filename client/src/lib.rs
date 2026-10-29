@@ -85,16 +85,29 @@ pub fn default_tools(
         Some("responses") => "apply_patch",
         _ => "edit",
     };
-    let mut tools = vec!["shell", "read", "write", editor, "wait", "history"];
-    if search == config::WebSearch::Live && providers[provider]["web_search"] == true {
-        tools.push("web_search");
+    let mut tools = vec![
+        "shell",
+        "write_stdin",
+        "read",
+        "write",
+        editor,
+        "wait",
+        "history",
+    ];
+    if search == config::WebSearch::Live {
+        // Search is the provider's to offer; the daemon fetches a page
+        // for any.
+        if providers[provider]["web_search"] == true {
+            tools.push("web_search");
+        }
+        tools.push("web_fetch");
     }
     tools
 }
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 21;
+pub const PROTOCOL: u64 = 22;
 
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
@@ -403,19 +416,31 @@ mod tests {
         let live = config::WebSearch::Live;
         assert_eq!(
             default_tools(&providers, "chatgpt/gpt-6-sol", live),
-            ["shell", "read", "write", "apply_patch", "wait", "history"]
+            [
+                "shell",
+                "write_stdin",
+                "read",
+                "write",
+                "apply_patch",
+                "wait",
+                "history",
+                "web_fetch"
+            ]
         );
-        // Search comes where the provider offers it, unless turned off.
+        // Search comes where the provider offers it, and fetch everywhere,
+        // unless turned off.
         assert_eq!(
             default_tools(&providers, "anthropic/claude-opus-5-5", live),
             [
                 "shell",
+                "write_stdin",
                 "read",
                 "write",
                 "edit",
                 "wait",
                 "history",
-                "web_search"
+                "web_search",
+                "web_fetch"
             ]
         );
         let off = default_tools(
@@ -423,8 +448,8 @@ mod tests {
             "anthropic/claude-opus-5-5",
             config::WebSearch::Disabled,
         );
-        assert!(!off.contains(&"web_search"));
-        assert_eq!(default_tools(&providers, "unknown/model", live)[3], "edit");
+        assert!(!off.contains(&"web_search") && !off.contains(&"web_fetch"));
+        assert_eq!(default_tools(&providers, "unknown/model", live)[4], "edit");
     }
 
     #[tokio::test]

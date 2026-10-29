@@ -78,7 +78,7 @@ pub struct ToolSchema {
     /// A Lark grammar its input follows. On Responses such a tool is a
     /// custom tool whose call is the free-form text itself; elsewhere a
     /// function taking that text as `input`.
-    pub grammar: Option<&'static str>,
+    pub grammar: Option<std::borrow::Cow<'static, str>>,
 }
 
 impl Family {
@@ -152,10 +152,22 @@ impl Family {
     /// A person's words and the pictures sent with them, the words first
     /// so `content[0].text` reads them.
     pub fn user_item_with(self, text: &str, images: &[Image]) -> Result<Vec<u8>> {
-        let mut content = vec![match self {
+        self.user_item_from(text, None, images)
+    }
+    /// A prompt's words, then the line saying who sent it when no person
+    /// did, then its pictures.
+    pub fn user_item_from(
+        self,
+        text: &str,
+        sender: Option<&str>,
+        images: &[Image],
+    ) -> Result<Vec<u8>> {
+        let part = |text: &str| match self {
             Family::Responses => json!({"type":"input_text","text":text}),
             Family::Anthropic => json!({"type":"text","text":text}),
-        }];
+        };
+        let mut content = vec![part(text)];
+        content.extend(sender.map(part));
         content.extend(images.iter().map(|image| self.image(image)));
         Ok(serde_json::to_vec(
             &json!({"role":"user","content":content}),
@@ -209,7 +221,7 @@ impl Family {
         let encoded: Vec<Value> = tools
             .iter()
             .map(|tool| match self {
-                Family::Responses if let Some(grammar) = tool.grammar => json!({"type":"custom",
+                Family::Responses if let Some(grammar) = &tool.grammar => json!({"type":"custom",
                     "name":tool.name,"description":tool.description,
                     "format":{"type":"grammar","syntax":"lark","definition":grammar}}),
                 Family::Responses => json!({"type":"function","name":tool.name,
@@ -539,7 +551,7 @@ mod tests {
             name: "apply_patch".into(),
             description: "d".into(),
             parameters: json!({"type":"object","properties":{"input":{"type":"string"}}}),
-            grammar: Some("start: \"x\""),
+            grammar: Some("start: \"x\"".into()),
         };
         let declared = Family::Responses.tools(std::slice::from_ref(&patch));
         assert_eq!(declared[0]["type"], "custom");

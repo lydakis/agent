@@ -41,7 +41,11 @@ be told again.
 ## What it tells
 
 What a lead's `tasks` subscription watches is every bot it or one of its
-tasks made, and every bot named `PROJECT.*`. Two kinds of event count:
+tasks made, and every bot named `PROJECT.*`. Another lead, which has
+subscriptions of its own, is heard only by a subscription that names it
+as it is, with no `*`, as the person asks a lead to watch another: then
+it is a task here in all but what it makes, which stays its own, and the
+turns its own lookout's notes start. Two kinds of event count:
 
 | Event | When |
 | --- | --- |

@@ -30,14 +30,16 @@ pub const PROJECT: &str = "new_project";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const TRIGGERS: &str = "triggers";
 pub const MEMORY: &str = "memory";
+pub const EXEC: &str = crate::exec::NAME;
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
 /// lead, outside the agent's sandbox as a pane's command is, a removal can
 /// drop work, a subscription sends other bots' words to the subscriber's
-/// judge, and a trigger is a job that runs as the person, its `if`
-/// command outside any sandbox.
-pub const GATED: [&str; 6] = [START, REMOVE, PROJECT, SUBSCRIPTIONS, RUN, TRIGGERS];
+/// judge, a trigger is a job that runs as the person, its `if`
+/// command outside any sandbox, and a script calls MCP servers, which run
+/// as the person too.
+pub const GATED: [&str; 7] = [START, REMOVE, PROJECT, SUBSCRIPTIONS, RUN, TRIGGERS, EXEC];
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.
@@ -51,30 +53,27 @@ const SPLIT: [&str; 4] = crate::mux::SIDES;
 
 /// Sonny's answered tools, as it declares them on a lead, or on another
 /// bot: the lead's own, which the tasks it starts do not take, and those
-/// every agent has.
+/// every agent has, `exec` while the person has MCP servers.
 pub fn tools(lead: bool) -> Vec<Value> {
     let mut tools = Vec::new();
     if lead {
         tools.extend([start(), remove(), project(), subscriptions()]);
     }
     tools.extend([show(), run(), triggers(), memory()]);
+    tools.extend(crate::exec::tool());
     tools
 }
 
 fn start() -> Value {
     json!({
         "name": START,
-        "description": "Start a new task. Sonny makes the task's folder the way the person set Sonny up, unless \
-            this project's tasks all work in this folder: a git worktree of this repository on the branch \
-            agent/NAME, from the last commit, or a sandfs copy, which takes uncommitted changes along and works \
-            outside git too. With setup, the folder's .agents/setup runs in the copy first. The task starts there \
-            with this folder's rules, skills and memory, in the role named, and the brief as its first message. \
-            Paths in this folder that the brief names are turned into the task's own. The result is the task's \
-            turn handle, and how its work comes back here: on its branch, here already for a worktree; with \
-            the git push it names for a sandfs copy of a repository; or for a sandfs copy of another folder, with \
-            `task changes`, which lists what the task changed and with --apply writes it here once you have checked \
-            it. Take a task's work back only that way: never copy its files here yourself (cp, a redirect, tee), \
-            which can write zeros over the files here. A start that fails leaves no folder behind.",
+        "description": "Start a new task. Unless this project's tasks all work in this folder, Sonny makes the \
+            task a git worktree of this repository on the branch agent/NAME, from the last commit, so uncommitted \
+            changes here are not in it; outside git, the task works in this folder. With setup, the folder's \
+            .agents/setup runs in the worktree first. The task starts there with this folder's rules, skills and \
+            memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
+            names are turned into the task's own. The result is the task's turn handle; its work comes back on \
+            its branch, here already as it commits. A start that fails leaves no folder behind.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -109,9 +108,9 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it. A worktree is removed, and its branch kept while it has commits not merged here; a sandfs copy \
-            is unmounted and removed. It refuses, before removing anything, while the task is working or its \
-            folder holds work that is not here yet, and says what. With discard, that work is dropped: only \
+            it. A worktree is removed, and its branch kept while it has commits not merged here. It refuses, \
+            before removing anything, while the task is working or its worktree has uncommitted changes, and \
+            says what. With discard, that work is dropped: only \
             when the person says to drop it.",
         "parameters": {
             "type": "object",
@@ -181,7 +180,8 @@ fn subscriptions() -> Value {
                         "tasks_of": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots it watches by name, * matching any run of characters."}
+                            "description": "Bots it watches by name, * matching any run of characters; \
+                                another lead, which has subscriptions of its own, counts only where named as it is."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -556,6 +556,8 @@ async fn serve(
     let Ok(me) = std::env::current_exe() else {
         return;
     };
+    // The MCP servers scripts call, kept up between calls.
+    let hub = crate::mcp::Hub::for_person();
     loop {
         if let Ok((client, _events)) = Client::connect(&socket).await {
             loop {
@@ -566,17 +568,22 @@ async fn serve(
                     let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
                     let mut jobs = serving.lock().unwrap();
                     if !jobs.contains_key(&key) {
-                        let (client, me, store, socket, serving, subscribed) = (
+                        let (client, me, store, socket, serving, subscribed, hub) = (
                             client.clone(),
                             me.clone(),
                             store.clone(),
                             socket.clone(),
                             serving.clone(),
                             subscribed.clone(),
+                            hub.clone(),
                         );
                         let held = key.clone();
                         let job = tokio::spawn(async move {
-                            let answer = answer(&client, &call, &me, &store, &socket).await;
+                            let answer = match call["name"] == EXEC {
+                                // In the lookout, where the servers stay up.
+                                true => script(&hub, &call).await,
+                                false => answer(&client, &call, &me, &store, &socket).await,
+                            };
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                                 "call_id": call["call_id"]});
                             match answer {
@@ -600,7 +607,10 @@ async fn serve(
                 }
                 tokio::select! {
                     _ = nudge.notified() => {}
-                    _ = tokio::time::sleep(SWEEP) => {}
+                    _ = tokio::time::sleep(SWEEP) => {
+                        let hub = hub.clone();
+                        tokio::spawn(async move { hub.reap(crate::mcp::IDLE).await });
+                    }
                 }
             }
         }
@@ -642,6 +652,24 @@ fn cut(mut text: String) -> String {
         text.push_str("\n[cut]");
     }
     text
+}
+
+/// An `exec` call answered here, with its script's time bounded by the
+/// call's.
+async fn script(hub: &crate::mcp::Hub, call: &Value) -> Answer {
+    let input = call["arguments"]["input"].as_str().unwrap_or_default();
+    crate::exec::answer(hub, &str_of(&call["bot"]), input, left(call))
+        .await
+        .map_err(|e| ("exec_refused", e))
+}
+
+/// The time a call has left before the daemon gives up on it.
+fn left(call: &Value) -> Duration {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let expires = call["expires_ms"].as_u64().unwrap_or(now);
+    Duration::from_millis(expires.saturating_sub(now))
 }
 
 /// One call answered by `sonny tool NAME`, run as the calling agent's shell
@@ -719,14 +747,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
             .write_all(call["arguments"].to_string().as_bytes())
             .await;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    let left = call["expires_ms"]
-        .as_u64()
-        .unwrap_or(now)
-        .saturating_sub(now);
-    let output = tokio::time::timeout(Duration::from_millis(left), child.wait_with_output())
+    let output = tokio::time::timeout(left(call), child.wait_with_output())
         .await
         .map_err(|_| ("tool_unserved", "ran out of time".to_owned()))?;
     // Answered: what it left running on purpose, as a pane's program or a
@@ -796,6 +817,7 @@ pub fn stop() {
     for group in GROUPS.lock().unwrap().take().unwrap_or_default() {
         kill(group);
     }
+    crate::mcp::kill_all();
 }
 
 /// The error codes `sonny tool` answers with, as static names.
@@ -828,8 +850,11 @@ mod tests {
 
     #[test]
     fn a_lead_answers_more_than_its_tasks_and_keeps_its_own() {
+        // `exec` comes and goes with the person's MCP servers.
         let names = |tools: Vec<Value>| -> Vec<String> {
-            tools.iter().map(|t| str_of(&t["name"])).collect()
+            (tools.iter().map(|t| str_of(&t["name"])))
+                .filter(|name| name != EXEC)
+                .collect()
         };
         assert_eq!(names(tools(false)), [SHOW, RUN, TRIGGERS, MEMORY]);
         assert_eq!(
@@ -845,7 +870,7 @@ mod tests {
                 MEMORY
             ]
         );
-        for tool in tools(true) {
+        for tool in tools(true).into_iter().filter(|t| t["name"] != EXEC) {
             assert_eq!(tool["answered_by"], TAG);
             // A lead's own are not its tasks'.
             assert_eq!(

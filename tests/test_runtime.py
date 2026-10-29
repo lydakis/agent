@@ -280,16 +280,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # inside the turn keeps at least its newest call in view. A
                 # step is a call, or a list of calls made in one round.
                 done = max((int(i['call_id'][7:].split('.')[0]) + 1 for i in request['input']
-                            if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
+                            if i.get('type') in ('function_call', 'custom_tool_call')
+                            and i['call_id'].startswith('script-')),
                            default=0)
                 text = ''
                 if done < len(self.server.call_script):
                     step = self.server.call_script[done]
                     calls = step if isinstance(step, list) else [step]
-                    output = [{'type': 'function_call', 'name': name,
-                               'call_id': f'script-{done}' + (f'.{n}' if n else ''),
-                               'arguments': json.dumps(arguments)}
-                              for n, (name, arguments) in enumerate(calls)]
+                    # Text arguments make a custom tool's call.
+                    output = [{'type': 'custom_tool_call', 'name': name, 'input': arguments}
+                              if isinstance(arguments, str) else
+                              {'type': 'function_call', 'name': name, 'arguments': json.dumps(arguments)}
+                              for name, arguments in calls]
+                    for n, item in enumerate(output):
+                        item['call_id'] = f'script-{done}' + (f'.{n}' if n else '')
                 else:
                     text = 'done'
                     output = [{'type': 'message', 'role': 'assistant',
@@ -2108,6 +2112,16 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='h9', prompt='history:9')['result']['turn']
         client.finished(turn)
         self.assertIn('turn_not_in_history', poll(client, 'Bob', turn)['result']['text'])
+        self.assertIn('or with query to search them for text', texts[3][0])
+        # A search finds text in the omitted turns, and not in the turn it
+        # runs in, whose prompt names the same text.
+        prompt = 'calls:' + json.dumps([['history', {'query': 'REPLY:P2'}]])
+        turn = client.request('submit', bot='Bob', request_id='s', prompt=prompt)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        found = json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
+        self.assertEqual([m['turn'] for m in found['matches']], [2])
+        self.assertIn('reply:p2', found['matches'][0]['text'])
+        self.assertTrue(found['done'])
         # A fork sees the same lineage and computes its own window over it.
         client.request('fork', source='Bob', bot='branch', workspace=str(self.path))
         turn = client.request('submit', bot='branch', request_id='b', prompt='history:2')['result']['turn']
@@ -2116,6 +2130,41 @@ class RuntimeTests(ModelFixture):
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
+
+    def test_a_terminal_takes_input_across_turns_and_ends_on_its_handle(self):
+        client = self.client('shell,write_stdin,wait')
+        for bot in ('Bob', 'Eve'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           tools=['shell', 'write_stdin', 'wait'])
+
+        def call(bot, request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            turn = client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, bot, turn)['result']['text'][5:])
+
+        started = call('Bob', 't1', 'shell', {'command': "read -p 'name? ' n; echo \"hi $n\"",
+                                              'tty': True, 'yield_time_ms': 1000})
+        self.assertTrue(started['running'])
+        self.assertEqual(started['output'], 'name? ')
+        handle = started['handle']
+        # Only the bot that started it types into it.
+        prompt = 'calls:' + json.dumps([['write_stdin', {'handle': handle, 'chars': 'x\n'}]])
+        turn = client.request('submit', bot='Eve', request_id='e1', prompt=prompt)['result']['turn']
+        client.finished(turn)
+        self.assertIn('terminal_not_running', poll(client, 'Eve', turn)['result']['text'])
+        # A later turn types into it, and sees it end.
+        typed = call('Bob', 't2', 'write_stdin', {'handle': handle, 'chars': 'bob\n', 'yield_time_ms': 5000})
+        self.assertEqual(typed['output'], 'bob\nhi bob\n')
+        self.assertEqual(typed['exit_code'], 0)
+        ended = call('Bob', 't3', 'wait', {'handles': [handle]})
+        self.assertEqual(ended['results'][handle]['exit_code'], 0)
+        # One still running ends with the daemon, which stops at once.
+        self.assertTrue(call('Bob', 't4', 'shell', {'command': 'sleep 600', 'tty': True,
+                                                    'yield_time_ms': 0})['running'])
+        started = time.monotonic()
+        client.close()
+        self.assertLess(time.monotonic() - started, 3)
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
         client = self.client(settings={'keep_turns': 2})
