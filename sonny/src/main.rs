@@ -15,6 +15,7 @@ mod background;
 mod banner;
 mod cache;
 mod calls;
+mod config;
 mod declared;
 mod diff;
 mod embed;
@@ -771,11 +772,17 @@ async fn run() -> Result<(), String> {
     app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
-        app.notice = Some(format!(
-            "a copy of {source} that answers without acting; {source} carries on"
-        ));
+        // One allowed no tool answers; one with its source's acts.
+        let acts = !bot["allowed"]
+            .as_array()
+            .is_some_and(|tools| tools.is_empty());
+        app.notice = Some(match acts {
+            true => format!("a copy of {source} that can do anything it can; {source} carries on"),
+            false => format!("a copy of {source} that answers without acting; {source} carries on"),
+        });
     }
-    // The person's agent can react to them; a side chat calls no tool.
+    // The person's agent can react to them; a side chat has its agent's
+    // tools, or none.
     if options.side.is_none() {
         app.declare = declared::declare(&bot, project.is_some());
     }
@@ -1237,9 +1244,9 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
-/// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 15] = [
+/// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
+/// open `/background`, and `/settings` opens `/config`, unlisted.
+const COMMANDS: [(&str, &str); 16] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1260,6 +1267,7 @@ const COMMANDS: [(&str, &str); 15] = [
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
     ),
+    ("/config", "the settings in ~/.agent/config.toml"),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/verbose",
@@ -1489,6 +1497,8 @@ struct App {
     retry: Option<Instant>,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
+    /// `/config`, open over the composer.
+    config: Option<config::View>,
     /// The model listing `/model` waits on.
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
     /// The model and effort picked, set once no turn runs.
@@ -2185,6 +2195,7 @@ impl App {
             lead: String::new(),
             retry: None,
             picker: None,
+            config: None,
             listing: None,
             switch: None,
             tools: record["tools"]
@@ -4662,6 +4673,7 @@ impl App {
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
                 && self.input.is_empty()
                 && self.picker.is_none()
+                && self.config.is_none()
                 && self.choosing.is_none()
                 && self.reacting.is_none()
             {
@@ -4700,6 +4712,7 @@ impl App {
             KeyCode::Char('f')
                 if ctrl
                     && self.picker.is_none()
+                    && self.config.is_none()
                     && self.choosing.is_none()
                     && self.reacting.is_none() =>
             {
@@ -4975,6 +4988,14 @@ impl App {
             }
             return;
         }
+        if let Some(view) = &mut self.config {
+            if let Event::Resize(width, _) = event {
+                self.width = width as usize;
+            } else if let config::Key::Close = view.event(&event) {
+                self.config = None;
+            }
+            return;
+        }
         if let Some(picker) = &mut self.picker {
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -5214,6 +5235,14 @@ impl App {
                 },
                 None => "no HTML page in this conversation yet".into(),
             });
+            return;
+        }
+        if matches!(prompt.as_str(), "/config" | "/settings") {
+            self.input.clear();
+            match config::View::open() {
+                Ok(view) => self.config = Some(view),
+                Err(error) => self.notice = Some(error),
+            }
             return;
         }
         if prompt == "/model" {
@@ -5651,26 +5680,34 @@ impl App {
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
     /// mid-turn included, and opened in a Sonny of its own on the alternate
     /// screen. The copy may call no tool, so it answers from what the bot
-    /// knows; the daemon deletes it once it has been idle a quarter hour.
-    /// This bot carries on, and its lines wait for the main screen.
+    /// knows, unless the config's `[sonny] side_chat` is `"fork"`: then it
+    /// may do anything the bot may. The daemon deletes it once it has been
+    /// idle a quarter hour. This bot carries on, and its lines wait for the
+    /// main screen.
     async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
         }
+        let tools = match agent_client::config::load() {
+            Ok(config) => config.sonny.side_chat,
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
-        let forked = self
-            .client
-            .request(
-                "fork",
-                json!({"source": self.bot, "bot": name, "allow": [],
-                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name}),
-            )
-            .await;
+        let mut fork = json!({"source": self.bot, "bot": name,
+            "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name});
+        // A fork with no list keeps its source's tools.
+        if tools == agent_client::config::SideChat::Answer {
+            fork["allow"] = json!([]);
+        }
+        let forked = self.client.request("fork", fork).await;
         let forked = match forked {
             Ok(forked) => forked,
             Err(error) => {
@@ -6008,6 +6045,11 @@ impl App {
                     let room = area.height.saturating_sub(below);
                     let column = area.width.min(PROSE as u16);
                     let rows = self.screen.height(column as usize).min(room as usize);
+                    // `/config` lists every setting over the rows above.
+                    let rows = match &self.config {
+                        Some(_) => (rows + config::SETTINGS.len()).min(room as usize),
+                        None => rows,
+                    };
                     let [history, view, _] = Layout::vertical([
                         Constraint::Length(rows as u16),
                         Constraint::Length(below),
@@ -6216,6 +6258,24 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some(view) = &self.config {
+                // Every setting where there is room, over the rows above.
+                let rows = view.rows(composer.y.saturating_sub(frame.area().y) as usize);
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(rows.len() as u16),
+                    height: rows.len() as u16,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let (line, cursor) = view.line();
+                frame.render_widget(Paragraph::new(line), composer);
+                if let Some(column) = cursor {
+                    frame.set_cursor_position((composer.x + column, composer.y));
+                }
+                frame.render_widget(Paragraph::new(view.keys()), footer);
+                return;
+            }
             if let Some(picker) = &self.picker {
                 let shown = picker.shown();
                 let at = picker.at();
@@ -6355,6 +6415,7 @@ impl App {
         let keep = match self.choosing.is_some()
             || self.approving.is_some()
             || self.picker.is_some()
+            || self.config.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
         {

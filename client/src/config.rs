@@ -15,6 +15,7 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
+//! side_chat = "fork"            # "answer", the default, calls no tool
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -62,6 +63,17 @@ pub struct Judge {
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
+    pub side_chat: SideChat,
+}
+
+/// What the copy `/side` talks to may do: `"answer"`, the default, from
+/// what its agent knows, calling no tool; or `"fork"`, anything its agent
+/// may, with its tools, in its folder, under its approvals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SideChat {
+    #[default]
+    Answer,
+    Fork,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -127,7 +139,7 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
-            "sonny" => &["lead_effort", "task_effort"],
+            "sonny" => &["lead_effort", "task_effort", "side_chat"],
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
@@ -135,6 +147,14 @@ fn parse(text: &str) -> Result<Config, String> {
                 return Err(format!("unknown key {name}.{key}"));
             }
             let value = string(&format!("{name}.{key}"), value)?;
+            if key == "side_chat" {
+                config.sonny.side_chat = match value.as_str() {
+                    "answer" => SideChat::Answer,
+                    "fork" => SideChat::Fork,
+                    other => return Err(format!("sonny.side_chat is answer or fork, not {other}")),
+                };
+                continue;
+            }
             // The daemon judges models and levels when the agents are made.
             *match (name.as_str(), key.as_str()) {
                 ("judge", "model") => &mut config.judge.model,
@@ -161,6 +181,13 @@ fn string(key: &str, value: &toml::Value) -> Result<String, String> {
 /// new one goes at the end of its table, or of the top level for a bare
 /// key. The file is written whole, and only if it still reads.
 pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
+    let pairs: Vec<(&str, Option<&str>)> = pairs.iter().map(|(k, v)| (*k, Some(*v))).collect();
+    write(path, &pairs)
+}
+
+/// As `set`, where a key with no value has its line taken out, so it is
+/// its default again; one the file does not name is left so.
+pub fn write(path: &Path, pairs: &[(&str, Option<&str>)]) -> Result<(), String> {
     let unwritable =
         |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
     read(path)?;
@@ -171,7 +198,6 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     for (key, value) in pairs {
         let (table, name) = key.split_once('.').unwrap_or(("", key));
-        let line = format!("{name} = {}", toml::Value::String((*value).to_owned()));
         let at = |line: &str| {
             line.trim_start().strip_prefix('[').map(|h| {
                 h.trim_start_matches('[')
@@ -184,10 +210,12 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         };
         // The lines of `table`: after its header, or the top level's
         // before the first header, up to the next header.
+        let header = lines.iter().position(|l| at(l).as_deref() == Some(table));
         let begin = match table {
             "" => 0,
-            _ => match lines.iter().position(|l| at(l).as_deref() == Some(table)) {
+            _ => match header {
                 Some(header) => header + 1,
+                None if value.is_none() => continue,
                 None => {
                     if lines.last().is_some_and(|l| !l.trim().is_empty()) {
                         lines.push(String::new());
@@ -205,6 +233,19 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
                 .split_once('=')
                 .is_some_and(|(k, _)| k.trim().trim_matches('"') == name)
         });
+        let Some(value) = value else {
+            if let Some(i) = named {
+                lines.remove(i);
+                // A table left with nothing in it goes too.
+                if let Some(header) = header
+                    && lines[begin..end - 1].iter().all(|l| l.trim().is_empty())
+                {
+                    lines.drain(header..end - 1);
+                }
+            }
+            continue;
+        };
+        let line = format!("{name} = {}", toml::Value::String((*value).to_owned()));
         match named {
             Some(i) => lines[i] = line,
             None => {
@@ -219,8 +260,16 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
             }
         }
     }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let before = text;
     let mut text = lines.join("\n");
     text.push('\n');
+    // Nothing changed, as a default taken out of a file without it.
+    if text == before || (before.is_empty() && lines.is_empty()) {
+        return Ok(());
+    }
     parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| unwritable(&e))?;
@@ -252,6 +301,9 @@ mod tests {
         assert_eq!(config.web_search, WebSearch::Live);
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
+        assert_eq!(config.sonny.side_chat, SideChat::Answer);
+        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
+        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
         for (text, error) in [
             (
                 "web_search = \"cached\"",
@@ -264,6 +316,10 @@ mod tests {
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
             ("[judge]\neffort = 3", "judge.effort must be a string"),
             ("[judge]\nmodel = \"\"", "judge.model must not be empty"),
+            (
+                "[sonny]\nside_chat = \"all\"",
+                "sonny.side_chat is answer or fork, not all",
+            ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
         }
@@ -309,6 +365,37 @@ mod tests {
                 .contains("unknown key colour")
         );
         assert_eq!(read(&file).unwrap(), config);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_written_with_no_value_is_its_default_again() {
+        let dir = std::env::temp_dir().join(format!("agent-config-unset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("config.toml");
+        // Nothing to take out leaves no file and no table behind.
+        write(&file, &[("judge.model", None)]).unwrap();
+        assert!(!file.exists());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &file,
+            "# mine\nmodel = \"a/b\"\n\n[judge]\neffort = \"low\"\n\n[sonny]\nlead_effort = \"low\" # cheap\nside_chat = \"fork\"\n",
+        )
+        .unwrap();
+        write(
+            &file,
+            &[
+                ("sonny.lead_effort", None),
+                ("sonny.task_effort", Some("high")),
+                ("model", None),
+                ("judge.effort", None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "# mine\n\n[sonny]\nside_chat = \"fork\"\ntask_effort = \"high\"\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
