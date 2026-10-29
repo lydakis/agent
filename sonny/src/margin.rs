@@ -286,7 +286,7 @@ impl Reference {
                 _ if self.title.is_empty() || self.removed => self.title = id.to_owned(),
                 _ => {}
             }
-            self.removed = false;
+            let recreated = std::mem::take(&mut self.removed);
             let body = match (
                 arguments["from"].as_str().and_then(from),
                 arguments["file"].as_str(),
@@ -301,6 +301,8 @@ impl Reference {
                 },
                 (_, Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
                 (.., Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
+                // Put there again with nothing in it, as its own margin does.
+                _ if recreated => Body::Markdown(String::new()),
                 // Retitled only.
                 _ => continue,
             };
@@ -333,6 +335,11 @@ impl Reference {
                                 .as_str()
                                 .is_some_and(|f| !f.trim().is_empty())))
         })
+    }
+
+    /// Whether the note is taken away there: what was read of it stays.
+    pub fn removed(&self) -> bool {
+        self.removed
     }
 
     /// The other bot's note this one shows, by bot and id.
@@ -1144,12 +1151,13 @@ mod tests {
                 call(json!({"id": "flow", "title": "Request flow", "markdown": "one"})),
                 call(json!({"id": "other", "markdown": "not this"})),
                 call(json!({"id": "flow", "markdown": "two"})),
+                // Retitled only, it keeps what it shows.
+                call(json!({"id": "flow", "title": "Request path"})),
                 call(json!({"id": "flow", "remove": true})),
             ],
         );
-        // Retitled only, it keeps what it shows; that alone is no start.
+        // A retitle alone is no start to read back to.
         let retitled = [call(json!({"id": "flow", "title": "Request path"}))];
-        reference.read("flow", &retitled);
         assert!(!Reference::starts("flow", &retitled));
         let (title, body, _) = reference.shown().unwrap();
         margin.resolved("flow", title, body, None);
@@ -1172,6 +1180,19 @@ mod tests {
         );
         reference.file_read(Some("fn flow() {}".into()));
         reference.file_read(None);
+        // Taken away and put there again untitled with nothing in it, it
+        // shows nothing, as there.
+        let mut again = Reference::default();
+        again.read(
+            "flow",
+            &[
+                call(json!({"id": "flow", "title": "Old", "markdown": "old"})),
+                call(json!({"id": "flow", "remove": true})),
+                call(json!({"id": "flow", "title": "New"})),
+            ],
+        );
+        let (title, body, _) = again.shown().unwrap();
+        assert_eq!((title, body), ("New", Body::Markdown(String::new())));
         // Taken away there, the file is no longer read; posted again, it is.
         let removed = [call(json!({"id": "flow", "remove": true}))];
         reference.read("flow", &removed);

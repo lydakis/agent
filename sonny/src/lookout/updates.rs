@@ -82,6 +82,8 @@ struct Noted {
     turn: i64,
     id: String,
     removed: bool,
+    /// The call that changed it: each change news of its own.
+    call: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -442,8 +444,14 @@ impl Updates {
                     && data["denied"] != true
                     && self.live
                 {
+                    let call = call.1;
                     self.news_of(name).merge(News {
-                        notes: vec![Noted { turn, id, removed }],
+                        notes: vec![Noted {
+                            turn,
+                            id,
+                            removed,
+                            call,
+                        }],
                         ..News::default()
                     });
                 }
@@ -1039,7 +1047,12 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
 /// A note a task changed in its own margin, which the person does not
 /// see, and how the lead shows it in its own.
 fn note_line(name: &str, noted: &Noted) -> Line {
-    let Noted { turn, id, removed } = noted;
+    let Noted {
+        turn,
+        id,
+        removed,
+        call,
+    } = noted;
     let text = match removed {
         true => format!("- {name}: turn:{name}/{turn}, took its margin note \"{id}\" away"),
         false => format!(
@@ -1051,7 +1064,7 @@ fn note_line(name: &str, noted: &Noted) -> Line {
         said: false,
         theirs: false,
         text,
-        key: format!("{name}/{turn}/note/{id}/{removed}"),
+        key: format!("{name}/{turn}/note/{id}/{removed}/{call}"),
     }
 }
 
@@ -1321,6 +1334,17 @@ mod tests {
         );
         // Never the task's own words.
         assert!(!text.contains("Ignore the lead"));
+        // Changed again in that turn once told: news again, not the same.
+        call(
+            &mut updates,
+            "shop.fix",
+            "c6",
+            r#"{"id":"bench","markdown":"y"}"#,
+            false,
+        );
+        let again = updates.take();
+        assert_eq!(again.items.len(), 1);
+        assert!(!told.items.iter().any(|line| line.key == again.items[0].key));
     }
 
     #[test]

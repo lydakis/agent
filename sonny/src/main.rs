@@ -4122,6 +4122,10 @@ impl App {
     /// and, when that note shows another bot's, what that one did.
     async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
         self.read_history(bot, id, reference).await;
+        // Taken away there, what it showed stays as last read.
+        if reference.removed() {
+            return;
+        }
         let Some((through, note)) = reference.shows() else {
             reference.through = None;
             return;
@@ -10663,31 +10667,42 @@ mod tests {
 
     #[tokio::test]
     async fn a_task_s_note_that_shows_its_own_task_s_is_read_through() {
-        let client = daemon_answering(|asked| {
-            let arguments = match asked["bot"].as_str() {
-                Some("calc.add") => json!({"id": "flow", "title": "Flow", "from": "calc.sub/flow"}),
-                _ => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
+        let later = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on = later.clone();
+        let client = daemon_answering(move |asked| {
+            // Later the task takes its note away, and its own task changes.
+            let later = on.load(std::sync::atomic::Ordering::SeqCst);
+            let arguments = match (asked["bot"].as_str(), later) {
+                (Some("calc.add"), false) => {
+                    json!({"id": "flow", "title": "Flow", "from": "calc.sub/flow"})
+                }
+                (Some("calc.add"), true) => json!({"id": "flow", "remove": true}),
+                (_, false) => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
+                (_, true) => json!({"id": "flow", "markdown": "deeper"}),
             };
+            let node = if later { 2 } else { 1 };
             match asked["op"].as_str() {
                 Some("inspect") => json!({"bot_id": 1, "workspace": "/nowhere"}),
-                Some("history_nodes") => json!({"nodes": [{"node": 1}]}),
-                _ => json!({"items": [{"node": 1, "item": {"type": "function_call",
+                Some("history_nodes") => json!({"nodes": [{"node": node}]}),
+                _ => json!({"items": [{"node": node, "item": {"type": "function_call",
                     "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}}]}),
             }
         })
         .await;
         let mut app = app(client);
         app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
-        app.read_references().await;
-        let note = app.margin.note("flow").unwrap();
-        let margin::Body::From { shown, .. } = &note.body else {
-            panic!()
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
         };
-        assert_eq!(
-            shown.as_deref(),
-            Some(&margin::Body::Markdown("deep".into()))
-        );
-        assert_eq!(note.title, "Flow");
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+        // Taken away by the task, what it showed stays as last read.
+        later.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
     }
 
     #[tokio::test]
