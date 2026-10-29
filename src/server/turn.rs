@@ -2722,6 +2722,29 @@ impl Turn {
         Ok(steered)
     }
 
+    /// The bot's fallback `reference` names, unsent and with no credit, when
+    /// its provider is known and still speaks the bot's encoding.
+    fn fallback(
+        &self,
+        record: &agent_runtime::store::Bot,
+        reference: &str,
+    ) -> Result<Option<Fallback>> {
+        let (name, model) = split_model(reference)?;
+        let Some(known) = self.providers.get(name) else {
+            return Ok(None);
+        };
+        if known.family() != record.family()? {
+            return Ok(None);
+        }
+        Ok(Some(Fallback {
+            provider: Arc::new(shaped(known, self.settings())?.into_owned()),
+            name: name.to_owned(),
+            model: model.to_owned(),
+            credit: None,
+            pending: false,
+        }))
+    }
+
     /// One model call with retries. Each attempt streams the same immutable
     /// nodes and shares its prepared prefix; a
     /// refusal for pace holds the provider's pool rather than this turn.
@@ -2802,19 +2825,10 @@ impl Turn {
         // it answers this request alone, and the next goes to the bot's model.
         // A call parked on the fallback's pool resumes there.
         let mut fallback = match std::mem::take(&mut accounting.call_fallback) {
-            Some(parked) => {
-                let (name, to) = split_model(&parked.model)?;
-                match self.providers.get(name) {
-                    Some(known) => Some(Fallback {
-                        provider: Arc::new(shaped(known, self.settings())?.into_owned()),
-                        name: name.to_owned(),
-                        model: to.to_owned(),
-                        credit: parked.credit,
-                        pending: false,
-                    }),
-                    None => None,
-                }
-            }
+            Some(parked) => self.fallback(record, &parked.model)?.map(|to| Fallback {
+                credit: parked.credit,
+                ..to
+            }),
             None => None,
         };
         let mut tool_calls = tool_calls;
@@ -2983,16 +2997,12 @@ impl Turn {
                         && matches!(body, Body::Window(_))
                         && let Some(reference) = &record.fallback
                     {
-                        let (name, to) = split_model(reference)?;
-                        if let Some(known) = self.providers.get(name) {
-                            fallback = Some(Fallback {
-                                provider: Arc::new(shaped(known, self.settings())?.into_owned()),
-                                name: name.to_owned(),
-                                model: to.to_owned(),
-                                credit: credit.filter(|_| known.url() == own_provider.url()),
-                                pending: true,
-                            });
-                        }
+                        let reference = reference.clone();
+                        fallback = self.fallback(record, &reference)?.map(|to| Fallback {
+                            credit: credit.filter(|_| to.provider.url() == own_provider.url()),
+                            pending: true,
+                            ..to
+                        });
                     }
                     error
                 }
