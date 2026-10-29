@@ -58,7 +58,7 @@ pub fn read(store: &Path, store_id: Option<&str>, ours: impl Fn(&str) -> bool) -
         if !ours(&subscriber) {
             continue;
         }
-        let project = subscriber.strip_suffix(".lead");
+        let project = crate::project::lead_project(&subscriber);
         for sub in subs {
             let own = project.is_some_and(|p| sub == lookout::subs::Sub::lead(&subscriber, p));
             let described = sub.describe();
