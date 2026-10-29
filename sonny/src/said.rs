@@ -87,9 +87,18 @@ async fn turns_since(
             )
             .await?;
         let turns = page["turns"].as_array().cloned().unwrap_or_default();
-        let ran = |turn: &&Value| turn["finished_ms"].as_i64().is_none_or(|ms| ms >= since_ms);
-        let all = turns.iter().take_while(ran).count() == turns.len();
-        for turn in turns.iter().take_while(ran) {
+        // A bot runs one turn at a time, so once a turn that ran ended
+        // before `since_ms`, every older one that ran did too. A queued turn
+        // ended without running says nothing about older ones.
+        let mut ended = false;
+        for turn in &turns {
+            if turn["finished_ms"].as_i64().is_some_and(|ms| ms < since_ms) {
+                ended = !turn["started_ms"].is_null();
+                if ended {
+                    break;
+                }
+                continue;
+            }
             let Some(id) = turn["turn"].as_i64() else {
                 continue;
             };
@@ -103,7 +112,7 @@ async fn turns_since(
             found.insert(id, project);
         }
         before = page["next_before"].clone();
-        if !all || before.is_null() {
+        if ended || before.is_null() {
             return Ok(found);
         }
     }

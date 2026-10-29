@@ -7591,16 +7591,20 @@ mod tests {
                 ("bots", _) => json!({"bots": [{"name": "shop.lead"}, {"name": "shop.old"}],
                     "next_after": null}),
                 // Turns come a page at a time.
+                // Turns come a page at a time. Turn 7 was queued behind 6
+                // and cancelled before the cleanup; turn 4 ran before it.
                 ("turns", Some("shop.lead")) if args["before"].is_null() => json!({"turns": [
-                    {"turn": 7, "finished_ms": null, "workspace": shop_}], "next_before": 7}),
+                    {"turn": 8, "started_ms": 3000, "finished_ms": null, "workspace": shop_},
+                    {"turn": 7, "started_ms": null, "finished_ms": 600, "workspace": shop_}],
+                    "next_before": 7}),
                 ("turns", Some("shop.lead")) => json!({"turns": [
-                    {"turn": 6, "finished_ms": 2000, "workspace": elsewhere_},
-                    {"turn": 5, "finished_ms": 500, "workspace": elsewhere_}],
-                    "next_before": 5}),
+                    {"turn": 6, "started_ms": 400, "finished_ms": 2000, "workspace": elsewhere_},
+                    {"turn": 4, "started_ms": 100, "finished_ms": 300, "workspace": elsewhere_}],
+                    "next_before": 4}),
                 ("turns", _) => json!({"turns": [{"turn": 3, "finished_ms": 100}]}),
                 ("history_nodes", Some("shop.lead")) => json!({"nodes": [
-                    {"node": 30, "turn": 7}, {"node": 29, "turn": 7}, {"node": 28, "turn": 6},
-                    {"node": 27, "turn": 6}, {"node": 20, "turn": 5}], "next_from": 19}),
+                    {"node": 30, "turn": 8}, {"node": 29, "turn": 8}, {"node": 28, "turn": 6},
+                    {"node": 27, "turn": 6}, {"node": 20, "turn": 4}], "next_from": 19}),
                 ("history_items", Some("shop.lead")) => {
                     let items: Vec<Value> = (args["nodes"].as_array().into_iter().flatten())
                         .filter_map(|node| {
@@ -7631,7 +7635,7 @@ mod tests {
         assert_eq!(
             read,
             json!({"since_ms": 1000, "cut": false, "said": [
-                {"bot": "shop.lead", "turn": 7, "text": "Keep Bedrock out of evals.",
+                {"bot": "shop.lead", "turn": 8, "text": "Keep Bedrock out of evals.",
                     "project": "shop"},
                 {"bot": "shop.lead", "turn": 6, "text": "Squash-merge from now on.",
                     "project": null}]})
