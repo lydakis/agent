@@ -4236,6 +4236,34 @@ impl Database {
         }
         Ok(json!({"bot":name,"turns":turns}))
     }
+    /// The number `history_read` gives the turn `turn` (the store's, as a
+    /// handle names it) in `name`'s history, which may hold it from before
+    /// a fork.
+    pub fn history_number(&self, name: &str, turn: i64) -> Result<i64> {
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        // Turn ids only grow along a history: stop past the turn.
+        self.conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,turn,turn_seq) AS (
+                SELECT id,parent,turn,turn_seq FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.turn,n.turn_seq
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.turn IS NULL OR c.turn>=?2)
+             SELECT turn_seq FROM chain WHERE turn=?2 AND turn_seq IS NOT NULL LIMIT 1",
+            )?
+            .query_row(params![head, turn], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| {
+                Error::with(
+                    "turn_not_in_history",
+                    format!("turn:{name}/{turn} did not start a turn in {name}'s history"),
+                )
+            })
+    }
     pub fn history_read(
         &self,
         name: &str,
@@ -4275,7 +4303,13 @@ impl Database {
             .query_row(params![head, turn_seq], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         let Some((depth, end)) = boundary else {
-            return fail("turn_not_in_history");
+            return fail_with(
+                "turn_not_in_history",
+                format!(
+                    "turn {turn_seq} counts {name}'s turns from 1, as its listing numbers them; \
+                     a handle names a turn by the store's number"
+                ),
+            );
         };
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,depth) AS (
