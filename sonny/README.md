@@ -406,7 +406,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
-- `/usage` shows, in the pane beside the conversation on the full screen,
+- `/usage` shows, in the pane beside the conversation,
   the tokens the project's agents spent in the last 24 hours: in all, as
   stacked bars over time (output, input read fresh, and input read from the
   provider's cache), by agent and by model. `d`, `w` and `m` show the last
