@@ -76,16 +76,17 @@ pub fn declare(record: &Value, lead: bool) -> Option<Value> {
 
 /// The `configure` fields that bring a bot Sonny declared on before up
 /// to this build's tools, as opening its window would, or `None` when it
-/// has them or never had Sonny's: so an agent no one opens since an
+/// has them or never had Sonny's (a tool Sonny's lookout answers): so an agent no one opens since an
 /// upgrade, such as a task out of sight, gets a tool added since. A lead
 /// stays a lead, by the tool only a lead has, and a tool Sonny gates is
 /// gated as the bot's mode gates the rest.
 pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
+    // Sonny's own by a tool its lookout answers, not by a name another
+    // client's tool could share.
     let declared = record["declared"].as_array()?;
-    let names = tools(true);
     if !declared
         .iter()
-        .any(|tool| names.iter().any(|ours| ours["name"] == tool["name"]))
+        .any(|tool| tool["answered_by"] == crate::served::TAG)
     {
         return None;
     }
@@ -177,6 +178,10 @@ mod tests {
         // Another client's bot, or one with no tools declared, is left alone.
         let other = json!({"name": "x", "declared": [{"name": "theirs"}]});
         assert_eq!(refresh(&other), None);
+        // Nor is one whose tool only shares a name with one of Sonny's.
+        let named =
+            json!({"name": "x", "declared": [{"name": crate::served::MEMORY, "result": "ok"}]});
+        assert_eq!(refresh(&named), None);
         assert_eq!(refresh(&json!({"name": "x"})), None);
         // A lead from an older build, missing a tool: it stays a lead.
         let mut old: Vec<Value> = tools(true);
