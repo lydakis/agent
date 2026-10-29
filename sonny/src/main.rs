@@ -4073,8 +4073,8 @@ impl App {
             if read.insert(key.clone()) && !reference.gone {
                 self.read_reference(&key.0, &key.1, &mut reference).await;
             }
-            if let Some((title, body)) = reference.shown() {
-                self.margin.resolved(&note, title, body);
+            if let Some((title, body, folder)) = reference.shown() {
+                self.margin.resolved(&note, title, body, folder);
             }
             self.references.insert(key, reference);
         }
@@ -4119,10 +4119,15 @@ impl App {
                 break;
             };
             newest = newest.max(Some(last));
-            // In the nodes' order, and each node's as it holds them.
+            // In the nodes' order, and each node's as it holds them; a read
+            // cut short is asked again from where it was, next time.
+            let short = self.short_read.replace(false);
             let items: Vec<Value> = (self.items_of(bot, &nodes).await.into_iter())
                 .map(|(_, item)| item)
                 .collect();
+            if self.short_read.replace(short) {
+                return;
+            }
             let started = margin::Reference::starts(id, &items);
             pages.push(items);
             from = page["next_from"].as_i64();
@@ -8761,7 +8766,9 @@ mod tests {
 
     /// A daemon that greets and gives each request `answer`'s result, or
     /// its refusal when it names an `error`.
-    async fn daemon_answering(answer: impl Fn(&Value) -> Value + Send + 'static) -> Arc<Client> {
+    pub(crate) async fn daemon_answering(
+        answer: impl Fn(&Value) -> Value + Send + 'static,
+    ) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         // Tests start stand-ins at once, within the same millisecond.
         static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -10513,6 +10520,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("flow.md"), "# Flow").unwrap();
         let workspace = folder.display().to_string();
+        let folder_name = workspace.clone();
         let call = |arguments: Value| {
             json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
                 "arguments": arguments.to_string()})
@@ -10551,6 +10559,14 @@ mod tests {
         app.read_references().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+        // Its pictures are read in the task's folder.
+        let margin::Body::From {
+            folder: read_in, ..
+        } = &app.margin.note("flow").unwrap().body
+        else {
+            panic!()
+        };
+        assert_eq!(read_in.as_deref(), Some(folder_name.as_str()));
         // What it did since, a few seconds on.
         app.read_references().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
@@ -10572,7 +10588,13 @@ mod tests {
             json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
                 "arguments": arguments.to_string()})
         };
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let failing = fail.clone();
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            // A read that fails once, as a dropped connection would.
+            Some("history_items") if failing.swap(false, std::sync::atomic::Ordering::SeqCst) => {
+                json!({"error": "unavailable"})
+            }
             Some("inspect") => json!({"name": "calc.add", "workspace": "/nowhere"}),
             Some("history_nodes") if asked["min_node"] == 6 => json!({"nodes": [{"node": 6}]}),
             Some("history_nodes") if asked["min_node"] == 7 => json!({"nodes": [{"node": 7}]}),
@@ -10606,6 +10628,15 @@ mod tests {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
         };
+        // A read cut short leaves where it was read from.
+        app.read_references().await;
+        assert_eq!(shown(&app), None);
+        assert!(
+            app.references
+                .values()
+                .all(|reference| reference.node.is_none())
+        );
+        app.references_read = None;
         app.read_references().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("b".into())));
         assert_eq!(app.margin.note("flow").unwrap().title, "Flow");

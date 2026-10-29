@@ -107,6 +107,8 @@ pub enum Body {
         /// Its title there, as this note last took it.
         title: Option<String>,
         shown: Option<Box<Body>>,
+        /// The folder what it shows was read from there, for its pictures.
+        folder: Option<String>,
     },
 }
 
@@ -193,9 +195,11 @@ fn body_json(body: &Body, json: &mut Value) {
             id,
             title,
             shown,
+            folder,
         } => {
             json["from"] = json!(format!("{bot}/{id}"));
             json["shown_title"] = json!(title);
+            json["shown_folder"] = json!(folder);
             if let Some(shown) = shown {
                 let mut kept = json!({});
                 body_json(shown, &mut kept);
@@ -212,12 +216,12 @@ fn body_read(json: &Value) -> Option<Body> {
         let shown = body_read(&json["shown"])
             .filter(|shown| !matches!(shown, Body::From { .. }))
             .map(Box::new);
-        let title = text("shown_title");
         return Some(Body::From {
             bot,
             id,
-            title,
+            title: text("shown_title"),
             shown,
+            folder: text("shown_folder"),
         });
     }
     match text("file") {
@@ -269,11 +273,6 @@ impl Reference {
                 self.removed = true;
                 continue;
             }
-            let body = match (arguments["file"].as_str(), arguments["markdown"].as_str()) {
-                (Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
-                (_, Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
-                _ => continue,
-            };
             // Kept, as there, when changed without one.
             match arguments["title"].as_str().map(str::trim) {
                 Some(title) if !title.is_empty() => self.title = title.to_owned(),
@@ -281,6 +280,12 @@ impl Reference {
                 _ => {}
             }
             self.removed = false;
+            let body = match (arguments["file"].as_str(), arguments["markdown"].as_str()) {
+                (Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
+                (_, Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
+                // Retitled only.
+                _ => continue,
+            };
             if !matches!((&self.body, &body), (Some(Body::File(a)), Body::File(b)) if a == b) {
                 self.file = None;
             }
@@ -288,8 +293,9 @@ impl Reference {
         }
     }
 
-    /// Whether the bot's `items` set the note `id`'s title, or take it
-    /// away: what is shown from there on can be read without older ones.
+    /// Whether the bot's `items` set the note `id`'s text and title at
+    /// once, or take it away: what is shown from there on can be read
+    /// without older ones.
     pub fn starts(id: &str, items: &[Value]) -> bool {
         items.iter().any(|item| {
             let arguments = (item["arguments"].as_str())
@@ -302,7 +308,11 @@ impl Reference {
                 && (arguments["remove"] == true
                     || arguments["title"]
                         .as_str()
-                        .is_some_and(|t| !t.trim().is_empty()))
+                        .is_some_and(|t| !t.trim().is_empty())
+                        && (arguments["markdown"].is_string()
+                            || arguments["file"]
+                                .as_str()
+                                .is_some_and(|f| !f.trim().is_empty())))
         })
     }
 
@@ -321,32 +331,38 @@ impl Reference {
         }
     }
 
-    /// The note's title there, and what it shows: a file as the text
-    /// read of it, so that it stays once the bot's folder is gone.
-    pub fn shown(&self) -> Option<(&str, Body)> {
+    /// The note's title there, what it shows, and the folder that is
+    /// read from: a file as the text read of it, so that it stays once
+    /// the bot's folder is gone.
+    pub fn shown(&self) -> Option<(&str, Body, Option<PathBuf>)> {
+        let workspace = self.workspace.as_deref().map(PathBuf::from);
         let body = match self.body.as_ref()? {
             Body::File(path) => {
+                let folder = (workspace.map(|w| w.join(path)))
+                    .and_then(|file| file.parent().map(Path::to_path_buf));
                 let Some(text) = &self.file else {
                     return Some((
                         &self.title,
                         Body::Markdown(format!("*{path} is not read yet.*")),
+                        folder,
                     ));
                 };
                 let extension = (Path::new(path).extension().and_then(|e| e.to_str()))
                     .unwrap_or_default()
                     .to_lowercase();
-                if ["md", "markdown", "mdx"].contains(&extension.as_str()) {
+                let body = if ["md", "markdown", "mdx"].contains(&extension.as_str()) {
                     Body::Markdown(text.clone())
                 } else {
                     // Fenced past any run of backticks it holds.
                     let most = (text.split(|c| c != '`').map(str::len).max()).unwrap_or(0);
                     let fence = "`".repeat(most.max(2) + 1);
                     Body::Markdown(format!("{fence}{extension}\n{text}\n{fence}"))
-                }
+                };
+                return Some((&self.title, body, folder));
             }
             body => body.clone(),
         };
-        Some((&self.title, body))
+        Some((&self.title, body, workspace))
     }
 }
 
@@ -421,24 +437,29 @@ impl Margin {
 
     /// The note `note` shows of another bot's, read there as `body`,
     /// with that note's `title` when this one was given none.
-    pub fn resolved(&mut self, note: &str, title: &str, body: Body) {
+    pub fn resolved(&mut self, note: &str, title: &str, body: Body, read_in: Option<PathBuf>) {
         let Some(at) = self.kept.notes.iter().position(|n| n.id == note) else {
             return;
         };
         let note = &mut self.kept.notes[at];
         let Body::From {
-            title: took, shown, ..
+            title: took,
+            shown,
+            folder,
+            ..
         } = &mut note.body
         else {
             return;
         };
+        let read_in = read_in.map(|folder| folder.display().to_string());
         // Titled as there for as long as it was given no title of its own.
         let inherited = note.title == note.id || Some(&note.title) == took.as_ref();
         let retitled = inherited && !title.is_empty() && note.title != title;
-        if shown.as_deref() == Some(&body) && !retitled {
+        if shown.as_deref() == Some(&body) && !retitled && *folder == read_in {
             return;
         }
         *shown = Some(Box::new(body));
+        *folder = read_in;
         if retitled {
             note.title = title.to_owned();
             *took = Some(title.to_owned());
@@ -548,17 +569,20 @@ impl Margin {
                     id: i,
                     title,
                     shown,
+                    folder,
                 }) if *b == bot && *i == id => Body::From {
                     bot,
                     id,
                     title: title.clone(),
                     shown: shown.clone(),
+                    folder: folder.clone(),
                 },
                 _ => Body::From {
                     bot,
                     id,
                     title: None,
                     shown: None,
+                    folder: None,
                 },
             }),
             (_, Some(file), _) if !file.trim().is_empty() => {
@@ -691,15 +715,18 @@ impl Margin {
         most: usize,
     ) -> Option<Vec<Line<'static>>> {
         let note = self.note(id)?.body.clone();
-        let shown = match &note {
+        // Another bot's, its pictures read where it keeps them.
+        let (shown, folder) = match &note {
             Body::From {
-                shown: Some(shown), ..
-            } => shown.as_ref(),
-            body => body,
+                shown: Some(shown),
+                folder,
+                ..
+            } => (shown.as_ref(), folder.as_deref().map(Path::new)),
+            body => (body, None),
         };
         let mut body = match shown {
             Body::Markdown(text) => {
-                let mut markdown = Markdown::in_folder(workspace);
+                let mut markdown = Markdown::in_folder(folder.unwrap_or(workspace));
                 crate::transcript::markdown(&mut markdown, text, width, leads())
             }
             Body::File(path) => self.file_lines(workspace, path, width),
@@ -1087,11 +1114,15 @@ mod tests {
                 call(json!({"id": "flow", "remove": true})),
             ],
         );
-        let (title, body) = reference.shown().unwrap();
-        margin.resolved("flow", title, body);
+        // Retitled only, it keeps what it shows; that alone is no start.
+        let retitled = [call(json!({"id": "flow", "title": "Request path"}))];
+        reference.read("flow", &retitled);
+        assert!(!Reference::starts("flow", &retitled));
+        let (title, body, _) = reference.shown().unwrap();
+        margin.resolved("flow", title, body, None);
         let note = margin.note("flow").unwrap();
         // Titled as the task titled it, it showing what the task's shows.
-        assert_eq!(note.title, "Request flow");
+        assert_eq!(note.title, "Request path");
         let Body::From { shown, .. } = &note.body else {
             panic!()
         };
@@ -1108,11 +1139,12 @@ mod tests {
         );
         reference.file_read(Some("fn flow() {}".into()));
         reference.file_read(None);
-        let (_, body) = reference.shown().unwrap();
+        let (_, body, folder) = reference.shown().unwrap();
         assert_eq!(body, Body::Markdown("```rs\nfn flow() {}\n```".into()));
         let changes = margin.changes();
-        margin.resolved("flow", "Request flow", body.clone());
-        margin.resolved("flow", "Request flow", body);
+        assert_eq!(folder, Some(PathBuf::from("/work/calc.add/src")));
+        margin.resolved("flow", "Request flow", body.clone(), folder.clone());
+        margin.resolved("flow", "Request flow", body, folder);
         assert_eq!(margin.changes(), changes + 1);
         // Posted again, it keeps what was read; and it is kept.
         margin.apply(
