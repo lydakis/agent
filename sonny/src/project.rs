@@ -700,29 +700,26 @@ mod tests {
         let dir = dir.canonicalize().unwrap();
         std::fs::write(
             dir.join(".agents/project.toml"),
-            "name = \"top\"\nprofile = \"super-lead\"\n",
+            "name = \"top\"\nprofile = \"my-lead\"\n",
         )
         .unwrap();
         // Named but not written: the lead is not made without it.
         assert!(role(&dir).unwrap_err().starts_with("profile_not_found: "));
         std::fs::write(
-            dir.join(".agents/agents/super-lead.md"),
-            "---\nextends: lead\n---\nHand each ask to the lead it belongs to.\n",
+            dir.join(".agents/agents/my-lead.md"),
+            "---\nextends: lead\n---\nReview each change before it lands.\n",
         )
         .unwrap();
         let lead = role(&dir).unwrap();
-        assert_eq!(lead.name, "super-lead");
-        assert!(
-            lead.body
-                .ends_with("Hand each ask to the lead it belongs to.")
-        );
+        assert_eq!(lead.name, "my-lead");
+        assert!(lead.body.ends_with("Review each change before it lands."));
         // The lead's text, the person's or Sonny's, comes first.
         let base = profile(&dir, "lead").unwrap().body;
         assert!(lead.body.starts_with(&base));
         let text = instructions(&dir).unwrap();
-        assert!(text.contains("# Role: super-lead\n\n"), "{text}");
+        assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
-        assert!(!text.contains("- super-lead:"));
+        assert!(!text.contains("- my-lead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

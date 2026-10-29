@@ -1693,26 +1693,24 @@ mod tests {
         )
         .unwrap();
         let builtins = [("lead", "---\nmodel: a/lead\n---\nBe the lead.")];
-        // A super lead on the client's lead: the lead's text first, its
-        // model where the super lead names none, then the skill whole.
+        // A lead variant on the client's lead: the lead's text first, its
+        // model where the variant names none, then the skill whole.
         std::fs::write(
-            agents.join("super-lead.md"),
-            "---\nextends: lead\ndescription: Leads leads\nskills: [triage]\n---\nLead the leads below.\n",
+            agents.join("my-lead.md"),
+            "---\nextends: lead\ndescription: A careful lead\nskills: [triage]\n---\nReview each change before it lands.\n",
         )
         .unwrap();
-        let role = profile_with(&root, "super-lead", &builtins)
-            .unwrap()
-            .unwrap();
-        assert_eq!(role.name, "super-lead");
-        assert_eq!(role.path, Some(agents.join("super-lead.md")));
+        let role = profile_with(&root, "my-lead", &builtins).unwrap().unwrap();
+        assert_eq!(role.name, "my-lead");
+        assert_eq!(role.path, Some(agents.join("my-lead.md")));
         assert_eq!(role.model.as_deref(), Some("a/lead"));
         assert_eq!(
             role.body,
-            "Be the lead.\n\nLead the leads below.\n\n## Skill: triage\n\nSort every ask by owner."
+            "Be the lead.\n\nReview each change before it lands.\n\n## Skill: triage\n\nSort every ask by owner."
         );
         // Without the client's lead to build on, the base is missing.
         assert_eq!(
-            profile(&root, "super-lead").unwrap_err().code(),
+            profile(&root, "my-lead").unwrap_err().code(),
             "profile_not_found"
         );
         // A folder's lead.md on the lead it shadows, here the client's.
@@ -1724,13 +1722,12 @@ mod tests {
         let lead = profile_with(&root, "lead", &builtins).unwrap().unwrap();
         assert_eq!(lead.body, "Be the lead.\n\nAlso: be brief.");
         assert_eq!(lead.model.as_deref(), Some("b/mine"));
-        // The super lead now builds on that one, which builds on the client's.
-        let role = profile_with(&root, "super-lead", &builtins)
-            .unwrap()
-            .unwrap();
+        // The variant now builds on that one, which builds on the client's.
+        let role = profile_with(&root, "my-lead", &builtins).unwrap().unwrap();
         assert!(
-            role.body
-                .starts_with("Be the lead.\n\nAlso: be brief.\n\nLead the leads below.")
+            role.body.starts_with(
+                "Be the lead.\n\nAlso: be brief.\n\nReview each change before it lands."
+            )
         );
         assert_eq!(role.model.as_deref(), Some("b/mine"));
         // Neither variant is offered as a role to start a peer in.
@@ -1753,8 +1750,8 @@ mod tests {
         assert_eq!(names, ["careful", "reviewer"]);
         // So is a variant of a variant.
         std::fs::write(
-            agents.join("area-lead.md"),
-            "---\nextends: super-lead\n---\nOne area.",
+            agents.join("strict-lead.md"),
+            "---\nextends: my-lead\n---\nStricter still.",
         )
         .unwrap();
         let names: Vec<_> = instructions(&root, None, &[])

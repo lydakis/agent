@@ -15,7 +15,7 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
-//! lead_profile = "super-lead"   # the role a new lead starts in, not lead
+//! lead_profile = "my-lead"   # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
 //! ```
 //!
@@ -261,8 +261,8 @@ mod tests {
         assert_eq!(config.sonny.lead_profile, None);
         assert_eq!(config.web_search, WebSearch::Live);
         let roles =
-            parse("[sonny]\nlead_profile = \"super-lead\"\ntask_profile = \"worker\"").unwrap();
-        assert_eq!(roles.sonny.lead_profile.as_deref(), Some("super-lead"));
+            parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
+        assert_eq!(roles.sonny.lead_profile.as_deref(), Some("my-lead"));
         assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);

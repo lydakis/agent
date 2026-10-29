@@ -89,16 +89,16 @@ the lead's role, not kept in the file.
 #### Roles for leads and tasks
 
 A lead runs as the `lead` profile and every other agent is told the `task`
-one, unless set to another. A super lead, say, is a profile of its own,
-`~/.agents/agents/super-lead.md`, that builds on the lead's:
+one, unless set to another. Another kind of lead is a profile of its own,
+say `~/.agents/agents/my-lead.md`, that builds on the lead's:
 
 ```markdown
 ---
 extends: lead
-description: Leads the leads of the projects below
+description: A lead that reviews each change before it lands
 skills: [triage]
 ---
-Hand each ask to the lead of the project it belongs to.
+Review each change a task makes before it lands.
 ```
 
 and a project file names it for its lead:

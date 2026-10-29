@@ -911,13 +911,13 @@ mod tests {
         assert_eq!(read(&dir).unwrap()["subfolders"], "project");
         std::fs::write(
             dir.join(FILE),
-            "name = \"demo\"\nprofile = \"super-lead\"\nthreads_profile = \"worker\"",
+            "name = \"demo\"\nprofile = \"my-lead\"\nthreads_profile = \"worker\"",
         )
         .unwrap();
         let info = read(&dir).unwrap();
         assert_eq!(
             (&info["profile"], &info["threads_profile"]),
-            (&json!("super-lead"), &json!("worker"))
+            (&json!("my-lead"), &json!("worker"))
         );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
