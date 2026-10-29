@@ -7,7 +7,7 @@
 //! The calls are the record, in the bot's history; the margin as it
 //! stands is kept beside the person's reactions, by the bot's key, so a
 //! window opened later shows it without reading the whole history.
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -99,6 +99,12 @@ pub fn tool() -> Value {
 pub enum Body {
     Markdown(String),
     File(String),
+    /// A file's text as read where another bot keeps it, shown as the
+    /// file is: only what a [`Body::From`] shows.
+    Read {
+        path: String,
+        text: String,
+    },
     /// Another bot's note `id`, as it was last read there: kept once that
     /// bot or its note is gone.
     From {
@@ -190,6 +196,10 @@ fn body_json(body: &Body, json: &mut Value) {
     match body {
         Body::Markdown(text) => json["markdown"] = json!(text),
         Body::File(path) => json["file"] = json!(path),
+        Body::Read { path, text } => {
+            json["read"] = json!(path);
+            json["text"] = json!(text);
+        }
         Body::From {
             bot,
             id,
@@ -222,6 +232,12 @@ fn body_read(json: &Value) -> Option<Body> {
             title: text("shown_title"),
             shown,
             folder: text("shown_folder"),
+        });
+    }
+    if let Some(path) = text("read") {
+        return Some(Body::Read {
+            path,
+            text: text("text").unwrap_or_default(),
         });
     }
     match text("file") {
@@ -278,8 +294,9 @@ pub struct Reference {
     /// The notes its margin holds, oldest first, as far as read: one
     /// put there past [`MOST_NOTES`] takes the oldest away.
     held: Vec<String>,
-    /// Notes read as taken away: put there again, they are new ones.
-    left: HashSet<String>,
+    /// Notes read as taken away, the latest few: put there again, they
+    /// are new ones.
+    left: VecDeque<String>,
     /// Whether its history was read from its start: a note not yet held
     /// is then a new one, not one from before what was read.
     pub whole: bool,
@@ -304,16 +321,17 @@ impl Reference {
             if arguments["remove"] == true {
                 self.held.retain(|held| *held != at);
                 self.removed |= at == id;
-                self.left.insert(at);
+                self.left(at);
                 continue;
             }
             if !self.held.contains(&at) {
                 if self.whole || self.left.contains(&at) {
+                    self.left.retain(|left| *left != at);
                     self.held.push(at.clone());
                     if self.held.len() > MOST_NOTES {
                         let gone = self.held.remove(0);
                         self.removed |= gone == id;
-                        self.left.insert(gone);
+                        self.left(gone);
                     }
                 } else if self.held.len() < MOST_NOTES {
                     // Maybe one from before what was read, so older than
@@ -355,6 +373,15 @@ impl Reference {
                 self.file = None;
             }
             self.body = Some(body);
+        }
+    }
+
+    /// Note `id` read as taken away there, one of the latest few kept.
+    fn left(&mut self, id: String) {
+        self.left.retain(|left| *left != id);
+        self.left.push_back(id);
+        if self.left.len() > 4 * MOST_NOTES {
+            self.left.pop_front();
         }
     }
 
@@ -416,26 +443,13 @@ impl Reference {
                 let (_, body, folder) = self.through.as_ref()?.shown()?;
                 return Some((&self.title, body, folder));
             }
+            // Not shown until read: what was kept of it stays.
             Body::File(path) => {
                 let folder = (workspace.map(|w| w.join(path)))
                     .and_then(|file| file.parent().map(Path::to_path_buf));
-                let Some(text) = &self.file else {
-                    return Some((
-                        &self.title,
-                        Body::Markdown(format!("*{path} is not read yet.*")),
-                        folder,
-                    ));
-                };
-                let extension = (Path::new(path).extension().and_then(|e| e.to_str()))
-                    .unwrap_or_default()
-                    .to_lowercase();
-                let body = if ["md", "markdown", "mdx"].contains(&extension.as_str()) {
-                    Body::Markdown(text.clone())
-                } else {
-                    // Fenced past any run of backticks it holds.
-                    let most = (text.split(|c| c != '`').map(str::len).max()).unwrap_or(0);
-                    let fence = "`".repeat(most.max(2) + 1);
-                    Body::Markdown(format!("{fence}{extension}\n{text}\n{fence}"))
+                let body = Body::Read {
+                    path: path.clone(),
+                    text: self.file.clone()?,
                 };
                 return Some((&self.title, body, folder));
             }
@@ -769,7 +783,7 @@ impl Margin {
         let files: Vec<PathBuf> = (self.kept.notes.iter())
             .filter_map(|note| match &note.body {
                 Body::File(path) => Some(workspace.join(path)),
-                Body::Markdown(_) | Body::From { .. } => None,
+                Body::Markdown(_) | Body::Read { .. } | Body::From { .. } => None,
             })
             .collect();
         self.reads.retain(|path, _| files.contains(path));
@@ -809,6 +823,9 @@ impl Margin {
                 crate::transcript::markdown(&mut markdown, text, width, leads())
             }
             Body::File(path) => self.file_lines(workspace, path, width),
+            Body::Read { path, text } => {
+                text_lines(Path::new(path), text, folder.unwrap_or(workspace), width)
+            }
             Body::From { bot, id, .. } => {
                 let line = format!("{BODY}{bot}'s note {id}, once it is read");
                 vec![Line::from(line).dim()]
@@ -901,44 +918,9 @@ impl Margin {
             Ok(text) => text,
             Err(error) => return vec![Line::from(format!("{BODY}{error}")).dim()],
         };
-        let extension = (path.extension().and_then(|e| e.to_str()))
-            .unwrap_or_default()
-            .to_lowercase();
-        let lines: Vec<&str> = text.lines().collect();
-        let shown = lines.len().min(FILE_LINES);
         // Its pictures read from beside it.
-        let folder = path.parent().unwrap_or(workspace);
-        let mut out = match extension.as_str() {
-            "md" | "markdown" | "mdx" => {
-                let mut markdown = Markdown::document(folder);
-                crate::transcript::markdown(
-                    &mut markdown,
-                    &lines[..shown].join("\n"),
-                    width,
-                    leads(),
-                )
-            }
-            // Code as code, whatever it holds.
-            _ => {
-                let mut code = crate::highlight::Code::file(&path, lines.first().unwrap_or(&""));
-                let lead = || Span::raw(BODY);
-                (lines[..shown].iter())
-                    .flat_map(|text| {
-                        let text = text.replace('\t', "    ");
-                        let spans = match &mut code {
-                            Some(code) => code.line(&text),
-                            None => vec![Span::raw(text)],
-                        };
-                        crate::transcript::wrap(Line::from(spans), width, lead(), lead())
-                    })
-                    .collect()
-            }
-        };
-        if lines.len() > shown {
-            let more = lines.len() - shown;
-            out.push(Line::from(format!("{BODY}… {more} more lines")).dim());
-        }
-        out
+        let folder = path.parent().unwrap_or(workspace).to_owned();
+        text_lines(&path, text, &folder, width)
     }
 }
 
@@ -1009,6 +991,42 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
         (up + 3, up + 4, format!("{BUTTON}close/{id}")),
     ];
     (line, buttons)
+}
+
+/// A file's `text` as a note shows the file at `path`: Markdown as
+/// replies read, its pictures from `folder`, anything else as code.
+fn text_lines(path: &Path, text: &str, folder: &Path, width: usize) -> Vec<Line<'static>> {
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    let lines: Vec<&str> = text.lines().collect();
+    let shown = lines.len().min(FILE_LINES);
+    let mut out = match extension.as_str() {
+        "md" | "markdown" | "mdx" => {
+            let mut markdown = Markdown::document(folder);
+            crate::transcript::markdown(&mut markdown, &lines[..shown].join("\n"), width, leads())
+        }
+        // Code as code, whatever it holds.
+        _ => {
+            let mut code = crate::highlight::Code::file(path, lines.first().unwrap_or(&""));
+            let lead = || Span::raw(BODY);
+            (lines[..shown].iter())
+                .flat_map(|text| {
+                    let text = text.replace('\t', "    ");
+                    let spans = match &mut code {
+                        Some(code) => code.line(&text),
+                        None => vec![Span::raw(text)],
+                    };
+                    crate::transcript::wrap(Line::from(spans), width, lead(), lead())
+                })
+                .collect()
+        }
+    };
+    if lines.len() > shown {
+        let more = lines.len() - shown;
+        out.push(Line::from(format!("{BODY}… {more} more lines")).dim());
+    }
+    out
 }
 
 /// What the agent is told when the person takes its note `id` away,
@@ -1307,12 +1325,39 @@ mod tests {
         );
         assert!(reference.file().is_some());
         let (_, body, folder) = reference.shown().unwrap();
-        assert_eq!(body, Body::Markdown("```rs\nfn flow() {}\n```".into()));
+        let read = |path: &str, text: &str| Body::Read {
+            path: path.into(),
+            text: text.into(),
+        };
+        assert_eq!(body, read("src/flow.rs", "fn flow() {}"));
         let changes = margin.changes();
         assert_eq!(folder, Some(PathBuf::from("/work/calc.add/src")));
         margin.resolved("flow", "Request flow", body.clone(), folder.clone());
         margin.resolved("flow", "Request flow", body, folder);
         assert_eq!(margin.changes(), changes + 1);
+        // Shown as the file is there: a page as its source.
+        let rows = |margin: &mut Margin| {
+            (margin
+                .body("flow", 80, Path::new("/nowhere"), 100)
+                .unwrap()
+                .iter())
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        assert!(rows(&mut margin).contains("fn flow() {}"));
+        margin.resolved("flow", "Request flow", read("page.html", "<p>hi</p>"), None);
+        assert!(rows(&mut margin).contains("<p>hi</p>"));
+        // A file not read yet, here anew, leaves what was kept of it.
+        let mut anew = Reference::default();
+        anew.read(
+            "flow",
+            &[
+                call(json!({"id": "flow", "title": "Flow", "file": "src/flow.rs"})),
+                call(json!({"id": "flow", "remove": true})),
+            ],
+        );
+        assert!(anew.shown().is_none());
         // Posted again, it keeps what was read; and it is kept.
         margin.apply(
             "c2",

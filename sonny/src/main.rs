@@ -10947,18 +10947,22 @@ mod tests {
         };
         assert_eq!(read_in.as_deref(), Some(folder_name.as_str()));
         // What it did since, a few seconds on.
+        let read_flow = margin::Body::Read {
+            path: "flow.md".into(),
+            text: "# Flow".into(),
+        };
         app.read_references().await;
         assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
         app.references_read = None;
         app.read_references().await;
-        assert_eq!(shown(&app), Some(margin::Body::Markdown("# Flow".into())));
+        assert_eq!(shown(&app), Some(read_flow.clone()));
         // The task gone, with its folder, what it showed stays.
         gone.store(true, std::sync::atomic::Ordering::SeqCst);
         std::fs::remove_dir_all(&folder).unwrap();
         app.references_read = None;
         app.read_references().await;
         assert!(app.references.values().all(|reference| reference.gone));
-        assert_eq!(shown(&app), Some(margin::Body::Markdown("# Flow".into())));
+        assert_eq!(shown(&app), Some(read_flow.clone()));
     }
 
     #[tokio::test]
