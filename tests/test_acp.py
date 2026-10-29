@@ -288,8 +288,9 @@ class AcpTests(ModelFixture):
         self.model.models = ('synthetic-model', 'other-model')
         thread, session = self.open(repo)
         [option] = self.opened['result']['configOptions']
-        self.assertEqual((option['configId'], option['category'], option['currentValue']),
-                         ('model', 'model', 'default'))
+        # T3 Code reads `id` even on version 2, which names it `configId`.
+        self.assertEqual((option['id'], option['configId'], option['category'], option['currentValue']),
+                         ('model', 'model', 'model', 'default'))
         self.assertEqual([c['value'] for c in option['options']],
                          ['default', 'openai/synthetic-model', 'openai/other-model', 'anthropic/claude-x'])
         self.assertEqual(option['options'][2]['description'], 'faster')
