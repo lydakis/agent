@@ -1,8 +1,8 @@
 # Sonny (prototype)
 
-A terminal client for the daemon that lays its work out in Rex or Herdr. It
-speaks the daemon's socket protocol through `agent-client`; nothing in the
-daemon or CLI knows it exists.
+A terminal client for the daemon that lays its work out in Rex, Herdr or
+cmux. It speaks the daemon's socket protocol through `agent-client`; nothing
+in the daemon or CLI knows it exists.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
@@ -111,13 +111,15 @@ lead's effort after it is made.
 A lead moved to another
 folder (`--workspace`) comes back with the next message Sonny sends it from
 its own, history and all. When Sonny runs in a Rex block (`rex` found as
-`$REX`, on the PATH, or in the Mac app) or a Herdr pane (`herdr` found as
-`$HERDR` or on the PATH), the project gets one home there: in Rex a session
-(the one Sonny was opened in, else the one the lead is in, else one labelled
-with the project's name), in Herdr a workspace, chosen the same way. Each task
-the lead (or one of its tasks) starts gets a window (a Herdr tab) there
-running Sonny on that task, without taking focus, its block (pane) labelled
-with the task's name. In Rex, each window reports OSC 7501 status, so Rex
+`$REX`, on the PATH, or in the Mac app), a Herdr pane (`herdr` found as
+`$HERDR` or on the PATH) or a cmux tab (`cmux` found as the tab's own CLI,
+on the PATH, or in the Mac app), the project gets one home there: in Rex a
+session (the one Sonny was opened in, else the one the lead is in, else one
+labelled with the project's name), in Herdr or cmux a workspace, chosen the
+same way. Each task the lead (or one of its tasks) starts gets a window (a
+Herdr tab; in cmux a tab in the lead's pane) there running Sonny on that
+task, without taking focus, its block (pane, cmux tab) labelled with the
+task's name. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on an approval or done. In Herdr, Sonny
 supports Herdr the way its own agents do: each Sonny reports its bot through
 `herdr pane report-agent`, so the agent panel lists it as `Sonny: NAME`
@@ -130,18 +132,28 @@ pane of the Herdr server on its own machine: one reached by plain `ssh` from a
 Herdr pane is not listed, one in a remote machine Herdr itself connects to is.
 The daemon, lookout and approver Sonny starts run in a session of their own,
 so closing their pane or stopping Herdr leaves them and their turns running.
+In cmux, which reads OSC 7501 and OSC 777 itself, the workspace's sidebar row
+shows which task is working, waiting on an approval or done, and a
+notification rings the tab it came from. Each Sonny gives its tab a resume
+command (`cmux surface resume set`, shown as `Sonny: NAME`), so after cmux
+relaunches the tab runs `sonny` on the same bot again, once you allow
+commands starting with `sonny` from the tab's Resume Commands menu (until
+then cmux offers it to run by hand); quitting Sonny clears it. cmux lets
+only programs started in its tabs reach it, by default: the lookout Sonny
+starts there is one, and one started outside cmux needs Settings >
+Automation set to allow local automation.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
-`run_in_pane` and `show_agent` calls go to that Herdr workspace or Rex
-session, in that multiplexer, rather than one guessed from where the
+`run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
+Rex session, in that multiplexer, rather than one guessed from where the
 lookout answering them runs, which is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
 run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
-multiplexer it runs in to `~/.agents/skills` (`rex-windows` or
-`herdr-panes`, from `skills/`), so any agent can run a long command where
+multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
+`herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
 the person can watch it, and read it back: the `run_in_pane` tool
 (`name`, `command`, `split` right, left, above or below) opens a block
 labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
@@ -157,8 +169,9 @@ or its tasks, out in this one's home. `sonny --bot PROJECT.lead` anywhere is
 that lead's Sonny too, laying out its tasks where it runs. Opened in a
 session that already holds other work, Sonny takes that session as the
 project's home and leaves the rest alone: tasks get tabs of their own, and a
-tab that holds the person's own panes keeps its name. Herdr has no exit status to wait
-for, so its skill has agents end such a command with a line to wait for.
+tab that holds the person's own panes keeps its name. Herdr and cmux have no
+exit status to wait for, so their skills have agents end such a command with
+a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
