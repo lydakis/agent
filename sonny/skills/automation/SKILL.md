@@ -15,9 +15,10 @@ the job keeps its state in files in its folder and reads them each run.
 Give the job its own agent and folder, created with `--agents` so it reads
 the folder's rules and skills, then add a trigger for it with the
 triggers tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
-and `message` MESSAGE. Triggers need Sonny on macOS, where launchd keeps the
-time; elsewhere `add` is refused with `triggers_unsupported`, so say so
-rather than presenting a job as set up. Without the triggers tool, outside
+and `message` MESSAGE. Triggers need the system's scheduler to keep the time:
+launchd on macOS, systemd's user manager on Linux. Without one `add` is
+refused with `triggers_unsupported`, so say so rather than presenting a job
+as set up. Without the triggers tool, outside
 Sonny, `"$HOME/.agent/trigger" add` takes the same fields as flags
 (`--bot NAME --cron '...' -- MESSAGE`).
 

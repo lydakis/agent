@@ -1,6 +1,7 @@
 //! The environment an interactive login shell ends up with, where people
-//! export provider keys: what a daemon started from launchd, which gives
-//! only `HOME`, `SHELL` and `PATH`, needs to reach a provider.
+//! export provider keys: what a daemon started from a trigger's fire, which
+//! launchd or systemd gives little more than `HOME`, `SHELL` and `PATH`,
+//! needs to reach a provider.
 use std::ffi::OsString;
 use std::io::Read;
 use std::process::{Command, Stdio};

@@ -22,7 +22,8 @@ pub fn tool() -> Value {
         "name": TOOL,
         "description": "Mark a task resolved once nothing is left to do in it: its pull request merged, \
             its answer passed on, or the person dropped the work. As a task, resolve yourself, naming no \
-            task, in the turn that finishes the work; as a lead, name one of your tasks. The person's status \
+            task, in the turn that finishes the work, and still end that turn with your report: your reply \
+            after this call is what your lead reads. As a lead, name one of your tasks. The person's status \
             view files it under Resolved, out of their way, and its window closes once its turn ends. New \
             work sent to the task reopens it. A task that waits on the person, or on work still to come, is \
             not resolved.",

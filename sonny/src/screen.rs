@@ -20,7 +20,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// How far one notch of the wheel scrolls.
 const WHEEL: usize = 3;
@@ -526,47 +526,105 @@ impl Screen {
             false => query.to_owned(),
         };
         let mut hits = Vec::new();
-        // A line's text, and where each of its characters is drawn.
-        let (mut text, mut at) = (String::new(), Vec::<(usize, Spot, usize)>::new());
-        let mut look = |text: &mut String, at: &mut Vec<(usize, Spot, usize)>| {
-            for (from, found) in text.match_indices(&query) {
-                let cell = |byte| at.partition_point(|(b, _, _)| *b <= byte) - 1;
-                let start = at[cell(from)].1;
-                let (_, (row, column), wide) = at[cell(from + found.len() - 1)];
-                hits.push((start, (row, column + wide)));
+        // Each line's text, read whole over its rows; only a line the
+        // query is in is read again for where its characters are drawn.
+        let mut text = String::new();
+        let mut first = 0;
+        for row in 0..=self.shown.len() {
+            let shown = self.shown.get(row);
+            if shown.is_none_or(|shown| shown.joins.is_none()) {
+                if text.contains(&query) {
+                    self.place(&query, fold, first..row, &mut hits);
+                }
+                text.clear();
+                first = row;
             }
-            text.clear();
-            at.clear();
-        };
-        for (row, shown) in self.shown.iter().enumerate() {
-            if shown.joins.is_none() {
-                look(&mut text, &mut at);
-            }
-            let cells = cells(&shown.line);
-            if cells
-                .iter()
-                .any(|g| g.starts_with(crate::image::PLACEHOLDER))
+            let Some(shown) = shown else {
+                break;
+            };
+            let spans = shown.line.spans.iter();
+            if spans
+                .clone()
+                .any(|s| s.content.contains(crate::image::PLACEHOLDER))
             {
                 continue;
             }
-            for (column, cell) in cells.iter().enumerate().skip(shown.joins.unwrap_or(0)) {
-                if cell.is_empty() {
+            // Past the row's lead, as its cells are below.
+            let mut column = 0;
+            let lead = shown.joins.unwrap_or(0);
+            for span in spans {
+                let content = span.content.as_ref();
+                if column >= lead && content.is_ascii() {
+                    let from = text.len();
+                    text.push_str(content);
+                    if fold {
+                        text[from..].make_ascii_lowercase();
+                    }
                     continue;
                 }
-                let wide = cells[column + 1..]
-                    .iter()
-                    .take_while(|next| next.is_empty())
-                    .count()
-                    + 1;
-                at.push((text.len(), (row, column), wide));
-                match fold {
-                    true => text.push_str(&cell.to_lowercase()),
-                    false => text.push_str(cell),
+                for c in content.chars() {
+                    if column < lead {
+                        column += c.width().unwrap_or(0);
+                        continue;
+                    }
+                    match fold {
+                        true => text.extend(c.to_lowercase()),
+                        false => text.push(c),
+                    }
                 }
             }
         }
-        look(&mut text, &mut at);
         hits
+    }
+
+    /// Where `query` is in the line drawn over `rows`, added to `hits`.
+    fn place(
+        &self,
+        query: &str,
+        fold: bool,
+        rows: std::ops::Range<usize>,
+        hits: &mut Vec<(Spot, Spot)>,
+    ) {
+        // The line's text, and where each of its characters is drawn.
+        let (mut text, mut at) = (String::new(), Vec::<(usize, Spot, usize)>::new());
+        for row in rows {
+            let shown = &self.shown[row];
+            let spans = shown.line.spans.iter();
+            if spans
+                .clone()
+                .any(|s| s.content.contains(crate::image::PLACEHOLDER))
+            {
+                continue;
+            }
+            let lead = shown.joins.unwrap_or(0);
+            let mut column = 0;
+            for g in spans.flat_map(|span| span.content.graphemes(true)) {
+                // A mark that takes no cell goes with the one before.
+                let wide = match (g.width(), column) {
+                    (0, 0) => 1,
+                    (0, _) => 0,
+                    (wide, _) => wide,
+                };
+                if column < lead || (wide == 0 && column == lead) {
+                    column += wide;
+                    continue;
+                }
+                if wide > 0 {
+                    at.push((text.len(), (row, column), wide));
+                }
+                match fold {
+                    true => text.extend(g.chars().flat_map(char::to_lowercase)),
+                    false => text.push_str(g),
+                }
+                column += wide;
+            }
+        }
+        for (from, found) in text.match_indices(query) {
+            let cell = |byte| at.partition_point(|(b, _, _)| *b <= byte) - 1;
+            let start = at[cell(from)].1;
+            let (_, (row, column), wide) = at[cell(from + found.len() - 1)];
+            hits.push((start, (row, column + wide)));
+        }
     }
 
     /// Draw the rows that fit `area` of `buf`: the newest, or those the
@@ -1441,6 +1499,22 @@ mod tests {
         let area = Rect::new(0, 0, 20, 5);
         screen.render(area, &mut Buffer::empty(area), |_| None);
         assert_eq!(screen.found(), Some((11, 11)));
+    }
+
+    #[test]
+    fn find_places_wide_characters_and_marks_in_their_cells() {
+        let line = Line::from("  cafe\u{301} 日本語 TEST");
+        let (mut screen, _) = screen(vec![line], 30, 3);
+        for (query, text) in [
+            ("日本", "日本"),
+            ("e\u{301} 日", "e\u{301} 日"),
+            ("test", "TEST"),
+        ] {
+            screen.find(query);
+            assert_eq!(screen.found(), Some((1, 1)), "{query}");
+            let (start, end) = screen.finding.as_ref().unwrap().hits[0];
+            assert_eq!(screen.text(start, end), text);
+        }
     }
 
     #[test]

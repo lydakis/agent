@@ -34,10 +34,10 @@ class ServedToolTests(ModelFixture):
         self.addCleanup(self.daemon.close)
         self.script = []
 
-    def lookout(self):
+    def lookout(self, **extra):
         env = {**clean_env(), 'HOME': str(self.path), 'AGENT_BIN': str(self.binary),
                'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com',
-               'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com'}
+               'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com', **extra}
         service = subprocess.Popen([str(self.sonny), 'lookout', '--store', str(self.store),
                                     '--socket', str(self.daemon.socket_path)],
                                    env=env, stdout=subprocess.PIPE, text=True)
@@ -283,14 +283,17 @@ class ServedToolTests(ModelFixture):
         self.assertTrue(kept.name.endswith(f'-{lead["bot_id"]}'), kept.name)
 
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
-    def test_a_trigger_off_a_mac_is_refused_and_says_why(self):
+    def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('triggers')])
-        self.lookout()
+        # A runtime folder no user manager serves.
+        runtime = self.path / 'runtime'
+        runtime.mkdir()
+        self.lookout(XDG_RUNTIME_DIR=str(runtime))
         refused = json.loads(self.call('calc.lead', 'triggers', {'add': {'every': '30m', 'message': 'Check.'}}))
         self.assertEqual(refused['error'], 'trigger_refused')
         self.assertIn('triggers_unsupported', refused['detail'])
-        self.assertFalse((self.path / 'Library/LaunchAgents').exists())
+        self.assertEqual(list((self.path / '.config/systemd/user').glob('*.service')), [])
 
     def test_a_lookout_another_build_started_gives_way(self):
         old = self.lookout()
