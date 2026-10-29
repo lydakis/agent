@@ -42,13 +42,11 @@ be told again.
 ## What it checks
 
 What a lead's `tasks` subscription watches is every bot it or one of its
-tasks made, every bot named `PROJECT.*`, and the leads of the projects
-inside its folder: each project's lead whose folder is below the lead's
-with no other project's between, as a workspace's lead watches its
-repositories' leads. Those leads are its tasks in all but what they make,
-which stays theirs, and the turns their own lookout's notes start, which
-are their own work with their tasks. The home folder's lead watches no
-other leads. Two events count:
+tasks made, and every bot named `PROJECT.*`. Another lead, which has
+subscriptions of its own, is heard only by a subscription with `updates`
+that names it as it is, with no `*`, as the person asks a lead to watch
+another: then it is a task here in all but what it makes, which stays
+its own, and the turns its own lookout's notes start. Two events count:
 
 | Event | When |
 | --- | --- |

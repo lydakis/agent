@@ -162,8 +162,9 @@ pub struct Updates {
     /// The bots whose news this is, as the lookout's subscriptions with
     /// task updates name them.
     pub watched: HashSet<String>,
-    /// The leads inside the lead's folder: subscribers, but its tasks here.
-    pub inside: HashSet<String>,
+    /// The bots a subscription with task updates names as they are:
+    /// subscribers of their own among them are tasks here too.
+    pub named: HashSet<String>,
     /// Turns a lookout's note started in one of those: its own work, no news.
     noted: HashSet<Key>,
     pub live: bool,
@@ -203,7 +204,7 @@ impl Updates {
             memory,
             subscribers: HashSet::new(),
             watched: HashSet::new(),
-            inside: HashSet::new(),
+            named: HashSet::new(),
             noted: HashSet::new(),
             live: false,
             bots: HashMap::new(),
@@ -453,10 +454,10 @@ impl Updates {
 
     /// Whether the bot is one of the lead's tasks: one a subscription with
     /// task updates watches, not a fork of the lead nor a subscriber of its
-    /// own, unless it leads a project inside the lead's folder.
+    /// own, unless a subscription names it.
     fn task(&self, name: &str) -> bool {
         self.watched.contains(name)
-            && (!self.subscribers.contains(name) || self.inside.contains(name))
+            && (!self.subscribers.contains(name) || self.named.contains(name))
             && !name.starts_with(&format!("{}-", self.lead))
     }
 
@@ -759,7 +760,7 @@ impl Updates {
     /// them is no longer.
     pub fn subscribed(&mut self, subscribers: HashSet<String>) {
         let new: Vec<String> = (subscribers.difference(&self.subscribers))
-            .filter(|name| !self.inside.contains(*name))
+            .filter(|name| !self.named.contains(*name))
             .cloned()
             .collect();
         for name in new {

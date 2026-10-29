@@ -11,8 +11,7 @@
 //! subscriptions look for. One lookout watches a
 //! daemon, for every subscriber on it, started by the first Sonny to open;
 //! the daemon is unchanged: this follows every bot and submits to the
-//! subscribers like any client. A lead hears the leads of the projects
-//! inside its folder as it hears its tasks (`nested`). It also answers its agents' calls of the
+//! subscribers like any client. It also answers its agents' calls of the
 //! tools Sonny answers (`served`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
@@ -1318,39 +1317,6 @@ fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
     }
 }
 
-/// The leads of the projects inside `folder`, the lead `lead`'s, as the
-/// daemon lists them: each project's lead whose folder is below it with no
-/// other project's between, as a task is below its lead. The home folder's
-/// lead leads no others, as no project above another reaches past home.
-fn nested(
-    lead: &str,
-    folder: &Path,
-    records: &HashMap<String, Value>,
-    home: Option<&Path>,
-) -> HashSet<String> {
-    if home == Some(folder) {
-        return HashSet::new();
-    }
-    let below = |name: &String, record: &Value| -> Option<PathBuf> {
-        let at = Path::new(record["workspace"].as_str()?);
-        (name.ends_with(".lead")
-            && name != lead
-            && record["expire_ms"].is_null()
-            && at != folder
-            && at.starts_with(folder))
-        .then(|| at.to_owned())
-    };
-    let leads: Vec<(&String, PathBuf)> = (records.iter())
-        .filter_map(|(name, record)| Some((name, below(name, record)?)))
-        .collect();
-    (leads.iter())
-        .filter(|(_, at)| {
-            !(leads.iter()).any(|(_, between)| between != at && at.starts_with(between))
-        })
-        .map(|(name, _)| (*name).clone())
-        .collect()
-}
-
 /// Whether the bot listed under a name is another than the one seated.
 fn replaced(seated: &Value, listed: &Value) -> bool {
     let id = |record: &Value| record["bot_id"].as_i64();
@@ -1461,52 +1427,12 @@ impl Service {
                     if live && cursor > self.cursor {
                         self.cursor = cursor;
                     }
-                    // A lead opened in another folder moves there with its
-                    // next message, and so do the leads it hears and is heard
-                    // by. A steer's folder is for that message alone, so the
-                    // daemon's record says whether it moved. The replay's
-                    // records are listed as they are now.
-                    if let (true, Some("accepted" | "queued"), Some(name), Some(at)) = (
-                        live,
-                        event["event"].as_str(),
-                        event["bot"].as_str(),
-                        event["data"]["workspace"].as_str(),
-                    ) && name.ends_with(".lead")
-                        && (self.records.get(name)).is_some_and(|r| r["workspace"].as_str() != Some(at))
-                        && let Ok(page) = client.request("bots", json!({"name": name, "limit": 1})).await
-                        && let Some(at) = (page["bots"].get(0))
-                            .filter(|bot| bot["name"] == name)
-                            .and_then(|bot| bot["workspace"].as_str())
-                        && self.moved(name, at)
-                    {
-                        for lookout in self.lookouts.values_mut() {
-                            lookout.nest(&self.records);
-                        }
-                    }
                     if let (Some("created" | "forked"), Some(name)) =
                         (event["event"].as_str(), event["bot"].as_str())
                     {
                         let mut record = event["data"].clone();
                         record["name"] = json!(name);
-                        // The same bot as listed now is in the folder it is in
-                        // now, not where the replay says it was made.
-                        if let Some(listed) = (self.records.get(name))
-                            .filter(|had| had["bot_id"].is_i64() && had["bot_id"] == record["bot_id"])
-                        {
-                            record["workspace"] = listed["workspace"].clone();
-                        }
-                        // A project's lead made below a subscriber's folder;
-                        // a task, or a lead listed as it is, changes no one's.
-                        let nests = name.ends_with(".lead")
-                            && (self.records.get(name)).is_none_or(|had| {
-                                had["workspace"] != record["workspace"] || had["expire_ms"] != record["expire_ms"]
-                            });
                         self.records.insert(name.to_owned(), record.clone());
-                        if nests {
-                            for lookout in self.lookouts.values_mut() {
-                                lookout.nest(&self.records);
-                            }
-                        }
                         // Its judge is picked once the stream is live.
                         self.seat(&client, &record, live).await;
                         if live && let Some(lookout) = self.lookouts.get_mut(name) {
@@ -1518,11 +1444,6 @@ impl Service {
                     {
                         self.records.remove(name);
                         self.lookouts.remove(name);
-                        if name.ends_with(".lead") {
-                            for lookout in self.lookouts.values_mut() {
-                                lookout.nest(&self.records);
-                            }
-                        }
                     }
                     for lookout in self.lookouts.values_mut() {
                         lookout.event(&event);
@@ -1672,22 +1593,6 @@ impl Service {
                 lookout.wake(&client).await;
             }
         }
-    }
-
-    /// Keeps a lead's folder as the daemon lists it now: whether it
-    /// changed, which changes which leads hear which.
-    fn moved(&mut self, name: &str, at: &str) -> bool {
-        let Some(record) = self.records.get_mut(name) else {
-            return false;
-        };
-        if record["workspace"].as_str() == Some(at) {
-            return false;
-        }
-        record["workspace"] = json!(at);
-        if let Some(lookout) = self.lookouts.get_mut(name) {
-            lookout.workspace = PathBuf::from(at);
-        }
-        true
     }
 
     /// The subscriber's lookout, made once while its file lasts: whether it
@@ -2019,9 +1924,6 @@ struct Lookout {
     workspace: PathBuf,
     /// The subscriber's own tasks: every bot it or one of them made.
     lineage: HashSet<String>,
-    /// The leads of the projects inside its folder (`nested`), watched as
-    /// its tasks are, but not what they make.
-    inside: HashSet<String>,
     /// What the lookout watches for it, and asks.
     subs: Vec<subs::Sub>,
     /// For each other bot a subscription names the makers of: it, and every
@@ -2044,7 +1946,7 @@ struct Lookout {
     denied: HashMap<(String, i64), u64>,
     /// Queued turns already checked when they were queued.
     checked: HashSet<(String, i64)>,
-    /// Turns a lookout's note started in a lead inside its folder: that
+    /// Turns a lookout's note started in a lead a subscription names: that
     /// lead's own work with its tasks, never news here.
     noted: HashSet<(String, i64)>,
     /// Checks that failed once and were started again.
@@ -2091,7 +1993,6 @@ impl Lookout {
             lead: lead.to_owned(),
             workspace,
             lineage: [lead.to_owned()].into(),
-            inside: HashSet::new(),
             subs: Vec::new(),
             others: HashMap::new(),
             globbed: HashSet::new(),
@@ -2130,6 +2031,12 @@ impl Lookout {
             .filter(|bot| updating.iter().any(|sub| self.sub_watches(sub, bot)))
             .collect();
         self.updates.watched = watched;
+        // Another subscriber is a task here only where one names it as it is.
+        self.updates.named = (updating.iter())
+            .flat_map(|sub| sub.bots.iter())
+            .filter(|glob| !glob.contains('*'))
+            .cloned()
+            .collect();
     }
 
     /// Lineage is kept up during the replay too, so tasks made earlier count.
@@ -2443,7 +2350,7 @@ impl Lookout {
         let made = |root: &String| {
             bot != root
                 && match *root == self.lead {
-                    true => self.lineage.contains(bot) || self.inside.contains(bot),
+                    true => self.lineage.contains(bot),
                     false => self.others.get(root).is_some_and(|set| set.contains(bot)),
                 }
         };
@@ -2496,7 +2403,6 @@ impl Lookout {
         // The subscriber's own: what it made before it was seated is listed,
         // not replayed.
         grow(&mut self.lineage, records);
-        self.nest(records);
         let roots: HashSet<String> = (self.subs.iter())
             .flat_map(|sub| sub.tasks_of.iter().cloned())
             .filter(|root| *root != self.lead)
@@ -2514,18 +2420,6 @@ impl Lookout {
             .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
             .map(|(name, _)| name.clone())
             .collect();
-        self.sync();
-    }
-
-    /// The leads inside the subscriber's folder, as the daemon lists them
-    /// now: heard as its tasks are, task updates included.
-    fn nest(&mut self, records: &HashMap<String, Value>) {
-        let home = std::env::var_os("HOME").map(|home| {
-            let home = PathBuf::from(home);
-            home.canonicalize().unwrap_or(home)
-        });
-        self.inside = nested(&self.lead, &self.workspace, records, home.as_deref());
-        self.updates.inside = self.inside.clone();
         self.sync();
     }
 
@@ -2560,7 +2454,6 @@ impl Lookout {
 
     fn peers_of(&self, task: &str) -> Vec<String> {
         let mut peers: Vec<String> = (self.lineage.iter())
-            .chain(self.inside.iter())
             .chain(
                 self.others
                     .iter()
@@ -2867,7 +2760,6 @@ async fn replayed(store: &Path, socket: PathBuf, judges: &str, limit: usize) -> 
         lookout.roots(&records);
         // The lead's own events too, for where it stood at each check.
         let watched: HashSet<String> = (lookout.lineage.iter())
-            .chain(lookout.inside.iter())
             .chain(lookout.others.values().flatten())
             .chain(lookout.globbed.iter())
             .cloned()
@@ -3537,87 +3429,24 @@ mod tests {
     }
 
     #[test]
-    fn a_lead_hears_the_nearest_leads_inside_its_folder() {
-        let lead = |name: &str, at: &str| (name.to_owned(), json!({"name": name, "workspace": at}));
-        let records: HashMap<String, Value> = [
-            lead("ws.lead", "/w"),
-            lead("web.lead", "/w/web"),
-            lead("api.lead", "/w/api"),
-            // Inside web's folder: web's to hear, not the workspace's.
-            lead("ui.lead", "/w/web/ui"),
-            lead("other.lead", "/x"),
-            lead("wsx.lead", "/wsx"),
-            // A task in the workspace's folder, and one inside a project.
-            lead("ws.fix", "/w"),
-            ("web.fix".to_owned(), json!({"workspace": "/w/web"})),
-        ]
-        .into();
-        let mut heard: Vec<String> = nested("ws.lead", Path::new("/w"), &records, None)
-            .into_iter()
-            .collect();
-        heard.sort();
-        assert_eq!(heard, ["api.lead", "web.lead"]);
-        let heard = nested("web.lead", Path::new("/w/web"), &records, None);
-        assert_eq!(heard, ["ui.lead".to_owned()].into());
-        assert!(nested("ui.lead", Path::new("/w/web/ui"), &records, None).is_empty());
-        // The home folder's lead leads no others.
-        assert!(nested("ws.lead", Path::new("/w"), &records, Some(Path::new("/w"))).is_empty());
-    }
-
-    #[test]
-    fn a_lead_that_moves_is_heard_by_its_new_folder_s_lead() {
-        let record =
-            |name: &str, at: &str| (name.to_owned(), json!({"name": name, "workspace": at}));
-        let mut service = Service {
-            store: PathBuf::new(),
-            records: [
-                record("a.lead", "/a"),
-                record("b.lead", "/b"),
-                record("web.lead", "/a/web"),
-            ]
-            .into(),
-            subscribers: HashMap::new(),
-            socket: PathBuf::new(),
-            judge: None,
-            lookouts: HashMap::new(),
-            judges: HashMap::new(),
-            log: PathBuf::new(),
-            seated: 0,
-            live: false,
-            cursor: None,
-            saved: None,
-            resume: None,
-        };
-        for (lead, at) in [("a.lead", "/a"), ("b.lead", "/b")] {
-            let mut lookout = Lookout::new(lead, PathBuf::from(at), None);
-            lookout.nest(&service.records);
-            service.lookouts.insert(lead.into(), lookout);
-        }
-        assert!(service.lookouts["a.lead"].inside.contains("web.lead"));
-        // Messages in the same folder move nothing.
-        assert!(!service.moved("web.lead", "/a/web"));
-        assert!(service.moved("web.lead", "/b/web"));
-        for lookout in service.lookouts.values_mut() {
-            lookout.nest(&service.records);
-        }
-        assert!(service.lookouts["a.lead"].inside.is_empty());
-        assert!(service.lookouts["b.lead"].inside.contains("web.lead"));
-        // A subscriber that moves reads its new folder.
-        assert!(service.moved("b.lead", "/c"));
-        assert_eq!(service.lookouts["b.lead"].workspace, PathBuf::from("/c"));
-    }
-
-    #[test]
-    fn a_lead_inside_is_news_as_a_task_is_but_not_its_lookout_s_turns() {
+    fn a_lead_a_subscription_names_is_news_as_a_task_is_but_not_its_lookout_s_turns() {
         let mut lookout = lookout();
         lookout.event(&json!({"bot": "calc.lead", "event": "created", "data": {"bot_id": 1, "status": "idle"}}));
         lookout.event(&json!({"bot": "web.lead", "event": "created", "data": {"bot_id": 7, "status": "idle"}}));
         lookout.event(&json!({"event": "follow_live"}));
-        // Another subscriber, so no task of this lead's until it is inside.
+        // Another subscriber, so no task of this lead's until the person
+        // has it watched by name.
         lookout.updates.subscribed(["web.lead".to_owned()].into());
-        lookout.inside.insert("web.lead".into());
-        lookout.updates.inside = lookout.inside.clone();
-        lookout.sync();
+        let mut sub = subs::Sub::lead("calc.lead", "calc");
+        sub.name = "web".into();
+        sub.tasks_of.clear();
+        sub.bots = vec!["web.lead".into()];
+        assert!(!lookout.watches("web.lead"));
+        lookout.subs.push(sub);
+        lookout.roots(&HashMap::from([(
+            "web.lead".to_owned(),
+            json!({"name": "web.lead", "bot_id": 7}),
+        )]));
         assert!(lookout.watches("web.lead"));
         // Its own lookout's note, and the person's question.
         let note = json!({"request_id": "lookout-0123456789abcdef"});
