@@ -251,7 +251,8 @@ Parked turns survive a daemon restart: they are re-registered at
 startup, peer handles resolve from durable state (a peer interrupted by the
 restart reports `interrupted`), and commands that were still running resolve
 to `process_lost`: their supervision ended with the daemon, whether or not the
-OS process did. Interrupting a parked
+OS process did. A daemon that stops cleanly does not wait for them: it kills
+each one's process group and records `process_lost` itself. Interrupting a parked
 turn ends it as `interrupted`: the wait and any planned calls behind it get a
 `cancelled` tool result in the same transaction, so the conversation stays
 valid and the bot is not left uncertain. A bot whose turn is parked reports
