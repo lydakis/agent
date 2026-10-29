@@ -1,11 +1,13 @@
 name: Test
 
 # The gate on every pull request and on main. One job runs the Rust tests
-# and lints; the other builds the daemon and Sonny for release and runs the
+# and lints; another builds the daemon and Sonny for release and runs the
 # runtime suite (AGENT_TEST_RUNTIME=1) against those binaries: a real daemon
 # driven by scripted models through replay, restart and recovery, steering,
-# compaction, forks, approvals, triggers and the lookout. No provider key is
-# used and nothing is spent. The jobs run side by side.
+# compaction, forks, approvals, triggers and the lookout. The macos job runs
+# the Rust tests where the release is built, so a failure only macOS has
+# shows on the pull request instead of at release. No provider key is used
+# and nothing is spent. The jobs run side by side.
 
 on:
   pull_request:
@@ -47,6 +49,25 @@ jobs:
           # needs behind AppArmor.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           cargo test --locked --workspace
+      - name: Release script tests
+        run: python3 -m unittest discover -s release
+
+  macos:
+    # The release's package job runs these same tests on this runner before
+    # it builds anything.
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust tests
+        run: cargo test --locked --workspace
       - name: Release script tests
         run: python3 -m unittest discover -s release
 
