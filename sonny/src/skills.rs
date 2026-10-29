@@ -3,13 +3,15 @@
 //! edit them, and the scripts in `~/.agent` they run.
 use std::path::{Path, PathBuf};
 
-/// What every agent of Sonny's leans on: the lead's and tasks' roles, the
+/// What every agent of Sonny's leans on: the lead's and tasks' roles (and
+/// the superlead's, which a project opts into), the
 /// memory, plan and automation skills, the nightly cleanup's, and
 /// `~/.agent/memory` and `~/.agent/trigger`, which run this Sonny. Written
 /// at each start, so they lead to this copy.
 pub fn install_own() {
     install_role("lead", crate::project::LEAD);
     install_role("task", crate::project::TASK);
+    install_role("superlead", crate::project::SUPERLEAD);
     install("memory", include_str!("../skills/memory/SKILL.md"));
     install(
         "memory-cleanup",

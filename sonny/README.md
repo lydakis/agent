@@ -86,6 +86,43 @@ person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
 first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
+#### Roles for leads and tasks
+
+A lead runs as the `lead` profile and every other agent is told the `task`
+one, unless set to another. Another kind of lead is a profile of its own,
+say `~/.agents/agents/my-lead.md`, that builds on the lead's:
+
+```markdown
+---
+extends: lead
+description: A lead that reviews each change before it lands
+skills: [triage]
+---
+Review each change a task makes before it lands.
+```
+
+and a project file names it for its lead:
+
+| What | `~/.agent/config.toml` | `.agents/project.toml` |
+| --- | --- | --- |
+| The profile a lead runs as | `[sonny] lead_profile` | `profile` |
+| The profile every other agent is told | `[sonny] task_profile` | `threads_profile` |
+
+Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
+written to `~/.agents/agents` beside the others and used by no lead
+unless a project sets `profile = "superlead"`. It builds on the lead's:
+the folder holds other projects, so the lead subscribes to their leads
+and routes work and answers between them as it does between tasks. Sonny
+itself knows only leads and tasks.
+
+The project's wins, then the config's, then `lead` and `task`. A name that
+is not a profile in the folder's or the person's `.agents/agents` (nor one
+Sonny ships) stops the lead or task from being made, with
+`profile_not_found`. The profile is read when the lead's instructions are
+composed, so `/instructions` takes a change. `extends` and `skills` work
+in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
+`lead` or `task` is not offered to agents as a role to start a peer in.
+
 #### Effort for leads and tasks
 
 Each agent's effort is the daemon's to keep; Sonny only picks what a new

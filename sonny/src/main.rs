@@ -933,7 +933,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let instructions = project::as_task(&workspace, &composed.text)?;
+    let info = agent_client::project::read(&workspace)?;
+    let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let declare = json!(declared::tools(false));
     let config = agent_client::config::load()?;
     let tools = agent_client::default_tools(client.providers(), &model, config.web_search);

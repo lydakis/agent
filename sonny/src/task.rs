@@ -140,7 +140,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    let mut flags = match told(&place.dir, &flags) {
+    let mut flags = match told(&place.dir, &info, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
@@ -260,9 +260,10 @@ fn with_defaults(
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
 /// for a task in `dir` given as `--instructions`, with what every task is
-/// told (`task.md`) after it, and the role's model and tools unless the flags name their
-/// own. Other flags pass as they are.
-fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
+/// told (`task.md`, or the task profile the project `info` or the config
+/// names) after it, and the role's model and tools unless the flags name
+/// their own. Other flags pass as they are.
+fn told(dir: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, String> {
     let mut kept = Vec::new();
     let (mut agents, mut profile) = (false, None);
     let mut flags = flags.iter().map(|flag| flag.as_str());
@@ -286,20 +287,26 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     if named("--instructions") || named("--instructions-file") {
         return Err("--agents and --profile compose instructions; --instructions sets them".into());
     }
-    // What every task is told comes after any role, so it is never the role too.
-    let role = match profile.filter(|name| !name.eq_ignore_ascii_case("task")) {
-        Some(name) => Some(
-            agent_client::policy::profile(dir, name)
-                .map_err(|e| format!("{}: {e}", e.code()))?
-                .ok_or(format!(
-                    "no .agents/agents/{name}.md in the workspace or ~/.agents/agents"
-                ))?,
-        ),
+    // What every task is told comes after any role, so its body is never
+    // the role's too; its model and tools still apply when it is named.
+    let task = crate::project::task_profile(info)?;
+    let role = match profile {
+        Some(name) => Some(crate::project::profile(dir, name)?),
         None => None,
     };
+    // The same profile when it is the same file (a case-insensitive
+    // filesystem gives `Worker` and `worker` one), or the same built-in.
+    let told_after = |role: &&agent_client::policy::Profile| match &role.path {
+        None => role.name == task,
+        Some(path) => crate::project::profile(dir, &task).is_ok_and(|task| {
+            let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            task.path.is_some_and(|other| real(&other) == real(path))
+        }),
+    };
     let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
-    let composed = agent_client::policy::instructions(dir, role.as_ref(), &memory)
-        .map_err(|e| format!("{}: {e}", e.code()))?;
+    let composed =
+        agent_client::policy::instructions(dir, role.as_ref().filter(|r| !told_after(r)), &memory)
+            .map_err(|e| format!("{}: {e}", e.code()))?;
     let mut added = Vec::new();
     if let Some(role) = &role {
         if let Some(model) = role.model.as_ref().filter(|_| !named("--model")) {
@@ -311,7 +318,7 @@ fn told(dir: &Path, flags: &[&String]) -> Result<Vec<String>, String> {
     }
     added.extend([
         "--instructions".to_owned(),
-        crate::project::as_task(dir, &composed.text)?,
+        crate::project::as_task(dir, info, &composed.text)?,
     ]);
     kept.extend(added);
     Ok(kept)
@@ -879,9 +886,10 @@ mod tests {
             "---\nmodel: a/b\ntools: [shell, read]\n---\nReview it.\n",
         )
         .unwrap();
+        let project = std::cell::RefCell::new(serde_json::json!({"threads_profile": "task"}));
         let told = |flags: &[&str]| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
-            told(&dir, &flags.iter().collect::<Vec<_>>())
+            told(&dir, &project.borrow(), &flags.iter().collect::<Vec<_>>())
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();
@@ -913,6 +921,51 @@ mod tests {
         let flags = told(&["--profile", "task"]).unwrap();
         assert_eq!(flags.last().unwrap().matches("Be kind.").count(), 1);
         std::fs::remove_file(dir.join(".agents/agents/task.md")).unwrap();
+
+        // A project's tasks told another profile, which builds on Sonny's
+        // task text, and is told once even when named as the role too.
+        std::fs::write(
+            dir.join(".agents/agents/worker.md"),
+            "---\nextends: task\n---\nShip small.\n",
+        )
+        .unwrap();
+        *project.borrow_mut() = serde_json::json!({"threads_profile": "worker"});
+        let flags = told(&["--agents"]).unwrap();
+        let text = flags.last().unwrap();
+        assert!(
+            text.ends_with("helping them well is the care.\n\nShip small."),
+            "{text}"
+        );
+        std::fs::write(
+            dir.join(".agents/agents/worker.md"),
+            "---\nextends: task\ntools: [read]\n---\nShip small.\n",
+        )
+        .unwrap();
+        let flags = told(&["--profile", "worker"]).unwrap();
+        assert_eq!(flags[..2], ["--tools", "read"]);
+        assert_eq!(flags.last().unwrap().matches("Ship small.").count(), 1);
+        // `task` is then a role like any other, as is another file whose
+        // name differs only in case, where the filesystem tells them apart.
+        let flags = told(&["--profile", "task"]).unwrap();
+        assert!(flags.last().unwrap().contains("# Role: task\n\n"));
+        std::fs::write(dir.join(".agents/agents/Worker.md"), "Ship big.\n").unwrap();
+        if std::fs::read_to_string(dir.join(".agents/agents/worker.md")).unwrap() != "Ship big.\n" {
+            let flags = told(&["--profile", "Worker"]).unwrap();
+            assert!(
+                flags
+                    .last()
+                    .unwrap()
+                    .contains("# Role: Worker\n\nShip big.")
+            );
+        }
+        std::fs::remove_file(dir.join(".agents/agents/Worker.md")).unwrap();
+        *project.borrow_mut() = serde_json::json!({"threads_profile": "nobody"});
+        assert!(
+            told(&["--agents"])
+                .unwrap_err()
+                .starts_with("profile_not_found")
+        );
+        *project.borrow_mut() = serde_json::json!({"threads_profile": "task"});
 
         assert_eq!(told(&["--model", "x/y"]).unwrap(), ["--model", "x/y"]);
         assert!(told(&["--profile", "nobody"]).is_err());
