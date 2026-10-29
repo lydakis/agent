@@ -322,9 +322,11 @@ impl Screen {
                 let mut row = Row::new(line);
                 row.tag = Some(tag);
                 self.rows.insert(at, row);
+                self.grow_page(at - 1, 1);
             }
             (None, true) => {
                 self.rows.remove(at);
+                self.grow_page(at - 1, -1);
             }
             (None, false) => return true,
         }
@@ -353,9 +355,26 @@ impl Screen {
         for row in &mut fresh.rows {
             row.tag = Some(tag);
         }
+        let grown = fresh.rows.len() as isize - (end - first) as isize;
         self.rows.splice(first..end, fresh.rows);
+        self.grow_page(first, grown);
         self.relay(first, shown);
         true
+    }
+
+    /// The page of older items the row `row` is in, if any, `by` rows
+    /// longer: rows put into it or taken out, so it still ends where it
+    /// does.
+    fn grow_page(&mut self, row: usize, by: isize) {
+        let mut start = 0;
+        for page in &mut self.pages {
+            if row < start + page.rows {
+                page.rows = page.rows.saturating_add_signed(by);
+                self.placed = None;
+                return;
+            }
+            start += page.rows;
+        }
     }
 
     /// Each row's text, as written: what a test reads of the conversation.
@@ -2284,6 +2303,29 @@ mod tests {
         assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), pill()));
         assert_eq!(draw(&mut screen)[4], "row 19");
         assert!(!screen.put_under(Tag::End(99), Tag::Reactions(99), pill()));
+    }
+
+    #[test]
+    fn a_page_drawn_above_grows_and_shrinks_with_its_tagged_rows() {
+        let (mut screen, _) = screen(rows(100..160), 20, 5);
+        let mut older = Screen::default();
+        older.push(rows(0..3));
+        older.push_marked(
+            vec![Line::from("• Started a, b ▸")],
+            vec![(0, Mark::Tag(Tag::Group(1)))],
+        );
+        older.push(rows(4..6));
+        screen.prepend(0, older);
+        assert_eq!(screen.pages[0].rows, 6);
+        let open = vec![Line::from("▾"), Line::from("a"), Line::from("b")];
+        assert!(screen.replace_tagged(Tag::Group(1), open, Vec::new()));
+        assert_eq!(screen.pages[0].rows, 8);
+        assert!(screen.put_under(Tag::Group(1), Tag::Reactions(1), Some("👀".into())));
+        assert_eq!(screen.pages[0].rows, 9);
+        assert!(screen.put_under(Tag::Group(1), Tag::Reactions(1), None));
+        assert!(screen.replace_tagged(Tag::Group(1), vec!["▸".into()], Vec::new()));
+        assert_eq!(screen.pages[0].rows, 6);
+        assert_eq!(screen.texts()[6], "row 100");
     }
 
     #[test]
