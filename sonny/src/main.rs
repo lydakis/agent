@@ -1662,6 +1662,9 @@ struct App {
     /// How many rows the pages drawn took, and for how many items: how
     /// tall a page not drawn yet is guessed to be.
     page_rows: (usize, usize),
+    /// Ctrl+F steps to the next place, older or newer, once the pages let
+    /// go before it are drawn again: those looked through so far.
+    find_step: Option<(bool, Vec<u64>)>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2324,6 +2327,7 @@ impl App {
             short_read: std::cell::Cell::new(false),
             to_first: false,
             page_rows: (0, 0),
+            find_step: None,
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2550,6 +2554,28 @@ impl App {
                 // The next page asked for once this one is drawn, not a tick on.
                 if self.to_first {
                     self.woken.notify_one();
+                }
+            }
+            if let Some((older, looked)) = &mut self.find_step {
+                let older = *older;
+                match (self.screen.find_gap(older, looked)).filter(|_| self.finding.is_some()) {
+                    // A page at a time, the screen drawn between.
+                    Some(page) => {
+                        looked.push(page);
+                        self.draw_again(page).await;
+                        // A read cut short steps over what it did not draw.
+                        match self.short_read.get() {
+                            true => {
+                                self.find_step = None;
+                                self.screen.find_next(older);
+                            }
+                            false => self.woken.notify_one(),
+                        }
+                    }
+                    None => {
+                        self.find_step = None;
+                        self.screen.find_next(older);
+                    }
                 }
             }
             // A page let go drawn again before the view reaches it, or
@@ -5173,10 +5199,12 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.finding = None,
                 _ if copy => self.finding = None,
-                KeyCode::Up | KeyCode::Enter => self.screen.find_next(true),
-                KeyCode::Char('f' | 'p') if ctrl => self.screen.find_next(true),
-                KeyCode::Down => self.screen.find_next(false),
-                KeyCode::Char('n') if ctrl => self.screen.find_next(false),
+                // The pages let go on the way drawn first, so what they
+                // hold is found too.
+                KeyCode::Up | KeyCode::Enter => self.find_step = Some((true, Vec::new())),
+                KeyCode::Char('f' | 'p') if ctrl => self.find_step = Some((true, Vec::new())),
+                KeyCode::Down => self.find_step = Some((false, Vec::new())),
+                KeyCode::Char('n') if ctrl => self.find_step = Some((false, Vec::new())),
                 KeyCode::Backspace => {
                     query.pop();
                     self.screen.find(query);
@@ -5190,6 +5218,7 @@ impl App {
                 _ => {}
             }
             if self.finding.is_none() {
+                self.find_step = None;
                 self.screen.end_find();
             }
             return true;
@@ -6888,6 +6917,7 @@ impl App {
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + 5 + query.width() as u16, composer.y));
                 let place = match self.screen.found() {
+                    _ if self.find_step.is_some() => "  looking further · ".to_owned(),
                     Some((_, 0)) if !query.is_empty() => "  not found · ".to_owned(),
                     Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
                     _ => "  ".to_owned(),
