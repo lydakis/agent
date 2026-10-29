@@ -210,7 +210,7 @@ off again never shows.
   the conversation on the full screen, on the alternate screen inline.
   The copy answers from the agent's history and may call no tool;
   follow-ups stay with it, and Esc goes back. In the pane, every key goes
-  to the side chat but Shift+Tab, which goes back to the main composer
+  to the side chat but Ctrl+], which goes back to the main composer
   while the side chat stays open. The agent carries on meanwhile, in
   view on the full screen, waiting on the main screen inline. The daemon
   deletes the copy once it has been idle 15 minutes (`fork --expires`), and

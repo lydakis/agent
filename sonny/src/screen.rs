@@ -57,6 +57,8 @@ pub enum Tag {
     Group(u64),
     /// The rows of the message at this node that one bot sent another.
     Relayed(i64),
+    /// Tasks the lead started together, by the client's number for them.
+    Tasks(u64),
 }
 
 /// What a line pushed is besides its text: a [`Tag`], or a link its row
@@ -324,6 +326,12 @@ impl Screen {
     #[cfg(test)]
     pub fn texts(&self) -> Vec<String> {
         self.rows.iter().map(|row| row.line.to_string()).collect()
+    }
+
+    /// Where each row's link goes, if it has one.
+    #[cfg(test)]
+    pub fn links(&self) -> Vec<Option<String>> {
+        self.rows.iter().map(|row| row.link.clone()).collect()
     }
 
     /// Where the row `row` starts among the rows drawn, if it was laid out.

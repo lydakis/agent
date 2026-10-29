@@ -114,7 +114,7 @@ impl Pane {
     }
 
     /// `program` drawn in the pane under `title`, every key going to it
-    /// but Shift+Tab, which goes back to the conversation.
+    /// but Ctrl+], which goes back to the conversation.
     pub fn program(title: &str, program: crate::embed::Embedded) -> Self {
         Self {
             title: title.to_owned(),
@@ -123,7 +123,7 @@ impl Pane {
             screen: Screen::default(),
             area: Rect::default(),
             card: None,
-            keys: "shift+tab back",
+            keys: "ctrl+] back",
             program: Some(program),
             foot: None,
             prose: false,

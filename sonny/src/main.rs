@@ -47,6 +47,7 @@ mod setup;
 mod shell;
 mod skills;
 mod sound;
+mod started;
 mod status;
 mod table;
 mod task;
@@ -64,7 +65,7 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-            EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+            EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
         },
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -1112,6 +1113,13 @@ struct Relayed {
     open: bool,
 }
 
+/// Ctrl+], which moves the keys between the conversation and the pane:
+/// no terminal or multiplexer takes it, as many take Shift+Tab. Without
+/// the keyboard protocol it arrives as Ctrl+5.
+fn switches(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']' | '5'))
+}
+
 /// The most denials `/approve` offers.
 const DENIALS: usize = 8;
 
@@ -1500,6 +1508,14 @@ struct App {
     /// Words between agents drawn quiet, by node: what was said, who
     /// said it, and whether a click opened it.
     relayed: HashMap<i64, Relayed>,
+    /// The tasks the lead started, by the group they were started in; the
+    /// group the last went into, with the rows drawn by then, as a fold
+    /// has; how they are drawn; and when what they do was last read, or
+    /// none for all of them to be read now.
+    tasks: Vec<Vec<started::Task>>,
+    starting: Option<(usize, usize)>,
+    task_style: started::Style,
+    tasks_read: Option<Instant>,
     /// A button clicked in the conversation, which [`App::press`] takes.
     pressed: Option<String>,
     /// How many triggers and subscriptions run for this agent, as the
@@ -2178,6 +2194,10 @@ impl App {
             folds: Vec::new(),
             folding: None,
             relayed: HashMap::new(),
+            tasks: Vec::new(),
+            starting: None,
+            task_style: started::Style::chosen(),
+            tasks_read: None,
             pressed: None,
         }
     }
@@ -2327,6 +2347,7 @@ impl App {
             self.listed();
             self.follow_place().await;
             self.count_behind();
+            self.read_tasks().await;
             if std::mem::take(&mut self.want_older) {
                 self.older().await;
             }
@@ -2621,6 +2642,8 @@ impl App {
         self.folds.clear();
         self.folding = None;
         self.relayed.clear();
+        self.tasks.clear();
+        self.starting = None;
         self.held.clear();
         self.live = None;
         self.any_history = false;
@@ -2796,6 +2819,11 @@ impl App {
                 }));
             return;
         }
+        // A task started stands out, and a click opens it in the pane.
+        if name == served::START && !failed {
+            self.commit_started(arguments, output);
+            return;
+        }
         let draw = match self.verbose {
             true => transcript::tool,
             false => transcript::clean,
@@ -2843,6 +2871,162 @@ impl App {
         self.folding = Some((at, self.rows_drawn));
     }
 
+    /// The task a `start_task` call started, joining the tasks started
+    /// right before it.
+    fn commit_started(&mut self, arguments: &Value, output: &str) {
+        let name = arguments["name"].as_str().unwrap_or("task").to_owned();
+        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
+            .find(|word| word.starts_with("turn:"))
+            .map(calls::handle_bot)
+            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
+            .unwrap_or_else(|| name.clone());
+        let task = started::Task {
+            bot,
+            name,
+            brief: arguments["brief"].as_str().unwrap_or("").to_owned(),
+            state: "starting".into(),
+        };
+        self.tasks_read = None;
+        if let Some((at, drawn)) = self.starting
+            && drawn == self.rows_drawn
+        {
+            self.tasks[at].push(task.clone());
+            if self.draw_started(at) {
+                return;
+            }
+            // Gone from the conversation: this task starts a group of its own.
+            self.tasks[at].pop();
+        }
+        let at = self.tasks.len();
+        self.tasks.push(vec![task]);
+        let (lines, marks) = self.started_lines(at);
+        let count = lines.len();
+        self.commit(lines);
+        let from = self.pending.len() - count;
+        let tag = screen::Mark::Tag(screen::Tag::Tasks(at as u64));
+        self.marks
+            .extend((from..from + count).map(|line| (line, tag.clone())));
+        self.marks
+            .extend(marks.into_iter().map(|(line, mark)| (from + line, mark)));
+        self.starting = Some((at, self.rows_drawn));
+    }
+
+    /// The rows of the tasks started together as `at`, and the buttons
+    /// on them that open each.
+    fn started_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
+        let tasks = &self.tasks[at];
+        let rows = started::draw(self.task_style, tasks, self.prose());
+        let mut marks = Vec::new();
+        let lines = (rows.into_iter().enumerate())
+            .map(|(line, (row, task))| {
+                if let Some(task) = task {
+                    let button = format!("{}task/{}", screen::BUTTON, tasks[task].bot);
+                    marks.push((line, screen::Mark::Link(button)));
+                }
+                row
+            })
+            .collect();
+        (lines, marks)
+    }
+
+    /// The tasks started together as `at` drawn again where they are;
+    /// whether they are still in the conversation.
+    fn draw_started(&mut self, at: usize) -> bool {
+        let (lines, marks) = self.started_lines(at);
+        self.flush();
+        (self.screen).replace_tagged(screen::Tag::Tasks(at as u64), lines, marks)
+    }
+
+    /// What the tasks started are doing, read again every few seconds:
+    /// those still at work, and every one when news of them came.
+    async fn read_tasks(&mut self) {
+        if self.tasks.is_empty()
+            || self
+                .tasks_read
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        let all = self.tasks_read.is_none();
+        self.tasks_read = Some(Instant::now());
+        let mut bots: Vec<String> = (self.tasks.iter().flatten())
+            .filter(|task| all || !started::settled(&task.state))
+            .map(|task| task.bot.clone())
+            .collect();
+        bots.sort();
+        bots.dedup();
+        let mut states = HashMap::new();
+        for bot in bots {
+            let read = self
+                .client
+                .request("turns", json!({"bot": bot, "newest": true, "limit": 1}))
+                .await;
+            let state = match read {
+                Ok(page) => started::state(&page["turns"][0]),
+                Err(_) => "removed".to_owned(),
+            };
+            states.insert(bot, state);
+        }
+        for at in 0..self.tasks.len() {
+            let mut changed = false;
+            for task in &mut self.tasks[at] {
+                if let Some(state) = states.get(&task.bot)
+                    && *state != task.state
+                {
+                    task.state = state.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                self.draw_started(at);
+            }
+        }
+    }
+
+    /// The task `bot` opened in the pane: its own Sonny, to watch it and
+    /// talk to it.
+    fn open_task(&mut self, bot: &str) {
+        let name = (self.tasks.iter().flatten())
+            .find(|task| task.bot == bot)
+            .map_or(bot.to_owned(), |task| task.name.clone());
+        let args = ["--no-sound", "--no-layout", "--bot", bot].map(str::to_owned);
+        if let Err(error) = self.embed(&name, &args) {
+            self.notice = Some(format!("could not open {name}: {error}"));
+        }
+    }
+
+    /// Sonny run with `args` in the pane, on a terminal of its own: a side
+    /// chat, or a task opened to watch.
+    fn embed(&mut self, title: &str, args: &[String]) -> Result<(), String> {
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut command = std::process::Command::new(me);
+        command
+            .arg("--store")
+            .arg(&self.options.store)
+            .arg("--socket")
+            .arg(&self.options.socket)
+            .args(args);
+        if let Some(model) = &self.turn_model {
+            command.args(["--model", model]);
+        }
+        let mut program = portable_pty::CommandBuilder::new(command.get_program());
+        program.args(command.get_args());
+        if let Ok(here) = std::env::current_dir() {
+            program.cwd(here);
+        }
+        program.env("TERM", "xterm-256color");
+        let height = self.height.saturating_sub(2).max(2) as u16;
+        let width = match pane::width(self.full_width, PROSE as u16) {
+            0 => 80,
+            width => width,
+        };
+        let woken = self.woken.clone();
+        let drawn = move || woken.notify_one();
+        let program = embed::Embedded::spawn(program, height, width, term::light(), drawn)?;
+        self.open_pane(pane::Pane::program(title, program));
+        Ok(())
+    }
+
     /// The calls folded at `at` drawn again where they are, folded or
     /// open; whether they are still in the conversation.
     fn draw_fold(&mut self, at: usize) -> bool {
@@ -2862,7 +3046,8 @@ impl App {
 
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
-    /// between agents at NODE; `answer/N/ID` answers the question
+    /// between agents at NODE; `task/BOT` opens the task BOT in the pane;
+    /// `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press(&mut self, button: &str) {
         if let Some(at) = button
@@ -2872,6 +3057,9 @@ impl App {
         {
             self.folds[at].open = !self.folds[at].open;
             self.draw_fold(at);
+        }
+        if let Some(bot) = button.strip_prefix("task/") {
+            self.open_task(bot);
         }
         if let Some(node) = button
             .strip_prefix("said/")
@@ -4692,13 +4880,13 @@ impl App {
         if self.finding.is_none()
             && let Some(pane) = &mut self.pane
         {
-            // A program has every key but Shift+Tab, which comes back here.
+            // A program has every key but Ctrl+], which comes back here.
             if self.pane_keys
                 && let Some(program) = &pane.program
             {
-                match key.code {
-                    KeyCode::BackTab => self.pane_keys = false,
-                    _ => program.key(*key),
+                match switches(key) {
+                    true => self.pane_keys = false,
+                    false => program.key(*key),
                 }
                 return true;
             }
@@ -4712,7 +4900,6 @@ impl App {
                 let scrolls = matches!(
                     key.code,
                     KeyCode::Tab
-                        | KeyCode::BackTab
                         | KeyCode::PageUp
                         | KeyCode::PageDown
                         | KeyCode::Home
@@ -4722,7 +4909,7 @@ impl App {
                     view.keep();
                 }
                 match key.code {
-                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
                         pane.screen.unselect();
                         self.copied(&text);
@@ -4753,7 +4940,7 @@ impl App {
                     {
                         watch.resolved = !watch.resolved
                     }
-                    KeyCode::Tab | KeyCode::BackTab => self.pane_keys = false,
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
                     _ if copy && let Some(text) = pane.screen.selected() => {
                         pane.screen.unselect();
                         self.copied(&text);
@@ -4772,12 +4959,13 @@ impl App {
                 }
                 return true;
             }
-            // Tab, with nothing typed, puts the keys in the pane.
-            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-                && self.input.is_empty()
-                && self.picker.is_none()
-                && self.choosing.is_none()
-                && self.reacting.is_none()
+            // Ctrl+], or Tab with nothing typed, puts the keys in the pane.
+            if switches(key)
+                || key.code == KeyCode::Tab
+                    && self.input.is_empty()
+                    && self.picker.is_none()
+                    && self.choosing.is_none()
+                    && self.reacting.is_none()
             {
                 pane.screen.unselect();
                 self.pane_keys = true;
@@ -5779,41 +5967,12 @@ impl App {
         {
             self.notice = Some(format!("the side chat did not take the question: {error}"));
         }
-        let me = match std::env::current_exe() {
-            Ok(me) => me,
-            Err(error) => {
-                self.notice = Some(error.to_string());
-                return;
-            }
-        };
-        let mut command = std::process::Command::new(me);
-        command
-            .arg("--store")
-            .arg(&self.options.store)
-            .arg("--socket")
-            .arg(&self.options.socket)
-            .args(["--no-sound", "--no-layout", "--bot", &name])
-            .args(["--side", &forked["head"].as_i64().unwrap_or(0).to_string()]);
-        if let Some(model) = &self.turn_model {
-            command.args(["--model", model]);
-        }
+        let head = forked["head"].as_i64().unwrap_or(0).to_string();
+        let args =
+            ["--no-sound", "--no-layout", "--bot", &name, "--side", &head].map(str::to_owned);
         // Beside the conversation, on a terminal of its own.
-        let mut program = portable_pty::CommandBuilder::new(command.get_program());
-        program.args(command.get_args());
-        if let Ok(here) = std::env::current_dir() {
-            program.cwd(here);
-        }
-        program.env("TERM", "xterm-256color");
-        let height = self.height.saturating_sub(2).max(2) as u16;
-        let width = match pane::width(self.full_width, PROSE as u16) {
-            0 => 80,
-            width => width,
-        };
-        let woken = self.woken.clone();
-        let drawn = move || woken.notify_one();
-        match embed::Embedded::spawn(program, height, width, term::light(), drawn) {
-            Ok(program) => self.open_pane(pane::Pane::program("side chat", program)),
-            Err(error) => self.notice = Some(format!("no side chat: {error}")),
+        if let Err(error) = self.embed("side chat", &args) {
+            self.notice = Some(format!("no side chat: {error}"));
         }
     }
 
@@ -7997,13 +8156,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tasks_started_in_a_row_fold_into_one_row_a_click_opens() {
+    async fn agents_messaged_in_a_row_fold_into_one_row_a_click_opens() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
         app.width = 80;
         let start = |app: &mut App, name: &str| {
-            let arguments = json!({"name": name, "brief": format!("Fix {name}")});
-            app.commit_call("c", served::START, &arguments, "{}", false);
+            let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
+            app.commit_call("c", "shell", &json!({"command": command}), "", false);
         };
         app.commit(vec![Line::from("› fix the three bugs")]);
         start(&mut app, "calc.add");
@@ -8012,7 +8171,7 @@ mod tests {
             [
                 "› fix the three bugs",
                 "",
-                "• Started calc.add",
+                "• Messaged calc.add",
                 "  └ Fix calc.add"
             ]
         );
@@ -8023,7 +8182,7 @@ mod tests {
             [
                 "› fix the three bugs",
                 "",
-                "• Started calc.add, calc.neg and calc.div ▸"
+                "• Messaged calc.add, calc.neg and calc.div ▸"
             ]
         );
         // A click on it opens it, and again folds it.
@@ -8031,15 +8190,15 @@ mod tests {
         let button = app.pressed.take().unwrap();
         app.press(&button).await;
         let open = drawn(&mut app);
-        assert_eq!(open[2], "• Started calc.add, calc.neg and calc.div ▾");
+        assert_eq!(open[2], "• Messaged calc.add, calc.neg and calc.div ▾");
         assert_eq!(
             open[3..],
             [
-                "• Started calc.add",
+                "• Messaged calc.add",
                 "  └ Fix calc.add",
-                "• Started calc.neg",
+                "• Messaged calc.neg",
                 "  └ Fix calc.neg",
-                "• Started calc.div",
+                "• Messaged calc.div",
                 "  └ Fix calc.div"
             ]
         );
@@ -8058,15 +8217,46 @@ mod tests {
             "{}",
             false,
         );
-        app.commit(vec![Line::from("• Started those.")]);
+        app.commit(vec![Line::from("• Messaged those.")]);
         start(&mut app, "calc.sub");
         let rows = drawn(&mut app);
         assert_eq!(
             rows[2],
-            "• Started calc.add, calc.neg, calc.div and calc.mul ▸"
+            "• Messaged calc.add, calc.neg, calc.div and calc.mul ▸"
         );
         assert_eq!(rows[4], "• Removed calc.add");
-        assert_eq!(rows[8], "• Started calc.sub");
+        assert_eq!(rows[8], "• Messaged calc.sub");
+    }
+
+    #[tokio::test]
+    async fn tasks_started_in_a_row_are_one_roster_a_click_opens_one_from() {
+        let client = daemon_answering(|asked| match asked["bot"].as_str() {
+            Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
+            _ => json!({"turns": [{"turn": 1, "status": "running"}]}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.task_style = started::Style::Roster;
+        let start = |app: &mut App, name: &str| {
+            let arguments = json!({"name": name, "brief": format!("Fix {name}")});
+            let output = format!("turn:calc.{name}/1");
+            app.commit_call("c", served::START, &arguments, &output, false);
+        };
+        start(&mut app, "add");
+        start(&mut app, "neg");
+        let rows = drawn(&mut app);
+        assert_eq!(rows[0], "◆ Started 2 tasks");
+        assert!(rows[1].starts_with("  ○ add  Fix add") && rows[1].ends_with("starting ›"));
+        // What each does is read, and drawn where they are.
+        app.read_tasks().await;
+        let rows = drawn(&mut app);
+        assert!(rows[1].starts_with("  ✓ add") && rows[1].ends_with("done ›"));
+        assert!(rows[2].starts_with("  ● neg") && rows[2].ends_with("working ›"));
+        // A click on a task's row opens that task.
+        let links = app.screen.links();
+        assert_eq!(links[0], None);
+        assert_eq!(links[2].as_deref(), Some("sonny:task/calc.neg"));
     }
 
     #[tokio::test]
