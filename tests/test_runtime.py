@@ -621,6 +621,21 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
             assert request['cache_control'] == cache
+            # The API reads breakpoints in order (tools, system, messages,
+            # then the request's own last one) and refuses a longer lifetime
+            # after a shorter one.
+            marks = [b['cache_control'] for b in request.get('tools', []) + request.get('system', [])
+                     + [b for m in request['messages'] for b in m['content']] if 'cache_control' in b]
+            ttls = [{'5m': 300, '1h': 3600}[m.get('ttl', '5m')] for m in marks + [request['cache_control']]]
+            if any(later > earlier for earlier, later in zip(ttls, ttls[1:])):
+                body = (b'{"type":"error","error":{"type":"invalid_request_error","message":'
+                        b'"a ttl=1h cache_control block must not come after a ttl=5m cache_control block"}}')
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             summary = is_summary(request)
             # A summary of its own disables tool calls; a copy of the bot's
             # call keeps its tool choice, which the message cache covers.

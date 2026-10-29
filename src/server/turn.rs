@@ -637,7 +637,27 @@ impl Turn {
         } else {
             Vec::new()
         };
-        window.prefix(&listed, budget)
+        window.prefix(&listed, budget, self.settings().cache_hour())
+    }
+
+    /// The bot's settings, with one cache lifetime for every request that
+    /// carries its pinned summary and note: the turn's model's, the
+    /// summarizer's, which copies the turn's calls, and the fallback's,
+    /// which answers them.
+    fn with_one_lifetime(&self, record: &agent_runtime::store::Bot, model: &str) -> Settings {
+        let summarizer = summarizer(record);
+        one_lifetime(
+            &self.providers,
+            record.family().ok(),
+            &record.settings,
+            [
+                Some(model),
+                Some(summarizer.as_str()),
+                record.fallback.as_deref(),
+            ]
+            .into_iter()
+            .flatten(),
+        )
     }
 
     /// The bot's settings. Every use is inside `rounds`, which reads them
@@ -1956,8 +1976,9 @@ impl Turn {
     ) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
-        self.settings.get_or_init(|| record.settings.clone());
         let context = self.store.op("context", move |db| db.context(turn)).await?;
+        self.settings
+            .get_or_init(|| self.with_one_lifetime(&record, &context.model));
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
@@ -5162,6 +5183,28 @@ fn failure(error: Error) -> Outcome {
     }
 }
 
+/// `settings` with five minutes for an hour where any of the `models` a
+/// request may go to must keep five minutes, as a longer marker may not
+/// follow a shorter one. A model on a provider unknown here or of another
+/// family is sent nothing.
+fn one_lifetime<'a>(
+    providers: &HashMap<String, Provider>,
+    family: Option<agent_runtime::codec::Family>,
+    settings: &Settings,
+    models: impl IntoIterator<Item = &'a str>,
+) -> Settings {
+    let mut settings = settings.clone();
+    let takes_hour = (models.into_iter())
+        .filter_map(|reference| split_model(reference).ok())
+        .filter_map(|(name, model)| Some((providers.get(name)?, model)))
+        .filter(|(provider, _)| Some(provider.family()) == family)
+        .all(|(provider, model)| provider.takes_cache_hour(model));
+    if settings.cache_hour() && !takes_hour {
+        settings.cache_ttl = Some(agent_runtime::store::CacheTtl::Minutes);
+    }
+    settings
+}
+
 /// The summarizer: the bot's own model unless the client named one of the
 /// same family, checked at creation.
 fn summarizer(record: &agent_runtime::store::Bot) -> String {
@@ -5216,19 +5259,85 @@ mod tests {
         assert!(super::backoff(1, 7).as_millis() < 400);
     }
     #[test]
+    fn one_model_that_keeps_five_minutes_keeps_every_request_at_five() {
+        use super::{HashMap, Provider, Settings};
+        use agent_runtime::{codec::Family, provider::Transport, store::CacheTtl};
+        let provider = |url| {
+            Provider::new(Transport::new(1, 1).unwrap(), Family::Anthropic, url, None).unwrap()
+        };
+        let providers = HashMap::from([
+            (
+                "anthropic".to_owned(),
+                provider("https://api.anthropic.com/v1"),
+            ),
+            (
+                "bedrock".to_owned(),
+                provider("https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1"),
+            ),
+        ]);
+        let hour = Settings {
+            cache_ttl: Some(CacheTtl::Hour),
+            ..Settings::default()
+        };
+        let ttl = |models: &[&str]| {
+            super::one_lifetime(
+                &providers,
+                Some(Family::Anthropic),
+                &hour,
+                models.iter().copied(),
+            )
+            .cache_ttl
+        };
+        assert_eq!(
+            ttl(&[
+                "anthropic/claude-opus-5-5",
+                "bedrock/us.anthropic.claude-opus-5-5-v1:0"
+            ]),
+            Some(CacheTtl::Hour)
+        );
+        // A summarizer or fallback on older Claude there brings the turn's
+        // own calls down too; a provider not here is sent nothing.
+        assert_eq!(
+            ttl(&[
+                "anthropic/claude-opus-5-5",
+                "bedrock/anthropic.claude-sonnet-4-20250514-v1:0"
+            ]),
+            Some(CacheTtl::Minutes)
+        );
+        assert_eq!(
+            ttl(&["anthropic/claude-opus-5-5", "gone/claude-3-7-sonnet"]),
+            Some(CacheTtl::Hour)
+        );
+        // Five minutes stays five minutes.
+        assert_eq!(
+            super::one_lifetime(
+                &providers,
+                Some(Family::Anthropic),
+                &Settings::default(),
+                ["anthropic/claude-opus-5-5"]
+            )
+            .cache_ttl,
+            None
+        );
+    }
+
+    #[test]
     fn pinned_blocks_cache_only_with_their_provider_format() {
         use agent_runtime::codec::Family;
-        let anthropic: serde_json::Value =
-            serde_json::from_slice(&super::pinned_item(Family::Anthropic, "stable").unwrap())
-                .unwrap();
-        assert_eq!(
-            anthropic["content"][0]["cache_control"]["type"],
-            "ephemeral"
-        );
-        assert_eq!(
-            super::pinned_item(Family::Responses, "stable").unwrap(),
-            Family::Responses.user_item("stable").unwrap()
-        );
+        for hour in [false, true] {
+            let anthropic: serde_json::Value = serde_json::from_slice(
+                &super::pinned_item(Family::Anthropic, "stable", hour).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                anthropic["content"][0]["cache_control"],
+                agent_runtime::codec::cache_control(hour)
+            );
+            assert_eq!(
+                super::pinned_item(Family::Responses, "stable", hour).unwrap(),
+                Family::Responses.user_item("stable").unwrap()
+            );
+        }
     }
     use super::*;
     use serde_json::Value;
