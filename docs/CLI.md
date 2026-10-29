@@ -309,6 +309,15 @@ family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `~/.agent/config.toml` sets `web_search = "disabled"`. An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
+`run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that
+answers a request a safety classifier declined, that request alone; the next
+goes to the bot's own model. Without it the bot takes its model's entry in
+`[fallbacks]` in `~/.agent/config.toml`, if any:
+
+```toml
+[fallbacks]
+"anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
+```
 Other client commands require an already running daemon.
 
 `models` prints `~/.agent/models`, the models clients offer, as JSON

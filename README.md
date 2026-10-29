@@ -214,6 +214,9 @@ bot can also read a page with `web_fetch`, which the daemon runs itself. Put
 `web_search = "disabled"` in `config.toml` to leave both out of new bots.
 A message one agent sends another reaches its model with a line naming the
 sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
+A request Claude's safety classifiers decline ends the turn, unless
+`[fallbacks]` names another model for the bot's own; that model then answers
+that request alone ([CLI.md](docs/CLI.md)).
 
 ## How fast is it?
 

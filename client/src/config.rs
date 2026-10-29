@@ -9,6 +9,9 @@
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //!
+//! [fallbacks]                   # the model a declined request goes to, by model
+//! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
+//!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
@@ -54,6 +57,10 @@ pub struct Config {
     /// sent it with no line naming the sender: `senders = "hidden"`;
     /// `"shown"`, the default, names it.
     pub hide_senders: bool,
+    /// Each model's fallback, as `provider/model` in its family: a new
+    /// agent on that model that names none sends a request a safety
+    /// classifier declined to it, that request alone.
+    pub fallbacks: BTreeMap<String, String>,
     pub judge: Judge,
     pub sonny: Sonny,
 }
@@ -337,6 +344,14 @@ fn parse(text: &str) -> Result<Config, String> {
                 "hidden" => true,
                 other => return Err(format!("senders is shown or hidden, not {other}")),
             };
+            continue;
+        }
+        if name == "fallbacks" {
+            let models = value.as_table().ok_or("fallbacks must be a table")?;
+            for (model, fallback) in models {
+                let fallback = string(&format!("fallbacks.{model}"), fallback)?;
+                config.fallbacks.insert(model.clone(), fallback);
+            }
             continue;
         }
         if let Some(top) = match name.as_str() {
@@ -686,6 +701,12 @@ mod tests {
         assert!(!quiet.sonny.chime && quiet.sonny.verbose);
         assert!(parse("senders = \"hidden\"").unwrap().hide_senders);
         assert!(!parse("senders = \"shown\"").unwrap().hide_senders);
+        let fallbacks = parse("[fallbacks]\n\"a/big\" = \"a/other\"\n")
+            .unwrap()
+            .fallbacks;
+        assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
+        assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
+        assert!(parse("fallbacks = \"a/other\"").is_err());
         for (text, error) in [
             (
                 "web_search = \"cached\"",
