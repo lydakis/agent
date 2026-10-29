@@ -315,6 +315,8 @@ fn memory() -> Value {
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
         },
+        "read": {"type": "string", "minLength": 1,
+            "description": "The name of a fact to open: its whole file. The read is recorded, so the nightly cleanup can check facts no agent has read in 30 days."},
         "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
         "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
         "check": {"type": "boolean",
@@ -328,7 +330,7 @@ fn memory() -> Value {
     json!({
         "name": MEMORY,
         "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
-            says how to read and what to save. Save one fact, or remove one; index or check a folder's facts; \
+            says how to read and what to save. Read one fact, save one, or remove one; index or check a folder's facts; \
             with none of these, the result shows both indexes (the person's and this project's), each with its \
             folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
             nothing: merge or remove facts first.",
