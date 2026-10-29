@@ -1571,7 +1571,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 61;
+    pub const SCHEMA: i32 = 62;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1673,6 +1673,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS compactions_cut ON compactions(cut);
             CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;
             CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                item BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT);
@@ -4461,10 +4463,10 @@ impl Database {
         // Already single-line items need no rewrite (escaped newlines are fine).
         // Pictures go without their bytes, as other history reads return them.
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -4564,13 +4566,15 @@ impl Database {
         // view has may not be in the item as stored: the view decides.
         let mut contains = self.conn.prepare_cached(
             "SELECT instr(item,x'0a')>0 OR instr(item,x'0d')>0
-                OR instr(lower(CAST(item AS TEXT)),?2)>0 FROM nodes WHERE id=?1",
+                OR instr(lower(CAST(item AS TEXT)),?2)>0
+             FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)",
         )?;
         // The raw item may match only in what the view leaves out, such as
         // a picture's bytes, so a match counts once the view has it too.
         let mut reading = self.conn.prepare_cached(&format!(
             "SELECT CAST({READING_ITEM} AS TEXT),json_extract(CAST(item AS TEXT),'$.type')
-             FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+             FROM (SELECT {PICTURELESS} AS item FROM
+                (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut rows = chain.query(params![head])?;
         let mut skipping = own || before.is_some();
@@ -4735,7 +4739,8 @@ impl Database {
         if let Some((turn, mut saved, status, saved_options, prompt_node, saved_images)) = prior {
             if let Some(node) = prompt_node {
                 saved = self.conn.prepare_cached(
-                    "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
+                    "SELECT json_extract(CAST(COALESCE((SELECT item FROM declined WHERE node=?1),item) AS TEXT),
+                        '$.content[0].text') FROM nodes WHERE id=?1"
                 )?.query_row([node], |r| r.get(0))?;
             }
             // A turn records the folder it runs in; a retry that names none
@@ -7058,6 +7063,72 @@ impl Database {
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
             params![status, epoch_ms(), turn],
         )?;
+        // A request a safety classifier declined, and the bot's fallback
+        // too: what it added since the model last answered goes to later
+        // requests as notes in its place, since Anthropic says to remove it
+        // before going on. Each note is the size of what it replaces, so
+        // nothing counted for the context changes, and the originals are
+        // kept beside them.
+        let mut left_out = 0;
+        if code == Some("provider_refusal") {
+            let category = (error.and_then(|e| e.facts.as_ref()))
+                .and_then(|facts| facts.get("category"))
+                .and_then(Value::as_str);
+            let family = bot.family()?;
+            let mut added = Vec::new();
+            let (mut node, mut child) = (head, None::<i64>);
+            while let Some(id) = node {
+                let (parent, item, first): (Option<i64>, Vec<u8>, Option<i64>) = tx
+                    .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
+                    .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                if super::context::model_output(&item) {
+                    break;
+                }
+                // A node another bot reaches, as a fork taken while the
+                // request was out does, is its history too: it and what
+                // came before it stay as they are.
+                let shared: bool = tx
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1
+                                OR note=?1 OR compaction=?1 OR elision=?1))
+                            OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1 AND id IS NOT ?3)",
+                    )?
+                    .query_row(params![id, bot.name, child], |r| r.get(0))?;
+                if shared {
+                    break;
+                }
+                added.push((id, item));
+                if first == Some(turn) {
+                    break;
+                }
+                (node, child) = (parent, Some(id));
+            }
+            let mut noted = false;
+            for (id, item) in added.iter().rev() {
+                let result = super::context::is_tool_result(item);
+                let first = !result && !noted;
+                let note = super::context::declined(family, item, category, first, item.len())?;
+                let Some(note) = note else { continue };
+                noted |= !result;
+                left_out += 1;
+                tx.prepare_cached("INSERT OR IGNORE INTO declined(node,item) VALUES (?,?)")?
+                    .execute(params![id, item])?;
+                tx.prepare_cached("UPDATE nodes SET item=? WHERE id=?")?
+                    .execute(params![note, id])?;
+                // A stub quotes the result, so it says the same.
+                let stub: Option<i64> = tx
+                    .prepare_cached("SELECT length(item) FROM stubs WHERE node=?")?
+                    .query_row([id], |r| r.get(0))
+                    .optional()?;
+                if let Some(len) = stub
+                    && let Some(note) =
+                        super::context::declined(family, item, category, first, len as usize)?
+                {
+                    tx.prepare_cached("UPDATE stubs SET item=? WHERE node=?")?
+                        .execute(params![note, id])?;
+                }
+            }
+        }
         // An expiring bot's clock starts again from this turn's end.
         tx.execute(
             "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL,
@@ -7074,6 +7145,9 @@ impl Database {
         let mut data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         with_facts(&mut data, error);
+        if left_out > 0 {
+            data["left_out"] = json!(left_out);
+        }
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
         self.approvals -= unstarted;
@@ -8134,6 +8208,7 @@ impl Database {
             tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
             tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
+            tx.execute("DELETE FROM declined WHERE node=?", [id])?;
             tx.execute("DELETE FROM senders WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
@@ -8457,7 +8532,8 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
-             FROM (SELECT id,{PICTURELESS} AS item FROM nodes WHERE id=?1) n
+             FROM (SELECT id,{PICTURELESS} AS item FROM
+                (SELECT n.id,COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id"
         ))?;
         for &node in wanted {
@@ -8555,12 +8631,13 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
-                    substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
-                    length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
+                    substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END,1,200),
+                    length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END),
                     t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,
                         CASE WHEN t.bot_model IS NULL THEN b.reasoning ELSE t.bot_reasoning END),t.summary_ms,
                     t.budget_tokens
              FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
+             LEFT JOIN declined d ON d.node=t.prompt_node
              WHERE t.bot=?1 AND t.id>?2 AND t.id<?3 ORDER BY t.id {order} LIMIT ?4"
         ))?;
         let before = before.unwrap_or(i64::MAX);
@@ -8860,7 +8937,11 @@ impl Database {
         }
         let item: Vec<u8> =
             self.conn
-                .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+                .query_row(
+                    "SELECT COALESCE(d.item,n.item) FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
+                    [node],
+                    |r| r.get(0),
+                )?;
         let Some((_, _, output)) = super::context::tool_result(&item) else {
             return fail("result_not_found");
         };
@@ -10371,7 +10452,13 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE bots DROP COLUMN fallbacks;",
         )?;
     }
-    // 60 -> 61: the daemon's companions, in a table the schema creates;
+    // 60 -> 61: what a declined request added goes to later requests as
+    // notes. No request was declined so.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+            item BLOB NOT NULL);",
+    )?;
+    // 61 -> 62: the daemon's companions, in a table the schema creates;
     // there were none.
     Ok(())
 }
