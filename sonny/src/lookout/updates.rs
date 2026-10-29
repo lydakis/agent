@@ -34,8 +34,6 @@ const PENDING: usize = 128;
 /// How much of a task's reply a note carries, in characters: the whole of
 /// almost any, so the lead need not read the turn again.
 pub const REPLY_CHARS: usize = 32_000;
-/// How many replies read before their turn's news are kept for it.
-const EARLY_REPLIES: usize = 256;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
@@ -169,9 +167,8 @@ pub struct Updates {
     from: HashMap<Key, String>,
     origin: HashMap<Key, String>,
     answer_to: HashMap<Key, i64>,
-    /// Turns whose answer a trigger passes to the lead: when they become
-    /// news if it does not, and the news.
-    forwarding: HashMap<Key, (Instant, String, Option<String>, Option<String>)>,
+    /// Turns whose answer a trigger passes to the lead.
+    forwarding: HashMap<Key, Forward>,
     /// Approvals not yet answered: when they become news, and the call.
     approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Each task's news, in the order it first came.
@@ -186,9 +183,16 @@ pub struct Updates {
     opened: u64,
     /// Tasks' turns that resolved them, until they are told.
     resolving: crate::resolved::Own,
-    /// Replies read before their turn was news, as a trigger's answer the
-    /// lead hears only if the trigger does not pass it on.
-    replies: HashMap<Key, String>,
+}
+
+/// A turn whose answer a trigger passes to the lead: when it becomes news
+/// if the trigger does not, the news, and what the task replied.
+struct Forward {
+    at: Instant,
+    status: String,
+    from: Option<String>,
+    origin: Option<String>,
+    reply: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -218,7 +222,6 @@ impl Updates {
             memory_seen: None,
             opened: now_ms(),
             resolving: Default::default(),
-            replies: HashMap::new(),
         }
     }
 
@@ -405,8 +408,16 @@ impl Updates {
                     .and_then(|c| self.bots.get(c))
                     .and_then(|c| c.id);
                 if answered.is_some() && answered == creator {
-                    self.forwarding
-                        .insert(key(turn), (now + FORWARD, status, from, origin));
+                    self.forwarding.insert(
+                        key(turn),
+                        Forward {
+                            at: now + FORWARD,
+                            status,
+                            from,
+                            origin,
+                            reply: None,
+                        },
+                    );
                 } else {
                     self.tell(name, turn, &status, from, None, origin);
                 }
@@ -491,7 +502,8 @@ impl Updates {
     }
 
     /// What a task replied, ending a turn: told with that turn's news,
-    /// cut at `REPLY_CHARS`.
+    /// cut at `REPLY_CHARS`, or with a trigger's answer once it is news.
+    /// A turn that is no news, or no longer, drops it.
     pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
         let text = text.trim();
         if !self.live || text.is_empty() {
@@ -505,14 +517,10 @@ impl Updates {
                 .flatten()
                 .find(|t| t.turn == turn && t.status != APPROVAL && t.status != QUIET)
         });
-        match told {
-            Some(t) => t.reply = Some(reply),
-            None => {
-                if self.replies.len() >= EARLY_REPLIES {
-                    self.replies.clear();
-                }
-                self.replies.insert((name.to_owned(), turn), reply);
-            }
+        if let Some(t) = told {
+            t.reply = Some(reply);
+        } else if let Some(forwarding) = self.forwarding.get_mut(&(name.to_owned(), turn)) {
+            forwarding.reply = Some(text.to_owned());
         }
     }
 
@@ -541,10 +549,6 @@ impl Updates {
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         };
-        let reply = match status {
-            APPROVAL | QUIET => None,
-            _ => self.replies.remove(&(name.to_owned(), turn)),
-        };
         let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
@@ -560,7 +564,7 @@ impl Updates {
             count: 1,
             which,
             resolved,
-            reply,
+            reply: None,
         };
         news.merge(match theirs {
             true => News {
@@ -594,12 +598,22 @@ impl Updates {
         let late: Vec<Key> = self
             .forwarding
             .iter()
-            .filter(|(_, (at, ..))| *at <= now)
+            .filter(|(_, forward)| forward.at <= now)
             .map(|(key, _)| key.clone())
             .collect();
         for key in late {
-            if let Some((_, status, from, origin)) = self.forwarding.remove(&key) {
+            if let Some(forward) = self.forwarding.remove(&key) {
+                let Forward {
+                    status,
+                    from,
+                    origin,
+                    reply,
+                    ..
+                } = forward;
                 self.tell(&key.0, key.1, &status, from, None, origin);
+                if let Some(reply) = reply {
+                    self.replied(&key.0, key.1, &reply);
+                }
             }
         }
         let waited: Vec<Key> = (self.approvals.iter())
@@ -1418,6 +1432,53 @@ mod tests {
         updates.unsent(told);
         let again = updates.take();
         assert!(text(&again).contains("shop.docs/2 waiting for the person's approval"));
+    }
+
+    #[test]
+    fn a_reply_is_kept_only_while_its_turn_may_still_be_news() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        // Waited on: no news, and its reply is not kept.
+        updates.event(
+            &ev(
+                "shop.lead",
+                Some(9),
+                "turn_waiting",
+                json!({"handles": ["turn:shop.fix/4"]}),
+            ),
+            now,
+        );
+        let lead = json!({"from": {"bot": "shop.lead", "turn": 9}});
+        turn(&mut updates, "shop.fix", 4, lead, "completed");
+        updates.replied("shop.fix", 4, "fixed");
+        assert!(!updates.news());
+        updates.event(
+            &ev(
+                "shop.lead",
+                Some(9),
+                "turn_finished",
+                json!({"status": "completed"}),
+            ),
+            now,
+        );
+        // A trigger's answer to the lead: its reply waits with it.
+        let fire = |turn| json!({"request_id": format!("trigger_t{turn}.to.1")});
+        turn(&mut updates, "shop.docs", 5, fire(5), "completed");
+        turn(&mut updates, "shop.docs", 6, fire(6), "completed");
+        updates.replied("shop.docs", 5, "passed on");
+        updates.replied("shop.docs", 6, "not passed on");
+        let passed = json!({"from": {"bot": "shop.docs", "turn": 5}});
+        updates.event(&ev("shop.lead", Some(10), "accepted", passed), now);
+        assert_eq!(updates.forwarding.len(), 1, "passed on, with its reply");
+        updates.expire(Instant::now() + FORWARD);
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.docs/6 completed"), "{told}");
+        assert!(told.contains("> not passed on"), "{told}");
+        assert!(
+            !told.contains("passed on\n") && !told.contains("> passed on"),
+            "{told}"
+        );
+        assert!(updates.forwarding.is_empty());
     }
 
     #[test]
