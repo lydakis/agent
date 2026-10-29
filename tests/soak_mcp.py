@@ -50,9 +50,13 @@ class Soak(ServedToolTests):
             self.assertIn('Script completed', self.call('calc.lead', 'exec', body))
             if i % 25 == 0 or i == n - 1:
                 print(f'run {i + 1}: lookout {rss_mb(service.pid)} MB, {time.monotonic() - started:.0f}s', flush=True)
-        capped = self.call('calc.lead', 'exec', 'let a = []; while (true) a.push("q".repeat(1e6));')
-        print('256 MB cap:', capped[:160].replace('\n', ' | '))
-        print(f'after the cap: lookout {rss_mb(service.pid)} MB')
+        for cap in range(5):
+            capped = self.call('calc.lead', 'exec', 'let a = []; while (true) a.push("q".repeat(1e6));')
+            print(f'256 MB cap {cap + 1}: lookout {rss_mb(service.pid)} MB;', capped[:60].replace('\n', ' | '))
+        for i in range(25):
+            self.call('calc.lead', 'exec', body)
+        time.sleep(1)
+        print(f'25 scripts after the caps: lookout {rss_mb(service.pid)} MB')
         starts = (self.path / 'starts').read_text().split()
         print('server starts:', len(starts))
         saved = self.path / '.agent/sonny/exec/output'
