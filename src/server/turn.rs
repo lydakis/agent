@@ -3544,7 +3544,7 @@ impl Turn {
                     let (sender, receiver) = oneshot::channel();
                     self.collect(id, &call.call_id, receiver);
                     let start = self.registry.terminal(
-                        &self.bot,
+                        record.bot_id,
                         id,
                         command,
                         workspace.to_path_buf(),
@@ -3565,9 +3565,14 @@ impl Turn {
                     yield_ms,
                     kill,
                 }) => {
-                    let typed = self
-                        .registry
-                        .write_stdin(&self.bot, handle, &chars, yield_ms, kill);
+                    let typed = self.registry.write_stdin(
+                        record.bot_id,
+                        handle,
+                        &chars,
+                        yield_ms,
+                        kill,
+                        sandbox,
+                    );
                     match self.run_tool(typed, None, warm.as_deref_mut()).await? {
                         Ran::Done(Ok(outcome)) => outcome,
                         Ran::Done(Err(error)) => failure(error),

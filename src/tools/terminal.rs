@@ -3,7 +3,7 @@
 //! runs one, for a REPL or a program that prompts. A terminal lives until
 //! its command exits or is killed, across turns, and reports its end on its
 //! proc handle as a background command does.
-use super::{MAX_YIELD_MS, Outcome, PREVIEW_BYTES, Registry, sh};
+use super::{Credentials, MAX_YIELD_MS, Outcome, PREVIEW_BYTES, Registry, sh};
 use crate::{Error, Result, fail_with, sandbox::Policy};
 use serde_json::{Value, json};
 use std::{
@@ -34,7 +34,10 @@ const ROWS: u16 = 40;
 pub type Terminals = Arc<Mutex<HashMap<i64, Arc<Terminal>>>>;
 
 pub struct Terminal {
-    owner: String,
+    /// The bot's id, which a later bot of the same name does not share.
+    owner: i64,
+    /// What confines the command, which input typed later stays under.
+    sandbox: Option<Arc<Policy>>,
     master: AsyncFd<OwnedFd>,
     /// The command's process group, which its session leads.
     group: i32,
@@ -99,7 +102,7 @@ impl Terminal {
         let dropped = std::mem::take(&mut state.dropped);
         let (text, end) = match &mut state.end {
             Some((end, rest)) => (std::mem::take(rest), Some(end.clone())),
-            None => (text(&mut state.unread), None),
+            None => (text(&mut state.unread, Some(&registry.credentials)), None),
         };
         drop(state);
         report(registry, Some(handle), text, dropped, end)
@@ -149,21 +152,47 @@ fn report(
     }
 }
 
-/// Decode what was read, keeping a character split across reads for the
-/// next; a terminal's line ends read as plain newlines.
-fn text(unread: &mut Vec<u8>) -> String {
-    let whole = match std::str::from_utf8(unread) {
+/// Decode what was read, keeping for the next read a character split
+/// across reads and, while the command runs, the carriage returns and the
+/// start of a credential that more output may finish; a terminal's line
+/// ends read as plain newlines.
+fn text(unread: &mut Vec<u8>, running: Option<&Credentials>) -> String {
+    let mut whole = match std::str::from_utf8(unread) {
         Err(error) if error.error_len().is_none() => error.valid_up_to(),
         _ => unread.len(),
     };
+    if let Some(credentials) = running {
+        while whole > 0 && unread[whole - 1] == b'\r' {
+            whole -= 1;
+        }
+        whole -= credentials.unfinished(&unread[..whole]);
+    }
     let rest = unread.split_off(whole);
     let read = std::mem::replace(unread, rest);
-    let mut text = String::from_utf8_lossy(&read).into_owned();
-    // A program's own carriage return before the terminal's makes two.
-    while text.contains("\r\n") {
-        text = text.replace("\r\n", "\n");
+    lines(&String::from_utf8_lossy(&read))
+}
+
+/// `text` with each run of carriage returns before a newline dropped: a
+/// program's own carriage return before the terminal's makes two.
+fn lines(text: &str) -> String {
+    let mut lines = String::with_capacity(text.len());
+    let mut returns = 0;
+    for c in text.chars() {
+        match c {
+            '\r' => returns += 1,
+            '\n' => {
+                returns = 0;
+                lines.push('\n');
+            }
+            c => {
+                lines.push_str(&"\r".repeat(returns));
+                returns = 0;
+                lines.push(c);
+            }
+        }
     }
-    text
+    lines.push_str(&"\r".repeat(returns));
+    lines
 }
 
 /// A pseudo-terminal's two ends, each closed on exec.
@@ -212,7 +241,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub async fn terminal(
         &self,
-        owner: &str,
+        owner: i64,
         handle: i64,
         command: String,
         workspace: PathBuf,
@@ -263,7 +292,8 @@ impl Registry {
         };
         let (exit, exited) = watch::channel(false);
         let terminal = Arc::new(Terminal {
-            owner: owner.to_owned(),
+            owner,
+            sandbox,
             master,
             group,
             state: Mutex::new(State {
@@ -352,7 +382,7 @@ impl Registry {
                 // read; a write that sees the end reports that too.
                 let last = {
                     let mut state = terminal.state.lock().unwrap_or_else(|e| e.into_inner());
-                    let rest = text(&mut state.unread);
+                    let rest = text(&mut state.unread, None);
                     let last = report(
                         &registry,
                         None,
@@ -392,14 +422,16 @@ impl Registry {
     }
 
     /// Type `input` into `owner`'s terminal `handle`, or kill it, and return
-    /// what it writes within `yield_ms`.
+    /// what it writes within `yield_ms`. A terminal whose sandbox is no
+    /// longer its bot's, `sandbox`, takes no more input: it is ended.
     pub async fn write_stdin(
         &self,
-        owner: &str,
+        owner: i64,
         handle: i64,
         input: &str,
         yield_ms: Option<u64>,
         kill: bool,
+        sandbox: Option<Arc<Policy>>,
     ) -> Result<Outcome> {
         let terminal = self
             .terminals
@@ -416,6 +448,15 @@ impl Registry {
                 ),
             );
         };
+        if terminal.sandbox != sandbox {
+            terminal.kill();
+            return fail_with(
+                "terminal_sandbox_changed",
+                format!(
+                    "this agent's sandbox changed since proc:{handle} started, so it was ended; start it again"
+                ),
+            );
+        }
         let yield_ms = if kill {
             terminal.kill();
             MAX_YIELD_MS
@@ -432,15 +473,37 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::text;
+    use super::{Credentials, lines, text};
 
     #[test]
     fn a_character_split_across_reads_waits_for_its_end() {
+        let none = Credentials::default();
         let mut unread = "a\r\r\né".as_bytes().to_vec();
         let last = unread.pop().unwrap();
-        assert_eq!(text(&mut unread), "a\n");
+        assert_eq!(text(&mut unread, Some(&none)), "a\n");
         unread.push(last);
-        assert_eq!(text(&mut unread), "é");
+        assert_eq!(text(&mut unread, Some(&none)), "é");
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn a_credential_split_across_reads_is_redacted_whole() {
+        let credentials = Credentials::default();
+        credentials.set("KEY", "sk-secret-1234");
+        let mut unread = b"key: sk-sec".to_vec();
+        assert_eq!(text(&mut unread, Some(&credentials)), "key: ");
+        unread.extend_from_slice(b"ret-1234\r\n> ");
+        let read = text(&mut unread, Some(&credentials));
+        assert_eq!(credentials.redact(read), "[REDACTED]\n> ");
+        // A command's end holds nothing back.
+        unread.extend_from_slice(b"sk-");
+        assert_eq!(text(&mut unread, None), "sk-");
+    }
+
+    #[test]
+    fn carriage_returns_before_a_newline_go_in_one_pass() {
+        let many = format!("{}\n", "\r".repeat(60_000));
+        assert_eq!(lines(&many), "\n");
+        assert_eq!(lines("a\rb\r\r\nc\r"), "a\rb\nc\r");
     }
 }

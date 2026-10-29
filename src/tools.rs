@@ -504,6 +504,21 @@ impl Credentials {
         }
         redact_secret_fields(redact_private_keys(text))
     }
+    /// How many of `text`'s last bytes could begin a credential that more
+    /// output would finish: what a stream holds back until it can redact.
+    pub fn unfinished(&self, text: &[u8]) -> usize {
+        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        set.values
+            .iter()
+            .filter_map(|credential| {
+                let value = credential.value.as_bytes();
+                (1..value.len().min(text.len() + 1))
+                    .rev()
+                    .find(|&n| text.ends_with(&value[..n]))
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 const REDACTED: &str = "[REDACTED]";

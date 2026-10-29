@@ -985,7 +985,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     let (done, end) = tokio::sync::oneshot::channel();
     let started = tools
         .terminal(
-            "bot",
+            1,
             1,
             "test -t 0 && echo tty; read -p 'name? ' name; echo \"hi $name\"; exit 3".into(),
             cwd.clone(),
@@ -1002,13 +1002,13 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     assert_eq!(started["output"], "tty\nname? ");
     // Only its own bot types into it.
     let error = tools
-        .write_stdin("other", 1, "x\n", None, false)
+        .write_stdin(2, 1, "x\n", None, false, None)
         .await
         .err()
         .unwrap();
     assert_eq!(error.code, "terminal_not_running");
     let typed = tools
-        .write_stdin("bot", 1, "bob\n", Some(5000), false)
+        .write_stdin(1, 1, "bob\n", Some(5000), false, None)
         .await
         .unwrap();
     assert!(typed.failed);
@@ -1021,7 +1021,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     assert_eq!(end["exit_code"], 3);
     assert!(end.get("handle").is_none());
     let error = tools
-        .write_stdin("bot", 1, "", None, false)
+        .write_stdin(1, 1, "", None, false, None)
         .await
         .err()
         .unwrap();
@@ -1030,20 +1030,11 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     // Ctrl-C reaches the program, as at a terminal; kill ends what ignores it.
     let (done, _end) = tokio::sync::oneshot::channel();
     tools
-        .terminal(
-            "bot",
-            2,
-            "cat".into(),
-            cwd.clone(),
-            0,
-            Vec::new(),
-            None,
-            done,
-        )
+        .terminal(1, 2, "cat".into(), cwd.clone(), 0, Vec::new(), None, done)
         .await
         .unwrap();
     let interrupted = tools
-        .write_stdin("bot", 2, "\u{3}", Some(5000), false)
+        .write_stdin(1, 2, "\u{3}", Some(5000), false, None)
         .await
         .unwrap();
     let interrupted: Value = serde_json::from_str(&interrupted.output).unwrap();
@@ -1051,7 +1042,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     let (done, _end) = tokio::sync::oneshot::channel();
     tools
         .terminal(
-            "bot",
+            1,
             3,
             "trap '' INT; sleep 60".into(),
             cwd.clone(),
@@ -1062,7 +1053,36 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         )
         .await
         .unwrap();
-    let killed = tools.write_stdin("bot", 3, "", None, true).await.unwrap();
+    // Input typed after its bot's sandbox changed would run outside the
+    // new one: the terminal ends instead.
+    let confined = std::sync::Arc::new(agent_runtime::sandbox::Policy {
+        roots: Vec::new(),
+        network: false,
+        socket: None,
+        capability: None,
+        helper: None,
+    });
+    let error = tools
+        .write_stdin(1, 3, "x\n", None, false, Some(confined))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "terminal_sandbox_changed");
+    let (done, _end) = tokio::sync::oneshot::channel();
+    tools
+        .terminal(
+            1,
+            4,
+            "trap '' INT; sleep 60".into(),
+            cwd.clone(),
+            0,
+            Vec::new(),
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    let killed = tools.write_stdin(1, 4, "", None, true, None).await.unwrap();
     let killed: Value = serde_json::from_str(&killed.output).unwrap();
     assert_eq!(killed["signal"], libc::SIGKILL);
 }
