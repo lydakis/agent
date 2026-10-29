@@ -2374,15 +2374,25 @@ pub fn restamp(places: &Places, identity: &str, lineage: &str, launchd: Loader) 
             return;
         };
         // Read again under the lock: an `rm`, `add` or fire may have come first.
-        let path = places.plist(&trigger.name);
+        let path = places.job(&trigger.name);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let stamped = text.replacen(
-            &format!("<string>{}</string>", escape(identity)),
-            &format!("<string>{}</string>", escape(lineage)),
-            1,
-        );
+        let stamped = match is_plist(&text) {
+            true => text.replacen(
+                &format!("<string>{}</string>", escape(identity)),
+                &format!("<string>{}</string>", escape(lineage)),
+                1,
+            ),
+            false => {
+                let flag = quoted("--store-id", true);
+                text.replacen(
+                    &format!("{flag} {}", quoted(identity, true)),
+                    &format!("{flag} {}", quoted(lineage, true)),
+                    1,
+                )
+            }
+        };
         if stamped == text {
             continue;
         }
@@ -2398,14 +2408,11 @@ pub fn restamp(places: &Places, identity: &str, lineage: &str, launchd: Loader) 
 
 /// Once Sonny knows its daemon: [`restamp`] the triggers made on its store.
 pub fn restamp_at_start(identity: Option<&str>, lineage: Option<&str>) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
     let (Ok(places), Some(identity), Some(lineage)) = (Places::home(), identity, lineage) else {
         return;
     };
     let (identity, lineage) = (identity.to_owned(), lineage.to_owned());
-    std::thread::spawn(move || restamp(&places, &identity, &lineage, &launchctl));
+    std::thread::spawn(move || restamp(&places, &identity, &lineage, &schedule));
 }
 
 /// What `trigger add` was asked.
@@ -4288,7 +4295,12 @@ mod tests {
 
     #[test]
     fn a_trigger_made_by_its_store_file_s_identity_names_its_lineage_instead() {
-        let w = World::new("restamp");
+        for w in [World::new("restamp"), World::systemd("restamp-unit")] {
+            restamps(w);
+        }
+    }
+
+    fn restamps(w: World) {
         let elsewhere = Trigger {
             name: "q.other".into(),
             store_id: "another-store".into(),
