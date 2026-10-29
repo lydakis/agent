@@ -115,12 +115,14 @@ class Agent(BaseInstalledAgent):
 
     def __init__(self, *args: Any, binary: str | None = None,
                  provider: str | list[str] | None = None, reasoning: str | None = None,
-                 chatgpt_login: str | None = None, **kwargs: Any) -> None:
+                 fallback: str | None = None, chatgpt_login: str | None = None,
+                 **kwargs: Any) -> None:
         limits = {key: kwargs.pop(key) for key in list(kwargs) if key in self._LIMITS}
         super().__init__(*args, **kwargs)
         self._binary = Path(binary or os.environ.get('AGENT_HARBOR_BINARY') or DEFAULT_BINARY)
         self._providers = [provider] if isinstance(provider, str) else list(provider or [])
         self._reasoning = reasoning
+        self._fallback = fallback
         self._limits = limits
         # A chatgpt/ model spends the plan through `agent login chatgpt`'s
         # login, unless a chatgpt spec names another endpoint, which never
@@ -202,9 +204,10 @@ class Agent(BaseInstalledAgent):
     def _command(self, instruction: str) -> str:
         if not self.model_name:
             raise ValueError('Model name is required, as PROVIDER/MODEL')
-        # Benchmarks keep going past a declined Anthropic request on the
-        # model Anthropic recommends; a fleet opts in per bot.
-        flags = ['--new', '--bot', BOT, '--agents', '--fallbacks', '--model', self.model_name]
+        flags = ['--new', '--bot', BOT, '--agents', '--model', self.model_name]
+        # A request a safety classifier declined goes to this model alone.
+        if self._fallback:
+            flags += ['--fallback', self._fallback]
         for spec in self._providers:
             flags += ['--provider', spec]
         if self._reasoning:
@@ -344,7 +347,7 @@ class Agent(BaseInstalledAgent):
             context.metadata['bots'] = len({t['bot'] for t in turns})
             # A bot the task delegated to chose its own settings.
             context.metadata['bot_settings'] = {
-                t['bot']: {'reasoning': t['reasoning'], 'fallbacks': bool(t['fallbacks'])}
+                t['bot']: {'reasoning': t['reasoning'], 'fallback': t['fallback']}
                 for t in turns}
         # Two arms asking for one model are matched only if both ran it, so
         # say what was asked and what answered. Without the store only the
@@ -375,7 +378,7 @@ class Agent(BaseInstalledAgent):
                 return [dict(row) for row in db.execute(
                     "SELECT t.bot,COALESCE(t.model,b.provider||'/'||b.model) AS model,t.status,"
                     't.input_tokens,t.cached_input_tokens,t.output_tokens,'
-                    't.model_rounds,t.retries,t.paced_ms,b.reasoning,b.fallbacks '
+                    't.model_rounds,t.retries,t.paced_ms,b.reasoning,b.fallback '
                     'FROM turns t JOIN bots b ON b.name=t.bot ORDER BY t.id')]
         except sqlite3.Error:
             return None

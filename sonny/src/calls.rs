@@ -159,7 +159,6 @@ const SWITCHES: &[&str] = &[
     "--no-spawn",
     "--agents",
     "--no-compaction",
-    "--fallbacks",
     "--discover",
     "--all",
     "--any",

@@ -147,6 +147,7 @@ it bounds the sends, and a fleet cannot start every pre-read at once.
 | Legacy thinking budget (Haiku 4.5) | yes | **observed** on Mantle | carried |
 | Thinking-binding check (`anthropic-beta: thinking-binding-controls-2026-08-01`, `block_binding`) | yes (PR #12) | **observed** on both: signed blocks replayed with no drops; on Mantle `block_binding` without the beta is a 400 | carried |
 | Server-side fallbacks (`fallbacks`, PR #13) | yes | **documented** unsupported; **observed** on Mantle: the field and the beta are each a 400 | not carried: Bedrock requests send neither |
+| Fallback credit (`fallback_credit_token`, `fallback-credit-2026-07-01`) | yes | **documented** supported; not tried on Bedrock | not carried: a refused request's retry on the bot's `--fallback` sends no credit, since an unknown beta is a 400 on Mantle |
 | Responses over WebSocket | yes | **documented** unsupported on either endpoint | refused for Bedrock URLs |
 | Rate-limit headers for pacing | yes | **documented** absent | escalating refusal backoff instead |
 | Legacy thinking budgets by model name | yes | ids are vendor- and profile-prefixed | carried: `us.anthropic.claude-haiku-4-5…` reads as `claude-haiku-4-5` |

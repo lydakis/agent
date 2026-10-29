@@ -308,7 +308,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 web_search,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
