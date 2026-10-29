@@ -541,6 +541,39 @@ fn lead_mode(agent: &Path, name: &str) -> Option<&'static str> {
 
 /// Whether the daemon has a task `name`: one whose start failed after it
 /// was made keeps its folder, since a retry continues it there.
+/// The tasks `lead` started that are still there, by name and status,
+/// as the daemon lists the bots of its project: none when it cannot say.
+pub fn still_there(lead: &str) -> Vec<(String, String)> {
+    let project = crate::project::lead_project(lead).unwrap_or(lead);
+    let Some(agent) = crate::agent_bin() else {
+        return Vec::new();
+    };
+    let Ok(output) = Command::new(agent)
+        .args(["ls", "--name", &format!("{project}.*")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(bots)) => own(&bots, lead),
+        _ => Vec::new(),
+    }
+}
+
+/// Of `bots`, those `lead` made itself, side chats left out.
+fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
+    (bots.iter())
+        .filter(|bot| bot["created_by"] == lead && bot["expire_ms"].is_null())
+        .filter_map(|bot| {
+            let name = bot["name"].as_str()?;
+            let status = bot["status"].as_str().unwrap_or("idle");
+            Some((name.to_owned(), status.to_owned()))
+        })
+        .collect()
+}
+
 fn listed(agent: &Path, name: &str) -> bool {
     let Ok(output) = Command::new(agent)
         .args(["ls", "--name", name])
@@ -808,6 +841,27 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_s_tasks_still_there_are_those_it_made_itself() {
+        use serde_json::json;
+        let bots = [
+            json!({"name": "shop.lead", "status": "running"}),
+            json!({"name": "shop.fix", "status": "idle", "created_by": "shop.lead"}),
+            json!({"name": "shop.docs", "status": "running", "created_by": "shop.lead"}),
+            json!({"name": "shop.fix.check", "status": "idle", "created_by": "shop.fix"}),
+            json!({"name": "shop.invoices", "status": "idle", "created_by": "shop.lead.billing"}),
+            json!({"name": "shop.lead.side-1a2b3c", "status": "idle",
+                "created_by": "shop.lead", "expire_ms": 900_000}),
+        ];
+        assert_eq!(
+            own(&bots, "shop.lead"),
+            [
+                ("shop.fix".to_owned(), "idle".to_owned()),
+                ("shop.docs".to_owned(), "running".to_owned())
+            ]
+        );
+    }
 
     #[test]
     fn a_provider_spec_s_key_is_kept_from_setup() {

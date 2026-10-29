@@ -462,9 +462,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
   `start_task` tool (`name`, `brief`, `setup`, `profile`, `model`,
-  `effort`), which makes its worktree, runs `.agents/setup` there with
-  `setup`, starts the task with `agent run`, and leaves no folder behind
-  when that fails. Every agent Sonny starts, leads and tasks
+  `effort`, `reason`), which makes its worktree, runs `.agents/setup`
+  there with `setup`, starts the task with `agent run`, and leaves no
+  folder behind when that fails. While the lead has tasks still there, a
+  start without a `reason` saying why the work is separate is refused
+  with those tasks listed, so work one of them holds goes to it. Every agent Sonny starts, leads and tasks
   alike, is told that the person it works for may be under pressure, and
   to care whether they succeed: take work off their plate, do or offer
   what they will need next, and say once when a better way of working

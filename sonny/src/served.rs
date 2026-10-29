@@ -108,7 +108,11 @@ fn start() -> Value {
                     "description": "PROVIDER/MODEL, when the person asked for one; else the one this \
                         project's task rule names, else yours."},
                 "effort": {"type": "string", "minLength": 1,
-                    "description": "The task's effort level."}
+                    "description": "The task's effort level."},
+                "reason": {"type": "string", "minLength": 1,
+                    "description": "Why this is work none of your tasks still there should take, when you \
+                        have any: a task given more work keeps what it learned. Without it, a start while \
+                        you have tasks is refused with the list of them."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
@@ -428,6 +432,24 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         std::env::var("AGENT_BOT").map_err(|_| ("no_caller", "AGENT_BOT is not set".into()))?;
     match name {
         START => {
+            // Work that one of the lead's tasks may hold already goes to
+            // it, unless the lead says why it is separate.
+            if text("reason").is_none_or(|reason| reason.trim().is_empty()) {
+                let there = crate::task::still_there(&caller);
+                if !there.is_empty() {
+                    let listed: Vec<String> = (there.iter())
+                        .map(|(name, status)| format!("{name} ({status})"))
+                        .collect();
+                    return Err((
+                        "tasks_exist",
+                        format!(
+                            "your tasks still there: {}. Work one of them holds goes to it; \
+                             start this one again with reason saying why it is separate",
+                            listed.join(", ")
+                        ),
+                    ));
+                }
+            }
             let start = crate::task::Start {
                 name: text("name").unwrap_or_default(),
                 brief: text("brief").unwrap_or_default(),
@@ -934,11 +956,12 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 14] = [
+    const CODES: [&str; 15] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
         "task_not_started",
+        "tasks_exist",
         "task_not_removed",
         "not_shown",
         "pane_not_opened",
@@ -1052,6 +1075,7 @@ mod tests {
         assert!(cut(long).len() <= OUTPUT_BYTES + 6);
         assert_eq!(cut("short".into()), "short");
         assert_eq!(code("task_not_started"), "task_not_started");
+        assert_eq!(code("tasks_exist"), "tasks_exist");
         assert_eq!(code("Anything Else"), "tool_failed");
     }
 }

@@ -98,15 +98,22 @@ class ServedToolTests(ModelFixture):
         turns = self.daemon.request('turns', bot='calc.fix')['result']['turns']
         prompts = self.daemon.request('prompts', bot='calc.fix', turn=turns[0]['turn'])['result']['prompts']
         self.assertEqual(prompts[0]['text'], f'Fix {worktree}/calc.py.')
+        # With a task still there, another start says why it is separate
+        # work, or is refused with the tasks it could go to.
+        refused = json.loads(self.call('calc.lead', 'start_task', {'name': 'docs', 'brief': 'Docs.'}))
+        self.assertEqual(refused['error'], 'tasks_exist')
+        self.assertIn('calc.fix (', refused['detail'])
+        self.assertEqual(self.daemon.request('bots', name='calc.docs')['result']['bots'], [])
         # Its name is taken now, so a second start is refused, and nothing
         # is left behind.
-        refused = json.loads(self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': 'Again.'}))
+        refused = json.loads(self.call('calc.lead', 'start_task',
+                                       {'name': 'fix', 'brief': 'Again.', 'reason': 'Another fix.'}))
         self.assertEqual(refused['error'], 'task_not_started')
         self.assertTrue(worktree.is_dir())
         # In `full`, with no gate to ask, a task runs unconfined, as its
         # lead does.
         self.daemon.request('configure', bot='calc.lead', approve=[])
-        output = self.call('calc.lead', 'start_task', {'name': 'free', 'brief': 'Go.'})
+        output = self.call('calc.lead', 'start_task', {'name': 'free', 'brief': 'Go.', 'reason': 'Separate.'})
         self.assertTrue(output.startswith('Started calc.free: '), output)
         free = self.daemon.request('inspect', bot='calc.free')['result']['settings']
         self.assertEqual((free['sandbox'], free['writable'], free['network']), ('danger-full-access', [], False))
