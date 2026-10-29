@@ -78,6 +78,160 @@ pub fn as_task(dir: &Path, info: &Value, text: &str) -> Result<String, String> {
     })
 }
 
+/// The project `bot` leads: `shop` for its first lead, `shop.lead`, and
+/// for another lead of the same folder, `shop.lead.NAME`; `None` for any
+/// other bot, a lead's side chat (`shop.lead.side-1a2b`) included.
+pub fn lead_project(bot: &str) -> Option<&str> {
+    if let Some(project) = bot.strip_suffix(".lead") {
+        return Some(project).filter(|p| !p.is_empty());
+    }
+    let (first, name) = bot.rsplit_once('.')?;
+    let project = first.strip_suffix(".lead").filter(|p| !p.is_empty())?;
+    (lead_named(name) && crate::side_source(bot).is_none()).then_some(project)
+}
+
+/// Whether `bot` is a project's lead, its first or another.
+pub fn is_lead(bot: &str) -> bool {
+    lead_project(bot).is_some()
+}
+
+/// Whether `name` can name another lead of a folder, as in
+/// `shop.lead.NAME`: lowercase letters, digits and hyphens, at most 32,
+/// and never a side chat's.
+pub fn lead_named(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.starts_with("side-")
+}
+
+/// The lead of `project` that `name` names: `lead` the first one,
+/// `shop.lead`, any other `shop.lead.NAME`.
+pub fn lead_bot(project: &str, name: &str) -> String {
+    match name {
+        "" | "lead" => format!("{project}.lead"),
+        name => format!("{project}.lead.{name}"),
+    }
+}
+
+/// The short name of a lead, as `/lead` takes it: `lead` for the first.
+pub fn lead_short(bot: &str) -> &str {
+    match bot.ends_with(".lead") {
+        true => "lead",
+        false => bot.rsplit_once('.').map_or(bot, |(_, name)| name),
+    }
+}
+
+/// A lead's name made from the person's first words to it, as
+/// `fix-the-login` for "Fix the login redirect, it loops": what a thread
+/// with no name of its own is called.
+pub fn lead_name_from(text: &str) -> String {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut name = String::new();
+    for word in words {
+        if name.len() + word.len() + 1 > 32 {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.push_str(&word);
+    }
+    match lead_named(&name) {
+        true => name,
+        false => "thread".into(),
+    }
+}
+
+/// Which of a folder's leads to open.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pick {
+    /// The one the person last wrote to there; the first when none.
+    Last,
+    /// This one, by its short name, which must be there.
+    Named(String),
+    /// A new one, named so, else numbered (`lead.2`); the folder's first
+    /// when it has none yet.
+    New(Option<String>),
+    /// A new thread's in T3 Code: the folder's first lead when it has none
+    /// yet, else a new one named after the person's first words to it.
+    Thread(String),
+}
+
+/// Where Sonny notes which lead of a folder the person last wrote to.
+fn last_path(dir: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".agent/sonny/last-lead")
+            .join(fingerprint(&dir.to_string_lossy())),
+    )
+}
+
+/// Note that the person wrote to `bot`, a lead working in `dir`.
+pub fn wrote_to(dir: &str, bot: &str) {
+    if !is_lead(bot) || dir.is_empty() {
+        return;
+    }
+    let Some(path) = last_path(Path::new(dir)) else {
+        return;
+    };
+    if std::fs::read_to_string(&path).is_ok_and(|had| had.trim() == bot) {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let staged = path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&staged, bot).is_ok() {
+        let _ = std::fs::rename(&staged, &path);
+    }
+}
+
+fn last_lead(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(last_path(dir)?).ok()?;
+    Some(text.trim().to_owned()).filter(|bot| is_lead(bot))
+}
+
+/// Every lead of `project` working in `dir`, first one first, then by name.
+pub async fn leads(client: &Client, project: &str, dir: &Path) -> Result<Vec<Value>, String> {
+    let at = dir.to_str().unwrap_or("");
+    let mut found = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let page = client
+            .request(
+                "bots",
+                json!({"name": format!("{project}.lead*"), "limit": 256, "after": after}),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            let name = bot["name"].as_str().unwrap_or("");
+            if lead_project(name) == Some(project) && bot["workspace"] == at {
+                found.push(bot.clone());
+            }
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    found.sort_by_key(|bot| {
+        let name = bot["name"].as_str().unwrap_or("").to_owned();
+        (!name.ends_with(".lead"), name)
+    });
+    Ok(found)
+}
+
 pub struct Lead {
     pub project: String,
     pub bot: String,
@@ -359,38 +513,129 @@ fn same_name(dir: &Path, name: &str) -> bool {
     default_name(&root).is_ok_and(|found| found == name)
 }
 
-/// The lead for `dir`, made first when the folder is not a project yet.
-pub async fn open(client: &Client, dir: &Path, model: Option<&str>) -> Result<Lead, String> {
+/// The lead for `dir` that `pick` picks, made first when the folder is
+/// not a project yet or the pick is a new one.
+pub async fn open(
+    client: &Client,
+    dir: &Path,
+    model: Option<&str>,
+    pick: &Pick,
+) -> Result<Lead, String> {
     let dir = folder_of(&dir.canonicalize().map_err(|e| e.to_string())?)?;
     let project = default_name(&dir)?;
-    let bot = format!("{project}.lead");
-    if let Some(found) = find(client, &bot).await? {
+    let first = format!("{project}.lead");
+    let found = find(client, &first).await?;
+    if let Some(found) = &found {
         let there = found["workspace"].as_str().unwrap_or("");
-        let moving = (there != dir.to_str().unwrap_or("")).then_some(dir);
         // Another folder of the same name is its own project: its lead
-        // stays there. One moved anywhere else is still this folder's, and
-        // comes back with the next message, history and all.
-        if moving.is_some() && same_name(Path::new(there), &project) {
+        // stays there.
+        if there != dir.to_str().unwrap_or("") && same_name(Path::new(there), &project) {
             return Err(format!(
-                "project_exists: {bot} is the lead of {there}, a project of the same name; \
+                "project_exists: {first} is the lead of {there}, a project of the same name; \
                  name this one in .agents/project.toml or pass --bot"
             ));
         }
+    }
+    let Some(found) = found else {
+        // The folder's first lead, whatever was asked: its name is the
+        // project's, so the others can be found by it.
+        if let Pick::Named(name) = pick
+            && lead_bot(&project, name) != first
+        {
+            return Err(format!("lead_missing: {project} has no lead {name} yet"));
+        }
+        create(client, &dir, model, None).await?;
         return Ok(Lead {
             project,
-            bot,
-            new: false,
-            moving,
-            above: None,
+            bot: first,
+            new: true,
+            moving: None,
+            above: above(&dir),
         });
-    }
-    create(client, &dir, model).await?;
+    };
+    let existing = || async { leads(client, &project, &dir).await };
+    let make = |bot: String| {
+        let (dir, project) = (dir.clone(), project.clone());
+        async move {
+            if !lead_named(lead_short(&bot)) {
+                return Err(
+                    "lead_invalid: a lead's name is lowercase letters, digits and hyphens, \
+                     at most 32, as billing or fix-login"
+                        .into(),
+                );
+            }
+            if find(client, &bot).await?.is_some() {
+                return Err(format!(
+                    "lead_exists: {bot} is there already; /lead {} opens it",
+                    lead_short(&bot)
+                ));
+            }
+            create(client, &dir, model, Some(&bot)).await?;
+            Ok(Lead {
+                project,
+                bot,
+                new: true,
+                moving: None,
+                above: None,
+            })
+        }
+    };
+    let free = |leads: &[Value], stem: &str| -> String {
+        let taken = |bot: &str| leads.iter().any(|b| b["name"] == bot);
+        let mut n = 2;
+        loop {
+            let name = match stem {
+                "" => n.to_string(),
+                stem => format!("{stem}-{n}"),
+            };
+            let bot = lead_bot(&project, &name);
+            if !taken(&bot) {
+                return bot;
+            }
+            n += 1;
+        }
+    };
+    let bot = match pick {
+        Pick::Named(name) => {
+            let bot = lead_bot(&project, name);
+            if bot != first && find(client, &bot).await?.is_none() {
+                return Err(format!(
+                    "lead_missing: {project} has no lead {name}; /lead new {name} makes it"
+                ));
+            }
+            bot
+        }
+        Pick::New(Some(name)) => return make(lead_bot(&project, name)).await,
+        Pick::New(None) => return make(free(&existing().await?, "")).await,
+        Pick::Thread(words) => {
+            let leads = existing().await?;
+            let stem = lead_name_from(words);
+            let bot = lead_bot(&project, &stem);
+            let bot = match leads.iter().any(|b| b["name"] == bot.as_str()) {
+                true => free(&leads, &stem),
+                false => bot,
+            };
+            return make(bot).await;
+        }
+        Pick::Last => last_lead(&dir)
+            .filter(|bot| lead_project(bot) == Some(project.as_str()))
+            .unwrap_or_else(|| first.clone()),
+    };
+    let found = match bot == first {
+        true => Some(found),
+        false => find(client, &bot).await?,
+    };
+    let found = found.ok_or_else(|| format!("lead_missing: {bot} is gone"))?;
+    let there = found["workspace"].as_str().unwrap_or("");
+    // One moved anywhere else is still this folder's, and comes back with
+    // the next message, history and all.
+    let moving = (there != dir.to_str().unwrap_or("")).then_some(dir);
     Ok(Lead {
         project,
         bot,
-        new: true,
-        moving: None,
-        above: above(&dir),
+        new: false,
+        moving,
+        above: None,
     })
 }
 
@@ -492,7 +737,13 @@ async fn newest(client: &Client) -> Result<Option<String>, String> {
     }
 }
 
-async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), String> {
+/// Make the folder's first lead, or `bot`, another lead of it.
+async fn create(
+    client: &Client,
+    dir: &Path,
+    model: Option<&str>,
+    bot: Option<&str>,
+) -> Result<(), String> {
     let role = role(dir)?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
@@ -530,15 +781,17 @@ async fn create(client: &Client, dir: &Path, model: Option<&str>) -> Result<(), 
         fallbacks: config.fallbacks,
         ..Default::default()
     };
-    make(client, dir, &role, &picks).await.map(|_| ())
+    make(client, dir, &role, &picks, bot).await.map(|_| ())
 }
 
-/// Make the project in `dir` with its lead in `role`, told the task rule.
+/// Make the project in `dir` with its lead in `role`, told the task rule;
+/// or `bot`, another lead of it.
 async fn make(
     client: &Client,
     dir: &Path,
     role: &agent_client::policy::Profile,
     picks: &agent_client::project::Picks,
+    bot: Option<&str>,
 ) -> Result<Value, String> {
     let (instructions, _) = folder(dir, role)?;
     // Gated and confined from the start, as a new lead's mode makes it,
@@ -571,7 +824,7 @@ async fn make(
         "gate": gate,
         "settings": settings,
     });
-    agent_client::project::create(client, dir, &policy, client.providers(), picks, None).await
+    agent_client::project::create(client, dir, &policy, client.providers(), picks, bot).await
 }
 
 /// A `new_project` call of `caller`'s: the project Sonny makes for a
@@ -591,7 +844,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     let (client, _events) = Client::connect(&socket)
         .await
         .map_err(|e| format!("{}: {}", e.code, e.detail.unwrap_or_default()))?;
-    let mut made = make(&client, &dir, &role(&dir)?, &picks).await;
+    let mut made = make(&client, &dir, &role(&dir)?, &picks, None).await;
     if let Ok(made) = &mut made {
         // Composed from its folder, so the lead follows the folder's
         // changes as one Sonny opened there does, when it opens.
@@ -621,7 +874,10 @@ async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut 
     let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
     let opened = std::env::current_exe()
         .map_err(|e| e.to_string())
-        .and_then(|me| crate::open_lead(socket, store.as_deref(), project, &like, &me));
+        .and_then(|me| {
+            let bot = format!("{project}.lead");
+            crate::open_lead(socket, store.as_deref(), project, &bot, &like, &me)
+        });
     match opened {
         Ok((home, _)) => made["opened_in"] = json!(home),
         Err(error) => made["not_opened"] = json!(error),
@@ -672,6 +928,40 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_has_a_first_lead_and_others_named_after_it() {
+        assert_eq!(lead_project("shop.lead"), Some("shop"));
+        assert_eq!(lead_project("shop.web.lead"), Some("shop.web"));
+        assert_eq!(lead_project("shop.lead.billing"), Some("shop"));
+        assert_eq!(lead_project("shop.web.lead.fix-2"), Some("shop.web"));
+        // A side chat, a task, a lead's task and a bad name lead nothing.
+        for not in [
+            "shop.lead.side-1a2b",
+            "shop.fix",
+            "shop.lead.billing.side-3f",
+            "shop.lead.Big",
+            ".lead",
+            "lead",
+        ] {
+            assert_eq!(lead_project(not), None, "{not}");
+        }
+        assert_eq!(lead_bot("shop", "lead"), "shop.lead");
+        assert_eq!(lead_bot("shop", "billing"), "shop.lead.billing");
+        assert_eq!(lead_short("shop.lead"), "lead");
+        assert_eq!(lead_short("shop.lead.billing"), "billing");
+        assert!(!lead_named("side-1a2b") && !lead_named("-x") && !lead_named(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn a_threads_lead_is_named_after_its_first_words() {
+        assert_eq!(
+            lead_name_from("Fix the login redirect, it loops"),
+            "fix-the-login-redirect"
+        );
+        assert_eq!(lead_name_from("  ¿¡ !"), "thread");
+        assert!(lead_named(&lead_name_from(&"word ".repeat(40))));
+    }
 
     #[test]
     fn a_new_project_reads_its_picks_and_refuses_others() {

@@ -1082,6 +1082,9 @@ struct Lookout {
     others: HashMap<String, HashSet<String>>,
     /// Bots a subscription's `--bot` glob names, as listed and made since.
     globbed: HashSet<String>,
+    /// The other leads of the lead's folder and every bot they or theirs
+    /// made: theirs, which no glob of this lead's names.
+    theirs: HashSet<String>,
     /// Steers waiting to be absorbed, by task and steer turn: who sent it,
     /// or `None` for the subscriber.
     steers: HashMap<(String, i64), Option<String>>,
@@ -1124,6 +1127,7 @@ impl Lookout {
             subs: Vec::new(),
             others: HashMap::new(),
             globbed: HashSet::new(),
+            theirs: HashSet::new(),
             steers: HashMap::new(),
             queued: HashSet::new(),
             noted: HashSet::new(),
@@ -1179,6 +1183,9 @@ impl Lookout {
                         made.insert(bot.to_owned());
                     }
                 }
+                if self.sibling(bot) || self.theirs.contains(by) {
+                    self.theirs.insert(bot.to_owned());
+                }
                 if self.globs(bot) {
                     self.globbed.insert(bot.to_owned());
                 }
@@ -1186,6 +1193,7 @@ impl Lookout {
             "deleted" if bot != self.lead => {
                 self.lineage.remove(bot);
                 self.globbed.remove(bot);
+                self.theirs.remove(bot);
                 // A root keeps its place under its name, so what it makes
                 // once made again is still watched.
                 for (root, made) in self.others.iter_mut() {
@@ -1379,6 +1387,11 @@ impl Lookout {
             grow(&mut made, records);
             self.others.insert(root, made);
         }
+        self.theirs = (records.keys())
+            .filter(|name| self.sibling(name))
+            .cloned()
+            .collect();
+        grow(&mut self.theirs, records);
         self.globbed = (records.iter())
             .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
             .map(|(name, _)| name.clone())
@@ -1386,9 +1399,17 @@ impl Lookout {
         self.sync();
     }
 
+    /// Whether `bot` is another lead of this lead's folder.
+    fn sibling(&self, bot: &str) -> bool {
+        bot != self.lead
+            && crate::project::lead_project(bot).is_some()
+            && crate::project::lead_project(bot) == crate::project::lead_project(&self.lead)
+    }
+
     /// Whether a subscription's `--bot` glob names this bot.
     fn globs(&self, bot: &str) -> bool {
         bot != self.lead
+            && !self.theirs.contains(bot)
             && (self.subs.iter()).any(|sub| sub.bots.iter().any(|glob| subs::matches(glob, bot)))
     }
 

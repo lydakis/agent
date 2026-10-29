@@ -78,6 +78,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         sound: false,
         side: None,
         embedded: false,
+        lead: project::Pick::Last,
     };
     let agent = Arc::new(Agent {
         out: Arc::new(Out::default()),
@@ -408,7 +409,11 @@ impl Agent {
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
             Some(id) => match t3::recall(id) {
-                Some(bot) => session.bind(self, Some(bot), false).await,
+                Some(bot) => {
+                    session
+                        .bind(self, Some(bot), false, &project::Pick::Last)
+                        .await
+                }
                 None => Err(format!("Sonny does not know thread {id}")),
             },
             None => Ok(()),
@@ -508,12 +513,13 @@ struct Offer {
 impl Session {
     /// Make this thread `bot`'s, or its folder's lead's, and follow it.
     /// `claimed`: a task that waited for this thread, whose first turn
-    /// runs already.
+    /// runs already. With no bot, `pick` picks which of the folder's leads.
     async fn bind(
         self: &Arc<Self>,
         agent: &Arc<Agent>,
         bot: Option<String>,
         claimed: bool,
+        pick: &project::Pick,
     ) -> Result<(), String> {
         let (client, mut events) = Client::connect(&agent.options.socket)
             .await
@@ -524,13 +530,13 @@ impl Session {
         // too, keeps its own.
         let (bot, project, moving, made) = match bot {
             Some(bot) => {
-                let project = bot.strip_suffix(".lead").map(str::to_owned);
+                let project = project::lead_project(&bot).map(str::to_owned);
                 services(agent, &client, &bot, project.as_deref()).await?;
                 (bot, project, None, false)
             }
             None => {
                 let picked = self.state.lock().await.picked.clone();
-                let lead = project::open(&client, &self.cwd, picked.as_deref()).await?;
+                let lead = project::open(&client, &self.cwd, picked.as_deref(), pick).await?;
                 let moving = lead.moving.as_ref().map(|dir| dir.display().to_string());
                 setup_lead(agent, &self.id, &client, &lead, moving.as_deref()).await?;
                 (lead.bot, Some(lead.project), moving, lead.new)
@@ -816,9 +822,25 @@ impl Session {
             if task {
                 self.state.lock().await.prompt = Some((id.clone(), None));
             }
-            if let Err(error) = self.bind(agent, claimed, task).await {
+            // A new thread is a new lead of its folder, named after these
+            // words, unless they are `/lead NAME`, which opens one there.
+            let chosen = lead_asked(&text);
+            let pick = chosen
+                .clone()
+                .unwrap_or_else(|| project::Pick::Thread(text.clone()));
+            if let Err(error) = self.bind(agent, claimed, task, &pick).await {
                 self.state.lock().await.prompt = None;
                 return Err((FAILED, error));
+            }
+            if chosen.is_some() {
+                let bot = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone());
+                let said = format!("This thread is {}.", bot.unwrap_or_default());
+                agent.out.update(
+                    &self.id,
+                    json!({"sessionUpdate": "agent_message_chunk",
+                        "messageId": format!("{}-lead", self.id), "content": {"type": "text", "text": said}}),
+                );
+                return Ok(json!({"stopReason": "end_turn"}));
             }
             if task {
                 let mut state = self.state.lock().await;
@@ -862,6 +884,8 @@ impl Session {
             asked["workspace"] = json!(dir);
         }
         let client = bound.client.clone();
+        // The lead its folder opens next in Sonny.
+        project::wrote_to(&bound.workspace, &bound.bot);
         // A prompt that steers joins the turn an earlier one waits on,
         // which is answered now: its words are in. Its own turn is the one
         // the daemon names for it, which the running turn may take in.
@@ -1678,6 +1702,18 @@ async fn open_task(
 
 /// A prompt's words and pictures: text as it is, a file or resource as its
 /// path or its text, a picture as the daemon takes one.
+/// The lead a thread's first words ask for: `/lead NAME` one of the
+/// folder's, `/lead new [NAME]` a new one.
+fn lead_asked(text: &str) -> Option<project::Pick> {
+    let rest = text.trim().strip_prefix("/lead")?;
+    let mut words = rest.split_whitespace();
+    match (words.next()?, words.next(), words.next()) {
+        ("new", name, None) => Some(project::Pick::New(name.map(str::to_owned))),
+        (name, None, _) => Some(project::Pick::Named(name.to_owned())),
+        _ => None,
+    }
+}
+
 fn words(prompt: &Value) -> (String, Vec<Value>) {
     let mut text = String::new();
     let mut images = Vec::new();

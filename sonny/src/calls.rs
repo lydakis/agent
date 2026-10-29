@@ -711,7 +711,7 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                     let beside = field("beside").unwrap_or("you");
                     said("Moved", &format!("{agent} to a split {side} {beside}"))
                 }
-                None if agent.ends_with(".lead") => said("Opened", agent),
+                None if crate::project::is_lead(agent) => said("Opened", agent),
                 None => said("Moved", &format!("{agent} to a tab of its own")),
             })
         }

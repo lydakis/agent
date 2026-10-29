@@ -493,9 +493,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
     }
 }
 
-/// The project a lead leads: its name less `.lead`, else up to its first dot.
+/// The project a lead leads, else the name up to its first dot.
 fn project_of(bot: &str) -> String {
-    match bot.strip_suffix(".lead") {
+    match crate::project::lead_project(bot) {
         Some(project) => project.to_owned(),
         None => bot
             .split_once('.')

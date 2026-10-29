@@ -185,14 +185,17 @@ struct Options {
     /// Drawn in another Sonny's pane: the terminal's tab is that Sonny's,
     /// so this one claims nothing of it.
     embedded: bool,
+    /// Which of the folder's leads to open, with no `--bot`.
+    lead: project::Pick,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--bot NAME [--new [--workspace DIR]]]\n\
-     With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
-     open beside it in Rex or Herdr, each in a git worktree of its own. Type /status for\n\
-     the project's agents.\n\
+     \x20      [--bot NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     With no --bot, the folder's lead you last wrote to, its first made with --model the\n\
+     first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
+     tasks open beside it in Rex or Herdr, each in a git worktree of its own. Type /status\n\
+     for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
      and subscribe to the lookout with tools Sonny gives them, which the lookout answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
@@ -224,10 +227,10 @@ async fn show(
     let (socket, project) = agents_project(caller).await?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     if split.is_none()
-        && let Some(other) = bot.strip_suffix(".lead").filter(|p| *p != project)
+        && let Some(other) = project::lead_project(bot).filter(|p| *p != project)
     {
         let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
-        let (home, opened) = open_lead(&socket, store.as_deref(), other, &project, &me)?;
+        let (home, opened) = open_lead(&socket, store.as_deref(), other, bot, &project, &me)?;
         return Ok(json!({"bot": bot, "in": home, "opened": opened}));
     }
     let mut layout = mux::for_agent(&socket, &project, None)?;
@@ -255,7 +258,7 @@ async fn show(
     Ok(json!({"bot": bot, "in": layout.home()}))
 }
 
-/// Open `project`'s lead in that project's own home, made when needed in
+/// Open `bot`, a lead of `project`, in that project's own home, made when needed in
 /// the multiplexer `like`'s home is in, running Sonny on it: a session for
 /// each lead, and in it a window for each of its tasks. A lead whose Sonny
 /// is there already is left as it is. Returns the home, and whether it
@@ -264,11 +267,12 @@ fn open_lead(
     socket: &std::path::Path,
     store: Option<&std::path::Path>,
     project: &str,
+    bot: &str,
     like: &str,
     me: &std::path::Path,
 ) -> Result<(String, bool), String> {
     let mut layout = mux::for_agent(socket, project, Some(like))?;
-    let bot = format!("{project}.lead");
+    let bot = bot.to_owned();
     let mut command = vec![me.to_string_lossy().into_owned()];
     if let Some(store) = store {
         command.extend(["--store".into(), store.to_string_lossy().into_owned()]);
@@ -279,7 +283,11 @@ fn open_lead(
         "--bot".into(),
         bot.clone(),
     ]);
-    let opened = layout.show(&bot, "lead", &command)?;
+    let label = match bot.ends_with(".lead") {
+        true => "lead".to_owned(),
+        false => format!("lead {}", project::lead_short(&bot)),
+    };
+    let opened = layout.show(&bot, &label, &command)?;
     Ok((layout.home(), opened))
 }
 
@@ -613,12 +621,19 @@ fn daemon_paths(
 }
 
 fn parse() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1);
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
+    let mut lead = project::Pick::Last;
+    let mut args = args.peekable();
     while let Some(arg) = args.next() {
+        if arg == "--new-lead" {
+            let name = args.next_if(|next| !next.starts_with("--"));
+            lead = project::Pick::New(name);
+            continue;
+        }
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
             "--store" => store = Some(PathBuf::from(value()?)),
@@ -630,6 +645,7 @@ fn parse() -> Result<Options, String> {
             "--no-layout" => layout = false,
             "--rex-host" => rex_host = Some(value()?),
             "--no-sound" => sound = false,
+            "--lead" => lead = project::Pick::Named(value()?),
             // Unlisted: how `/side` opens a side chat.
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
             // Unlisted: how a task opens in the pane.
@@ -650,23 +666,34 @@ fn parse() -> Result<Options, String> {
         sound,
         side,
         embedded,
+        lead,
     })
 }
 
-/// What runs this Sonny again on the same bot, from the same folder: `sonny`
+/// What runs this Sonny again on `bot`, from the same folder: `sonny`
 /// with its own arguments, less those that made the bot or changed a
-/// setting, and with the daemon the environment named.
-fn reopen() -> Vec<String> {
+/// setting, naming `bot` when the folder would not open it on its own, and
+/// with the daemon the environment named.
+fn reopen(bot: &str) -> Vec<String> {
     let mut command = vec!["sonny".to_owned()];
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" => {
+            "--workspace" | "--lead" | "--bot" => {
                 args.next();
+            }
+            "--new-lead" => {
+                args.next_if(|next| !next.starts_with("--"));
             }
             _ => command.push(arg),
         }
+    }
+    let named = std::env::args().any(|arg| arg == "--bot");
+    match project::lead_project(bot) {
+        Some(_) if !named && bot.ends_with(".lead") => {}
+        Some(_) if !named => command.extend(["--lead".into(), project::lead_short(bot).into()]),
+        _ => command.extend(["--bot".into(), bot.to_owned()]),
     }
     for (flag, var) in [("--store", "AGENT_STORE"), ("--socket", "AGENT_SOCKET")] {
         if !command.iter().any(|a| a == flag)
@@ -758,7 +785,7 @@ async fn run() -> Result<(), String> {
             }
             // Sonny on a project's lead is that lead's Sonny, wherever it
             // was opened, as by `show_agent` in the project's own home.
-            (bot.clone(), bot.strip_suffix(".lead").map(str::to_owned))
+            (bot.clone(), project::lead_project(bot).map(str::to_owned))
         }
         None => {
             if options.new {
@@ -770,7 +797,8 @@ async fn run() -> Result<(), String> {
             if options.layout {
                 mux::install_skill(options.rex_host.as_deref());
             }
-            let lead = project::open(&client, &dir, options.model.as_deref()).await?;
+            let lead =
+                project::open(&client, &dir, options.model.as_deref(), &options.lead).await?;
             fresh = lead.new;
             moving = lead.moving;
             above = lead.above;
@@ -780,8 +808,8 @@ async fn run() -> Result<(), String> {
     // A side chat borrows its agent's pane, and Herdr keeps the agent; a
     // task in the pane is in its lead's.
     if options.side.is_none() && !options.embedded {
-        herdr::announce(&name, reopen());
-        cmux::announce(&name, reopen());
+        herdr::announce(&name, reopen(&name));
+        cmux::announce(&name, reopen(&name));
     }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
@@ -932,6 +960,21 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     status_report("clear", &name);
+    // `/lead NAME`: this window becomes that lead's Sonny, as if opened on it.
+    if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
+        use std::os::unix::process::CommandExt;
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        // Named by --bot, whatever folder this window is in.
+        let mut args = reopen(&other).split_off(1);
+        if let Some(at) = args.iter().position(|arg| arg == "--lead") {
+            args.drain(at..at + 2);
+        }
+        if !args.iter().any(|arg| arg == "--bot") {
+            args.extend(["--bot".into(), other.clone()]);
+        }
+        let error = std::process::Command::new(me).args(&args).exec();
+        return Err(format!("could not open {other}: {error}"));
+    }
     result
 }
 
@@ -1435,6 +1478,7 @@ const COMMANDS: [(&str, &str); 18] = [
     ),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
+    ("/lead", "the folder's leads: open another, or make one"),
     (
         "/margin",
         "the agent's notes beside the conversation, shown or closed",
@@ -1570,6 +1614,9 @@ struct App {
     following: bool,
     notice: Option<String>,
     quit: bool,
+    /// Another lead of the folder, which this window opens on instead once
+    /// it quits: `/lead NAME`.
+    switch_to: Option<String>,
     started: Instant,
     fleet: Option<Fleet>,
     /// Layout notes waiting for the lead's running calls to be shown.
@@ -1856,6 +1903,15 @@ struct Fleet {
     resolving: resolved::Own,
 }
 
+/// A lead as the person tells it apart: `shop lead` for the folder's
+/// first, `shop lead billing` for `shop.lead.billing`.
+fn lead_title(project: &str, bot: &str) -> String {
+    match bot.ends_with(".lead") {
+        true => format!("{project} lead"),
+        false => format!("{project} lead {}", project::lead_short(bot)),
+    }
+}
+
 /// The projects inside `project` whose leads are among `names`:
 /// `shop.web` for `shop.web.lead` in `shop`.
 fn inner_projects<'a>(names: impl Iterator<Item = &'a str>, project: &str) -> Vec<String> {
@@ -1878,30 +1934,80 @@ enum Kin {
     None,
 }
 
-/// What `bot`, made by `by`, is to the lead of `project` whose lineage
-/// made the bots in `lineage`, with `leads` the other projects seen: any
-/// other project's lead but one this project is inside, by its name alone;
-/// else a task when its name is the project's or one of the lineage made
-/// it, unless it is one of theirs.
+/// What `bot`, made by `by`, is to `lead`, a lead of `project`, whose
+/// lineage made the bots in `lineage`, with `leads` the other projects
+/// seen: any other project's lead but one this project is inside, by its
+/// name alone; never another lead of this folder; else a task when one of
+/// the lineage made it, or, to the folder's first lead, when no agent did
+/// and its name is the project's, unless it is one of theirs.
 fn kin(
     bot: &str,
     by: &str,
+    lead: &str,
     project: &str,
     lineage: &std::collections::HashSet<String>,
     leads: &std::collections::HashSet<String>,
 ) -> Kin {
-    let lead = format!("{project}.lead");
+    let first = lead == format!("{project}.lead");
     let theirs = leads.iter().any(|p| bot.starts_with(&format!("{p}.")));
     // A project this one is inside names all of this one's bots too.
     let outer = |p: &str| project.starts_with(&format!("{p}."));
-    match bot.strip_suffix(".lead").filter(|_| bot != lead) {
-        Some(other) if outer(other) => Kin::None,
+    match project::lead_project(bot).filter(|_| bot != lead) {
+        Some(other) if other == project || outer(other) => Kin::None,
         Some(other) => Kin::Lead(other.to_owned()),
-        None if !theirs && (lineage.contains(by) || bot.starts_with(&format!("{project}."))) => {
+        None if !theirs
+            && (lineage.contains(by)
+                || (first && by.is_empty() && bot.starts_with(&format!("{project}.")))) =>
+        {
             Kin::Task
         }
         _ => Kin::None,
     }
+}
+
+/// The bots among `bots` (as `bots` lists them) that are `lead`'s: made by
+/// it or by one of its, or, for the folder's first lead, made by no agent
+/// at all; never another lead.
+fn lineage_of(bots: &[Value], lead: &str, first: bool) -> std::collections::HashSet<String> {
+    let made_by: HashMap<&str, &str> = (bots.iter())
+        .filter_map(|bot| {
+            Some((
+                bot["name"].as_str()?,
+                bot["created_by"].as_str().unwrap_or(""),
+            ))
+        })
+        .collect();
+    let mut mine = std::collections::HashSet::new();
+    for &name in made_by.keys() {
+        if name == lead || project::is_lead(name) {
+            continue;
+        }
+        let mut at = name;
+        // A chain of makers no longer than the daemon lists bots.
+        for _ in 0..=made_by.len() {
+            match made_by.get(at).copied() {
+                Some(by) if by == lead => {
+                    mine.insert(name.to_owned());
+                    break;
+                }
+                Some(by) if by.is_empty() || project::is_lead(by) => {
+                    if by.is_empty() && first {
+                        mine.insert(name.to_owned());
+                    }
+                    break;
+                }
+                Some(by) => at = by,
+                None => {
+                    // Made by a bot no longer listed: the first lead's.
+                    if first && at != name {
+                        mine.insert(name.to_owned());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    mine
 }
 
 impl Fleet {
@@ -1973,11 +2079,24 @@ impl Fleet {
         // lead opens there and its tasks are its own.
         let names = bots.iter().filter_map(|bot| bot["name"].as_str());
         self.leads.extend(inner_projects(names, &self.project));
+        // With other leads in the folder, their tasks are theirs.
+        let first = self.lead == format!("{}.lead", self.project);
+        let shared = (bots.iter()).any(|bot| {
+            let name = bot["name"].as_str().unwrap_or("");
+            name != self.lead && project::lead_project(name) == Some(self.project.as_str())
+        });
+        let mine = shared.then(|| lineage_of(&bots, &self.lead, first));
         for bot in &bots {
             // Side chats are never tasks, as when they are made.
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
+            if name != self.lead
+                && (project::is_lead(name)
+                    || mine.as_ref().is_some_and(|mine| !mine.contains(name)))
+            {
+                continue;
+            }
             let running = !bot["running_turn"].is_null();
             if (self.leads.iter()).any(|p| name.starts_with(&format!("{p}."))) {
                 continue;
@@ -2114,7 +2233,7 @@ impl Fleet {
     /// the lead by its project, as `shop lead`, a task by its own name.
     fn named(&self, bot: &str) -> String {
         match bot == self.lead {
-            true => format!("{} lead", self.project),
+            true => lead_title(&self.project, bot),
             false => self.short(bot).to_owned(),
         }
     }
@@ -2265,7 +2384,14 @@ impl Fleet {
             // A copy that goes once idle is a side chat, not a task.
             "created" | "forked" if event["data"]["expire_ms"].is_null() => {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
-                match kin(bot, by, &self.project, &self.lineage, &self.leads) {
+                match kin(
+                    bot,
+                    by,
+                    &self.lead,
+                    &self.project,
+                    &self.lineage,
+                    &self.leads,
+                ) {
                     Kin::Task => {
                         self.lineage.insert(bot.to_owned());
                     }
@@ -2341,6 +2467,7 @@ impl App {
             following: true,
             notice: None,
             quit: false,
+            switch_to: None,
             started: Instant::now(),
             fleet: None,
             held: Vec::new(),
@@ -5080,7 +5207,7 @@ impl App {
         let side = (self.options.side.is_some())
             .then(|| side_source(&self.bot))
             .flatten()
-            .and_then(|source| source.strip_suffix(".lead"));
+            .and_then(project::lead_project);
         let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
             return;
         };
@@ -5260,7 +5387,7 @@ impl App {
     /// its lead; a lone agent's only.
     fn scope(&self) -> background::Scope {
         let (project, lead) = match &self.project {
-            Some(project) => (project.clone(), format!("{project}.lead")),
+            Some(project) => (project.clone(), self.bot.clone()),
             None => (
                 self.bot.split('.').next().unwrap_or(&self.bot).to_owned(),
                 self.bot.clone(),
@@ -5306,11 +5433,27 @@ impl App {
             .as_millis() as u64;
         let store = self.store();
         let mut rows = Vec::new();
+        // With other leads in the folder, their tasks are theirs: each
+        // lead shows as a row of its own.
+        let listed = page["bots"].as_array().cloned().unwrap_or_default();
+        let shared = (listed.iter()).any(|bot| {
+            let name = bot["name"].as_str().unwrap_or("");
+            name != lead && project::lead_project(name) == Some(project.as_str())
+        });
+        let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
+            .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
         // Side chats are not the project's agents.
         for bot in page["bots"].as_array().into_iter().flatten() {
             let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
                 continue;
             };
+            if let Some(mine) = &mine
+                && name != lead
+                && !mine.contains(name)
+                && project::lead_project(name) != Some(project.as_str())
+            {
+                continue;
+            }
             let turns = self
                 .client
                 .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
@@ -7022,6 +7165,14 @@ impl App {
             self.quit = true;
             return;
         }
+        if let Some(rest) = prompt
+            .strip_prefix("/lead")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.lead_command(rest.trim()).await;
+            return;
+        }
         if let Some(question) = prompt
             .strip_prefix("/side")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
@@ -7124,6 +7275,10 @@ impl App {
             )
             .await
             .map_err(|error| error.to_string())?;
+        // The lead the folder opens next time.
+        if origin.is_none() && self.options.side.is_none() {
+            project::wrote_to(&self.workspace, &self.bot);
+        }
         if let Some(turn) = reply["turn"].as_i64() {
             // A steer is a submission of its own that ends as steered; the
             // person's is the turn it joins: the running one, or the one the
@@ -7459,6 +7614,58 @@ impl App {
         // Beside the conversation, on a terminal of its own.
         if let Err(error) = self.embed("side chat", &args) {
             self.notice = Some(format!("no side chat: {error}"));
+        }
+    }
+
+    /// `/lead`: the folder's leads; `/lead NAME` opens this window on one,
+    /// and `/lead new [NAME]` makes one and opens it.
+    async fn lead_command(&mut self, rest: &str) {
+        let Some(project) = self.project.clone().filter(|_| self.options.side.is_none()) else {
+            self.notice = Some("/lead is for a folder's lead, not this agent".into());
+            return;
+        };
+        let dir = std::path::PathBuf::from(&self.workspace);
+        let mut words = rest.split_whitespace();
+        let pick = match (words.next(), words.next(), words.next()) {
+            (None, ..) => None,
+            (Some("new"), name, None) => Some(project::Pick::New(name.map(str::to_owned))),
+            (Some(name), None, _) => Some(project::Pick::Named(name.to_owned())),
+            _ => {
+                self.notice = Some("/lead, /lead NAME or /lead new [NAME]".into());
+                return;
+            }
+        };
+        let Some(pick) = pick else {
+            self.notice = Some(match project::leads(&self.client, &project, &dir).await {
+                Ok(leads) => {
+                    let names: Vec<String> = (leads.iter())
+                        .filter_map(|lead| lead["name"].as_str())
+                        .map(|name| match name == self.bot {
+                            true => format!("{} (this one)", project::lead_short(name)),
+                            false => project::lead_short(name).to_owned(),
+                        })
+                        .collect();
+                    format!(
+                        "{project}'s leads here: {}; /lead NAME opens one, /lead new [NAME] makes one",
+                        names.join(", ")
+                    )
+                }
+                Err(error) => error,
+            });
+            return;
+        };
+        if let project::Pick::Named(name) = &pick
+            && project::lead_bot(&project, name) == self.bot
+        {
+            self.notice = Some(format!("this window is the {name} lead already"));
+            return;
+        }
+        match project::open(&self.client, &dir, None, &pick).await {
+            Ok(lead) => {
+                self.switch_to = Some(lead.bot);
+                self.quit = true;
+            }
+            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -8009,7 +8216,7 @@ impl App {
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
-                Some(project) => format!("{project} lead"),
+                Some(project) => lead_title(project, &self.bot),
                 None => self.bot.clone(),
             };
             let hint = match self.running {
@@ -8303,6 +8510,13 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
     if bot == lead {
         return "lead".into();
     }
+    // Another lead of the same folder, by the name /lead takes.
+    if project::lead_project(bot) == Some(project) {
+        return match bot.ends_with(".lead") {
+            true => "first lead".into(),
+            false => format!("lead {}", project::lead_short(bot)),
+        };
+    }
     bot.strip_prefix(&format!("{project}."))
         .unwrap_or(bot)
         .to_owned()
@@ -8497,20 +8711,80 @@ mod tests {
     }
 
     #[test]
+    fn another_lead_of_the_folder_and_its_tasks_are_never_tasks_here() {
+        let lineage: std::collections::HashSet<String> = ["ws.lead.api".into()].into();
+        let leads = std::collections::HashSet::new();
+        // The other leads are neither tasks nor another project's.
+        assert_eq!(
+            kin("ws.lead", "", "ws.lead.api", "ws", &lineage, &leads),
+            Kin::None
+        );
+        assert_eq!(
+            kin("ws.lead.web", "", "ws.lead", "ws", &lineage, &leads),
+            Kin::None
+        );
+        // Named like the project, a bot no agent made is the first lead's.
+        assert_eq!(
+            kin("ws.x", "", "ws.lead.api", "ws", &lineage, &leads),
+            Kin::None
+        );
+        assert_eq!(
+            kin("ws.x", "", "ws.lead", "ws", &lineage, &leads),
+            Kin::Task
+        );
+        assert_eq!(
+            kin("ws.y", "ws.lead.api", "ws.lead.api", "ws", &lineage, &leads),
+            Kin::Task
+        );
+        let bot = |name: &str, by: Option<&str>| json!({"name": name, "created_by": by});
+        let bots = [
+            bot("ws.lead", None),
+            bot("ws.lead.api", None),
+            bot("ws.fix", Some("ws.lead")),
+            bot("ws.fix-helper", Some("ws.fix")),
+            bot("ws.api-fix", Some("ws.lead.api")),
+            bot("ws.loose", None),
+        ];
+        let mine = |lead: &str, first: bool| {
+            let mut mine: Vec<String> = lineage_of(&bots, lead, first).into_iter().collect();
+            mine.sort();
+            mine
+        };
+        assert_eq!(
+            mine("ws.lead", true),
+            ["ws.fix", "ws.fix-helper", "ws.loose"]
+        );
+        assert_eq!(mine("ws.lead.api", false), ["ws.api-fix"]);
+    }
+
+    #[test]
     fn another_projects_lead_and_its_tasks_are_never_tasks_here() {
         let lineage: std::collections::HashSet<String> = ["ws.lead".into(), "ws.fix".into()].into();
         let mut leads = std::collections::HashSet::new();
-        assert_eq!(kin("ws.fix2", "ws.fix", "ws", &lineage, &leads), Kin::Task);
-        assert_eq!(kin("ws.side", "", "ws", &lineage, &leads), Kin::Task);
+        assert_eq!(
+            kin("ws.fix2", "ws.fix", "ws.lead", "ws", &lineage, &leads),
+            Kin::Task
+        );
+        assert_eq!(
+            kin("ws.side", "", "ws.lead", "ws", &lineage, &leads),
+            Kin::Task
+        );
         // Whoever made it, as the new_project tool says no one.
         assert_eq!(
-            kin("ws.web.lead", "", "ws", &lineage, &leads),
+            kin("ws.web.lead", "", "ws.lead", "ws", &lineage, &leads),
             Kin::Lead("ws.web".into())
         );
         leads.insert("ws.web".to_owned());
         // That lead's tasks are its own, though named like this project's.
         assert_eq!(
-            kin("ws.web.fix", "ws.web.lead", "ws", &lineage, &leads),
+            kin(
+                "ws.web.fix",
+                "ws.web.lead",
+                "ws.lead",
+                "ws",
+                &lineage,
+                &leads
+            ),
             Kin::None
         );
         // After a restart, a project inside this one is known by its lead.
@@ -8523,17 +8797,30 @@ mod tests {
         ];
         assert_eq!(inner_projects(names.into_iter(), "ws"), ["ws.web"]);
         assert_eq!(
-            kin("shop.lead", "ws.lead", "ws", &lineage, &leads),
+            kin("shop.lead", "ws.lead", "ws.lead", "ws", &lineage, &leads),
             Kin::Lead("shop".into())
         );
-        assert_eq!(kin("other.task", "", "ws", &lineage, &leads), Kin::None);
+        assert_eq!(
+            kin("other.task", "", "ws.lead", "ws", &lineage, &leads),
+            Kin::None
+        );
         // The lead of a project this one is inside leaves its tasks here.
         let lineage: std::collections::HashSet<String> = ["ws.web.lead".into()].into();
         let mut leads = std::collections::HashSet::new();
-        assert_eq!(kin("ws.lead", "", "ws.web", &lineage, &leads), Kin::None);
+        assert_eq!(
+            kin("ws.lead", "", "ws.web.lead", "ws.web", &lineage, &leads),
+            Kin::None
+        );
         leads.insert("ws.api".to_owned());
         assert_eq!(
-            kin("ws.web.fix", "ws.web.lead", "ws.web", &lineage, &leads),
+            kin(
+                "ws.web.fix",
+                "ws.web.lead",
+                "ws.web.lead",
+                "ws.web",
+                &lineage,
+                &leads
+            ),
             Kin::Task
         );
     }
@@ -8623,6 +8910,7 @@ mod tests {
             sound: false,
             side: None,
             embedded: false,
+            lead: project::Pick::Last,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
