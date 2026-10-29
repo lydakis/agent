@@ -600,7 +600,9 @@ Shift+Cmd+click in Ghostty) opens a file outside Sonny from the
 conversation. Keys go
 to the pane after a click in it; Tab takes them back to the composer, and
 Tab with nothing typed puts them in the pane again. A window too narrow for
-both shows the one the keys are in. Ctrl+F finds text in
+both shows the one the keys are in. With nothing typed, Home goes up to
+the conversation's first turn, drawing the turns over it on the way, and
+End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are. `/fullscreen` switches
 to inline, where Sonny writes into the terminal's own scrollback, and back;

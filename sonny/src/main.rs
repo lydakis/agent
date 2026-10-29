@@ -117,6 +117,11 @@ const HISTORY_ITEMS: u64 = 200;
 /// How much older history is drawn at a time as the view nears its top:
 /// a page drawn while the wheel turns, so small enough not to stall it.
 const OLDER_ITEMS: u64 = 50;
+/// How many nodes the way up to the first turn reads at a time, cut
+/// into pages of [`OLDER_ITEMS`].
+const WALKED_ITEMS: u64 = 400;
+/// About how many pages the way up to the first turn reads between frames.
+const WALKED_PAGES: usize = 32;
 /// The widest the conversation is written, however wide the window: a
 /// reply reads as a column, not a band across the screen. Prose reads
 /// best at 45 to 90 characters a line, but replies carry code, paths and
@@ -1236,6 +1241,36 @@ impl Paged {
     }
 }
 
+/// The reaction a call to react makes in this window, not another
+/// agent's.
+fn own_reaction(item: &Value) -> Option<(String, bool)> {
+    (item["arguments"].as_str())
+        .and_then(|a| serde_json::from_str::<Value>(a).ok())
+        .filter(|arguments| reactions::target(arguments).is_none())
+        .as_ref()
+        .and_then(reactions::call)
+}
+
+/// What `items` give back undrawn, as drawing them as older items would:
+/// what the calls before them returned.
+fn unpaired(items: impl IntoIterator<Item = (i64, Value)>) -> Vec<(i64, Value)> {
+    let mut calls = std::collections::HashSet::new();
+    let mut unpaired = Vec::new();
+    for (node, item) in items {
+        let id = item["call_id"].as_str().unwrap_or("").to_owned();
+        match item["type"].as_str() {
+            Some("function_call")
+                if item["name"] != reactions::TOOL || own_reaction(&item).is_some() =>
+            {
+                calls.insert(id);
+            }
+            Some("function_call_output") if !calls.remove(&id) => unpaired.push((node, item)),
+            _ => {}
+        }
+    }
+    unpaired
+}
+
 /// What the bot is saying: its rows stay in the viewport until what comes
 /// next tells whether they were a step on the way, before a call, or its
 /// reply, at the turn's end. Rows past what the viewport holds are written
@@ -1621,6 +1656,12 @@ struct App {
     /// A read of the bot's items came back short: what was drawn from it
     /// is not all there was.
     short_read: std::cell::Cell<bool>,
+    /// Home, with nothing typed, goes on up to the first turn as the pages
+    /// over it are drawn, until a key or the wheel says otherwise.
+    to_first: bool,
+    /// How many rows the pages drawn took, and for how many items: how
+    /// tall a page not drawn yet is guessed to be.
+    page_rows: (usize, usize),
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2281,6 +2322,8 @@ impl App {
             pages: HashMap::new(),
             next_page: 0,
             short_read: std::cell::Cell::new(false),
+            to_first: false,
+            page_rows: (0, 0),
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2501,8 +2544,18 @@ impl App {
             if full() && self.older.is_some() && self.screen.near_top() {
                 self.older().await;
             }
-            // A page let go drawn again before the view reaches it.
+            if self.to_first {
+                self.screen.scroll(isize::MAX);
+                self.to_first = full() && self.older.is_some() && self.screen.near_top();
+                // The next page asked for once this one is drawn, not a tick on.
+                if self.to_first {
+                    self.woken.notify_one();
+                }
+            }
+            // A page let go drawn again before the view reaches it, or
+            // once the way up to the first turn is done.
             if full()
+                && !self.to_first
                 && let Some(page) = self.screen.wanted()
             {
                 self.draw_again(page).await;
@@ -2839,7 +2892,7 @@ impl App {
             let unpaired = std::mem::take(&mut self.unpaired);
             self.history_since(newest, true).await;
             self.unpaired = unpaired;
-            self.screen.blank(pages);
+            self.screen.prepend_blank(pages);
             return Ok(());
         }
         let welcome = self.welcome();
@@ -2854,45 +2907,91 @@ impl App {
 
     /// The page of items before the oldest drawn, drawn on its own and
     /// put above the rest, the view left where it is: the conversation
-    /// drawn so far is not drawn again, and a turn running goes on.
+    /// drawn so far is not drawn again, and a turn running goes on. On
+    /// the way up to the first turn, the pages over it are blank rows as
+    /// tall as they may be, a few at a time, drawn once the view nears
+    /// them.
     async fn older(&mut self) {
-        let Some(from) = self.older else {
-            return;
-        };
-        let asked = json!({"bot": self.bot, "from": from, "limit": OLDER_ITEMS});
-        let page = match self.client.request("history_nodes", asked).await {
-            Ok(page) => page,
-            Err(error) => {
-                self.notice = Some(error.to_string());
-                return;
-            }
-        };
-        let mut nodes: Vec<i64> = Vec::new();
-        let mut turns: HashMap<i64, i64> = HashMap::new();
-        for n in page["nodes"].as_array().into_iter().flatten() {
-            let Some(node) = n["node"].as_i64() else {
-                continue;
+        // Newest first, those on the way up, by their ids and rows.
+        let mut blanks: Vec<(u64, usize)> = Vec::new();
+        while let Some(from) = self.older
+            && blanks.len() < WALKED_PAGES
+        {
+            // On the way up, as many nodes as a read gives, cut into pages.
+            let limit = match self.to_first {
+                true => WALKED_ITEMS,
+                false => OLDER_ITEMS,
             };
-            nodes.push(node);
-            if let Some(turn) = n["turn"].as_i64() {
-                turns.insert(node, turn);
+            let asked = json!({"bot": self.bot, "from": from, "limit": limit});
+            let page = match self.client.request("history_nodes", asked).await {
+                Ok(page) => page,
+                Err(error) => {
+                    self.notice = Some(error.to_string());
+                    break;
+                }
+            };
+            let mut nodes: Vec<i64> = Vec::new();
+            let mut turns: HashMap<i64, i64> = HashMap::new();
+            for n in page["nodes"].as_array().into_iter().flatten() {
+                let Some(node) = n["node"].as_i64() else {
+                    continue;
+                };
+                nodes.push(node);
+                if let Some(turn) = n["turn"].as_i64() {
+                    turns.insert(node, turn);
+                }
+            }
+            nodes.reverse();
+            self.older = page["next_from"].as_i64();
+            if nodes.is_empty() {
+                self.older = None;
+                break;
+            }
+            self.short_read.set(false);
+            let mut items = match self.to_first {
+                true => self.items_at(&nodes).await,
+                false => Vec::new(),
+            };
+            // A read cut short: the rest of the way drawn a page at a time.
+            if self.short_read.get() {
+                self.older = Some(from);
+                self.to_first = false;
+                break;
+            }
+            while !nodes.is_empty() {
+                let cut = nodes.len().saturating_sub(OLDER_ITEMS as usize);
+                let ours = nodes.split_off(cut);
+                self.first_node = Some(ours[0]);
+                let turns = (ours.iter())
+                    .filter_map(|node| Some((*node, *turns.get(node)?)))
+                    .collect();
+                let after = std::mem::take(&mut self.unpaired);
+                let first = self.older.is_none() && nodes.is_empty();
+                let paged = Paged::new(ours, turns, &after, first);
+                let id = self.next_page;
+                self.next_page += 1;
+                let cut = items.partition_point(|(node, _)| *node < paged.nodes[0]);
+                let read = items.split_off(cut);
+                if !self.to_first || paged.first {
+                    blanks.reverse();
+                    self.screen.prepend_blank(blanks);
+                    let (lines, unpaired) = self.draw_page(&paged, after).await;
+                    self.unpaired = unpaired;
+                    self.page_rows.0 += lines.len();
+                    self.page_rows.1 += paged.nodes.len();
+                    self.pages.insert(id, paged);
+                    self.screen.prepend(id, lines);
+                    return;
+                }
+                // Only read: what its calls returned is all drawing it gives.
+                self.unpaired = unpaired(read.into_iter().chain(after));
+                let (rows, items) = self.page_rows;
+                blanks.push((id, paged.nodes.len() * rows.max(1) / items.max(1)));
+                self.pages.insert(id, paged);
             }
         }
-        nodes.reverse();
-        self.older = page["next_from"].as_i64();
-        let Some(&oldest) = nodes.first() else {
-            self.older = None;
-            return;
-        };
-        self.first_node = Some(oldest);
-        let after = std::mem::take(&mut self.unpaired);
-        let paged = Paged::new(nodes, turns, &after, self.older.is_none());
-        let (lines, unpaired) = self.draw_page(&paged, after).await;
-        self.unpaired = unpaired;
-        let id = self.next_page;
-        self.next_page += 1;
-        self.pages.insert(id, paged);
-        self.screen.prepend(id, lines);
+        blanks.reverse();
+        self.screen.prepend_blank(blanks);
     }
 
     /// The page `id`, let go as the view moved away, drawn again as it
@@ -3336,13 +3435,7 @@ impl App {
                     // Counted once it is known to have been taken.
                     // One naming another agent is drawn in that agent's window.
                     (Some("function_call"), _) if item["name"] == reactions::TOOL => {
-                        if let Some(reaction) = item["arguments"]
-                            .as_str()
-                            .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                            .filter(|arguments| reactions::target(arguments).is_none())
-                            .as_ref()
-                            .and_then(reactions::call)
-                        {
+                        if let Some(reaction) = own_reaction(&item) {
                             let id = item["call_id"].as_str().unwrap_or("").to_owned();
                             self.react_calls.insert(id, reaction);
                         }
@@ -4837,6 +4930,20 @@ impl App {
     /// What the full screen takes before the rest: the mouse, a copy of
     /// the selection, and the keys that scroll. Whether it took `event`.
     fn full_screen(&mut self, event: &Event) -> bool {
+        use ratatui::crossterm::event::MouseEventKind;
+        // A key, or the wheel, ends the way up to the first turn.
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.to_first = false,
+            Event::Mouse(mouse)
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                self.to_first = false
+            }
+            _ => {}
+        }
         let key = match event {
             // A paste while finding is more to find.
             // A paste in the pane's program is its own.
@@ -5112,6 +5219,20 @@ impl App {
             KeyCode::Esc if self.screen.unselect() || self.input.unselect() => {}
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.screen.page(false),
+            // With nothing typed, Home goes to the first turn, the pages
+            // over it drawn on the way, and End back to the newest.
+            KeyCode::Home | KeyCode::End
+                if self.input.is_empty()
+                    && self.picker.is_none()
+                    && self.choosing.is_none()
+                    && self.reacting.is_none() =>
+            {
+                self.to_first = key.code == KeyCode::Home;
+                match self.to_first {
+                    true => self.screen.scroll(isize::MAX),
+                    false => self.screen.latest(),
+                }
+            }
             // Sending goes back to the newest rows, where its answer comes.
             KeyCode::Enter => {
                 self.screen.latest();
@@ -7545,6 +7666,29 @@ fn responses(item: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_only_read_gives_back_what_drawing_it_would() {
+        let call = |id: &str, name: &str, arguments: &str| json!({"type": "function_call", "call_id": id, "name": name, "arguments": arguments});
+        let result = |id: &str| json!({"type": "function_call_output", "call_id": id});
+        let items = vec![
+            (1, result("before")),
+            (2, call("ran", "shell", "{}")),
+            (3, result("ran")),
+            (4, call("here", "react", r#"{"emoji":"👍"}"#)),
+            (5, call("there", "react", r#"{"emoji":"👍","bot":"other"}"#)),
+            (6, result("here")),
+            (6, result("there")),
+        ];
+        let after = vec![(9, result("newer"))];
+        let back: Vec<i64> = unpaired(items.into_iter().chain(after))
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        // A result before its call, one for another agent's reaction, and
+        // one a newer page could not pair are for older pages.
+        assert_eq!(back, vec![1, 6, 9]);
+    }
 
     #[test]
     fn another_projects_lead_and_its_tasks_are_never_tasks_here() {

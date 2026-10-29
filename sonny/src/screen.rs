@@ -320,6 +320,35 @@ impl Screen {
         self.let_go();
     }
 
+    /// Blank rows above the first row standing in for `pages`, from the
+    /// first, each as many rows as it says, until the view nears it.
+    pub fn prepend_blank(&mut self, pages: Vec<(u64, usize)>) {
+        if pages.is_empty() {
+            return;
+        }
+        let pages: Vec<Page> = (pages.into_iter())
+            .map(|(id, rows)| Page {
+                id,
+                rows: rows.max(1),
+                drawn: false,
+            })
+            .collect();
+        let rows = pages.iter().map(|page| page.rows).sum();
+        // One page as tall as them all, then each its own.
+        self.pages.insert(
+            0,
+            Page {
+                id: 0,
+                rows: 0,
+                drawn: false,
+            },
+        );
+        self.placed = None;
+        self.swap(0, vec![Line::default(); rows]);
+        self.pages.splice(0..1, pages);
+        self.placed = None;
+    }
+
     /// The page `id`, let go before, drawn again with `lines`.
     pub fn fill(&mut self, id: u64, lines: Vec<Line<'static>>) {
         let Some(page) = self.pages.iter().position(|p| p.id == id && !p.drawn) else {
@@ -337,42 +366,6 @@ impl Screen {
         (self.pages.iter().enumerate())
             .map(|(p, page)| (page.id, placed.get(p).map_or(page.rows, |at| at.len())))
             .collect()
-    }
-
-    /// Blank rows over the rest for each of `pages`, as tall as it was,
-    /// to be drawn again as the view nears it: the view stays as many
-    /// rows up from the newest.
-    pub fn blank(&mut self, pages: Vec<(u64, usize)>) {
-        let blank = Arc::new(Line::default());
-        let rows: usize = pages.iter().map(|(_, rows)| rows).sum();
-        self.rows.splice(
-            0..0,
-            (0..rows).map(|_| Row {
-                line: blank.clone(),
-                rest: None,
-                link: None,
-            }),
-        );
-        // Rows wrapped already are wrapped again under them.
-        self.shown.clear();
-        self.wrapped = 0;
-        self.relaid = 0;
-        self.selection = None;
-        self.linked = None;
-        for spot in [&mut self.go_to, &mut self.keep].into_iter().flatten() {
-            spot.0 += rows;
-        }
-        if let Some(top) = &mut self.top_row {
-            *top += rows;
-        }
-        let pages = pages.into_iter().map(|(id, rows)| Page {
-            id,
-            rows,
-            drawn: false,
-        });
-        self.pages.splice(0..0, pages);
-        self.placed = None;
-        self.laid += 1;
     }
 
     /// A page let go that the view is near, the nearest: to draw again.
@@ -1944,7 +1937,7 @@ mod tests {
         // rows as tall as they were, the view on the newest.
         screen.clear();
         screen.push(lines(20_000..20_050, "new"));
-        screen.blank(pages);
+        screen.prepend_blank(pages);
         let buf = drawn(&mut screen, area);
         assert_eq!(row(&buf, 4).trim_end(), "new 20049");
         assert_eq!(screen.height(20), 9_050);
@@ -1962,6 +1955,27 @@ mod tests {
         screen.fill(2, rows(0..3_000));
         let buf = drawn(&mut screen, area);
         assert_eq!(row(&buf, 0).trim_end(), "row 0");
+    }
+
+    #[test]
+    fn pages_put_above_blank_wait_for_the_view_and_are_drawn_in_place() {
+        let area = Rect::new(0, 0, 20, 5);
+        let (mut screen, _) = screen(rows(20_000..20_050), 20, 5);
+        drawn(&mut screen, area);
+        // Guessed at 100 rows each; the view goes up to the first.
+        screen.prepend_blank(vec![(1, 100), (2, 100), (3, 100)]);
+        let buf = drawn(&mut screen, area);
+        assert_eq!(row(&buf, 4).trim_end(), "row 20049");
+        assert_eq!(screen.height(20), 350);
+        screen.scroll(isize::MAX);
+        drawn(&mut screen, area);
+        assert_eq!(screen.wanted(), Some(1));
+        // Drawn shorter than guessed, at the top all the same.
+        screen.fill(1, rows(0..30));
+        let buf = drawn(&mut screen, area);
+        assert_eq!(row(&buf, 0).trim_end(), "row 0");
+        assert_eq!(screen.height(20), 280);
+        assert_eq!(screen.wanted(), Some(2));
     }
 
     #[test]
