@@ -66,11 +66,11 @@ Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
 
-A new project's empty transcript opens with a welcome: Sonny, the robot
-the client is named for, drawn in half blocks, as a portrait the first
-time Sonny ever runs (noted in `~/.agent/sonny/welcomed`) and as a small
-icon for each project after that. A folder that already has a lead opens
-on its history, with no welcome over it.
+A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
+the robot the client is named for, as a portrait drawn in half blocks,
+beside the folder, the lead's model and a few commands. A new lead opens
+on it; a long conversation shows it above its first message, once scrolling
+up has reached it. A side chat has none.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`

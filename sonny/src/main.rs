@@ -856,10 +856,8 @@ async fn run() -> Result<(), String> {
         app.gating = Some(mode);
     }
     app.project = project;
-    // A new project's lead has no history yet: Sonny says hello over it.
-    if fresh && options.side.is_none() {
-        app.welcome = Some(Vec::new());
-    }
+    // Sonny's welcome heads a lead's conversation, though not a side chat.
+    app.welcome = options.side.is_none();
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
@@ -1359,9 +1357,9 @@ struct App {
     /// Lines let go while `/status` held the screen, past what is kept.
     skipped: usize,
     any_history: bool,
-    /// The welcome over a new project's empty transcript: asked for at
-    /// start, drawn once the width is known, and kept for a repaint.
-    welcome: Option<Vec<Line<'static>>>,
+    /// Sonny's welcome heads the transcript once it is drawn back to the
+    /// conversation's first item, as Claude Code's does.
+    welcome: bool,
     width: usize,
     /// The terminal's rows, which bound how much of the bot's words is held.
     height: usize,
@@ -2033,7 +2031,7 @@ impl App {
             pending: Vec::new(),
             skipped: 0,
             any_history: false,
-            welcome: None,
+            welcome: false,
             width: 80,
             height: 24,
             live: None,
@@ -2138,11 +2136,17 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
-        if let Some(welcome) = self.welcome.as_mut() {
-            *welcome = banner::welcome(&self.bot, &tilde(&self.workspace), &self.model, self.width);
-        }
-        self.draw_welcome();
         self.history().await;
+        // Known to start the conversation only once its newest page is
+        // read, the welcome goes above it.
+        let mut welcome = self.welcome();
+        if !welcome.is_empty() {
+            if self.any_history {
+                welcome.push(Line::default());
+            }
+            self.any_history = true;
+            self.pending.splice(0..0, welcome);
+        }
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
             status_report("working", &self.bot);
@@ -2594,7 +2598,8 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
-        self.draw_welcome();
+        let welcome = self.welcome();
+        self.commit(welcome);
         // Back to the first node this window drew, not only the newest page.
         match self.first_node {
             Some(first) => self.history_since(first - 1, true).await,
@@ -2777,10 +2782,12 @@ impl App {
     }
 
     /// Commit a finished cell, a blank line apart from the one before.
-    /// The welcome, first in the transcript, when this window has one.
-    fn draw_welcome(&mut self) {
-        if let Some(welcome) = self.welcome.clone() {
-            self.commit(welcome);
+    /// The welcome, when this window has one and draws the conversation
+    /// from its first item: none above a page with older ones before it.
+    fn welcome(&self) -> Vec<Line<'static>> {
+        match self.welcome && self.older.is_none() {
+            true => banner::welcome(&tilde(&self.workspace), &self.model, self.width),
+            false => Vec::new(),
         }
     }
 
