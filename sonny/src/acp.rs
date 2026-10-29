@@ -1700,8 +1700,6 @@ async fn open_task(
     }
 }
 
-/// A prompt's words and pictures: text as it is, a file or resource as its
-/// path or its text, a picture as the daemon takes one.
 /// The lead a thread's first words ask for: `/lead NAME` one of the
 /// folder's, `/lead new [NAME]` a new one.
 fn lead_asked(text: &str) -> Option<project::Pick> {
@@ -1714,6 +1712,8 @@ fn lead_asked(text: &str) -> Option<project::Pick> {
     }
 }
 
+/// A prompt's words and pictures: text as it is, a file or resource as its
+/// path or its text, a picture as the daemon takes one.
 fn words(prompt: &Value) -> (String, Vec<Value>) {
     let mut text = String::new();
     let mut images = Vec::new();
