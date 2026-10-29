@@ -25,6 +25,8 @@ mod fetch;
 mod files;
 mod patch;
 mod picture;
+#[cfg(unix)]
+mod terminal;
 use files::read_bounded;
 pub use patch::Patch;
 
@@ -47,6 +49,12 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
 /// Detached commands still running at once, daemon-wide, unless configured.
 pub const DEFAULT_DETACHED_BUDGET: usize = 16;
+/// How long a terminal's start waits for output by default, and how long
+/// it or a write waits at most.
+const START_YIELD_MS: u64 = 1_000;
+const MAX_YIELD_MS: u64 = 30_000;
+/// The most a write to a terminal may type at once.
+const INPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
@@ -61,6 +69,7 @@ enum Tool {
     Note,
     WebSearch,
     WebFetch,
+    WriteStdin,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -76,6 +85,7 @@ impl Tool {
             "note" => Tool::Note,
             "web_search" => Tool::WebSearch,
             "web_fetch" => Tool::WebFetch,
+            "write_stdin" => Tool::WriteStdin,
             _ => return None,
         })
     }
@@ -92,6 +102,7 @@ impl Tool {
             Tool::Note => "note",
             Tool::WebSearch => "web_search",
             Tool::WebFetch => "web_fetch",
+            Tool::WriteStdin => "write_stdin",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -102,10 +113,11 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill. With tty=true the command runs in a terminal you type into: use it for a REPL or a program that asks for input. It returns what the command wrote within yield_time_ms (default 1000, at most 30000) and, while it runs, a proc handle; type into it, read more, or kill it with write_stdin. A terminal runs until it exits or is killed, across turns, and wait on its handle reports how it ended. Its output merges stdout and stderr.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
-                "background":{"type":"boolean"},"detach":{"type":"boolean"}},
+                "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
+                "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS}},
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
@@ -152,6 +164,13 @@ impl Tool {
                 "Fetch a public http or https URL and return its text: an HTML page as Markdown, with its title and links resolved to absolute URLs; other text as it is. The result names the final URL after redirects and the HTTP status. Text past 64 KiB is cut to its start and end, with the whole kept as an artifact to page with read. Use it to read a page you were given or found; it does not run the page's scripts or sign in.",
                 json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},
                 "required":["url"],"additionalProperties":false}),
+            ),
+            Tool::WriteStdin => (
+                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, which echoes what was typed. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started.",
+                json!({"type":"object","properties":{"handle":{"type":"string"},
+                "chars":{"type":"string","maxLength":INPUT_BYTES},
+                "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
+                "required":["handle"],"additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
@@ -368,6 +387,9 @@ pub struct Registry {
     /// A permit stays with each detached child until its wait completes.
     detached_slots: Arc<Semaphore>,
     detached_budget: usize,
+    /// Running terminals, by proc handle, each its bot's own.
+    #[cfg(unix)]
+    terminals: terminal::Terminals,
     credentials: Credentials,
     environment: Arc<Vec<(String, String)>>,
     /// What the daemon keeps that a sandbox leaves alone or lets through.
@@ -637,6 +659,20 @@ pub enum Prepared {
     },
     /// A command in its own session, neither tracked nor killed.
     Detach(String),
+    /// A command in a terminal its bot types into, on a proc handle.
+    /// Resolved by the runtime, never by the registry.
+    Terminal {
+        command: String,
+        yield_ms: u64,
+    },
+    /// Input for a bot's terminal, or its end. Resolved by the runtime,
+    /// never by the registry.
+    WriteStdin {
+        handle: i64,
+        chars: String,
+        yield_ms: Option<u64>,
+        kill: bool,
+    },
     /// Resolved by the runtime, never by the registry.
     History {
         /// Another agent's, or the caller's own when `None`.
@@ -775,7 +811,7 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch"
+            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch,write_stdin"
         } else {
             "echo,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch"
         })
@@ -787,7 +823,7 @@ impl Registry {
             if tools.contains(&tool) {
                 return fail("unsupported_tool_set");
             }
-            if tool == Tool::Shell && !cfg!(unix) {
+            if matches!(tool, Tool::Shell | Tool::WriteStdin) && !cfg!(unix) {
                 return fail("shell_platform_unsupported");
             }
             tools.push(tool);
@@ -799,6 +835,8 @@ impl Registry {
             pending: Arc::default(),
             detached_slots: Arc::new(Semaphore::new(DEFAULT_DETACHED_BUDGET)),
             detached_budget: DEFAULT_DETACHED_BUDGET,
+            #[cfg(unix)]
+            terminals: Arc::default(),
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
@@ -971,12 +1009,14 @@ impl Registry {
         #[serde(deny_unknown_fields)]
         struct Shell {
             command: String,
-            #[serde(default = "default_timeout")]
-            timeout_ms: u64,
+            timeout_ms: Option<u64>,
             #[serde(default)]
             background: bool,
             #[serde(default)]
             detach: bool,
+            #[serde(default)]
+            tty: bool,
+            yield_time_ms: Option<u64>,
             /// Whether a sandboxed bot's command asks to leave its sandbox;
             /// decided before the call runs, through its gate.
             sandbox_permissions: Option<String>,
@@ -1031,9 +1071,6 @@ impl Registry {
             #[serde(default)]
             replace_all: bool,
         }
-        fn default_timeout() -> u64 {
-            DEFAULT_SHELL_TIMEOUT_MS
-        }
         fn one() -> usize {
             1
         }
@@ -1066,13 +1103,32 @@ impl Registry {
                     Some("command is over 16 KiB".to_owned())
                 } else if args.command.contains('\0') {
                     Some("command contains a NUL byte".to_owned())
-                } else if !(1..=MAX_SHELL_TIMEOUT_MS).contains(&args.timeout_ms) {
+                } else if let Some(timeout_ms) = args
+                    .timeout_ms
+                    .filter(|t| !(1..=MAX_SHELL_TIMEOUT_MS).contains(t))
+                {
                     Some(format!(
-                        "timeout_ms is {}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}",
-                        args.timeout_ms
+                        "timeout_ms is {timeout_ms}; it runs from 1 to {MAX_SHELL_TIMEOUT_MS}"
                     ))
                 } else if args.detach && args.background {
                     Some("detach and background cannot both be set".to_owned())
+                } else if args.tty && (args.detach || args.background || args.timeout_ms.is_some())
+                {
+                    Some(
+                        "a terminal runs until it exits or is killed: tty takes no detach, background or timeout_ms"
+                            .to_owned(),
+                    )
+                } else if args.tty
+                    && args.sandbox_permissions.as_deref() == Some("require_escalated")
+                {
+                    // Input typed into an escaped terminal would run unjudged.
+                    Some(
+                        "a terminal runs in the sandbox: tty takes no require_escalated".to_owned(),
+                    )
+                } else if !args.tty && args.yield_time_ms.is_some() {
+                    Some("yield_time_ms is for a terminal, with tty".to_owned())
+                } else if args.yield_time_ms.is_some_and(|y| y > MAX_YIELD_MS) {
+                    Some(format!("yield_time_ms runs from 0 to {MAX_YIELD_MS}"))
                 } else if args
                     .sandbox_permissions
                     .as_deref()
@@ -1095,9 +1151,15 @@ impl Registry {
                 if args.detach {
                     return Ok(Prepared::Detach(args.command));
                 }
+                if args.tty {
+                    return Ok(Prepared::Terminal {
+                        command: args.command,
+                        yield_ms: args.yield_time_ms.unwrap_or(START_YIELD_MS),
+                    });
+                }
                 Prepared::Shell {
                     command: args.command,
-                    timeout_ms: args.timeout_ms,
+                    timeout_ms: args.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS),
                     background: args.background,
                 }
             }
@@ -1158,6 +1220,48 @@ impl Registry {
                 }
                 let args: WebFetch = serde_json::from_str(args).map_err(invalid)?;
                 Prepared::WebFetch(fetch::parse(&args.url)?)
+            }
+            Tool::WriteStdin => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct WriteStdin {
+                    handle: String,
+                    #[serde(default)]
+                    chars: String,
+                    yield_time_ms: Option<u64>,
+                    #[serde(default)]
+                    kill: bool,
+                }
+                let args: WriteStdin = serde_json::from_str(args).map_err(invalid)?;
+                let handle = args
+                    .handle
+                    .strip_prefix("proc:")
+                    .and_then(|id| id.parse::<i64>().ok())
+                    .filter(|id| *id > 0 && args.handle == format!("proc:{id}"));
+                let invalid = match handle {
+                    None => Some(format!("{:?} is no proc handle", args.handle)),
+                    Some(_) if args.chars.len() > INPUT_BYTES => {
+                        Some(format!("chars is over {INPUT_BYTES} bytes"))
+                    }
+                    Some(_) if args.kill && !args.chars.is_empty() => {
+                        Some("kill takes no chars".to_owned())
+                    }
+                    Some(_) if args.yield_time_ms.is_some_and(|y| y > MAX_YIELD_MS) => {
+                        Some(format!("yield_time_ms runs from 0 to {MAX_YIELD_MS}"))
+                    }
+                    Some(_) => None,
+                };
+                match (invalid, handle) {
+                    (None, Some(handle)) => Prepared::WriteStdin {
+                        handle,
+                        chars: args.chars,
+                        yield_ms: args.yield_time_ms,
+                        kill: args.kill,
+                    },
+                    (detail, _) => {
+                        return fail_with("invalid_tool_arguments", detail.unwrap_or_default());
+                    }
+                }
             }
             Tool::Note => {
                 #[derive(serde::Deserialize)]
@@ -1261,6 +1365,9 @@ impl Registry {
                 detach(&command, workspace, self, environment, sandbox).await
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
+            Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
+                fail("terminal_requires_runtime")
+            }
             Prepared::History { .. } | Prepared::HistorySearch { .. } => {
                 fail("history_requires_runtime")
             }
