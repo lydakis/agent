@@ -24,9 +24,9 @@ use std::{
 /// daemon is asked whether it is.
 pub const DOUBT: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
-/// About what one note may take, well under the daemon's prompt limit; a
-/// line other than the person's words and the tasks' replies counts as
-/// `LINE_BYTES`.
+/// About what one note may take, well under the daemon's 256 KiB prompt
+/// limit; a message counts as its quoted words and `LINE_BYTES`, and a
+/// turn as its line and reply as they read.
 const NOTE_BYTES: usize = 192 * 1024;
 const LINE_BYTES: usize = 160;
 /// How many messages a task's news keeps the person's words for.
@@ -714,11 +714,25 @@ impl Updates {
                 }
             }
             news.said = kept;
-            if !wait.is_empty() {
-                let waiting = News {
+            // How its turns end, each with its reply, as they will read: the
+            // first thing a note tells always fits; past that, turns that do
+            // not wait for the next note.
+            let turns: Vec<Line> = [(false, &news.act), (true, &news.theirs)]
+                .into_iter()
+                .filter_map(|(theirs, t)| Some(line(&name, theirs, t.as_ref()?)))
+                .collect();
+            let size: usize = turns.iter().map(|l| l.text.len() + 1).sum();
+            let first = items.is_empty() && news.said.is_empty();
+            let fits = first || bytes + size <= NOTE_BYTES;
+            if !wait.is_empty() || !fits {
+                let mut waiting = News {
                     said: wait,
                     ..News::default()
                 };
+                if !fits {
+                    waiting.act = news.act.take();
+                    waiting.theirs = news.theirs.take();
+                }
                 later.push((name.clone(), waiting));
             }
             // A message that started a turn told below as asked by its
@@ -728,17 +742,13 @@ impl Updates {
             };
             let left: Vec<Said> = news.said.iter().filter(|s| !ended(s)).cloned().collect();
             items.extend(said(&name, &left, &mut quoted));
-            let turns = [(false, &news.act), (true, &news.theirs)];
-            items.extend(
-                (turns.into_iter())
-                    .filter_map(|(theirs, t)| Some(line(&name, theirs, t.as_ref()?))),
-            );
-            let replies = [&news.act, &news.theirs].into_iter().flatten();
-            bytes += 2 * LINE_BYTES
-                + replies
-                    .filter_map(|t| t.reply.as_ref())
-                    .map(String::len)
-                    .sum::<usize>();
+            if fits {
+                items.extend(turns);
+                bytes += size;
+            } else {
+                // Nothing more fits this note.
+                bytes = NOTE_BYTES;
+            }
             sent.push((name, news));
         }
         later.extend(rest);
@@ -1262,6 +1272,44 @@ mod tests {
         );
         assert_eq!(told.more, 9);
         assert!(!updates.quoting());
+    }
+
+    #[test]
+    fn replies_past_one_note_s_bytes_wait_for_the_next() {
+        let mut updates = fleet();
+        let tasks = ["shop.fix", "shop.docs", "shop.ui"];
+        updates.seat(&json!({"name": "shop.ui", "bot_id": 5, "status": "idle"}));
+        updates.watched.insert("shop.ui".into());
+        let long = "漢".repeat(REPLY_CHARS);
+        for (n, task) in tasks.iter().enumerate() {
+            let turn = n as i64 + 1;
+            updates.event(
+                &ev(task, Some(turn), "accepted", json!({"origin": "tasks"})),
+                Instant::now(),
+            );
+            updates.event(
+                &ev(
+                    task,
+                    Some(turn),
+                    "turn_finished",
+                    json!({"status": "completed"}),
+                ),
+                Instant::now(),
+            );
+            updates.replied(task, turn, &long);
+        }
+        let first = updates.take();
+        let size: usize = first.items.iter().map(|i| i.text.len()).sum();
+        assert_eq!((first.items.len(), first.more), (2, 1));
+        assert!(size <= NOTE_BYTES && size + 8 * 1024 < 256 * 1024, "{size}");
+        updates.sent(first);
+        let second = updates.take();
+        assert_eq!(second.items.len(), 1);
+        assert!(
+            second.items[0]
+                .text
+                .starts_with("- shop.ui: turn:shop.ui/3 completed")
+        );
     }
 
     #[test]
