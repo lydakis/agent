@@ -53,12 +53,13 @@ fn sign(state: &str) -> Span<'static> {
     }
 }
 
-fn first(brief: &str) -> &str {
-    brief
+/// A brief's first line, cut short enough to keep.
+pub fn first(brief: &str) -> String {
+    let line = brief
         .lines()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim()
+        .unwrap_or("");
+    cut(line.trim(), 200)
 }
 
 /// The rows of `tasks` started together, `width` wide, each with the
@@ -92,7 +93,7 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
                 Span::raw("  "),
                 Span::raw(format!("{:<states$}", task.state)).dim(),
                 Span::raw("  "),
-                Span::raw(cut(first(&task.brief), room)),
+                Span::raw(cut(&first(&task.brief), room)),
             ]),
             Some(at),
         ));

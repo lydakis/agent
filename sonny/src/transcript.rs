@@ -1165,28 +1165,45 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
 /// first words (or the news it brings), `▸` to open it; open, the same
 /// row with `▾` and the whole message under it.
 pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<Line<'static>> {
-    let news = news(text);
-    let head = match (&news, from, open) {
-        (Some(parts), _, false) => parts.join(" · "),
-        (Some(parts), _, true) => parts[0].clone(),
-        (None, Some(from), false) => format!("{from}: {}", text.lines().next().unwrap_or("")),
-        (None, Some(from), true) => format!("from {from}"),
-        (None, None, _) => text.lines().next().unwrap_or("").to_owned(),
+    if !open {
+        return relayed_shut(&relayed_head(text, from), width);
+    }
+    let head = match (news(text), from) {
+        (Some(parts), _) => parts[0].clone(),
+        (None, Some(from)) => format!("from {from}"),
+        (None, None) => text.lines().next().unwrap_or("").to_owned(),
     };
-    let sign = if open { "▾" } else { "▸" };
     let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
-    let mut out = vec![Line::from(format!("{head} {sign}"))];
-    if open {
-        for line in text.lines() {
-            out.extend(wrap(
-                Line::from(line.to_string()),
-                width,
-                Span::raw("  "),
-                Span::raw("  "),
-            ));
-        }
+    let mut out = vec![Line::from(format!("{head} ▾"))];
+    for line in text.lines() {
+        out.extend(wrap(
+            Line::from(line.to_string()),
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
     }
     out.into_iter().map(|line| line.dim()).collect()
+}
+
+/// What the shut row of words between agents says: who sent them and
+/// their first words, or the news they bring, cut short enough to keep.
+pub fn relayed_head(text: &str, from: Option<&str>) -> String {
+    let head = match (news(text), from) {
+        (Some(parts), _) => parts.join(" · "),
+        (None, Some(from)) => format!("{from}: {}", text.lines().next().unwrap_or("")),
+        (None, None) => text.lines().next().unwrap_or("").to_owned(),
+    };
+    cut(head.trim(), RELAYED_HEAD)
+}
+
+/// The most columns of a shut row kept: wider than any conversation.
+const RELAYED_HEAD: usize = 200;
+
+/// The shut row of words between agents, from [`relayed_head`].
+pub fn relayed_shut(head: &str, width: usize) -> Vec<Line<'static>> {
+    let head = cut(&format!("↳ {head}"), width.saturating_sub(2));
+    vec![Line::from(format!("{head} ▸")).dim()]
 }
 
 /// The most lines of a prompt shown above its reply.

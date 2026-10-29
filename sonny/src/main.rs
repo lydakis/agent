@@ -144,6 +144,9 @@ struct Options {
     /// A side chat, opened by `/side`: the node its copy was taken at,
     /// after which its history is drawn.
     side: Option<i64>,
+    /// Drawn in another Sonny's pane: the terminal's tab is that Sonny's,
+    /// so this one claims nothing of it.
+    embedded: bool,
 }
 
 fn usage() -> String {
@@ -560,7 +563,7 @@ fn parse() -> Result<Options, String> {
     let (mut store, mut socket, mut bot, mut new, mut model, mut workspace) =
         (None, None, None, false, None, None);
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
-    let mut side = None;
+    let (mut side, mut embedded) = (None, false);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(usage);
         match arg.as_str() {
@@ -575,6 +578,8 @@ fn parse() -> Result<Options, String> {
             "--no-sound" => sound = false,
             // Unlisted: how `/side` opens a side chat.
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
+            // Unlisted: how a task opens in the pane.
+            "--embedded" => embedded = true,
             _ => return Err(usage()),
         }
     }
@@ -590,6 +595,7 @@ fn parse() -> Result<Options, String> {
         rex_host,
         sound,
         side,
+        embedded,
     })
 }
 
@@ -709,8 +715,9 @@ async fn run() -> Result<(), String> {
             (lead.bot, Some(lead.project))
         }
     };
-    // A side chat borrows its agent's pane, and Herdr keeps the agent.
-    if options.side.is_none() {
+    // A side chat borrows its agent's pane, and Herdr keeps the agent; a
+    // task in the pane is in its lead's.
+    if options.side.is_none() && !options.embedded {
         herdr::announce(&name, reopen());
         cmux::announce(&name, reopen());
     }
@@ -1109,9 +1116,12 @@ fn said_button(node: i64) -> screen::Mark {
 
 /// A message one bot sent another, drawn quiet until a click opens it.
 struct Relayed {
-    text: String,
+    /// What its shut row says, as [`transcript::relayed_head`] has it.
+    head: String,
     from: Option<String>,
-    open: bool,
+    /// The whole message while it is open, read again from the history
+    /// when it opens, so a long conversation keeps none of them.
+    text: Option<String>,
 }
 
 /// Ctrl+], which moves the keys between the conversation and the pane:
@@ -1515,6 +1525,8 @@ struct App {
     tasks: Vec<Vec<started::Task>>,
     starting: Option<(usize, usize)>,
     tasks_read: Option<Instant>,
+    /// When every task started, ended ones too, was last read.
+    tasks_all_read: Option<Instant>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
     /// A button clicked in the conversation, which [`App::press`] takes.
@@ -2119,6 +2131,7 @@ impl App {
             tasks: Vec::new(),
             starting: None,
             tasks_read: None,
+            tasks_all_read: None,
             tasks_width: 0,
             pressed: None,
         }
@@ -2807,7 +2820,8 @@ impl App {
         let task = started::Task {
             bot,
             name,
-            brief: arguments["brief"].as_str().unwrap_or("").to_owned(),
+            // Only its first words are drawn.
+            brief: started::first(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
         self.tasks_read = None;
@@ -2879,8 +2893,16 @@ impl App {
         {
             return;
         }
-        let all = self.tasks_read.is_none();
+        // A task that ended can be given more work: every one is read
+        // again now and then.
+        let all = self.tasks_read.is_none()
+            || self
+                .tasks_all_read
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
         self.tasks_read = Some(Instant::now());
+        if all {
+            self.tasks_all_read = self.tasks_read;
+        }
         let mut bots: Vec<String> = (self.tasks.iter().flatten())
             .filter(|task| all || !started::settled(&task.state))
             .map(|task| task.bot.clone())
@@ -2895,7 +2917,9 @@ impl App {
                 .await;
             let state = match read {
                 Ok(page) => started::state(&page["turns"][0]),
-                Err(_) => "removed".to_owned(),
+                Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
+                // Not read this time: it stays as it was.
+                Err(_) => continue,
             };
             states.insert(bot, state);
         }
@@ -2921,7 +2945,7 @@ impl App {
         let name = (self.tasks.iter().flatten())
             .find(|task| task.bot == bot)
             .map_or(bot.to_owned(), |task| task.name.clone());
-        let args = ["--no-sound", "--no-layout", "--bot", bot].map(str::to_owned);
+        let args = ["--no-sound", "--no-layout", "--embedded", "--bot", bot].map(str::to_owned);
         if let Err(error) = self.embed(&name, &args) {
             self.notice = Some(format!("could not open {name}: {error}"));
         }
@@ -2938,9 +2962,6 @@ impl App {
             .arg("--socket")
             .arg(&self.options.socket)
             .args(args);
-        if let Some(model) = &self.turn_model {
-            command.args(["--model", model]);
-        }
         let mut program = portable_pty::CommandBuilder::new(command.get_program());
         program.args(command.get_args());
         if let Ok(here) = std::env::current_dir() {
@@ -2996,9 +3017,21 @@ impl App {
         if let Some(node) = button
             .strip_prefix("said/")
             .and_then(|node| node.parse::<i64>().ok())
-            && let Some(relayed) = self.relayed.get_mut(&node)
+            && self.relayed.contains_key(&node)
         {
-            relayed.open = !relayed.open;
+            let text = match self.relayed[&node].text {
+                Some(_) => None,
+                None => match self.items(&[node]).await.first() {
+                    Some(item) => Some(text(item)),
+                    None => {
+                        self.notice = Some("could not read that message".into());
+                        return;
+                    }
+                },
+            };
+            if let Some(relayed) = self.relayed.get_mut(&node) {
+                relayed.text = text;
+            }
             let lines = self.relayed_lines(node);
             self.flush();
             let tag = screen::Tag::Relayed(node);
@@ -3043,11 +3076,10 @@ impl App {
         self.bot_reactions.clear();
         // Words between agents are one quiet row a click opens.
         if transcript::relays(said, from) {
-            let (text, from) = (said.to_owned(), from.map(str::to_owned));
             let relayed = Relayed {
-                text,
-                from,
-                open: false,
+                head: transcript::relayed_head(said, from),
+                from: from.map(str::to_owned),
+                text: None,
             };
             self.relayed.insert(node, relayed);
             let lines = self.relayed_lines(node);
@@ -3072,12 +3104,10 @@ impl App {
         let Some(relayed) = self.relayed.get(&node) else {
             return Vec::new();
         };
-        transcript::relayed(
-            &relayed.text,
-            relayed.from.as_deref(),
-            relayed.open,
-            self.prose(),
-        )
+        match &relayed.text {
+            Some(text) => transcript::relayed(text, relayed.from.as_deref(), true, self.prose()),
+            None => transcript::relayed_shut(&relayed.head, self.prose()),
+        }
     }
 
     /// The bot's words at `node`, as replayed: their last row tagged,
@@ -5926,8 +5956,13 @@ impl App {
             self.notice = Some(format!("the side chat did not take the question: {error}"));
         }
         let head = forked["head"].as_i64().unwrap_or(0).to_string();
-        let args =
-            ["--no-sound", "--no-layout", "--bot", &name, "--side", &head].map(str::to_owned);
+        let mut args = ["--no-sound", "--no-layout", "--bot", &name, "--side", &head]
+            .map(str::to_owned)
+            .to_vec();
+        // On the model this window's turns run on, whose cache is warm.
+        if let Some(model) = &self.turn_model {
+            args.extend(["--model".to_owned(), model.clone()]);
+        }
         // Beside the conversation, on a terminal of its own.
         if let Err(error) = self.embed("side chat", &args) {
             self.notice = Some(format!("no side chat: {error}"));
@@ -6873,6 +6908,7 @@ mod tests {
             rex_host: None,
             sound: false,
             side: None,
+            embedded: false,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -8064,7 +8100,13 @@ mod tests {
 
     #[tokio::test]
     async fn words_between_agents_are_one_quiet_row_a_click_opens() {
-        let client = daemon_answering(|_| json!({})).await;
+        // Opened, the message is read again from the history.
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("history_items") => json!({"items": [{"node": 4, "item": {"type": "message",
+                "role": "user", "content": "The build is green.\nI pushed the fix to calc.add."}}]}),
+            _ => json!({}),
+        })
+        .await;
         let mut app = app(client);
         app.width = 80;
         app.land(
@@ -8179,9 +8221,17 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_started_in_a_row_are_one_roster_a_click_opens_one_from() {
-        let client = daemon_answering(|asked| match asked["bot"].as_str() {
-            Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
-            _ => json!({"turns": [{"turn": 1, "status": "running"}]}),
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read = reads.clone();
+        let client = daemon_answering(move |asked| {
+            let n = read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match asked["bot"].as_str() {
+                Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
+                Some("calc.gone") => json!({"error": "bot_not_found"}),
+                // The daemon not there for a moment, then there again.
+                _ if n >= 3 && n < 5 => json!({"error": "daemon_unavailable"}),
+                _ => json!({"turns": [{"turn": 1, "status": "running"}]}),
+            }
         })
         .await;
         let mut app = app(client);
@@ -8201,6 +8251,13 @@ mod tests {
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ✓ add  done     Fix add");
         assert_eq!(rows[2], "  ● neg  working  Fix neg");
+        // A task the daemon could not read stays as it was; one it does not
+        // have is removed.
+        start(&mut app, "gone");
+        app.read_tasks().await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[2], "  ● neg   working  Fix neg");
+        assert_eq!(rows[3], "  ■ gone  removed  Fix gone");
         // A click on a task's row opens that task.
         let links = app.screen.links();
         assert_eq!(links[0], None);
