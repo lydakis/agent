@@ -105,10 +105,11 @@ fn start() -> Value {
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
                 "model": {"type": "string", "minLength": 1,
-                    "description": "PROVIDER/MODEL, when the person asked for one; else the one this \
-                        project's task rule names, else yours."},
+                    "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
+                        the person's notes on them, when the work suits another model than yours; \
+                        without one, the project's threads_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
-                    "description": "The task's effort level."}
+                    "description": "The task's effort level, when the work calls for one."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
