@@ -1533,7 +1533,10 @@ impl Service {
                     }
                     // A turn whose goal's check is to run is news only once
                     // it says how the goal stands.
-                    if let Some((bot, turn)) = self.goals.event(&event, live, &client, &checked) {
+                    let bot_id = (event["bot"].as_str())
+                        .and_then(|bot| self.records.get(bot))
+                        .and_then(|record| record["bot_id"].as_i64());
+                    if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
                         }
@@ -2273,8 +2276,11 @@ impl Lookout {
     /// Who wrote a turn, as the note names them; `None` for the lead, whose
     /// words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
-        // A lookout's own note to a lead another subscriber watches.
-        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
+        // A lookout's own note to a lead another subscriber watches, or a
+        // goal's next turn, whose end alone is news.
+        if (data["request_id"].as_str())
+            .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
+        {
             return None;
         }
         match (data["from"]["bot"].as_str(), data["origin"].as_str()) {

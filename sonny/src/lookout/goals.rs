@@ -33,7 +33,7 @@ const IDLE_TURNS: u32 = 2;
 /// What a turn the goal started carries as its request ID, before the
 /// agent and turn it follows: not the lookout's own note, since the
 /// turn is the agent's work and its end is news.
-const REQUEST: &str = "goal-";
+pub(crate) const REQUEST: &str = "goal-";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Goal {
@@ -236,10 +236,18 @@ pub async fn call(
         }
         return Ok(json!({"bot": bot, "cleared": had.is_some()}));
     }
-    let mine: Vec<Value> = (all(store).into_values())
-        .filter(|goal| goal.bot == caller || goal.set_by == caller)
-        .map(|goal| goal.shown())
-        .collect();
+    // Its own, and its tasks', whoever set them.
+    let me = inspect(caller).await?["bot_id"].clone();
+    let mut mine = Vec::new();
+    for goal in all(store).into_values() {
+        if goal.bot == caller
+            || inspect(&goal.bot)
+                .await
+                .is_ok_and(|task| task["created_by_id"] == me)
+        {
+            mine.push(goal.shown());
+        }
+    }
     Ok(json!({"goals": mine}))
 }
 
@@ -342,9 +350,12 @@ impl Goals {
 
     /// An event the lookout read: the turn it holds for a goal, whose news
     /// waits for `done` to settle it, when its end is one.
+    /// `bot_id` is the id of the agent the event names, as the lookout
+    /// knows it now.
     pub fn event(
         &mut self,
         event: &Value,
+        bot_id: Option<i64>,
         live: bool,
         client: &std::sync::Arc<Client>,
         done: &tokio::sync::mpsc::Sender<Settled>,
@@ -384,6 +395,13 @@ impl Goals {
                     None => self.goals.remove(bot),
                 };
                 let goal = self.goals.get(bot)?.clone();
+                // Left by an agent deleted while the lookout was away, whose
+                // name another has since.
+                if bot_id.is_some_and(|id| id != goal.bot_id) {
+                    end(&self.store, &goal);
+                    self.goals.remove(bot);
+                    return None;
+                }
                 if self.checking.contains(bot) {
                     return None;
                 }
@@ -433,6 +451,10 @@ async fn pursue(
     }
     let check = format!("`{}`", goal.check);
     let (code, output) = run(goal, store, socket).await;
+    // Cleared or set again while the check ran: this turn is plain news.
+    if read(store, &goal.bot).is_none_or(|now| now.set_ms != goal.set_ms) {
+        return Some(String::new());
+    }
     if code == Some(0) {
         end(store, goal);
         return Some(format!(", and met its goal: {check} exits 0"));
@@ -441,10 +463,6 @@ async fn pursue(
         Some(code) => format!("exits {code}"),
         None => "did not finish".to_owned(),
     };
-    // Cleared or set again while the check ran: this turn is plain news.
-    if read(store, &goal.bot).is_none_or(|now| now.set_ms != goal.set_ms) {
-        return Some(String::new());
-    }
     if let Some(budget) = goal.budget_tokens {
         let record = client.request("inspect", json!({"bot": goal.bot})).await;
         let used = (record.ok())
