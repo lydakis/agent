@@ -1317,6 +1317,31 @@ fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
     }
 }
 
+/// The person's newest message in `bot`: one no agent or client sent,
+/// and no reaction of theirs.
+async fn newest_said(client: &Client, bot: &str) -> Option<i64> {
+    let page = client
+        .request("history_nodes", json!({"bot": bot, "limit": 40}))
+        .await
+        .ok()?;
+    let ids: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    let read = client
+        .request("history_items", json!({"bot": bot, "nodes": ids}))
+        .await
+        .ok()?;
+    (read["items"].as_array().into_iter().flatten())
+        .filter(|entry| {
+            entry["item"]["role"] == "user"
+                && entry["from"].is_null()
+                && entry["origin"].is_null()
+                && !crate::reactions::is_reaction(&crate::text(&entry["item"]))
+        })
+        .filter_map(|entry| entry["node"].as_i64())
+        .max()
+}
+
 /// Whether the bot listed under a name is another than the one seated.
 fn replaced(seated: &Value, listed: &Value) -> bool {
     let id = |record: &Value| record["bot_id"].as_i64();
@@ -1417,6 +1442,9 @@ impl Service {
                 event = events.recv() => {
                     let Some(event) = event else { return };
                     served.event(&event);
+                    if live {
+                        self.picked(&client, &event);
+                    }
                     let cursor = event["cursor"].as_i64();
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
@@ -1593,6 +1621,43 @@ impl Service {
                 lookout.wake(&client).await;
             }
         }
+    }
+
+    /// A lead's `react` call naming one of its project's agents: its
+    /// reaction kept under the person's newest message there, for that
+    /// agent's window to draw.
+    fn picked(&self, client: &Arc<Client>, event: &Value) {
+        let data = &event["data"];
+        if event["event"] != "tool_started" || data["name"] != crate::reactions::TOOL {
+            return;
+        }
+        let Some(arguments) =
+            (data["arguments"].as_str()).and_then(|a| serde_json::from_str::<Value>(a).ok())
+        else {
+            return;
+        };
+        let (Some(by), Some(bot), Some((emoji, remove))) = (
+            event["bot"].as_str(),
+            crate::reactions::target(&arguments),
+            crate::reactions::call(&arguments),
+        ) else {
+            return;
+        };
+        let project = by.split('.').next().unwrap_or(by);
+        let Some(id) = (self.records.get(bot))
+            .filter(|_| bot != by && bot.starts_with(&format!("{project}.")))
+            .and_then(|record| record["bot_id"].as_i64())
+        else {
+            return;
+        };
+        let store = std::fs::canonicalize(&self.store).unwrap_or_else(|_| self.store.clone());
+        let key = crate::reactions::key(&store, id);
+        let (client, by, bot) = (client.clone(), by.to_owned(), bot.to_owned());
+        tokio::spawn(async move {
+            if let Some(node) = newest_said(&client, &bot).await {
+                let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
+            }
+        });
     }
 
     /// The subscriber's lookout, made once while its file lasts: whether it
