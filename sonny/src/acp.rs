@@ -150,8 +150,10 @@ struct Agent {
     options: crate::Options,
     t3: Option<t3::T3>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// The daemon, reached once, with Sonny's skills installed first.
-    ready: OnceCell<Result<(), String>>,
+    /// The daemon, reached once, with Sonny's skills installed first. A
+    /// failure is not kept: the next thread tries again, so a daemon
+    /// restarted under a running T3 is reached without restarting T3.
+    ready: OnceCell<()>,
     /// The version the client asked for, when older.
     version: AtomicI64,
 }
@@ -290,23 +292,23 @@ impl Agent {
         if !choices.iter().any(|choice| choice["value"] == value) {
             choices.push(json!({"value": value, "name": value}));
         }
-        let mut option = json!({"name": "Model", "category": "model", "type": "select",
-            "currentValue": value, "options": choices});
-        option[if self.v2() { "configId" } else { "id" }] = json!("model");
-        json!([option])
+        // Both names: version 2's schema says `configId`, but T3 Code finds
+        // the model option by `id` whatever the version.
+        json!([{"id": "model", "configId": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": value, "options": choices}])
     }
 
     /// The daemon, started as `sonny` starts it, with Sonny's skills
     /// installed before any lead is made, so its instructions list them.
     async fn ready(&self) -> Result<(), String> {
         self.ready
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 crate::skills::install_own();
                 crate::trigger::at_start();
                 crate::connect(&self.options).await.map(drop)
             })
             .await
-            .clone()
+            .map(drop)
     }
 
     /// A thread starts (`session/new`) or comes back (`session/resume`).
@@ -573,11 +575,9 @@ impl Session {
     /// only, at once when the bot is idle and with its next turn when it
     /// is not; a thread that is no bot yet keeps it for the lead it makes.
     async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
-        if params["configId"] != "model" {
-            return Err((
-                INVALID_PARAMS,
-                format!("Sonny has no option {}", params["configId"]),
-            ));
+        let option = params.get("configId").unwrap_or(&params["id"]);
+        if option != "model" {
+            return Err((INVALID_PARAMS, format!("Sonny has no option {option}")));
         }
         let Some(value) = params["value"].as_str() else {
             return Err((INVALID_PARAMS, "a model is picked by its id".into()));
