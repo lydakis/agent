@@ -51,9 +51,17 @@ fn git(
     input: Option<&str>,
 ) -> Result<String, String> {
     let mut command = Command::new("git");
+    // The folder's own code never runs here, where the daemon's keys are:
+    // no hook, no fsmonitor, and none of the keys in its environment.
     command
         .arg("-C")
         .arg(dir)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(if input.is_some() {
@@ -63,6 +71,9 @@ fn git(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for key in crate::task::kept_keys() {
+        command.env_remove(key);
+    }
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
@@ -472,6 +483,30 @@ mod tests {
         commit(&staged, REFS, 7, 2, 20, false).unwrap();
         let second = find(&top, REFS, 7, Some(2)).unwrap();
         assert!(!listed(&second.commit).contains("generated.log"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_hook_of_the_folder_runs() {
+        let (dir, top) = repo("hooks");
+        let ran = dir.join("ran");
+        for hook in [
+            "reference-transaction",
+            "post-checkout",
+            "post-index-change",
+        ] {
+            let path = top.join(".git/hooks").join(hook);
+            std::fs::write(&path, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(top.join("new.txt"), "x\n").unwrap();
+        let staged = stage(&top).unwrap().unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        restore(&top, &snapshot, &dir.join("copy"), "agent/copy").unwrap();
+        forget(&top, REFS, 7).unwrap();
+        assert!(!ran.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
