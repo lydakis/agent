@@ -423,8 +423,15 @@ the HTML a README is written with and its math (`$$ … $$`, `\[ … \]`,
 `$…$` and `\(…\)`) drawn as in a reply, and a picture, SVG, Mermaid
 file or HTML page drawn as it looks. Markdown and plain text read at the 100
 columns the conversation is written at; code, pictures, diagrams and
-pages fill the pane. A click on a picture, diagram or page in the
-conversation opens it in the pane, bigger. The pane scrolls,
+pages fill the pane. A folder shows as a tree, folders first: a click
+on a folder opens it in place, a chain of folders that each hold only
+the next shows on one row, and what git says of a file shows at its
+row's end (M changed, A added, D deleted, R renamed, U new, a dot on a
+folder that holds a change, ignored ones dim). A click on a picture,
+diagram or page in the conversation opens it in the pane, bigger. A
+link in what the pane shows opens there too, and the pane goes back and
+forward as a browser does: ‹ and › in its title, or ← and → (Backspace
+back) while keys go to it, each page as it was left. The pane scrolls,
 selects and copies as the conversation does; a click on its name opens
 the file in the app the system opens it with, and Esc closes it. Links
 are the terminal's own links too, so its link click (Cmd+click, or
@@ -451,6 +458,10 @@ the choice is kept with the other settings.
 ![A Mermaid diagram clicked in the conversation, drawn across the pane](../docs/sonny/pane-mermaid.png)
 
 ![An HTML page clicked in the conversation, drawn in the pane](../docs/sonny/pane-html.png)
+
+![A folder beside the chat as a tree: docs opened in place, what git says of each file at its row's end, ignored build dim](../docs/sonny/pane-tree.png)
+
+![The tree, then a guide opened from it, then the math notes it links to; ‹ goes back to the guide and to the tree as it was left, › forward again](../docs/sonny/pane-tree-back.gif)
 
 ![A Markdown file's math beside the chat, drawn as the reply draws it, in dollars and in brackets](../docs/sonny/pane-math.png)
 
