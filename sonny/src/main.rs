@@ -4251,7 +4251,9 @@ impl App {
             };
             running.extend(
                 (page["bots"].as_array().into_iter().flatten())
+                    // Its side chats lapse, and are no tasks.
                     .filter(|bot| bot["created_by"] == self.bot.as_str())
+                    .filter(|bot| bot["expire_ms"].is_null())
                     .filter_map(|bot| bot["name"].as_str().map(str::to_owned)),
             );
             after = page["next_after"].clone();
@@ -11349,8 +11351,10 @@ mod tests {
                 None => json!({"next_after": "calc.ask", "bots": [
                     {"name": "calc.add", "created_by": "calc"},
                     {"name": "calc.ask", "created_by": "calc"}]}),
+                // A side chat of its own is no task.
                 Some(_) => json!({"next_after": null, "bots": [
                     {"name": "calc.mul", "created_by": "calc"},
+                    {"name": "calc.side", "created_by": "calc", "expire_ms": 60000},
                     {"name": "other.fix", "created_by": "other"}]}),
             }
         })

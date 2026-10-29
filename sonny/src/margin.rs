@@ -287,6 +287,9 @@ pub struct Reference {
     pub workspace: Option<String>,
     pub gone: bool,
     title: String,
+    /// Whether it was given its title there, not its id for want of one:
+    /// untitled, one it shows of another bot's is titled as that one.
+    titled: bool,
     body: Option<Body>,
     file: Option<String>,
     /// Taken away there since it was last posted.
@@ -345,8 +348,14 @@ impl Reference {
             }
             // Kept, as there, when changed without one.
             match arguments["title"].as_str().map(str::trim) {
-                Some(title) if !title.is_empty() => self.title = title.to_owned(),
-                _ if self.title.is_empty() || self.removed => self.title = id.to_owned(),
+                Some(title) if !title.is_empty() => {
+                    self.title = title.to_owned();
+                    self.titled = true;
+                }
+                _ if self.title.is_empty() || self.removed => {
+                    self.title = id.to_owned();
+                    self.titled = false;
+                }
                 _ => {}
             }
             let recreated = std::mem::take(&mut self.removed);
@@ -438,10 +447,12 @@ impl Reference {
     pub fn shown(&self) -> Option<(&str, Body, Option<PathBuf>)> {
         let workspace = self.workspace.as_deref().map(PathBuf::from);
         let body = match self.body.as_ref()? {
-            // As read there, under this one's title.
+            // As read there, under this one's title, or that one's when
+            // it has none of its own.
             Body::From { .. } => {
-                let (_, body, folder) = self.through.as_ref()?.shown()?;
-                return Some((&self.title, body, folder));
+                let (title, body, folder) = self.through.as_ref()?.shown()?;
+                let title = if self.titled { &self.title } else { title };
+                return Some((title, body, folder));
             }
             // Not shown until read: what was kept of it stays.
             Body::File(path) => {
@@ -1252,6 +1263,28 @@ mod tests {
         ));
         reference.read("flow", &items);
         assert!(!reference.removed());
+    }
+
+    #[test]
+    fn a_task_s_untitled_note_showing_another_s_is_titled_as_that_one() {
+        let call = |arguments: Value| json!({"type": "function_call", "name": TOOL, "arguments": arguments.to_string()});
+        let mut sub = Reference::default();
+        sub.read(
+            "flow",
+            &[call(
+                json!({"id": "flow", "title": "Sub flow", "markdown": "deep"}),
+            )],
+        );
+        let mut reference = Reference::default();
+        reference.read(
+            "flow",
+            &[call(json!({"id": "flow", "from": "calc.sub/flow"}))],
+        );
+        reference.through = Some(Box::new(sub));
+        assert_eq!(reference.shown().unwrap().0, "Sub flow");
+        // Given its own, it keeps it.
+        reference.read("flow", &[call(json!({"id": "flow", "title": "Flow"}))]);
+        assert_eq!(reference.shown().unwrap().0, "Flow");
     }
 
     #[test]
