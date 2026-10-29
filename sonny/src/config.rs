@@ -28,7 +28,7 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SWITCH: &[&str] = &["true", "false"];
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 13] = [
+pub const SETTINGS: [Setting; 14] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -106,6 +106,12 @@ pub const SETTINGS: [Setting; 13] = [
         about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
         values: SWITCH,
         default: "false",
+    },
+    Setting {
+        key: "sonny.suggest",
+        about: "after a turn you started, a copy of the agent guesses your next message for Tab to take; one small call",
+        values: SWITCH,
+        default: "true",
     },
 ];
 

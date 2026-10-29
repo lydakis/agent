@@ -21,6 +21,7 @@
 //! side_chat = "fork"            # "answer", the default, calls no tool
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
+//! suggest = false               # no guess at the next message, on by default
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
@@ -90,6 +91,9 @@ pub struct Sonny {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// Whether a copy of the agent guesses the person's next message after
+    /// a turn they started, shown in the empty composer for Tab to take.
+    pub suggest: bool,
 }
 
 impl Default for Sonny {
@@ -101,6 +105,7 @@ impl Default for Sonny {
             task_profile: None,
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
+            suggest: true,
             chime: true,
             verbose: false,
         }
@@ -331,6 +336,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "side_chat",
                 "chime",
                 "verbose",
+                "suggest",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -350,6 +356,7 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
+                "suggest" => Some(&mut config.sonny.suggest),
                 "verbose" => Some(&mut config.sonny.verbose),
                 _ => None,
             } {
@@ -586,6 +593,12 @@ mod tests {
             parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
         assert_eq!(roles.sonny.lead_profile.as_deref(), Some("my-lead"));
         assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
+        assert!(config.sonny.suggest);
+        assert!(!parse("[sonny]\nsuggest = false").unwrap().sonny.suggest);
+        assert_eq!(
+            parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
+            "sonny.suggest must be true or false"
+        );
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);

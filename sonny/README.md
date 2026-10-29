@@ -140,6 +140,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
+| A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -261,6 +262,27 @@ out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
 
 ![A selection in the composer](../docs/sonny/composer-selection.png)
 
+After a turn you started from this window ends well, a copy of the agent
+guesses what you will type next, as Claude Code's prompt suggestions and
+Codex's composer predictions do, and the empty composer shows it dim for
+Tab to take. Tab puts it in the composer to edit or send; it never sends
+itself. The copy is forked where the turn ended, with the agent's tools and
+model so its prompt cache is warm, but allowed no call; it is asked for 2 to
+12 words in your style, or nothing when the next step is not obvious, and is
+deleted once it answers. That is one small model call per turn of yours
+(a steer counts for the turn it joins): none follows a turn the lead, the
+lookout or another window started, one that failed or was stopped, or one
+that ended on a question, so watching a task costs nothing.
+`[sonny] suggest = false` turns it off. Typing hides the guess, a new turn
+drops it, and Tab does what it does otherwise while none shows. Every Sonny
+has it, so a side chat or a task opened in the pane does too.
+
+![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
+
+![Tab took it into the composer, unsent](../docs/sonny/suggest-taken.png)
+
+![The same in a side chat in the pane](../docs/sonny/suggest-side.png)
+
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file
 dropped on the terminal, or its path pasted, is attached rather than typed.
@@ -313,8 +335,8 @@ off again never shows.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`) through them and its
-  default; Enter types one that takes a name (`model`, `provider`,
+  `senders`, `side_chat`, `chime`, `verbose`, `suggest`) through them
+  and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
