@@ -197,10 +197,14 @@ impl Agent {
                 None => Err((INVALID_PARAMS, "no such session".into())),
             },
             "session/close" => {
-                if let Some(session) = params["sessionId"].as_str()
-                    && let Ok(mut sessions) = self.sessions.lock()
-                {
-                    sessions.remove(session);
+                let closed = params["sessionId"].as_str().and_then(|session| {
+                    self.sessions
+                        .lock()
+                        .ok()
+                        .and_then(|mut s| s.remove(session))
+                });
+                if let Some(closed) = closed {
+                    closed.stop();
                 }
                 Ok(json!({}))
             }
@@ -279,10 +283,16 @@ impl Agent {
             id: id.clone(),
             cwd,
             state: AsyncMutex::new(State::default()),
+            follower: Mutex::new(None),
         });
-        // Open before it follows its bot: a closed thread stops following.
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.insert(id.clone(), session.clone());
+        // Open before it follows its bot; one it replaces stops following.
+        let replaced = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.insert(id.clone(), session.clone()));
+        if let Some(old) = replaced {
+            old.stop();
         }
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
@@ -313,6 +323,16 @@ struct Session {
     id: String,
     cwd: PathBuf,
     state: AsyncMutex<State>,
+    /// What follows its bot, stopped when the thread closes.
+    follower: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl Session {
+    fn stop(&self) {
+        if let Some(follower) = self.follower.lock().ok().and_then(|mut f| f.take()) {
+            follower.abort();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -330,6 +350,11 @@ struct State {
     calls: HashMap<String, (String, Value)>,
     /// Calls put to the person, by call and request.
     asked: HashSet<String>,
+    /// The last of the bot's kept events this thread handled, to follow on
+    /// from when its stream drops.
+    cursor: i64,
+    /// The person stopped the prompt before its turn was known.
+    cancelled: bool,
 }
 
 struct Bound {
@@ -358,6 +383,7 @@ impl Session {
         let (bot, project, moving) = match bot {
             Some(bot) => {
                 let project = bot.strip_suffix(".lead").map(str::to_owned);
+                services(agent, &client, &bot, project.as_deref()).await?;
                 (bot, project, None)
             }
             None => {
@@ -371,7 +397,7 @@ impl Session {
             .request("follow", json!({"bot": bot, "after": 0}))
             .await
             .map_err(|e| e.to_string())?;
-        crate::caught_up(&mut events).await;
+        let cursor = live(&mut events, |_| async {}).await;
         let record = client
             .request("inspect", json!({"bot": bot}))
             .await
@@ -381,6 +407,7 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.running = record["running_turn"].as_i64();
+            state.cursor = cursor;
             state.bound = Some(Bound {
                 bot,
                 client,
@@ -401,19 +428,29 @@ impl Session {
             let state = self.state.lock().await;
             (state.bound.as_ref()).map(|b| (b.client.clone(), b.bot.clone(), state.running))
         };
-        tokio::spawn(async move {
+        let follower = self.clone();
+        let handle = tokio::spawn(async move {
             if let Some((client, bot, turn @ Some(_))) = waiting {
-                session.approvals(&agent, &client, &bot, turn).await;
+                follower.approvals(&agent, &client, &bot, turn).await;
             }
-            session.follow(&agent, events).await
+            follower.follow(&agent, events).await
         });
+        if let Ok(mut old) = session.follower.lock()
+            && let Some(old) = old.replace(handle.abort_handle())
+        {
+            old.abort();
+        }
         Ok(())
     }
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
         let (text, images) = words(&params["prompt"]);
         let text = t3::request(&text).to_owned();
-        let bound = self.state.lock().await.bound.is_some();
+        let bound = {
+            let mut state = self.state.lock().await;
+            state.cancelled = false;
+            state.bound.is_some()
+        };
         if !bound {
             // The first prompt of a thread T3 Code opened for a task is
             // that task's brief.
@@ -446,6 +483,9 @@ impl Session {
             }
         }
         let mut state = self.state.lock().await;
+        if std::mem::take(&mut state.cancelled) {
+            return Ok(json!({"stopReason": "cancelled"}));
+        }
         let Some(bound) = &state.bound else {
             return Err((FAILED, "the thread has no bot".into()));
         };
@@ -474,6 +514,14 @@ impl Session {
                 {
                     bound.moving = None;
                 }
+                // Stopped while it was being sent.
+                if std::mem::take(&mut state.cancelled)
+                    && let (Some(bound), Some(turn)) = (&state.bound, reply["turn"].as_i64())
+                {
+                    let _ = (bound.client)
+                        .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
+                        .await;
+                }
                 if let Some((_, turn @ None)) = &mut state.prompt {
                     *turn = reply["turn"].as_i64();
                 }
@@ -487,11 +535,19 @@ impl Session {
     }
 
     async fn cancel(&self) {
-        let state = self.state.lock().await;
-        if let (Some(bound), Some(turn)) = (&state.bound, state.running) {
-            let _ = (bound.client)
-                .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
-                .await;
+        let mut state = self.state.lock().await;
+        let turn = state
+            .running
+            .or(state.prompt.as_ref().and_then(|(_, turn)| *turn));
+        match (&state.bound, turn) {
+            (Some(bound), Some(turn)) => {
+                let _ = (bound.client)
+                    .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
+                    .await;
+            }
+            // Its turn is not known yet: it is stopped once it is.
+            _ if state.prompt.is_some() || state.bound.is_none() => state.cancelled = true,
+            _ => {}
         }
     }
 
@@ -575,11 +631,24 @@ impl Session {
         let (client, mut events) = Client::connect(&agent.options.socket)
             .await
             .map_err(|e| e.to_string())?;
+        let after = {
+            let mut state = self.state.lock().await;
+            if let Some(bound) = &mut state.bound {
+                bound.client = client.clone();
+            }
+            state.cursor
+        };
         client
-            .request("follow", json!({"bot": bot, "after": 0}))
+            .request("follow", json!({"bot": bot, "after": after}))
             .await
             .map_err(|e| e.to_string())?;
-        crate::caught_up(&mut events).await;
+        // What was kept while the thread was away is handled as it would
+        // have been: a task started then still opens its thread.
+        let cursor = live(
+            &mut events,
+            |event| async move { self.on(agent, &event).await },
+        )
+        .await;
         let record = client
             .request("inspect", json!({"bot": bot}))
             .await
@@ -587,9 +656,7 @@ impl Session {
         let running = record["running_turn"].as_i64();
         {
             let mut state = self.state.lock().await;
-            if let Some(bound) = &mut state.bound {
-                bound.client = client.clone();
-            }
+            state.cursor = state.cursor.max(cursor);
             let waited = state.prompt.as_ref().and_then(|(_, turn)| *turn);
             let ended = |turn: Option<i64>| turn.is_some() && running != turn;
             if ended(state.running) || ended(waited) {
@@ -620,6 +687,9 @@ impl Session {
             return;
         }
         let (client, bot) = (bound.client.clone(), bound.bot.clone());
+        if let Some(cursor) = event["cursor"].as_i64() {
+            state.cursor = state.cursor.max(cursor);
+        }
         let turn = event["turn"].as_i64();
         let data = &event["data"];
         let out = &agent.out;
@@ -907,6 +977,55 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
         .await;
 }
 
+/// Handle the events a follow replays, until it is live: the cursor it is
+/// live from.
+async fn live<F, R>(events: &mut Events, mut each: F) -> i64
+where
+    F: FnMut(Value) -> R,
+    R: std::future::Future<Output = ()>,
+{
+    let replay = async {
+        while let Some(event) = events.recv().await {
+            if event["event"] == "follow_live" {
+                return event["cursor"].as_i64().unwrap_or(0);
+            }
+            each(event).await;
+        }
+        0
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), replay)
+        .await
+        .unwrap_or(0)
+}
+
+/// What a bot this thread comes back to needs running, as when its lead
+/// was set up: the lookout watching the lead's tasks and answering
+/// Sonny's tools, and a judge for an `auto` gate.
+async fn services(
+    agent: &Agent,
+    client: &Client,
+    bot: &str,
+    project: Option<&str>,
+) -> Result<(), String> {
+    let record = client
+        .request("inspect", json!({"bot": bot}))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(project) = project {
+        lookout::subscribe_lead(&agent.options.store, bot, project)?;
+    }
+    crate::start_lookout(&agent.options)?;
+    if approvals::mode(&record) == Some("auto") {
+        let model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or(""),
+            record["model"].as_str().unwrap_or("")
+        );
+        crate::serve_auto(client, &agent.options, &model).await?;
+    }
+    Ok(())
+}
+
 /// Set up the lead a thread is, as `sonny` sets up the lead it opens: the
 /// tools Sonny gives it, its folder's rules and skills as they are today,
 /// the approval mode a new lead starts in, the lookout watching its tasks,
@@ -1012,7 +1131,13 @@ async fn open_task(
     let Some(name) = arguments["name"].as_str() else {
         return;
     };
-    let bot = format!("{project}.{name}");
+    // Named as `start_task` names it.
+    let short = name.trim();
+    let bot = match short.strip_prefix(&format!("{project}.")) {
+        Some(_) => short.to_owned(),
+        None => format!("{project}.{short}"),
+    };
+    let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(&bot);
     let opened = async {
         let record = client
             .request("inspect", json!({"bot": bot}))
