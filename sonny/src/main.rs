@@ -1203,6 +1203,39 @@ fn context_after(event: &Value) -> Option<u64> {
     })
 }
 
+/// What a page of older items was drawn from: its nodes, the turn each
+/// was made in, what newer pages' calls returned that it has the calls
+/// of (the nodes to read, and the calls), and whether it is the first
+/// page, the welcome over it.
+struct Paged {
+    nodes: Vec<i64>,
+    turns: HashMap<i64, i64>,
+    after: Vec<i64>,
+    returned: std::collections::HashSet<String>,
+    first: bool,
+}
+
+impl Paged {
+    fn new(nodes: Vec<i64>, turns: HashMap<i64, i64>, after: &[(i64, Value)], first: bool) -> Self {
+        let mut read = Vec::new();
+        for (node, _) in after {
+            if read.last() != Some(node) {
+                read.push(*node);
+            }
+        }
+        let returned = (after.iter())
+            .map(|(_, item)| item["call_id"].as_str().unwrap_or("").to_owned())
+            .collect();
+        Self {
+            nodes,
+            turns,
+            after: read,
+            returned,
+            first,
+        }
+    }
+}
+
 /// What the bot is saying: its rows stay in the viewport until what comes
 /// next tells whether they were a step on the way, before a call, or its
 /// reply, at the turn's end. Rows past what the viewport holds are written
@@ -1580,6 +1613,14 @@ struct App {
     /// What calls older than the first node drawn returned, from the top
     /// of the oldest page: drawn with the older page that has the calls.
     unpaired: Vec<(i64, Value)>,
+    /// What each page of older items drawn above was drawn from, by its
+    /// id on the screen, to draw it again once let go.
+    pages: HashMap<u64, Paged>,
+    /// The id the next page takes.
+    next_page: u64,
+    /// A read of the bot's items came back short: what was drawn from it
+    /// is not all there was.
+    short_read: std::cell::Cell<bool>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2237,6 +2278,9 @@ impl App {
             first_node: None,
             older: None,
             unpaired: Vec::new(),
+            pages: HashMap::new(),
+            next_page: 0,
+            short_read: std::cell::Cell::new(false),
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2456,6 +2500,12 @@ impl App {
             // Older items drawn above before the view reaches the first row.
             if full() && self.older.is_some() && self.screen.near_top() {
                 self.older().await;
+            }
+            // A page let go drawn again before the view reaches it.
+            if full()
+                && let Some(page) = self.screen.wanted()
+            {
+                self.draw_again(page).await;
             }
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && !self.watching() && self.side.is_none() {
@@ -2740,14 +2790,28 @@ impl App {
     }
 
     /// The conversation drawn again in the background's new colours, or
-    /// in the view just picked, once no turn is running: the screen and scrollback cleared, and the
-    /// bot's items read again as on attach.
+    /// in the view just picked, once no turn is running: the screen and
+    /// scrollback cleared, and the bot's items read again as on attach.
+    /// On the full screen the pages of older items above are drawn again
+    /// only as the view nears them.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
         if std::mem::take(&mut self.switch_screen) {
             own_screen(!full());
         }
+        // The pages of older items above stay, as blank rows drawn again
+        // as the view nears them: only the newest rows are drawn now.
+        let pages = match full() {
+            true => self.screen.pages(),
+            false => Vec::new(),
+        };
+        let newest = (pages.last())
+            .and_then(|(id, _)| self.pages.get(id))
+            .and_then(|paged| paged.nodes.last().copied());
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
+        if newest.is_none() {
+            self.pages.clear();
+        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2770,6 +2834,14 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        if let Some(newest) = newest {
+            // What calls older than the oldest page returned stays its own.
+            let unpaired = std::mem::take(&mut self.unpaired);
+            self.history_since(newest, true).await;
+            self.unpaired = unpaired;
+            self.screen.blank(pages);
+            return Ok(());
+        }
         let welcome = self.welcome();
         self.commit(welcome);
         // Back to the first node this window drew, not only the newest page.
@@ -2813,17 +2885,57 @@ impl App {
             return;
         };
         self.first_node = Some(oldest);
-        // What the newer rows were drawn with is put by meanwhile.
+        let after = std::mem::take(&mut self.unpaired);
+        let paged = Paged::new(nodes, turns, &after, self.older.is_none());
+        let (lines, unpaired) = self.draw_page(&paged, after).await;
+        self.unpaired = unpaired;
+        let id = self.next_page;
+        self.next_page += 1;
+        self.pages.insert(id, paged);
+        self.screen.prepend(id, lines);
+    }
+
+    /// The page `id`, let go as the view moved away, drawn again as it
+    /// nears it: once all its items are read, else asked for again.
+    async fn draw_again(&mut self, id: u64) {
+        let Some(paged) = self.pages.remove(&id) else {
+            return;
+        };
+        self.short_read.set(false);
+        let mut after = self.items_at(&paged.after).await;
+        after.retain(|(_, item)| {
+            paged
+                .returned
+                .contains(item["call_id"].as_str().unwrap_or(""))
+        });
+        let (lines, _) = self.draw_page(&paged, after).await;
+        self.pages.insert(id, paged);
+        if !self.short_read.get() {
+            self.screen.fill(id, lines);
+        }
+    }
+
+    /// The rows of a page of older items, and what calls older than it
+    /// returned: drawn on their own, what the newer rows were drawn with
+    /// put by meanwhile.
+    async fn draw_page(
+        &mut self,
+        paged: &Paged,
+        after: Vec<(i64, Value)>,
+    ) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
         let pending = std::mem::take(&mut self.pending);
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
         let bot_reactions = std::mem::take(&mut self.bot_reactions);
         let react_calls = std::mem::take(&mut self.react_calls);
         let answering = self.answering.take();
-        let welcome = self.welcome();
-        self.commit(welcome);
-        let unpaired = std::mem::take(&mut self.unpaired);
-        self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
+        if paged.first {
+            let welcome = self.welcome();
+            self.commit(welcome);
+        }
+        let unpaired = self
+            .draw_nodes(&paged.nodes, &paged.turns, true, after)
+            .await;
         let mut lines = std::mem::replace(&mut self.pending, pending);
         self.any_history = any_history;
         self.rows_drawn = rows_drawn;
@@ -2834,7 +2946,7 @@ impl App {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        self.screen.prepend(lines);
+        (lines, unpaired)
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -3033,10 +3145,12 @@ impl App {
                 .request("history_items", json!({"bot": bot, "nodes": rest}))
                 .await
             else {
+                self.short_read.set(true);
                 break;
             };
             let entries = read["items"].as_array().cloned().unwrap_or_default();
             if entries.is_empty() {
+                self.short_read.set(true);
                 break;
             }
             rest = &rest[entries.len().min(rest.len())..];
