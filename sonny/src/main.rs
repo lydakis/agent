@@ -2806,6 +2806,8 @@ impl App {
     /// they ran as it was when it ran, its last row tagged, and the
     /// message the bot now answers.
     fn land(&mut self, node: i64, said: &str) {
+        // Reactions from here on answer this one.
+        self.bot_reactions.clear();
         let prose = self.prose();
         let lines = landed(said, &mut self.ran_here, prose);
         self.commit(lines);
@@ -5487,7 +5489,6 @@ impl App {
     /// what was drawn last, with a row of their own that says which.
     fn draw_bot_reactions(&mut self) {
         if self.place_bot_reactions() {
-            self.bot_reactions.clear();
             return;
         }
         let on = std::mem::take(&mut self.bot_reactions);
@@ -6651,6 +6652,12 @@ mod tests {
         App::new(client, "b", &json!({"name": "b"}), options)
     }
 
+    /// What the conversation holds, the lines still waiting written in.
+    fn drawn(app: &mut App) -> Vec<String> {
+        app.flush();
+        app.screen.texts()
+    }
+
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
     }
@@ -7500,6 +7507,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reaction_to_an_older_reply_goes_under_that_reply() {
+        let client = daemon_answering(|_| json!({"turn": 9})).await;
+        let mut app = app(client);
+        app.commit_said(4, transcript::reply("Merged it.", 80));
+        app.saw_reply(4, "Merged it.");
+        app.land(6, "and tag it");
+        app.commit_said(8, transcript::reply("Tagged 0.4.0.", 80));
+        app.saw_reply(8, "Tagged 0.4.0.");
+        app.react_to = Some((4, "Merged it.".into()));
+        app.input.set("🎉");
+        app.submit().await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[..2], ["• Merged it.", "   🎉 "], "{rows:?}");
+        assert_eq!(rows.last().map(String::as_str), Some("• Tagged 0.4.0."));
+        // Another joins it on the same row; taking one back leaves the other.
+        app.react_to = Some((4, "Merged it.".into()));
+        app.input.set("👍");
+        app.submit().await;
+        assert_eq!(drawn(&mut app)[1], "   🎉 👍 ");
+        app.react_to = Some((4, "Merged it.".into()));
+        app.input.set("🎉");
+        app.submit().await;
+        assert_eq!(drawn(&mut app)[1], "   👍 ");
+        app.react_to = Some((4, "Merged it.".into()));
+        app.input.set("👍");
+        app.submit().await;
+        assert_eq!(drawn(&mut app)[..2], ["• Merged it.", ""]);
+    }
+
+    #[tokio::test]
     async fn the_bots_reaction_goes_under_the_message_once_its_turn_ends() {
         let client = daemon_answering(move |asked| {
             let item = match asked["nodes"][0].as_i64() {
@@ -7522,34 +7559,32 @@ mod tests {
                 json!({"call_id": id, "name": "react", "arguments": arguments.to_string()}),
             )
         };
-        let rows = |app: &mut App| {
-            std::mem::take(&mut app.pending)
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-        };
-        // A turn that only reacts: 👀 taken off again is never drawn, and
-        // no line closes the turn.
+        // A turn that only reacts: right under the message as it reacts,
+        // 👀 taken off again, and no line closes the turn.
         app.daemon(turn_event("accepted", 1, json!({"node": 1})))
             .await;
         for (id, arguments) in [
             ("c1", json!({"emoji": "👀"})),
             ("c2", json!({"emoji": "👍"})),
-            ("c3", json!({"emoji": "👀", "remove": true})),
         ] {
             app.daemon(react(1, id, arguments)).await;
             app.daemon(turn_event("tool_completed", 1, json!({"call_id": id})))
                 .await;
         }
-        assert_eq!(rows(&mut app), ["› merged, thanks"], "drawn when it ends");
+        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👀 👍 "]);
+        app.daemon(react(1, "c3", json!({"emoji": "👀", "remove": true})))
+            .await;
+        app.daemon(turn_event("tool_completed", 1, json!({"call_id": "c3"})))
+            .await;
+        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
         app.daemon(turn_event(
             "turn_finished",
             1,
             json!({"status": "completed"}),
         ))
         .await;
-        assert_eq!(rows(&mut app), ["   👍 "]);
-        // One that answers too: the reaction says which message.
+        assert_eq!(drawn(&mut app), ["› merged, thanks", "   👍 "]);
+        // One that answers too: under its own message, not the reply.
         app.daemon(turn_event("accepted", 2, json!({"node": 5})))
             .await;
         app.daemon(react(2, "c4", json!({"emoji": "🎉"}))).await;
@@ -7572,12 +7607,31 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        let drawn = rows(&mut app);
-        assert_eq!(drawn[1], "› and the notes?");
-        assert!(drawn[3].starts_with("─ Worked"), "{drawn:?}");
+        let rows = drawn(&mut app);
+        assert_eq!(rows[2..5], ["", "› and the notes?", "   🎉 "]);
+        assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
+        assert_eq!(rows[7..], ["", "• Updated."]);
+        // Once that message is no longer in the conversation, a reaction
+        // goes under what was drawn last, saying which message.
+        app.seen_node = 0;
+        app.daemon(turn_event("accepted", 3, json!({"node": 5})))
+            .await;
+        app.flush();
+        app.screen.clear();
+        app.daemon(react(3, "c6", json!({"emoji": "👀"}))).await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "c6"})))
+            .await;
+        app.daemon(turn_event("message", 3, json!({"node": 7})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
         assert_eq!(
-            drawn[5..],
-            ["• Updated.", "", "  ↳ reacted 🎉 to “and the notes?”"]
+            drawn(&mut app).last().map(String::as_str),
+            Some("  ↳ reacted 👀 to “and the notes?”")
         );
     }
 
@@ -7613,18 +7667,16 @@ mod tests {
         .await;
         let mut app = app(client);
         app.history().await;
-        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(
-            rows,
+            drawn(&mut app),
             [
                 "› merged, thanks",
                 "   👍 ",
                 "",
                 "› and the notes?",
+                "   🎉 ",
                 "",
                 "• Updated.",
-                "",
-                "  ↳ reacted 🎉 to “and the notes?”"
             ]
         );
     }

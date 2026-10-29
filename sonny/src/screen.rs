@@ -1594,4 +1594,88 @@ mod tests {
             Some(Action::Copy("one two three four five six".into()))
         );
     }
+
+    #[test]
+    fn a_row_put_under_a_tagged_one_moves_what_is_below_it() {
+        let mut screen = Screen::default();
+        let lines: Vec<Line> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        screen.push_marked(lines, vec![(5, Mark::Tag(Tag::End(5)))]);
+        let area = Rect::new(0, 0, 20, 5);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            (0..5)
+                .map(|y| row(&buf, y).trim_end().to_owned())
+                .collect::<Vec<_>>()
+        };
+        draw(&mut screen);
+        // Scrolled to the rows around it: they stay where they were, and
+        // the row goes in under the tagged one.
+        screen.hold(13);
+        assert_eq!(draw(&mut screen)[..2], ["row 2", "row 3"]);
+        let pill = || Some(Line::from("  👍"));
+        assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), pill()));
+        assert_eq!(
+            draw(&mut screen),
+            ["row 2", "row 3", "row 4", "row 5", "  👍"]
+        );
+        // Put again, it is changed in place; none takes it off.
+        assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), Some(Line::from("  🎉"))));
+        assert_eq!(draw(&mut screen)[4], "  🎉");
+        assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), None));
+        assert_eq!(draw(&mut screen)[4], "row 6");
+        assert_eq!(screen.texts().len(), 20);
+        // At the newest rows, the view stays there.
+        screen.latest();
+        assert!(screen.put_under(Tag::End(5), Tag::Reactions(5), pill()));
+        assert_eq!(draw(&mut screen)[4], "row 19");
+        assert!(!screen.put_under(Tag::End(99), Tag::Reactions(99), pill()));
+    }
+
+    #[test]
+    fn tagged_rows_are_replaced_whole_and_a_button_is_no_underlined_link() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("before")]);
+        screen.push_marked(
+            vec![Line::from("• Started a, b ▸")],
+            vec![
+                (0, Mark::Tag(Tag::Group(1))),
+                (0, Mark::Link(format!("{BUTTON}fold/1"))),
+            ],
+        );
+        screen.push(vec![Line::from("after")]);
+        let area = Rect::new(0, 0, 30, 6);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert!(!buf[(3, 1)].modifier.contains(Modifier::UNDERLINED));
+        assert!(screen.link_cells(&buf).is_empty(), "never an OSC 8 link");
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        assert_eq!(
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 1)),
+            Some(Action::Open("sonny:fold/1".into()))
+        );
+        let open = vec![
+            Line::from("• Started a, b ▾"),
+            Line::from("• Started a"),
+            Line::from("• Started b"),
+        ];
+        assert!(screen.replace_tagged(Tag::Group(1), open, Vec::new()));
+        assert_eq!(
+            screen.texts(),
+            [
+                "before",
+                "• Started a, b ▾",
+                "• Started a",
+                "• Started b",
+                "after"
+            ]
+        );
+        assert!(screen.replace_tagged(
+            Tag::Group(1),
+            vec![Line::from("• Started a, b ▸")],
+            Vec::new()
+        ));
+        assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
+        assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
 }
