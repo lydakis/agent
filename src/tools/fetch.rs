@@ -7,6 +7,11 @@ use std::{sync::OnceLock, time::Duration};
 
 /// Body bytes read from the server; a longer page is cut there.
 const BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Markdown made from a page; past it the page is cut. Links resolved to
+/// long absolute URLs can make Markdown longer than the page.
+const MARKDOWN_BYTES: usize = 2 * BODY_BYTES;
+/// The deepest a nested list indents.
+const INDENTS: usize = 8;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The page at `url`: its final address, status, type, title and text.
@@ -98,15 +103,22 @@ pub async fn fetch(url: Url) -> Result<Page> {
         }
         body.extend_from_slice(&chunk);
     }
-    let body = String::from_utf8_lossy(&body);
-    let html = mime == "text/html"
-        || mime == "application/xhtml+xml"
-        || (mime.is_empty() && looks_like_html(&body));
+    let sniffed =
+        mime.is_empty() && looks_like_html(&String::from_utf8_lossy(&body[..body.len().min(1024)]));
+    let html = mime == "text/html" || mime == "application/xhtml+xml" || sniffed;
+    let named = charset(&content_type, html.then_some(&body));
+    let body = decoded(body, named)?;
     let (title, text) = if html {
+        // Converting a large page takes a while: off the runtime's thread.
         let base = Url::parse(&url).ok();
-        markdown(&body, base.as_ref())
+        let (title, text, over) =
+            tokio::task::spawn_blocking(move || markdown(&body, base.as_ref()))
+                .await
+                .map_err(|_| Error::new("web_fetch_failed"))?;
+        cut |= over;
+        (title, text)
     } else {
-        (None, body.into_owned())
+        (None, body)
     };
     Ok(Page {
         url,
@@ -118,14 +130,61 @@ pub async fn fetch(url: Url) -> Result<Page> {
     })
 }
 
+/// The charset a response names in its type, or else an HTML page in a
+/// `meta` tag near its start, lowercased.
+fn charset(content_type: &str, html: Option<&Vec<u8>>) -> Option<String> {
+    let named = |text: &str| {
+        let lower = text.to_ascii_lowercase();
+        let at = lower.find("charset=")? + "charset=".len();
+        let value: String = lower[at..]
+            .trim_start_matches(['"', '\''])
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+            .collect();
+        (!value.is_empty()).then_some(value)
+    };
+    named(content_type).or_else(|| {
+        let head = String::from_utf8_lossy(&html?[..html?.len().min(1024)]).into_owned();
+        named(&head)
+    })
+}
+
+/// A body as text in its charset: UTF-8 or Latin-1, which browsers read
+/// as windows-1252; any other is refused rather than misread.
+fn decoded(body: Vec<u8>, charset: Option<String>) -> Result<String> {
+    // windows-1252's characters at 0x80 to 0x9F; the rest are Latin-1's.
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    match charset.as_deref() {
+        None | Some("utf-8" | "utf8" | "us-ascii" | "ascii") => Ok(String::from_utf8(body)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())),
+        Some(
+            "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1" | "l1" | "windows-1252" | "cp1252",
+        ) => Ok(body
+            .into_iter()
+            .map(|b| match b {
+                0x80..=0x9f => HIGH[usize::from(b - 0x80)],
+                b => char::from(b),
+            })
+            .collect()),
+        Some(other) => fail_with(
+            "web_fetch_charset",
+            format!("{other} text is not decoded; web_fetch reads UTF-8 and Latin-1"),
+        ),
+    }
+}
+
 /// reqwest's message, which repeats the URL the model already has.
 fn without_url(error: reqwest::Error) -> String {
     error.without_url().to_string()
 }
 
-fn looks_like_html(body: &str) -> bool {
-    let start = body.trim_start().get(..64).unwrap_or(body.trim_start());
-    let start = start.to_ascii_lowercase();
+fn looks_like_html(start: &str) -> bool {
+    let start = start.trim_start();
+    let start = start.get(..64).unwrap_or(start).to_ascii_lowercase();
     start.starts_with("<!doctype html") || start.starts_with("<html")
 }
 
@@ -161,14 +220,28 @@ const BLOCKS: [&str; 22] = [
 
 /// An HTML page's title and its text as Markdown: headings, links, lists,
 /// code, quotes and tables kept as Markdown writes them; scripts, styles
-/// and markup dropped. `base` resolves relative links.
-pub fn markdown(html: &str, base: Option<&Url>) -> (Option<String>, String) {
+/// and markup dropped. `base` resolves relative links. The flag says the
+/// Markdown passed `MARKDOWN_BYTES` and was cut there.
+pub fn markdown(html: &str, base: Option<&Url>) -> (Option<String>, String, bool) {
     let mut out = Markdown::default();
     let mut title = None;
     let mut rest = html;
     while let Some(at) = rest.find('<') {
+        if out.out.len() > MARKDOWN_BYTES {
+            return (title, out.finish(), true);
+        }
         out.text(&rest[..at]);
         rest = &rest[at..];
+        // A `<` that opens no tag, as in `x < 10`, is text.
+        let opens = rest[1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'));
+        if !opens {
+            out.text("<");
+            rest = &rest[1..];
+            continue;
+        }
         if let Some(comment) = rest.strip_prefix("<!--") {
             rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
             continue;
@@ -191,9 +264,15 @@ pub fn markdown(html: &str, base: Option<&Url>) -> (Option<String>, String) {
         }
         if !closing && (HIDDEN.contains(&name.as_str()) || name == "title") {
             // Skip to the matching close tag; its content is not markup.
-            let lower = rest.to_ascii_lowercase();
-            let close = format!("</{name}");
-            let content_end = lower.find(&close).unwrap_or(rest.len());
+            let content_end = rest
+                .match_indices("</")
+                .map(|(at, _)| at)
+                .find(|at| {
+                    rest.as_bytes()[at + 2..]
+                        .get(..name.len())
+                        .is_some_and(|close| close.eq_ignore_ascii_case(name.as_bytes()))
+                })
+                .unwrap_or(rest.len());
             if name == "title" && title.is_none() {
                 let text = collapse(&decode(&rest[..content_end]));
                 if !text.is_empty() {
@@ -207,7 +286,8 @@ pub fn markdown(html: &str, base: Option<&Url>) -> (Option<String>, String) {
         out.tag(&name, closing, tag, base);
     }
     out.text(rest);
-    (title, out.finish())
+    let over = out.out.len() > MARKDOWN_BYTES;
+    (title, out.finish(), over)
 }
 
 /// The `>` that ends the tag at the start of `text`, past quoted values.
@@ -454,7 +534,7 @@ impl Markdown {
             }
             ("li", false) => {
                 self.line(false);
-                let depth = self.lists.len().saturating_sub(1);
+                let depth = self.lists.len().saturating_sub(1).min(INDENTS);
                 self.out.push_str(&"  ".repeat(depth));
                 match self.lists.last_mut() {
                     Some(Some(number)) => {
@@ -506,7 +586,16 @@ impl Markdown {
         self.line(false);
         let mut out = String::with_capacity(self.out.len());
         let mut blank = 0;
+        // A code block's lines are kept as they are, blank ones included.
+        let mut code = false;
         for line in self.out.lines() {
+            if line.starts_with("```") {
+                code = !code;
+            } else if code {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
             let line = line.trim_end();
             if line.is_empty() {
                 blank += 1;
@@ -546,7 +635,7 @@ mod tests {
     #[test]
     fn html_reads_as_markdown() {
         let base = Url::parse("https://example.com/docs/page").unwrap();
-        let (title, text) = markdown(
+        let (title, text, cut) = markdown(
             r#"<!doctype html><html><head><title>The &amp; Page</title>
             <style>body { color: red }</style><script>let x = "<p>";</script></head>
             <body><nav><a href="/">Home</a></nav>
@@ -562,6 +651,7 @@ mod tests {
             <!-- hidden <p>comment</p> --></body></html>"#,
             Some(&base),
         );
+        assert!(!cut);
         assert_eq!(title.as_deref(), Some("The & Page"));
         assert_eq!(
             text,
@@ -580,7 +670,7 @@ mod tests {
 
     #[test]
     fn broken_markup_keeps_its_text() {
-        let (title, text) = markdown("plain <b>bold</b> & more <unclosed", None);
+        let (title, text, _) = markdown("plain <b>bold</b> & more <unclosed", None);
         assert_eq!(title, None);
         assert_eq!(text, "plain **bold** & more <unclosed\n");
         assert_eq!(decode("&#x1F980; &bogus; &#xZZ; &"), "🦀 &bogus; &#xZZ; &");
@@ -588,6 +678,52 @@ mod tests {
             attribute(r#"a data-href="x" href='y'"#, "href").as_deref(),
             Some("y")
         );
+    }
+
+    #[test]
+    fn text_a_page_holds_comes_through_whole() {
+        // A `<` that opens no tag is text.
+        let (_, text, _) = markdown("<p>Use x < 10 and y > 0, or a <3.</p>", None);
+        assert_eq!(text, "Use x < 10 and y > 0, or a <3.\n");
+        // A code block keeps its blank lines and trailing spaces.
+        let (_, text, _) = markdown("<pre>a = \"\"\"\n\n\nend  \n\"\"\"</pre>", None);
+        assert_eq!(text, "```\na = \"\"\"\n\n\nend  \n\"\"\"\n```\n");
+        // Latin-1 reads as windows-1252, as browsers read it; another
+        // charset is refused rather than misread.
+        assert_eq!(
+            decoded(
+                b"caf\xe9 \x80".to_vec(),
+                charset("text/plain; charset=ISO-8859-1", None)
+            )
+            .unwrap(),
+            "café €"
+        );
+        let page = br#"<html><head><meta charset="windows-1252"></head>caf\xe9</html>"#.to_vec();
+        assert_eq!(
+            charset("text/html", Some(&page)).as_deref(),
+            Some("windows-1252")
+        );
+        assert_eq!(
+            decoded(Vec::new(), Some("utf-16".into())).unwrap_err().code,
+            "web_fetch_charset"
+        );
+    }
+
+    #[test]
+    fn a_hostile_page_converts_in_bounded_time_and_space() {
+        let hidden = "<script></script>".repeat(10_000) + &"x".repeat(1 << 20);
+        let started = std::time::Instant::now();
+        let (_, text, _) = markdown(&hidden, None);
+        assert_eq!(text.len(), (1 << 20) + 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Nested lists indent only so deep.
+        let (_, text, _) = markdown(&"<ul><li>x".repeat(10_000), None);
+        assert!(text.len() < 10_000 * (2 * INDENTS + 8), "{}", text.len());
+        // Links resolved long are cut at the Markdown bound.
+        let base = Url::parse(&format!("https://example.com/{}/", "a".repeat(4000))).unwrap();
+        let (_, text, cut) = markdown(&"<a href=x>y</a>".repeat(10_000), Some(&base));
+        assert!(cut);
+        assert!(text.len() < MARKDOWN_BYTES + 8192);
     }
 
     #[test]

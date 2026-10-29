@@ -2863,8 +2863,11 @@ searches (`web_search`). It runs without approval, as Codex's does.
 `web_fetch` reads one public http or https URL from the daemon, so it works on
 every provider, Claude on Bedrock and a ChatGPT login included. It follows up
 to ten redirects within 30 seconds, reads at most 4 MiB of the body, and
-refuses a type that is not text (`web_fetch_not_text`). An HTML page comes back
-as Markdown with its title and links made absolute; other text as it is. Text
+refuses a type that is not text (`web_fetch_not_text`). Text is read as UTF-8,
+or as windows-1252 when the response or an HTML page's `meta` names Latin-1;
+another charset is refused (`web_fetch_charset`) rather than misread. An HTML
+page comes back as Markdown with its title and links made absolute, converted
+off the runtime's thread and cut at 8 MiB; other text as it is. Text
 past 64 KiB is shown as its start and end and kept whole as the call's `text`
 artifact, up to 1 MiB, which `read` pages. A status outside 2xx marks the
 result failed. Unlike search, it is gated like any other tool, and `auto`
