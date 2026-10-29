@@ -2626,6 +2626,7 @@ impl App {
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
+        image::forget_waiting();
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -6082,6 +6083,7 @@ impl App {
                 let workspace = std::path::Path::new(&self.workspace);
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
+                    image::send_shown(buf);
                     linked = links::cells(buf, &cut, |word| links::file(workspace, word));
                 })?;
                 // The rows sit just above the viewport now; those still on
@@ -6139,7 +6141,7 @@ impl App {
         let mut linked = Vec::new();
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
-        terminal.draw(|frame| {
+        let paint = |frame: &mut ratatui::Frame| {
             // The full screen: the conversation above the rows that move,
             // which sit right under it until it fills the screen, as inline.
             let view = match full() {
@@ -6449,6 +6451,11 @@ impl App {
                 ));
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+        };
+        terminal.draw(|frame| {
+            paint(frame);
+            // The pictures it shows, sent before it is written.
+            image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at.filter(|_| full());
         // Over themselves, the cursor kept where the frame left it.
