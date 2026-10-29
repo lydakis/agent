@@ -56,6 +56,7 @@ mod term;
 #[cfg(test)]
 mod testing;
 mod transcript;
+mod tree;
 mod trigger;
 mod user_shell;
 
@@ -4431,6 +4432,11 @@ impl App {
                 let in_pane = if held { self.pane_mouse } else { over_pane };
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
+                        // ‹ and › go back and forward, as a browser's do.
+                        if down && let Some(back) = pane.on_arrow(mouse.column, mouse.row) {
+                            self.go(back);
+                            return true;
+                        }
                         // A click on its name opens the file outside Sonny.
                         if down
                             && pane.on_title(mouse.column, mouse.row)
@@ -4462,6 +4468,9 @@ impl App {
                 };
                 match action {
                     Some(screen::Action::Copy(text)) => self.copied(&text),
+                    // A folder in the pane's tree opens there, in place.
+                    Some(screen::Action::Open(link))
+                        if in_pane && self.pane.as_mut().is_some_and(|p| p.toggle(&link)) => {}
                     Some(screen::Action::Open(link)) => self.follow(&link),
                     None => {}
                 }
@@ -4542,6 +4551,9 @@ impl App {
                         pane.screen.unselect();
                         self.copied(&text);
                     }
+                    // Back and forward through what the pane has shown.
+                    KeyCode::Left | KeyCode::Backspace if pane.can_go(true) => self.go(true),
+                    KeyCode::Right if pane.can_go(false) => self.go(false),
                     KeyCode::Up => pane.screen.scroll(1),
                     KeyCode::Down => pane.screen.scroll(-1),
                     KeyCode::PageUp => pane.screen.page(true),
@@ -4642,16 +4654,32 @@ impl App {
     /// a preview, and anything else opened as the system opens it.
     fn follow(&mut self, link: &str) {
         if link.starts_with("file://") {
-            let workspace = std::path::Path::new(&self.workspace);
-            let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
-            match pane::Pane::preview(link, workspace, width) {
-                Ok(pane) => self.open_pane(pane),
+            match self.preview(link) {
+                // After the file shown, as a browser goes on to a page.
+                Ok(pane) => match self.pane.take() {
+                    Some(shown) if shown.url().is_some() => self.open_pane(pane.after(shown)),
+                    _ => self.open_pane(pane),
+                },
                 Err(error) => self.notice = Some(error),
             }
             return;
         }
         if let Err(error) = open(link) {
             self.notice = Some(error);
+        }
+    }
+
+    /// The file `link` names, read for the pane at its width.
+    fn preview(&self, link: &str) -> Result<pane::Pane, String> {
+        let workspace = std::path::Path::new(&self.workspace);
+        let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
+        pane::Pane::preview(link, workspace, width)
+    }
+
+    /// The pane back (`back`) or forward to what it showed, as it was left.
+    fn go(&mut self, back: bool) {
+        if let Some(pane) = self.pane.take() {
+            self.open_pane(pane.go(back));
         }
     }
 
