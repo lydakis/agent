@@ -36,7 +36,7 @@ fn binding(family: Family) -> Binding<'static> {
         created_by_id: None,
         compaction_instructions: None,
         compaction_model: None,
-        fallbacks: false,
+        fallback: None,
         gate: None,
         settings: Default::default(),
         declared: None,

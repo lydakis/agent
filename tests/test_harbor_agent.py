@@ -38,13 +38,13 @@ def store(path, turns):
     """The columns of a store's bots and turns that accounting reads."""
     with sqlite3.connect(path) as db:
         db.execute('CREATE TABLE bots(name TEXT, provider TEXT, model TEXT, reasoning TEXT, '
-                   'fallbacks INT)')
+                   'fallback TEXT)')
         db.execute('CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT, model TEXT, status TEXT, '
                    'input_tokens INT, cached_input_tokens INT, output_tokens INT, '
                    'model_rounds INT, retries INT, paced_ms INT)')
         # The task bot as the adapter creates it; others as a model might.
         db.executemany('INSERT INTO bots VALUES (?,?,?,?,?)',
-                       {(t[0], 'gw', 'm', *(('high', 1) if t[0] == 'task' else (None, 0)))
+                       {(t[0], 'gw', 'm', *(('high', 'gw/backup') if t[0] == 'task' else (None, None)))
                         for t in turns})
         db.executemany('INSERT INTO turns(bot,model,status,input_tokens,cached_input_tokens,'
                        'output_tokens,model_rounds,retries,paced_ms) VALUES (?,?,?,?,?,?,2,1,5)',
@@ -63,9 +63,11 @@ class HarborAgentTest(unittest.TestCase):
 
     def test_command_quotes_the_instruction_and_keeps_the_turn_status(self):
         with tempfile.TemporaryDirectory() as logs:
-            command = self.agent(logs, reasoning='high', max_output_tokens=4096)._command(
+            command = self.agent(logs, reasoning='high', fallback='gw/backup',
+                                 max_output_tokens=4096)._command(
                 "it's \"quoted\"; rm -rf /\n$(x)")
         self.assertIn("-- 'it'\"'\"'s \"quoted\"; rm -rf /\n$(x)' < /dev/null", command)
+        self.assertIn('--model gw/m --fallback gw/backup', command)
         self.assertIn('--effort high --max-output-tokens 4096 --', command)
         self.assertTrue(command.endswith('| tee /logs/agent/agent.jsonl; exit ${PIPESTATUS[0]}'))
 
@@ -142,8 +144,8 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual(context.metadata, {'model_rounds': 6, 'retries': 3, 'paced_ms': 15,
                                             'status': ['completed', 'interrupted'], 'bots': 2,
                                             'bot_settings': {
-                                                'task': {'reasoning': 'high', 'fallbacks': True},
-                                                'helper': {'reasoning': None, 'fallbacks': False}},
+                                                'task': {'reasoning': 'high', 'fallback': 'gw/backup'},
+                                                'helper': {'reasoning': None, 'fallback': None}},
                                             'requested_model': 'gw/m', 'served_calls': {}})
         self.assertIsNone(unpriced.cost_usd)
         self.assertEqual(unpriced.n_output_tokens, 300)
@@ -183,8 +185,8 @@ class HarborAgentTest(unittest.TestCase):
         # as the provider named it: each attempt of a fallback, and the dated
         # snapshot behind the requested name.
         self.assertEqual((context.metadata['requested_model'], context.metadata['served_calls'],
-                          context.metadata['bot_settings']['task']['fallbacks']),
-                         ('gw/m', {'gw/m': 1, 'gw/backup': 1, 'gw/m-2026-09-26': 1}, True))
+                          context.metadata['bot_settings']['task']['fallback']),
+                         ('gw/m', {'gw/m': 1, 'gw/backup': 1, 'gw/m-2026-09-26': 1}, 'gw/backup'))
         self.assertNotIn('unrecorded_input_tokens', context.metadata)
         self.assertNotIn('unnamed_calls', context.metadata)
         self.assertEqual((short.metadata['served_calls'], short.metadata['unrecorded_input_tokens']),
@@ -384,7 +386,7 @@ class HarborStoreTest(ModelFixture):
                          (listed[0]['input_tokens'], listed[0]['output_tokens'], ['completed']))
         self.assertEqual(list(context.model_usage), ['openai/synthetic-model'])
         self.assertEqual(context.metadata['bot_settings'],
-                         {'task': {'reasoning': None, 'fallbacks': False}})
+                         {'task': {'reasoning': None, 'fallback': None}})
         # The daemon's count and the stored usage events agree, and every
         # call names the dated snapshot the test provider answers with.
         self.assertEqual(context.metadata['served_calls'],

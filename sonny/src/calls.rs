@@ -159,7 +159,6 @@ const SWITCHES: &[&str] = &[
     "--no-spawn",
     "--agents",
     "--no-compaction",
-    "--fallbacks",
     "--discover",
     "--all",
     "--any",
@@ -216,6 +215,7 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
         }
         Some("rm") => ("Removed from memory".into(), name()),
         Some("read") => ("Read from memory".into(), name()),
+        Some("said") => ("Read what the person wrote".into(), String::new()),
         Some(other) => (format!("Used memory {other}"), String::new()),
     };
     Said {
@@ -743,6 +743,7 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 (None, None, Some(read)) => said("Read from memory", read),
                 _ if arguments["index"] == true => said("Indexed memory", ""),
                 _ if arguments["check"] == true => said("Checked memory", ""),
+                _ if arguments["said"] == true => said("Read what the person wrote", ""),
                 _ if arguments.get("cleanup").is_some() || arguments["changed"] == true => {
                     said("Cleaned up memory", "")
                 }

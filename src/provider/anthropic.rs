@@ -104,6 +104,9 @@ pub struct State {
     thinking_dropped: usize,
     fallbacks: Vec<(Option<String>, String)>,
     stop_details: Option<String>,
+    /// What a refusal names for a retry: its category and the credit that
+    /// prices a retry on another model as if it had run there all along.
+    refusal: serde_json::Map<String, Value>,
     /// The request cached for an hour: see [`usage`].
     hour: bool,
 }
@@ -287,6 +290,11 @@ impl State {
                     .flatten()
                     .collect();
                     self.stop_details = (!parts.is_empty()).then(|| parts.join("; "));
+                    for key in ["category", "fallback_credit_token"] {
+                        if let Some(value) = details[key].as_str() {
+                            self.refusal.insert(key.to_owned(), json!(value));
+                        }
+                    }
                 }
                 // Sent again after a server-side fallback.
                 self.dropped(&event["input_transformations"]);
@@ -369,9 +377,13 @@ impl State {
     /// The thinking blocks the request lost to the binding check.
     fn dropped(&mut self, transformations: &Value) {
         if let Some(list) = transformations.as_array() {
+            // Only an edit under replayed thinking; a block another model
+            // wrote, as after a fallback, is dropped as the API means it to.
             self.thinking_dropped = list
                 .iter()
-                .filter(|t| t["type"] == "thinking_dropped")
+                .filter(|t| {
+                    t["type"] == "thinking_dropped" && t["reason"] == "prefix_binding_mismatch"
+                })
                 .count();
         }
     }
@@ -396,10 +408,14 @@ impl State {
                     .map(|(_, to)| format!("fell back to {to}"))
                     .chain(self.stop_details)
                     .collect();
-                return match parts.is_empty() {
-                    true => fail("provider_refusal"),
-                    false => fail_with("provider_refusal", parts.join("; ")),
+                let error = match parts.is_empty() {
+                    true => Error::new("provider_refusal"),
+                    false => Error::with("provider_refusal", parts.join("; ")),
                 };
+                return Err(match self.refusal.is_empty() {
+                    true => error,
+                    false => error.facts(Value::Object(self.refusal)),
+                });
             }
             other => {
                 return fail_with(
@@ -674,15 +690,17 @@ mod tests {
     }
     #[test]
     fn dropped_thinking_is_counted_from_the_latest_report() {
-        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":1},"input_transformations":[{"type":"thinking_dropped","message_index":1,"block_index":0},{"type":"other"}]}}"#;
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":1},"input_transformations":[{"type":"thinking_dropped","path":"messages.1.content.0","reason":"prefix_binding_mismatch"},{"type":"other"}]}}"#;
         let text = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}"#;
         let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#;
         let stop = r#"{"type":"message_stop"}"#;
         let mut state = State::default();
         feed(&mut state, &[start, text, delta, stop]);
         assert_eq!(state.finish().unwrap().thinking_dropped, 1);
-        // After a fallback the delta repeats the whole list for the final request.
-        let fallback = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1},"input_transformations":[{"type":"thinking_dropped"},{"type":"thinking_dropped"}]}"#;
+        // After a fallback the delta repeats the whole list for the final
+        // request. A block another model wrote is dropped as the API means
+        // to, and an unknown reason is not counted either.
+        let fallback = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1},"input_transformations":[{"type":"thinking_dropped","reason":"prefix_binding_mismatch"},{"type":"thinking_dropped","reason":"prefix_binding_mismatch"},{"type":"thinking_dropped","reason":"model_binding_mismatch"},{"type":"thinking_dropped","reason":"later"}]}"#;
         let mut state = State::default();
         feed(&mut state, &[start, text, fallback, stop]);
         assert_eq!(state.finish().unwrap().thinking_dropped, 2);
@@ -798,6 +816,36 @@ mod tests {
             error.detail.as_deref(),
             Some("category cyber; retry on claude-opus-4-8")
         );
+        assert_eq!(
+            serde_json::to_value(error.facts.unwrap()).unwrap(),
+            json!({"category":"cyber"})
+        );
+        // The credit for a retry elsewhere is a fact, not part of the detail.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","fallback_credit_token":"credit","fallback_has_prefill_claim":false}},"usage":{"output_tokens":0}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let error = state.finish().unwrap_err();
+        assert_eq!(error.detail.as_deref(), Some("category cyber"));
+        assert_eq!(
+            serde_json::to_value(error.facts.unwrap()).unwrap(),
+            json!({"category":"cyber","fallback_credit_token":"credit"})
+        );
+        // A refusal naming nothing has no facts.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":null}},"usage":{"output_tokens":0}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let error = state.finish().unwrap_err();
+        assert_eq!((error.detail, error.facts), (None, None));
         // A chain that switched models and still declined names the switch.
         let mut state = State::default();
         feed(

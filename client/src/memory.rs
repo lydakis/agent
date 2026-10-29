@@ -39,7 +39,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -68,7 +68,7 @@ pub fn cli(args: &[String]) -> i32 {
 /// A `memory` call of an agent working in `cwd`, as a client's tool takes
 /// it: the script's commands but `schedule`, which is the person's, with
 /// the fact's text in the call. `read` NAME, `save {name, type,
-/// description, source, text}`, `remove` NAME, `index`, `check`, `changed`
+/// description, source, text, external}`, `remove` NAME, `index`, `check`, `changed`
 /// or `cleanup` (`start` or `finish`); with none, `show`. `user` or `project` picks the scope.
 pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
@@ -87,6 +87,9 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
             ("source", "--source"),
         ] {
             args.extend([flag.to_owned(), text(&save[key])]);
+        }
+        if save["external"] == true {
+            args.push("--external".to_owned());
         }
         args
     } else if let Some(name) = arguments["read"].as_str() {
@@ -159,9 +162,14 @@ fn run(
     let mut name = None;
     let mut fields = [None, None, None];
     let mut scope = None;
+    let mut external = false;
     let mut it = flags.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
+            "--external" if verb == "save" && !external => {
+                external = true;
+                continue;
+            }
             "--type" => &mut fields[0],
             "--description" => &mut fields[1],
             "--source" => &mut fields[2],
@@ -237,6 +245,7 @@ fn run(
                 description,
                 source,
                 verified: today(),
+                external,
             };
             save(&scope()?, &fact, &text)
         }
@@ -319,25 +328,37 @@ struct Fact {
     description: String,
     source: String,
     verified: String,
+    /// Saved in a turn that read outside content, a web page, a search or
+    /// an MCP server, so it may carry words no person wrote.
+    external: bool,
 }
 
 impl Fact {
     fn render(&self, body: &str) -> String {
         format!(
-            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n---\n\n{}\n",
+            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n{}---\n\n{}\n",
             self.name,
             self.description,
             self.kind,
             self.source,
             self.verified,
+            if self.external {
+                "external: true\n"
+            } else {
+                ""
+            },
             body.trim()
         )
     }
 
     fn line(&self) -> String {
         format!(
-            "- {} ({}, verified {}): {}\n",
-            self.name, self.kind, self.verified, self.description
+            "- {} ({}, verified {}{}): {}\n",
+            self.name,
+            self.kind,
+            self.verified,
+            if self.external { ", external" } else { "" },
+            self.description
         )
     }
 
@@ -368,6 +389,11 @@ impl Fact {
             description: field("description")?,
             source: field("source")?,
             verified: field("verified")?,
+            external: match fields.get("external") {
+                None => false,
+                Some(&"true") => true,
+                Some(other) => return Err(format!("external is true or absent, not {other}")),
+            },
         };
         if format!("{}.md", fact.name) != file {
             return Err(format!("its name is {}, not its file's", fact.name));
@@ -622,7 +648,10 @@ fn check(dir: &Path) -> Value {
 /// saved since, and `finish` commits the cleanup, or reverts it when it
 /// removed more facts than the loss guard allows.
 const CLEANUP: &str = ".cleanup";
-const IGNORE: &str = ".lock\n.reads\n/.cleanup\n.DS_Store\n";
+/// When the last finished cleanup started, in ms: what the person wrote
+/// from then on is the next cleanup's to read.
+const SAID: &str = ".said";
+const IGNORE: &str = ".lock\n.reads\n/.cleanup\n/.said\n.DS_Store\n";
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
@@ -790,7 +819,10 @@ fn changed(root: &Path) -> Result<Value, String> {
         // predates them.
         git(root, &["status", "--porcelain", "--untracked-files=all"])?
             .lines()
-            .any(|line| Path::new(line.get(3..).unwrap_or("")).file_name() != Some(READS.as_ref()))
+            .any(|line| {
+                let file = Path::new(line.get(3..).unwrap_or("")).file_name();
+                file != Some(READS.as_ref()) && file != Some(SAID.as_ref())
+            })
     } else {
         all_facts(root)? > 0
     };
@@ -822,16 +854,22 @@ fn cleanup_start(root: &Path) -> Result<Value, String> {
     let message = format!("Memory before cleanup, {}", today());
     git(root, &["commit", "-q", "--allow-empty", "-m", &message])?;
     let commit = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
     write(
         &state,
-        &json!({"commit": commit, "facts": count}).to_string(),
+        &json!({"commit": commit, "facts": count, "at_ms": at_ms}).to_string(),
     )?;
     started(root, &commit, count as u64, false)
 }
 
 /// A started cleanup, with the facts saved and removed since the last one,
-/// which are what it reads first, and those no agent has read in a while,
-/// which it checks still hold.
+/// which are what it reads first, those no agent has read in a while,
+/// which it checks still hold, and when the last finished one started
+/// (`since_ms`, null before the first), from which it reads what the person
+/// wrote: a turn that ended while that one ran is read again rather than
+/// missed.
 fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Value, String> {
     let since = git(
         root,
@@ -839,9 +877,12 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
     )?;
     let (removed, added, changed) = fact_changes(&since);
     let saved: Vec<_> = added.into_iter().chain(changed).collect();
+    let since_ms = std::fs::read_to_string(root.join(SAID))
+        .ok()
+        .and_then(|ms| ms.trim().parse::<i64>().ok());
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
-        "unread": unread(root)?, "duplicate": duplicate}),
+        "unread": unread(root)?, "since_ms": since_ms, "duplicate": duplicate}),
     )
 }
 
@@ -907,6 +948,11 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
             "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}, and the refused cleanup is commit {head}",
             removed.len()
         ));
+    }
+    // A refused cleanup saved nothing of what the person wrote, so the
+    // next one reads it again.
+    if let Some(at_ms) = open["at_ms"].as_i64() {
+        write(&root.join(SAID), &at_ms.to_string())?;
     }
     std::fs::remove_file(&state).map_err(|e| format!("memory_failed: {}: {e}", state.display()))?;
     Ok(
@@ -1552,6 +1598,7 @@ mod tests {
                 description: format!("old fact {name}"),
                 source: "the person, 2020-01-01".into(),
                 verified: verified.into(),
+                external: false,
             };
             std::fs::write(root.join(format!("{name}.md")), fact.render("old")).unwrap();
         };
@@ -1598,6 +1645,77 @@ mod tests {
     }
 
     #[test]
+    fn a_fact_saved_after_outside_content_says_so_in_its_file_and_the_index() {
+        let home = temp("outside");
+        let root = home.join(".agents/memory");
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        let save = json!({"save": {"name": "pinned-version", "type": "reference",
+            "description": "The SDK pin a release note named", "source": "turn:shop.lead/4",
+            "text": "Pin the SDK at 2.3.", "external": true}, "user": true});
+        call(&home, &home, &save).unwrap();
+        let file = std::fs::read_to_string(root.join("pinned-version.md")).unwrap();
+        assert!(file.contains("\nverified: ") && file.contains("\nexternal: true\n---\n"));
+        let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        assert!(
+            index.contains(", external): The SDK pin a release note named"),
+            "{index}"
+        );
+        assert_eq!(check(&root)["problems"], json!([]));
+        // Saved again without it, from the person's word, it is theirs.
+        let mut plain = save.clone();
+        plain["save"]["external"] = json!(false);
+        plain["save"]["source"] = json!("the person, 2026-10-29");
+        call(&home, &home, &plain).unwrap();
+        let file = std::fs::read_to_string(root.join("pinned-version.md")).unwrap();
+        assert!(!file.contains("external"));
+        assert!(
+            !std::fs::read_to_string(root.join(INDEX))
+                .unwrap()
+                .contains("external")
+        );
+        // The script takes it as a flag, once.
+        let run_ = |line: &[&str]| run(&root, &home, &args(line), &no_stdin);
+        let line = |extra: &[&str]| {
+            let mut line = vec![
+                "save",
+                "x",
+                "--type",
+                "project",
+                "--description",
+                "d",
+                "--source",
+                "s",
+                "--user",
+            ];
+            line.extend_from_slice(extra);
+            line.extend_from_slice(&["--", "t"]);
+            line.iter().map(|w| w.to_string()).collect::<Vec<_>>()
+        };
+        fn refs(words: &[String]) -> Vec<&str> {
+            words.iter().map(String::as_str).collect()
+        }
+        run_(&refs(&line(&["--external"]))).unwrap();
+        assert!(
+            std::fs::read_to_string(root.join("x.md"))
+                .unwrap()
+                .contains("external: true")
+        );
+        assert_eq!(
+            code(run_(&refs(&line(&["--external", "--external"])))),
+            "usage"
+        );
+        assert_eq!(code(run_(&["rm", "x", "--external", "--user"])), "usage");
+        // Any other value is not a fact.
+        std::fs::write(
+            root.join("y.md"),
+            "---\nname: y\ndescription: d\ntype: project\nsource: s\nverified: 2026-10-29\nexternal: yes\n---\n\nt\n",
+        )
+        .unwrap();
+        assert_eq!(code(run_(&["index", "--user"])), "memory_invalid");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn dates_count_days_from_1970() {
         assert_eq!(day_number("1970-01-01"), Some(0));
         assert_eq!(day_number("2000-03-01"), Some(11_017));
@@ -1629,6 +1747,7 @@ mod tests {
             (json!(4), json!(false))
         );
         assert_eq!(started["saved"], json!(["a.md", "b.md", "c.md", "d.md"]));
+        assert_eq!(started["since_ms"], Value::Null);
         // A start while one is open is that one, so the guard counts from it.
         let again = run_(&["cleanup", "start"]).unwrap();
         assert_eq!(
@@ -1650,6 +1769,14 @@ mod tests {
         // Removing more than the guard allows is undone.
         save_user(&root, "e", "fact e", "x").unwrap();
         let next = run_(&["cleanup", "start"]).unwrap();
+        // The next one reads what the person wrote from when the last
+        // finished one started.
+        let since = next["since_ms"].as_i64().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(now - since < 60_000, "{since}");
         assert_eq!(
             (next["saved"].clone(), next["removed"].clone()),
             (json!(["e.md"]), json!([]))
@@ -1681,6 +1808,9 @@ mod tests {
         assert_eq!(check(&root)["problems"], json!([]));
         assert_eq!(code(changed(&root)), "unchanged");
         assert!(!root.join(CLEANUP).exists());
+        // A refused cleanup leaves what the person wrote to the next one.
+        let after = run_(&["cleanup", "start"]).unwrap();
+        assert_eq!(after["since_ms"], json!(since));
         std::fs::remove_dir_all(root).unwrap();
     }
 
