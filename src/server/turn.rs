@@ -3431,9 +3431,13 @@ impl Turn {
             // confined fails rather than run unconfined. An escape no gate
             // approved is refused, as Codex refuses one under a policy that
             // never asks: a command, or a write or edit held to the sandbox.
+            // A command its client lets out of the sandbox runs unconfined,
+            // as a Codex rule that allows it does.
             let mut sandbox = None;
-            let confined =
-                record.sandboxed() && agent_runtime::sandbox::confinable(&call.name) && !approved;
+            let confined = record.sandboxed()
+                && agent_runtime::sandbox::confinable(&call.name)
+                && !approved
+                && !record.unsandboxed(&call);
             let prepared = match prepared {
                 Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
                     if confined && !record.confines(&call, workspace) =>
@@ -3759,15 +3763,17 @@ impl Turn {
             .await?;
         // A sandboxed bot's commands all run in its one sandbox; when it
         // can't be had, each command fails with why.
-        let shells = batch
-            .iter()
-            .any(|(_, prepared)| matches!(prepared, Prepared::Shell { .. }));
+        // A command its client lets out of it runs unconfined.
+        let shells = batch.iter().any(|(call, prepared)| {
+            matches!(prepared, Prepared::Shell { .. }) && !record.unsandboxed(call)
+        });
         let sandbox = match shells && record.sandboxed() {
             true => self.sandbox(record, workspace).await,
             false => Ok(None),
         };
         let runs = batch.into_iter().map(|(call, prepared)| {
             let sandbox = match (&prepared, &sandbox) {
+                _ if record.unsandboxed(&call) => Ok(None),
                 (Prepared::Shell { .. }, Err(error)) => Err(error.clone()),
                 (_, sandbox) => Ok(sandbox.clone().unwrap_or_default()),
             };

@@ -323,6 +323,38 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'shell-3')[1]['error'], 'escalation_refused')
         self.assertEqual(list(outside.iterdir()), [])
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_its_client_trusts_runs_outside_the_sandbox_without_asking(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, outside)
+        client = self.gated(settings={'sandbox': 'workspace-write', 'unsandboxed': ['touch']})
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['unsandboxed'], ['touch'])
+        # Alone, and beside a command that runs anything else, which stays
+        # in the sandbox; neither asks.
+        for request_id, calls in [('alone', [['shell', {'command': f'touch {outside}/alone'}]]),
+                                  ('together', [['shell', {'command': f"touch '{outside}/one' && touch {outside}/two"}],
+                                                ['shell', {'command': f'touch {outside}/three && true'}]])]:
+            turn = client.request('submit', bot='Bob', request_id=request_id,
+                                  prompt='calls:' + json.dumps(calls))['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            self.assertEqual(self.events(client, turn, 'approval_requested'), [])
+        self.assertEqual(sorted(path.name for path in outside.iterdir()), ['alone', 'one', 'two'])
+        self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
+        # Only with a sandbox; configure replaces the list, and a bot the
+        # bot makes runs outside only what its creator does.
+        self.assertEqual(client.request('configure', bot='Bob', unsandboxed=['touch'])['error'], 'invalid_setting')
+        self.assertEqual(client.request('configure', bot='Bob', sandbox='danger-full-access',
+                                        unsandboxed=['touch'])['error'], 'invalid_setting')
+        configured = client.request('configure', bot='Bob', sandbox='workspace-write',
+                                    unsandboxed=['touch', 'mcpx'])['result']
+        self.assertEqual(configured['changed'], ['sandbox'])
+        bob = client.request('inspect', bot='Bob')['result']
+        kid = client.request('create', bot='Kid', workspace=str(self.path), created_by='Bob',
+                             created_by_id=bob['bot_id'],
+                             settings={'sandbox': 'read-only', 'unsandboxed': ['mcpx', 'rm']})['result']
+        self.assertEqual((kid['settings']['sandbox'], kid['settings']['unsandboxed']), ('read-only', ['mcpx']))
+
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:touch ran')['result']['turn']

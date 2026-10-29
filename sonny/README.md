@@ -141,6 +141,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -374,9 +375,19 @@ off again never shows.
   `/tmp`), reach the network, and may commit to the folder's repository,
   whose hooks and config stay read-only; a call that leaves the sandbox
   waits for the verdict. In `full` the lead runs unconfined. Every task
-  is sandboxed the same way in its own folder, whatever the lead's mode.
+  is sandboxed the same way in its own folder, but in `full`, where
+  nothing would answer a call that asks to leave the sandbox, tasks run
+  unconfined too, as under Codex's full access; a pick sets the tasks'
+  sandboxes along with their gates.
   A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
-  it. On Linux sandboxes need bubblewrap.
+  it. On Linux sandboxes need bubblewrap. A tool that keeps a daemon of its
+  own, such as mcpx, can't run inside a sandbox: name it in
+  `~/.agent/config.toml`, `[sonny] unsandboxed = ["mcpx"]`, and every agent
+  runs it outside without asking, as a Codex rule that allows a command
+  does. Each entry is a command's first words (`"docker compose"`), and a
+  call runs outside only when everything it runs is named, so
+  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
+  it.
 - `/approve` lists the calls the judge denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
@@ -527,7 +538,8 @@ note, with no sound. It judges with the config's `[judge] model`, the
 approver's setting, else the lead's own model, at `[judge] effort` when
 set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
-by name, questions of its own), and `/background` lists what it watches;
+by name, sources outside such as a chat you poll, questions of its own),
+and `/background` lists what it watches;
 see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout also answers
 Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are

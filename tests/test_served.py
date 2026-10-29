@@ -74,9 +74,11 @@ class ServedToolTests(ModelFixture):
         (repo / 'calc.py').write_text('one\n')
         self.git(repo, 'add', '.')
         self.git(repo, 'commit', '-qm', 'one')
+        # A lead in `auto`.
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('start_task', inherit=False),
-                                                           declared('show_agent')])
+                                                           declared('show_agent')],
+                            approve=['show_agent'], approver='auto')
         self.lookout()
         output = self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': f'Fix {repo}/calc.py.'})
         self.assertTrue(output.startswith('Started calc.fix: '), output)
@@ -101,6 +103,13 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': 'Again.'}))
         self.assertEqual(refused['error'], 'task_not_started')
         self.assertTrue(worktree.is_dir())
+        # In `full`, with no gate to ask, a task runs unconfined, as its
+        # lead does.
+        self.daemon.request('configure', bot='calc.lead', approve=[])
+        output = self.call('calc.lead', 'start_task', {'name': 'free', 'brief': 'Go.'})
+        self.assertTrue(output.startswith('Started calc.free: '), output)
+        free = self.daemon.request('inspect', bot='calc.free')['result']['settings']
+        self.assertEqual((free['sandbox'], free['writable'], free['network']), ('danger-full-access', [], False))
 
     def test_a_turn_interrupted_mid_setup_stops_it_and_starts_no_task(self):
         repo = self.path / 'calc'
@@ -215,7 +224,7 @@ class ServedToolTests(ModelFixture):
             time.sleep(.05)
         self.lookout()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': []})
+        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': []})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_lookout_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')

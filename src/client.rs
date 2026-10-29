@@ -406,6 +406,18 @@ fn parse(args: &[String]) -> Result<Options> {
                             options.settings_flags.push(flag.to_owned());
                         }
                     }
+                    "--unsandboxed" => {
+                        let unsandboxed = options
+                            .settings
+                            .entry("unsandboxed".to_owned())
+                            .or_insert_with(|| json!([]));
+                        if let Value::Array(commands) = unsandboxed {
+                            commands.push(json!(value));
+                        }
+                        if !options.settings_flags.iter().any(|f| f == flag) {
+                            options.settings_flags.push(flag.to_owned());
+                        }
+                    }
                     "--cache-ttl" => {
                         if !matches!(value.as_str(), "5m" | "1h") {
                             return fail_with("usage", "--cache-ttl needs 5m or 1h");

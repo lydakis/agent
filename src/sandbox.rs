@@ -287,6 +287,96 @@ pub fn escapes(
     }
 }
 
+/// Whether `command` runs nothing but commands `unsandboxed` lets out of
+/// the sandbox, as a Codex rule that allows a command prefix lets it out
+/// without asking: each entry is a prefix of words, such as `mcpx` or
+/// `docker compose`. Such a command, as a tool with a daemon of its own
+/// needs, runs where the bot's client trusted it to. Only a plain script
+/// is read, as Codex reads one: words, quoted or not, in commands joined by
+/// `&&`, `||`, `;`, `|` or a newline, every one of them a match. Anything
+/// that could run something else (an expansion, a substitution, a
+/// redirection, a subshell, a command in the background) and anything
+/// ill-formed is no match, and the command stays in the sandbox.
+pub fn unsandboxed(unsandboxed: &[String], command: &str) -> bool {
+    let Some(commands) = commands(command) else {
+        return false;
+    };
+    let prefixes: Vec<Vec<&str>> = unsandboxed
+        .iter()
+        .map(|prefix| prefix.split_whitespace().collect())
+        .filter(|words: &Vec<&str>| !words.is_empty())
+        .collect();
+    !commands.is_empty()
+        && commands.iter().all(|words| {
+            prefixes.iter().any(|prefix| {
+                words.len() >= prefix.len() && words.iter().zip(prefix).all(|(a, b)| a == b)
+            })
+        })
+}
+
+/// The words of each command in a plain script, as bash reads them; `None`
+/// for anything else.
+fn commands(script: &str) -> Option<Vec<Vec<String>>> {
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => words.extend(word.take()),
+            '\n' | ';' | '&' | '|' => {
+                match c {
+                    // Alone, `&` puts a command in the background.
+                    '&' if chars.next_if_eq(&'&').is_none() => return None,
+                    '|' => drop(chars.next_if_eq(&'|')),
+                    _ => {}
+                }
+                words.extend(word.take());
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+            }
+            '\'' => {
+                let word = word.get_or_insert_default();
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                let word = word.get_or_insert_default();
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '$' | '`' => return None,
+                        '\\' => match chars.next()? {
+                            '\n' => {}
+                            c @ ('"' | '\\' | '$' | '`') => word.push(c),
+                            c => word.extend(['\\', c]),
+                        },
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => match chars.next()? {
+                '\n' => {}
+                c => word.get_or_insert_default().push(c),
+            },
+            // A comment, which could hide what a reader of the call misses.
+            '#' if word.is_none() => return None,
+            '$' | '`' | '<' | '>' | '(' | ')' => return None,
+            c => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word);
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    Some(commands)
+}
+
 /// Whether `path`, read against `folder`, lies outside every folder a bot
 /// in `mode` may write.
 fn outside(
@@ -1070,6 +1160,51 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_plain_script_of_allowed_commands_leaves_the_sandbox() {
+        let allowed = ["mcpx".to_owned(), "docker  compose".to_owned()];
+        for command in [
+            "mcpx",
+            "mcpx github search_issues --query 'is:open label:\"bug\"'",
+            "mcpx a && mcpx b || mcpx c; mcpx d | mcpx e\nmcpx f",
+            "'mcpx' \"x y\" a\\ b \\\n  --flag=1 2>x#y",
+            "docker compose up",
+            "mcpx a;;",
+        ] {
+            let command = command.replace("2>x#y", "x#y");
+            assert!(unsandboxed(&allowed, &command), "{command}");
+        }
+        for command in [
+            "",
+            "  ;",
+            "mcpx a | jq .",
+            "docker ps",
+            "docker",
+            "mcpxx a",
+            "/usr/bin/mcpx a",
+            "PATH=. mcpx a",
+            "mcpx a & evil",
+            "mcpx a |& evil",
+            "mcpx $(evil)",
+            "mcpx `evil`",
+            "mcpx \"$(evil)\"",
+            "mcpx \"`evil`\"",
+            "mcpx $HOME",
+            "mcpx > ~/.zshrc",
+            "mcpx < input",
+            "mcpx <(evil)",
+            "(mcpx a)",
+            "mcpx a # ; evil",
+            "mcpx 'unclosed",
+            "mcpx \"unclosed",
+            "mcpx a\\",
+        ] {
+            assert!(!unsandboxed(&allowed, command), "{command}");
+        }
+        assert!(!unsandboxed(&[], "mcpx a"));
+        assert!(!unsandboxed(&[" ".to_owned()], "mcpx a"));
+    }
 
     #[test]
     fn a_call_escapes_by_asking_or_by_writing_outside_its_roots() {
