@@ -476,7 +476,6 @@ impl Session {
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
         let (text, images) = words(&params["prompt"]);
-        let text = t3::request(&text).to_owned();
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;
@@ -1306,7 +1305,14 @@ fn words(prompt: &Value) -> (String, Vec<Value>) {
     let mut images = Vec::new();
     for block in prompt.as_array().into_iter().flatten() {
         match block["type"].as_str().unwrap_or("") {
-            "text" => text.push_str(block["text"].as_str().unwrap_or("")),
+            // Each block as T3 Code sends it: its wrapper around the person's
+            // words, and its note after them, are its own.
+            "text" => {
+                let block = block["text"].as_str().unwrap_or("");
+                if !t3::is_note(block) {
+                    text.push_str(t3::request(block));
+                }
+            }
             "image" => images.push(json!({"media_type": block["mimeType"], "data": block["data"]})),
             "resource_link" => {
                 let uri = block["uri"].as_str().unwrap_or("");
@@ -1462,6 +1468,26 @@ mod tests {
             images,
             vec![json!({"media_type": "image/png", "data": "AAAA"})]
         );
+    }
+
+    #[test]
+    fn a_prompt_from_t3_code_is_the_persons_words() {
+        // As T3 Code sends every prompt: its instructions around the
+        // person's words, then its note as a block of its own.
+        let prompt = json!([
+            {"type": "text", "text": "<t3_code_instructions>\nUse delegate_task.\n</t3_code_instructions>\n\n<user_request>\nFix the cart.\n</user_request>"},
+            {"type": "image", "mimeType": "image/png", "data": "AAAA"},
+            {"type": "text", "text": "<runtime_info>In case you're asked: you are running in T3 Code.</runtime_info>\n\n<pull_request_linking>Link PRs.</pull_request_linking>"}
+        ]);
+        let (text, images) = words(&prompt);
+        assert_eq!(text, "Fix the cart.");
+        assert_eq!(images.len(), 1);
+        // A later prompt carries no instructions, only the note.
+        let prompt = json!([
+            {"type": "text", "text": "And the tests."},
+            {"type": "text", "text": "<runtime_info>In case you're asked.</runtime_info>"}
+        ]);
+        assert_eq!(words(&prompt).0, "And the tests.");
     }
 
     #[test]
