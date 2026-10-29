@@ -1581,6 +1581,12 @@ struct App {
     /// it joins while nothing else was drawn.
     folds: BTreeMap<usize, Fold>,
     folding: Option<(usize, usize)>,
+    /// The number the next group of rows (a fold, a roster) takes: never
+    /// one taken before, on whatever page.
+    next_group: usize,
+    /// The conversation's screen, put by while an older page is written
+    /// on one of its own.
+    newer: Option<screen::Screen>,
     /// Words between agents drawn quiet, by node: what was said, who
     /// said it, and whether a click opened it.
     relayed: HashMap<i64, Relayed>,
@@ -2197,6 +2203,8 @@ impl App {
             ran_here: Vec::new(),
             screen: screen::Screen::default(),
             folds: BTreeMap::new(),
+            next_group: 0,
+            newer: None,
             folding: None,
             relayed: HashMap::new(),
             tasks: BTreeMap::new(),
@@ -2714,12 +2722,14 @@ impl App {
         // page is written on a screen of its own: a group of calls in it
         // drawn again is found there, not among the newer rows.
         self.flush();
-        let screen = std::mem::take(&mut self.screen);
+        self.newer = Some(std::mem::take(&mut self.screen));
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
         let bot_reactions = std::mem::take(&mut self.bot_reactions);
         let react_calls = std::mem::take(&mut self.react_calls);
         let answering = self.answering.take();
+        let folding = self.folding.take();
+        let starting = self.starting.take();
         let welcome = self.welcome();
         self.commit(welcome);
         let unpaired = std::mem::take(&mut self.unpaired);
@@ -2729,12 +2739,15 @@ impl App {
         self.bot_reactions = bot_reactions;
         self.react_calls = react_calls;
         self.answering = answering;
+        self.folding = folding;
+        self.starting = starting;
         // A blank row apart from what was the first.
         if wrote {
             self.pending.push(Line::default());
         }
         self.flush();
-        let older = std::mem::replace(&mut self.screen, screen);
+        let newer = self.newer.take().unwrap_or_default();
+        let older = std::mem::replace(&mut self.screen, newer);
         self.screen.prepend(older);
     }
 
@@ -2910,14 +2923,12 @@ impl App {
         // Folds whose rows the conversation let go keep nothing: the
         // oldest go first, as rows do.
         while let Some(&first) = self.folds.keys().next() {
-            let tag = screen::Tag::Group(first as u64);
-            let waiting = (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag));
-            if waiting || self.screen.has(tag) {
+            if self.kept(screen::Tag::Group(first as u64)) {
                 break;
             }
             self.folds.remove(&first);
         }
-        let at = self.folds.keys().next_back().map_or(0, |at| at + 1);
+        let at = self.group();
         self.folds.insert(
             at,
             Fold {
@@ -2963,7 +2974,7 @@ impl App {
             // Gone from the conversation: this task starts a group of its own.
             self.tasks.remove(&at);
         }
-        let at = self.tasks.keys().next_back().map_or(0, |at| at + 1);
+        let at = self.group();
         self.tasks.insert(at, vec![task]);
         let (lines, marks) = self.started_lines(at);
         let count = lines.len();
@@ -3003,6 +3014,20 @@ impl App {
         (self.screen).replace_tagged(screen::Tag::Tasks(at as u64), lines, marks)
     }
 
+    /// Whether rows tagged `tag` are in the conversation, drawn or waiting
+    /// to be, the rows put by while an older page is written included.
+    fn kept(&self, tag: screen::Tag) -> bool {
+        (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+            || self.screen.has(tag)
+            || (self.newer.as_ref()).is_some_and(|newer| newer.has(tag))
+    }
+
+    /// A number for a new group of rows, unlike any before it.
+    fn group(&mut self) -> usize {
+        self.next_group += 1;
+        self.next_group - 1
+    }
+
     /// What the tasks started are doing, read again every few seconds:
     /// those still at work, and every one when news of them came.
     async fn read_tasks(&mut self) {
@@ -3010,11 +3035,7 @@ impl App {
         // read again.
         let gone: Vec<usize> = (self.tasks.keys())
             .copied()
-            .filter(|at| {
-                let tag = screen::Tag::Tasks(*at as u64);
-                !self.screen.has(tag)
-                    && !(self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
-            })
+            .filter(|at| !self.kept(screen::Tag::Tasks(*at as u64)))
             .collect();
         for at in gone {
             self.tasks.remove(&at);
@@ -8652,6 +8673,40 @@ mod tests {
         // The person's own words are drawn as ever.
         app.land(6, "thanks", None, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
+    }
+
+    #[tokio::test]
+    async fn an_older_page_s_folds_leave_the_newer_ones_and_their_numbers() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        let start = |app: &mut App, name: &str| {
+            let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
+            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+        };
+        start(&mut app, "calc.add");
+        start(&mut app, "calc.neg");
+        app.flush();
+        // An older page written on a screen of its own, as older() does.
+        app.newer = Some(std::mem::take(&mut app.screen));
+        app.any_history = false;
+        let folding = app.folding.take();
+        start(&mut app, "calc.old");
+        start(&mut app, "calc.older");
+        app.flush();
+        app.folding = folding;
+        let older = std::mem::replace(&mut app.screen, app.newer.take().unwrap());
+        app.screen.prepend(older);
+        assert_eq!(app.folds.len(), 2, "the newer fold is kept");
+        app.follow("sonny:fold/0");
+        let button = app.pressed.take().unwrap();
+        app.press(&button).await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[0], "• Messaged calc.old and calc.older ▸", "{rows:?}");
+        assert!(
+            rows.contains(&"• Messaged calc.add and calc.neg ▾".to_string()),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test]
