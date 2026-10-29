@@ -5398,7 +5398,11 @@ impl App {
                 // After the file shown, as a browser goes on to a page.
                 Ok(pane) => match self.pane.take() {
                     Some(shown) if shown.url().is_some() => self.open_pane(pane.after(shown)),
-                    _ => self.open_pane(pane),
+                    // The margin goes under it, as under anything opened.
+                    shown => {
+                        self.pane = shown;
+                        self.open_pane(pane)
+                    }
                 },
                 Err(error) => self.notice = Some(error),
             }
@@ -9166,6 +9170,20 @@ mod tests {
         assert!(!app.margin.closed());
         assert!(app.step_pane(false));
         assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
+    }
+
+    #[tokio::test]
+    async fn a_file_link_opens_over_the_margin_too() {
+        let dir = std::env::temp_dir().join(format!("sonny-over-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        let mut app = app(daemon_with(json!([])).await);
+        app.margin_back();
+        app.follow(&format!("file://{}", dir.join("a.md").display()));
+        assert!(app.pane.as_ref().is_some_and(|p| !p.is_margin() && p.over));
+        app.close_pane(true);
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
