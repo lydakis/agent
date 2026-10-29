@@ -322,6 +322,9 @@ fn memory() -> Value {
         "check": {"type": "boolean",
             "description": "Report files that are not valid facts and an index out of date."},
         "changed": {"type": "boolean", "description": "For the nightly cleanup only."},
+        "said": {"type": "boolean",
+            "description": "For the nightly cleanup only: what the person wrote to any agent since since_ms, else over the last day."},
+        "since_ms": {"type": "integer", "description": "With said: unix milliseconds."},
         "cleanup": {"type": "string", "enum": ["start", "finish"], "description": "For the nightly cleanup only."}
     });
     if let (Value::Object(properties), Value::Object(scope)) = (&mut properties, scope) {
@@ -484,6 +487,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
         }
+        MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
+            .await
+            .map(|said| said.to_string())
+            .map_err(|e| ("memory_refused", e)),
         MEMORY => {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)

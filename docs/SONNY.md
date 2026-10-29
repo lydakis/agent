@@ -316,6 +316,7 @@ each time it starts, a script that runs it as
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
 ~/.agent/memory check [SCOPE]
+~/.agent/memory said [SINCE_MS]
 ~/.agent/memory changed | cleanup start | cleanup finish
 ~/.agent/memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
   SCOPE: --user | --project NAME; none: the project of this folder
@@ -350,6 +351,18 @@ as having read. The script takes `--external` for the same. Agents treat
 such a fact as a lead to check, and the cleanup removes one that reads as
 an instruction to agents. Saving the fact again without it, say on the
 person's word, clears the mark.
+
+The cleanup also reads what the person wrote to any agent since the last
+cleanup finished (`cleanup start` gives that time as `since_ms`, null the
+first night, when it looks back a day): the memory tool's `said` with
+`since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
+daemon: every message in a turn that ran since then that carries no other
+agent's or named client's mark, steers included, newest first and at most
+96 KiB, each with its agent, turn and memory project. It saves what no
+agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
+the day's notes, taking only the person's own words and their scope, as
+Codex's extraction does. The trigger still wakes it only when memory
+changed; words from a quiet night are read the next time it runs.
 
 `read` gives one fact's whole file as `text` and records the read in the
 folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor

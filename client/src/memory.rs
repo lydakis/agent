@@ -39,7 +39,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -856,8 +856,9 @@ fn cleanup_start(root: &Path) -> Result<Value, String> {
 }
 
 /// A started cleanup, with the facts saved and removed since the last one,
-/// which are what it reads first, and those no agent has read in a while,
-/// which it checks still hold.
+/// which are what it reads first, those no agent has read in a while,
+/// which it checks still hold, and when the last one finished (`since_ms`,
+/// null before the first), from which it reads what the person wrote.
 fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Value, String> {
     let since = git(
         root,
@@ -865,9 +866,21 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
     )?;
     let (removed, added, changed) = fact_changes(&since);
     let saved: Vec<_> = added.into_iter().chain(changed).collect();
+    // When the last cleanup finished, for what the person wrote since.
+    let last = git(
+        root,
+        &[
+            "log",
+            "-1",
+            "--format=%ct",
+            "--grep=^Memory cleanup, ",
+            commit,
+        ],
+    )?;
+    let since_ms = last.trim().parse::<i64>().ok().map(|s| s * 1000);
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
-        "unread": unread(root)?, "duplicate": duplicate}),
+        "unread": unread(root)?, "since_ms": since_ms, "duplicate": duplicate}),
     )
 }
 
@@ -1727,6 +1740,7 @@ mod tests {
             (json!(4), json!(false))
         );
         assert_eq!(started["saved"], json!(["a.md", "b.md", "c.md", "d.md"]));
+        assert_eq!(started["since_ms"], Value::Null);
         // A start while one is open is that one, so the guard counts from it.
         let again = run_(&["cleanup", "start"]).unwrap();
         assert_eq!(
@@ -1748,6 +1762,12 @@ mod tests {
         // Removing more than the guard allows is undone.
         save_user(&root, "e", "fact e", "x").unwrap();
         let next = run_(&["cleanup", "start"]).unwrap();
+        let since = next["since_ms"].as_i64().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(now - since < 60_000 && since % 1000 == 0, "{since}");
         assert_eq!(
             (next["saved"].clone(), next["removed"].clone()),
             (json!(["e.md"]), json!([]))
