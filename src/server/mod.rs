@@ -271,6 +271,8 @@ enum Command {
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
+        /// Its prompt-cache lifetime, as `create`'s settings name it.
+        cache_ttl: Option<agent_runtime::store::CacheTtl>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -329,6 +331,22 @@ enum Command {
         limit: Option<usize>,
         #[serde(default)]
         newest: bool,
+    },
+    /// The tokens bots' turns spent: in all, by bot, by model, and over
+    /// time. A read.
+    Usage {
+        /// A GLOB of bot names, as `bots` takes it; absent is every bot.
+        name: Option<String>,
+        /// Only turns started at or after this, in milliseconds since the
+        /// Unix epoch; absent is all of them.
+        #[serde(default)]
+        since_ms: i64,
+        /// Sum `series` in buckets this wide from `since_ms`; absent
+        /// leaves the series out.
+        bucket_ms: Option<i64>,
+        /// The most bots listed by what they spent, the rest summed as
+        /// `other_bots`; 64 when absent.
+        limit: Option<usize>,
     },
     Submit {
         bot: String,
@@ -2598,6 +2616,25 @@ impl Service {
                     })
                     .await
             }
+            Command::Usage {
+                name,
+                since_ms,
+                bucket_ms,
+                limit,
+            } => {
+                // Off the dispatch path: it reads every matching turn, which
+                // grows with history, so other requests go on meanwhile.
+                let (reader, output) = (store.reader(), output.clone());
+                tokio::spawn(async move {
+                    let result = reader
+                        .read("usage", move |db| {
+                            db.usage(name.as_deref(), since_ms, bucket_ms, limit.unwrap_or(64))
+                        })
+                        .await;
+                    retention_reply(session, &output, id, result).await;
+                });
+                Err(Error::new("deferred"))
+            }
             Command::Delete { bot, bot_id } => {
                 if let Some(id) = bot_id {
                     let name = bot.clone();
@@ -2692,6 +2729,7 @@ impl Service {
                 sandbox,
                 writable,
                 network,
+                cache_ttl,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
@@ -2812,6 +2850,11 @@ impl Service {
                             && db.set_sandbox(&bot, Some(id), sandbox)?
                         {
                             changed.push("sandbox");
+                        }
+                        if let Some(ttl) = cache_ttl
+                            && db.set_cache_ttl(&bot, Some(id), ttl)?
+                        {
+                            changed.push("cache_ttl");
                         }
 
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))

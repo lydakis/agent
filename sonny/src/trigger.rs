@@ -233,7 +233,7 @@ pub struct Trigger {
     /// every fire writes.
     pub file: Option<PathBuf>,
     pub daemon: Daemon,
-    /// The store identity its daemon announced when it was made; a daemon
+    /// The store lineage its daemon announced when it was made; a daemon
     /// on that socket serving another store is not its daemon.
     pub store_id: String,
     pub message: String,
@@ -1918,6 +1918,52 @@ pub fn refresh(places: &Places, app: &Path, launchd: Loader) {
     }
 }
 
+/// A trigger made before triggers named their store by its lineage names
+/// it by its file's identity, which a replaced file does not keep: each
+/// that names `identity`, the daemon's now, names `lineage` from here on.
+pub fn restamp(places: &Places, identity: &str, lineage: &str, launchd: Loader) {
+    for (trigger, _) in read_all(places).filter_map(|(_, r)| r.ok()) {
+        if trigger.store_id != identity {
+            continue;
+        }
+        let Ok(_lock) = Lock::take(places) else {
+            return;
+        };
+        // Read again under the lock: an `rm`, `add` or fire may have come first.
+        let path = places.plist(&trigger.name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let stamped = text.replacen(
+            &format!("<string>{}</string>", escape(identity)),
+            &format!("<string>{}</string>", escape(lineage)),
+            1,
+        );
+        if stamped == text {
+            continue;
+        }
+        let _ = swap(
+            &path,
+            &format!("{LABEL}{}", trigger.name),
+            Some(&text),
+            &stamped,
+            launchd,
+        );
+    }
+}
+
+/// Once Sonny knows its daemon: [`restamp`] the triggers made on its store.
+pub fn restamp_at_start(identity: Option<&str>, lineage: Option<&str>) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let (Ok(places), Some(identity), Some(lineage)) = (Places::home(), identity, lineage) else {
+        return;
+    };
+    let (identity, lineage) = (identity.to_owned(), lineage.to_owned());
+    std::thread::spawn(move || restamp(&places, &identity, &lineage, &launchctl));
+}
+
 /// What `trigger add` was asked.
 #[derive(Debug, PartialEq)]
 struct Add {
@@ -2753,6 +2799,7 @@ async fn submit(
     started: bool,
     ask: Option<&Asked>,
 ) -> Value {
+    let id = asking["bot_id"].as_i64().unwrap_or_default();
     let submitted = client.request("submit", asking).await;
     let outcome = match submitted {
         Ok(turn) => {
@@ -2777,7 +2824,42 @@ async fn submit(
         }
         Err(error) => json!({"outcome": "failed", "detail": error.to_string()}),
     };
+    if matches!(outcome["outcome"].as_str(), Some("skipped" | "failed")) {
+        missed(client, trigger, (bot, id), &outcome).await;
+    }
     reply(client, trigger, bot, outcome).await
+}
+
+/// A fire that sent nothing tells the agent its answer goes to, else the
+/// agent it messages, without starting a turn: it reads it in its next
+/// model call, also the one it is busy with, instead of hearing nothing.
+async fn missed(client: &Client, trigger: &Trigger, (bot, id): (&str, i64), outcome: &Value) {
+    let (to, to_id) = match &trigger.reply_to {
+        Some((to, to_id)) => (to.as_str(), *to_id),
+        None => (bot, id),
+    };
+    let detail = outcome["detail"].as_str().unwrap_or("no reason given");
+    let prompt = format!(
+        "[trigger {} · {} · {} not sent to {bot}: {detail}]",
+        trigger.name,
+        stamp(now()),
+        trigger.when
+    );
+    let request = format!(
+        "{}missed.{to_id}.{}.{}.{}",
+        sent_by(trigger),
+        now(),
+        std::process::id(),
+        sends()
+    );
+    // Telling is a courtesy: what came of the fire is its row's either way.
+    let _ = client
+        .request(
+            "submit",
+            json!({"bot": to, "bot_id": to_id, "request_id": request, "prompt": prompt,
+                "delivery": "attach", "origin": "trigger"}),
+        )
+        .await;
 }
 
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire
@@ -3562,6 +3644,37 @@ mod tests {
             ]
         );
         assert_eq!(found[1].0["when"], "every 30m");
+    }
+
+    #[test]
+    fn a_trigger_made_by_its_store_file_s_identity_names_its_lineage_instead() {
+        let w = World::new("restamp");
+        let elsewhere = Trigger {
+            name: "q.other".into(),
+            store_id: "another-store".into(),
+            ..trigger()
+        };
+        for t in [&trigger(), &elsewhere] {
+            w.install(t).unwrap();
+        }
+        let unloads = w.fake.unloads.get();
+        restamp(&w.places, "00ab", "0123456789abcdef", &|x| w.fake.call(x));
+        let mut ids: Vec<(String, String)> = triggers(&w.places)
+            .into_iter()
+            .map(|(t, _)| (t.name, t.store_id))
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                ("p.fix-login".into(), "0123456789abcdef".into()),
+                ("q.other".into(), "another-store".into())
+            ]
+        );
+        // Reloaded once; again it changes nothing.
+        assert_eq!(w.fake.unloads.get(), unloads + 1);
+        restamp(&w.places, "00ab", "0123456789abcdef", &|x| w.fake.call(x));
+        assert_eq!(w.fake.unloads.get(), unloads + 1);
     }
 
     fn once() -> Trigger {

@@ -241,7 +241,12 @@ inherits. Sonny takes the person's words out of the instructions T3 Code
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
-same bot.
+same bot. T3 Code's model picker lists `~/.agent/models` (the list `agent
+models` shows) after "Default", the model the lead or task runs: a model
+picked before the first prompt is the one a new lead starts on, and one
+picked later is the lead's from its next turn. A thread offers only its
+bot's provider family, since a bot changes model only within it, and a task's
+thread keeps the model its lead gave the task.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
@@ -404,6 +409,15 @@ off again never shows.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+- `/usage` shows, in the pane beside the conversation on the full screen,
+  the tokens the project's agents spent in the last 24 hours: in all, as
+  stacked bars over time (output, input read fresh, and input read from the
+  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  day, week or month, `a` every agent in the store, by project, and `c`
+  hides the cached reads, so what the provider charges most for stands out.
+  A turn counts where it started. It reads again every minute.
+
+  ![/usage in the pane](../docs/sonny/usage.gif)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`

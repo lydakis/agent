@@ -580,6 +580,11 @@ async fn judge(
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
             Err(_) => return Err(late()),
             Ok(Err(Unjudged::TooLong)) => return Err(long("the call is too long to show")),
+            Ok(Err(Unjudged::Unnamed)) => {
+                return Err(long(
+                    "an earlier call this turn changed files it no longer names",
+                ));
+            }
             Ok(Err(Unjudged::Failed)) => {
                 return Err(Unreviewed::Failed("the turn could not be read".into()));
             }
@@ -710,11 +715,12 @@ fn patch_paths(text: &str) -> Vec<String> {
     paths
 }
 
-/// The files a file-changing call too large to read back changes: a
-/// patch's as the daemon named them whole, else as its preview names them.
+/// The files a file-changing call too large to read back changes: as the
+/// daemon named them whole, else as its preview names them.
 fn cut_files(tool: &str, call: &Value, preview: &str) -> std::result::Result<Value, Unjudged> {
-    match call["paths"].as_array() {
-        Some(paths) if tool == "apply_patch" => Ok(json!({"paths":paths})),
+    match (tool, call["paths"].as_array().map(Vec::as_slice)) {
+        ("apply_patch", Some(paths)) => Ok(json!({"paths":paths})),
+        (_, Some([path])) => Ok(json!({"path":path})),
         _ => cut_change(tool, preview),
     }
 }
@@ -792,6 +798,9 @@ fn written_file(file: &Path) -> Option<Written> {
 
 enum Unjudged {
     TooLong,
+    /// An earlier call of the turn changed files that cannot be read back,
+    /// any of which the calls may run.
+    Unnamed,
     Failed,
 }
 
@@ -938,7 +947,7 @@ async fn intent(
                     // Too large to read back: as a call with no node.
                     Err(Unjudged::TooLong) if writes => {
                         sized = false;
-                        cut_files(&tool, call, preview)?
+                        cut_files(&tool, call, preview).map_err(|_| Unjudged::Unnamed)?
                     }
                     Err(Unjudged::TooLong) => {
                         allowed_cut = true;
@@ -950,7 +959,7 @@ async fn intent(
                 // no file this turn wrote could be matched.
                 None if writes => {
                     sized = false;
-                    cut_files(&tool, call, preview)?
+                    cut_files(&tool, call, preview).map_err(|_| Unjudged::Unnamed)?
                 }
                 None => {
                     allowed_cut = true;

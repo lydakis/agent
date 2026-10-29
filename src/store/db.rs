@@ -1363,6 +1363,31 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "started_ms":r.get::<_, Option<i64>>(11)?,"finished_ms":r.get::<_, Option<i64>>(12)?}))
 }
 
+/// The most buckets a `usage` series splits its window into.
+const MAX_USAGE_BUCKETS: i64 = 1024;
+/// What some turns spent, as `usage` sums it.
+#[derive(Default)]
+struct Spent {
+    turns: i64,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+}
+impl Spent {
+    fn add(&mut self, other: &Spent) {
+        self.turns += other.turns;
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+    fn tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens
+    }
+    fn json(&self) -> Value {
+        json!({"turns":self.turns,"input_tokens":self.input_tokens,
+            "cached_input_tokens":self.cached_input_tokens,"output_tokens":self.output_tokens})
+    }
+}
 /// The share of input tokens the provider served from its prompt cache,
 /// to three places; zero when nothing was sent.
 pub fn cache_hit(cached: i64, input: i64) -> f64 {
@@ -2306,6 +2331,23 @@ impl Database {
             settings = settings.under(creator);
         }
         settings.validate()?;
+        let stored = settings.stored()?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
+            params![stored, id, stored],
+        )?;
+        Ok(changed == 1)
+    }
+    /// The bot's prompt-cache lifetime; whether that changed it.
+    pub fn set_cache_ttl(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        ttl: CacheTtl,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let mut settings = self.inspect(name)?.settings;
+        settings.cache_ttl = Some(ttl);
         let stored = settings.stored()?;
         let changed = self.conn.execute(
             "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
@@ -4246,6 +4288,34 @@ impl Database {
         }
         Ok(json!({"bot":name,"turns":turns}))
     }
+    /// The number `history_read` gives the turn `turn` (the store's, as a
+    /// handle names it) in `name`'s history, which may hold it from before
+    /// a fork.
+    pub fn history_number(&self, name: &str, turn: i64) -> Result<i64> {
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        // Turn ids only grow along a history: stop past the turn.
+        self.conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,turn,turn_seq) AS (
+                SELECT id,parent,turn,turn_seq FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.turn,n.turn_seq
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.turn IS NULL OR c.turn>=?2)
+             SELECT turn_seq FROM chain WHERE turn=?2 AND turn_seq IS NOT NULL LIMIT 1",
+            )?
+            .query_row(params![head, turn], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| {
+                Error::with(
+                    "turn_not_in_history",
+                    format!("turn:{name}/{turn} did not start a turn in {name}'s history"),
+                )
+            })
+    }
     pub fn history_read(
         &self,
         name: &str,
@@ -4285,7 +4355,13 @@ impl Database {
             .query_row(params![head, turn_seq], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         let Some((depth, end)) = boundary else {
-            return fail("turn_not_in_history");
+            return fail_with(
+                "turn_not_in_history",
+                format!(
+                    "turn {turn_seq} counts {name}'s turns from 1, as its listing numbers them; \
+                     a handle names a turn by the store's number"
+                ),
+            );
         };
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,depth) AS (
@@ -6567,20 +6643,35 @@ impl Database {
             let call_id = data["call_id"].as_str().unwrap_or_default().to_owned();
             let mut arguments = data["arguments"].as_str().unwrap_or_default().to_owned();
             let mut truncated = data["arguments_truncated"].as_bool().unwrap_or(false);
+            // The files a call changes come before its arguments: a call cut
+            // here, at what is left, still names them when it was not cut
+            // at its preview, which named them then.
+            let paths = match data.get("paths") {
+                Some(paths) => Some(paths.clone()),
+                None if !truncated && arguments.len() > calls_left => {
+                    changed_paths(data["name"].as_str().unwrap_or_default(), &arguments)
+                        .map(|(paths, _)| json!(paths))
+                }
+                None => None,
+            };
+            let (mut named, mut paths_cut) = (None, data["paths_cut"] == true);
+            if let Some(paths) = paths {
+                let size = paths.to_string().len();
+                if size <= calls_left {
+                    calls_left -= size;
+                    named = Some(paths);
+                } else {
+                    paths_cut = true;
+                }
+            }
             truncated |= cut(&mut arguments, &mut calls_left);
             let mut call = json!({"call_id":call_id,"name":data["name"],"arguments":arguments,
                 "arguments_truncated":truncated,"done":done.contains(&call_id)});
-            // The files a cut patch changes, when they fit what is left.
-            if let Some(paths) = data.get("paths") {
-                let size = paths.to_string().len();
-                let fits = size <= calls_left;
-                if fits {
-                    calls_left -= size;
-                    call["paths"] = paths.clone();
-                }
-                if !fits || data["paths_cut"] == true {
-                    call["paths_cut"] = json!(true);
-                }
+            if let Some(paths) = named {
+                call["paths"] = paths;
+            }
+            if paths_cut {
+                call["paths_cut"] = json!(true);
             }
             if failed.contains(&call_id) {
                 call["failed"] = json!(true);
@@ -8420,6 +8511,130 @@ impl Database {
             false => json!({"turns":turns,"next_after":next}),
         })
     }
+    /// What the turns of the bots whose names match `name` (every bot
+    /// when absent) spent, from those started at `since_ms` or later: in
+    /// all, by bot (the `limit` that spent most, the rest summed as one),
+    /// by model, and, with `bucket_ms`, in buckets of that width from
+    /// `since_ms`. A turn counts wholly where it started. One statement,
+    /// so one snapshot.
+    pub fn usage(
+        &self,
+        name: Option<&str>,
+        since_ms: i64,
+        bucket_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Value> {
+        if name.is_some_and(|pattern| pattern.is_empty() || pattern.len() > 256) {
+            return fail_with(
+                "invalid_bot_filter",
+                "name is a GLOB pattern of 1 to 256 bytes",
+            );
+        }
+        if !(1..=256).contains(&limit) {
+            return fail_with("invalid_usage_page", "limit must be 1 to 256");
+        }
+        if since_ms < 0 {
+            return fail_with("invalid_usage_window", "since_ms must be 0 or more");
+        }
+        if let Some(bucket) = bucket_ms {
+            let buckets = (epoch_ms() - since_ms).max(0) / bucket.max(1);
+            if bucket < 1 || since_ms == 0 || buckets >= MAX_USAGE_BUCKETS {
+                return fail_with(
+                    "invalid_usage_window",
+                    format!(
+                        "bucket_ms needs a since_ms, and splits the time since it into fewer than {MAX_USAGE_BUCKETS} buckets"
+                    ),
+                );
+            }
+        }
+        let glob = match name {
+            Some(_) => " AND t.bot GLOB ?3",
+            None => "",
+        };
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT t.bot,b.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
+                    (t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
+                    SUM(t.cached_input_tokens),SUM(t.output_tokens)
+             FROM turns t JOIN bots b ON b.name=t.bot
+             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,4"
+        ))?;
+        let width = bucket_ms.unwrap_or(i64::MAX);
+        let mut rows = match name {
+            Some(pattern) => statement.query(params![since_ms, width, pattern])?,
+            None => statement.query(params![since_ms, width])?,
+        };
+        let mut total = Spent::default();
+        let mut bots: HashMap<String, (i64, Spent)> = HashMap::new();
+        let mut models: HashMap<String, Spent> = HashMap::new();
+        let mut series: BTreeMap<i64, Spent> = BTreeMap::new();
+        while let Some(r) = rows.next()? {
+            let spent = Spent {
+                turns: r.get(4)?,
+                input_tokens: r.get(5)?,
+                cached_input_tokens: r.get(6)?,
+                output_tokens: r.get(7)?,
+            };
+            total.add(&spent);
+            let bot = bots.entry(r.get(0)?).or_default();
+            bot.0 = r.get(1)?;
+            bot.1.add(&spent);
+            models.entry(r.get(2)?).or_default().add(&spent);
+            if bucket_ms.is_some() {
+                series.entry(r.get(3)?).or_default().add(&spent);
+            }
+        }
+        let mut bots: Vec<(String, i64, Spent)> = bots
+            .into_iter()
+            .map(|(bot, (id, spent))| (bot, id, spent))
+            .collect();
+        bots.sort_by(|a, b| b.2.tokens().cmp(&a.2.tokens()).then_with(|| a.0.cmp(&b.0)));
+        let mut others = Spent::default();
+        let rest = bots.len().saturating_sub(limit);
+        for (_, _, spent) in bots.drain(limit.min(bots.len())..) {
+            others.add(&spent);
+        }
+        let mut models: Vec<(String, Spent)> = models.into_iter().collect();
+        models.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
+        let mut out = total.json();
+        out["since_ms"] = json!(since_ms);
+        out["bucket_ms"] = json!(bucket_ms);
+        out["bots"] = bots
+            .iter()
+            .map(|(bot, id, spent)| {
+                let mut row = spent.json();
+                row["bot"] = json!(bot);
+                row["bot_id"] = json!(id);
+                row
+            })
+            .collect();
+        out["other_bots"] = match rest {
+            0 => Value::Null,
+            n => {
+                let mut row = others.json();
+                row["bots"] = json!(n);
+                row
+            }
+        };
+        out["models"] = models
+            .iter()
+            .map(|(model, spent)| {
+                let mut row = spent.json();
+                row["model"] = json!(model);
+                row
+            })
+            .collect();
+        if let Some(bucket) = bucket_ms {
+            out["series"] = series
+                .iter()
+                .map(|(index, spent)| {
+                    let mut row = spent.json();
+                    row["at_ms"] = json!(since_ms + index * bucket);
+                    row
+                })
+                .collect();
+        }
+        Ok(out)
+    }
     /// Own outputs stay a direct indexed lookup. Inherited outputs must have
     /// their tool-result node in the selected branch, never a later source turn.
     fn authorize_artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<()> {
@@ -8669,28 +8884,50 @@ fn started(call: &ToolCall) -> Value {
     let truncated = preview.len() < call.arguments.len();
     let mut data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
         "arguments_truncated":truncated});
-    // A cut patch still names every file it changes, for a judge of a later
-    // call that runs one.
-    if truncated
-        && call.name == "apply_patch"
-        && let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments)
-        && let Some(Ok(patch)) = arguments["input"].as_str().map(crate::tools::Patch::parse)
-    {
-        // Within what an event page carries: past it, the rest is marked
-        // as left out.
-        let (mut paths, mut size) = (Vec::new(), 0);
-        for path in patch.paths() {
-            size += path.len() + 3;
-            if size > STARTED_PATHS_BYTES {
-                data["paths_cut"] = json!(true);
-                break;
-            }
-            paths.push(path);
+    // A cut write, edit or patch still names every file it changes, for a
+    // judge of a later call that runs one.
+    if truncated && let Some((paths, whole)) = changed_paths(&call.name, &call.arguments) {
+        if !whole {
+            data["paths_cut"] = json!(true);
         }
         data["paths"] = json!(paths);
     }
     data
 }
+
+/// The files a write, edit or patch with `arguments` changes, and whether
+/// that is all of them: past what an event page carries, the rest are left
+/// out.
+fn changed_paths(name: &str, arguments: &str) -> Option<(Vec<String>, bool)> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        path: String,
+    }
+    match name {
+        "write" | "edit" => serde_json::from_str::<Named>(arguments)
+            .ok()
+            .filter(|named| named.path.len() <= STARTED_PATHS_BYTES)
+            .map(|named| (vec![named.path], true)),
+        "apply_patch" => {
+            let arguments = serde_json::from_str::<Value>(arguments).ok()?;
+            let patch = arguments["input"]
+                .as_str()
+                .map(crate::tools::Patch::parse)?
+                .ok()?;
+            let (mut paths, mut size) = (Vec::new(), 0);
+            for path in patch.paths() {
+                size += path.len() + 3;
+                if size > STARTED_PATHS_BYTES {
+                    return Some((paths, false));
+                }
+                paths.push(path.to_owned());
+            }
+            Some((paths, true))
+        }
+        _ => None,
+    }
+}
+
 /// The most of a cut patch's paths a `tool_started` event names.
 const STARTED_PATHS_BYTES: usize = 64 * 1024;
 /// In an answered call's start, note it as waiting for its client, and
@@ -10527,6 +10764,30 @@ mod tests {
         let data = started(&many);
         assert_eq!(data["paths_cut"], true);
         assert!(data.to_string().len() < 80 * 1024);
+    }
+
+    #[test]
+    fn a_cut_write_or_edit_still_names_its_file() {
+        for (name, arguments) in [
+            (
+                "write",
+                json!({"path":"notes.txt","content":"x".repeat(3000)}),
+            ),
+            (
+                "edit",
+                json!({"path":"notes.txt","old":"a","new":"x".repeat(3000)}),
+            ),
+        ] {
+            let call = ToolCall {
+                name: name.into(),
+                call_id: "c".into(),
+                arguments: arguments.to_string(),
+                custom: false,
+            };
+            let data = started(&call);
+            assert_eq!(data["arguments_truncated"], true, "{name}");
+            assert_eq!(data["paths"], json!(["notes.txt"]), "{name}");
+        }
     }
 
     #[test]

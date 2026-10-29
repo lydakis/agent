@@ -1573,6 +1573,25 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(state['already_allowed'],
                          [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': None}, 'status': 'succeeded'}])
 
+    def test_an_ungated_write_cut_before_its_path_still_names_its_file(self):
+        self.judge.answer = lambda body, id: .05
+        # Its content comes first, as a model may write it: the preview the
+        # call starts with is cut before its path.
+        script = '# padding line\n' * 250 + 'printf ok\n'
+        self.model.call_script = [('write', {'content': script, 'path': 'run.sh'}),
+                                  ('shell', {'command': 'sh run.sh'})]
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
+        self.approver(daemon)
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertFalse(self.poll(daemon, turn, 'script-1').get('denied'))
+        state = self.judge.requests.get(timeout=5)['body']['state']
+        [shell] = state['planned_calls']
+        self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': script}])
+
     def test_the_judge_sees_the_bots_history_and_the_agents_md_it_was_given(self):
         self.judge.answer = lambda body, id: .05
         # The first call returns words meant for the judge, and edits AGENTS.md.
