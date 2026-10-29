@@ -177,6 +177,13 @@ fn result(tool: &str, called: Value) -> Result<Value, String> {
     Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
+/// The note T3 Code adds to every prompt as a block of its own, after the
+/// person's words: which harness runs the thread, and how it links pull
+/// requests. It is T3 Code's, not the person's.
+pub fn is_note(block: &str) -> bool {
+    block.starts_with("<runtime_info>")
+}
+
 /// What the person wrote, out of a prompt T3 Code wrapped in its own
 /// instructions: those name tools the bot does not have.
 pub fn request(prompt: &str) -> &str {
