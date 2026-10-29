@@ -168,7 +168,8 @@ identity is `bot_not_found`.
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
-  folder), `--network` and `--hide-senders`; they are not daemon options, and an existing bot
+  folder), `--network`, `--hide-senders` and `--unsandboxed` (repeatable: a
+  command's first words, such as `mcpx`); they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope
@@ -308,6 +309,15 @@ family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `~/.agent/config.toml` sets `web_search = "disabled"`. An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
+`run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that
+answers a request a safety classifier declined, that request alone; the next
+goes to the bot's own model. Without it the bot takes its model's entry in
+`[fallbacks]` in `~/.agent/config.toml`, if any:
+
+```toml
+[fallbacks]
+"anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
+```
 Other client commands require an already running daemon.
 
 `models` prints `~/.agent/models`, the models clients offer, as JSON

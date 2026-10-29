@@ -98,10 +98,10 @@ pub struct Bot {
     pub thinking: Strip,
     #[serde(skip)]
     pub thinking_elided: i64,
-    /// Anthropic server-side fallbacks: a declined request is rerun on the
-    /// model Anthropic recommends instead of failing the turn. The client's
-    /// choice at creation; forks inherit it.
-    pub fallbacks: bool,
+    /// The model, as `provider/model` in the bot's family, that answers a
+    /// request a safety classifier declined, that request alone, instead of
+    /// the turn failing. The client's choice at creation; forks inherit it.
+    pub fallback: Option<String>,
     /// Tools whose calls wait for a verdict, per approver tag. Fixed at
     /// creation, except a root bot's through `configure`: a bot keeps every
     /// gate it descends from.
@@ -227,6 +227,11 @@ pub struct Settings {
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_senders: bool,
+    /// Command prefixes, each of words, that run outside the sandbox
+    /// without asking, as a Codex rule that allows a prefix runs it
+    /// ([`crate::sandbox::unsandboxed`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsandboxed: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -291,7 +296,8 @@ impl Settings {
     /// makes: no weaker a sandbox than its creator's, as Codex's subagents
     /// inherit their parent's. A sandboxed creator's child takes the
     /// creator's sandbox and writable folders unless it names a stricter
-    /// sandbox, and reaches the network only if both do.
+    /// sandbox, and reaches the network only if both do; it runs outside
+    /// the sandbox only commands its creator does.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         let sandboxed = |settings: &Settings| {
@@ -306,7 +312,10 @@ impl Settings {
         if !sandboxed(&self) {
             self.writable = creator.writable.clone();
             self.network = creator.network;
+            self.unsandboxed = creator.unsandboxed.clone();
         }
+        self.unsandboxed
+            .retain(|prefix| creator.unsandboxed.contains(prefix));
         self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
         if self.sandbox != Some(Mode::WorkspaceWrite) {
             self.writable.clear();
@@ -362,6 +371,21 @@ impl Settings {
         if !confined && (!self.writable.is_empty() || self.network) {
             return refuse("writable and network go with sandbox workspace-write");
         }
+        let sandboxed = matches!(
+            self.sandbox,
+            Some(crate::sandbox::Mode::ReadOnly | crate::sandbox::Mode::WorkspaceWrite)
+        );
+        if !sandboxed && !self.unsandboxed.is_empty() {
+            return refuse("unsandboxed goes with sandbox read-only or workspace-write");
+        }
+        if self.unsandboxed.len() > 64
+            || self
+                .unsandboxed
+                .iter()
+                .any(|prefix| prefix.split_whitespace().next().is_none() || prefix.len() > 1024)
+        {
+            return refuse("unsandboxed names at most 64 commands, each words of at most 1 KiB");
+        }
         if self.writable.len() > 64
             || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
         {
@@ -386,7 +410,7 @@ impl Settings {
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
-            "hide_senders":self.hide_senders})
+            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -453,6 +477,21 @@ impl Bot {
             self.settings.sandbox,
             Some(Mode::ReadOnly | Mode::WorkspaceWrite)
         )
+    }
+    /// Whether this call is a command the bot's client lets run outside its
+    /// sandbox without asking: one the bot doesn't ask to escalate, which
+    /// runs nothing but its `unsandboxed` commands.
+    pub fn unsandboxed(&self, call: &ToolCall) -> bool {
+        if call.name != "shell" || self.settings.unsandboxed.is_empty() || !self.sandboxed() {
+            return false;
+        }
+        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
+            return false;
+        };
+        arguments["sandbox_permissions"] != "require_escalated"
+            && arguments["command"].as_str().is_some_and(|command| {
+                crate::sandbox::unsandboxed(&self.settings.unsandboxed, command)
+            })
     }
     /// Whether this call runs inside the bot's sandbox: the bot has one, the
     /// tool is one a sandbox holds, and the call doesn't ask to leave it.
@@ -541,8 +580,8 @@ pub struct Binding<'a> {
     /// client's; with no instructions the bot never compacts.
     pub compaction_instructions: Option<&'a str>,
     pub compaction_model: Option<&'a str>,
-    /// Anthropic server-side fallbacks for this bot.
-    pub fallbacks: bool,
+    /// The model that answers a request a classifier declined.
+    pub fallback: Option<&'a str>,
     /// The bot's own gate; its creator's, if any, is added by the store.
     pub gate: Option<&'a Gate>,
     pub settings: Settings,
@@ -713,6 +752,18 @@ pub struct Waiting {
     /// tried again, so the turn resumed before then does not wait on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_retry_ms: Option<u64>,
+    /// The fallback a declined request went to, so the call parked on its
+    /// pool resumes there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<ParkedFallback>,
+}
+/// A declined request's fallback model, as `provider/model`, and the credit
+/// its retry redeems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ParkedFallback {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
 }
 /// The call a summary copies: the elision floor its window was read under,
 /// the node that window starts at, the node it ends at when the copy had
@@ -1520,7 +1571,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 59;
+    pub const SCHEMA: i32 = 60;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1650,7 +1701,7 @@ impl Database {
                 compaction_instructions TEXT, compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
                 thinking_floor INTEGER NOT NULL DEFAULT 0,
-                fallbacks INTEGER NOT NULL DEFAULT 0,
+                fallback TEXT,
                 elision INTEGER REFERENCES elisions(node),
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
@@ -2066,7 +2117,7 @@ impl Database {
                 to: r.get(28)?,
             },
             thinking_elided: r.get(29)?,
-            fallbacks: r.get::<_, i64>(25)? != 0,
+            fallback: r.get(25)?,
             elision: r.get(26)?,
             gates: match r.get::<_, Option<String>>(30)? {
                 None => Vec::new(),
@@ -2125,7 +2176,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -2299,20 +2350,26 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
-    /// Replace a bot's sandbox: its mode, the folders it may write besides
-    /// its own and whether it reaches the network. A bot another bot made
+    /// Replace a bot's sandbox with `sandbox`'s: its mode, the folders it
+    /// may write besides its own, whether it reaches the network and the
+    /// commands that run outside it. A bot another bot made
     /// keeps no weaker a sandbox than its creator's, as when it was made.
     /// Whether anything changed.
     pub fn set_sandbox(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        sandbox: (Option<crate::sandbox::Mode>, Vec<String>, bool),
+        sandbox: Settings,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        let mut settings = bot.settings;
-        (settings.sandbox, settings.writable, settings.network) = sandbox;
+        let settings = Settings {
+            sandbox: sandbox.sandbox,
+            writable: sandbox.writable,
+            network: sandbox.network,
+            unsandboxed: sandbox.unsandboxed,
+            ..bot.settings
+        };
         let creator = match bot.created_by_id {
             Some(creator) => self
                 .conn
@@ -2327,9 +2384,10 @@ impl Database {
                 .transpose()?,
             None => None,
         };
-        if let Some(creator) = &creator {
-            settings = settings.under(creator);
-        }
+        let settings = match &creator {
+            Some(creator) => settings.under(creator),
+            None => settings,
+        };
         settings.validate()?;
         let stored = settings.stored()?;
         let changed = self.conn.execute(
@@ -2523,7 +2581,7 @@ impl Database {
             "provider":binding.provider,"model":binding.model,"effort":binding.effort,
             "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
-            "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings,
+            "fallback":binding.fallback,"gate":binding.gate,"settings":binding.settings,
             "declare":binding.declared}));
         if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
             if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
@@ -2559,7 +2617,7 @@ impl Database {
             None => binding.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2575,7 +2633,7 @@ impl Database {
                 created_by_id,
                 binding.compaction_instructions,
                 binding.compaction_model,
-                binding.fallbacks,
+                binding.fallback,
                 gates,
                 settings.stored()?,
                 creation(binding.request_id, request),
@@ -5895,6 +5953,7 @@ impl Database {
             answer: None,
             copied: None,
             summary_retry_ms,
+            fallback: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -6008,6 +6067,7 @@ impl Database {
             answer: Some(tag.clone()),
             copied: None,
             summary_retry_ms,
+            fallback: None,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -7050,6 +7110,7 @@ impl Database {
             answer: None,
             copied: None,
             summary_retry_ms,
+            fallback: None,
         };
         let tx = self.conn.savepoint()?;
         // A verdict for a later call of the round waits in the store.
@@ -7082,6 +7143,7 @@ impl Database {
         copied: Option<CopiedCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
+        fallback: Option<ParkedFallback>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -7104,6 +7166,7 @@ impl Database {
             answer: None,
             copied,
             summary_retry_ms,
+            fallback,
         };
         let tx = self.conn.savepoint()?;
         flush(&tx, turn, self.live.get(&turn))?;
@@ -7689,7 +7752,7 @@ impl Database {
             None => parent.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -7714,7 +7777,7 @@ impl Database {
                 // its own context against it.
                 thinking.0,
                 thinking.1.below,
-                parent.fallbacks,
+                parent.fallback,
                 thinking.1.from,
                 thinking.1.to,
                 thinking.2,
@@ -10269,6 +10332,19 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 58 -> 59: a Responses custom tool's call is answered in its own
         // kind of item. No custom tool was declared before.
         conn.execute_batch("ALTER TABLE tools ADD COLUMN custom INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='fallback')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 59 -> 60: a bot names the model a declined request falls back to,
+        // retried by the daemon, rather than asking Anthropic for its own
+        // fallback, which sticks to that model. No bot names one yet.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN fallback TEXT;
+             ALTER TABLE bots DROP COLUMN fallbacks;",
+        )?;
     }
     Ok(())
 }

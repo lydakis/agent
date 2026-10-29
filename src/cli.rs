@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
         startup: true,
     },
     Command {
@@ -388,9 +388,13 @@ fn print_flags(flags: &str) {
                 "",
                 "A new bot's model reads what other bots and clients send it with no line naming the sender",
             ),
-            "--fallbacks" => (
-                "",
-                "A new bot's declined Anthropic requests rerun on the recommended model",
+            "--unsandboxed" => (
+                "COMMAND",
+                "A command, by its first words, a sandboxed bot runs outside its sandbox without asking; repeat for more",
+            ),
+            "--fallback" => (
+                "PROVIDER/MODEL",
+                "A new bot's model for a request a safety classifier declined, that request alone; default none",
             ),
             "--grace" => (
                 "DURATION",
@@ -564,7 +568,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             return fail_with("usage", format!("{} does not accept {flag}", c.name));
         }
         if flags.iter().any(|f| f == flag)
-            && !matches!(flag, "--provider" | "--image" | "--writable")
+            && !matches!(
+                flag,
+                "--provider" | "--image" | "--writable" | "--unsandboxed"
+            )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
         }
@@ -583,7 +590,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--newest"
                 | "--no-compaction"
                 | "--agents"
-                | "--fallbacks"
                 | "--network"
                 | "--hide-senders"
                 | "--discover"
@@ -710,11 +716,12 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--agents",
             "--profile",
             "--budget-tokens",
-            "--fallbacks",
+            "--fallback",
             "--sandbox",
             "--writable",
             "--network",
             "--hide-senders",
+            "--unsandboxed",
             "--approval",
             "--approve",
         ]

@@ -3,8 +3,8 @@
 //! thread. A thread in a folder is that folder's lead, as `sonny` there
 //! finds or makes it, set up the same way: its rules and skills, its tools,
 //! its approval mode, and the lookout. Each task the lead starts opens as a
-//! thread of its own, through T3 Code's tools, and that thread is the
-//! task's.
+//! thread through T3 Code's tools, the lead thread's child while the
+//! person's prompt runs, and that thread is the task's.
 //!
 //! It speaks the protocol's version 2 draft as T3 Code does: the turns a
 //! bot takes on its own, as when the lookout wakes a lead because a task
@@ -29,14 +29,20 @@ const VERSION: i64 = 2;
 /// The most of a call's output a thread is shown.
 const OUTPUT_BYTES: usize = 8 * 1024;
 
+/// The longest the person's prompt waits for its tasks' threads to open.
+const OPENING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The longest a thread's start waits for the providers to list models.
+const LISTING: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// JSON-RPC's codes for what Sonny refuses.
 const INVALID_PARAMS: i64 = -32602;
 const NOT_FOUND: i64 = -32601;
 const FAILED: i64 = -32603;
 
-/// The model picker's first choice: the model the thread's bot runs, or
-/// the one Sonny gives a new lead.
-const DEFAULT_MODEL: &str = "default";
+/// The model and effort pickers' first choice: what the thread's bot
+/// runs, or what Sonny gives a new lead.
+const DEFAULT: &str = "default";
 
 /// `sonny acp [--store PATH] [--socket PATH]`.
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -78,6 +84,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         t3,
         sessions: Mutex::new(HashMap::new()),
         ready: OnceCell::new(),
+        offer: Mutex::new(Offer::default()),
         version: AtomicI64::new(VERSION),
     });
     tokio::runtime::Builder::new_multi_thread()
@@ -146,8 +153,12 @@ struct Agent {
     options: crate::Options,
     t3: Option<t3::T3>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// The daemon, reached once, with Sonny's skills installed first.
-    ready: OnceCell<Result<(), String>>,
+    /// The daemon, reached once, with Sonny's skills installed first. A
+    /// failure is not kept: the next thread tries again, so a daemon
+    /// restarted under a running T3 is reached without restarting T3.
+    ready: OnceCell<()>,
+    /// The models the providers list, and the daemon's providers.
+    offer: Mutex<Offer>,
     /// The version the client asked for, when older.
     version: AtomicI64,
 }
@@ -260,49 +271,106 @@ impl Agent {
         self.version.load(Ordering::Relaxed) >= 2
     }
 
-    /// A thread's options: its model, picked from `~/.agent/models` as
-    /// `agent models` lists it, with Sonny's own choice first. A bot's
-    /// thread offers only its family's, since a bot changes model only
-    /// within it; `bound` is the model the bot runs and the daemon's
-    /// providers.
-    fn options(&self, value: &str, bound: Option<(&str, &Value)>) -> Value {
-        let listed = agent_client::models::path()
-            .and_then(|path| agent_client::models::read(&path).ok())
+    /// A thread's options: its model, picked from what the providers list
+    /// as `/model` lists it, with `~/.agent/models`' notes and the models
+    /// only it names, and its effort. Sonny's own choice is first in both.
+    /// A bot's thread offers only its family's models, since a bot changes
+    /// model only within it, and its family's efforts; `bound` is the
+    /// model the bot runs and the daemon's providers.
+    fn options(&self, model: &str, effort: &str, bound: Option<(&str, &Value)>) -> Value {
+        let offer = self
+            .offer
+            .lock()
+            .map(|offer| offer.clone())
             .unwrap_or_default();
-        let mut choices = vec![json!({"value": DEFAULT_MODEL, "name": "Default",
+        let providers = bound.map_or(&offer.providers, |(_, providers)| providers);
+        let mut models = vec![json!({"value": DEFAULT, "name": "Default",
             "description": "The model the lead or task runs, or the one Sonny gives a new lead"})];
-        for model in listed {
-            if let Some((current, providers)) = bound
-                && family(providers, &model.id) != family(providers, current)
+        for (id, note) in offer.models {
+            if let Some((current, _)) = bound
+                && family(providers, &id) != family(providers, current)
             {
                 continue;
             }
-            let mut choice = json!({"value": model.id, "name": model.id});
-            if let Some(note) = model.note {
+            let mut choice = json!({"value": id, "name": id});
+            if let Some(note) = note {
                 choice["description"] = json!(note);
             }
-            choices.push(choice);
+            models.push(choice);
         }
-        if !choices.iter().any(|choice| choice["value"] == value) {
-            choices.push(json!({"value": value, "name": value}));
+        if !models.iter().any(|choice| choice["value"] == model) {
+            models.push(json!({"value": model, "name": model}));
         }
-        let mut option = json!({"name": "Model", "category": "model", "type": "select",
-            "currentValue": value, "options": choices});
-        option[if self.v2() { "configId" } else { "id" }] = json!("model");
-        json!([option])
+        // A bot's family's efforts; before there is one, the picked
+        // model's, or every family's.
+        let of = bound
+            .map(|(current, _)| current)
+            .or(Some(model).filter(|model| *model != DEFAULT));
+        let mut efforts = vec![json!({"value": DEFAULT, "name": "Default",
+            "description": "The effort the lead or task runs at, or the one Sonny gives a new lead"})];
+        for level in levels(providers, of) {
+            efforts.push(json!({"value": level, "name": level}));
+        }
+        if !efforts.iter().any(|choice| choice["value"] == effort) {
+            efforts.push(json!({"value": effort, "name": effort}));
+        }
+        // Both names: version 2's schema says `configId`, but T3 Code finds
+        // an option by `id` whatever the version.
+        json!([{"id": "model", "configId": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": model, "options": models},
+        {"id": "effort", "configId": "effort", "name": "Effort", "category": "thought_level",
+            "type": "select", "currentValue": effort, "options": efforts}])
+    }
+
+    /// What the providers list now, as `/model` asks them, with what
+    /// `~/.agent/models` says of them and the models only it names. A
+    /// listing that does not come in time leaves the file's.
+    async fn list(&self) {
+        let file = agent_client::models::path()
+            .and_then(|path| agent_client::models::read(&path).ok())
+            .unwrap_or_default();
+        let mut offer = Offer::default();
+        if let Ok((client, _events)) = Client::connect(&self.options.socket).await {
+            offer.providers = client.providers().clone();
+            let listing =
+                tokio::time::timeout(LISTING, client.request("provider_models", json!({}))).await;
+            if let Ok(Ok(listing)) = listing
+                && let Some(providers) = listing["providers"].as_object()
+            {
+                let mut names: Vec<&String> = providers.keys().collect();
+                names.sort();
+                for name in names {
+                    for model in providers[name]["models"].as_array().into_iter().flatten() {
+                        if let Some(id) = model["id"].as_str() {
+                            offer.models.push((format!("{name}/{id}"), None));
+                        }
+                    }
+                }
+            }
+            client.close().await;
+        }
+        for model in file {
+            match offer.models.iter_mut().find(|(id, _)| *id == model.id) {
+                Some((_, note)) => *note = model.note,
+                None => offer.models.push((model.id, model.note)),
+            }
+        }
+        if let Ok(mut kept) = self.offer.lock() {
+            *kept = offer;
+        }
     }
 
     /// The daemon, started as `sonny` starts it, with Sonny's skills
     /// installed before any lead is made, so its instructions list them.
     async fn ready(&self) -> Result<(), String> {
         self.ready
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 crate::skills::install_own();
                 crate::trigger::at_start();
                 crate::connect(&self.options).await.map(drop)
             })
             .await
-            .clone()
+            .map(drop)
     }
 
     /// A thread starts (`session/new`) or comes back (`session/resume`).
@@ -315,6 +383,7 @@ impl Agent {
             .filter(|cwd| cwd.is_absolute())
             .ok_or((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))?;
         self.ready().await.map_err(|e| (FAILED, e))?;
+        self.list().await;
         let id = match resumed {
             Some(id) => id.to_owned(),
             None => crate::unique("sonny"),
@@ -403,9 +472,15 @@ struct State {
     /// The last steer a running turn took in, and that turn: for a prompt
     /// whose steer went in before its turn was named.
     steered: Option<(i64, i64)>,
-    /// The model the person picked, which the bot takes when it is next
-    /// idle; a new lead starts on it.
+    /// The model and effort the person picked, which the bot takes when
+    /// it is next idle; a new lead starts on the model.
     picked: Option<String>,
+    effort: Option<String>,
+    /// Tasks whose threads are opening, as children of the person's prompt
+    /// while it runs, and the answers of the prompts whose turns ended
+    /// meanwhile, held until they are open.
+    opening: usize,
+    held: Vec<(Value, Value)>,
 }
 
 struct Bound {
@@ -421,6 +496,14 @@ struct Bound {
     effort: Option<String>,
 }
 
+/// What a thread may pick from: `provider/model` with its note, and the
+/// daemon's providers, whose families and efforts they are.
+#[derive(Clone, Default)]
+struct Offer {
+    models: Vec<(String, Option<String>)>,
+    providers: Value,
+}
+
 impl Session {
     /// Make this thread `bot`'s, or its folder's lead's, and follow it.
     /// `claimed`: a task that waited for this thread, whose first turn
@@ -434,18 +517,22 @@ impl Session {
         let (client, mut events) = Client::connect(&agent.options.socket)
             .await
             .map_err(|e| e.to_string())?;
-        let (bot, project, moving) = match bot {
+        // A pick made before the thread had a bot is for a lead Sonny
+        // makes: T3 Code puts its last pick to every thread it opens, and
+        // the folder's lead that is there already, every other thread's
+        // too, keeps its own.
+        let (bot, project, moving, made) = match bot {
             Some(bot) => {
                 let project = bot.strip_suffix(".lead").map(str::to_owned);
                 services(agent, &client, &bot, project.as_deref()).await?;
-                (bot, project, None)
+                (bot, project, None, false)
             }
             None => {
                 let picked = self.state.lock().await.picked.clone();
                 let lead = project::open(&client, &self.cwd, picked.as_deref()).await?;
                 let moving = lead.moving.as_ref().map(|dir| dir.display().to_string());
                 setup_lead(agent, &self.id, &client, &lead, moving.as_deref()).await?;
-                (lead.bot, Some(lead.project), moving)
+                (lead.bot, Some(lead.project), moving, lead.new)
             }
         };
         client
@@ -498,8 +585,11 @@ impl Session {
             state.cursor = cursor;
             // A task keeps the model its lead gave it, whatever T3 Code
             // picked for the thread it opened.
-            if claimed || state.picked.as_ref() == Some(&model) {
+            if !made || state.picked.as_ref() == Some(&model) {
                 state.picked = None;
+            }
+            if !made || state.effort == effort {
+                state.effort = None;
             }
             state.bound = Some(Bound {
                 bot,
@@ -543,11 +633,15 @@ impl Session {
     async fn options(&self, agent: &Agent) -> Value {
         let state = self.state.lock().await;
         let bound = state.bound.as_ref();
-        let value = (state.picked.as_deref())
+        let model = (state.picked.as_deref())
             .or(bound.map(|bound| bound.model.as_str()))
-            .unwrap_or(DEFAULT_MODEL);
+            .unwrap_or(DEFAULT);
+        let effort = (state.effort.as_deref())
+            .or(bound.and_then(|bound| bound.effort.as_deref()))
+            .unwrap_or(DEFAULT);
         agent.options(
-            value,
+            model,
+            effort,
             bound.map(|bound| (bound.model.as_str(), bound.client.providers())),
         )
     }
@@ -560,24 +654,35 @@ impl Session {
         );
     }
 
-    /// The person picks a model. A bot's thread takes one of its family
-    /// only, at once when the bot is idle and with its next turn when it
-    /// is not; a thread that is no bot yet keeps it for the lead it makes.
+    /// The person picks a model or an effort. A bot's thread takes a
+    /// model of its family only, at once when the bot is idle and with its
+    /// next turn when it is not; a thread that is no bot yet keeps it for
+    /// the lead it makes.
     async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
-        if params["configId"] != "model" {
-            return Err((
-                INVALID_PARAMS,
-                format!("Sonny has no option {}", params["configId"]),
-            ));
-        }
+        let option = params.get("configId").unwrap_or(&params["id"]);
         let Some(value) = params["value"].as_str() else {
-            return Err((INVALID_PARAMS, "a model is picked by its id".into()));
+            return Err((INVALID_PARAMS, "an option is picked by its value".into()));
         };
         let _one = self.switching.lock().await;
-        {
+        if option == "effort" {
+            let mut state = self.state.lock().await;
+            state.effort = match &state.bound {
+                Some(bound) if value != DEFAULT && Some(value) != bound.effort.as_deref() => {
+                    let of = state.picked.as_deref().unwrap_or(&bound.model);
+                    if !levels(bound.client.providers(), Some(of)).contains(&value) {
+                        return Err((INVALID_PARAMS, format!("{of} has no effort {value}")));
+                    }
+                    Some(value.to_owned())
+                }
+                Some(_) => None,
+                None => (value != DEFAULT).then(|| value.to_owned()),
+            };
+        } else if option != "model" {
+            return Err((INVALID_PARAMS, format!("Sonny has no option {option}")));
+        } else {
             let mut state = self.state.lock().await;
             let picked = match &state.bound {
-                Some(bound) if value != DEFAULT_MODEL && value != bound.model => {
+                Some(bound) if value != DEFAULT && value != bound.model => {
                     let providers = bound.client.providers();
                     let wanted = family(providers, value);
                     if wanted.is_null() {
@@ -595,7 +700,7 @@ impl Session {
                     Some(value.to_owned())
                 }
                 Some(_) => None,
-                None => (value != DEFAULT_MODEL).then(|| value.to_owned()),
+                None => (value != DEFAULT).then(|| value.to_owned()),
             };
             state.picked = picked;
         }
@@ -630,12 +735,15 @@ impl Session {
             record["provider"].as_str().unwrap_or(""),
             record["model"].as_str().unwrap_or("")
         );
+        let effort = record["effort"].as_str().map(str::to_owned);
         let changed = {
             let mut state = self.state.lock().await;
             match &mut state.bound {
-                Some(bound) if bound.bot == bot && bound.model != model => {
+                Some(bound)
+                    if bound.bot == bot && (bound.model != model || bound.effort != effort) =>
+                {
                     bound.model = model;
-                    bound.effort = record["effort"].as_str().map(str::to_owned);
+                    bound.effort = effort;
                     true
                 }
                 _ => false,
@@ -646,25 +754,31 @@ impl Session {
         }
     }
 
-    /// Give an idle bot the model the person picked. The caller holds
-    /// `switching`.
+    /// Give an idle bot the model and effort the person picked. The
+    /// caller holds `switching`.
     async fn switch(&self, agent: &Agent) -> Result<(), String> {
-        let (client, asked, model) = {
+        let (client, asked, model, effort) = {
             let state = self.state.lock().await;
-            let (Some(bound), Some(model), None) = (&state.bound, &state.picked, state.running)
-            else {
+            let (Some(bound), None) = (&state.bound, state.running) else {
                 return Ok(());
             };
-            let asked = json!({"bot": bound.bot, "model": model, "effort": bound.effort});
-            (bound.client.clone(), asked, model.clone())
+            if state.picked.is_none() && state.effort.is_none() {
+                return Ok(());
+            }
+            let model = state.picked.clone().unwrap_or_else(|| bound.model.clone());
+            let effort = state.effort.clone().or_else(|| bound.effort.clone());
+            let asked = json!({"bot": bound.bot, "model": model, "effort": effort});
+            (bound.client.clone(), asked, model, effort)
         };
         let answer = client.request("configure", asked).await;
         let mut state = self.state.lock().await;
         match answer {
             Ok(_) => {
                 state.picked = None;
+                state.effort = None;
                 if let Some(bound) = &mut state.bound {
                     bound.model = model;
+                    bound.effort = effort;
                 }
                 drop(state);
                 self.show_options(agent).await;
@@ -674,6 +788,7 @@ impl Session {
             Err(error) if error.code == "bot_busy" => Ok(()),
             Err(error) => {
                 state.picked = None;
+                state.effort = None;
                 drop(state);
                 self.show_options(agent).await;
                 Err(error.to_string())
@@ -683,6 +798,9 @@ impl Session {
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
         let (text, images) = words(&params["prompt"]);
+        if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
+            return Ok(json!({"stopReason": "end_turn"}));
+        }
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;
@@ -725,8 +843,8 @@ impl Session {
                 return Ok(Value::Null);
             }
         }
-        // A model picked while the bot worked, or before a lead that was
-        // there already: the bot takes it before this turn.
+        // A model or effort picked while the bot worked: the bot takes it
+        // before this turn.
         self.settle(agent).await;
         let mut state = self.state.lock().await;
         if std::mem::take(&mut state.cancelled) {
@@ -1088,13 +1206,35 @@ impl Session {
                         .as_ref()
                         .map(|b| b.workspace.clone())
                         .unwrap_or_default();
-                    let (agent, session) = (agent.clone(), self.id.clone());
-                    tokio::spawn(async move {
-                        open_task(
-                            &agent, &session, &client, &project, &arguments, &workspace, &call,
-                        )
-                        .await
-                    });
+                    let this = (agent.sessions.lock().ok())
+                        .and_then(|sessions| sessions.get(&self.id).cloned());
+                    if let Some(session) = this {
+                        state.opening += 1;
+                        let session_id = session.id.clone();
+                        let agent = agent.clone();
+                        tokio::spawn(async move {
+                            let (opener, thread) = (agent.clone(), session.cwd.clone());
+                            let opening = tokio::spawn(async move {
+                                let at = Where {
+                                    project: &project,
+                                    workspace: &workspace,
+                                    thread: &thread,
+                                };
+                                let session = &session_id;
+                                open_task(&opener, session, &client, &at, &arguments, &call).await;
+                            });
+                            // The person's prompt waits for its tasks' threads,
+                            // not for ever: one still opening opens on its own.
+                            let _ = tokio::time::timeout(OPENING, opening).await;
+                            let mut state = session.state.lock().await;
+                            state.opening -= 1;
+                            if state.opening == 0 {
+                                for (prompt, result) in std::mem::take(&mut state.held) {
+                                    agent.out.answer(&prompt, result);
+                                }
+                            }
+                        });
+                    }
                 }
             }
             "approval_requested" | "approval_asked" => {
@@ -1144,7 +1284,13 @@ impl Session {
                         result["error"] = json!({"code": FAILED,
                             "message": data["error"].as_str().unwrap_or("the turn failed")});
                     }
-                    out.answer(&prompt, result);
+                    // A task T3 Code opens as a child of this prompt opens
+                    // while its run is on.
+                    if state.opening > 0 {
+                        state.held.push((prompt, result));
+                    } else {
+                        out.answer(&prompt, result);
+                    }
                 }
             }
             "deleted" => {
@@ -1375,10 +1521,7 @@ async fn setup_lead(
     let mut gating = lead.new.then_some(approvals::MODES[0].0);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(
-            &record,
-            &approvals::sandbox(mode, true, Path::new(&workspace)),
-        )
+        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
     {
         gating = Some(mode);
     }
@@ -1396,7 +1539,7 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.extend(approvals::sandbox(mode, true, Path::new(&workspace)));
+        fields.extend(approvals::sandbox(mode, Path::new(&workspace)));
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {
@@ -1430,18 +1573,28 @@ async fn setup_lead(
     Ok(())
 }
 
+/// Where a lead's thread is: its project, the lead's workspace, and the
+/// folder T3 Code opened the thread in.
+struct Where<'a> {
+    project: &'a str,
+    workspace: &'a str,
+    thread: &'a Path,
+}
+
 /// Open the task a lead's `start_task` call started as a thread of its
 /// own, with the task's brief as its first message; the thread is the
-/// task's when that message reaches it. The lead's call says where.
+/// task's when that message reaches it. While the person's prompt runs it
+/// is the lead thread's child, which T3 Code opens in the lead's folder;
+/// otherwise a thread of its own, where the lead's call says.
 async fn open_task(
     agent: &Agent,
     session: &str,
     client: &Client,
-    project: &str,
+    at: &Where<'_>,
     arguments: &Value,
-    lead_workspace: &str,
     call: &str,
 ) {
+    let (project, lead_workspace) = (at.project, at.workspace);
     let Some(t3) = &agent.t3 else { return };
     let Some(name) = arguments["name"].as_str() else {
         return;
@@ -1472,6 +1625,17 @@ async fn open_task(
             .ok_or("the task has no brief")?
             .to_owned();
         let workspace = record["workspace"].as_str().unwrap_or_default();
+        let message = t3::expect(&bot, &brief, at.thread)?;
+        let child = json!({"task": message, "title": name, "clientRequestId": bot});
+        // The person's prompt waits for it: not for ever. One that is late
+        // may open yet, so its task still waits for it and no other thread
+        // is opened for it.
+        let delegating = t3.call("delegate_task", child);
+        match tokio::time::timeout(OPENING, delegating).await {
+            Ok(Ok(delegated)) => return Ok(delegated),
+            Ok(Err(_)) => {}
+            Err(_) => return Ok(Value::Null),
+        }
         let message = t3::expect(&bot, &brief, Path::new(workspace))?;
         let mut launch = json!({"title": name, "message": message, "clientRequestId": bot});
         if workspace != lead_workspace {
@@ -1594,7 +1758,6 @@ fn text_content(text: &str) -> Value {
     json!({"type": "content", "content": {"type": "text", "text": text}})
 }
 
-/// At most `OUTPUT_BYTES` of a call's output, on a character boundary.
 /// The family a `provider/model` belongs to, as the daemon's providers
 /// say: null for a provider it does not serve.
 fn family<'a>(providers: &'a Value, model: &str) -> &'a Value {
@@ -1604,6 +1767,31 @@ fn family<'a>(providers: &'a Value, model: &str) -> &'a Value {
     &providers[provider]["family"]
 }
 
+/// The efforts `model`'s provider takes, as the daemon's providers say;
+/// with no model, every provider's.
+fn levels<'a>(providers: &'a Value, model: Option<&str>) -> Vec<&'a str> {
+    let named = model.map(|model| {
+        model
+            .split_once('/')
+            .map_or(model, |(provider, _)| provider)
+    });
+    let mut levels = Vec::new();
+    for (name, binding) in providers.as_object().into_iter().flatten() {
+        if named.is_some_and(|named| named != name) {
+            continue;
+        }
+        for level in binding["efforts"].as_array().into_iter().flatten() {
+            if let Some(level) = level.as_str()
+                && !levels.contains(&level)
+            {
+                levels.push(level);
+            }
+        }
+    }
+    levels
+}
+
+/// At most `OUTPUT_BYTES` of a call's output, on a character boundary.
 fn cut(text: &str) -> String {
     if text.len() <= OUTPUT_BYTES {
         return text.to_owned();

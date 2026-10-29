@@ -271,7 +271,7 @@ a process budget of two, because waiters hold nothing.
 ## Accounting and budgets
 
 Provider-reported usage records a durable `usage` event (with a per-model
-`models` split when a provider-side fallback ran another model and on every
+`models` split when a fallback ran another model and on every
 summarizer call, naming the summarizer's provider and model, and
 `cache_write_tokens` when Anthropic wrote input to its prompt cache: part of
 `input_tokens`, billed above the base rate, and kept only in the event since
@@ -413,6 +413,7 @@ keep-warm when it sets any of them.
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
+| `unsandboxed` (`--unsandboxed`, repeatable) | Commands a sandboxed bot runs outside its sandbox without asking, each by its first words, such as `mcpx` or `docker compose` (see [sandbox](#sandbox)). At most 64, each at most 1 KiB. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -720,7 +721,7 @@ Nothing else in the request differs, since the cache is keyed on everything it
 renders. A refresh is paced and admitted like a call, but gives up waiting
 for its pool and startup admission once the cache it would refresh has
 expired, and after 30 seconds in any case. Usage is read per attempt, as for
-a call, when a server-side fallback served it. A refused
+a call. A refused
 refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
 until the next model call, which pays the write it would have paid anyway.
 
@@ -750,45 +751,52 @@ between turns may never be called again. The Responses cache needs none: the
 ChatGPT backend still read 7.4k of 7.7k tokens after a 20-minute gap, and it
 refuses `prompt_cache_retention: "24h"` with a 400.
 
-A bot created with `--fallbacks` (`create.fallbacks`, inherited by its forks)
-opts its Anthropic requests into server-side fallbacks
-(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header);
-other bots send neither, and a declined request ends their turn with
-`provider_refusal` as before. It is a bot's choice because a fallback answers
-with a model the caller did not pick and bills at that model's rate. The
-Harbor adapter asks for it, since a benchmark task is better finished on the
-recommended model than failed.
+A bot created with `--fallback PROVIDER/MODEL` (`create.fallback`, a known
+provider's model in the bot's family, inherited by its forks) sends a request
+a safety classifier declined (`stop_reason: "refusal"`) to that model, on the
+same body, and only that request: the next goes to the bot's own model again,
+with the fallback's answer in its history. Other bots end the turn with
+`provider_refusal` as before, and so does a refusal the fallback repeats. It
+is a bot's choice because a fallback answers with a model the caller did not
+pick and bills at that model's rate. A client may name one for each model:
+the CLI and Sonny give a new bot that names none the person's entry for its
+model from `[fallbacks]` in `~/.agent/config.toml`.
+
+The retry is published as a `retry` event with the refusal as its error and
+`fallback` naming the model, and the answer as a non-durable `model_fallback`
+event with `from` and `to`; its `usage` event names the fallback's provider
+and model in `models`, so it is priced at that model's rates. On the Claude
+API, when the fallback is on the bot's own provider, the retry redeems the
+refusal's `stop_details.fallback_credit_token` (the
+`fallback-credit-2026-07-01` beta), so the fallback's cache writes are priced
+as if it had run there all along; a 400 to the credit sends the same retry
+without it. Bedrock requests send no credit: the beta is documented there, but
+Mantle answered a beta it did not take with a 400
+([BEDROCK.md](BEDROCK.md)), and this one has not been tried there.
+
+Anthropic's server-side fallback (`fallbacks: "default"`) is not asked for:
+its sticky routing sends the same conversation to the fallback model for about
+an hour, where this one goes back to the bot's model at once. Its
+`server-side-fallback-2026-07-01` beta is still sent on the Claude API, so a
+history that holds an answer it served replays: a `fallback` content block
+marks each switch. Blocks before the last one are a declined attempt's partial
+output: its non-empty text is kept as part of the answer, while its thinking
+and tool calls are neither stored, replayed, nor run. The marker is stored in
+place, since the API checks the thinking around it by its position, and the
+response's per-attempt `usage.iterations`, when present, replace its top-level
+usage.
+
 The protocol described here is from Anthropic's documentation, read
-2026-09-25: [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)
-for the stream, the `usage.iterations` entries, billing and the replay rules,
-and Anthropic's model migration guide (the Claude Opus 5 and Claude Fable 5.1
-sections) for the `"default"` form and its beta header. Only model acceptance
-of the field was observed live; the fallback stream itself is exercised against
-a synthetic endpoint built from that description. With it, a request a safety
-classifier declines is rerun, on the same stream, on the
-model Anthropic recommends for that refusal category instead of ending the turn
-with `provider_refusal`. A `fallback` content block marks each switch. Blocks
-before the last one are a declined attempt's partial output: its non-empty text
-is kept as part of the answer, while its thinking and tool calls are neither
-stored, replayed, nor run. The marker is stored in place, since the API checks
-the thinking around it by its position. Each switch is published as a
-non-durable `model_fallback` event with `from` and `to`. When the response's
-per-attempt `usage.iterations` list is present it replaces the top-level usage,
-which covers only the last attempt: an attempt declined before any output is
-reported but not billed, so it is not counted, and every other attempt is
-billed at the rates of the model that ran it. The `usage` event then carries a
-`models` list with each billed attempt, including a turn that sticky routing
-(about an hour after a fallback) sent straight to the fallback model, so
-clients can price them per model; its totals are their sum. A refusal that
-survives the fallbacks still fails the turn with `provider_refusal`, with the
-models it switched to, the refusal category and any recommended retry model as
-its detail. Bedrock,
-Vertex and Foundry do not offer server-side fallback, so Bedrock requests send
-neither the field nor its beta header. Observed 2026-09-24:
-`claude-sonnet-5`, `claude-haiku-4-5` and `claude-sonnet-4-5` accept the field,
-and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
-with it set; a live refusal was not reproduced, so the fallback path is covered
-by parser and synthetic-endpoint tests.
+2026-10-29: [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)
+and [Handle streaming refusals](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/handle-streaming-refusals),
+which lists Bedrock. A refusal may follow partial output, which is discarded;
+its `stop_details` names a `category` (kept in the error's detail and facts)
+and may name a recommended model and a credit. The fallback's thinking blocks
+are dropped by the API when the bot's model reads them back
+(`input_transformations` reason `model_binding_mismatch`), which is not
+counted as a binding drop; only `prefix_binding_mismatch` is. A live refusal
+was not reproduced, so the fallback path is covered by parser and
+synthetic-endpoint tests.
 
 `effort` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
@@ -1187,9 +1195,9 @@ since its history is kept in that family's encoding
 `approve: []` alone removes them, including the gates a bot took from the
 bot that made it: whoever configures a bot decides, as a person overriding
 one does, and bots it already made keep theirs. The gate is checked before
-anything is written. `sandbox`, with `writable` and `network` (as `create`'s
-settings name them), replaces the bot's sandbox, and the two left out go back
-to none and off; a bot another bot made keeps no weaker a sandbox than its
+anything is written. `sandbox`, with `writable`, `network` and `unsandboxed`
+(as `create`'s settings name them), replaces the bot's sandbox, and those left
+out go back to none, off and none; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
 bot's prompt-cache lifetime from its next model call. It answers `{bot, bot_id, changed}`, `changed` naming the fields
@@ -2248,10 +2256,27 @@ a policy that never asks, a command asking to escalate is refused with
 from its arguments and the folders' names alone, so the round that announces
 it and the run that starts it agree.
 
+A command its client trusts runs outside the sandbox without asking, as a
+Codex rule that allows a command prefix runs it: a shell call that doesn't
+ask to escalate, whose script runs nothing but commands that begin with the
+words of one of the bot's `unsandboxed` entries. So a tool with a daemon of
+its own, such as mcpx, which keeps its lock and socket under
+`~/.local/state` and starts its daemon on first use, works from a sandboxed
+bot once it is named: started in a sandbox, the daemon would keep the
+sandbox's limits, and on Linux die with the command. Only a plain script is
+read, as Codex reads one: words, quoted or not, in commands joined by `&&`,
+`||`, `;`, `|` or a newline. A script with anything that could run something
+else (`$`, a backquote, a redirection, parentheses, `&` alone, a comment)
+runs in the sandbox, and so does one with any other command in it, such as
+`mcpx … | jq`; it can still ask to escalate. The command is found on the
+daemon's `PATH`, so an `unsandboxed` command is only as trusted as the
+folders there.
+
 A bot that a sandboxed bot makes (its `created_by`), or forks, takes the
 creator's sandbox and `writable` folders unless it names a stricter sandbox,
 and reaches the network only if both do, as Codex's subagents inherit their
-parent's sandbox.
+parent's sandbox. It runs outside the sandbox only commands its creator
+does.
 
 On Linux, bubblewrap makes an empty folder on the host to mount a missing
 `.git` read-only over; the daemon removes it once no running sandbox holds
@@ -2762,9 +2787,7 @@ rounds (a copy and a request of its own) and, under a budget, the most
 those two may bill: each sending at most the view, the tools and both
 instructions at a token to a byte, and generating at most the summarizer's
 output bound; with no known output bound (a Responses provider without
-`max_output_tokens`), or with server-side fallbacks on, which may bill any
-number of attempts per request, a budgeted bot's summary does not run
-beside. A summary beside the call that an interrupt cancels still adds its
+`max_output_tokens`), a budgeted bot's summary does not run beside. A summary beside the call that an interrupt cancels still adds its
 retries and pacing to the turn's. A refresh does not keep warm the view of
 a call whose summary has written its replacement.
 Otherwise, and at a turn's start or as a parked turn resumes, when the

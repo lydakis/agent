@@ -429,4 +429,7 @@ the 10 focused hub tests, Clippy, formatting, and diff checks also passed.
 - Tool approval at fleet scale on macOS.
 - How often either judge allows a risky call: the labeled set holds only
   calls that should run, so it measures false denials, not false allows.
-- Multi-daemon operation and concurrent tool calls: designs only.
+- Multi-daemon operation: a design only.
+- What running tool calls together (#291, up to four at a time) saves on
+  real tasks: it is implemented, and one test shows two 0.6 s commands
+  finishing in under 1.1 s, but no run has measured it on a fleet.

@@ -1,6 +1,7 @@
-//! What the person set in Sonny, kept for every folder it opens:
-//! `~/.agent/sonny/settings.json`. A missing or unreadable file is the
-//! defaults.
+//! What the person set in Sonny, kept for every folder it opens: the chime
+//! and the view in `~/.agent/config.toml`'s `[sonny]`, as `/config` shows
+//! them, and the screen in `~/.agent/sonny/settings.json`. A missing or
+//! unreadable file is the defaults.
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -19,9 +20,10 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        let sonny = agent_client::config::Sonny::default();
         Settings {
-            chime: true,
-            verbose: false,
+            chime: sonny.chime,
+            verbose: sonny.verbose,
             fullscreen: true,
         }
     }
@@ -34,31 +36,47 @@ fn path() -> Option<PathBuf> {
 impl Settings {
     pub fn load() -> Self {
         let text = path().and_then(|path| std::fs::read_to_string(path).ok());
-        text.and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .map(|saved| Self::from(&saved))
-            .unwrap_or_default()
+        let saved = text.and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let sonny = agent_client::config::load().map(|config| config.sonny);
+        Self::from(&saved.unwrap_or_default(), sonny.unwrap_or_default())
     }
 
-    fn from(saved: &Value) -> Self {
+    fn from(saved: &Value, sonny: agent_client::config::Sonny) -> Self {
         let defaults = Settings::default();
         Settings {
-            chime: saved["chime"].as_bool().unwrap_or(defaults.chime),
-            verbose: saved["verbose"].as_bool().unwrap_or(defaults.verbose),
+            chime: sonny.chime,
+            verbose: sonny.verbose,
             fullscreen: (saved["fullscreen"].as_bool()).unwrap_or(defaults.fullscreen),
         }
     }
 
+    /// The chime and the view into the config, where one changed: its
+    /// default as no line at all. The screen beside.
     pub fn save(&self) -> Result<(), String> {
+        let was = Self::load();
+        let defaults = Settings::default();
+        let mut pairs = Vec::new();
+        for (key, now, then, default) in [
+            ("sonny.chime", self.chime, was.chime, defaults.chime),
+            ("sonny.verbose", self.verbose, was.verbose, defaults.verbose),
+        ] {
+            if now != then {
+                pairs.push((key, (now != default).then(|| now.into())));
+            }
+        }
+        if !pairs.is_empty() {
+            let config = agent_client::config::path().ok_or("HOME is not set")?;
+            agent_client::config::write(&config, &pairs)?;
+        }
+        if self.fullscreen == was.fullscreen {
+            return Ok(());
+        }
         let path = path().ok_or("HOME is not set")?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let text = serde_json::to_string_pretty(&json!({
-            "chime": self.chime,
-            "verbose": self.verbose,
-            "fullscreen": self.fullscreen,
-        }))
-        .map_err(|e| e.to_string())?;
+        let text = serde_json::to_string_pretty(&json!({"fullscreen": self.fullscreen}))
+            .map_err(|e| e.to_string())?;
         std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
     }
 }
@@ -69,11 +87,16 @@ mod tests {
 
     #[test]
     fn what_is_not_saved_keeps_its_default() {
-        assert_eq!(Settings::from(&json!({})), Settings::default());
-        assert!(!Settings::from(&json!({"chime": false})).chime);
-        assert!(Settings::from(&json!({"chime": "no"})).chime);
-        assert!(Settings::from(&json!({"verbose": true})).verbose);
-        assert!(!Settings::from(&json!({"verbose": "yes"})).verbose);
-        assert!(!Settings::from(&json!({"fullscreen": false})).fullscreen);
+        let sonny = agent_client::config::Sonny::default;
+        assert_eq!(Settings::from(&json!({}), sonny()), Settings::default());
+        assert!(!Settings::from(&json!({"fullscreen": false}), sonny()).fullscreen);
+        assert!(Settings::from(&json!({"fullscreen": "no"}), sonny()).fullscreen);
+        let quiet = agent_client::config::Sonny {
+            chime: false,
+            verbose: true,
+            ..sonny()
+        };
+        let settings = Settings::from(&json!({}), quiet);
+        assert!(!settings.chime && settings.verbose);
     }
 }

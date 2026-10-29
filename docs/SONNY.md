@@ -327,20 +327,20 @@ or with `goal`.
 
 Memory is what earlier agents learned that a later one needs: decisions,
 the person's preferences and corrections, traps, pointers. Each fact is one
-Markdown file of at most 4 KiB with front matter (`name`, `description`,
+Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
-`verified`). The person's facts are in `~/.agents/memory`, a project's in
+`verified`, and `external` when it is so). The person's facts are in `~/.agents/memory`, a project's in
 `~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
 task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
 it). Each folder's `MEMORY.md` is an index generated from the front matter,
-one line per fact, and is held to 4 KiB so reading it at the start of
+one line per fact, and is held to 16 KiB so reading it at the start of
 every task stays cheap. The daemon knows nothing of memory.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 lookout answers outside the agent's sandbox, so a sandboxed agent still
-saves to `~/.agents/memory`: `save {name, type, description, source,
-text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
+saves to `~/.agents/memory`: `read` NAME, `save {name, type,
+description, source, text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
 or `project`, or nothing to show both indexes. It waits for no verdict.
 For people, scripts and other harnesses, Sonny writes `~/.agent/memory`
 each time it starts, a script that runs it as
@@ -348,10 +348,12 @@ each time it starts, a script that runs it as
 
 ```sh
 ~/.agent/memory show [SCOPE]
-~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
+~/.agent/memory read NAME [SCOPE]
+~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
 ~/.agent/memory check [SCOPE]
+~/.agent/memory said [SINCE_MS]
 ~/.agent/memory changed | cleanup start | cleanup finish
 ~/.agent/memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
   SCOPE: --user | --project NAME; none: the project of this folder
@@ -368,13 +370,51 @@ absolute path, the project null outside one, so an agent need not expand
 index under the folder's lock, so two agents saving at once cannot leave
 an index that misses one. Saving a fact unchanged is `"duplicate": true`,
 and so is removing one already gone. A save that would push the index past
-4 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
+16 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
 file that is not a valid fact (`memory_invalid` names it), rather than an
 index that quietly leaves it out. `check` reports such a file and an index
 that is out of date without changing anything; `index` rewrites the index,
-and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
+and refuses with `memory_full` an index of hand-added facts past 16 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
-past 4 KiB is `fact_too_large` rather than cut.
+past 16 KiB is `fact_too_large` rather than cut.
+
+A save the memory tool answers in a turn that had already read outside
+content, a provider's web search or fetch, `web_fetch`, or an MCP server
+through `exec`, is marked `external: true` in its front matter and
+`, external` in its index line, as Codex leaves out of memory the sessions
+that used MCP or web search and OpenClaw's dreaming drops untrusted
+sources. Sonny reads the whole turn so far, whichever provider stored its
+calls; a turn whose history, or an item of it, it cannot read counts as
+having read. The tool's `save` takes `external` and the script
+`--external` for the same. Agents treat such a fact as a lead to check,
+and the cleanup removes one that reads as an instruction to agents and
+keeps the mark on one it merges or re-dates. Saving the fact again
+without it, say on the person's word, clears the mark.
+
+The cleanup also reads what the person wrote to any agent since the last
+finished cleanup started (`finish` keeps that time in `.said`, out of git,
+and `cleanup start` gives it as `since_ms`, null the first night, when it
+looks back a day; a refused cleanup leaves it, so its night is read again): the memory tool's `said` with
+`since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
+daemon: every message in a turn that ran since then that carries no other
+agent's or named client's mark, steers included, newest first and at most
+56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
+that turn ran in. It saves what no
+agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
+the day's notes, taking only the person's own words and their scope, as
+Codex's extraction does. The trigger still wakes it only when memory
+changed; words from a quiet night are read the next time it runs.
+
+`read` gives one fact's whole file as `text` and records the read in the
+folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
+in the cleanup's git history, so a read changes no index, no cached prompt
+and no night's `changed`. Removing a fact drops its record. `cleanup start`
+lists as `unread` the facts no agent has read or saved in 30 days, oldest
+first, each with its `last_read` and `verified`, and the cleanup checks
+that they still hold, as Codex drops memories unused for 30 days and
+Copilot those unused for 28; unread alone removes nothing. Reads with the
+`read` tool are not counted, which is why the memory skill opens facts with
+the memory tool.
 
 A new agent starts with both indexes in its instructions: the person's
 and, when its folder is in a project (from a task's worktree too), the

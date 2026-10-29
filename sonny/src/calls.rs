@@ -159,7 +159,6 @@ const SWITCHES: &[&str] = &[
     "--no-spawn",
     "--agents",
     "--no-compaction",
-    "--fallbacks",
     "--discover",
     "--all",
     "--any",
@@ -215,6 +214,8 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
             (verb.into(), what)
         }
         Some("rm") => ("Removed from memory".into(), name()),
+        Some("read") => ("Read from memory".into(), name()),
+        Some("said") => ("Read what the person wrote".into(), String::new()),
         Some(other) => (format!("Used memory {other}"), String::new()),
     };
     Said {
@@ -725,8 +726,12 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             })
         }
         crate::served::MEMORY => Some(
-            match (arguments["save"]["name"].as_str(), field("remove")) {
-                (Some(saved), _) => {
+            match (
+                arguments["save"]["name"].as_str(),
+                field("remove"),
+                field("read"),
+            ) {
+                (Some(saved), _, _) => {
                     let mut said = said("Saved to memory", saved.trim());
                     if let Some(description) = arguments["save"]["description"].as_str() {
                         said.under
@@ -734,9 +739,11 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                     }
                     said
                 }
-                (None, Some(removed)) => said("Removed from memory", removed),
+                (None, Some(removed), _) => said("Removed from memory", removed),
+                (None, None, Some(read)) => said("Read from memory", read),
                 _ if arguments["index"] == true => said("Indexed memory", ""),
                 _ if arguments["check"] == true => said("Checked memory", ""),
+                _ if arguments["said"] == true => said("Read what the person wrote", ""),
                 _ if arguments.get("cleanup").is_some() || arguments["changed"] == true => {
                     said("Cleaned up memory", "")
                 }
@@ -1068,6 +1075,14 @@ Keep the rest.'"#,
             ("Already in memory", "flow")
         );
         assert!(saved.under.is_empty() && saved.output.is_none());
+        let read = said_or_none(
+            r#""$HOME/.agent/memory" read flow --user"#,
+            r#"{"read":"flow","reads":3}"#,
+        );
+        assert_eq!(
+            (read.verb.as_str(), read.what.as_str()),
+            ("Read from memory", "flow")
+        );
         let refused = said_or_none(
             r#"~/.agent/trigger add --bot shop.lead --cron '0 9 * * 1' -- Brief me"#,
             r#"{"error":"triggers_unsupported","detail":"needs macOS"}"#,

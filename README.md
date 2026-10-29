@@ -214,6 +214,9 @@ bot can also read a page with `web_fetch`, which the daemon runs itself. Put
 `web_search = "disabled"` in `config.toml` to leave both out of new bots.
 A message one agent sends another reaches its model with a line naming the
 sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
+A request Claude's safety classifiers decline ends the turn, unless
+`[fallbacks]` names another model for the bot's own; that model then answers
+that request alone ([CLI.md](docs/CLI.md)).
 
 ## How fast is it?
 
@@ -259,7 +262,8 @@ measurements behind every decision.
 Agent is an experiment with no users yet. It supports the OpenAI Responses and
 Anthropic Messages APIs, with streamed thinking, usage, and prompt-cache
 accounting; long conversations are compacted while the full history is kept.
-MCP and handing a conversation across providers are not implemented.
+The daemon has no MCP client (Sonny reaches MCP servers through its `exec`
+tool), and handing a conversation across providers is not implemented.
 Protocols, CLI defaults, and the store format may change between revisions;
 stores migrate forward automatically.
 
@@ -267,8 +271,13 @@ Agent runs bots; it doesn't create workspaces, manage Git branches, or choose
 machines. Those stay with the caller. To run work on another machine, see
 [Errand](https://github.com/lydakis/errand).
 
-Bots run their tools with your permissions, directly on your machine. Agent
-provides no sandbox; run it inside one if you need isolation.
+Bots run their tools with your permissions, directly on your machine, unless
+they are made with a `sandbox`: `read-only` or `workspace-write` confine their
+commands, writes and edits under bubblewrap on Linux and Seatbelt on macOS,
+ported from Codex. A call that would leave the sandbox goes to the bot's
+approval gate, and is refused when it has none. A bot made without a sandbox
+runs unconfined, as `danger-full-access` does. Sonny sandboxes its leads and
+tasks by default. See [sandbox](docs/RUST_PROTOTYPE.md#sandbox).
 
 ## When you need more
 

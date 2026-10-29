@@ -17,6 +17,7 @@ mod banner;
 mod cache;
 mod calls;
 mod cmux;
+mod config;
 mod declared;
 mod diff;
 mod embed;
@@ -44,6 +45,7 @@ mod prompt;
 mod reactions;
 mod resolved;
 mod rex;
+mod said;
 mod screen;
 mod seed;
 mod served;
@@ -706,6 +708,11 @@ fn main() -> std::process::ExitCode {
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
+            // The person's words are read from the daemon, which only
+            // Sonny reaches; the rest is memory's own.
+            if let Some(("said", since)) = rest.split_first().map(|(v, r)| (v.as_str(), r)) {
+                return std::process::ExitCode::from(said::cli(since) as u8);
+            }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
         Some((verb, rest)) if verb == trigger::VERB => {
@@ -826,11 +833,17 @@ async fn run() -> Result<(), String> {
     app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
-        app.notice = Some(format!(
-            "a copy of {source} that answers without acting; {source} carries on"
-        ));
+        // One allowed no tool answers; one with its source's acts.
+        let acts = !bot["allowed"]
+            .as_array()
+            .is_some_and(|tools| tools.is_empty());
+        app.notice = Some(match acts {
+            true => format!("a copy of {source} that can do anything it can; {source} carries on"),
+            false => format!("a copy of {source} that answers without acting; {source} carries on"),
+        });
     }
-    // The person's agent can react to them; a side chat calls no tool.
+    // The person's agent can react to them; a side chat has its agent's
+    // tools, or none.
     if options.side.is_none() {
         app.declare = declared::declare(&bot, project.is_some());
     }
@@ -909,7 +922,7 @@ async fn run() -> Result<(), String> {
         && let Some(mode) = app.mode.filter(|mode| *mode != "full")
         && !approvals::sandboxed_as(
             &bot,
-            &approvals::sandbox(mode, true, std::path::Path::new(&app.workspace)),
+            &approvals::sandbox(mode, std::path::Path::new(&app.workspace)),
         )
     {
         app.gating = Some(mode);
@@ -971,7 +984,7 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
         "request_id": unique("tui-create")});
     // Confined from the start, as the mode it is made with confines it.
-    let mut settings = approvals::sandbox(approvals::MODES[0].0, true, &workspace);
+    let mut settings = approvals::sandbox(approvals::MODES[0].0, &workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
@@ -979,6 +992,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         settings.insert("hide_senders".into(), json!(true));
     }
     asked["settings"] = Value::Object(settings);
+    if let Some(fallback) = config.fallbacks.get(&model) {
+        asked["fallback"] = json!(fallback);
+    }
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = &mut asked {
@@ -1099,6 +1115,24 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
 }
 
+/// The agent a side chat is a copy of, from the name `/side` gives it,
+/// `SOURCE.side-HEX`; `None` for any other bot. A name alone can be a
+/// task's, so `side_copy` checks the record too.
+pub fn side_source(bot: &str) -> Option<&str> {
+    let (source, stamp) = bot.rsplit_once(".side-")?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    (!source.is_empty() && (1..=6).contains(&stamp.len()) && stamp.bytes().all(hex))
+        .then_some(source)
+}
+
+/// The agent `record`, a bot as `bots` lists it, is a side chat of: named
+/// as `/side` names one, made by that agent, and expiring as a side chat
+/// does. `None` for any other bot, a task named `NAME.side-feed` included.
+pub fn side_copy(record: &Value) -> Option<&str> {
+    let source = side_source(record["name"].as_str()?)?;
+    (record["created_by"] == source && record["expire_ms"].is_u64()).then_some(source)
+}
+
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
 /// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
 /// the same to Herdr, which takes it from its own CLI instead.
@@ -1173,6 +1207,39 @@ fn context_after(event: &Value) -> Option<u64> {
     (event["event"] == "usage" && data["purpose"].is_null()).then(|| {
         call["input_tokens"].as_u64().unwrap_or(0) + call["output_tokens"].as_u64().unwrap_or(0)
     })
+}
+
+/// What a page of older items was drawn from: its nodes, the turn each
+/// was made in, what newer pages' calls returned that it has the calls
+/// of (the nodes to read, and the calls), and whether it is the first
+/// page, the welcome over it.
+struct Paged {
+    nodes: Vec<i64>,
+    turns: HashMap<i64, i64>,
+    after: Vec<i64>,
+    returned: std::collections::HashSet<String>,
+    first: bool,
+}
+
+impl Paged {
+    fn new(nodes: Vec<i64>, turns: HashMap<i64, i64>, after: &[(i64, Value)], first: bool) -> Self {
+        let mut read = Vec::new();
+        for (node, _) in after {
+            if read.last() != Some(node) {
+                read.push(*node);
+            }
+        }
+        let returned = (after.iter())
+            .map(|(_, item)| item["call_id"].as_str().unwrap_or("").to_owned())
+            .collect();
+        Self {
+            nodes,
+            turns,
+            after: read,
+            returned,
+            first,
+        }
+    }
 }
 
 /// What the bot is saying: its rows stay in the viewport until what comes
@@ -1314,9 +1381,9 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 }
 
 /// The slash commands, as the menu lists them: name and what it does.
-/// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
-/// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 17] = [
+/// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
+/// open `/background`, and `/settings` opens `/config`, unlisted.
+const COMMANDS: [(&str, &str); 18] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1339,6 +1406,7 @@ const COMMANDS: [(&str, &str); 17] = [
     ),
     ("/usage", "the tokens the agents spent, over time"),
     ("/mcp", "the MCP servers agents' scripts call"),
+    ("/config", "the settings in ~/.agent/config.toml"),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/verbose",
@@ -1551,6 +1619,14 @@ struct App {
     /// What calls older than the first node drawn returned, from the top
     /// of the oldest page: drawn with the older page that has the calls.
     unpaired: Vec<(i64, Value)>,
+    /// What each page of older items drawn above was drawn from, by its
+    /// id on the screen, to draw it again once let go.
+    pages: HashMap<u64, Paged>,
+    /// The id the next page takes.
+    next_page: u64,
+    /// A read of the bot's items came back short: what was drawn from it
+    /// is not all there was.
+    short_read: std::cell::Cell<bool>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -1585,6 +1661,8 @@ struct App {
     retry: Option<Instant>,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
+    /// `/config`, open over the composer.
+    config: Option<config::View>,
     /// The model listing `/model` waits on.
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
     /// The model and effort picked, set once no turn runs.
@@ -2206,6 +2284,9 @@ impl App {
             first_node: None,
             older: None,
             unpaired: Vec::new(),
+            pages: HashMap::new(),
+            next_page: 0,
+            short_read: std::cell::Cell::new(false),
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2220,6 +2301,7 @@ impl App {
             lead: String::new(),
             retry: None,
             picker: None,
+            config: None,
             listing: None,
             switch: None,
             cache: None,
@@ -2425,6 +2507,12 @@ impl App {
             if full() && self.older.is_some() && self.screen.near_top() {
                 self.older().await;
             }
+            // A page let go drawn again before the view reaches it.
+            if full()
+                && let Some(page) = self.screen.wanted()
+            {
+                self.draw_again(page).await;
+            }
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() && !self.watching() && self.side.is_none() {
                 self.repaint = false;
@@ -2548,7 +2636,7 @@ impl App {
             // A lead's sandbox goes with its mode.
             if self.project.is_some() {
                 let workspace = std::path::Path::new(&self.workspace);
-                fields.extend(approvals::sandbox(mode, true, workspace));
+                fields.extend(approvals::sandbox(mode, workspace));
             }
         }
         match self.client.request("configure", asked).await {
@@ -2708,14 +2796,28 @@ impl App {
     }
 
     /// The conversation drawn again in the background's new colours, or
-    /// in the view just picked, once no turn is running: the screen and scrollback cleared, and the
-    /// bot's items read again as on attach.
+    /// in the view just picked, once no turn is running: the screen and
+    /// scrollback cleared, and the bot's items read again as on attach.
+    /// On the full screen the pages of older items above are drawn again
+    /// only as the view nears them.
     async fn repaint(&mut self, terminal: &mut Tui) -> Result<(), String> {
         if std::mem::take(&mut self.switch_screen) {
             own_screen(!full());
         }
+        // The pages of older items above stay, as blank rows drawn again
+        // as the view nears them: only the newest rows are drawn now.
+        let pages = match full() {
+            true => self.screen.pages(),
+            false => Vec::new(),
+        };
+        let newest = (pages.last())
+            .and_then(|(id, _)| self.pages.get(id))
+            .and_then(|paged| paged.nodes.last().copied());
         // The full screen's rows are Sonny's own; inline, the scrollback's.
         self.screen.clear();
+        if newest.is_none() {
+            self.pages.clear();
+        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2738,6 +2840,14 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        if let Some(newest) = newest {
+            // What calls older than the oldest page returned stays its own.
+            let unpaired = std::mem::take(&mut self.unpaired);
+            self.history_since(newest, true).await;
+            self.unpaired = unpaired;
+            self.screen.blank(pages);
+            return Ok(());
+        }
         let welcome = self.welcome();
         self.commit(welcome);
         // Back to the first node this window drew, not only the newest page.
@@ -2781,17 +2891,57 @@ impl App {
             return;
         };
         self.first_node = Some(oldest);
-        // What the newer rows were drawn with is put by meanwhile.
+        let after = std::mem::take(&mut self.unpaired);
+        let paged = Paged::new(nodes, turns, &after, self.older.is_none());
+        let (lines, unpaired) = self.draw_page(&paged, after).await;
+        self.unpaired = unpaired;
+        let id = self.next_page;
+        self.next_page += 1;
+        self.pages.insert(id, paged);
+        self.screen.prepend(id, lines);
+    }
+
+    /// The page `id`, let go as the view moved away, drawn again as it
+    /// nears it: once all its items are read, else asked for again.
+    async fn draw_again(&mut self, id: u64) {
+        let Some(paged) = self.pages.remove(&id) else {
+            return;
+        };
+        self.short_read.set(false);
+        let mut after = self.items_at(&paged.after).await;
+        after.retain(|(_, item)| {
+            paged
+                .returned
+                .contains(item["call_id"].as_str().unwrap_or(""))
+        });
+        let (lines, _) = self.draw_page(&paged, after).await;
+        self.pages.insert(id, paged);
+        if !self.short_read.get() {
+            self.screen.fill(id, lines);
+        }
+    }
+
+    /// The rows of a page of older items, and what calls older than it
+    /// returned: drawn on their own, what the newer rows were drawn with
+    /// put by meanwhile.
+    async fn draw_page(
+        &mut self,
+        paged: &Paged,
+        after: Vec<(i64, Value)>,
+    ) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
         let pending = std::mem::take(&mut self.pending);
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
         let bot_reactions = std::mem::take(&mut self.bot_reactions);
         let react_calls = std::mem::take(&mut self.react_calls);
         let answering = self.answering.take();
-        let welcome = self.welcome();
-        self.commit(welcome);
-        let unpaired = std::mem::take(&mut self.unpaired);
-        self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
+        if paged.first {
+            let welcome = self.welcome();
+            self.commit(welcome);
+        }
+        let unpaired = self
+            .draw_nodes(&paged.nodes, &paged.turns, true, after)
+            .await;
         let mut lines = std::mem::replace(&mut self.pending, pending);
         self.any_history = any_history;
         self.rows_drawn = rows_drawn;
@@ -2802,7 +2952,7 @@ impl App {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        self.screen.prepend(lines);
+        (lines, unpaired)
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -3001,10 +3151,12 @@ impl App {
                 .request("history_items", json!({"bot": bot, "nodes": rest}))
                 .await
             else {
+                self.short_read.set(true);
                 break;
             };
             let entries = read["items"].as_array().cloned().unwrap_or_default();
             if entries.is_empty() {
+                self.short_read.set(true);
                 break;
             }
             rest = &rest[entries.len().min(rest.len())..];
@@ -4001,9 +4153,15 @@ impl App {
     /// happens, when its window closes too; replayed, by the time the
     /// lead's turn ended, unless the mark it made then is kept.
     async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
-        let Some(project) = &self.project else {
+        // A side chat forked from a lead resolves that lead's tasks.
+        let side = (self.options.side.is_some())
+            .then(|| side_source(&self.bot))
+            .flatten()
+            .and_then(|source| source.strip_suffix(".lead"));
+        let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
             return;
         };
+        let project = &project;
         let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
             return;
         };
@@ -4901,6 +5059,7 @@ impl App {
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
                 && self.input.is_empty()
                 && self.picker.is_none()
+                && self.config.is_none()
                 && self.choosing.is_none()
                 && self.reacting.is_none()
             {
@@ -4939,6 +5098,7 @@ impl App {
             KeyCode::Char('f')
                 if ctrl
                     && self.picker.is_none()
+                    && self.config.is_none()
                     && self.choosing.is_none()
                     && self.reacting.is_none() =>
             {
@@ -5330,6 +5490,21 @@ impl App {
             }
             return;
         }
+        if let Some(view) = &mut self.config {
+            if let Event::Resize(width, _) = event {
+                self.width = width as usize;
+            } else if let config::Key::Close = view.event(&event) {
+                self.config = None;
+            }
+            // The chime and the view as the file now has them.
+            let settings = settings::Settings::load();
+            self.sounds.chime = settings.chime;
+            if self.verbose != settings.verbose {
+                self.verbose = settings.verbose;
+                self.repaint = true;
+            }
+            return;
+        }
         if let Some(picker) = &mut self.picker {
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -5592,6 +5767,14 @@ impl App {
                 },
                 None => "no HTML page in this conversation yet".into(),
             });
+            return;
+        }
+        if matches!(prompt.as_str(), "/config" | "/settings") {
+            self.input.clear();
+            match config::View::open() {
+                Ok(view) => self.config = Some(view),
+                Err(error) => self.notice = Some(error),
+            }
             return;
         }
         if prompt == "/model" {
@@ -6117,26 +6300,51 @@ impl App {
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
     /// mid-turn included, and opened in a Sonny of its own on the alternate
     /// screen. The copy may call no tool, so it answers from what the bot
-    /// knows; the daemon deletes it once it has been idle a quarter hour.
-    /// This bot carries on, and its lines wait for the main screen.
+    /// knows, unless the config's `[sonny] side_chat` is `"fork"`: then it
+    /// may do anything the bot may. The daemon deletes it once it has been
+    /// idle a quarter hour. This bot carries on, and its lines wait for the
+    /// main screen.
     async fn side(&mut self, question: String, pictures: &[attach::Picture]) {
         if self.options.side.is_some() {
             self.notice = Some("this is a side chat already".into());
             return;
         }
+        let tools = match agent_client::config::load() {
+            Ok(config) => config.sonny.side_chat,
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
-        let forked = self
+        // Made by the agent it copies, which is how Sonny's own tools know
+        // the copy for one rather than by its name alone.
+        let page = self
             .client
-            .request(
-                "fork",
-                json!({"source": self.bot, "bot": name, "allow": [],
-                    "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name}),
-            )
-            .await;
+            .request("bots", json!({"name": self.bot, "limit": 1}));
+        let source = match page.await {
+            Ok(page) if page["bots"][0]["name"] == self.bot.as_str() => page["bots"][0].clone(),
+            Ok(_) => {
+                self.notice = Some(format!("no side chat: {} is gone", self.bot));
+                return;
+            }
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
+        let mut fork = json!({"source": self.bot, "bot": name,
+            "created_by": self.bot, "created_by_id": source["bot_id"],
+            "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name});
+        // A fork with no list keeps its source's tools.
+        if tools == agent_client::config::SideChat::Answer {
+            fork["allow"] = json!([]);
+        }
+        let forked = self.client.request("fork", fork).await;
         let forked = match forked {
             Ok(forked) => forked,
             Err(error) => {
@@ -6499,6 +6707,11 @@ impl App {
                     let room = area.height.saturating_sub(below);
                     let column = area.width.min(PROSE as u16);
                     let rows = self.screen.height(column as usize).min(room as usize);
+                    // `/config` lists every setting over the rows above.
+                    let rows = match &self.config {
+                        Some(_) => (rows + config::SETTINGS.len()).min(room as usize),
+                        None => rows,
+                    };
                     let [history, view, _] = Layout::vertical([
                         Constraint::Length(rows as u16),
                         Constraint::Length(below),
@@ -6707,6 +6920,24 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
+            if let Some(view) = &self.config {
+                // Every setting where there is room, over the rows above.
+                let rows = view.rows(composer.y.saturating_sub(frame.area().y) as usize);
+                let area = ratatui::layout::Rect {
+                    y: composer.y.saturating_sub(rows.len() as u16),
+                    height: rows.len() as u16,
+                    ..composer
+                };
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(Paragraph::new(rows), area);
+                let (line, cursor) = view.line();
+                frame.render_widget(Paragraph::new(line), composer);
+                if let Some(column) = cursor {
+                    frame.set_cursor_position((composer.x + column, composer.y));
+                }
+                frame.render_widget(Paragraph::new(view.keys()), footer);
+                return;
+            }
             if let Some(picker) = &self.picker {
                 let shown = picker.shown();
                 let at = picker.at();
@@ -6877,6 +7108,7 @@ impl App {
         let keep = match self.choosing.is_some()
             || self.approving.is_some()
             || self.picker.is_some()
+            || self.config.is_some()
             || self.reacting.is_some()
             || self.finding.is_some()
         {
@@ -7452,6 +7684,80 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_reads_only_what_the_person_wrote_since_the_last_one() {
+        let said_ = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        // The agent moved into the shop project after turn 6: each message
+        // keeps the project of the folder its turn ran in.
+        let shop = std::env::temp_dir().join(format!("said-shop-{}", std::process::id()));
+        std::fs::create_dir_all(shop.join(".agents")).unwrap();
+        std::fs::write(shop.join(".agents/project.toml"), "name = \"shop\"\n").unwrap();
+        let elsewhere = std::env::temp_dir();
+        let (shop_, elsewhere_) = (shop.clone(), elsewhere.clone());
+        let client = daemon_answering(move |asked| {
+            let args = asked;
+            match (
+                asked["op"].as_str().unwrap_or_default(),
+                args["bot"].as_str(),
+            ) {
+                ("bots", _) => json!({"bots": [{"name": "shop.lead"}, {"name": "shop.old"}],
+                    "next_after": null}),
+                // Turns come a page at a time.
+                // Turns come a page at a time. Turn 7 was queued behind 6
+                // and cancelled before the cleanup; turn 4 ran before it.
+                ("turns", Some("shop.lead")) if args["before"].is_null() => json!({"turns": [
+                    {"turn": 8, "started_ms": 3000, "finished_ms": null, "workspace": shop_},
+                    {"turn": 7, "started_ms": null, "finished_ms": 600, "workspace": shop_}],
+                    "next_before": 7}),
+                ("turns", Some("shop.lead")) => json!({"turns": [
+                    {"turn": 6, "started_ms": 400, "finished_ms": 2000, "workspace": elsewhere_},
+                    {"turn": 4, "started_ms": 100, "finished_ms": 300, "workspace": elsewhere_}],
+                    "next_before": 4}),
+                ("turns", _) => json!({"turns": [{"turn": 3, "finished_ms": 100}]}),
+                ("history_nodes", Some("shop.lead")) => json!({"nodes": [
+                    {"node": 30, "turn": 8}, {"node": 29, "turn": 8}, {"node": 28, "turn": 6},
+                    {"node": 27, "turn": 6}, {"node": 20, "turn": 4}], "next_from": 19}),
+                ("history_items", Some("shop.lead")) => {
+                    let items: Vec<Value> = (args["nodes"].as_array().into_iter().flatten())
+                        .filter_map(|node| {
+                            let item = match node.as_i64()? {
+                                30 => {
+                                    json!({"node": 30, "item": said_("Keep Bedrock out of evals.")})
+                                }
+                                29 => json!({"node": 29, "item": {"type": "message",
+                                    "role": "assistant", "content": [{"type": "output_text",
+                                    "text": "Noted."}]}}),
+                                28 => json!({"node": 28, "item": said_("Use the old API."),
+                                    "from": {"bot": "shop.fix", "turn": 2}}),
+                                27 => {
+                                    json!({"node": 27, "item": said_("Squash-merge from now on.")})
+                                }
+                                _ => return None,
+                            };
+                            Some(item)
+                        })
+                        .collect();
+                    json!({"items": items})
+                }
+                _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+            }
+        })
+        .await;
+        let read = said::said(&client, 1000).await.unwrap();
+        assert_eq!(
+            read,
+            json!({"since_ms": 1000, "cut": false, "said": [
+                {"bot": "shop.lead", "turn": 8, "text": "Keep Bedrock out of evals.",
+                    "project": "shop"},
+                {"bot": "shop.lead", "turn": 6, "text": "Squash-merge from now on.",
+                    "project": null}]})
+        );
+        std::fs::remove_dir_all(shop).unwrap();
     }
 
     #[tokio::test]

@@ -110,6 +110,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             created_by,
             compaction_instructions,
             compaction_model,
+            fallback,
             declare,
             settings,
             ..
@@ -126,6 +127,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 created_by,
                 compaction_instructions,
                 compaction_model,
+                fallback,
             ))
             .map(|bytes| {
                 bytes
@@ -218,9 +220,9 @@ enum Command {
         /// the client's; without instructions the bot never compacts.
         compaction_instructions: Option<String>,
         compaction_model: Option<String>,
-        /// Anthropic server-side fallbacks for this bot; off unless asked.
-        #[serde(default)]
-        fallbacks: bool,
+        /// The model, as `provider/model` in the bot's family, that answers
+        /// a request a safety classifier declined, that request alone.
+        fallback: Option<String>,
         /// A gate: tools whose calls wait for a verdict, the approver tag
         /// that answers them, and how long a call may wait for it.
         approve: Option<Vec<String>>,
@@ -266,13 +268,14 @@ enum Command {
         /// removes them.
         declare: Option<Vec<Declared>>,
         /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable` and `network`, which
-        /// otherwise go back to none and off.
+        /// settings name it: with `writable`, `network` and `unsandboxed`,
+        /// which otherwise go back to none, off and none.
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
+        unsandboxed: Option<Vec<String>>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -2468,7 +2471,7 @@ impl Service {
                 created_by_id,
                 compaction_instructions,
                 compaction_model,
-                fallbacks,
+                fallback,
                 approve,
                 approver,
                 approve_expire_ms,
@@ -2548,12 +2551,13 @@ impl Service {
                 }
                 // The summarizer must speak the bot's family: its items are
                 // stored in that encoding and go to the summarizer as they are.
-                if let Some(reference) = &compaction_model {
-                    let (summarizer, _) = split_model(reference)?;
+                // So must a fallback, which is sent the same request.
+                for reference in compaction_model.iter().chain(&fallback) {
+                    let (other, _) = split_model(reference)?;
                     let known = self
                         .providers
-                        .get(summarizer)
-                        .ok_or(Error::with("provider_unavailable", summarizer))?;
+                        .get(other)
+                        .ok_or(Error::with("provider_unavailable", other))?;
                     if known.family() != family {
                         return fail_with("provider_family_mismatch", reference.clone());
                     }
@@ -2577,7 +2581,7 @@ impl Service {
                                 created_by_id,
                                 compaction_instructions: compaction_instructions.as_deref(),
                                 compaction_model: compaction_model.as_deref(),
-                                fallbacks,
+                                fallback: fallback.as_deref(),
                                 gate: gate.as_ref(),
                                 settings: *settings,
                                 declared: declare.as_deref(),
@@ -2730,6 +2734,7 @@ impl Service {
                 writable,
                 network,
                 cache_ttl,
+                unsandboxed,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
@@ -2740,6 +2745,7 @@ impl Service {
                             sandbox: Some(mode),
                             writable: writable.unwrap_or_default(),
                             network: network.unwrap_or(false),
+                            unsandboxed: unsandboxed.unwrap_or_default(),
                             ..Settings::default()
                         };
                         settings.validate()?;
@@ -2750,12 +2756,12 @@ impl Service {
                         })
                         .await
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
-                        Some((settings.sandbox, settings.writable, settings.network))
+                        Some(settings)
                     }
-                    None if writable.is_some() || network.is_some() => {
+                    None if writable.is_some() || network.is_some() || unsandboxed.is_some() => {
                         return fail_with(
                             "invalid_setting",
-                            "writable and network go with sandbox",
+                            "writable, network and unsandboxed go with sandbox",
                         );
                     }
                     None => None,
@@ -4143,7 +4149,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -4287,7 +4293,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -4504,7 +4510,7 @@ mod tests {
             created_by_id: None,
             compaction_instructions: None,
             compaction_model: None,
-            fallbacks: false,
+            fallback: None,
             gate: None,
             settings: Default::default(),
             declared: None,
@@ -4744,7 +4750,7 @@ mod tests {
                                 created_by_id: None,
                                 compaction_instructions: None,
                                 compaction_model: None,
-                                fallbacks: false,
+                                fallback: None,
                                 gate: None,
                                 settings: Default::default(),
                                 declared: None,
@@ -5040,7 +5046,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -5127,7 +5133,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -5275,7 +5281,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         store
             .call(move |db| {
-                db.suspend_paced(bob, 0, 0, 0, 0, 0, 0, false, None, None, None)
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, 0, false, None, None, None, None)
                     .map(|_| ())
             })
             .await
@@ -5373,7 +5379,7 @@ mod tests {
             created_by_id: None,
             compaction_instructions: None,
             compaction_model: None,
-            fallbacks: false,
+            fallback: None,
             approve: None,
             approver: None,
             approve_expire_ms: None,
@@ -5957,7 +5963,7 @@ mod tests {
                             created_by_id: creator.as_ref().map(|c| c.bot_id),
                             compaction_instructions: None,
                             compaction_model: None,
-                            fallbacks: false,
+                            fallback: None,
                             gate: Some(&gate),
                             settings: Default::default(),
                             declared: None,
@@ -6238,7 +6244,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: Some(&gate),
                         settings: Default::default(),
                         declared: None,

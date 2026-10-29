@@ -5692,3 +5692,55 @@ Store jobs per turn did not change (7.5 on both). Every change is within the
 gate's 15%. The benches' calls are short, so `tool_started` takes its old path:
 the new parse runs only for a write or edit past the 2 KiB preview, once, on
 arguments the daemon already holds, as a cut patch's parse already did.
+
+## Commands a client trusts leave the sandbox (#309)
+
+A sandboxed bot may now name commands, `unsandboxed`, that run outside its
+sandbox without asking. Every shell call of a sandboxed bot looks at that
+list; only a non-empty list parses the command. Bots without a sandbox, as
+in every bench, skip the look. The Perf workflow's matched screen, base main
+7cb4221 against the PR head 9d5c0fd, on the GitHub runner (2026-10-29):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.951 | 30.049 | +0.3% |
+| admission | burst submit p99, ms | 4.027 | 3.99 | -0.9% |
+| completion | release to terminal p99, ms | 9.28 | 8.892 | -4.2% |
+| footprint | idle RSS, MiB | 18.949 | 18.824 | -0.7% |
+| footprint | per idle bot, KiB | 1.454 | 1.45 | -0.3% |
+| footprint | RSS after a turn each, MiB | 28.65 | 28.865 | +0.7% |
+| footprint | CPU per turn, ms | 0.877 | 0.875 | -0.3% |
+| lifecycle | CPU, s | 0.895 | 0.88 | -1.7% |
+| lifecycle | p95 turn, ms | 698.223 | 629.455 | -9.8% |
+| lifecycle | peak RSS, MiB | 25.547 | 25.078 | -1.8% |
+
+Store jobs per turn did not change, and every change is within the gate's
+15%. Sandboxed bots and the parse itself are not measured: it walks the
+command's characters once, against a list of at most 64 prefixes.
+
+## A declined request goes to the bot's fallback, that request alone (#349)
+
+Every model call now keeps its own provider and model beside the target it
+sends to, and takes a parked fallback back on resume; a bot without a
+fallback, as in every bench, carries `None` through both. A refusal builds a
+fallback only on `stop_reason: "refusal"`. The Perf workflow's matched
+screen, base main fc8560a against the PR head 7de1ff4, on the GitHub runner
+(2026-10-29):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.67 | 29.48 | -0.6% |
+| admission | burst submit p99, ms | 4.079 | 3.971 | -2.7% |
+| completion | release to terminal p99, ms | 9.463 | 9.056 | -4.3% |
+| footprint | idle RSS, MiB | 18.861 | 19.109 | +1.3% |
+| footprint | per idle bot, KiB | 1.652 | 1.372 | -16.9% |
+| footprint | RSS after a turn each, MiB | 28.752 | 28.312 | -1.5% |
+| footprint | CPU per turn, ms | 0.893 | 0.867 | -2.9% |
+| lifecycle | CPU, s | 0.88 | 0.885 | +0.6% |
+| lifecycle | p95 turn, ms | 630.609 | 620.821 | -1.6% |
+| lifecycle | peak RSS, MiB | 25.453 | 25.283 | -0.7% |
+
+Store jobs per turn did not change (7.5 on both), and no change is a cost
+past the gate's 15%; the per-idle-bot drop is the bench's noise, as the
+change adds nothing to an idle bot. The refused path is not measured: it
+runs once per refusal, a second request to the provider.

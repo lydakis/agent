@@ -603,14 +603,15 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/messages'
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
-            # Server-side fallbacks are a bot's choice: the field and its beta
-            # header travel together, or not at all.
-            if 'fallbacks' in request:
-                assert request['fallbacks'] == 'default'
-                assert self.headers.get('anthropic-beta') == (
-                    'thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01')
-            else:
-                assert self.headers.get('anthropic-beta') == 'thinking-binding-controls-2026-08-01'
+            # No request asks for a server-side fallback, which would stick;
+            # a refused request's own retry redeems the refusal's credit.
+            assert 'fallbacks' not in request
+            assert self.headers.get('anthropic-beta') == (
+                'thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,'
+                'server-side-fallback-2026-07-01')
+            if 'fallback_credit_token' in request:
+                assert request['fallback_credit_token'] == 'credit-1' and request['model'] == 'synthetic-claude-2'
+                self.server.credits = getattr(self.server, 'credits', 0) + 1
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             # A cache refresh is the same request with no output and no stream.
@@ -682,6 +683,17 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             # for an api_error after the stream began. An optional failure
             # count also models a transient outage with the same request,
             # and `unreadable_any` a failure whatever the request replays.
+            # The fallback model's pool closes long enough to park the turn.
+            if request['model'] == 'synthetic-claude-2' and getattr(self.server, 'limit_fallback', 0):
+                self.server.limit_fallback -= 1
+                body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+                self.send_response(429)
+                self.send_header('Retry-After', '1.2')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if getattr(self.server, 'rate_limits', 0):
                 self.server.rate_limits -= 1
                 body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
@@ -737,6 +749,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                             return
                 signature = thinking_binding(request, request['messages'], self.headers.get('Host'))
             blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
+            details = None
             prompt = next((b['text'] for m in request['messages'] if m['role'] == 'user'
                            for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
             if prompt and not summary:
@@ -794,6 +807,16 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                                              'title': 'Example', 'encrypted_content': 'opaque'}]},
                                {'type': 'text', 'text': 'found'}]
                     stop = 'pause_turn'
+                elif user.startswith('refuse:') and (request['model'] == 'synthetic-claude'
+                                                     or user.startswith('refuse:all')):
+                    # A classifier declines mid-output: the partial is
+                    # discarded, and the refusal names its category and,
+                    # on the first model, a credit for the retry.
+                    blocks.append({'type': 'text', 'text': 'Partial '})
+                    stop = 'refusal'
+                    details = {'type': 'refusal', 'category': 'cyber', 'explanation': None}
+                    if request['model'] == 'synthetic-claude':
+                        details['fallback_credit_token'] = 'credit-1'
                 elif user.startswith('fallback:'):
                     # A classifier declines mid-output and another model
                     # finishes: the declined partial stays in the stream.
@@ -811,7 +834,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                      'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2,
                                **getattr(self.server, 'start_usage', {})}}
             if getattr(self.server, 'report_drops', 0):
-                start['input_transformations'] = [{'type': 'thinking_dropped', 'message_index': 1, 'block_index': 0}
+                start['input_transformations'] = [{'type': 'thinking_dropped', 'message_index': 1, 'block_index': 0,
+                                                   'reason': 'prefix_binding_mismatch'}
                                                   for _ in range(self.server.report_drops)]
             events = [('message_start', {'message': start})]
             for index, block in enumerate(blocks):
@@ -840,7 +864,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                      'cache_creation_input_tokens': 0, 'output_tokens': 4},
                     {'type': 'fallback_message', 'model': 'synthetic-fallback', 'input_tokens': 6,
                      'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 1, 'output_tokens': 7}]
-            events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': usage}))
+            delta = {'stop_reason': stop, **({'stop_details': details} if details else {})}
+            events.append(('message_delta', {'delta': delta, 'usage': usage}))
             events.append(('message_stop', {}))
             # An overload after the stream began, as Anthropic sends one.
             if getattr(self.server, 'overloads', 0):
@@ -1084,9 +1109,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
                                                          model.requests.get(timeout=1))], [True, True])
         self.assertTrue(model.requests.empty())
 
-    def test_a_fallback_answer_replays_without_the_declined_attempt(self):
+    def test_a_server_side_fallback_answer_replays_without_the_declined_attempt(self):
+        # No request asks for one now, but a history may hold one.
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), effort='low', fallbacks=True)
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='fallback:kept')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
@@ -1113,6 +1139,59 @@ class AnthropicRuntimeTests(unittest.TestCase):
             {'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': 'kept'}}])
         self.assertEqual(second['messages'][2]['content'],
                          [{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'kept'}])
+
+    def test_a_refused_request_alone_goes_to_the_fallback_model(self):
+        client, model, path = self.start()
+        # The fallback's pool parks the turn once: it resumes on the fallback.
+        model.limit_fallback = 1
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       fallback='anthropic/synthetic-claude-2')
+        turn = client.request('submit', bot='Bob', request_id='f1', prompt='refuse:once')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        refused, limited, answered = (model.requests.get(timeout=1) for _ in range(3))
+        self.assertEqual((limited['model'], limited['fallback_credit_token']), ('synthetic-claude-2', 'credit-1'))
+        # The same body on the fallback model, with the refusal's credit.
+        self.assertEqual((refused['model'], answered['model']), ('synthetic-claude', 'synthetic-claude-2'))
+        self.assertNotIn('fallback_credit_token', refused)
+        self.assertEqual(answered['fallback_credit_token'], 'credit-1')
+        self.assertEqual(answered['messages'], refused['messages'])
+        retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
+        self.assertEqual([(r['error'], r.get('fallback'), r['parked']) for r in retried],
+                         [('provider_refusal', 'anthropic/synthetic-claude-2', False),
+                          ('provider_http_429', None, True)])
+        self.assertEqual(retried[0]['detail'], 'category cyber')
+        fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
+        self.assertEqual([(m['from'], m['to']) for m in fallback], [('synthetic-claude', 'synthetic-claude-2')])
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual(usage[-1]['served_model'], 'synthetic-claude-2-20260926')
+        # The next request goes back to the bot's own model, with the
+        # fallback's answer in its history and the declined partial not.
+        turn = client.request('submit', bot='Bob', request_id='f2', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        after = model.requests.get(timeout=1)
+        self.assertEqual(after['model'], 'synthetic-claude')
+        self.assertNotIn('fallback_credit_token', after)
+        self.assertEqual([b.get('text') for b in after['messages'][1]['content'] if b['type'] == 'text'],
+                         ['reply:refuse:once'])
+        self.assertTrue(model.requests.empty())
+
+    def test_a_refusal_the_fallback_repeats_fails_the_turn(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), fallback='anthropic/synthetic-claude-2')
+        client.request('create', bot='Solo', workspace=str(path))
+        turn = client.request('submit', bot='Bob', request_id='f1', prompt='refuse:all')['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['error'], finished['detail']), ('provider_refusal', 'category cyber'))
+        self.assertEqual([model.requests.get(timeout=1)['model'] for _ in range(2)],
+                         ['synthetic-claude', 'synthetic-claude-2'])
+        # With no fallback, a refusal ends the turn at once.
+        turn = client.request('submit', bot='Solo', request_id='s1', prompt='refuse:all')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['error'], 'provider_refusal')
+        self.assertEqual(model.requests.get(timeout=1)['model'], 'synthetic-claude')
+        self.assertTrue(model.requests.empty())
+        # A fallback is a known provider's model in the bot's family.
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(path),
+                                        fallback='openai/x')['error'], 'provider_unavailable')
 
     def test_a_hosted_search_is_declared_kept_and_its_paused_turn_resumed(self):
         client, model, path = self.start()
@@ -1186,7 +1265,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), effort='low', fallbacks=True)
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       fallback='anthropic/synthetic-claude-2')
         before = time.time() * 1000
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:shared')['result']['turn']
         finished = client.finished(turn)
