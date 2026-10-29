@@ -151,6 +151,10 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     if let Some(git) = crate::approvals::repository(&place.dir) {
         flags.extend(["--writable".to_owned(), git]);
     }
+    // And runs outside it the commands the person's config lets out.
+    for command in &config.sonny.unsandboxed {
+        flags.extend(["--unsandboxed".to_owned(), command.clone()]);
+    }
     // A path in the lead's folder would have the task write there instead
     // of in its copy, where nothing keeps it apart from the lead's work.
     let brief = vec![start.brief.clone()];

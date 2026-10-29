@@ -359,7 +359,14 @@ off again never shows.
   waits for the verdict. In `full` the lead runs unconfined. Every task
   is sandboxed the same way in its own folder, whatever the lead's mode.
   A lead made before Sonny sandboxed leads is sandboxed when Sonny opens
-  it. On Linux sandboxes need bubblewrap.
+  it. On Linux sandboxes need bubblewrap. A tool that keeps a daemon of its
+  own, such as mcpx, can't run inside a sandbox: name it in
+  `~/.agent/config.toml`, `[sonny] unsandboxed = ["mcpx"]`, and every agent
+  runs it outside without asking, as a Codex rule that allows a command
+  does. Each entry is a command's first words (`"docker compose"`), and a
+  call runs outside only when everything it runs is named, so
+  `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
+  it.
 - `/approve` lists the calls the judge denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
