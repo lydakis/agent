@@ -3217,11 +3217,14 @@ impl App {
 
     /// The turn that says what a task does, from its newest `turns`: a
     /// message steered into a running turn is a turn of its own, settled
-    /// at once, so the turn it joined is read instead. A failed one with
+    /// at once, so the turn it joined is read instead, and one attached to
+    /// the next call (a reaction) waits for work that is not there, so the
+    /// turn before it is read too. A failed one with
     /// why it failed, which `turns` leaves out, as `wait` has it.
     async fn task_turn(&self, page: &Value) -> Value {
         let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
-        let Some(turn) = turns.iter().find(|t| t["status"] != "steered") else {
+        let passive = |t: &&Value| matches!(t["status"].as_str(), Some("steered" | "attached"));
+        let Some(turn) = turns.iter().find(|t| !passive(t)) else {
             return turns.first().cloned().unwrap_or(Value::Null);
         };
         let mut turn = turn.clone();
@@ -4775,10 +4778,11 @@ impl App {
                 .unwrap_or_default();
             let turn = turns.first().cloned().unwrap_or(Value::Null);
             // A message steered into a running turn is recorded as a turn
-            // of its own that never ran: the time is the one it joined.
+            // of its own that never ran: the time is the one it joined. One
+            // attached to the next call has not run either.
             let ran = turns
                 .iter()
-                .find(|turn| turn["status"] != "steered")
+                .find(|turn| !matches!(turn["status"].as_str(), Some("steered" | "attached")))
                 .unwrap_or(&Value::Null);
             let running = !bot["running_turn"].is_null();
             let state = match (
@@ -9312,7 +9316,9 @@ mod tests {
         let client = daemon_answering(move |asked| {
             let n = read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match asked["bot"].as_str() {
-                Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
+                // A reaction attached to the next call: the task is still done.
+                Some("calc.add") => json!({"turns": [
+                    {"turn": 2, "status": "attached"}, {"turn": 1, "status": "completed"}]}),
                 // A message steered into a running turn: the task still works.
                 Some("calc.neg") if n < 3 => json!({"turns": [
                     {"turn": 2, "status": "steered"}, {"turn": 1, "status": "running"}]}),
