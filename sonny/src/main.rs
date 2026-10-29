@@ -553,7 +553,8 @@ impl From<String> for NotStarted {
 
 /// Start the daemon of `store` on `socket` the way the CLI starts it, and
 /// wait for it to be ready. With `login`, it gets the login shell's
-/// environment, for a start from launchd, which gives no provider keys.
+/// environment, for a start from a trigger's fire, which launchd or systemd
+/// gives no provider keys.
 fn start_daemon(
     store: &std::path::Path,
     socket: &std::path::Path,
@@ -562,9 +563,26 @@ fn start_daemon(
     let bin = agent_bin().ok_or(
         "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
     )?;
-    let mut command = std::process::Command::new(&bin);
+    // A trigger's fire runs as a systemd service, which takes every process
+    // left in it when it ends: the daemon is started in a scope of its own,
+    // as a desktop starts an app, so it outlives the fire.
+    let scoped = login && cfg!(target_os = "linux") && std::env::var_os("INVOCATION_ID").is_some();
+    let mut command = match scoped {
+        true => {
+            let mut command = std::process::Command::new("systemd-run");
+            command
+                .args(["--user", "--scope", "--quiet", "--collect", "--"])
+                .arg(&bin);
+            command
+        }
+        false => std::process::Command::new(&bin),
+    };
     if let Some(environment) = login.then(login::environment).flatten() {
         command.env_clear().envs(environment);
+    }
+    // systemd-run finds the user manager by its runtime folder.
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|_| scoped) {
+        command.env("XDG_RUNTIME_DIR", runtime);
     }
     apply_env_file(&mut command)?;
     let out = command
@@ -694,7 +712,7 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
         }
-        // launchd runs this for a trigger's fire.
+        // launchd or systemd runs this for a trigger's fire.
         Some((flag, rest)) if flag == trigger::FIRE_FLAG => {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
