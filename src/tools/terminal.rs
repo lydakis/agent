@@ -3,7 +3,7 @@
 //! runs one, for a REPL or a program that prompts. A terminal lives until
 //! its command exits or is killed, across turns, and reports its end on its
 //! proc handle as a background command does.
-use super::{Credentials, MAX_YIELD_MS, Outcome, PREVIEW_BYTES, Registry, sh};
+use super::{Credentials, DRAIN_PAUSE, MAX_YIELD_MS, Outcome, PREVIEW_BYTES, Registry, sh};
 use crate::{Error, Result, fail_with, sandbox::Policy};
 use serde_json::{Value, json};
 use std::{
@@ -342,13 +342,22 @@ impl Registry {
                         // An end of file, or the far end gone (EIO).
                         Ok(Ok(0) | Err(_)) => return,
                         Ok(Ok(n)) => {
-                            let mut state =
-                                terminal.state.lock().unwrap_or_else(|e| e.into_inner());
-                            state.unread.extend_from_slice(&buffer[..n]);
-                            let over = state.unread.len().saturating_sub(PREVIEW_BYTES);
-                            if over > 0 {
-                                state.unread.drain(..over);
-                                state.dropped += over as u64;
+                            let dropping = {
+                                let mut state =
+                                    terminal.state.lock().unwrap_or_else(|e| e.into_inner());
+                                state.unread.extend_from_slice(&buffer[..n]);
+                                let over = state.unread.len().saturating_sub(PREVIEW_BYTES);
+                                if over > 0 {
+                                    state.unread.drain(..over);
+                                    state.dropped += over as u64;
+                                }
+                                over > 0
+                            };
+                            // What no read keeps is drained slowly, as a
+                            // command's pipe is: the writer waits on the
+                            // terminal instead of spending the daemon's thread.
+                            if dropping {
+                                tokio::time::sleep(DRAIN_PAUSE).await;
                             }
                         }
                     }
