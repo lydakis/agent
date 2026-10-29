@@ -505,8 +505,15 @@ chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
 shows by itself when the window leaves the conversation its 100 columns
 and the margin 40 more; in a narrower one the footer counts the notes
-(`✎ 3`), and Tab with nothing typed shows the margin. The notes are kept
-by agent in `~/.agent/sonny/margin/`, and the calls stay in its history.
+(`✎ 3`), and Tab with nothing typed shows the margin. Where the margin
+cannot show, because the window is narrower or it is closed, each note is
+drawn in the conversation where it was put instead of its marker, up to
+40 rows with the rest a click away, and it goes back beside the
+conversation once there is room again. The agent's plan sits over the
+notes, one plan however often it changes; each `plan` call in the
+conversation is a row of how far it had got, and where the margin cannot
+show, the newest is the whole checklist. The notes are kept by agent in
+`~/.agent/sonny/margin/`, and the calls stay in its history.
 A note is drawn the way the conversation and the pane draw things:
 Markdown with its tables and math, Mermaid diagrams, HTML pages,
 pictures, and code in syntax colors.
@@ -516,6 +523,10 @@ pictures, and code in syntax colors.
 ![Margin notes in Markdown with a table and math, a Mermaid diagram and a picture, each pinned to a row in the conversation](../docs/sonny/margin-rich.png)
 
 ![Further down the same margin: the picture, an HTML dashboard page, and a file note in syntax colors](../docs/sonny/margin-rich-more.png)
+
+![The plan over the margin's notes, and each plan call a row of how far it had got](../docs/sonny/margin-plan-wide.png)
+
+![The same conversation in a narrower window: the notes drawn where they were put, and the newest plan as the whole checklist](../docs/sonny/margin-inline-narrow.png)
 
 ![/status laid over the margin: its title's ← goes back, and the footer counts the note the margin holds](../docs/sonny/margin-status.png)
 

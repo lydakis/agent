@@ -61,6 +61,8 @@ pub enum Tag {
     Tasks(u64),
     /// Where a note was put in the margin, by [`crate::margin::anchor`].
     Note(u64),
+    /// A `plan` call, by the client's number for it.
+    Plan(u64),
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -279,6 +281,11 @@ impl Screen {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
     }
 
+    /// Which line of those pushed is tagged `tag`, the newest if more are.
+    pub fn row_of(&self, tag: Tag) -> Option<usize> {
+        self.tagged(tag)
+    }
+
     /// Whether a row is tagged `tag`.
     pub fn has(&self, tag: Tag) -> bool {
         self.tagged(tag).is_some()
@@ -424,9 +431,13 @@ impl Screen {
     /// The view put with the row tagged `tag`, the newest if more are,
     /// `above` drawn rows under its top; whether a row is.
     pub fn show_tagged(&mut self, tag: Tag, above: usize) -> bool {
-        let Some(row) = self.tagged(tag) else {
+        let Some(mut row) = self.tagged(tag) else {
             return false;
         };
+        // From the first of the rows tagged so together.
+        while row > 0 && self.rows[row - 1].tag == Some(tag) {
+            row -= 1;
+        }
         self.show_row(row, above);
         true
     }

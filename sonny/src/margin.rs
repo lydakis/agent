@@ -197,6 +197,9 @@ pub struct Margin {
     /// Counts each change to the notes or the files they show.
     changes: u64,
     drawn: Option<(Drawn, Rows)>,
+    /// The bot's plan as its newest `plan` call set it, shown over the
+    /// notes: one, however often it changes.
+    plan: Vec<String>,
 }
 
 /// The number a note's pin goes by on the screen: its call's, the same
@@ -224,6 +227,14 @@ impl Margin {
             file,
             kept,
             ..Margin::default()
+        }
+    }
+
+    /// The plan shown over the notes now `steps`, none taking it away.
+    pub fn set_plan(&mut self, steps: &[String]) {
+        if self.plan != steps {
+            self.plan = steps.to_vec();
+            self.changes += 1;
         }
     }
 
@@ -383,17 +394,7 @@ impl Margin {
     /// buttons, ↑ back to where it was put and × to take it away. The
     /// rows last drawn while nothing they show changed.
     pub fn lines(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
-        let files: Vec<PathBuf> = (self.kept.notes.iter())
-            .filter_map(|note| match &note.body {
-                Body::File(path) => Some(workspace.join(path)),
-                Body::Markdown(_) => None,
-            })
-            .collect();
-        // Only the files notes show now are kept read.
-        self.reads.retain(|path, _| files.contains(path));
-        for path in &files {
-            self.look(path);
-        }
+        self.freshen(workspace);
         let from = (
             width,
             live,
@@ -411,9 +412,75 @@ impl Margin {
         rows
     }
 
+    /// The files notes show looked at again, so one changed counts as a
+    /// change; only those are kept read.
+    pub fn freshen(&mut self, workspace: &Path) {
+        let files: Vec<PathBuf> = (self.kept.notes.iter())
+            .filter_map(|note| match &note.body {
+                Body::File(path) => Some(workspace.join(path)),
+                Body::Markdown(_) => None,
+            })
+            .collect();
+        self.reads.retain(|path, _| files.contains(path));
+        for path in &files {
+            self.look(path);
+        }
+    }
+
+    /// How many times what the margin shows has changed: a note, a file a
+    /// note shows, or the margin shown or closed.
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    /// The note `id`'s rows `width` wide, files read from `workspace`, cut
+    /// at `most` rows with a row saying how many more there are.
+    pub fn body(
+        &mut self,
+        id: &str,
+        width: usize,
+        workspace: &Path,
+        most: usize,
+    ) -> Option<Vec<Line<'static>>> {
+        let note = self.note(id)?.body.clone();
+        let mut body = match &note {
+            Body::Markdown(text) => {
+                let mut markdown = Markdown::in_folder(workspace);
+                crate::transcript::markdown(&mut markdown, text, width, leads())
+            }
+            Body::File(path) => self.file_lines(workspace, path, width),
+        };
+        if body.len() > most {
+            let more = body.len() - most;
+            body.truncate(most);
+            body.push(Line::from(format!("{BODY}  … {more} more rows")).dim());
+        }
+        Some(body)
+    }
+
     fn draw(&mut self, width: usize, workspace: &Path, live: Option<i64>) -> Rows {
         let mut lines = Vec::new();
         let mut marks = Vec::new();
+        if !self.plan.is_empty() {
+            lines.push(Line::default());
+            let done = self
+                .plan
+                .iter()
+                .filter(|step| step.starts_with("[x]"))
+                .count();
+            lines.push(Line::from(vec![
+                Span::raw(" ☰ ").fg(Color::Cyan),
+                Span::raw("Plan").bold(),
+                Span::raw(format!("  {done}/{}", self.plan.len())).dim(),
+            ]));
+            for step in crate::calls::plan(&self.plan).under {
+                let lead = || Span::raw(BODY);
+                lines.extend(crate::transcript::wrap(step, width, lead(), lead()));
+            }
+        }
+        if self.kept.notes.is_empty() && !self.plan.is_empty() {
+            return (lines, marks);
+        }
         if self.kept.notes.is_empty() {
             lines.push(Line::default());
             lines.push(
@@ -429,19 +496,10 @@ impl Margin {
             lines.push(head);
             marks.push((at, Mark::Tag(Tag::Note(anchor(&note.call)))));
             marks.push((at, Mark::Buttons(buttons)));
-            let mut body = match &note.body {
-                Body::Markdown(text) => {
-                    let mut markdown = Markdown::in_folder(workspace);
-                    crate::transcript::markdown(&mut markdown, text, width, leads())
-                }
-                Body::File(path) => self.file_lines(workspace, path, width),
-            };
-            if body.len() > NOTE_ROWS {
-                let more = body.len() - NOTE_ROWS;
-                body.truncate(NOTE_ROWS);
-                body.push(Line::from(format!("{BODY}  … {more} more rows")).dim());
-            }
-            lines.extend(body);
+            lines.extend(
+                self.body(&note.id, width, workspace, NOTE_ROWS)
+                    .unwrap_or_default(),
+            );
         }
         (lines, marks)
     }

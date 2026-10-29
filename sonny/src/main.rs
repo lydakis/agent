@@ -1484,6 +1484,18 @@ struct App {
     margin: margin::Margin,
     under: Option<pane::Pane>,
     margin_focus: Option<u64>,
+    /// Notes drawn in the conversation where they were put, while the
+    /// margin is closed or the window has no room for it: by pin, each
+    /// note's id and title; whether the margin was beside the
+    /// conversation and how often it had changed when they were last
+    /// drawn so, and whether a note put since waits to be.
+    inline: HashMap<u64, (String, String)>,
+    folded: Option<(bool, u64)>,
+    refold: bool,
+    /// The `plan` calls drawn, by the number each is tagged with, and the
+    /// one drawn in full: the newest, where the margin cannot show it.
+    plans: HashMap<u64, Vec<String>>,
+    plan_full: Option<u64>,
     /// Where a note was put, to show in the conversation once it is drawn
     /// back that far; and how many more older pages may be read for it.
     jump: Option<(screen::Tag, u8)>,
@@ -2133,6 +2145,11 @@ impl App {
             margin: margin::Margin::default(),
             under: None,
             margin_focus: None,
+            inline: HashMap::new(),
+            folded: None,
+            refold: false,
+            plans: HashMap::new(),
+            plan_full: None,
             jump: None,
             pressed: Vec::new(),
             woken: Arc::new(tokio::sync::Notify::new()),
@@ -2627,6 +2644,9 @@ impl App {
         self.folds.clear();
         self.folding = None;
         self.relayed.clear();
+        self.plans.clear();
+        self.plan_full = None;
+        self.refold = true;
         self.tasks.clear();
         self.starting = None;
         self.held.clear();
@@ -2807,6 +2827,24 @@ impl App {
                     let button = format!("{}answer/{at}/{id}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
+            return;
+        }
+        // A plan said in a row of how far it has got: the newest shows
+        // in full in the margin, or here when the margin cannot show it.
+        if name == plan::TOOL
+            && !failed
+            && let Some(steps) = plan::steps(arguments)
+        {
+            let at = self.plans.len() as u64;
+            let lines = transcript::plan_lines(&steps, false, self.prose());
+            let from = self.pending.len() + usize::from(self.any_history);
+            let rows = lines.len();
+            self.commit(lines);
+            let tag = screen::Mark::Tag(screen::Tag::Plan(at));
+            self.marks
+                .extend((from..from + rows).map(|row| (row, tag.clone())));
+            self.plans.insert(at, steps);
+            self.refold = true;
             return;
         }
         // A task started stands out, and a click opens it in the pane.
@@ -3169,18 +3207,99 @@ impl App {
             (_, true) => format!("took {id} away"),
             _ => format!("changed {id}"),
         };
-        let line = Line::from(vec![
-            Span::raw("  ✎ ").fg(Color::Yellow).dim(),
-            Span::raw(what).dim().underlined(),
-            Span::raw(" · in the margin").dim(),
-        ]);
-        self.commit(vec![line]);
+        self.commit(vec![note_marker(what, true)]);
+        // Drawn out where it was put, when the margin cannot show it.
+        self.refold = true;
         if let Some(note) = note {
             let pin = margin::anchor(&note.call);
             let link = format!("{}note/{id}", screen::BUTTON);
             self.mark_last(screen::Mark::Tag(screen::Tag::Note(pin)));
             self.mark_last(screen::Mark::Link(link));
         }
+    }
+
+    /// The notes drawn out in the conversation where they were put when
+    /// the margin is not `beside` it, each its marker alone where it is:
+    /// done again only once that, or a note, changed.
+    fn fold_notes(&mut self, beside: bool) {
+        let workspace = std::path::PathBuf::from(&self.workspace);
+        if !beside {
+            self.margin.freshen(&workspace);
+        }
+        let key = (beside, self.margin.changes());
+        if !std::mem::take(&mut self.refold) && self.folded == Some(key) {
+            return;
+        }
+        self.folded = Some(key);
+        self.fold_plan(beside);
+        let notes: Vec<(u64, String, String)> = (self.margin.notes().iter())
+            .map(|note| {
+                (
+                    margin::anchor(&note.call),
+                    note.id.clone(),
+                    note.title.clone(),
+                )
+            })
+            .collect();
+        // Back to their markers: all of them beside the margin, else those
+        // taken away.
+        let back: Vec<u64> = (self.inline.keys())
+            .filter(|pin| beside || !notes.iter().any(|(at, ..)| at == *pin))
+            .copied()
+            .collect();
+        for pin in back {
+            let (id, title) = self.inline.remove(&pin).expect("drawn out");
+            let link = screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
+            let line = note_marker(title, true);
+            (self.screen).replace_tagged(screen::Tag::Note(pin), vec![line], vec![(0, link)]);
+        }
+        if beside {
+            return;
+        }
+        let width = self.prose();
+        for (pin, id, title) in notes {
+            let tag = screen::Tag::Note(pin);
+            if !self.screen.has(tag) {
+                continue;
+            }
+            let body = (self.margin.body(&id, width, &workspace, INLINE_ROWS)).unwrap_or_default();
+            let link = || screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
+            let mut marks = vec![(0, link())];
+            // The rest of it a click away, in the margin.
+            if body.len() > INLINE_ROWS {
+                marks.push((body.len(), link()));
+            }
+            let mut lines = vec![note_marker(title.clone(), false)];
+            lines.extend(body);
+            self.screen.replace_tagged(tag, lines, marks);
+            self.inline.insert(pin, (id, title));
+        }
+    }
+
+    /// The newest plan drawn shown in the margin, and in full where it
+    /// was set when the margin is not `beside` the conversation; every
+    /// other plan call a row of how far it had got.
+    fn fold_plan(&mut self, beside: bool) {
+        let newest = (self.plans.keys())
+            .filter_map(|at| Some((self.screen.row_of(screen::Tag::Plan(*at))?, *at)))
+            .max()
+            .map(|(_, at)| at);
+        let steps = newest.and_then(|at| self.plans.get(&at)).cloned();
+        self.margin.set_plan(steps.as_deref().unwrap_or_default());
+        let full = newest.filter(|_| !beside);
+        if full == self.plan_full {
+            return;
+        }
+        let width = self.prose();
+        for (at, full) in [(self.plan_full, false), (full, true)] {
+            let Some(steps) = at.and_then(|at| self.plans.get(&at)) else {
+                continue;
+            };
+            let lines = transcript::plan_lines(steps, full, width);
+            let tag = screen::Tag::Plan(at.expect("found"));
+            self.screen.replace_tagged(tag, lines, Vec::new());
+        }
+        self.plan_full = full;
     }
 
     /// A `margin` call applied as it starts, so a note shows while the
@@ -6490,6 +6609,9 @@ impl App {
         open_rows.drain(..hidden);
         let live_rows = open_rows.len().max(1) as u16;
         self.flush();
+        let beside =
+            !self.margin.closed() && pane::margin_width(size.width, PROSE as u16).is_some();
+        self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
         if let Some(at) = shown
@@ -7159,6 +7281,24 @@ fn first_line(text: &str) -> String {
 
 /// How many pages older a jump to a note's place reads before giving up.
 const JUMP_PAGES: u8 = 20;
+
+/// The most rows of a note drawn in the conversation, when the margin
+/// cannot show it: a picture and a few lines around it.
+const INLINE_ROWS: usize = 40;
+
+/// Where a note was put in the conversation: `title`, said to be in the
+/// margin when it is `beside` the conversation, else the note's own head
+/// over its rows.
+fn note_marker(title: String, beside: bool) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  ✎ ").fg(Color::Yellow).dim(),
+        Span::raw(title).dim().underlined(),
+    ];
+    if beside {
+        spans.push(Span::raw(" · in the margin").dim());
+    }
+    Line::from(spans)
+}
 
 /// Whether a message of the person's is drawn elsewhere than as a
 /// message: a reaction under its reply, a note taken away in the margin.
@@ -9187,6 +9327,105 @@ mod tests {
         app.close_pane(true);
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_note_the_margin_cannot_show_is_drawn_where_it_was_put() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
+        let post = json!({"id": "routing", "title": "Routing today", "markdown": "a to b"});
+        app.daemon(turn_event("tool_started", 3, call("m1", post)))
+            .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m1"})))
+            .await;
+        app.flush();
+        app.commit(vec![Line::from("after")]);
+        app.flush();
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        // Too narrow for the margin: the note where it was put.
+        app.fold_notes(false);
+        assert_eq!(texts(&app)[..], ["✎ Routing today", "a to b", "after"]);
+        // Changed, it changes there.
+        let update = json!({"id": "routing", "markdown": "a to c"});
+        app.daemon(turn_event("tool_started", 3, call("m2", update)))
+            .await;
+        app.fold_notes(false);
+        assert_eq!(texts(&app)[..], ["✎ Routing today", "a to c", "after"]);
+        // With room for the margin, its marker alone again.
+        app.fold_notes(true);
+        assert_eq!(
+            texts(&app)[..],
+            ["✎ Routing today · in the margin", "after"]
+        );
+        // Closed, out again; taken away, its marker alone.
+        app.fold_notes(false);
+        assert_eq!(texts(&app).len(), 3);
+        app.margin.remove("routing", None);
+        app.fold_notes(false);
+        assert_eq!(
+            texts(&app)[..],
+            ["✎ Routing today · in the margin", "after"]
+        );
+        let link = Some("sonny:note/routing".to_owned());
+        assert!(app.screen.links().contains(&link));
+    }
+
+    #[tokio::test]
+    async fn one_plan_shows_however_often_it_changes() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        let plans = [
+            json!({"steps": ["[>] Read", "[ ] Fix", "[ ] Test"]}),
+            json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]}),
+        ];
+        for (n, plan) in plans.iter().enumerate() {
+            app.commit_call(&format!("p{n}"), "plan", plan, "Plan set.", false);
+            app.commit(vec![Line::from(format!("reply {n}"))]);
+        }
+        app.flush();
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        // Beside the margin: each a row, the newest plan in the margin.
+        app.fold_notes(true);
+        assert_eq!(
+            texts(&app)[..],
+            [
+                "• Updated the plan · 0/3 · → Read",
+                "reply 0",
+                "• Updated the plan · 1/3 · → Fix",
+                "reply 1"
+            ]
+        );
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
+        assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
+        assert!(margin.iter().any(|r| r.contains("→ Fix")));
+        assert!(!margin.iter().any(|r| r.contains("→ Read")));
+        // Without it: the newest in full where it was set, the rest a row.
+        app.fold_notes(false);
+        let rows = texts(&app);
+        assert_eq!(rows[0], "• Updated the plan · 0/3 · → Read");
+        assert_eq!(rows[2], "• Updated the plan");
+        assert!(rows[3..6].iter().any(|r| r.contains("→ Fix")), "{rows:?}");
+        assert_eq!(rows.last().unwrap(), "reply 1");
+        // A newer plan takes the full rows over.
+        let done = json!({"steps": ["[x] Read", "[x] Fix", "[x] Test"]});
+        app.commit_call("p2", "plan", &done, "Plan set.", false);
+        app.flush();
+        app.fold_notes(false);
+        let rows = texts(&app);
+        assert_eq!(rows[2], "• Updated the plan · 1/3 · → Fix");
+        assert!(rows.iter().any(|r| r.contains("✔ Test")), "{rows:?}");
     }
 
     #[tokio::test]
