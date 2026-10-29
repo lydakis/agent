@@ -191,10 +191,8 @@ fn usage() -> String {
      and subscribe to the lookout with tools Sonny gives them, which the lookout answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
-     sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon, wakes\n\
-     it when its tasks need it and answers its agents' calls of Sonny's tools; Sonny\n\
-     starts one. sonny lookout --replay --judge SPEC[,SPEC]... [--limit N] runs its\n\
-     checks over what the store kept.\n\
+     sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
+     and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
@@ -441,8 +439,8 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
     Ok(())
 }
 
-/// The lookout, `sonny lookout`, which wakes leads when their tasks need
-/// them and answers Sonny's tools: started detached, logging beside the
+/// The lookout, `sonny lookout`, which tells leads what happens in their
+/// tasks and answers Sonny's tools: started detached, logging beside the
 /// store. One already watching this daemon keeps it, and the new one
 /// exits.
 fn start_lookout(options: &Options) -> Result<(), String> {
@@ -454,8 +452,6 @@ fn start_lookout(options: &Options) -> Result<(), String> {
         .append(true)
         .open(&log)
         .map_err(|e| e.to_string())?;
-    // The judge's settings and keys are in Agent's env file, as for the
-    // approver.
     let mut command = agent_command(&me)?;
     agent_client::own_session(&mut command);
     let mut child = command

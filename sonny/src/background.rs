@@ -33,8 +33,8 @@ pub struct Item {
     pub when: String,
     /// What it does: a trigger's message, a subscription's watch.
     pub what: String,
-    /// What came of it: a trigger's sends and last fire, a subscription's
-    /// checks in the last day.
+    /// What came of it: a trigger's sends and last fire; whether a
+    /// subscription is Sonny's own.
     pub facts: Vec<String>,
     /// Who gets a trigger's answers, when not the agent it messages.
     pub reply_to: Option<String>,
@@ -73,7 +73,10 @@ pub fn read(store: &Path, store_id: Option<&str>, ours: impl Fn(&str) -> bool) -
                 bots: vec![subscriber.clone()],
                 when: String::new(),
                 what,
-                facts: Vec::new(),
+                facts: match own {
+                    true => vec!["Sonny's own, for the lead's tasks".into()],
+                    false => Vec::new(),
+                },
                 reply_to: None,
                 own,
             });
@@ -219,10 +222,9 @@ impl View {
     /// Read it all again, the pick kept on the same row where it still is.
     pub fn reload(&mut self) {
         let picked = self.items.get(self.selected).map(key_of);
-        let items = read(&self.store, self.store_id.as_deref(), |b| {
+        let mut items = read(&self.store, self.store_id.as_deref(), |b| {
             self.scope.takes(b)
         });
-        let mut items = self.with_checks(items);
         items.sort_by_key(|item| item.kind == Kind::Subscription);
         self.items = items;
         self.selected = picked
@@ -234,24 +236,6 @@ impl View {
             self.confirm = None;
         }
         self.lookout = lookout::status(&self.store, &self.bot);
-    }
-
-    fn with_checks(&self, mut items: Vec<Item>) -> Vec<Item> {
-        let mut seen = std::collections::HashMap::new();
-        for item in items.iter_mut().filter(|i| i.kind == Kind::Subscription) {
-            let checks = seen
-                .entry(item.bot.clone())
-                .or_insert_with(|| lookout::checks(&self.store, &item.bot));
-            let n = checks.get(&item.name).copied().unwrap_or(0);
-            item.facts.push(format!(
-                "{n} check{} in the last day",
-                if n == 1 { "" } else { "s" }
-            ));
-            if item.own {
-                item.facts.push("Sonny's own, for the lead's tasks".into());
-            }
-        }
-        items
     }
 
     /// The item a removal was asked for is kept: a key went elsewhere.

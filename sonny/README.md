@@ -142,7 +142,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A new lead's effort | `[sonny] lead_effort` | `effort` |
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
-| The approver's and lookout's judge | `[judge] model`, `effort` | |
+| The approver's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |

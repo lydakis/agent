@@ -130,8 +130,8 @@ class AcpTests(ModelFixture):
                     'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com',
                     'T3_ACP_MCP_ENDPOINT': f'http://127.0.0.1:{self.t3.server_port}/mcp',
                     'T3_ACP_MCP_AUTHORIZATION': 'Bearer thread-1'}
-        # The lookout the threads find running, judging nothing.
-        lookout = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'off', '--store', str(self.store),
+        # The lookout the threads find running.
+        lookout = subprocess.Popen([str(self.sonny), 'lookout', '--store', str(self.store),
                                     '--socket', str(self.daemon.socket_path)],
                                    env=self.env, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (lookout.kill(), lookout.wait(timeout=5), lookout.stdout.close()))
