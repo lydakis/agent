@@ -1664,6 +1664,7 @@ fn drawn(
                 .join(", "),
         ),
         "echo" | "note" => ("Noted", field("text")),
+        "exec" => ("Ran", scripted(output.unwrap_or(""))),
         _ => ("Called", format!("{name} {arguments}")),
     };
     let mut header = Line::from(vec![
@@ -1733,9 +1734,38 @@ fn drawn(
             }
         }
         "shell" | "wait" => out.extend(preview(output.unwrap_or(""), width)),
+        "exec" => {
+            let output = output.unwrap_or("");
+            let printed = output
+                .split_once("Output:\n")
+                .map_or(output, |(_, printed)| printed);
+            out.extend(preview(printed, width));
+        }
         _ => {}
     }
     out
+}
+
+/// An `exec` call as one line: the MCP calls its script made, by server,
+/// from the head of its result, and how it ended when not well.
+fn scripted(output: &str) -> String {
+    let head = output.split_once("Output:\n").map_or("", |(head, _)| head);
+    let mut line = match head.lines().find_map(|l| l.strip_prefix("MCP calls: ")) {
+        Some(calls) => {
+            let total: usize = (calls.split(", "))
+                .filter_map(|each| each.rsplit_once(' ')?.1.parse::<usize>().ok())
+                .sum();
+            let noun = if total == 1 { "call" } else { "calls" };
+            format!("a script: {total} MCP {noun} ({calls})")
+        }
+        None => "a script".to_owned(),
+    };
+    if let Some(status) = head.lines().next().filter(|l| *l != "Script completed")
+        && let Some(how) = status.strip_prefix("Script ")
+    {
+        line.push_str(&format!(", {how}"));
+    }
+    line
 }
 
 /// The most rows an edit's diff, or a diff a command printed, takes.
@@ -2495,6 +2525,21 @@ mod tests {
         std::fs::write(dir.join("f"), "a\n").unwrap();
         assert_eq!(current(&dir.join("f")).as_deref(), Some("a\n"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_script_is_one_line_of_its_mcp_calls_over_what_it_printed() {
+        let input = serde_json::json!({"input": "await tools.mcp__github__a({});"});
+        let output = "Script completed\nWall time 1.2 seconds\nMCP calls: github 10, linear 2\nOutput:\n3 open issues";
+        let rows = text(&tool("exec", &input, Some(output), false, "/", 80));
+        assert_eq!(
+            rows[0],
+            "• Ran a script: 12 MCP calls (github 10, linear 2)"
+        );
+        assert!(rows[1].contains("3 open issues"), "{rows:#?}");
+        let failed = "Script terminated: it ran out of time\nWall time 600.0 seconds\nOutput:\n";
+        let rows = text(&tool("exec", &input, Some(failed), true, "/", 80));
+        assert_eq!(rows[0], "• Ran a script, terminated: it ran out of time");
     }
 
     #[test]

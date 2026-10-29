@@ -19,6 +19,7 @@ mod cmux;
 mod declared;
 mod diff;
 mod embed;
+mod exec;
 mod herdr;
 mod highlight;
 mod html;
@@ -30,6 +31,7 @@ mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
 mod math;
+mod mcp;
 mod mermaid;
 mod models;
 mod mux;
@@ -662,6 +664,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1238,7 +1241,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
 /// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 16] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1259,6 +1262,7 @@ const COMMANDS: [(&str, &str); 15] = [
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
     ),
+    ("/mcp", "the MCP servers agents' scripts call"),
     ("/sound", "the chime when work ends, on or off"),
     (
         "/verbose",
@@ -5099,6 +5103,20 @@ impl App {
                 self.notice = Some("/background is for the agent itself, not a side chat".into());
             } else {
                 self.background();
+            }
+            return;
+        }
+        if prompt == "/mcp" {
+            self.input.clear();
+            if full() {
+                let lines = mcp::card();
+                // In the place of `/status` or `/background`, if open.
+                self.watch = None;
+                let mut pane = pane::Pane::card("/mcp", "esc closes");
+                pane.set_card(lines, "esc closes");
+                self.open_pane(pane);
+            } else {
+                self.notice = Some(mcp::summary());
             }
             return;
         }
