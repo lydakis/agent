@@ -755,7 +755,9 @@ impl Screen {
     /// but those `looked` through already: to draw before stepping, so
     /// what it holds is found too.
     pub fn find_gap(&mut self, older: bool, looked: &[u64]) -> Option<u64> {
-        let finding = (self.finding.as_ref()).filter(|f| f.at != AGAIN && f.laid == self.laid)?;
+        // Nothing looked for, nothing to draw for it.
+        let finding = (self.finding.as_ref())
+            .filter(|f| !f.query.is_empty() && f.at != AGAIN && f.laid == self.laid)?;
         let bottom = self.shown.len() - self.back.min(self.shown.len());
         let starts: Vec<usize> = finding.hits.iter().map(|(start, _)| start.0).collect();
         let at = finding.at;
@@ -2078,6 +2080,10 @@ mod tests {
             screen.prepend(1, lines(0..7_000, "middle"));
             screen.prepend(2, lines(0..7_000, "old"));
             drawn(&mut screen, area);
+            // Nothing typed yet, nothing to draw for it.
+            screen.find("");
+            drawn(&mut screen, area);
+            assert_eq!(screen.find_gap(older, &[]), None);
             screen.find("old 699");
             drawn(&mut screen, area);
             assert_eq!(screen.found(), Some((0, 0)));

@@ -2571,9 +2571,11 @@ impl App {
                 }
             }
             // A page let go drawn again before the view reaches it, or
-            // once the way up to the first turn is done.
+            // once the way up to the first turn, or a step finding, is
+            // done: never letting go a page found in before it is shown.
             if full()
                 && !self.to_first
+                && self.find_step.is_none()
                 && let Some(page) = self.screen.wanted()
             {
                 self.draw_again(page).await;
@@ -5001,6 +5003,7 @@ impl App {
             Event::Paste(text) if let Some(query) = &mut self.finding => {
                 query.extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
                 self.screen.find(query);
+                self.find_step = None;
                 return true;
             }
             Event::Mouse(mouse) => {
@@ -5217,13 +5220,16 @@ impl App {
                 KeyCode::Char('f' | 'p') if ctrl => self.find_step = Some((true, Vec::new())),
                 KeyCode::Down => self.find_step = Some((false, Vec::new())),
                 KeyCode::Char('n') if ctrl => self.find_step = Some((false, Vec::new())),
+                // Another text: a step for the last one goes no further.
                 KeyCode::Backspace => {
                     query.pop();
                     self.screen.find(query);
+                    self.find_step = None;
                 }
                 KeyCode::Char(c) if !ctrl => {
                     query.push(c);
                     self.screen.find(query);
+                    self.find_step = None;
                 }
                 KeyCode::PageUp => self.page_up(),
                 KeyCode::PageDown => self.screen.page(false),
