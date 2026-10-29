@@ -661,11 +661,12 @@ the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are.
 
 The pane's place, when nothing else is open there, is the margin. Its
-first row is a glance at what runs for the agent: its tasks at work and
-what waits on you (a click opens `/status`), `↻` for its triggers and
-subscriptions (a click opens `/background`), and its context, each left
-out when there is nothing to say; the footer stops saying them while it
-shows. Under it are the notes the agent keeps there with its `margin`
+first row is a glance at what runs for the agent: `↻` for its triggers
+and subscriptions (a click opens `/background`), and its context, each
+left out when there is nothing to say; the footer stops saying them while
+it shows. Under the composer, the footer counts the other agents at work
+(cyan `●`) and what needs you (yellow `●`), and a click on the count
+opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the
@@ -673,11 +674,15 @@ margin` row there scrolls the margin to it when clicked, and the note's
 `↑` scrolls the conversation back there, drawing older messages again
 when it is further back. Its `×` takes the note away and tells the agent
 with its next call. Posting a note's id again changes it in place, so a
-live note stays one note. A file, `/status`, `/background` or a side
+live note stays one note. A lead can show a task's note as
+`from: "task/id"`, which lookout names when the task puts one up: it
+shows as the task keeps it, follows the task's title until the lead gives
+its own, and stays once the task is gone. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
-shows by itself when the window leaves the conversation its 100 columns
-and the margin 40 more; in a narrower one the footer counts the notes
+opens by itself with its first note, once the window leaves the
+conversation its 100 columns and the margin 40 more, and goes once it
+holds nothing; closed with Esc, it stays closed as notes come; in a narrower one the footer counts the notes
 (`✎ 3`), and Tab with nothing typed shows the margin. Where the margin
 cannot show, because the window is narrower or it is closed, each note is
 drawn in the conversation where it was put instead of its marker, up to

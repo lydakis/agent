@@ -6228,7 +6228,8 @@ impl App {
     }
 
     /// The margin back beside the conversation when nothing else is
-    /// there, unless the person closed it.
+    /// there and it holds something, unless the person closed it: out of
+    /// the way again once it holds nothing, unless the keys are in it.
     fn margin_back(&mut self) {
         if self.margin.closed() {
             self.under = None;
@@ -6236,14 +6237,20 @@ impl App {
                 over.over = false;
             }
         }
-        if self.pane.is_none() && !self.margin.closed() {
+        let empty = self.margin.is_empty();
+        if empty && !self.pane_keys && self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
+            self.pane = None;
+        }
+        if self.pane.is_none() && !self.margin.closed() && (!empty || self.pane_keys) {
             self.pane = Some(self.under.take().unwrap_or_else(pane::Pane::margin));
         }
     }
 
     /// `/margin`: the margin shown, with the keys, or closed.
     fn toggle_margin(&mut self) {
-        let shown = !self.margin.closed();
+        // Out of the way while it holds nothing, it is not shown either.
+        let shown = !self.margin.closed()
+            && (self.under.is_some() || self.pane.as_ref().is_some_and(pane::Pane::is_margin));
         self.margin.close(shown);
         if shown {
             if self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
@@ -6260,8 +6267,8 @@ impl App {
                 self.under = Some(pane::Pane::margin());
             }
             None => {
-                self.margin_back();
                 self.pane_keys = true;
+                self.margin_back();
             }
         }
     }
@@ -11171,8 +11178,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_margin_opens_with_its_first_note_and_goes_once_it_holds_none() {
+        let mut app = app(daemon_with(json!([])).await);
+        let margin = |app: &App| app.pane.as_ref().is_some_and(pane::Pane::is_margin);
+        app.margin_back();
+        assert!(!margin(&app));
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.margin_back();
+        assert!(margin(&app));
+        app.margin
+            .apply("m2", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin_back();
+        assert!(!margin(&app) && !app.margin.closed());
+        // Asked for, it shows with nothing in it.
+        app.toggle_margin();
+        app.margin_back();
+        assert!(margin(&app) && app.pane_keys && !app.margin.closed());
+        // Closed by the person, a note does not open it again.
+        app.close_pane(true);
+        app.margin.apply("m3", &post, None, None);
+        app.margin_back();
+        assert!(!margin(&app) && app.margin.closed());
+    }
+
+    #[tokio::test]
     async fn what_opens_lays_over_the_margin_and_esc_steps_back_to_it() {
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
@@ -11200,6 +11234,8 @@ mod tests {
     #[tokio::test]
     async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
         assert!(app.step_pane(true));
@@ -11217,6 +11253,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.md"), "# A\n").unwrap();
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         app.follow(&format!("file://{}", dir.join("a.md").display()));
         assert!(app.pane.as_ref().is_some_and(|p| !p.is_margin() && p.over));
@@ -11340,6 +11378,8 @@ mod tests {
     #[tokio::test]
     async fn the_margin_shows_by_itself_only_where_the_conversation_keeps_its_width() {
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
         assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(69)));
@@ -11351,8 +11391,6 @@ mod tests {
         assert_eq!(margin.map(|m| m.width), Some(64));
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
         app.follow("sonny:note/repro");
         let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert!(margin.is_some());

@@ -462,6 +462,11 @@ impl Margin {
         self.kept.notes.iter().find(|note| note.id == id)
     }
 
+    /// Whether it holds no note and no plan.
+    pub fn is_empty(&self) -> bool {
+        self.kept.notes.is_empty() && self.plan.is_empty()
+    }
+
     /// Whether the person closed the margin.
     pub fn closed(&self) -> bool {
         self.kept.closed
