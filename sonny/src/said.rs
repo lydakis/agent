@@ -5,6 +5,8 @@
 //! left out, so the cleanup learns nothing from text no person wrote.
 use agent_client::Client;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::Path;
 
 /// The most of the person's words one call returns; the newest are kept.
 const BYTES: usize = 96 * 1024;
@@ -15,7 +17,7 @@ pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Every message the person wrote to an agent in a turn that ran at or
 /// after `since_ms`, newest first, each with its agent, turn, and the
-/// project whose memory the agent reads (null for none).
+/// project whose memory the turn's folder reads (null for none).
 pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
     let failed = |e: agent_client::Error| format!("said_unread: {e}");
     let mut said = Vec::new();
@@ -27,18 +29,23 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
             .map_err(failed)?;
         for bot in page["bots"].as_array().into_iter().flatten() {
             let name = bot["name"].as_str().unwrap_or_default();
-            // The project whose memory its folder reads, as memory finds it.
-            let project = bot["workspace"]
-                .as_str()
-                .and_then(|dir| agent_client::policy::project(std::path::Path::new(dir)).ok())
-                .flatten();
-            if let Some(first) = first_turn(client, name, since_ms).await.map_err(failed)? {
-                let mut found = words(client, name, first).await.map_err(failed)?;
-                for (_, entry) in &mut found {
-                    entry["project"] = json!(project);
+            let projects = turns_since(client, name, since_ms).await.map_err(failed)?;
+            let Some(first) = projects.keys().min().copied() else {
+                continue;
+            };
+            walk(client, name, first, |turn, entry| {
+                if let Some(node) = crate::lookout::said_by_person(entry) {
+                    let text = cut(crate::text(&entry["item"]));
+                    let project = projects.get(&turn).cloned().flatten();
+                    said.push((
+                        node,
+                        json!({"bot": name, "turn": turn, "text": text, "project": project}),
+                    ));
                 }
-                said.extend(found);
-            }
+                false
+            })
+            .await
+            .map_err(failed)?;
         }
         after = page["next_after"].clone();
         if after.is_null() {
@@ -61,32 +68,55 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
     Ok(json!({"since_ms": since_ms, "said": kept, "cut": cut}))
 }
 
-/// The oldest turn of `bot` that was running at or after `since_ms`.
-async fn first_turn(
+/// The turns of `bot` that were running at or after `since_ms`, each with
+/// the project whose memory its folder reads, as memory finds it: a bot
+/// that moved between projects keeps each turn's own.
+async fn turns_since(
     client: &Client,
     bot: &str,
     since_ms: i64,
-) -> Result<Option<i64>, agent_client::Error> {
-    let page = client
-        .request("turns", json!({"bot": bot, "newest": true, "limit": 256}))
-        .await?;
-    Ok(page["turns"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take_while(|turn| turn["finished_ms"].as_i64().is_none_or(|ms| ms >= since_ms))
-        .filter_map(|turn| turn["turn"].as_i64())
-        .min())
+) -> Result<HashMap<i64, Option<String>>, agent_client::Error> {
+    let mut found = HashMap::new();
+    let mut folders: HashMap<String, Option<String>> = HashMap::new();
+    let mut before = Value::Null;
+    loop {
+        let page = client
+            .request(
+                "turns",
+                json!({"bot": bot, "newest": true, "limit": 256, "before": before}),
+            )
+            .await?;
+        let turns = page["turns"].as_array().cloned().unwrap_or_default();
+        let ran = |turn: &&Value| turn["finished_ms"].as_i64().is_none_or(|ms| ms >= since_ms);
+        let all = turns.iter().take_while(ran).count() == turns.len();
+        for turn in turns.iter().take_while(ran) {
+            let Some(id) = turn["turn"].as_i64() else {
+                continue;
+            };
+            let project = match turn["workspace"].as_str() {
+                Some(dir) => folders
+                    .entry(dir.to_owned())
+                    .or_insert_with(|| agent_client::policy::project(Path::new(dir)).ok().flatten())
+                    .clone(),
+                None => None,
+            };
+            found.insert(id, project);
+        }
+        before = page["next_before"].clone();
+        if !all || before.is_null() {
+            return Ok(found);
+        }
+    }
 }
 
-/// The person's messages to `bot` in its turns from `first` on, each with
-/// its node, newest first.
-async fn words(
+/// Each history entry of `bot` in its turns from `first` on, newest first,
+/// with its turn, until `visit` says to stop.
+pub async fn walk(
     client: &Client,
     bot: &str,
     first: i64,
-) -> Result<Vec<(i64, Value)>, agent_client::Error> {
-    let mut found = Vec::new();
+    mut visit: impl FnMut(i64, &Value) -> bool,
+) -> Result<(), agent_client::Error> {
     let mut from = Value::Null;
     loop {
         let page = client
@@ -103,6 +133,7 @@ async fn words(
             .into_iter()
             .take_while(|(_, turn)| *turn >= first)
             .collect();
+        let turns: HashMap<i64, i64> = wanted.iter().copied().collect();
         let mut next = 0;
         while next < wanted.len() {
             let chunk: Vec<i64> = wanted[next..(next + 100).min(wanted.len())]
@@ -115,26 +146,21 @@ async fn words(
             // Fewer than asked when they are large; at least one.
             let items = items["items"].as_array().cloned().unwrap_or_default();
             if items.is_empty() {
-                return Ok(found);
+                return Ok(());
             }
             next += items.len();
             for entry in &items {
-                let Some(node) = crate::lookout::said_by_person(entry) else {
-                    continue;
-                };
-                let turn = wanted
-                    .iter()
-                    .find(|(id, _)| *id == node)
-                    .map(|(_, turn)| *turn);
-                found.push((
-                    node,
-                    json!({"bot": bot, "turn": turn, "text": cut(crate::text(&entry["item"]))}),
-                ));
+                let turn = entry["node"].as_i64().and_then(|node| turns.get(&node));
+                if let Some(turn) = turn
+                    && visit(*turn, entry)
+                {
+                    return Ok(());
+                }
             }
         }
         from = page["next_from"].clone();
         if older || wanted.is_empty() || from.is_null() {
-            return Ok(found);
+            return Ok(());
         }
     }
 }

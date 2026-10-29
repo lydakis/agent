@@ -710,39 +710,43 @@ fn left(call: &Value) -> Duration {
 
 /// Whether turn `turn` of `bot` has read outside content so far, so a fact
 /// it saves may carry words no person wrote, as Codex leaves out of memory
-/// the sessions that used MCP or web search. Its newest items are looked at;
-/// a turn longer than one page of them counts as having read.
+/// the sessions that used MCP or web search. A turn whose history cannot be
+/// read counts as having read.
 async fn read_outside(client: &Client, bot: &str, turn: i64) -> bool {
-    const PAGE: usize = 400;
-    let items = crate::lookout::recent(client, bot, PAGE, false, None).await;
-    let mine: Vec<&Value> = items
-        .iter()
-        .take_while(|(of, _)| *of == Some(turn))
-        .map(|(_, item)| item)
-        .collect();
-    (items.len() == PAGE && mine.len() == PAGE) || mine.into_iter().any(outside)
+    let mut read = false;
+    let walked = crate::said::walk(client, bot, turn, |_, entry| {
+        read = outside(&entry["item"]);
+        read
+    })
+    .await;
+    walked.is_err() || read
 }
 
 /// A history item that brought in outside content: a provider's own web
-/// search or fetch, `web_fetch`, or an MCP server through `exec`.
+/// search or fetch, `web_fetch`, or an MCP server through `exec`, as any
+/// provider stores the call.
 fn outside(item: &Value) -> bool {
-    match item["type"].as_str() {
-        Some("web_search_call") => true,
-        Some("function_call" | "custom_tool_call") => {
-            item["namespace"] == "web"
-                || matches!(
-                    item["name"].as_str(),
-                    Some("web_fetch" | "web_search" | crate::exec::NAME)
-                )
-        }
-        _ => item["content"].as_array().is_some_and(|parts| {
-            parts.iter().any(|part| {
-                part["type"]
-                    .as_str()
-                    .is_some_and(|kind| kind == "server_tool_use" || kind.ends_with("_tool_result"))
+    let hosted = item["content"].as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            part["type"]
+                .as_str()
+                .is_some_and(|kind| kind == "server_tool_use" || kind.ends_with("_tool_result"))
+        })
+    });
+    hosted
+        || crate::responses(item)
+            .iter()
+            .any(|call| match call["type"].as_str() {
+                Some("web_search_call") => true,
+                Some("function_call") => {
+                    call["namespace"] == "web"
+                        || matches!(
+                            call["name"].as_str(),
+                            Some("web_fetch" | "web_search" | crate::exec::NAME)
+                        )
+                }
+                _ => false,
             })
-        }),
-    }
 }
 
 /// One call answered by `sonny tool NAME`, run as the calling agent's shell
@@ -958,6 +962,11 @@ mod tests {
                 {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"}]}),
             json!({"type": "message", "role": "user", "content": [
                 {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_2"}]}),
+            // Anthropic keeps the daemon's own tools' calls in its message.
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Reading."},
+                {"type": "tool_use", "id": "t2", "name": "web_fetch", "input": {}}]}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t3", "name": "exec", "input": {}}]}),
         ];
         for item in &read {
             assert!(outside(item), "{item}");
@@ -969,6 +978,8 @@ mod tests {
             json!({"type": "message", "role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1"}, {"type": "input_text", "text": "hi"}]}),
             json!({"type": "reasoning"}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t4", "name": "shell", "input": {}}]}),
         ];
         for item in &own {
             assert!(!outside(item), "{item}");

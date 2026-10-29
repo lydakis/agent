@@ -7575,6 +7575,13 @@ mod tests {
             json!({"type": "message", "role": "user",
             "content": [{"type": "input_text", "text": text}]})
         };
+        // The agent moved into the shop project after turn 6: each message
+        // keeps the project of the folder its turn ran in.
+        let shop = std::env::temp_dir().join(format!("said-shop-{}", std::process::id()));
+        std::fs::create_dir_all(shop.join(".agents")).unwrap();
+        std::fs::write(shop.join(".agents/project.toml"), "name = \"shop\"\n").unwrap();
+        let elsewhere = std::env::temp_dir();
+        let (shop_, elsewhere_) = (shop.clone(), elsewhere.clone());
         let client = daemon_answering(move |asked| {
             let args = asked;
             match (
@@ -7583,9 +7590,13 @@ mod tests {
             ) {
                 ("bots", _) => json!({"bots": [{"name": "shop.lead"}, {"name": "shop.old"}],
                     "next_after": null}),
+                // Turns come a page at a time.
+                ("turns", Some("shop.lead")) if args["before"].is_null() => json!({"turns": [
+                    {"turn": 7, "finished_ms": null, "workspace": shop_}], "next_before": 7}),
                 ("turns", Some("shop.lead")) => json!({"turns": [
-                    {"turn": 7, "finished_ms": null}, {"turn": 6, "finished_ms": 2000},
-                    {"turn": 5, "finished_ms": 500}]}),
+                    {"turn": 6, "finished_ms": 2000, "workspace": elsewhere_},
+                    {"turn": 5, "finished_ms": 500, "workspace": elsewhere_}],
+                    "next_before": 5}),
                 ("turns", _) => json!({"turns": [{"turn": 3, "finished_ms": 100}]}),
                 ("history_nodes", Some("shop.lead")) => json!({"nodes": [
                     {"node": 30, "turn": 7}, {"node": 29, "turn": 7}, {"node": 28, "turn": 6},
@@ -7621,10 +7632,11 @@ mod tests {
             read,
             json!({"since_ms": 1000, "cut": false, "said": [
                 {"bot": "shop.lead", "turn": 7, "text": "Keep Bedrock out of evals.",
-                    "project": null},
+                    "project": "shop"},
                 {"bot": "shop.lead", "turn": 6, "text": "Squash-merge from now on.",
                     "project": null}]})
         );
+        std::fs::remove_dir_all(shop).unwrap();
     }
 
     #[tokio::test]

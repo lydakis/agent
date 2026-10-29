@@ -648,7 +648,10 @@ fn check(dir: &Path) -> Value {
 /// saved since, and `finish` commits the cleanup, or reverts it when it
 /// removed more facts than the loss guard allows.
 const CLEANUP: &str = ".cleanup";
-const IGNORE: &str = ".lock\n.reads\n/.cleanup\n.DS_Store\n";
+/// When the last finished cleanup started, in ms: what the person wrote
+/// from then on is the next cleanup's to read.
+const SAID: &str = ".said";
+const IGNORE: &str = ".lock\n.reads\n/.cleanup\n/.said\n.DS_Store\n";
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
@@ -816,7 +819,10 @@ fn changed(root: &Path) -> Result<Value, String> {
         // predates them.
         git(root, &["status", "--porcelain", "--untracked-files=all"])?
             .lines()
-            .any(|line| Path::new(line.get(3..).unwrap_or("")).file_name() != Some(READS.as_ref()))
+            .any(|line| {
+                let file = Path::new(line.get(3..).unwrap_or("")).file_name();
+                file != Some(READS.as_ref()) && file != Some(SAID.as_ref())
+            })
     } else {
         all_facts(root)? > 0
     };
@@ -848,17 +854,22 @@ fn cleanup_start(root: &Path) -> Result<Value, String> {
     let message = format!("Memory before cleanup, {}", today());
     git(root, &["commit", "-q", "--allow-empty", "-m", &message])?;
     let commit = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
     write(
         &state,
-        &json!({"commit": commit, "facts": count}).to_string(),
+        &json!({"commit": commit, "facts": count, "at_ms": at_ms}).to_string(),
     )?;
     started(root, &commit, count as u64, false)
 }
 
 /// A started cleanup, with the facts saved and removed since the last one,
 /// which are what it reads first, those no agent has read in a while,
-/// which it checks still hold, and when the last one finished (`since_ms`,
-/// null before the first), from which it reads what the person wrote.
+/// which it checks still hold, and when the last finished one started
+/// (`since_ms`, null before the first), from which it reads what the person
+/// wrote: a turn that ended while that one ran is read again rather than
+/// missed.
 fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Value, String> {
     let since = git(
         root,
@@ -866,18 +877,9 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
     )?;
     let (removed, added, changed) = fact_changes(&since);
     let saved: Vec<_> = added.into_iter().chain(changed).collect();
-    // When the last cleanup finished, for what the person wrote since.
-    let last = git(
-        root,
-        &[
-            "log",
-            "-1",
-            "--format=%ct",
-            "--grep=^Memory cleanup, ",
-            commit,
-        ],
-    )?;
-    let since_ms = last.trim().parse::<i64>().ok().map(|s| s * 1000);
+    let since_ms = std::fs::read_to_string(root.join(SAID))
+        .ok()
+        .and_then(|ms| ms.trim().parse::<i64>().ok());
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
         "unread": unread(root)?, "since_ms": since_ms, "duplicate": duplicate}),
@@ -946,6 +948,11 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
             "loss_guard: the cleanup removed {} of {before} facts, above {limit}; memory is back as it was at {start}, and the refused cleanup is commit {head}",
             removed.len()
         ));
+    }
+    // A refused cleanup saved nothing of what the person wrote, so the
+    // next one reads it again.
+    if let Some(at_ms) = open["at_ms"].as_i64() {
+        write(&root.join(SAID), &at_ms.to_string())?;
     }
     std::fs::remove_file(&state).map_err(|e| format!("memory_failed: {}: {e}", state.display()))?;
     Ok(
@@ -1762,12 +1769,14 @@ mod tests {
         // Removing more than the guard allows is undone.
         save_user(&root, "e", "fact e", "x").unwrap();
         let next = run_(&["cleanup", "start"]).unwrap();
+        // The next one reads what the person wrote from when the last
+        // finished one started.
         let since = next["since_ms"].as_i64().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        assert!(now - since < 60_000 && since % 1000 == 0, "{since}");
+        assert!(now - since < 60_000, "{since}");
         assert_eq!(
             (next["saved"].clone(), next["removed"].clone()),
             (json!(["e.md"]), json!([]))
@@ -1799,6 +1808,9 @@ mod tests {
         assert_eq!(check(&root)["problems"], json!([]));
         assert_eq!(code(changed(&root)), "unchanged");
         assert!(!root.join(CLEANUP).exists());
+        // A refused cleanup leaves what the person wrote to the next one.
+        let after = run_(&["cleanup", "start"]).unwrap();
+        assert_eq!(after["since_ms"], json!(since));
         std::fs::remove_dir_all(root).unwrap();
     }
 

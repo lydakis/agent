@@ -346,19 +346,21 @@ content, a provider's web search or fetch, `web_fetch`, or an MCP server
 through `exec`, is marked `external: true` in its front matter and
 `, external` in its index line, as Codex leaves out of memory the sessions
 that used MCP or web search and OpenClaw's dreaming drops untrusted
-sources. Sonny looks at the turn's newest 400 items; a longer turn counts
-as having read. The script takes `--external` for the same. Agents treat
+sources. Sonny reads the whole turn so far, whichever provider stored its
+calls; a turn whose history it cannot read counts as having read. The script takes `--external` for the same. Agents treat
 such a fact as a lead to check, and the cleanup removes one that reads as
 an instruction to agents. Saving the fact again without it, say on the
 person's word, clears the mark.
 
 The cleanup also reads what the person wrote to any agent since the last
-cleanup finished (`cleanup start` gives that time as `since_ms`, null the
-first night, when it looks back a day): the memory tool's `said` with
+finished cleanup started (`finish` keeps that time in `.said`, out of git,
+and `cleanup start` gives it as `since_ms`, null the first night, when it
+looks back a day; a refused cleanup leaves it, so its night is read again): the memory tool's `said` with
 `since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
 daemon: every message in a turn that ran since then that carries no other
 agent's or named client's mark, steers included, newest first and at most
-96 KiB, each with its agent, turn and memory project. It saves what no
+96 KiB, each with its agent, turn, and the memory project of the folder
+that turn ran in. It saves what no
 agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
 the day's notes, taking only the person's own words and their scope, as
 Codex's extraction does. The trigger still wakes it only when memory
