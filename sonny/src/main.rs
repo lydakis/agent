@@ -45,6 +45,7 @@ mod prompt;
 mod reactions;
 mod resolved;
 mod rex;
+mod said;
 mod screen;
 mod seed;
 mod served;
@@ -707,6 +708,11 @@ fn main() -> std::process::ExitCode {
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
+            // The person's words are read from the daemon, which only
+            // Sonny reaches; the rest is memory's own.
+            if let Some(("said", since)) = rest.split_first().map(|(v, r)| (v.as_str(), r)) {
+                return std::process::ExitCode::from(said::cli(since) as u8);
+            }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
         Some((verb, rest)) if verb == trigger::VERB => {
@@ -7678,6 +7684,80 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_reads_only_what_the_person_wrote_since_the_last_one() {
+        let said_ = |text: &str| {
+            json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+        };
+        // The agent moved into the shop project after turn 6: each message
+        // keeps the project of the folder its turn ran in.
+        let shop = std::env::temp_dir().join(format!("said-shop-{}", std::process::id()));
+        std::fs::create_dir_all(shop.join(".agents")).unwrap();
+        std::fs::write(shop.join(".agents/project.toml"), "name = \"shop\"\n").unwrap();
+        let elsewhere = std::env::temp_dir();
+        let (shop_, elsewhere_) = (shop.clone(), elsewhere.clone());
+        let client = daemon_answering(move |asked| {
+            let args = asked;
+            match (
+                asked["op"].as_str().unwrap_or_default(),
+                args["bot"].as_str(),
+            ) {
+                ("bots", _) => json!({"bots": [{"name": "shop.lead"}, {"name": "shop.old"}],
+                    "next_after": null}),
+                // Turns come a page at a time.
+                // Turns come a page at a time. Turn 7 was queued behind 6
+                // and cancelled before the cleanup; turn 4 ran before it.
+                ("turns", Some("shop.lead")) if args["before"].is_null() => json!({"turns": [
+                    {"turn": 8, "started_ms": 3000, "finished_ms": null, "workspace": shop_},
+                    {"turn": 7, "started_ms": null, "finished_ms": 600, "workspace": shop_}],
+                    "next_before": 7}),
+                ("turns", Some("shop.lead")) => json!({"turns": [
+                    {"turn": 6, "started_ms": 400, "finished_ms": 2000, "workspace": elsewhere_},
+                    {"turn": 4, "started_ms": 100, "finished_ms": 300, "workspace": elsewhere_}],
+                    "next_before": 4}),
+                ("turns", _) => json!({"turns": [{"turn": 3, "finished_ms": 100}]}),
+                ("history_nodes", Some("shop.lead")) => json!({"nodes": [
+                    {"node": 30, "turn": 8}, {"node": 29, "turn": 8}, {"node": 28, "turn": 6},
+                    {"node": 27, "turn": 6}, {"node": 20, "turn": 4}], "next_from": 19}),
+                ("history_items", Some("shop.lead")) => {
+                    let items: Vec<Value> = (args["nodes"].as_array().into_iter().flatten())
+                        .filter_map(|node| {
+                            let item = match node.as_i64()? {
+                                30 => {
+                                    json!({"node": 30, "item": said_("Keep Bedrock out of evals.")})
+                                }
+                                29 => json!({"node": 29, "item": {"type": "message",
+                                    "role": "assistant", "content": [{"type": "output_text",
+                                    "text": "Noted."}]}}),
+                                28 => json!({"node": 28, "item": said_("Use the old API."),
+                                    "from": {"bot": "shop.fix", "turn": 2}}),
+                                27 => {
+                                    json!({"node": 27, "item": said_("Squash-merge from now on.")})
+                                }
+                                _ => return None,
+                            };
+                            Some(item)
+                        })
+                        .collect();
+                    json!({"items": items})
+                }
+                _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+            }
+        })
+        .await;
+        let read = said::said(&client, 1000).await.unwrap();
+        assert_eq!(
+            read,
+            json!({"since_ms": 1000, "cut": false, "said": [
+                {"bot": "shop.lead", "turn": 8, "text": "Keep Bedrock out of evals.",
+                    "project": "shop"},
+                {"bot": "shop.lead", "turn": 6, "text": "Squash-merge from now on.",
+                    "project": null}]})
+        );
+        std::fs::remove_dir_all(shop).unwrap();
     }
 
     #[tokio::test]
