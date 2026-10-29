@@ -152,10 +152,22 @@ impl Family {
     /// A person's words and the pictures sent with them, the words first
     /// so `content[0].text` reads them.
     pub fn user_item_with(self, text: &str, images: &[Image]) -> Result<Vec<u8>> {
-        let mut content = vec![match self {
+        self.user_item_from(text, None, images)
+    }
+    /// A prompt's words, then the line saying who sent it when no person
+    /// did, then its pictures.
+    pub fn user_item_from(
+        self,
+        text: &str,
+        sender: Option<&str>,
+        images: &[Image],
+    ) -> Result<Vec<u8>> {
+        let part = |text: &str| match self {
             Family::Responses => json!({"type":"input_text","text":text}),
             Family::Anthropic => json!({"type":"text","text":text}),
-        }];
+        };
+        let mut content = vec![part(text)];
+        content.extend(sender.map(part));
         content.extend(images.iter().map(|image| self.image(image)));
         Ok(serde_json::to_vec(
             &json!({"role":"user","content":content}),

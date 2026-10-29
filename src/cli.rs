@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders",
         startup: true,
     },
     Command {
@@ -376,6 +376,10 @@ fn print_flags(flags: &str) {
                 "Another folder a workspace-write bot may change; repeat for more",
             ),
             "--network" => ("", "A workspace-write bot's commands may use the network"),
+            "--hide-senders" => (
+                "",
+                "A new bot's model reads what other bots and clients send it with no line naming the sender",
+            ),
             "--fallbacks" => (
                 "",
                 "A new bot's declined Anthropic requests rerun on the recommended model",
@@ -564,6 +568,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--agents"
                 | "--fallbacks"
                 | "--network"
+                | "--hide-senders"
                 | "--discover"
         ) {
             if inline.is_some() {
@@ -692,6 +697,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--sandbox",
             "--writable",
             "--network",
+            "--hide-senders",
             "--approval",
             "--approve",
         ]
@@ -700,7 +706,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     {
         return fail_with(
             "usage",
-            "instructions, budget, approval and sandbox are creation options; use --new",
+            "instructions, budget, approval, sandbox and senders are creation options; use --new",
         );
     }
     Ok(Some(out))

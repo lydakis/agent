@@ -7,6 +7,7 @@
 //! model = "anthropic/claude-opus-5-5"  # a new agent's, with none named
 //! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
+//! senders = "hidden"            # "shown", the default, labels what agents send
 //!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
@@ -34,6 +35,10 @@ pub struct Config {
     /// and `web_fetch`, as Codex's `web_search` key says: `"live"`, the
     /// default, or `"disabled"`.
     pub web_search: WebSearch,
+    /// Whether a new agent's model reads what another agent or a client
+    /// sent it with no line naming the sender: `senders = "hidden"`;
+    /// `"shown"`, the default, names it.
+    pub hide_senders: bool,
     pub judge: Judge,
     pub sonny: Sonny,
 }
@@ -111,6 +116,14 @@ fn parse(text: &str) -> Result<Config, String> {
                 "live" => WebSearch::Live,
                 "disabled" => WebSearch::Disabled,
                 other => return Err(format!("web_search is live or disabled, not {other}")),
+            };
+            continue;
+        }
+        if name == "senders" {
+            config.hide_senders = match string(name, value)?.as_str() {
+                "shown" => false,
+                "hidden" => true,
+                other => return Err(format!("senders is shown or hidden, not {other}")),
             };
             continue;
         }
@@ -252,12 +265,16 @@ mod tests {
         assert_eq!(config.web_search, WebSearch::Live);
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
+        assert!(!config.hide_senders);
+        assert!(parse("senders = \"hidden\"").unwrap().hide_senders);
+        assert!(!parse("senders = \"shown\"").unwrap().hide_senders);
         for (text, error) in [
             (
                 "web_search = \"cached\"",
                 "web_search is live or disabled, not cached",
             ),
             ("web_search = false", "web_search must be a string"),
+            ("senders = \"off\"", "senders is shown or hidden, not off"),
             ("colour = \"red\"", "unknown key colour"),
             ("model = 3", "model must be a string"),
             ("[web]\nsearch = true", "unknown table [web]"),

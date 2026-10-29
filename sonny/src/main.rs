@@ -900,8 +900,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
     let instructions = project::as_task(&workspace, &composed.text)?;
     let declare = json!(declared::tools(false));
-    let search = agent_client::config::load()?.web_search;
-    let tools = agent_client::default_tools(client.providers(), &model, search);
+    let config = agent_client::config::load()?;
+    let tools = agent_client::default_tools(client.providers(), &model, config.web_search);
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "tools": tools, "declare": declare,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
@@ -910,6 +910,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let mut settings = approvals::sandbox(approvals::MODES[0].0, true, &workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
         settings.insert("cache_ttl".into(), json!(ttl));
+    }
+    if config.hide_senders {
+        settings.insert("hide_senders".into(), json!(true));
     }
     asked["settings"] = Value::Object(settings);
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
@@ -6546,9 +6549,16 @@ fn first_line(text: &str) -> String {
     cut
 }
 
-/// A message item's text.
+/// A message item's text: a prompt's own words, without the line the
+/// daemon adds after them naming who sent it.
 fn text(item: &Value) -> String {
-    joined(&item["content"])
+    match (&item["role"], &item["content"]) {
+        (role, Value::Array(parts)) if role == "user" => (parts.iter())
+            .find_map(|part| part["text"].as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        (_, content) => joined(content),
+    }
 }
 
 /// Text, or the text of a list of parts, leaving out the pictures.

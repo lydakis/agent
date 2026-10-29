@@ -221,6 +221,12 @@ fn parse(args: &[String]) -> Result<Options> {
                 options.settings.insert("network".to_owned(), json!(true));
                 options.settings_flags.push("--network".to_owned());
             }
+            "--hide-senders" => {
+                options
+                    .settings
+                    .insert("hide_senders".to_owned(), json!(true));
+                options.settings_flags.push("--hide-senders".to_owned());
+            }
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -1392,13 +1398,17 @@ fn run(options: &Options) -> Result<i32> {
                 .map(str::to_owned)
                 .collect(),
         };
+        let mut settings = options.settings.clone();
+        if config()?.hide_senders {
+            settings.entry("hide_senders").or_insert(json!(true));
+        }
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
             "instructions":instructions,"effort":effort,
             "budget_tokens":options.budget_tokens,"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallbacks":options.fallbacks,
-            "settings":options.settings,"request_id":request_id});
+            "settings":settings,"request_id":request_id});
         if let Value::Object(gate) = requested_gate(options, &tools)? {
             // Its approver first, so a missing judge leaves no bot behind.
             if gate.get("approver").is_some_and(|tag| tag == "auto") {
