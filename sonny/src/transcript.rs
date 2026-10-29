@@ -24,8 +24,9 @@ pub struct Markdown {
     hang: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
-    /// Inside `$$` display math, gathered in `picture`.
-    math: bool,
+    /// Inside display math, gathered in `picture`: what closes it,
+    /// `$$` or `\]`.
+    math: Option<&'static str>,
     /// The open fence's code, in its language's colors when known.
     code: Option<crate::highlight::Code>,
     /// The folder a picture's relative path is read from: the file's,
@@ -60,7 +61,7 @@ impl Markdown {
     /// says nothing of the reply is shown yet, so it gets the bullet.
     pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
         let mut text = text;
-        if !self.fence && !self.math {
+        if !self.fence && self.math.is_none() {
             // An HTML comment over lines says nothing; what follows it does.
             if self.comment {
                 match text.split_once("-->") {
@@ -210,26 +211,37 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        // $$ display math $$, on one line or around several.
-        if !self.fence && trimmed.trim_end().starts_with("$$") {
-            let inner = trimmed.trim_end().trim_start_matches("$$");
-            if let Some(math) = inner.strip_suffix("$$") {
-                self.ready = Some(("math".into(), math.to_owned()));
-                return None;
-            }
-            match self.picture.take() {
-                Some((lang, math)) if lang == "math" && self.math => {
-                    self.math = false;
-                    self.ready = Some((lang, math));
+        // $$ display math $$, on one line or around several, and the
+        // \[ display math \] many models write.
+        let line = trimmed.trim_end();
+        if !self.fence && self.math.is_none() {
+            let open = [("$$", "$$"), ("\\[", "\\]")]
+                .into_iter()
+                .find(|(open, _)| line.starts_with(open));
+            if let Some((open, close)) = open {
+                let inner = &line[open.len()..];
+                if let Some(math) = inner.strip_suffix(close) {
+                    self.ready = Some(("math".into(), math.to_owned()));
+                    return None;
                 }
-                held => {
+                // `\[` opens display math only alone on its line: one that
+                // runs on is an escaped bracket.
+                if open == "$$" || inner.is_empty() {
+                    let held = self.picture.take();
                     self.picture = held.or(Some(("math".into(), format!("{inner}\n"))));
-                    self.math = true;
+                    self.math = Some(close);
+                    return None;
                 }
             }
+        }
+        if let Some(close) = self.math
+            && line.starts_with(close)
+        {
+            self.math = None;
+            self.ready = self.picture.take();
             return None;
         }
-        if self.math
+        if self.math.is_some()
             && let Some((_, math)) = &mut self.picture
         {
             math.push_str(text);
@@ -679,6 +691,17 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         }
     };
     while let Some(c) = rest.chars().next() {
+        // \(math\), as many models write it.
+        if let Some(after) = rest.strip_prefix("\\(")
+            && let Some(end) = after.find("\\)")
+            && end > 0
+        {
+            flush(&mut plain, &mut spans);
+            let math = crate::math::unicode(after[..end].trim());
+            spans.push(Span::styled(math, base.italic()));
+            rest = &after[end + 2..];
+            continue;
+        }
         // A mark and its closer, with the style of what is between.
         let pairs: [(&str, &str, Style, bool); 11] = [
             ("`", "`", base.fg(Color::Cyan), false),
@@ -2326,6 +2349,24 @@ mod tests {
         assert_eq!(text(&rows), ["• Here:", "    -a", "    +b"]);
         let rows = reply("$$\nx^2", 40, std::path::Path::new("."));
         assert_eq!(text(&rows), ["•   x^2"]);
+    }
+
+    #[test]
+    fn math_in_brackets_reads_as_math_in_dollars_does() {
+        let folder = std::path::Path::new(".");
+        let dollars = reply("$$\nx^2\n$$\nafter", 40, folder);
+        let brackets = reply("\\[\nx^2\n\\]\nafter", 40, folder);
+        assert_eq!(text(&brackets), text(&dollars));
+        assert_eq!(
+            text(&reply("\\[ x^2 \\]", 40, folder)),
+            text(&reply("$$ x^2 $$", 40, folder))
+        );
+        assert_eq!(
+            text(&reply("so \\(x^2\\) holds", 40, folder)),
+            text(&reply("so $x^2$ holds", 40, folder))
+        );
+        // An escaped bracket that runs on is words.
+        assert_eq!(text(&reply("\\[not math", 40, folder)), ["• \\[not math"]);
     }
 
     #[test]

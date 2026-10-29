@@ -410,8 +410,9 @@ Sonny drew around it. A click on a web link opens it in the browser, and
 a click on a file opens it in a pane beside the conversation: code in
 syntax colors with its line numbers, at the line the link names
 (`src/main.rs:120`), Markdown as replies read, with its pictures and
-the HTML a README is written with, and a picture, SVG, Mermaid file or
-HTML page drawn as it looks. Markdown and plain text read at the 100
+the HTML a README is written with and its math (`$$ … $$`, `\[ … \]`,
+`$…$` and `\(…\)`) drawn as in a reply, and a picture, SVG, Mermaid
+file or HTML page drawn as it looks. Markdown and plain text read at the 100
 columns the conversation is written at; code, pictures, diagrams and
 pages fill the pane. A click on a picture, diagram or page in the
 conversation opens it in the pane, bigger. The pane scrolls,
@@ -441,6 +442,8 @@ the choice is kept with the other settings.
 ![A Mermaid diagram clicked in the conversation, drawn across the pane](../docs/sonny/pane-mermaid.png)
 
 ![An HTML page clicked in the conversation, drawn in the pane](../docs/sonny/pane-html.png)
+
+![A Markdown file's math beside the chat, drawn as the reply draws it, in dollars and in brackets](../docs/sonny/pane-math.png)
 
 ![A screenshot the agent named in its reply, drawn in the conversation](../docs/sonny/chat-picture.png)
 
