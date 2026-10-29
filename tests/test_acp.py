@@ -372,6 +372,10 @@ class AcpTests(ModelFixture):
         refused, _ = fourth.answer_of(fourth.ask('session/prompt', {'sessionId': session,
                                                                      'prompt': self.wrapped('/lead gone')}))
         self.assertIn('error', refused)
+        # Another lead outlives the folder's first.
+        self.assertIn('result', self.daemon.request('delete', bot='calc.lead'))
+        fifth, session = self.open(repo)
+        self.adopt(fifth, session, 'again')
 
     def test_a_thread_sonny_does_not_know_does_not_come_back(self):
         repo = self.repo()

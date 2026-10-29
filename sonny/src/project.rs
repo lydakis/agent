@@ -542,6 +542,18 @@ pub async fn open(
         if let Pick::Named(name) = pick
             && lead_bot(&project, name) != first
         {
+            // Another lead of the folder outlives the first.
+            let bot = lead_bot(&project, name);
+            let there = find(client, &bot).await?;
+            if there.is_some_and(|found| found["workspace"].as_str() == dir.to_str()) {
+                return Ok(Lead {
+                    project,
+                    bot,
+                    new: false,
+                    moving: None,
+                    above: above(&dir),
+                });
+            }
             return Err(format!("lead_missing: {project} has no lead {name} yet"));
         }
         create(client, &dir, model, None).await?;
