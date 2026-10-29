@@ -4136,8 +4136,9 @@ impl App {
     /// and, when that note shows another bot's, what that one did.
     async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
         self.read_history(bot, id, reference).await;
-        // Taken away there, what it showed stays as last read.
-        if reference.removed() {
+        // Taken away there, or the bot gone, what it showed stays as
+        // last read.
+        if reference.removed() || reference.gone {
             return;
         }
         let Some((through, note)) = reference.shows() else {
@@ -10667,21 +10668,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_task_s_note_that_shows_its_own_task_s_is_read_through() {
-        let later = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let on = later.clone();
+        use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+        // Later the task takes its note away (1), or is gone (2), and its
+        // own task changes.
+        let phase = Arc::new(AtomicU8::new(0));
+        let on = phase.clone();
         let client = daemon_answering(move |asked| {
-            // Later the task takes its note away, and its own task changes.
-            let later = on.load(std::sync::atomic::Ordering::SeqCst);
+            let later = on.load(SeqCst);
             let arguments = match (asked["bot"].as_str(), later) {
-                (Some("calc.add"), false) => {
+                (Some("calc.add"), 1) => json!({"id": "flow", "remove": true}),
+                (Some("calc.add"), _) => {
                     json!({"id": "flow", "title": "Flow", "from": "calc.sub/flow"})
                 }
-                (Some("calc.add"), true) => json!({"id": "flow", "remove": true}),
-                (_, false) => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
-                (_, true) => json!({"id": "flow", "markdown": "deeper"}),
+                (_, 0) => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
+                _ => json!({"id": "flow", "markdown": "deeper"}),
             };
-            let node = if later { 2 } else { 1 };
+            let node = if later > 0 { 2 } else { 1 };
             match asked["op"].as_str() {
+                Some("inspect") if later == 2 && asked["bot"] == "calc.add" => {
+                    json!({"error": "bot_not_found"})
+                }
                 Some("inspect") => json!({"bot_id": 1, "workspace": "/nowhere"}),
                 Some("history_nodes") => json!({"nodes": [{"node": node}]}),
                 _ => json!({"items": [{"node": node, "item": {"type": "function_call",
@@ -10689,20 +10695,24 @@ mod tests {
             }
         })
         .await;
-        let mut app = app(client);
-        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
         let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
             margin::Body::From { shown, .. } => shown.as_deref().cloned(),
             _ => None,
         };
-        app.read_references().await;
-        assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
-        assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
-        // Taken away by the task, what it showed stays as last read.
-        later.store(true, std::sync::atomic::Ordering::SeqCst);
-        app.references_read = None;
-        app.read_references().await;
-        assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
+        for then in [1, 2] {
+            phase.store(0, SeqCst);
+            let mut app = app(client.clone());
+            app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+            app.read_references().await;
+            assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
+            assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+            // Taken away by the task, or the task gone, what it showed
+            // stays as last read.
+            phase.store(then, SeqCst);
+            app.references_read = None;
+            app.read_references().await;
+            assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
+        }
     }
 
     #[tokio::test]
