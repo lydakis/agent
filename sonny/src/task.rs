@@ -37,6 +37,17 @@ pub struct Start {
     pub setup: bool,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// A task to fork, with its files as they were after its turn `turn`,
+    /// else its newest that has them.
+    pub from: Option<String>,
+    pub turn: Option<i64>,
+}
+
+/// The task a fork copies, and its files after the turn it copies.
+struct Source {
+    name: String,
+    workspace: PathBuf,
+    snapshot: crate::snapshot::Snapshot,
 }
 
 /// Start the task `start` asks for of the lead `lead`, whose folder is
@@ -80,10 +91,14 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
         flags.extend(["--effort".to_owned(), effort]);
     }
-    let mut place = if info["threads_in"] == "project" {
-        in_place(here)
-    } else {
-        worktree(here, name)?
+    let source = match &start.from {
+        Some(from) => Some(source(&agent, project, from, start, here)?),
+        None => None,
+    };
+    let mut place = match &source {
+        Some(source) => forked(here, name, source)?,
+        None if info["threads_in"] == "project" => in_place(here),
+        None => worktree(here, name)?,
     };
     // Only a run that started can have made the task, which then keeps
     // its folder; anything that failed before leaves nothing behind.
@@ -170,14 +185,64 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         }
     }
     // A path in the lead's folder would have the task write there instead
-    // of in its copy, where nothing keeps it apart from the lead's work.
-    let brief = vec![start.brief.clone()];
+    // of in its copy, where nothing keeps it apart from the lead's work;
+    // so would one in the folder of a task it forks.
+    let mut brief = vec![start.brief.clone()];
+    if let Some(source) = &source {
+        brief.insert(
+            0,
+            format!(
+                "You are a copy of {} as it was after its turn {}, now {name}, in {}: a \
+                 worktree of its own with the files as they were then. Work only there.",
+                source.name,
+                source.snapshot.turn,
+                shell_quote(&place.dir)
+            ),
+        );
+        brief = in_copy(&brief, &source.workspace, &place.dir).0;
+    }
     let (brief, moved) = match &place.copy {
         Some((from, to)) => in_copy(&brief, from, to),
         None => (brief, 0),
     };
+    if let Some(source) = &source {
+        // A fork keeps its source's instructions, role, model and sandbox.
+        let forked = crate::agent_command(&agent)?
+            .args([
+                "fork",
+                "--source",
+                &source.name,
+                "--bot",
+                name,
+                "--checkpoint",
+            ])
+            .arg(source.snapshot.checkpoint.to_string())
+            .arg("--workspace")
+            .arg(&place.dir)
+            .stdin(Stdio::null())
+            .output();
+        match forked {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let said = String::from_utf8_lossy(&output.stderr);
+                return failed(
+                    &place,
+                    true,
+                    format!("{name} was not forked: {}", said.trim()),
+                );
+            }
+            Err(e) => {
+                return failed(&place, false, format!("running {}: {e}", agent.display()));
+            }
+        }
+        flags.clear();
+    }
+    command.args(["run", "--detach"]);
+    if source.is_none() {
+        command.arg("--new");
+    }
     let output = command
-        .args(["run", "--detach", "--new", "--bot", name, "--workspace"])
+        .args(["--bot", name, "--workspace"])
         .arg(&place.dir)
         .args(flags)
         .arg("--")
@@ -629,6 +694,93 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     })
 }
 
+/// Whether `dir` is in a worktree Sonny made a task.
+pub fn in_worktree(dir: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    home_dir().is_ok_and(|home| real(dir).starts_with(real(&home.join(".agent/worktrees"))))
+}
+
+/// The bot `name` as the daemon lists it.
+fn record(agent: &Path, name: &str) -> Option<Value> {
+    let output = Command::new(agent)
+        .args(["ls", "--name", name])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let bots: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
+    bots.into_iter().find(|bot| bot["name"] == name)
+}
+
+/// The task of `project` named `from` that a start forks, and its files
+/// after `start.turn`, or after its newest turn that kept them.
+fn source(
+    agent: &Path,
+    project: &str,
+    from: &str,
+    start: &Start,
+    here: &Path,
+) -> Result<Source, String> {
+    if start.profile.is_some() || start.model.is_some() || start.effort.is_some() {
+        return Err("a fork keeps its source's role, model and effort; name none".into());
+    }
+    let name = crate::resolved::call(&serde_json::json!({"task": from}), project)
+        .ok_or("from names a task, without /")?;
+    let bot = record(agent, &name).ok_or_else(|| format!("{name} is not an agent here"))?;
+    let workspace = PathBuf::from(bot["workspace"].as_str().unwrap_or_default());
+    if !in_worktree(&workspace) {
+        return Err(format!(
+            "{name} works in no worktree of its own, so no turn of it kept its files"
+        ));
+    }
+    let bot_id = bot["bot_id"]
+        .as_i64()
+        .ok_or("the daemon listed no bot_id")?;
+    let snapshot =
+        crate::snapshot::find(here, bot_id, start.turn).map_err(|e| format!("{name}: {e}"))?;
+    Ok(Source {
+        name,
+        workspace,
+        snapshot,
+    })
+}
+
+/// A git worktree on branch agent/NAME holding the files `source` had
+/// after its turn, on the commit it was on, in the lead's subfolder of it.
+fn forked(here: &Path, name: &str, source: &Source) -> Result<Place, String> {
+    let top = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"])?);
+    let prefix = git(here, &["rev-parse", "--show-prefix"])?;
+    let path = home_dir()?.join(".agent/worktrees").join(name);
+    let branch = format!("agent/{name}");
+    if path.exists() {
+        return Err(format!("{} exists; pick another name", path.display()));
+    }
+    crate::snapshot::restore(here, &source.snapshot, &path, &branch)?;
+    let mut note = format!(
+        "{name}: a worktree at {} on branch {branch}, with {}'s files as they were after its \
+         turn {}, changes since its last commit uncommitted as they were",
+        shell_quote(&path),
+        source.name,
+        source.snapshot.turn
+    );
+    if source.snapshot.late {
+        note.push_str(
+            "; an agent was working in that folder again as they were kept, so they may hold \
+             some of that later work",
+        );
+    }
+    Ok(Place {
+        dir: within(&path, Path::new(prefix.trim_end_matches('/'))),
+        note: Some(note),
+        undo: Undo::Worktree {
+            here: here.to_owned(),
+            path: path.clone(),
+            branch,
+        },
+        copy: Some((top, path)),
+    })
+}
+
 /// Whether `path` is a worktree of the repository `here` is in, on `branch`.
 fn ours(here: &Path, path: &Path, branch: &str) -> bool {
     let common = |dir: &Path| {
@@ -774,6 +926,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         Ok(())
     };
     kept()?;
+    let bot_id = record(&agent, name).and_then(|bot| bot["bot_id"].as_i64());
     if listed(&agent, name) {
         let output = crate::agent_command(&agent)?
             .args(["rm", "--bot", name])
@@ -785,6 +938,10 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             return Err(format!("{name} was not removed: {}", said.trim()));
         }
         kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
+    }
+    // Its snapshots go with it: only a worktree of its own has any.
+    if let Some(bot_id) = bot_id {
+        crate::snapshot::forget(here, bot_id)?;
     }
     if let Some(path) = &worktree {
         let path = path.to_string_lossy();

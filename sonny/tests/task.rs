@@ -29,7 +29,8 @@ impl Lab {
             "#!/bin/sh\ncase \"$1\" in\n\
              run) printf '%s\\n' \"$@\" > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
-             rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\nesac\n",
+             rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\n\
+             fork) printf '%s\\n' \"$@\" > \"$AGENT_LOG.fork\";;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -368,6 +369,126 @@ fn a_done_worktree_task_is_removed_with_its_merged_branch() {
     // Its branch had nothing more than this one, so it went too.
     assert_eq!(
         lab.git(&lab.repo, &["branch", "--list", "agent/demo.fix"]),
+        ""
+    );
+}
+
+/// Keep the worktree's files as the lookout does after a completed turn
+/// (snapshot.rs): bot 5's turn `turn`, at history node `checkpoint`.
+fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
+    let index = lab.scratch.join("snapshot.index");
+    let add = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    add(&["read-tree", "HEAD"]);
+    add(&["add", "-A"]);
+    let tree = add(&["write-tree"]);
+    let message = format!("Files after turn {turn}\n\nAgent-Checkpoint: {checkpoint}");
+    let commit = add(&["commit-tree", &tree, "-p", "HEAD", "-m", &message]);
+    lab.git(
+        worktree,
+        &[
+            "update-ref",
+            &format!("refs/agent/snapshots/5/{turn}"),
+            &commit,
+        ],
+    );
+}
+
+#[test]
+fn a_task_forked_from_another_s_turn_gets_its_files_then_in_a_worktree_of_its_own() {
+    let lab = Lab::new("fork");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let source = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::write(source.join("src/lib.rs"), "three\n").unwrap();
+    std::fs::write(source.join("src/new.rs"), "made\n").unwrap();
+    snapshot(&lab, &source, 12, 77);
+    // Work after the turn is not in the fork.
+    std::fs::write(source.join("src/lib.rs"), "four\n").unwrap();
+    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
+        "workspace": source.join("src")}]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+
+    let start =
+        |call: serde_json::Value| lab.tool(&lab.repo.join("src"), "start_task", call, false);
+    let (ok, err) = start(
+        serde_json::json!({"name": "other", "brief": "b", "from": "fix",
+        "model": "openai/x"}),
+    );
+    assert!(!ok && err.contains("keeps its source's role"), "{err}");
+    let (ok, err) =
+        start(serde_json::json!({"name": "other", "brief": "b", "from": "fix", "turn": 11}));
+    assert!(!ok && err.contains("turn 11 has no snapshot"), "{err}");
+    assert!(!lab.home.join(".agent/worktrees/demo.other").exists());
+
+    let (ok, said) =
+        start(serde_json::json!({"name": "try", "brief": "try another way", "from": "fix"}));
+    assert!(ok, "{said}");
+    assert!(
+        said.contains("demo.fix's files as they were after its turn 12"),
+        "{said}"
+    );
+    let copy = lab.home.join(".agent/worktrees/demo.try");
+    let workspace = copy.join("src").to_string_lossy().into_owned();
+    let forked = std::fs::read_to_string(lab.scratch.join("run.log.fork")).unwrap();
+    let forked: Vec<&str> = forked.lines().collect();
+    assert_eq!(
+        forked,
+        [
+            "fork",
+            "--source",
+            "demo.fix",
+            "--bot",
+            "demo.try",
+            "--checkpoint",
+            "77",
+            "--workspace",
+            &workspace
+        ]
+    );
+    // Only the brief: the fork keeps its source's instructions.
+    let ran = lab.ran();
+    assert_eq!(
+        ran[..6],
+        [
+            "run",
+            "--detach",
+            "--bot",
+            "demo.try",
+            "--workspace",
+            &workspace
+        ]
+    );
+    assert_eq!(ran[6], "--");
+    assert!(ran[7].contains(&format!("in '{workspace}'")), "{}", ran[7]);
+    assert_eq!(ran[8], "try another way");
+    let read = |name: &str| std::fs::read_to_string(copy.join(name)).unwrap();
+    assert_eq!(read("src/lib.rs"), "three\n");
+    assert_eq!(read("src/new.rs"), "made\n");
+    assert_eq!(
+        lab.git(&copy, &["branch", "--show-current"]),
+        "agent/demo.try"
+    );
+    assert_eq!(lab.git(&copy, &["diff", "--cached", "--name-only"]), "");
+
+    // Removing the source drops its snapshots.
+    let (ok, err) = lab.remove(&lab.repo, true);
+    assert!(ok, "{err}");
+    assert_eq!(
+        lab.git(&lab.repo, &["for-each-ref", "refs/agent/snapshots/"]),
         ""
     );
 }

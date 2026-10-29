@@ -108,7 +108,15 @@ fn start() -> Value {
                     "description": "PROVIDER/MODEL, when the person asked for one; else the one this \
                         project's task rule names, else yours."},
                 "effort": {"type": "string", "minLength": 1,
-                    "description": "The task's effort level."}
+                    "description": "The task's effort level."},
+                "from": {"type": "string", "minLength": 1,
+                    "description": "Another task to fork instead of starting afresh, to try another way \
+                        from where it was: the new task gets its conversation up to a turn it completed \
+                        and its files as they were then, in a worktree of its own, and keeps its role, \
+                        model and effort, so name none of those. The brief is its next message."},
+                "turn": {"type": "integer", "minimum": 1,
+                    "description": "With from, the turn to fork after: the number in its turn handle. \
+                        Without it, the newest turn whose files were kept."}
             },
             "required": ["name", "brief"],
             "additionalProperties": false
@@ -435,6 +443,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 setup: arguments["setup"] == true,
                 model: text("model"),
                 effort: text("effort"),
+                from: text("from"),
+                turn: arguments["turn"].as_i64(),
             };
             crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))
         }

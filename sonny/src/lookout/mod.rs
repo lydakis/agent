@@ -687,12 +687,18 @@ impl Service {
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);
         let mut reread: Option<Instant> = None;
+        // Past the replay: a turn that ends now left its folder as it is.
+        let mut streaming = false;
         loop {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { return };
                     let event = whole_margin_call(&client, event).await;
                     served.event(&event);
+                    streaming |= event["event"] == "follow_live";
+                    if streaming {
+                        self.snapshot(&client, &event);
+                    }
                     // A `subscriptions` call this lookout answered counts
                     // from the next event on, not from the next tick.
                     if served.subscribed() {
@@ -817,6 +823,49 @@ impl Service {
                 lookout.wake(&client).await;
                 lookout.wake_sources(&client).await;
             }
+        }
+    }
+
+    /// Keep a task's worktree as a completed turn left it, for a task
+    /// forked from that turn (snapshot.rs); drop a deleted task's.
+    fn snapshot(&self, client: &Arc<Client>, event: &Value) {
+        let Some(record) = event["bot"].as_str().and_then(|bot| self.records.get(bot)) else {
+            return;
+        };
+        let (Some(bot_id), Some(workspace)) =
+            (record["bot_id"].as_i64(), record["workspace"].as_str())
+        else {
+            return;
+        };
+        let workspace = PathBuf::from(workspace);
+        // Only a task's own worktree: what forks from, and no one else's.
+        if !crate::task::in_worktree(&workspace) {
+            return;
+        }
+        let data = &event["data"];
+        match event["event"].as_str() {
+            Some("turn_finished") if data["status"] == "completed" => {
+                let (Some(turn), Some(checkpoint)) =
+                    (event["turn"].as_i64(), data["checkpoint"].as_i64())
+                else {
+                    return;
+                };
+                tokio::spawn(crate::snapshot::after_turn(
+                    client.clone(),
+                    workspace,
+                    bot_id,
+                    turn,
+                    checkpoint,
+                ));
+            }
+            // A task's own folder may be gone, and its removal drops its
+            // snapshots first.
+            Some("deleted") => {
+                tokio::task::spawn_blocking(move || {
+                    let _ = crate::snapshot::forget(&workspace, bot_id);
+                });
+            }
+            _ => {}
         }
     }
 
