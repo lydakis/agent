@@ -229,6 +229,9 @@ pub struct Updates {
     opened: u64,
     /// Tasks' turns that resolved them, until they are told.
     resolving: crate::resolved::Own,
+    /// Turns whose reply is being read: how each ends waits for it, so a
+    /// note tells a turn's end with its reply or not yet.
+    replying: HashSet<Key>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -289,6 +292,7 @@ impl Updates {
             memory_seen: None,
             opened: now_ms(),
             resolving: Default::default(),
+            replying: HashSet::new(),
         }
     }
 
@@ -625,6 +629,8 @@ impl Updates {
     /// cut at `REPLY_CHARS`, or with a trigger's answer once it is news.
     /// A turn that is no news, or no longer, drops it.
     pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
+        // Read, whether or not it found words: the turn waits no more.
+        self.replying.remove(&(name.to_owned(), turn));
         let text = text.trim();
         if !self.live || text.is_empty() {
             return;
@@ -888,6 +894,17 @@ impl Updates {
         Some(std::mem::replace(&mut lead.status, "idle".into()))
     }
 
+    /// The reply that ends a task's turn is being read.
+    pub fn reading_reply(&mut self, name: &str, turn: i64) {
+        self.replying.insert((name.to_owned(), turn));
+    }
+
+    /// Reads under way were cut off, as by a dropped connection: no turn
+    /// waits on them.
+    pub fn replies_dropped(&mut self) {
+        self.replying.clear();
+    }
+
     /// The news for the next note, taken: every task's, those with the
     /// person's words first, then those with news to act on.
     pub fn take(&mut self) -> Told {
@@ -917,6 +934,18 @@ impl Updates {
                 }
             }
             news.said = kept;
+            // A turn whose reply is still being read is told with it, in a
+            // later note.
+            let replying = |t: &Option<Turn>| {
+                (t.as_ref()).is_some_and(|t| self.replying.contains(&(name.clone(), t.turn)))
+            };
+            let mut held = News::default();
+            if replying(&news.act) {
+                held.act = news.act.take();
+            }
+            if replying(&news.theirs) {
+                held.theirs = news.theirs.take();
+            }
             // How its turns end, each with its reply, as they will read: the
             // first thing a note tells always fits; past that, turns that do
             // not wait for the next note.
@@ -929,14 +958,11 @@ impl Updates {
             let size: usize = turns.iter().map(|l| l.text.len() + 1).sum();
             let first = items.is_empty() && news.said.is_empty();
             let fits = first || bytes + size <= NOTE_BYTES;
-            if !wait.is_empty() || !fits {
-                let mut waiting = News {
-                    said: wait,
-                    ..News::default()
-                };
+            if !wait.is_empty() || !fits || held != News::default() {
+                let mut waiting = News { said: wait, ..held };
                 if !fits {
-                    waiting.act = news.act.take();
-                    waiting.theirs = news.theirs.take();
+                    waiting.act = waiting.act.or(news.act.take());
+                    waiting.theirs = waiting.theirs.or(news.theirs.take());
                     waiting.notes = std::mem::take(&mut news.notes);
                 }
                 later.push((name.clone(), waiting));
