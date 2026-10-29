@@ -1237,6 +1237,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         resume: std::fs::read_to_string(cursor_path(&settings.store))
             .ok()
             .and_then(|text| text.trim().parse().ok()),
+        reacting: HashMap::new(),
     };
     println!(
         "{}",
@@ -1296,6 +1297,9 @@ struct Service {
     saved: Option<i64>,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
+    /// Lead `react` calls naming another agent, by call, until they end:
+    /// who called, the agent named, the emoji, and whether it comes off.
+    reacting: HashMap<String, (String, String, String, bool)>,
 }
 
 /// Every bot that one of `made` made, and what those made, as the daemon
@@ -1318,28 +1322,61 @@ fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
 }
 
 /// The person's newest message in `bot`: one no agent or client sent,
-/// and no reaction of theirs.
+/// with words of theirs, not only tool results, and no reaction of theirs.
+/// Read newest first, as far back as a long turn of tool calls reaches.
 async fn newest_said(client: &Client, bot: &str) -> Option<i64> {
-    let page = client
-        .request("history_nodes", json!({"bot": bot, "limit": 40}))
-        .await
-        .ok()?;
-    let ids: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
-        .filter_map(|n| n["node"].as_i64())
-        .collect();
-    let read = client
-        .request("history_items", json!({"bot": bot, "nodes": ids}))
-        .await
-        .ok()?;
-    (read["items"].as_array().into_iter().flatten())
-        .filter(|entry| {
-            entry["item"]["role"] == "user"
-                && entry["from"].is_null()
-                && entry["origin"].is_null()
-                && !crate::reactions::is_reaction(&crate::text(&entry["item"]))
-        })
-        .filter_map(|entry| entry["node"].as_i64())
-        .max()
+    const READ: usize = 2000;
+    let (mut from, mut read) = (Value::Null, 0);
+    while read < READ {
+        let page = client
+            .request(
+                "history_nodes",
+                json!({"bot": bot, "from": from, "limit": 200}),
+            )
+            .await
+            .ok()?;
+        let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|n| n["node"].as_i64())
+            .collect();
+        read += nodes.len();
+        let mut next = 0;
+        while next < nodes.len() {
+            let wanted = &nodes[next..(next + 100).min(nodes.len())];
+            let items = client
+                .request("history_items", json!({"bot": bot, "nodes": wanted}))
+                .await
+                .ok()?;
+            // Fewer than asked when they are large; at least one.
+            let items = items["items"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                return None;
+            }
+            next += items.len();
+            if let Some(node) = items.iter().find_map(said_by_person) {
+                return Some(node);
+            }
+        }
+        from = page["next_from"].clone();
+        if from.is_null() || nodes.is_empty() {
+            return None;
+        }
+    }
+    None
+}
+
+/// The node of a history entry the person wrote: words of theirs, as an
+/// Anthropic tool result is a user message too.
+fn said_by_person(entry: &Value) -> Option<i64> {
+    let item = &entry["item"];
+    let words = crate::responses(item)
+        .into_iter()
+        .any(|said| said["role"] == "user" && !crate::text(&said).trim().is_empty());
+    (entry["from"].is_null()
+        && entry["origin"].is_null()
+        && words
+        && !crate::reactions::is_reaction(&crate::text(item)))
+    .then(|| entry["node"].as_i64())
+    .flatten()
 }
 
 /// Whether the bot listed under a name is another than the one seated.
@@ -1623,41 +1660,56 @@ impl Service {
         }
     }
 
-    /// A lead's `react` call naming one of its project's agents: its
-    /// reaction kept under the person's newest message there, for that
-    /// agent's window to draw.
-    fn picked(&self, client: &Arc<Client>, event: &Value) {
+    /// A lead's `react` call naming one of its project's agents: once it
+    /// succeeds, its reaction kept under the person's newest message there,
+    /// for that agent's window to draw.
+    fn picked(&mut self, client: &Arc<Client>, event: &Value) {
         let data = &event["data"];
-        if event["event"] != "tool_started" || data["name"] != crate::reactions::TOOL {
-            return;
-        }
-        let Some(arguments) =
-            (data["arguments"].as_str()).and_then(|a| serde_json::from_str::<Value>(a).ok())
-        else {
-            return;
-        };
-        let (Some(by), Some(bot), Some((emoji, remove))) = (
-            event["bot"].as_str(),
-            crate::reactions::target(&arguments),
-            crate::reactions::call(&arguments),
-        ) else {
-            return;
-        };
-        let project = by.split('.').next().unwrap_or(by);
-        let Some(id) = (self.records.get(bot))
-            .filter(|_| bot != by && bot.starts_with(&format!("{project}.")))
-            .and_then(|record| record["bot_id"].as_i64())
-        else {
-            return;
-        };
-        let store = std::fs::canonicalize(&self.store).unwrap_or_else(|_| self.store.clone());
-        let key = crate::reactions::key(&store, id);
-        let (client, by, bot) = (client.clone(), by.to_owned(), bot.to_owned());
-        tokio::spawn(async move {
-            if let Some(node) = newest_said(&client, &bot).await {
-                let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
+        let call = data["call_id"].as_str().unwrap_or("").to_owned();
+        match event["event"].as_str() {
+            Some("tool_started") if data["name"] == crate::reactions::TOOL => {
+                let Some(arguments) = (data["arguments"].as_str())
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                else {
+                    return;
+                };
+                if let (Some(by), Some(bot), Some((emoji, remove))) = (
+                    event["bot"].as_str(),
+                    crate::reactions::target(&arguments),
+                    crate::reactions::call(&arguments),
+                ) {
+                    self.reacting
+                        .insert(call, (by.to_owned(), bot.to_owned(), emoji, remove));
+                }
             }
-        });
+            // The daemon refuses a call that does not fit, or that the bot
+            // may not make.
+            Some("tool_completed") => {
+                let Some((by, bot, emoji, remove)) = self.reacting.remove(&call) else {
+                    return;
+                };
+                if data["failed"] == true || data["denied"] == true {
+                    return;
+                }
+                let project = by.split('.').next().unwrap_or(&by);
+                let Some(id) = (self.records.get(&bot))
+                    .filter(|_| bot != by && bot.starts_with(&format!("{project}.")))
+                    .and_then(|record| record["bot_id"].as_i64())
+                else {
+                    return;
+                };
+                let store =
+                    std::fs::canonicalize(&self.store).unwrap_or_else(|_| self.store.clone());
+                let key = crate::reactions::key(&store, id);
+                let client = client.clone();
+                tokio::spawn(async move {
+                    if let Some(node) = newest_said(&client, &bot).await {
+                        let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
+                    }
+                });
+            }
+            _ => {}
+        }
     }
 
     /// The subscriber's lookout, made once while its file lasts: whether it
@@ -3050,6 +3102,38 @@ mod tests {
     }
 
     #[test]
+    fn a_lead_s_reaction_lands_on_words_the_person_wrote() {
+        let said = |item: Value, extra: Value| {
+            let mut entry = json!({"node": 7, "item": item});
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            said_by_person(&entry)
+        };
+        let words =
+            json!({"role": "user", "content": [{"type": "input_text", "text": "add color"}]});
+        assert_eq!(said(words.clone(), json!({})), Some(7));
+        // An Anthropic tool result is a user message with no words of theirs.
+        let result = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]});
+        assert_eq!(said(result, json!({})), None);
+        // Another agent's prompt, or a client's, is not the person's.
+        assert_eq!(
+            said(words.clone(), json!({"from": {"bot": "calc.lead"}})),
+            None
+        );
+        assert_eq!(said(words, json!({"origin": "lookout"})), None);
+        assert_eq!(
+            said(
+                json!({"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}),
+                json!({})
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn news_the_lead_read_before_its_note_leaves_a_log_line() {
         let mut lookout = lookout();
         let log = std::env::temp_dir().join(format!("lookout-read-{}.jsonl", std::process::id()));
@@ -3793,6 +3877,7 @@ mod tests {
             cursor: None,
             saved: None,
             resume: None,
+            reacting: HashMap::new(),
         };
         service.lookouts.insert("calc.lead".into(), lookout());
         service.lookouts.insert(
@@ -3856,6 +3941,7 @@ mod tests {
             cursor: None,
             saved: None,
             resume: None,
+            reacting: HashMap::new(),
         };
         // Named like a lead, it is a bot like any other.
         assert!(!service.place(&lead));
