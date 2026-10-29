@@ -5334,7 +5334,7 @@ impl App {
         let (verb, id) = what.split_once('/').unwrap_or((what, ""));
         match verb {
             "close" => {
-                if self.margin.remove(id, None).is_none() {
+                if self.margin.note(id).is_none() {
                     return;
                 }
                 // The person's click, said in Sonny's words: nothing the
@@ -5350,7 +5350,10 @@ impl App {
                     .await;
                 match sent {
                     // No clip in the footer: the margin says it.
+                    // Taken away once the agent will hear of it; kept to
+                    // close again when it could not be told.
                     Ok(reply) => {
+                        self.margin.remove(id, None);
                         self.reaction_turn = reply["turn"].as_i64();
                         if let Some(turn) = reply["turn"].as_i64() {
                             self.margin.applied(&format!("t{turn}"));
@@ -9291,5 +9294,19 @@ mod tests {
         assert!(quiet_message(told));
         // No clip in the footer for it.
         assert_eq!(app.reaction_turn, Some(12));
+    }
+
+    #[tokio::test]
+    async fn a_note_the_agent_could_not_be_told_of_stays_to_close_again() {
+        let client = daemon_answering(|_| json!({"error": "bot_busy", "detail": "busy"})).await;
+        let mut app = app(client);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.follow("sonny:close/repro");
+        for what in std::mem::take(&mut app.pressed) {
+            app.press(&what).await;
+        }
+        assert!(app.margin.note("repro").is_some());
+        assert!(app.notice.is_some());
     }
 }

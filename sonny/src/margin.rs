@@ -29,6 +29,9 @@ const MOST_NOTES: usize = 20;
 const NOTE_BYTES: usize = 64 * 1024;
 /// The most lines of a file a note shows.
 const FILE_LINES: usize = 400;
+/// The most rows a note is drawn in, so all the notes together stay
+/// under what a [`crate::screen::Screen`] keeps.
+const NOTE_ROWS: usize = 600;
 /// How many of the calls and messages applied are remembered, so one
 /// read again as the conversation is drawn again is not applied twice.
 const SEEN: usize = 1024;
@@ -410,10 +413,15 @@ impl Margin {
             lines.push(head);
             marks.push((at, Mark::Tag(Tag::Note(anchor(&note.call)))));
             marks.push((at, Mark::Buttons(buttons)));
-            let body = match &note.body {
+            let mut body = match &note.body {
                 Body::Markdown(text) => markdown(text, inner, Markdown::in_folder(workspace)),
                 Body::File(path) => self.file_lines(workspace, path, inner),
             };
+            if body.len() > NOTE_ROWS {
+                let more = body.len() - NOTE_ROWS;
+                body.truncate(NOTE_ROWS);
+                body.push(Line::from(format!("  … {more} more rows")).dim());
+            }
             lines.extend(
                 body.into_iter()
                     .map(|line| crate::transcript::indent(line, 3)),
@@ -755,6 +763,22 @@ mod tests {
         assert_eq!(margin.notes()[0].id, "n1");
         // A note posted without a title goes by its id.
         assert_eq!(margin.notes()[0].title, "n1");
+    }
+
+    #[test]
+    fn every_note_stays_drawn_however_long_they_all_are() {
+        let mut margin = margin();
+        let long = "a line\n\n".repeat(700);
+        for n in 0..MOST_NOTES {
+            let post = json!({"id": format!("n{n}"), "markdown": long});
+            margin.apply(&format!("c{n}"), &post, None, None);
+        }
+        let (lines, marks) = margin.lines(60, Path::new("."), None);
+        // Under what a screen keeps, each note cut short and saying so.
+        assert!(lines.len() < 12_500, "{}", lines.len());
+        let heads = marks.iter().filter(|(_, m)| matches!(m, Mark::Tag(_)));
+        assert_eq!(heads.count(), MOST_NOTES);
+        assert!(lines.iter().any(|l| l.to_string().contains("more rows")));
     }
 
     #[test]
