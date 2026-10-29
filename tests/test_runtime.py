@@ -1135,7 +1135,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
         self.assertFalse([e for e in events if e['event'].startswith('tool_')])
 
-    def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_fails_one_to_a_prompt(self):
+    def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_after_a_prompt(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path))
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:silent')['result']['turn']
@@ -1145,8 +1145,14 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # The history it left takes the next prompt.
         turn = client.request('submit', bot='Bob', request_id='r2', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # A reply of nothing to a prompt is the bot choosing to say nothing.
         turn = client.request('submit', bot='Bob', request_id='r3', prompt='silent')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['error'], 'empty_completion')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        waited = client.request('wait', handles=[f'turn:Bob/{turn}'], timeout_ms=0)['result']
+        self.assertEqual(waited['results'][f'turn:Bob/{turn}']['text'], '')
+        # And the next prompt still goes.
+        turn = client.request('submit', bot='Bob', request_id='r4', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_an_empty_reply_after_a_call_that_parked_ends_the_turn(self):
         # The call waits on the person's verdict, so the turn parks and
