@@ -411,9 +411,9 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
 /// running for as long as it runs, as it does the lookout. One kept already
 /// keeps the judge it was given first, so leads on other models do not
 /// start it again.
-async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(), String> {
+async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
     let bin = agent_bin().ok_or("Agent's binary was not found to judge calls; set AGENT_BIN")?;
-    let args = daemon_args("approver", options);
+    let args = daemon_args("approver");
     let kept = client
         .request("companions", json!({}))
         .await
@@ -432,13 +432,13 @@ async fn serve_auto(client: &Client, options: &Options, model: &str) -> Result<(
 /// back with the next daemon. This Sonny's own build replaces another's:
 /// the build is part of what the daemon keeps, so a Sonny upgraded in
 /// place has the daemon start the new one.
-async fn start_lookout(client: &Client, options: &Options) -> Result<(), String> {
+async fn start_lookout(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     keep(
         client,
         LOOKOUT,
         &me,
-        daemon_args("lookout", options),
+        daemon_args("lookout"),
         json!({"SONNY_BUILD": lookout::identity()}),
     )
     .await
@@ -448,15 +448,11 @@ async fn start_lookout(client: &Client, options: &Options) -> Result<(), String>
 const LOOKOUT: &str = "sonny-lookout";
 const APPROVER: &str = "approver-auto";
 
-fn daemon_args(command: &str, options: &Options) -> Vec<String> {
-    let path = |path: &Path| path.to_string_lossy().into_owned();
-    vec![
-        command.to_owned(),
-        "--store".to_owned(),
-        path(&options.store),
-        "--socket".to_owned(),
-        path(&options.socket),
-    ]
+/// A companion's arguments: its store and socket come from the daemon
+/// that runs it (`AGENT_STORE`, `AGENT_SOCKET`), which may serve the store
+/// on another socket later.
+fn daemon_args(command: &str) -> Vec<String> {
+    vec![command.to_owned()]
 }
 
 /// Ask the daemon to keep `name` running `bin` with `args`; the same again
@@ -861,7 +857,7 @@ async fn run() -> Result<(), String> {
         app.notice = Some(format!("the lookout: {error}"));
     }
     // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.client, &app.options).await {
+    if let Err(error) = start_lookout(&app.client).await {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -921,7 +917,7 @@ async fn run() -> Result<(), String> {
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
     } else if app.mode == Some("auto")
-        && let Err(error) = serve_auto(&app.client, &app.options, &app.model).await
+        && let Err(error) = serve_auto(&app.client, &app.model).await
     {
         app.notice = Some(error);
     }
@@ -2827,8 +2823,7 @@ impl App {
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
                     if mode == "auto"
-                        && let Err(error) =
-                            serve_auto(&self.client, &self.options, &self.model).await
+                        && let Err(error) = serve_auto(&self.client, &self.model).await
                     {
                         self.notice = Some(error);
                     }
@@ -3253,11 +3248,11 @@ impl App {
                 .await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
-            if let Err(error) = start_lookout(&self.client, &self.options).await {
+            if let Err(error) = start_lookout(&self.client).await {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
-                && let Err(error) = serve_auto(&self.client, &self.options, &self.model).await
+                && let Err(error) = serve_auto(&self.client, &self.model).await
             {
                 self.notice = Some(error);
             }

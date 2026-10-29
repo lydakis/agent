@@ -132,6 +132,9 @@ pub struct Companions {
     /// Whether they run: only a daemon on a socket has one to reach it on.
     runs: bool,
     kept: HashMap<String, Kept>,
+    /// Companions removed and still stopping: shutdown waits for them, and
+    /// one added again under the name starts once its last has stopped.
+    stopping: HashMap<String, JoinHandle<()>>,
 }
 
 impl Companions {
@@ -143,6 +146,7 @@ impl Companions {
             logs: logs.into(),
             runs,
             kept: HashMap::new(),
+            stopping: HashMap::new(),
         }
     }
 
@@ -153,10 +157,13 @@ impl Companions {
         if self.kept.get(name).is_some_and(|kept| kept.spec == spec) {
             return;
         }
-        let before = self.kept.remove(name).map(|kept| {
-            let _ = kept.stop.send(true);
-            kept.task
-        });
+        let before = match self.kept.remove(name) {
+            Some(kept) => {
+                let _ = kept.stop.send(true);
+                Some(kept.task)
+            }
+            None => self.stopping.remove(name),
+        };
         let status = Arc::new(Mutex::new(Status::default()));
         let (stop, stopped) = watch::channel(false);
         let run = Run {
@@ -188,10 +195,13 @@ impl Companions {
 
     /// Stop `name`'s companion; whether one was kept.
     pub fn drop_one(&mut self, name: &str) -> bool {
-        self.kept
-            .remove(name)
-            .map(|kept| kept.stop.send(true))
-            .is_some()
+        self.stopping.retain(|_, task| !task.is_finished());
+        let Some(kept) = self.kept.remove(name) else {
+            return false;
+        };
+        let _ = kept.stop.send(true);
+        self.stopping.insert(name.to_owned(), kept.task);
+        true
     }
 
     /// Stop every companion and wait for them to exit.
@@ -203,6 +213,7 @@ impl Companions {
                 let _ = kept.stop.send(true);
                 kept.task
             })
+            .chain(self.stopping.drain().map(|(_, task)| task))
             .collect();
         futures_util::future::join_all(tasks).await;
     }
@@ -264,7 +275,7 @@ impl Run {
             }
             first = false;
             let started = Instant::now();
-            let exit = match self.spawn() {
+            let exit = match self.spawn().await {
                 Ok(mut child) => {
                     {
                         let mut status = self.status();
@@ -298,14 +309,20 @@ impl Run {
         }
     }
 
-    fn spawn(&self) -> std::result::Result<tokio::process::Child, String> {
-        std::fs::create_dir_all(self.log.parent().expect("in its folder"))
+    async fn spawn(&self) -> std::result::Result<tokio::process::Child, String> {
+        // Off the runtime thread: a slow disk, or a FIFO at the log's
+        // path, holds only this companion.
+        tokio::fs::create_dir_all(self.log.parent().expect("in its folder"))
+            .await
             .map_err(|e| e.to_string())?;
-        let log = std::fs::OpenOptions::new()
+        let log = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log)
-            .map_err(|e| format!("{}: {e}", self.log.display()))?;
+            .await
+            .map_err(|e| format!("{}: {e}", self.log.display()))?
+            .into_std()
+            .await;
         let mut command = tokio::process::Command::new(&self.spec.command);
         command
             .args(&self.spec.args)
@@ -335,17 +352,22 @@ fn exited(exit: std::io::Result<std::process::ExitStatus>) -> Value {
     }
 }
 
-/// SIGTERM to its group, then SIGKILL once its grace is up.
+/// SIGTERM to its group, then SIGKILL to what is left of it once its
+/// grace is up, the companion itself gone or not.
 async fn terminate(child: &mut tokio::process::Child) {
     let Some(pid) = child.id() else { return };
     let group = -(pid as i32);
+    let deadline = tokio::time::Instant::now() + GRACE;
     // SAFETY: a signal to the process group this companion leads.
     unsafe { libc::kill(group, libc::SIGTERM) };
-    if tokio::time::timeout(GRACE, child.wait()).await.is_err() {
-        // SAFETY: as above.
-        unsafe { libc::kill(group, libc::SIGKILL) };
-        let _ = child.wait().await;
+    let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+    // SAFETY: signal 0 only asks whether any of the group lives.
+    while unsafe { libc::kill(group, 0) } == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // SAFETY: as above; a group already gone is no error to mind.
+    unsafe { libc::kill(group, libc::SIGKILL) };
+    let _ = child.wait().await;
 }
 
 fn epoch_ms() -> i64 {
@@ -430,6 +452,37 @@ mod tests {
         // SAFETY: signal 0 only asks whether it lives.
         assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
         assert_eq!(companions.listed(), json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_removed_companion_s_group_is_stopped_before_the_daemon_is() {
+        let dir = std::env::temp_dir().join(format!("companions-rm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut companions = Companions::new(&dir.join("state.sqlite"), vec![], true);
+        // It exits on SIGTERM; what it started does not.
+        let started = dir.join("started");
+        let script = format!(
+            "(trap '' TERM; exec sleep 30) & echo $! > {}; wait",
+            started.display()
+        );
+        companions.keep("stubborn", spec("sh", &["-c", &script]));
+        until(|| std::fs::read_to_string(&started).is_ok_and(|pid| pid.ends_with('\n'))).await;
+        let pid: i32 = std::fs::read_to_string(&started)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(companions.drop_one("stubborn"));
+        assert_eq!(companions.listed(), json!([]));
+        companions.stop().await;
+        // Gone, or a zombie no init here reaps, once SIGKILL lands.
+        let dead = || {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // SAFETY: signal 0 only asks whether it lives.
+            (unsafe { libc::kill(pid, 0) }) != 0 || state.contains(") Z ")
+        };
+        until(dead).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

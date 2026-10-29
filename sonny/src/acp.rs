@@ -1476,14 +1476,14 @@ async fn services(
     if let Some(project) = project {
         lookout::subscribe_lead(&agent.options.store, bot, project)?;
     }
-    crate::start_lookout(client, &agent.options).await?;
+    crate::start_lookout(client).await?;
     if approvals::mode(&record) == Some("auto") {
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or(""),
             record["model"].as_str().unwrap_or("")
         );
-        crate::serve_auto(client, &agent.options, &model).await?;
+        crate::serve_auto(client, &model).await?;
     }
     Ok(())
 }
@@ -1562,14 +1562,14 @@ async fn setup_lead(
         }
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
-    crate::start_lookout(client, &agent.options).await?;
+    crate::start_lookout(client).await?;
     if gating.or(mode) == Some("auto") {
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or(""),
             record["model"].as_str().unwrap_or("")
         );
-        crate::serve_auto(client, &agent.options, &model).await?;
+        crate::serve_auto(client, &model).await?;
     }
     Ok(())
 }
