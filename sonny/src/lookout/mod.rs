@@ -3296,6 +3296,7 @@ mod tests {
         let record = |name: &str, id: i64, by: Option<&str>| json!({"name": name, "bot_id": id, "created_by": by});
         let mut service = Service {
             store: PathBuf::new(),
+            runner: sources::Runner::new(PathBuf::new(), tokio::sync::mpsc::channel(1).0),
             records: [
                 record("calc.lead", 1, None),
                 record("calc.speed", 2, Some("calc.lead")),
