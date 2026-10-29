@@ -1946,6 +1946,9 @@ struct Lookout {
     denied: HashMap<(String, i64), u64>,
     /// Queued turns already checked when they were queued.
     checked: HashSet<(String, i64)>,
+    /// Turns a lookout's note started in a lead a subscription names: that
+    /// lead's own work with its tasks, never news here.
+    noted: HashSet<(String, i64)>,
     /// Checks that failed once and were started again.
     retried: HashSet<(String, i64, Kind)>,
     /// The messages notes told lately, newest last.
@@ -1999,6 +2002,7 @@ impl Lookout {
             steers: HashMap::new(),
             denied: HashMap::new(),
             checked: HashSet::new(),
+            noted: HashSet::new(),
             retried: HashSet::new(),
             told: VecDeque::new(),
             briefs: HashMap::new(),
@@ -2027,6 +2031,12 @@ impl Lookout {
             .filter(|bot| updating.iter().any(|sub| self.sub_watches(sub, bot)))
             .collect();
         self.updates.watched = watched;
+        // Another subscriber is a task here only where one names it as it is.
+        self.updates.named = (updating.iter())
+            .flat_map(|sub| sub.bots.iter())
+            .filter(|glob| !glob.contains('*'))
+            .cloned()
+            .collect();
     }
 
     /// Lineage is kept up during the replay too, so tasks made earlier count.
@@ -2072,6 +2082,7 @@ impl Lookout {
                 }
                 self.briefs.remove(bot);
                 self.led.remove(bot);
+                self.noted.retain(|(task, _)| task != bot);
                 self.exchanges.remove(bot);
             }
             _ => {}
@@ -2138,6 +2149,11 @@ impl Lookout {
             return;
         }
         let node = data["node"].as_i64();
+        if matches!(kind, "accepted" | "queued")
+            && (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
+        {
+            self.noted.insert((bot.to_owned(), turn));
+        }
         match kind {
             "accepted" => {
                 // Words checked when they were queued are not checked again,
@@ -2179,6 +2195,9 @@ impl Lookout {
             }
             "turn_finished" => {
                 let status = data["status"].as_str().unwrap_or("ended");
+                if self.noted.remove(&(bot.to_owned(), turn)) {
+                    return;
+                }
                 if status == "steered" {
                     match self.steers.remove(&(bot.to_owned(), turn)) {
                         Some(Some(from)) => {
@@ -3407,6 +3426,54 @@ mod tests {
                 "- calc.ops: turn:calc.ops/2 completed, asked by tasks",
             ]
         );
+    }
+
+    #[test]
+    fn a_lead_a_subscription_names_is_news_as_a_task_is_but_not_its_lookout_s_turns() {
+        let mut lookout = lookout();
+        lookout.event(&json!({"bot": "calc.lead", "event": "created", "data": {"bot_id": 1, "status": "idle"}}));
+        lookout.event(&json!({"bot": "web.lead", "event": "created", "data": {"bot_id": 7, "status": "idle"}}));
+        lookout.event(&json!({"event": "follow_live"}));
+        // Another subscriber, so no task of this lead's until the person
+        // has it watched by name.
+        lookout.updates.subscribed(["web.lead".to_owned()].into());
+        let mut sub = subs::Sub::lead("calc.lead", "calc");
+        sub.name = "web".into();
+        sub.tasks_of.clear();
+        sub.bots = vec!["web.lead".into()];
+        assert!(!lookout.watches("web.lead"));
+        lookout.subs.push(sub);
+        lookout.roots(&HashMap::from([(
+            "web.lead".to_owned(),
+            json!({"name": "web.lead", "bot_id": 7}),
+        )]));
+        assert!(lookout.watches("web.lead"));
+        // Its own lookout's note, and the person's question.
+        let note = json!({"request_id": "lookout-0123456789abcdef"});
+        lookout.event(&ev("web.lead", 2, "accepted", note));
+        lookout.event(&ev(
+            "web.lead",
+            2,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        lookout.event(&ev("web.lead", 3, "accepted", json!({"node": 40})));
+        lookout.event(&ev(
+            "web.lead",
+            3,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        let told = lookout.updates.take();
+        let texts: Vec<&str> = told.items.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.iter().all(|t| !t.contains("web.lead/2")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("web.lead/3")), "{texts:?}");
+        let checked: Vec<(i64, Kind)> = lookout.due.iter().map(|s| (s.turn, s.kind)).collect();
+        assert_eq!(checked, [(3, Kind::Said), (3, Kind::Ended)]);
+        // What it makes is its own, never this lead's.
+        lookout.event(&json!({"bot": "web.fix", "event": "created",
+            "data": {"bot_id": 8, "status": "idle", "created_by": "web.lead", "created_by_id": 7}}));
+        assert!(!lookout.watches("web.fix"));
     }
 
     #[test]

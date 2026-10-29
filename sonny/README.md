@@ -324,7 +324,8 @@ yours to an older reply goes under that reply.
   architectural choice or a step that cannot be undone, it calls its `ask`
   tool with the question, why it asks, two to four options each with what
   picking it means, and the one it recommends and why. Sonny draws the
-  decision in the conversation where it was asked, and the composer's hint
+  decision in the conversation where it was asked, its words read as
+  Markdown with the same renderer a reply uses, and the composer's hint
   names it: what you type next answers it (an option's number picks it),
   and goes to the lead as `You asked: QUESTION` and your answer. Esc sets
   it aside for a message of your own, and Esc again goes back to it. The
@@ -363,7 +364,7 @@ turn of the task numbered after that one reopens it.
 
 ![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 
-![A decision the lead asked with the ask tool, drawn where it asked it](../docs/sonny/ask-asked.png)
+![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 

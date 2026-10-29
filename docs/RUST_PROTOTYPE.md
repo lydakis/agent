@@ -411,6 +411,7 @@ keep-warm when it sets any of them.
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
+| `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -1284,7 +1285,12 @@ else `invalid_origin`), mutually exclusive with `from`, stored and reported the 
 no meaning, but a prompt with an `origin` is no person's word to the
 approver. The sender's identity is resolved at submit and kept on the turn
 (`turns.from_id`), so a queued message whose sender is deleted before it
-starts still names it.
+starts still names it. The model reads the sender too, as a text part after
+the prompt's words and before its pictures, so it does not take another
+agent's words for a person's: `[Written by the agent NAME in
+turn:NAME/TURN, not by a person.]` for `from`, `[Sent by ORIGIN.]` for
+`origin`, and nothing for a person's prompt. `content[0]` stays the words.
+A bot made with `hide_senders` reads the words alone.
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with

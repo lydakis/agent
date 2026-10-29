@@ -504,11 +504,10 @@ fn preview(
         // A document reads at the conversation's width, its pictures too.
         prose = true;
         let mut markdown = crate::transcript::Markdown::document(folder);
-        let mut rows = Vec::new();
-        for text in &lines[..shown] {
-            rows.extend(markdown.feed(text, width.min(crate::PROSE), false));
-        }
-        rows.extend(markdown.end(width.min(crate::PROSE), false));
+        let leads = (Line::from("  "), Line::from("  "));
+        let text = lines[..shown].join("\n");
+        let rows =
+            crate::transcript::markdown(&mut markdown, &text, width.min(crate::PROSE), leads);
         screen.push(rows);
     } else {
         let mut code = crate::highlight::Code::file(path, lines.first().unwrap_or(&""));
