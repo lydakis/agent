@@ -143,9 +143,11 @@ fn charset(content_type: &str, html: Option<&Vec<u8>>) -> Option<String> {
             .collect();
         (!value.is_empty()).then_some(value)
     };
+    // A page's own declaration is in a `meta` tag, never in its text.
     named(content_type).or_else(|| {
-        let head = String::from_utf8_lossy(&html?[..html?.len().min(1024)]).into_owned();
-        named(&head)
+        let head = String::from_utf8_lossy(&html?[..html?.len().min(1024)]).to_ascii_lowercase();
+        head.match_indices("<meta")
+            .find_map(|(at, _)| named(head[at..].split('>').next().unwrap_or("")))
     })
 }
 
@@ -226,6 +228,8 @@ pub fn markdown(html: &str, base: Option<&Url>) -> (Option<String>, String, bool
     let mut out = Markdown::default();
     let mut title = None;
     let mut rest = html;
+    // A page's `base` element moves where its relative links lead.
+    let mut base = base.cloned();
     while let Some(at) = rest.find('<') {
         if out.out.len() > MARKDOWN_BYTES {
             return (title, out.finish(), true);
@@ -283,7 +287,13 @@ pub fn markdown(html: &str, base: Option<&Url>) -> (Option<String>, String, bool
             rest = rest.find('>').map_or("", |end| &rest[end + 1..]);
             continue;
         }
-        out.tag(&name, closing, tag, base);
+        if name == "base"
+            && let Some(href) = attribute(tag, "href")
+        {
+            base = base.and_then(|base| base.join(&href).ok());
+            continue;
+        }
+        out.tag(&name, closing, tag, base.as_ref());
     }
     out.text(rest);
     let over = out.out.len() > MARKDOWN_BYTES;
@@ -555,6 +565,8 @@ impl Markdown {
             }
             ("td" | "th", true) => self.out.push_str(" |"),
             ("a", false) => {
+                // Links don't nest: one opening ends the one still open.
+                self.tag("a", true, "", base);
                 let href = attribute(tag, "href").and_then(|href| link(&href, base));
                 if href.is_some() {
                     self.inline("[");
@@ -703,9 +715,25 @@ mod tests {
             charset("text/html", Some(&page)).as_deref(),
             Some("windows-1252")
         );
+        // Text that names a charset is not a declaration.
+        let page = b"<html><p>Use charset=windows-1252 for old files</p></html>".to_vec();
+        assert_eq!(charset("text/html", Some(&page)), None);
         assert_eq!(
             decoded(Vec::new(), Some("utf-16".into())).unwrap_err().code,
             "web_fetch_charset"
+        );
+    }
+
+    #[test]
+    fn links_follow_the_pages_base_and_never_nest() {
+        let base = Url::parse("https://example.com/view/page").unwrap();
+        let (_, text, _) = markdown(
+            r#"<base href="/docs/"><a href="api">API</a> <a href="a">one <a href="b">two</a>"#,
+            Some(&base),
+        );
+        assert_eq!(
+            text,
+            "[API](https://example.com/docs/api) [one](https://example.com/docs/a) [two](https://example.com/docs/b)\n"
         );
     }
 
