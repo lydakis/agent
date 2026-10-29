@@ -6,7 +6,7 @@
 //! message. The open questions are read from the history Sonny replays:
 //! its `ask` calls not yet answered.
 use ratatui::{
-    style::{Color, Stylize},
+    style::{Color, Style, Stylize},
     text::{Line, Span},
 };
 use serde_json::{Value, json};
@@ -197,27 +197,25 @@ pub fn answer(ask: &Ask, typed: &str) -> String {
 /// each option by number with what it means, and the recommendation.
 pub fn lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
     let indent = || Span::raw("  ");
+    // What the agent wrote reads as its Markdown, as a reply does.
+    let markdown = |text: &str, first: Line<'static>, rest: Line<'static>, style: Style| {
+        let mut markdown = crate::transcript::Markdown::default();
+        let rows = crate::transcript::markdown(&mut markdown, text, width, (first, rest));
+        rows.into_iter().map(move |row| row.patch_style(style))
+    };
     let mut rows = Vec::new();
-    for (at, line) in ask.question.lines().enumerate() {
-        let first = match at {
-            0 => Span::raw("? ").fg(Color::Yellow).bold(),
-            _ => indent(),
-        };
-        rows.extend(crate::transcript::wrap(
-            Line::from(line.to_owned()).bold(),
-            width,
-            first,
-            indent(),
-        ));
-    }
-    for line in ask.why.lines() {
-        rows.extend(crate::transcript::wrap(
-            Line::from(line.to_owned()).dim(),
-            width,
-            indent(),
-            indent(),
-        ));
-    }
+    rows.extend(markdown(
+        &ask.question,
+        Line::from(Span::raw("? ").fg(Color::Yellow).bold()),
+        Line::from(indent()),
+        Style::new().bold(),
+    ));
+    rows.extend(markdown(
+        &ask.why,
+        Line::from(indent()),
+        Line::from(indent()),
+        Style::new().dim(),
+    ));
     if !ask.options.is_empty() {
         rows.push(Line::default());
     }
@@ -237,27 +235,25 @@ pub fn lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
             ]),
             Line::from(under()),
         ));
-        for line in choice.explanation.lines() {
-            rows.extend(crate::transcript::wrap(
-                Line::from(line.to_owned()),
-                width,
-                under(),
-                under(),
-            ));
-        }
+        rows.extend(markdown(
+            &choice.explanation,
+            Line::from(under()),
+            Line::from(under()),
+            Style::new(),
+        ));
     }
     if let Some(at) = ask.recommended
         && !ask.reason.is_empty()
     {
         rows.push(Line::default());
-        rows.extend(crate::transcript::wrap_lines(
-            Line::from(ask.reason.clone()).dim(),
-            width,
+        rows.extend(markdown(
+            &ask.reason,
             Line::from(vec![
                 indent(),
                 Span::raw(format!("Why {}: ", at + 1)).fg(Color::Green),
             ]),
             Line::from(indent()),
+            Style::new().dim(),
         ));
     }
     rows
@@ -276,10 +272,15 @@ pub fn hint(ask: &Ask, more: usize, width: usize) -> String {
     };
     let tail = format!(": {keys}{more} · Esc to chat");
     let room = width.saturating_sub(tail.chars().count() + "Answer “”".chars().count());
-    let question = ask.question.lines().next().unwrap_or("");
+    // The question as it reads on the card, without its Markdown marks.
+    let question: String =
+        crate::transcript::inline(ask.question.lines().next().unwrap_or(""), Style::default())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
     format!(
         "Answer “{}”{tail}",
-        crate::transcript::cut(question, room.max(8))
+        crate::transcript::cut(&question, room.max(8))
     )
 }
 
@@ -374,6 +375,33 @@ mod tests {
         let at = narrow.iter().position(|row| row == "  1  Keep it").unwrap();
         assert_eq!(narrow[at + 1], "     Old clients work; a shim");
         assert_eq!(narrow[at + 2], "     stays a release.");
+    }
+
+    #[test]
+    fn what_the_agent_wrote_in_a_decision_reads_as_markdown() {
+        let ask = call(
+            "c1",
+            &json!({
+                "question": "Ship **0.5** with `--fast` on?",
+                "options": [{"label": "Yes", "explanation": "Runs $n^2$ checks, see [the plan](https://x.dev)."}],
+            }),
+        )
+        .unwrap();
+        let shown: Vec<String> = lines(&ask, 80).iter().map(|row| row.to_string()).collect();
+        assert_eq!(shown[0], "? Ship 0.5 with --fast on?");
+        assert_eq!(
+            shown[3],
+            "     Runs n² checks, see the plan (https://x.dev)."
+        );
+        // The question stays bold, past what its words make bold.
+        assert!(
+            lines(&ask, 80)[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        // The composer names it without its marks.
+        assert!(hint(&ask, 0, 80).starts_with("Answer “Ship 0.5 with --fast on?”"));
     }
 
     #[test]

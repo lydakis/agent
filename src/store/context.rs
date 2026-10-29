@@ -197,7 +197,7 @@ pub(crate) fn context_prefix(
             };
             if history && omitted_turns > 0 {
                 text.push_str(&format!(
-                    " Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
+                    " Use the history tool with a turn number from 1 to {omitted_turns} to read any of them, or with query to search them for text."
                 ));
             }
             if !listed.is_empty() {
@@ -390,13 +390,14 @@ pub fn picture_stub(
 pub fn prompt_stub(
     family: Family,
     prompt: &str,
+    sender: Option<&str>,
     pictures: usize,
     weight: usize,
 ) -> Result<Option<Vec<u8>>> {
     let text = format!(
         "{prompt}\n[{pictures} picture(s) sent with this message, elided from this request]"
     );
-    let stub = family.user_item_with(&text, &[])?;
+    let stub = family.user_item_from(&text, sender, &[])?;
     Ok((stub.len() < weight).then_some(stub))
 }
 

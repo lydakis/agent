@@ -135,15 +135,8 @@ pub fn plain_line(text: &str) -> String {
 }
 
 /// The lead, then its tasks by group, resolved ones only counted unless
-/// `resolved` shows them; then the project's Errand jobs, when it has any
-/// running.
-pub fn card(
-    project: &str,
-    rows: &[Row],
-    jobs: &[Row],
-    width: usize,
-    resolved: bool,
-) -> Vec<Line<'static>> {
+/// `resolved` shows them.
+pub fn card(project: &str, rows: &[Row], width: usize, resolved: bool) -> Vec<Line<'static>> {
     let tasks: Vec<&Row> = rows.iter().filter(|r| r.name != "lead").collect();
     let count = |group: Group| tasks.iter().filter(|r| r.group == group).count();
     let mut head = format!(
@@ -186,27 +179,6 @@ pub fn card(
         ]));
         for row in tasks.iter().filter(|r| r.group == group) {
             out.extend(row_lines(row, width));
-        }
-    }
-    if !jobs.is_empty() {
-        out.push(Line::default());
-        out.push(Line::from(format!("On Errand · {} active", jobs.len())).bold());
-        for job in jobs {
-            let mut spans = vec![
-                Span::raw(" "),
-                mark(&job.state),
-                Span::raw(job.name.clone()),
-            ];
-            if let Some(seconds) = job.seconds {
-                spans.push(Span::raw(format!(" · {}", crate::transcript::elapsed(seconds))).dim());
-            }
-            out.extend(crate::transcript::capped(
-                Line::from(spans),
-                width,
-                Span::raw(""),
-                1,
-            ));
-            out.push(Line::from(format!("   {}", job.place)).dim());
         }
     }
     out
@@ -261,7 +233,8 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         ));
     }
     if !row.latest.is_empty() {
-        let line = Line::from(row.latest.clone()).dim();
+        // The agent's words, read as the Markdown they are.
+        let line = Line::from(crate::transcript::inline(&row.latest, Default::default())).dim();
         out.extend(crate::transcript::capped(
             line,
             width,
@@ -345,7 +318,7 @@ mod tests {
             row("old", "done", Group::Resolved),
         ];
         let text = |resolved| -> Vec<String> {
-            card("calc", &rows, &[], 100, resolved)
+            card("calc", &rows, 100, resolved)
                 .iter()
                 .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect()

@@ -242,9 +242,13 @@ pub fn write(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The tools a sandbox confines: what runs a command or writes a file.
+/// The tools a sandbox confines: what runs a command or writes a file, and
+/// input typed into a terminal, whose command runs in the sandbox.
 pub fn confinable(tool: &str) -> bool {
-    matches!(tool, "shell" | "write" | "edit" | "apply_patch")
+    matches!(
+        tool,
+        "shell" | "write" | "edit" | "apply_patch" | "write_stdin"
+    )
 }
 
 /// Whether a call by a bot in `mode` asks to run outside its sandbox: a

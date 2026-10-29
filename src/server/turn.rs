@@ -3435,7 +3435,7 @@ impl Turn {
             let confined =
                 record.sandboxed() && agent_runtime::sandbox::confinable(&call.name) && !approved;
             let prepared = match prepared {
-                Ok(Prepared::Shell { .. } | Prepared::Detach(_))
+                Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
                     if confined && !record.confines(&call, workspace) =>
                 {
                     Err(Error::with(
@@ -3524,6 +3524,50 @@ impl Turn {
                         Err(error) => return Err(error),
                     }
                 }
+                Ok(Prepared::Terminal { command, yield_ms }) => {
+                    let (turn, started) = (self.turn, call.call_id.clone());
+                    let id = self
+                        .store
+                        .op("process_start", move |db| db.process_start(turn, &started))
+                        .await?;
+                    let (sender, receiver) = oneshot::channel();
+                    self.collect(id, &call.call_id, receiver);
+                    let start = self.registry.terminal(
+                        record.bot_id,
+                        id,
+                        command,
+                        workspace.to_path_buf(),
+                        yield_ms,
+                        environment.to_vec(),
+                        sandbox,
+                        sender,
+                    );
+                    match self.run_tool(start, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
+                Ok(Prepared::WriteStdin {
+                    handle,
+                    chars,
+                    yield_ms,
+                    kill,
+                }) => {
+                    let typed = self.registry.write_stdin(
+                        record.bot_id,
+                        handle,
+                        &chars,
+                        yield_ms,
+                        kill,
+                        sandbox,
+                    );
+                    match self.run_tool(typed, None, warm.as_deref_mut()).await? {
+                        Ran::Done(Ok(outcome)) => outcome,
+                        Ran::Done(Err(error)) => failure(error),
+                        Ran::Lifted(_) => unreachable!("only a command moves to the background"),
+                    }
+                }
                 Ok(Prepared::Read {
                     source:
                         ReadSource::Artifact {
@@ -3564,6 +3608,12 @@ impl Turn {
                     match Box::pin(self.history(&call.call_id, bot, wanted, handle, offset, limit))
                         .await
                     {
+                        Ok(outcome) => outcome,
+                        Err(error) => failure(error),
+                    }
+                }
+                Ok(Prepared::HistorySearch { bot, query, before }) => {
+                    match self.history_search(&call.call_id, bot, query, before).await {
                         Ok(outcome) => outcome,
                         Err(error) => failure(error),
                     }
@@ -4182,6 +4232,31 @@ impl Turn {
             page["truncated"] = json!(true);
             page["done"] = json!(false);
         }
+    }
+
+    /// Matches of literal text in a bot's history, newest first; the
+    /// caller's own turn is left out of a search of its own.
+    async fn history_search(
+        &self,
+        call_id: &str,
+        bot: Option<String>,
+        query: String,
+        before: Option<i64>,
+    ) -> Result<Outcome> {
+        let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
+        let own = bot.is_none() || bot.as_deref() == Some(self.bot.as_str());
+        let bot = bot.unwrap_or_else(|| self.bot.clone());
+        let found = self
+            .store
+            .read("history_search", move |db| {
+                db.history_search(&bot, &query, before, own)
+            })
+            .await?;
+        let output = self.registry.redact_text(found.to_string());
+        if family.tool_result_item(call_id, false, &output)?.len() > budget {
+            return fail("history_context_exhausted");
+        }
+        Ok(Outcome::text(output))
     }
 
     /// Make the turn durable as waiting, then register its handles. Returns

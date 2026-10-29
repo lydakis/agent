@@ -7,8 +7,6 @@
 //! The notification is OSC 777, which Rex shows as a desktop notification.
 use std::{
     io::Write,
-    path::PathBuf,
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -90,21 +88,14 @@ fn play(alert: Alert) {
     if chosen == "off" {
         return;
     }
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let path = if chosen.contains('/') {
-            PathBuf::from(&chosen)
+            std::path::PathBuf::from(&chosen)
         } else {
-            PathBuf::from(format!("/System/Library/Sounds/{chosen}.aiff"))
+            std::path::PathBuf::from(format!("/System/Library/Sounds/{chosen}.aiff"))
         };
-        if path.is_file()
-            && let Ok(mut child) = Command::new("/usr/bin/afplay")
-                .arg(&path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-        {
-            std::thread::spawn(move || child.wait());
+        if path.is_file() && crate::mac::play(&path) {
             return;
         }
     }
