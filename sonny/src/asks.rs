@@ -194,8 +194,10 @@ pub fn answer(ask: &Ask, typed: &str) -> String {
 }
 
 /// The decision as it is drawn where it was asked: the question, why,
-/// each option by number with what it means, and the recommendation.
-pub fn lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
+/// each option by number with what it means, and the recommendation;
+/// and the row each option starts on, which a click picks it on.
+pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut options = Vec::new();
     let indent = || Span::raw("  ");
     let mut rows = Vec::new();
     for (at, line) in ask.question.lines().enumerate() {
@@ -224,6 +226,7 @@ pub fn lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
     // The explanation sits under its label, past the number.
     let under = || Span::raw("     ");
     for (at, choice) in ask.options.iter().enumerate() {
+        options.push(rows.len());
         let mut label = vec![Span::raw(choice.label.clone()).bold()];
         if ask.recommended == Some(at) {
             label.push(Span::raw(" · recommended").fg(Color::Green));
@@ -260,7 +263,7 @@ pub fn lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
             Line::from(indent()),
         ));
     }
-    rows
+    (rows, options)
 }
 
 /// The composer's hint while what is typed answers `ask`, cut to `width`.
@@ -351,7 +354,8 @@ mod tests {
     #[test]
     fn the_decision_reads_as_question_why_options_and_recommendation() {
         let ask = call("c1", &keep_api()).unwrap();
-        let shown: Vec<String> = lines(&ask, 60).iter().map(|row| row.to_string()).collect();
+        let (rows, options) = lines(&ask, 60);
+        let shown: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
         assert_eq!(
             shown,
             [
@@ -366,8 +370,11 @@ mod tests {
                 "  Why 2: Nobody runs 0.3 outside this machine.",
             ]
         );
+        // Where a click picks each option.
+        assert_eq!(options, [3, 5]);
         // Narrow, each part wraps under its own indent.
         let narrow: Vec<String> = lines(&ask, 30)
+            .0
             .iter()
             .map(|row| row.to_string().trim_end().to_owned())
             .collect();

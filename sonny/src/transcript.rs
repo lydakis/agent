@@ -928,6 +928,91 @@ fn kept(said: &crate::calls::Said) -> bool {
     KEPT.contains(&said.verb.as_str())
 }
 
+/// The calls that fold into one when several come in a row: those that
+/// start, message or change agents and what runs for them, which a lead
+/// often makes a few of at once.
+const FOLDS: [&str; 21] = [
+    "Started",
+    "Messaged",
+    "Steered",
+    "Queued for",
+    "Forked",
+    "Interrupted",
+    "Removed",
+    "Discarded",
+    "Resolved",
+    "Saved to memory",
+    "Updated in memory",
+    "Removed from memory",
+    "Scheduled",
+    "Removed the trigger",
+    "Fired the trigger",
+    "Subscribed to",
+    "Unsubscribed from",
+    "Moved",
+    "Opened",
+    "Opened a tab",
+    "Opened a split",
+];
+
+/// What a call that folds with others like it did, said as Sonny says it
+/// (`Started`) and whom (`calc.fix-avg`): a call of one of Sonny's tools,
+/// or one command Sonny knows, that did not fail.
+pub fn folds(
+    name: &str,
+    arguments: &Value,
+    output: Option<&str>,
+    failed: bool,
+) -> Option<(String, String)> {
+    if failed {
+        return None;
+    }
+    let said = match name {
+        "shell" => crate::calls::said(arguments["command"].as_str()?, output.unwrap_or(""), false)?,
+        _ => crate::calls::declared(name, arguments, false)?,
+    };
+    // A task's name, not the turn it started.
+    let what = said
+        .what
+        .split(" · ")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    (FOLDS.contains(&said.verb.as_str()) && !what.is_empty()).then_some((said.verb, what))
+}
+
+/// Calls folded into one: what they did, said once with whom each did
+/// it to, `▸` to open them; open, the same row with `▾`, and each call's
+/// own rows under it.
+pub fn folded(
+    verb: &str,
+    whats: &[String],
+    calls: &[Vec<Line<'static>>],
+    open: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut names = whats.join(", ");
+    if let Some(at) = names.rfind(", ") {
+        names.replace_range(at..at + 2, " and ");
+    }
+    let line = Line::from(vec![
+        Span::raw(verb.to_owned()).bold(),
+        Span::raw(" "),
+        Span::raw(names),
+        Span::raw(match open {
+            true => " ▾",
+            false => " ▸",
+        })
+        .dim(),
+    ]);
+    let mut out = wrap(line, width, Span::raw("• "), Span::raw("    "));
+    if open {
+        out.extend(calls.iter().flatten().cloned());
+    }
+    out
+}
+
 fn drawn(
     name: &str,
     arguments: &Value,

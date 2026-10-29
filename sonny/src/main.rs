@@ -1115,6 +1115,15 @@ struct Denial {
     reason: String,
 }
 
+/// Calls alike, drawn as one: what they did, whom each did it to, and
+/// each one's own rows, shown under it while open.
+struct Fold {
+    verb: String,
+    whats: Vec<String>,
+    calls: Vec<Vec<Line<'static>>>,
+    open: bool,
+}
+
 /// The most denials `/approve` offers.
 const DENIALS: usize = 8;
 
@@ -1500,6 +1509,13 @@ struct App {
     ran_here: Vec<user_shell::Ran>,
     /// The conversation's rows.
     screen: screen::Screen,
+    /// Calls drawn folded into one, by number; and the one the last call
+    /// went into, with the rows drawn by then, which the next call like
+    /// it joins while nothing else was drawn.
+    folds: Vec<Fold>,
+    folding: Option<(usize, usize)>,
+    /// A button clicked in the conversation, which [`App::press`] takes.
+    pressed: Option<String>,
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
@@ -2177,6 +2193,9 @@ impl App {
             unsent: Vec::new(),
             ran_here: Vec::new(),
             screen: screen::Screen::default(),
+            folds: Vec::new(),
+            folding: None,
+            pressed: None,
         }
     }
 
@@ -2616,6 +2635,8 @@ impl App {
         terminal.clear().map_err(|e| e.to_string())?;
         self.pending.clear();
         self.marks.clear();
+        self.folds.clear();
+        self.folding = None;
         self.held.clear();
         self.live = None;
         self.any_history = false;
@@ -2772,28 +2793,123 @@ impl App {
 
     /// A finished call, quiet, as the view shows it: every call when
     /// verbose, else only those [`transcript::clean`] keeps.
-    fn commit_call(&mut self, name: &str, arguments: &Value, output: &str, failed: bool) {
-        // A decision for the person stands out where it was asked.
+    /// Calls like the one before it, with nothing drawn between, fold
+    /// into one: several tasks started at once read as one row.
+    fn commit_call(&mut self, id: &str, name: &str, arguments: &Value, output: &str, failed: bool) {
+        // A decision for the person stands out where it was asked, each
+        // option a button that answers with it.
         if name == asks::TOOL
             && !failed
-            && let Some(ask) = asks::call("", arguments)
+            && let Some(ask) = asks::call(id, arguments)
         {
-            self.commit(asks::lines(&ask, self.width));
+            let (lines, options) = asks::lines(&ask, self.width);
+            let from = self.pending.len() + usize::from(self.any_history);
+            self.commit(lines);
+            self.marks
+                .extend(options.into_iter().enumerate().map(|(at, row)| {
+                    let button = format!("{}answer/{at}/{id}", screen::BUTTON);
+                    (from + row, screen::Mark::Link(button))
+                }));
             return;
         }
         let draw = match self.verbose {
             true => transcript::tool,
             false => transcript::clean,
         };
-        let lines = draw(
+        let lines = transcript::quiet(draw(
             name,
             arguments,
             Some(output),
             failed,
             &self.workspace,
             self.prose(),
-        );
-        self.commit(transcript::quiet(lines));
+        ));
+        if lines.is_empty() {
+            return;
+        }
+        let Some((verb, what)) = transcript::folds(name, arguments, Some(output), failed) else {
+            self.commit(lines);
+            return;
+        };
+        if let Some((at, drawn)) = self.folding
+            && drawn == self.rows_drawn
+            && self.folds[at].verb == verb
+        {
+            self.folds[at].whats.push(what.clone());
+            self.folds[at].calls.push(lines.clone());
+            if self.draw_fold(at) {
+                return;
+            }
+            // Gone from the conversation: this call starts a fold of its own.
+            self.folds[at].whats.pop();
+            self.folds[at].calls.pop();
+        }
+        let at = self.folds.len();
+        self.folds.push(Fold {
+            verb,
+            whats: vec![what],
+            calls: vec![lines.clone()],
+            open: false,
+        });
+        let from = self.pending.len() + usize::from(self.any_history);
+        self.commit(lines);
+        let tag = screen::Mark::Tag(screen::Tag::Group(at as u64));
+        self.marks
+            .extend((from..self.pending.len()).map(|line| (line, tag.clone())));
+        self.folding = Some((at, self.rows_drawn));
+    }
+
+    /// The calls folded at `at` drawn again where they are, folded or
+    /// open; whether they are still in the conversation.
+    fn draw_fold(&mut self, at: usize) -> bool {
+        let fold = &self.folds[at];
+        let lines = transcript::quiet(transcript::folded(
+            &fold.verb,
+            &fold.whats,
+            &fold.calls,
+            fold.open,
+            self.prose(),
+        ));
+        let open = screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON));
+        self.flush();
+        self.screen
+            .replace_tagged(screen::Tag::Group(at as u64), lines, vec![(0, open)])
+    }
+
+    /// What a button clicked in the conversation does: `fold/N` opens or
+    /// folds the calls folded as N; `answer/N/ID` answers the question
+    /// call ID asked with its option N, while it is open.
+    async fn press(&mut self, button: &str) {
+        if let Some(at) = button
+            .strip_prefix("fold/")
+            .and_then(|at| at.parse::<usize>().ok())
+            .filter(|at| *at < self.folds.len())
+        {
+            self.folds[at].open = !self.folds[at].open;
+            self.draw_fold(at);
+        }
+        if let Some((at, id)) = button
+            .strip_prefix("answer/")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(at, id)| Some((at.parse::<usize>().ok()?, id)))
+        {
+            let Some(ask) = self.asks.iter().find(|ask| ask.id == id).cloned() else {
+                self.notice = Some("that question was answered already".into());
+                return;
+            };
+            let answer = asks::answer(&ask, &(at + 1).to_string());
+            match self.send(answer, None, false, &[]).await {
+                Ok(()) => {
+                    self.notice = None;
+                    self.asks.retain(|open| open.id != ask.id);
+                    self.sent_answers.push(ask.question);
+                    if self.asks.is_empty() {
+                        self.chatting = false;
+                    }
+                }
+                Err(error) => self.notice = Some(error),
+            }
+        }
     }
 
     /// Commit a denied call, in either view.
@@ -3091,7 +3207,7 @@ impl App {
                                     failed = true;
                                     self.commit_denied(&name, &arguments, &reason);
                                 }
-                                None => self.commit_call(&name, &arguments, &output, failed),
+                                None => self.commit_call(id, &name, &arguments, &output, failed),
                             }
                             if name == resolved::TOOL && !failed && !reactions::refused(&item) {
                                 self.resolve(&arguments, id, turns.get(&node).copied(), false)
@@ -3695,7 +3811,7 @@ impl App {
                         }
                     }
                 } else {
-                    self.commit_call(&name, &arguments, &shown.0, shown.1);
+                    self.commit_call(id, &name, &arguments, &shown.0, shown.1);
                 }
                 if name == asks::TOOL && !shown.1 {
                     self.asked(id, &arguments);
@@ -4693,6 +4809,10 @@ impl App {
     /// A link clicked in the conversation: a file is shown in the pane, as
     /// a preview, and anything else opened as the system opens it.
     fn follow(&mut self, link: &str) {
+        if let Some(button) = link.strip_prefix(screen::BUTTON) {
+            self.pressed = Some(button.to_owned());
+            return;
+        }
         if link.starts_with("file://") {
             let workspace = std::path::Path::new(&self.workspace);
             let width = pane::width(self.full_width, PROSE as u16).max(20) as usize;
@@ -4773,6 +4893,9 @@ impl App {
             key.modifiers -= KeyModifiers::CONTROL;
         }
         if self.full_screen(&event) {
+            if let Some(button) = self.pressed.take() {
+                self.press(&button).await;
+            }
             return;
         }
         if let Some(pick) = &mut self.reacting {
@@ -7829,6 +7952,143 @@ mod tests {
         );
         assert!(rows.iter().all(|row| !row.contains("Ran")), "{rows:?}");
         assert_eq!(rows.last().map(String::as_str), Some("• Done."));
+    }
+
+    #[tokio::test]
+    async fn tasks_started_in_a_row_fold_into_one_row_a_click_opens() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        let start = |app: &mut App, name: &str| {
+            let arguments = json!({"name": name, "brief": format!("Fix {name}")});
+            app.commit_call("c", served::START, &arguments, "{}", false);
+        };
+        app.commit(vec![Line::from("› fix the three bugs")]);
+        start(&mut app, "calc.add");
+        assert_eq!(
+            drawn(&mut app),
+            [
+                "› fix the three bugs",
+                "",
+                "• Started calc.add",
+                "  └ Fix calc.add"
+            ]
+        );
+        start(&mut app, "calc.neg");
+        start(&mut app, "calc.div");
+        assert_eq!(
+            drawn(&mut app),
+            [
+                "› fix the three bugs",
+                "",
+                "• Started calc.add, calc.neg and calc.div ▸"
+            ]
+        );
+        // A click on it opens it, and again folds it.
+        app.follow("sonny:fold/0");
+        let button = app.pressed.take().unwrap();
+        app.press(&button).await;
+        let open = drawn(&mut app);
+        assert_eq!(open[2], "• Started calc.add, calc.neg and calc.div ▾");
+        assert_eq!(
+            open[3..],
+            [
+                "• Started calc.add",
+                "  └ Fix calc.add",
+                "• Started calc.neg",
+                "  └ Fix calc.neg",
+                "• Started calc.div",
+                "  └ Fix calc.div"
+            ]
+        );
+        app.follow("sonny:fold/0");
+        let button = app.pressed.take().unwrap();
+        app.press(&button).await;
+        assert_eq!(drawn(&mut app).len(), 3);
+        // Something drawn between, or another kind of call, starts anew;
+        // a call the clean view hides does not.
+        app.commit_call("c", "shell", &json!({"command": "ls"}), "a", false);
+        start(&mut app, "calc.mul");
+        app.commit_call(
+            "c",
+            served::REMOVE,
+            &json!({"task": "calc.add"}),
+            "{}",
+            false,
+        );
+        app.commit(vec![Line::from("• Started those.")]);
+        start(&mut app, "calc.sub");
+        let rows = drawn(&mut app);
+        assert_eq!(
+            rows[2],
+            "• Started calc.add, calc.neg, calc.div and calc.mul ▸"
+        );
+        assert_eq!(rows[4], "• Removed calc.add");
+        assert_eq!(rows[8], "• Started calc.sub");
+    }
+
+    #[tokio::test]
+    async fn a_click_on_an_option_answers_the_question_with_it() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked["prompt"].clone());
+            }
+            json!({"turn": 9})
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"question": "Merge?", "options": [
+            {"label": "Yes", "explanation": "Now."}, {"label": "No", "explanation": "Later."}]})
+        .to_string();
+        app.daemon(turn_event("accepted", 4, json!({}))).await;
+        app.daemon(turn_event(
+            "tool_started",
+            4,
+            json!({"call_id": "a4", "name": "ask", "arguments": arguments}),
+        ))
+        .await;
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "a4"})))
+            .await;
+        assert_eq!(app.asks.len(), 1);
+        // The option's row is a button, drawn as the rest of the question.
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        app.flush();
+        app.screen.render(area, &mut buf, |_| None);
+        let row = (0..12)
+            .find(|y| {
+                (0..80)
+                    .map(|x| buf[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("2  No")
+            })
+            .unwrap();
+        assert!(!buf[(5, row)].modifier.contains(Modifier::UNDERLINED));
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let click = MouseEvent {
+                kind,
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.key(Event::Mouse(click)).await;
+        }
+        assert_eq!(sent.lock().unwrap()[..], [json!("You asked: Merge?\n\nNo")]);
+        assert!(app.asks.is_empty());
+        // Once answered, another click sends nothing.
+        app.press("answer/0/a4").await;
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("that question was answered already")
+        );
     }
 
     #[tokio::test]
