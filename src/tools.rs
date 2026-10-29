@@ -164,7 +164,7 @@ impl Tool {
             name: self.name().into(),
             description: description.into(),
             parameters,
-            grammar: (self == Tool::ApplyPatch).then_some(patch::GRAMMAR),
+            grammar: (self == Tool::ApplyPatch).then_some(patch::GRAMMAR.into()),
         }
     }
 }
@@ -181,6 +181,13 @@ pub struct Declared {
     pub description: String,
     /// A JSON Schema object for the call's arguments.
     pub parameters: serde_json::Value,
+    /// A Lark grammar the call's input follows, for a tool whose input is
+    /// free-form text: declared as a custom tool where the provider has
+    /// them, and as a function of that text as `input` elsewhere, so
+    /// `parameters` must take `input` as a string. Either way the call's
+    /// arguments are `{"input": TEXT}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
     /// What the model reads as the call's result.
     #[serde(default = "declared_result")]
     pub result: String,
@@ -266,6 +273,21 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                 "invalid_declare",
                 format!("{name}: parameters must be an object schema"),
             );
+        }
+        if let Some(grammar) = &tool.grammar {
+            let input = &tool.parameters["properties"]["input"];
+            // Its call is the text alone, so nothing else may be required.
+            let required = tool.parameters["required"]
+                .as_array()
+                .is_some_and(|fields| fields.len() == 1 && fields[0] == "input");
+            if grammar.is_empty() || input["type"] != "string" || !required {
+                return fail_with(
+                    "invalid_declare",
+                    format!(
+                        "{name}: a tool with a grammar takes its text as `input`, a string and its only required field"
+                    ),
+                );
+            }
         }
         match &tool.answered_by {
             Some(tag) => {
@@ -854,7 +876,7 @@ impl Registry {
                 name: tool.name.clone().into(),
                 description: tool.description.clone().into(),
                 parameters: tool.parameters.clone(),
-                grammar: None,
+                grammar: tool.grammar.clone().map(Into::into),
             }))
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(

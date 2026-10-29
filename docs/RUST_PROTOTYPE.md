@@ -2272,6 +2272,15 @@ waiting on a verdict. An interrupt ends the call as cancelled, like any
 running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
 
+Protocol version 22 lets a declared tool take free-form text, as
+`apply_patch` does: a tool declared with `grammar`, a Lark grammar its
+input follows, is declared on Responses as a custom tool whose call is the
+text itself, and elsewhere as a function of that text, so its `parameters`
+must take `input` as a required string (`invalid_declare` otherwise).
+Either way the call's `arguments` are `{"input": TEXT}` and its answer is
+the provider's custom tool output where it has one. The grammar counts
+toward the 64 KiB. A client's code-running tool is one.
+
 ### Tool approval
 
 A bot may be created with a gate (one no bot made, which a client
