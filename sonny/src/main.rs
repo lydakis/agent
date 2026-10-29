@@ -3767,9 +3767,15 @@ impl App {
     /// happens, when its window closes too; replayed, by the time the
     /// lead's turn ended, unless the mark it made then is kept.
     async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
-        let Some(project) = &self.project else {
+        // A side chat forked from a lead resolves that lead's tasks.
+        let side = (self.options.side.is_some())
+            .then(|| self.bot.rsplit_once(".side-"))
+            .flatten()
+            .and_then(|(source, _)| source.strip_suffix(".lead"));
+        let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
             return;
         };
+        let project = &project;
         let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
             return;
         };

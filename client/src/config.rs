@@ -303,6 +303,24 @@ pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), S
     let before = text;
     let mut text = lines.join("\n");
     text.push('\n');
+    // A key written another way, as a dotted key or an inline table, is
+    // not one the lines above find: it is refused, not left as it was.
+    let table: toml::Table = text.parse().unwrap_or_default();
+    for (key, value) in pairs {
+        let (name, inner) = key
+            .split_once('.')
+            .map_or((*key, None), |(t, k)| (t, Some(k)));
+        let found = match inner {
+            Some(inner) => table.get(name).and_then(|t| t.get(inner)),
+            None => table.get(name),
+        };
+        if found != value.as_ref() {
+            return Err(format!(
+                "config_unwritable: {}: {key} is written in a form only an editor can change",
+                path.display()
+            ));
+        }
+    }
     // Nothing changed, as a default taken out of a file without it.
     if text == before || (before.is_empty() && lines.is_empty()) {
         return Ok(());
@@ -441,6 +459,15 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "# mine\n\n[sonny]\nside_chat = \"fork\"\ntask_effort = \"high\"\nchime = false\n"
         );
+        // A key the lines cannot find is refused, the file kept.
+        for text in ["sonny.chime = false\n", "sonny = { chime = false }\n"] {
+            std::fs::write(&file, text).unwrap();
+            for value in [None, Some(true.into())] {
+                let error = write(&file, &[("sonny.chime", value)]).unwrap_err();
+                assert!(error.starts_with("config_"), "{text}: {error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
