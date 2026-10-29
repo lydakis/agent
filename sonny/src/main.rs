@@ -4347,6 +4347,9 @@ impl App {
                 break;
             }
         }
+        if reference.node.is_none() {
+            reference.whole = from.is_none();
+        }
         for items in pages.iter().rev() {
             reference.read(id, items);
         }

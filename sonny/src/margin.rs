@@ -7,7 +7,7 @@
 //! The calls are the record, in the bot's history; the margin as it
 //! stands is kept beside the person's reactions, by the bot's key, so a
 //! window opened later shows it without reading the whole history.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -278,6 +278,11 @@ pub struct Reference {
     /// The notes its margin holds, oldest first, as far as read: one
     /// put there past [`MOST_NOTES`] takes the oldest away.
     held: Vec<String>,
+    /// Notes read as taken away: put there again, they are new ones.
+    left: HashSet<String>,
+    /// Whether its history was read from its start: a note not yet held
+    /// is then a new one, not one from before what was read.
+    pub whole: bool,
     /// The note it shows of another bot's, when it shows one, as read
     /// from there: one step on, no further.
     pub through: Option<Box<Reference>>,
@@ -299,12 +304,22 @@ impl Reference {
             if arguments["remove"] == true {
                 self.held.retain(|held| *held != at);
                 self.removed |= at == id;
+                self.left.insert(at);
                 continue;
             }
             if !self.held.contains(&at) {
-                self.held.push(at.clone());
-                if self.held.len() > MOST_NOTES {
-                    self.removed |= self.held.remove(0) == id;
+                if self.whole || self.left.contains(&at) {
+                    self.held.push(at.clone());
+                    if self.held.len() > MOST_NOTES {
+                        let gone = self.held.remove(0);
+                        self.removed |= gone == id;
+                        self.left.insert(gone);
+                    }
+                } else if self.held.len() < MOST_NOTES {
+                    // Maybe one from before what was read, so older than
+                    // the rest: never taken for a new one that puts the
+                    // oldest out.
+                    self.held.insert(0, at.clone());
                 }
             }
             if at != id {
@@ -1182,9 +1197,13 @@ mod tests {
         reference.read("flow", &[call(json!({"id": "flow", "title": "Again"}))]);
         let (title, body, _) = reference.shown().unwrap();
         assert_eq!((title, body), ("Again", Body::Markdown(String::new())));
-        // Put out by as many newer ones as its margin holds, it goes as
-        // there; one fewer, taken away or changed again, keeps it.
-        let mut reference = Reference::default();
+        // Read from the start of its history, put out by as many newer
+        // ones as its margin holds, it goes as there; one fewer, taken
+        // away or changed again, keeps it.
+        let mut reference = Reference {
+            whole: true,
+            ..Default::default()
+        };
         let mut items = vec![call(
             json!({"id": "flow", "title": "Flow", "markdown": "one"}),
         )];
@@ -1201,6 +1220,20 @@ mod tests {
         reference.read("flow", &[call(json!({"id": "flow", "title": "New"}))]);
         let (title, body, _) = reference.shown().unwrap();
         assert_eq!((title, body), ("New", Body::Markdown(String::new())));
+        // Read from partway, notes it did not see put there may be older
+        // ones changed: one new one puts out one of those, not this.
+        let mut reference = Reference::default();
+        let mut items = vec![call(
+            json!({"id": "flow", "title": "Flow", "markdown": "one"}),
+        )];
+        for n in 1..MOST_NOTES {
+            items.push(call(json!({"id": format!("old{n}"), "markdown": "again"})));
+        }
+        items.push(call(
+            json!({"id": "fresh", "title": "Fresh", "markdown": "new"}),
+        ));
+        reference.read("flow", &items);
+        assert!(!reference.removed());
     }
 
     #[test]
