@@ -439,7 +439,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/usage` shows, in the pane beside the conversation,
-  the tokens the project's agents spent in the last 24 hours: in all, as
+  the tokens the project's agents spent in the last 24 hours, as their
+  retained history records them: in all, as
   stacked bars over time (output, input read fresh, and input read from the
   provider's cache), by agent and by model. `d`, `w` and `m` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
