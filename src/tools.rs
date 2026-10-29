@@ -127,9 +127,10 @@ impl Tool {
                 "required":["input"],"additionalProperties":false}),
             ),
             Tool::History => (
-                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding.",
+                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
-                "turn":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536}},
+                "turn":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536},
+                "query":{"type":"string","minLength":1,"maxLength":256},"before":{"type":"integer","minimum":1}},
                 "additionalProperties":false}),
             ),
             Tool::Note => (
@@ -659,6 +660,14 @@ pub enum Prepared {
         limit: usize,
     },
     /// Resolved by the runtime, never by the registry.
+    HistorySearch {
+        /// Another agent's, or the caller's own when `None`.
+        bot: Option<String>,
+        query: String,
+        /// Search the turns before this one.
+        before: Option<i64>,
+    },
+    /// Resolved by the runtime, never by the registry.
     Wait {
         handles: Vec<String>,
         timeout_ms: Option<u64>,
@@ -992,6 +1001,8 @@ impl Registry {
             #[serde(default)]
             offset: u64,
             limit: Option<usize>,
+            query: Option<String>,
+            before: Option<i64>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1103,15 +1114,35 @@ impl Registry {
             }
             Tool::History => {
                 let args: HistoryArgs = serde_json::from_str(args).map_err(invalid)?;
+                if args
+                    .bot
+                    .as_ref()
+                    .is_some_and(|bot| bot.is_empty() || bot.len() > 128)
+                {
+                    return fail("invalid_tool_arguments");
+                }
+                if let Some(query) = args.query {
+                    // A search names no turn to page; the store checks the
+                    // query's length.
+                    if args.turn.is_some()
+                        || args.offset != 0
+                        || args.limit.is_some()
+                        || args.before.is_some_and(|before| before < 1)
+                    {
+                        return fail("invalid_tool_arguments");
+                    }
+                    return Ok(Prepared::HistorySearch {
+                        bot: args.bot,
+                        query,
+                        before: args.before,
+                    });
+                }
                 let limit = args.limit.unwrap_or(64 * 1024);
                 // Only another agent's turns are listed: a bot's own are in
                 // its context, and the context note numbers those left out.
                 if args.turn.is_some_and(|turn| turn < 1)
                     || (args.turn.is_none() && args.bot.is_none())
-                    || args
-                        .bot
-                        .as_ref()
-                        .is_some_and(|bot| bot.is_empty() || bot.len() > 128)
+                    || args.before.is_some()
                     || !(4..=64 * 1024).contains(&limit)
                 {
                     return fail("invalid_tool_arguments");
@@ -1232,7 +1263,9 @@ impl Registry {
                 detach(&command, workspace, self, environment, sandbox).await
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
-            Prepared::History { .. } => fail("history_requires_runtime"),
+            Prepared::History { .. } | Prepared::HistorySearch { .. } => {
+                fail("history_requires_runtime")
+            }
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
@@ -1806,6 +1839,10 @@ fn sh(
         "HERDR_WORKSPACE_ID",
         "HERDR_TAB_ID",
         "HERDR_PANE_ID",
+        "CMUX_WORKSPACE_ID",
+        "CMUX_SURFACE_ID",
+        "CMUX_TAB_ID",
+        "CMUX_PANEL_ID",
     ] {
         process.env_remove(name);
     }

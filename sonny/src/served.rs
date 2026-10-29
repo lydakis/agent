@@ -64,17 +64,13 @@ pub fn tools(lead: bool) -> Vec<Value> {
 fn start() -> Value {
     json!({
         "name": START,
-        "description": "Start a new task. Sonny makes the task's folder the way the person set Sonny up, unless \
-            this project's tasks all work in this folder: a git worktree of this repository on the branch \
-            agent/NAME, from the last commit, or a sandfs copy, which takes uncommitted changes along and works \
-            outside git too. With setup, the folder's .agents/setup runs in the copy first. The task starts there \
-            with this folder's rules, skills and memory, in the role named, and the brief as its first message. \
-            Paths in this folder that the brief names are turned into the task's own. The result is the task's \
-            turn handle, and how its work comes back here: on its branch, here already for a worktree; with \
-            the git push it names for a sandfs copy of a repository; or for a sandfs copy of another folder, with \
-            `task changes`, which lists what the task changed and with --apply writes it here once you have checked \
-            it. Take a task's work back only that way: never copy its files here yourself (cp, a redirect, tee), \
-            which can write zeros over the files here. A start that fails leaves no folder behind.",
+        "description": "Start a new task. Unless this project's tasks all work in this folder, Sonny makes the \
+            task a git worktree of this repository on the branch agent/NAME, from the last commit, so uncommitted \
+            changes here are not in it; outside git, the task works in this folder. With setup, the folder's \
+            .agents/setup runs in the worktree first. The task starts there with this folder's rules, skills and \
+            memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
+            names are turned into the task's own. The result is the task's turn handle; its work comes back on \
+            its branch, here already as it commits. A start that fails leaves no folder behind.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -109,9 +105,9 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it. A worktree is removed, and its branch kept while it has commits not merged here; a sandfs copy \
-            is unmounted and removed. It refuses, before removing anything, while the task is working or its \
-            folder holds work that is not here yet, and says what. With discard, that work is dropped: only \
+            it. A worktree is removed, and its branch kept while it has commits not merged here. It refuses, \
+            before removing anything, while the task is working or its worktree has uncommitted changes, and \
+            says what. With discard, that work is dropped: only \
             when the person says to drop it.",
         "parameters": {
             "type": "object",

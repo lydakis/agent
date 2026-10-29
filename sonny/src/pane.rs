@@ -57,6 +57,10 @@ pub struct Pane {
     /// A line kept on the last row under a card, however it is scrolled:
     /// `/background`'s keys, or what its last key did.
     pub foot: Option<Line<'static>>,
+    /// Its rows are prose, read at the width the conversation is written
+    /// at however wide the pane: Markdown and plain text. Code, pictures,
+    /// diagrams and pages go as wide as the pane.
+    prose: bool,
 }
 
 impl Pane {
@@ -70,7 +74,7 @@ impl Pane {
             _ => path.display().to_string(),
         };
         let mut screen = Screen::default();
-        let target = preview(&path, width, line, &mut screen)?;
+        let (target, prose) = preview(&path, width, line, &mut screen)?;
         screen.show_row(target, ABOVE);
         // Its escapes kept, as the path read back may hold `#` or `%`;
         // the line left off.
@@ -88,6 +92,7 @@ impl Pane {
             keys: "esc closes",
             program: None,
             foot: None,
+            prose,
         })
     }
 
@@ -104,6 +109,7 @@ impl Pane {
             keys,
             program: None,
             foot: None,
+            prose: false,
         }
     }
 
@@ -120,6 +126,7 @@ impl Pane {
             keys: "shift+tab back",
             program: Some(program),
             foot: None,
+            prose: false,
         }
     }
 
@@ -221,6 +228,14 @@ impl Pane {
                 program.render(rows, buf)
             }
             None => {
+                // Prose reads at the width the conversation is written at.
+                let rows = match self.prose {
+                    true => Rect {
+                        width: rows.width.min(crate::PROSE as u16),
+                        ..rows
+                    },
+                    false => rows,
+                };
                 self.screen.render(rows, buf, file);
                 None
             }
@@ -258,13 +273,14 @@ pub fn file_url(url: &str) -> Option<(PathBuf, Option<usize>)> {
 
 /// `path` written into `screen` at `width`: a folder's entries, a
 /// picture drawn, Markdown as replies read, code in its colors with its
-/// line numbers. The row to show first: that of `line`, if any.
+/// line numbers. The row to show first: that of `line`, if any; and
+/// whether its rows are prose, to be read no wider than the conversation.
 fn preview(
     path: &Path,
     width: usize,
     line: Option<usize>,
     screen: &mut Screen,
-) -> Result<usize, String> {
+) -> Result<(usize, bool), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
         for (line, url) in folder(path)? {
@@ -273,24 +289,39 @@ fn preview(
                 None => screen.push(vec![line]),
             }
         }
-        return Ok(0);
+        return Ok((0, false));
     }
     // A pipe, socket or device may never end, or never start.
     if !meta.is_file() {
         screen.push(vec![note(
             "not a file a preview reads: a pipe, socket or device",
         )]);
-        return Ok(0);
+        return Ok((0, false));
     }
     let size = meta.len();
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        let shown = match crate::term::graphics() {
+            true => crate::image::file(path, width, crate::image::tall())
+                .and_then(|drawn| crate::image::show(&drawn)),
+            false => Err("this terminal draws no pictures (Kitty and Ghostty do)".into()),
+        };
+        match shown {
+            Ok(rows) => screen.push(rows),
+            Err(error) => screen.push(vec![note(&format!(
+                "a picture, {}: {error}; click its name to open it",
+                bytes_said(size)
+            ))]),
+        }
+        return Ok((0, false));
+    }
     let mut bytes = Vec::new();
     use std::io::Read;
     std::fs::File::open(path)
         .and_then(|f| f.take(MOST_BYTES).read_to_end(&mut bytes))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let extension = (path.extension().and_then(|e| e.to_str()))
-        .unwrap_or_default()
-        .to_lowercase();
     let text = match String::from_utf8(bytes) {
         Ok(text) if !text.contains('\0') => text,
         // Cut in the middle of a character at the end of what was read.
@@ -305,31 +336,61 @@ fn preview(
                 "a binary file, {}; click its name to open it",
                 bytes_said(size)
             ))]);
-            return Ok(0);
+            return Ok((0, false));
         }
     };
-    // Drawn only where pictures can be; elsewhere, its source.
-    if extension == "svg"
-        && crate::term::graphics()
-        && let Ok(rows) = crate::image::render(&text, width).and_then(|d| crate::image::show(&d))
-    {
-        screen.push(rows);
-        return Ok(0);
+    // Drawn only where pictures can be, as tall as the pane; elsewhere,
+    // or when it cannot be drawn, its source, and why.
+    if line.is_none() && crate::term::graphics() {
+        let drawn =
+            match extension.as_str() {
+                "svg" => Some(crate::image::render_in(
+                    &text,
+                    width,
+                    crate::image::tall(),
+                    true,
+                )),
+                "mmd" | "mermaid" => Some(crate::mermaid::svg(&text).and_then(|svg| {
+                    crate::image::render_in(&svg, width, crate::image::tall(), true)
+                })),
+                "html" | "htm" => Some(
+                    crate::html::render(path, crate::image::page_width(width))
+                        .and_then(|png| crate::image::page_in(&png, width, crate::image::tall())),
+                ),
+                _ => None,
+            };
+        match drawn.map(|drawn| drawn.and_then(|drawn| crate::image::show(&drawn))) {
+            Some(Ok(rows)) => {
+                screen.push(rows);
+                return Ok((0, false));
+            }
+            Some(Err(error)) => screen.push(vec![
+                note(&format!("could not draw it: {error}")),
+                Line::default(),
+            ]),
+            None => {}
+        }
     }
     let lines: Vec<&str> = text.lines().collect();
     let shown = lines.len().min(MOST_LINES);
     let target = line.map(|line| line.saturating_sub(1).min(shown.saturating_sub(1)));
     let mut first_row = 0;
+    let prose;
     if matches!(extension.as_str(), "md" | "markdown" | "mdx") && line.is_none() {
-        let mut markdown = crate::transcript::Markdown::default();
+        let folder = path.parent().unwrap_or(Path::new("/"));
+        // A document reads at the conversation's width, its pictures too.
+        prose = true;
+        let mut markdown = crate::transcript::Markdown::document(folder);
         let mut rows = Vec::new();
         for text in &lines[..shown] {
-            rows.extend(markdown.feed(text, width, false));
+            rows.extend(markdown.feed(text, width.min(crate::PROSE), false));
         }
-        rows.extend(markdown.end(width, false));
+        rows.extend(markdown.end(width.min(crate::PROSE), false));
         screen.push(rows);
     } else {
         let mut code = crate::highlight::Code::file(path, lines.first().unwrap_or(&""));
+        // Text no language colors is read as prose.
+        prose = code.is_none();
         let digits = shown.max(1).to_string().len();
         for (at, text) in lines[..shown].iter().enumerate() {
             let text = text.replace('\t', "    ");
@@ -354,7 +415,7 @@ fn preview(
             note("… the rest is past what a preview shows; click its name to open it"),
         ]);
     }
-    Ok(first_row)
+    Ok((first_row, prose))
 }
 
 /// A folder's entries, folders first, each with the address it opens.
@@ -570,6 +631,49 @@ mod tests {
         let shown = rows(&mut pane, 20, 4);
         assert_eq!(shown[2], " 1  one two three");
         assert_eq!(shown[3], "    four five six");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_reads_at_the_conversations_width_in_a_wide_pane() {
+        let dir = std::env::temp_dir().join(format!("sonny-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, format!("{}\n", "word ".repeat(60))).unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 100).unwrap();
+        let shown = rows(&mut pane, 150, 5);
+        // The title spans the pane; the file's rows stop at 100 columns.
+        assert!(shown[0].ends_with("esc closes"), "{shown:?}");
+        assert!(shown[2].width() <= crate::PROSE, "{}", shown[2].width());
+        assert!(shown[3].starts_with("    word"), "{shown:?}");
+        // Code goes as wide as the pane.
+        let code = dir.join("a.rs");
+        std::fs::write(&code, format!("let x = \"{}\";\n", "w".repeat(120))).unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", code.display()), &dir, 150).unwrap();
+        assert!(rows(&mut pane, 150, 4)[2].width() > crate::PROSE);
+        // Markdown is prose.
+        let doc = dir.join("a.md");
+        std::fs::write(&doc, format!("{}\n", "word ".repeat(40))).unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", doc.display()), &dir, 150).unwrap();
+        let shown = rows(&mut pane, 150, 4);
+        assert!(shown[2].width() <= crate::PROSE, "{shown:?}");
+        // A card is not a file, and keeps the pane's width.
+        let mut card = Pane::card("/status", "esc closes");
+        card.set_card(vec![Line::from("x".repeat(140))], "esc closes");
+        assert_eq!(rows(&mut card, 150, 3)[2].width(), 140);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_picture_file_says_what_it_is_where_none_are_drawn() {
+        let dir = std::env::temp_dir().join(format!("sonny-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shot.png");
+        image::RgbaImage::new(4, 4).save(&file).unwrap();
+        let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 60).unwrap();
+        let shown = rows(&mut pane, 60, 3);
+        assert!(shown[2].starts_with(" a picture, "), "{shown:?}");
+        assert!(shown[2].contains("draws no pictures"), "{shown:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

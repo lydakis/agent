@@ -28,13 +28,64 @@ pub struct Markdown {
     math: bool,
     /// The open fence's code, in its language's colors when known.
     code: Option<crate::highlight::Code>,
+    /// The folder a picture's relative path is read from: the file's,
+    /// or the agent's workspace; else where Sonny runs.
+    folder: Option<std::path::PathBuf>,
+    /// A file read as a document, not a reply: an ```html or ```svg
+    /// fence in it is code to read, as GitHub shows it, not drawn.
+    document: bool,
+    /// Inside an HTML comment that spans lines.
+    comment: bool,
 }
 
 impl Markdown {
+    /// A reply's Markdown, its pictures' paths read from `folder`.
+    pub fn in_folder(folder: &std::path::Path) -> Self {
+        Self {
+            folder: Some(folder.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// A Markdown file in `folder`, read as a document.
+    pub fn document(folder: &std::path::Path) -> Self {
+        Self {
+            document: true,
+            ..Self::in_folder(folder)
+        }
+    }
+
     /// A streamed line as rows: a table that ended first, then the line,
     /// then a fence's picture or diff when the line closed one. `first`
     /// says nothing of the reply is shown yet, so it gets the bullet.
     pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
+        let mut text = text;
+        if !self.fence && !self.math {
+            // An HTML comment over lines says nothing; what follows it does.
+            if self.comment {
+                match text.split_once("-->") {
+                    Some((_, after)) => {
+                        self.comment = false;
+                        text = after;
+                        if text.trim().is_empty() {
+                            return Vec::new();
+                        }
+                    }
+                    None => return Vec::new(),
+                }
+            }
+            if let Some(after) = text.trim_start().strip_prefix("<!--")
+                && !after.contains("-->")
+            {
+                self.comment = true;
+                return Vec::new();
+            }
+            if let Some(pictures) = pictures(text) {
+                let mut out = self.finish(width);
+                out.extend(self.pictures(&pictures, width));
+                return out;
+            }
+        }
         if !self.fence && table_row(text) {
             self.table.push(text.trim().to_owned());
             return Vec::new();
@@ -78,7 +129,11 @@ impl Markdown {
                 out.extend(wrap(line, width, Span::raw(lead), Span::raw("    ")));
             }
         }
-        *self = Self::default();
+        *self = Self {
+            folder: self.folder.take(),
+            document: self.document,
+            ..Self::default()
+        };
         out
     }
 
@@ -111,15 +166,31 @@ impl Markdown {
                 })
                 .collect();
         }
+        // Kept in a file a click on the picture opens in the pane, bigger:
+        // the diagram's source, or the formula as MathJax drew it.
+        let kept = match lang.as_str() {
+            "mermaid" => keep(&source, "mmd", |path| std::fs::write(path, &source)),
+            "svg" => keep(&source, "svg", |path| std::fs::write(path, &source)),
+            _ => None,
+        };
+        let math = (lang == "math").then(|| kept_path(&(&source, crate::term::light()), "svg"));
         let drawn = crate::cache::drawn(&lang, &source, width, || {
             let svg = match lang.as_str() {
                 "mermaid" => crate::mermaid::svg(&source)?,
-                "math" => crate::math::svg(&source)?,
+                "math" => {
+                    let svg = crate::math::svg(&source)?;
+                    if let Some(Some(path)) = &math {
+                        let _ = std::fs::write(path, &svg);
+                    }
+                    svg
+                }
                 _ => source.clone(),
             };
             crate::image::render(&svg, width)
         });
-        match drawn.and_then(|drawn| crate::image::show(&drawn)) {
+        let kept = kept.or(math.flatten().filter(|path| path.is_file()));
+        let url = kept.and_then(|path| crate::links::file_url(&path));
+        match drawn.and_then(|drawn| crate::image::show_linked(&drawn, url)) {
             Ok(rows) => rows,
             Err(error) => {
                 let mut out: Vec<Line<'static>> = source
@@ -172,8 +243,13 @@ impl Markdown {
                 "latex" | "tex" | "katex" => "math",
                 lang => lang,
             };
-            let drawn = matches!(lang, "svg" | "mermaid") && crate::term::graphics();
-            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math" | "html")) {
+            let drawn = match lang {
+                "mermaid" => crate::term::graphics(),
+                "svg" => crate::term::graphics() && !self.document,
+                "html" => !self.document,
+                _ => false,
+            };
+            if self.fence && (drawn || matches!(lang, "diff" | "patch" | "math")) {
                 self.picture = Some((lang.to_owned(), String::new()));
             } else if self.fence {
                 self.code = crate::highlight::Code::language(lang);
@@ -204,10 +280,11 @@ impl Markdown {
         }
         let indent = &text[..text.len() - trimmed.len()];
         let bare = trimmed.trim_end();
-        if bare.len() >= 3
+        if (bare.len() >= 3
             && ["-", "*", "_"]
                 .iter()
-                .any(|c| bare.chars().all(|x| x.to_string() == *c || x == ' '))
+                .any(|c| bare.chars().all(|x| x.to_string() == *c || x == ' ')))
+            || matches!(bare, "<hr>" | "<hr/>" | "<hr />")
         {
             return Some(Line::from("─".repeat(width_hint())).dim());
         }
@@ -238,8 +315,350 @@ impl Markdown {
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
         }
-        Some(Line::from(inline(text, Style::new())))
+        let spans = inline(text, Style::new());
+        // A line of HTML that only lays the page out (`<p align=…>`,
+        // `</div>`, `<details>`) leaves no row of its own.
+        if text.contains('<') && spans.iter().all(|span| span.content.trim().is_empty()) {
+            return None;
+        }
+        Some(Line::from(spans))
     }
+
+    /// Pictures a line holds and nothing else, one under another; those
+    /// that cannot be drawn here (another machine's, or a terminal with no
+    /// pictures) as their words, together on a row.
+    fn pictures(&self, pictures: &[Picture], width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        let mut words: Vec<Span<'static>> = Vec::new();
+        let flush = |words: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>| {
+            if !words.is_empty() {
+                let line = Line::from(std::mem::take(words));
+                out.extend(wrap(line, width, Span::raw("  "), Span::raw("  ")));
+            }
+        };
+        for picture in pictures {
+            let path = self.path(&picture.src);
+            match path.as_deref().and_then(|path| picture_file(path, width)) {
+                Some(rows) => {
+                    flush(&mut words, &mut out);
+                    out.extend(rows);
+                }
+                None => {
+                    if !words.is_empty() {
+                        words.push(Span::raw("  "));
+                    }
+                    words.extend(picture_words(picture, path.is_some()));
+                }
+            }
+        }
+        flush(&mut words, &mut out);
+        out
+    }
+
+    /// The file a picture's address names on this machine, if it does.
+    fn path(&self, src: &str) -> Option<std::path::PathBuf> {
+        let src = src.trim();
+        if let Some(url) = src.strip_prefix("file://") {
+            return crate::pane::file_url(&format!("file://{url}")).map(|(path, _)| path);
+        }
+        if src.contains("://") || src.starts_with("data:") || src.starts_with('#') {
+            return None;
+        }
+        let src = src.split(['?', '#']).next().unwrap_or(src);
+        // `%20` and the like read back, as a browser reads them.
+        let (src, _) = crate::pane::file_url(&format!("file://{src}"))?;
+        let src = src.to_str()?;
+        let path = match src.strip_prefix("~/") {
+            Some(rest) => std::path::Path::new(&std::env::var_os("HOME")?).join(rest),
+            None => match &self.folder {
+                Some(folder) => folder.join(src),
+                None => std::env::current_dir().ok()?.join(src),
+            },
+        };
+        path.is_file().then_some(path)
+    }
+}
+
+/// A picture Markdown or HTML names: `![alt](src)` or `<img src alt>`.
+#[derive(Debug, PartialEq)]
+struct Picture {
+    alt: String,
+    src: String,
+}
+
+/// The pictures in a line that holds nothing else: Markdown's `![…](…)`,
+/// those inside a link (`[![…](…)](…)`, as badges are), and HTML's
+/// `<img>`, among the tags that only lay them out (`<p>`, `<a>`,
+/// `<picture>`).
+fn pictures(text: &str) -> Option<Vec<Picture>> {
+    let mut found = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        if let Some((taken, picture)) = markdown_picture(rest) {
+            found.push(picture);
+            rest = rest[taken..].trim_start();
+            continue;
+        }
+        // A picture as a link's text, and where the link goes.
+        if let Some(inner) = rest.strip_prefix('[')
+            && let Some((taken, picture)) = markdown_picture(inner)
+            && let Some(after) = inner[taken..].strip_prefix("](")
+            && let Some(end) = after.find(')')
+        {
+            found.push(picture);
+            rest = after[end + 1..].trim_start();
+            continue;
+        }
+        let (taken, tag) = html_tag(rest)?;
+        match tag.name.as_str() {
+            "img" => found.push(Picture {
+                alt: tag.attribute("alt").unwrap_or_default(),
+                src: tag.attribute("src")?,
+            }),
+            "p" | "div" | "a" | "picture" | "source" | "center" | "br" | "span" | "!--" => {}
+            _ => return None,
+        }
+        rest = rest[taken..].trim_start();
+    }
+    (!found.is_empty()).then_some(found)
+}
+
+/// `![alt](src "title")` at the start of `text`: how long it is, and
+/// the picture.
+fn markdown_picture(text: &str) -> Option<(usize, Picture)> {
+    let after = text.strip_prefix("![")?;
+    let close = after.find("](")?;
+    let alt = &after[..close];
+    let target = &after[close + 2..];
+    let end = target.find(')')?;
+    let src = target[..end].split_whitespace().next()?;
+    let src = src.trim_start_matches('<').trim_end_matches('>');
+    Some((
+        2 + close + 2 + end + 1,
+        Picture {
+            alt: alt.to_owned(),
+            src: src.to_owned(),
+        },
+    ))
+}
+
+/// A picture file drawn, `path`'s rows of the terminal's cells that a
+/// click opens in the pane; none where it cannot be.
+fn picture_file(path: &std::path::Path, width: usize) -> Option<Vec<Line<'static>>> {
+    if !crate::term::graphics() {
+        return None;
+    }
+    let extension = (path.extension().and_then(|e| e.to_str()))
+        .unwrap_or_default()
+        .to_lowercase();
+    let meta = std::fs::metadata(path).ok()?;
+    // Drawn again only when the file changed.
+    let key = format!(
+        "{}\0{}\0{:?}",
+        path.display(),
+        meta.len(),
+        meta.modified().ok()
+    );
+    let drawn = match extension.as_str() {
+        "svg" => crate::cache::drawn("svg file", &key, width, || {
+            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            crate::image::render(&text, width)
+        }),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => {
+            crate::cache::drawn("picture file", &key, width, || {
+                crate::image::file(path, width, crate::image::ROWS)
+            })
+        }
+        _ => return None,
+    };
+    let url = crate::links::file_url(path);
+    drawn
+        .and_then(|drawn| crate::image::show_linked(&drawn, url))
+        .ok()
+}
+
+/// A picture as words where it is not drawn: a mark, its description
+/// (or its file's name) and, when it is a file here, where it is.
+fn picture_words(picture: &Picture, here: bool) -> Vec<Span<'static>> {
+    let name = match picture.alt.trim() {
+        "" => picture.src.rsplit('/').next().unwrap_or(&picture.src),
+        alt => alt,
+    };
+    let mut words = vec![
+        Span::raw("▣ ").dim(),
+        Span::raw(name.to_owned()).underlined(),
+    ];
+    if here && picture.src != name {
+        words.push(Span::raw(format!(" ({})", picture.src)).dim());
+    }
+    words
+}
+
+/// An HTML tag: its name, lowercased (`!--` for a comment), whether it
+/// closes, and what is written after the name.
+struct Tag {
+    name: String,
+    closing: bool,
+    attributes: String,
+}
+
+impl Tag {
+    /// An attribute's value, quoted or not.
+    fn attribute(&self, wanted: &str) -> Option<String> {
+        let mut rest = self.attributes.as_str();
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
+            if rest.is_empty() {
+                return None;
+            }
+            let name_end = rest
+                .find(|c: char| c == '=' || c.is_whitespace() || c == '/')
+                .unwrap_or(rest.len());
+            let name = rest[..name_end].to_ascii_lowercase();
+            rest = rest[name_end..].trim_start();
+            let Some(after) = rest.strip_prefix('=') else {
+                if name.is_empty() {
+                    return None;
+                }
+                continue;
+            };
+            let after = after.trim_start();
+            let (value, left) = match after.chars().next() {
+                Some(quote @ ('"' | '\'')) => {
+                    let inner = &after[1..];
+                    let end = inner.find(quote).unwrap_or(inner.len());
+                    (&inner[..end], inner.get(end + 1..).unwrap_or(""))
+                }
+                _ => {
+                    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                    (&after[..end], &after[end..])
+                }
+            };
+            if name == wanted {
+                return Some(value.to_owned());
+            }
+            rest = left;
+        }
+    }
+}
+
+/// The HTML elements a README is written with, whose tags are read for
+/// what they mean, not shown as text.
+const ELEMENTS: &[&str] = &[
+    "a",
+    "abbr",
+    "b",
+    "big",
+    "blockquote",
+    "br",
+    "center",
+    "cite",
+    "code",
+    "dd",
+    "del",
+    "details",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "figcaption",
+    "figure",
+    "font",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "i",
+    "img",
+    "ins",
+    "kbd",
+    "li",
+    "mark",
+    "ol",
+    "p",
+    "picture",
+    "pre",
+    "q",
+    "s",
+    "samp",
+    "section",
+    "small",
+    "source",
+    "span",
+    "strike",
+    "strong",
+    "sub",
+    "summary",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "tt",
+    "u",
+    "ul",
+    "var",
+    "video",
+];
+
+/// A tag (or `<!-- comment -->`) of an element in [`ELEMENTS`] at the
+/// start of `text`, and how long it is.
+fn html_tag(text: &str) -> Option<(usize, Tag)> {
+    if let Some(after) = text.strip_prefix("<!--") {
+        let end = after.find("-->")?;
+        let tag = Tag {
+            name: "!--".into(),
+            closing: false,
+            attributes: String::new(),
+        };
+        return Some((4 + end + 3, tag));
+    }
+    let after = text.strip_prefix('<')?;
+    let (closing, after) = match after.strip_prefix('/') {
+        Some(after) => (true, after),
+        None => (false, after),
+    };
+    let name_end = after
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(after.len());
+    let name = after[..name_end].to_ascii_lowercase();
+    if !ELEMENTS.contains(&name.as_str()) {
+        return None;
+    }
+    let rest = &after[name_end..];
+    // A name, then attributes after a space, or the tag's end.
+    if !rest.starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace()) {
+        return None;
+    }
+    let end = rest.find('>')?;
+    if rest[..end].contains('<') {
+        return None;
+    }
+    let taken = text.len() - rest.len() + end + 1;
+    let attributes = rest[..end].to_owned();
+    Some((
+        taken,
+        Tag {
+            name,
+            closing,
+            attributes,
+        },
+    ))
+}
+
+/// Where the element `name` that opened just before `text` closes: the
+/// text inside it, and how far past its closing tag is.
+fn inside<'a>(text: &'a str, name: &str) -> Option<(&'a str, usize)> {
+    let lower = text.to_ascii_lowercase();
+    let close = format!("</{name}>");
+    let end = lower.find(&close)?;
+    Some((&text[..end], end + close.len()))
 }
 
 /// A rule's width: no wider than a turn's closing rule.
@@ -328,20 +747,83 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             rest = after;
             continue;
         }
-        // [text](url): the text, underlined, and the address when it says more.
-        if c == '['
-            && let Some(close) = rest.find("](")
-            && let Some(end) = rest[close + 2..].find(')')
+        // Other HTML a README is written with, read for what it means.
+        if c == '<'
+            && let Some((taken, tag)) = html_tag(rest)
         {
-            let label = &rest[1..close];
-            let url = &rest[close + 2..close + 2 + end];
+            flush(&mut plain, &mut spans);
+            rest = &rest[taken..];
+            if tag.closing {
+                continue;
+            }
+            let mut within = |style: Style, spans: &mut Vec<Span<'static>>| -> bool {
+                match inside(rest, &tag.name) {
+                    Some((inner, taken)) => {
+                        spans.extend(inline(inner, style));
+                        rest = &rest[taken..];
+                        true
+                    }
+                    None => false,
+                }
+            };
+            match tag.name.as_str() {
+                "a" => {
+                    let href = tag.attribute("href").unwrap_or_default();
+                    let before = spans.len();
+                    if within(base.underlined(), &mut spans) {
+                        let label: String =
+                            spans[before..].iter().map(|s| s.content.as_ref()).collect();
+                        if !href.is_empty() && href != label && !href.starts_with('#') {
+                            spans.push(Span::styled(format!(" ({href})"), base.dim()));
+                        }
+                    }
+                }
+                "img" => spans.extend(picture_words(
+                    &Picture {
+                        alt: tag.attribute("alt").unwrap_or_default(),
+                        src: tag.attribute("src").unwrap_or_default(),
+                    },
+                    false,
+                )),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "summary" => {
+                    if tag.name == "summary" {
+                        spans.push(Span::styled("▸ ", base.dim()));
+                    }
+                    within(base.add_modifier(Modifier::BOLD), &mut spans);
+                }
+                "del" | "s" | "strike" => {
+                    within(base.add_modifier(Modifier::CROSSED_OUT), &mut spans);
+                }
+                "u" | "ins" => {
+                    within(base.underlined(), &mut spans);
+                }
+                "li" => spans.push(Span::styled("- ", base.dim())),
+                _ => {}
+            }
+            continue;
+        }
+        // [text](url): the text, underlined, and the address when it says
+        // more; ![text](src), a picture among words, the same.
+        let link = match rest.strip_prefix("![") {
+            Some(_) => &rest[1..],
+            None => rest,
+        };
+        if link.starts_with('[')
+            && let Some(close) = link.find("](")
+            && let Some(end) = link[close + 2..].find(')')
+        {
+            let label = &link[1..close];
+            let url = &link[close + 2..close + 2 + end];
             if !label.contains('[') && !url.contains(' ') {
                 flush(&mut plain, &mut spans);
+                if link.len() < rest.len() {
+                    spans.push(Span::styled("▣ ", base.dim()));
+                }
                 spans.extend(inline(label, base.underlined()));
                 if url != label && !url.starts_with('#') {
                     spans.push(Span::styled(format!(" ({url})"), base.dim()));
                 }
-                rest = &rest[close + 2 + end + 1..];
+                rest = &link[close + 2 + end + 1..];
                 continue;
             }
         }
@@ -391,7 +873,10 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
             let png = crate::html::render(&path, crate::image::page_width(width))?;
             crate::image::page(&png, width)
         })
-        .and_then(|drawn| Ok((crate::image::show(&drawn)?, drawn.cut))),
+        .and_then(|drawn| {
+            let url = crate::links::file_url(&path);
+            Ok((crate::image::show_linked(&drawn, url)?, drawn.cut))
+        }),
         false => Err(String::new()),
     };
     let (mut out, more) = match drawn {
@@ -424,6 +909,30 @@ fn page(source: &str, width: usize) -> Vec<Line<'static>> {
         *page = Some(path);
     }
     out
+}
+
+/// Where a drawn fence's source is kept for the pane, named by what it
+/// holds, so drawing it again keeps the same file.
+fn kept_path(what: &impl std::hash::Hash, extension: &str) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let dir = std::env::temp_dir().join("sonny-pages");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    (what, extension).hash(&mut hasher);
+    Some(dir.join(format!("{:016x}.{extension}", hasher.finish())))
+}
+
+/// `source` kept in its file, written by `write` unless it is there.
+fn keep(
+    source: &str,
+    extension: &str,
+    write: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Option<std::path::PathBuf> {
+    let path = kept_path(&source, extension)?;
+    if !path.is_file() {
+        write(&path).ok()?;
+    }
+    Some(path)
 }
 
 /// `| a | b |`: a table's row, its separator included.
@@ -773,9 +1282,10 @@ pub fn reacted(emoji: &str) -> Line<'static> {
     ])
 }
 
-/// A whole reply, as replayed history shows it.
-pub fn reply(text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut markdown = Markdown::default();
+/// A whole reply, as replayed history shows it, its pictures' paths
+/// read from `folder`.
+pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'static>> {
+    let mut markdown = Markdown::in_folder(folder);
     let mut out = Vec::new();
     for line in text.lines() {
         let first = out.is_empty();
@@ -892,7 +1402,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 29] = [
+const KEPT: [&str; 26] = [
     "Started",
     "Messaged",
     "Steered",
@@ -919,9 +1429,6 @@ const KEPT: [&str; 29] = [
     "Unsubscribed from",
     "Opened a tab",
     "Opened a split",
-    "Stopped Errand job",
-    "Applied the changes of Errand job",
-    "Applied the changes of",
 ];
 
 fn kept(said: &crate::calls::Said) -> bool {
@@ -1600,6 +2107,92 @@ mod tests {
     }
 
     #[test]
+    fn a_line_of_pictures_is_read_as_markdown_and_html_write_them() {
+        let picture = |alt: &str, src: &str| Picture {
+            alt: alt.into(),
+            src: src.into(),
+        };
+        assert_eq!(
+            pictures("![The demo](docs/demo.gif \"title\")"),
+            Some(vec![picture("The demo", "docs/demo.gif")])
+        );
+        // Badges: pictures that are links.
+        assert_eq!(
+            pictures("[![CI](https://x/ci.svg)](https://x/ci) [![Docs](d.svg)](https://d)"),
+            Some(vec![
+                picture("CI", "https://x/ci.svg"),
+                picture("Docs", "d.svg")
+            ])
+        );
+        assert_eq!(
+            pictures(r#"<p align="center"><img src='a b.png' width=200 alt="A logo"/></p>"#),
+            Some(vec![picture("A logo", "a b.png")])
+        );
+        assert_eq!(
+            pictures("  <img width=\"800\" src=\"d.gif\">"),
+            Some(vec![picture("", "d.gif")])
+        );
+        assert_eq!(pictures("See ![a](a.png) here"), None);
+        assert_eq!(pictures("<p align=\"center\">"), None);
+        assert_eq!(pictures("Vec<String> is ![a](a.png)"), None);
+    }
+
+    #[test]
+    fn a_picture_not_drawn_reads_as_its_words_and_where_it_is() {
+        let dir = std::env::temp_dir().join(format!("sonny-pictures-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"not drawn in tests").unwrap();
+        std::fs::write(dir.join("a b.png"), b"not drawn in tests").unwrap();
+        let mut markdown = Markdown::document(&dir);
+        let rows = markdown.feed(
+            "![A shot](shot.png) [![CI](https://x/ci.svg)](https://x)",
+            80,
+            false,
+        );
+        // A file here keeps its path, to be clicked; another's only its words.
+        assert_eq!(text(&rows), vec!["  ▣ A shot (shot.png)  ▣ CI"]);
+        // An escaped name reads back as the file's.
+        let rows = markdown.feed("![Spaced](a%20b.png)", 80, false);
+        assert_eq!(text(&rows), vec!["  ▣ Spaced (a%20b.png)"]);
+        // Among words, a picture is a link to it.
+        let rows = markdown.feed("Look: ![plot](out/plot.png).", 80, false);
+        assert_eq!(text(&rows), vec!["  Look: ▣ plot (out/plot.png)."]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn html_in_markdown_reads_as_the_page_would_show_it() {
+        let shown = |source: &str| {
+            let mut markdown = Markdown::document(std::path::Path::new("."));
+            let mut rows = Vec::new();
+            for line in source.lines() {
+                rows.extend(markdown.feed(line, 80, false));
+            }
+            rows.extend(markdown.end(80, false));
+            text(&rows)
+        };
+        assert_eq!(
+            shown("<p align=\"center\">\n  <b>Agent</b>\n</p>\n<h1 align=\"center\">Title</h1>"),
+            vec!["    Agent", "  Title"]
+        );
+        assert_eq!(
+            shown(
+                "<details>\n<summary>More</summary>\n\nHidden <a href=\"https://x\">here</a>.\n</details>"
+            ),
+            vec!["  ▸ More", "  ", "  Hidden here (https://x)."]
+        );
+        // Comments say nothing, on one line or over several.
+        assert_eq!(
+            shown("a <!-- note --> b\n<!--\nlong\n-->\nc\n<hr>"),
+            vec!["  a  b", "  c", &format!("  {}", "─".repeat(40))]
+        );
+        // What is not an element stays as written.
+        assert_eq!(shown("Vec<String> and a<b"), vec!["  Vec<String> and a<b"]);
+        // In a document, an html fence is code to read.
+        assert_eq!(shown("```html\n<p>x</p>\n```"), vec!["    <p>x</p>"]);
+    }
+
+    #[test]
     fn a_step_is_dim_and_plain_but_a_failure_stays_red() {
         let ran = super::quiet(super::tool(
             "shell",
@@ -1699,7 +2292,7 @@ mod tests {
 
     #[test]
     fn a_fence_left_open_shows_what_it_had() {
-        let lines = reply("Here:\n```diff\n-old\n+new", 80);
+        let lines = reply("Here:\n```diff\n-old\n+new", 80, std::path::Path::new("."));
         let shown: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(shown.iter().any(|l| l.contains("-old")), "{shown:?}");
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
@@ -1714,7 +2307,11 @@ mod tests {
 
     #[test]
     fn a_reply_styles_fences_headings_and_code_spans() {
-        let rows = reply("Hi `x`\n## Head\n```rust\nlet a = 1;\n```\n- item", 40);
+        let rows = reply(
+            "Hi `x`\n## Head\n```rust\nlet a = 1;\n```\n- item",
+            40,
+            std::path::Path::new("."),
+        );
         assert_eq!(
             text(&rows),
             ["• Hi x", "  Head", "    let a = 1;", "  - item"]
@@ -1723,9 +2320,9 @@ mod tests {
 
     #[test]
     fn a_fence_that_never_closes_still_shows_as_code() {
-        let rows = reply("Here:\n```diff\n-a\n+b", 40);
+        let rows = reply("Here:\n```diff\n-a\n+b", 40, std::path::Path::new("."));
         assert_eq!(text(&rows), ["• Here:", "    -a", "    +b"]);
-        let rows = reply("$$\nx^2", 40);
+        let rows = reply("$$\nx^2", 40, std::path::Path::new("."));
         assert_eq!(text(&rows), ["•   x^2"]);
     }
 
@@ -1757,7 +2354,11 @@ mod tests {
 
     #[test]
     fn a_wrapped_list_item_hangs_under_its_text() {
-        let rows = reply("- divide by len(values), not len(values) - 1", 30);
+        let rows = reply(
+            "- divide by len(values), not len(values) - 1",
+            30,
+            std::path::Path::new("."),
+        );
         assert_eq!(
             text(&rows),
             ["• - divide by len(values), not ", "    len(values) - 1"]
@@ -2034,11 +2635,6 @@ mod tests {
                 "  └ triggers_unsupported: only macOS",
                 "    Check the queue."
             ]
-        );
-        assert!(shell(r#"sonny task changes calc.fix"#, "M calc.py").is_empty());
-        assert_eq!(
-            shell(r#"sonny task changes calc.fix --apply"#, ""),
-            ["• Applied the changes of calc.fix"]
         );
     }
 

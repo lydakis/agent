@@ -15,10 +15,10 @@ mod background;
 mod banner;
 mod cache;
 mod calls;
+mod cmux;
 mod declared;
 mod diff;
 mod embed;
-mod errand;
 mod herdr;
 mod highlight;
 mod html;
@@ -161,16 +161,12 @@ struct Options {
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--copies worktree|sandfs] [--bot NAME [--new [--workspace DIR]]]\n\
+     \x20      [--bot NAME [--new [--workspace DIR]]]\n\
      With no --bot, the folder's coordinator, made with --model the first time; its tasks\n\
-     open beside it in Rex or Herdr. Type /status for the project's agents.\n\
-     --copies (or /copies): how its tasks get their own copy, kept for every folder: git\n\
-     worktrees (the default), or sandfs copies (experimental, built in), which take\n\
-     uncommitted changes along and work outside git too.\n\
+     open beside it in Rex or Herdr, each in a git worktree of its own. Type /status for\n\
+     the project's agents.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
      and subscribe to the lookout with tools Sonny gives them, which the lookout answers.\n\
-     sonny task changes NAME [--apply] lists (or writes here) what a sandfs copy of a\n\
-     plain folder changed.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny lookout [--judge PROVIDER/MODEL|off] watches every lead on the daemon, wakes\n\
@@ -321,14 +317,6 @@ async fn project_of(client: &Client, bot: &str) -> String {
 
 /// How many lines of transcript wait while `/status` holds the screen.
 const KEPT_UNDER_STATUS: usize = 5_000;
-
-/// A program on PATH.
-fn which(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-}
 
 /// Agent's own binary: the one the daemon gave this shell, else the one
 /// installed beside Sonny (`libexec/agent`, as the Linux tarball lays it
@@ -603,15 +591,6 @@ fn parse() -> Result<Options, String> {
             "--no-sound" => sound = false,
             // Unlisted: how `/side` opens a side chat.
             "--side" => side = Some(value()?.parse().map_err(|_| usage())?),
-            "--copies" => {
-                let copies = value()?;
-                if !agent_client::project::COPIES.contains(&copies.as_str()) {
-                    return Err(usage());
-                }
-                let mut settings = settings::Settings::load();
-                settings.copies = copies;
-                settings.save()?;
-            }
             _ => return Err(usage()),
         }
     }
@@ -639,7 +618,7 @@ fn reopen() -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--copies" => {
+            "--workspace" => {
                 args.next();
             }
             _ => command.push(arg),
@@ -665,12 +644,8 @@ fn main() -> std::process::ExitCode {
         // SAFETY: nothing else runs yet: no thread is started before this.
         unsafe { std::env::set_var("AGENT_CLI", format!("\"{}\" agent", me.display())) };
     }
-    // sandfs serves task copies' mounts from this program run again as
-    // `sonny sandfs ...`, outside any runtime of Sonny's.
-    sandfs::handle_relaunch(&["sandfs"]);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        Some((task, rest)) if task == "task" => task::run(rest),
         // The lookout runs this for each call of a tool Sonny answers.
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
@@ -737,7 +712,8 @@ async fn run() -> Result<(), String> {
                 return Err(usage());
             }
             let dir = std::env::current_dir().map_err(|e| e.to_string())?;
-            skills::install_errand();
+            // Sonny no longer writes an `errand` skill: one it wrote, unedited, goes.
+            skills::remove("errand");
             if options.layout {
                 mux::install_skill(options.rex_host.as_deref());
             }
@@ -751,6 +727,7 @@ async fn run() -> Result<(), String> {
     // A side chat borrows its agent's pane, and Herdr keeps the agent.
     if options.side.is_none() {
         herdr::announce(&name, reopen());
+        cmux::announce(&name, reopen());
     }
     // Everything after now arrives live; history is read from the bot's
     // items instead of replayed events, so the replay is skipped. The bot
@@ -824,13 +801,6 @@ async fn run() -> Result<(), String> {
         ));
     }
     app.lead = project::lead(&app.options.socket, &bot);
-    // Task copies a restart unmounted are mounted again before any task
-    // works in its folder.
-    if project.is_some()
-        && let Some(error) = task::remount(&app.options.socket).pop()
-    {
-        app.notice = Some(error);
-    }
     // The lookout knows no leads: it watches a lead's tasks because Sonny
     // subscribes it to them, before the lookout starts so it reads the file.
     if let Some(project) = &project
@@ -1050,8 +1020,8 @@ fn unique(prefix: &str) -> String {
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
-/// (Ghostty, Rex) can mark this pane working, blocked or done; and the
-/// same to Herdr, which takes it from its own CLI instead.
+/// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
+/// the same to Herdr, which takes it from its own CLI instead.
 fn status_report(state: &str, bot: &str) {
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
@@ -1060,6 +1030,9 @@ fn status_report(state: &str, bot: &str) {
         return;
     }
     herdr::report(state);
+    if state == "clear" {
+        cmux::release();
+    }
     let mut body = format!("state={state}");
     if state == "blocked" {
         body.push_str(":kind=permission");
@@ -1141,9 +1114,9 @@ struct Live {
 }
 
 impl Live {
-    fn new(gap: bool) -> Self {
+    fn new(gap: bool, workspace: &str) -> Self {
         Live {
-            markdown: Markdown::default(),
+            markdown: Markdown::in_folder(std::path::Path::new(workspace)),
             partial: String::new(),
             lines: 0,
             rows: Vec::new(),
@@ -1263,7 +1236,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, and `/triggers` and `/lookout`
 /// open `/background`, unlisted.
-const COMMANDS: [(&str, &str); 16] = [
+const COMMANDS: [(&str, &str); 15] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1292,10 +1265,6 @@ const COMMANDS: [(&str, &str); 16] = [
     (
         "/fullscreen",
         "full screen (the default), or inline in the terminal's scrollback",
-    ),
-    (
-        "/copies",
-        "tasks in git worktrees or sandfs copies (experimental)",
     ),
     ("/react", "react to one of the agent's replies"),
     ("/copy", "the last reply, as Markdown"),
@@ -1352,8 +1321,6 @@ struct Watch {
     screen: Option<Tui>,
     project: String,
     rows: Vec<status::Row>,
-    /// This project's active Errand jobs.
-    jobs: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
     /// The lookout's line for the lead.
@@ -1373,8 +1340,7 @@ struct App {
     /// The project whose lead this is, when opened as the folder's coordinator.
     project: Option<String>,
     workspace: String,
-    /// The workspace's branch and what it is a sandfs copy of, as last
-    /// read, for the footer.
+    /// The workspace's branch, as last read, for the footer.
     place: place::Place,
     /// The read under way, of the workspace named, and when the last one
     /// began: the branch can change under a running turn.
@@ -1599,13 +1565,6 @@ struct Fleet {
     named: HashMap<String, String>,
     /// What to ring for, taken by the app after each event.
     alerts: Vec<(sound::Alert, String)>,
-    /// Detached Errand runs the project's bots started, by bot and call
-    /// (call ids are only unique within a bot): the command, until the
-    /// call's output names the job.
-    errands: HashMap<(String, String), String>,
-    /// Finished calls whose output names a job to follow in a window:
-    /// the bot, the output's node, and the command.
-    jobs: Vec<(String, i64, String, String)>,
     /// Tasks whose last turn completed, and that turn: its window closes
     /// once a wait has taken the result.
     ended: HashMap<String, i64>,
@@ -1706,8 +1665,6 @@ impl Fleet {
             doing: HashMap::new(),
             named: HashMap::new(),
             alerts: Vec::new(),
-            errands: HashMap::new(),
-            jobs: Vec::new(),
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
@@ -1772,32 +1729,6 @@ impl Fleet {
         let opened = self.layout.show(bot, &name, &command)?;
         self.doing(bot, "working");
         Ok(opened)
-    }
-
-    /// Note a detached Errand run as it starts, and its job once the call
-    /// finishes, to follow it in a window of its own.
-    fn errand(&mut self, bot: &str, kind: &str, data: &Value) {
-        let call = data["call_id"].as_str().unwrap_or("").to_owned();
-        match kind {
-            "tool_started" if data["name"] == "shell" => {
-                let command = data["arguments"]
-                    .as_str()
-                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                    .and_then(|a| a["command"].as_str().and_then(calls::errand_detached));
-                if let Some(command) = command {
-                    self.errands.insert((bot.to_owned(), call), command);
-                }
-            }
-            "tool_completed" => {
-                if let Some(command) = self.errands.remove(&(bot.to_owned(), call.clone()))
-                    && let Some(node) = data["node"].as_i64()
-                    && data["failed"] != true
-                {
-                    self.jobs.push((bot.to_owned(), node, call, command));
-                }
-            }
-            _ => {}
-        }
     }
 
     /// A finished task's window closes once its result is taken: its turn
@@ -1892,49 +1823,6 @@ impl Fleet {
         }
     }
 
-    /// A window for each Errand job started since: `errand attach` on its
-    /// handle, named after its command.
-    async fn follow_jobs(&mut self) {
-        let Some(errand) = which("errand") else {
-            self.jobs.clear();
-            return;
-        };
-        for (bot, node, call, command) in std::mem::take(&mut self.jobs) {
-            let Ok(read) = self
-                .client
-                .request("history_items", json!({"bot": bot, "nodes": [node]}))
-                .await
-            else {
-                continue;
-            };
-            // An Anthropic node holds every result of its turn's calls.
-            let Some(result) = responses(&read["items"][0]["item"])
-                .into_iter()
-                .find(|item| item["call_id"] == call.as_str())
-            else {
-                continue;
-            };
-            let (printed, _) = output(&result);
-            let Some(handle) = printed
-                .lines()
-                .map(str::trim)
-                .find(|line| line.contains('/') && !line.contains(' '))
-            else {
-                continue;
-            };
-            let label = format!("errand:{handle}");
-            let name = format!("errand · {}", first_line(&command));
-            let attach = vec![
-                errand.to_string_lossy().into_owned(),
-                "attach".into(),
-                handle.to_owned(),
-            ];
-            let _ = self
-                .layout
-                .place(&label, &name, &attach, &mux::Placement::Window);
-        }
-    }
-
     /// A bot's name in its project's session: `lead`, or the task's name.
     fn short<'a>(&self, bot: &'a str) -> &'a str {
         if bot == self.lead {
@@ -1969,10 +1857,6 @@ impl Fleet {
                 _ => None,
             };
             self.alerts.extend(alert);
-            // A task that waits needs little of its copy's memory.
-            if bot != self.lead && matches!(doing, "done" | "failed" | "needs you") {
-                task::trim(bot);
-            }
         }
     }
 
@@ -2015,11 +1899,11 @@ impl Fleet {
         }
     }
 
-    /// Whether a block is the project's: a bot's, a command one asked for
-    /// (`BOT/NAME`), or an Errand job's.
+    /// Whether a block is the project's: a bot's, or a command one asked
+    /// for (`BOT/NAME`).
     fn owns(&self, label: &str) -> bool {
         let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
-        label.starts_with("errand:") || self.doing.contains_key(bot) || self.lineage.contains(bot)
+        self.doing.contains_key(bot) || self.lineage.contains(bot)
     }
 
     /// Follow every bot again on a new connection; what changed while
@@ -2053,7 +1937,6 @@ impl Fleet {
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
         if self.lineage.contains(bot) {
-            self.errand(bot, kind, data);
             self.taken(bot, kind, event);
             self.resolving.event(event, &self.lead);
             match kind {
@@ -2345,11 +2228,6 @@ impl App {
                         continue;
                     };
                     let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
-                    if let Some(fleet) = &mut self.fleet
-                        && !fleet.jobs.is_empty()
-                    {
-                        fleet.follow_jobs().await;
-                    }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -3080,7 +2958,11 @@ impl App {
                     (_, Some("assistant")) => {
                         let reply = text(&item);
                         if !reply.is_empty() {
-                            let mut lines = transcript::reply(&reply, self.prose());
+                            let mut lines = transcript::reply(
+                                &reply,
+                                self.prose(),
+                                std::path::Path::new(&self.workspace),
+                            );
                             lines.extend(self.reacted_row(node));
                             said = Some(lines);
                             self.saw_reply(node, &reply);
@@ -3534,7 +3416,7 @@ impl App {
                         if let Some(closed) = closed {
                             self.write_words(closed, Words::Reply);
                         }
-                        Live::new(self.any_history)
+                        Live::new(self.any_history, &self.workspace)
                     }
                 };
                 live.partial.push_str(delta);
@@ -3587,8 +3469,12 @@ impl App {
                     self.close_live();
                 } else if let Some(item) = &item {
                     self.end_live(Words::Reply);
-                    let mut live = Live::new(self.any_history);
-                    let rows = transcript::reply(&text(item), self.prose());
+                    let mut live = Live::new(self.any_history, &self.workspace);
+                    let rows = transcript::reply(
+                        &text(item),
+                        self.prose(),
+                        std::path::Path::new(&self.workspace),
+                    );
                     self.live_rows(&mut live, rows);
                     live.closed = true;
                     self.live = Some(live);
@@ -3921,14 +3807,12 @@ impl App {
                 return;
             }
         };
-        let jobs = errand::jobs(self.folder_name()).await;
         // The full screen shows it beside the conversation.
         if full() {
             self.watch = Some(Watch {
                 screen: None,
                 project,
                 rows,
-                jobs,
                 read: Instant::now(),
                 lookout: self.lookout_line(),
                 resolved: false,
@@ -3938,7 +3822,7 @@ impl App {
             self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
             return;
         }
-        self.watch(project, rows, jobs, None);
+        self.watch(project, rows, None);
     }
 
     /// What runs for the project's agents with no one typing. Open
@@ -3958,7 +3842,6 @@ impl App {
                 screen: None,
                 project,
                 rows: Vec::new(),
-                jobs: Vec::new(),
                 read: Instant::now(),
                 lookout: String::new(),
                 resolved: false,
@@ -3968,7 +3851,7 @@ impl App {
             self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
             return;
         }
-        self.watch(project, Vec::new(), Vec::new(), Some(view));
+        self.watch(project, Vec::new(), Some(view));
     }
 
     /// Give `/status`, or `/background`, the screen.
@@ -3976,7 +3859,6 @@ impl App {
         &mut self,
         project: String,
         rows: Vec<status::Row>,
-        jobs: Vec<status::Row>,
         background: Option<background::View>,
     ) {
         // The full screen is the alternate screen already.
@@ -3993,7 +3875,6 @@ impl App {
                     screen: Some(screen),
                     project,
                     rows,
-                    jobs,
                     read: Instant::now(),
                     lookout: self.lookout_line(),
                     resolved: false,
@@ -4018,13 +3899,11 @@ impl App {
             watch.read = Instant::now();
             return;
         }
-        let jobs = errand::jobs(self.folder_name()).await;
         let lookout = self.lookout_line();
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
-            watch.jobs = jobs;
             watch.read = Instant::now();
             watch.lookout = lookout;
         }
@@ -4053,14 +3932,6 @@ impl App {
             Some(_) => lookout::status(&self.options.store, &self.bot),
             None => String::new(),
         }
-    }
-
-    /// The lead's folder's own name, which Errand names its jobs' project by.
-    fn folder_name(&self) -> String {
-        std::path::Path::new(&self.workspace)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
@@ -5383,52 +5254,6 @@ impl App {
             });
             return;
         }
-        if prompt == "/copies" {
-            self.input.clear();
-            let mut settings = settings::Settings::load();
-            settings.copies = match settings.copies.as_str() {
-                "sandfs" => "worktree",
-                _ => "sandfs",
-            }
-            .into();
-            if let Err(error) = settings.save() {
-                self.notice = Some(error);
-                return;
-            }
-            self.notice = Some(match settings.copies.as_str() {
-                "sandfs" => "tasks get sandfs copies (experimental)".into(),
-                _ => "tasks get git worktrees".into(),
-            });
-            // The lead is told now when idle, else once its turn ends,
-            // unless its instructions were set some other way.
-            if self.project.is_some() {
-                let bot = match self
-                    .client
-                    .request("inspect", json!({"bot": self.bot}))
-                    .await
-                {
-                    Ok(bot) => bot,
-                    Err(error) => {
-                        self.notice = Some(format!("the lead's instructions: {error}"));
-                        return;
-                    }
-                };
-                let dir = std::path::Path::new(&self.workspace);
-                match project::review(dir, &bot, &self.lead, false) {
-                    Ok(project::Instructions::Stale(text)) => {
-                        self.instruct = Some(text);
-                        self.configure().await;
-                    }
-                    // A toggle back before the turn ended: nothing to send.
-                    Ok(project::Instructions::Current) => self.instruct = None,
-                    Ok(project::Instructions::Kept { missing }) => {
-                        self.notice = Some(project::Instructions::kept_notice(&missing))
-                    }
-                    Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
-                }
-            }
-            return;
-        }
         if prompt == "/quit" {
             self.input.clear();
             self.quit = true;
@@ -6516,11 +6341,7 @@ impl App {
             0 => right,
             n => format!("↻ {n} in background · {right}"),
         };
-        // The folder, and what it is a copy of; its branch is kept whole.
-        let folder = match &self.place.copy_of {
-            Some(source) => format!("{folder}, a sandfs copy of {}", tilde(source)),
-            None => folder,
-        };
+        // The folder, and its branch, which is kept whole.
         let branch = match &self.place.branch {
             Some(branch) => format!(" on {branch}"),
             None => String::new(),
@@ -6600,17 +6421,8 @@ fn watch_card(watch: &Watch, width: usize) -> (Vec<Line<'static>>, bool) {
             row
         })
         .collect();
-    let jobs: Vec<status::Row> = watch
-        .jobs
-        .iter()
-        .cloned()
-        .map(|mut job| {
-            job.seconds = job.seconds.map(|s| s + since);
-            job
-        })
-        .collect();
     let any_resolved = rows.iter().any(|row| row.group == status::Group::Resolved);
-    let mut card = status::card(&watch.project, &rows, &jobs, width, watch.resolved);
+    let mut card = status::card(&watch.project, &rows, width, watch.resolved);
     if !watch.lookout.is_empty() {
         card.insert(1, Line::from(watch.lookout.clone()).dim());
     }
@@ -8041,25 +7853,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_footer_names_the_branch_and_what_a_copy_was_made_from() {
+    async fn the_footer_names_the_branch() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        app.workspace = "/work/tasks/fix-cart".into();
+        app.workspace = "/work/.agent/worktrees/fix-cart/packages/shop".into();
         app.model = "opus".into();
         app.place = place::Place {
             branch: Some("agent/fix-cart".into()),
-            copy_of: Some("/work/shop".into()),
         };
         let wide = app.footer_line(100).to_string();
         assert!(
-            wide.contains(
-                "opus · /work/tasks/fix-cart, a sandfs copy of /work/shop on agent/fix-cart"
-            ),
+            wide.contains("opus · /work/.agent/worktrees/fix-cart/packages/shop on agent/fix-cart"),
             "{wide}"
         );
         // A narrow footer cuts the folder from its start, never the branch.
         let narrow = app.footer_line(56).to_string();
         assert!(
-            narrow.contains("…") && narrow.contains("/work/shop on agent/fix-cart"),
+            narrow.contains("…") && narrow.contains("packages/shop on agent/fix-cart"),
             "{narrow}"
         );
         assert_eq!(narrow.trim_end().width(), 56 - 2);

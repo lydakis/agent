@@ -1,10 +1,8 @@
 //! The `start_task` and `remove_task` tools end to end, as the lookout
 //! runs them (`sonny tool NAME`), with a stand-in for the daemon's
-//! `agent`: a task gets a worktree by default and a sandfs copy when Sonny
-//! is set to, is started there with what the lead asked for, and a start
-//! that fails leaves no folder behind. Sandfs uses a cloned folder when
-//! supported, otherwise a real mount that needs FUSE 3 on Linux.
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+//! `agent`: a task gets a worktree, is started there with what the lead
+//! asked for, and a start that fails leaves no folder behind.
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,8 +17,6 @@ impl Lab {
     /// A repository with a commit and an uncommitted edit under `src`,
     /// and an `agent` that logs what `run` was given.
     fn new(test: &str) -> Lab {
-        // Under /tmp, not macOS's long $TMPDIR: sandfs's mount socket lives
-        // in the home made here, and a socket path must fit in 104 bytes.
         let scratch = Path::new("/tmp").join(format!("sonny-task-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         for dir in ["home", "repo/src"] {
@@ -57,12 +53,6 @@ impl Lab {
         lab
     }
 
-    fn sandfs(&self) {
-        let settings = self.home.join(".agent/sonny");
-        std::fs::create_dir_all(&settings).unwrap();
-        std::fs::write(settings.join("settings.json"), r#"{"copies": "sandfs"}"#).unwrap();
-    }
-
     fn run(&self, dir: &Path, program: &str, args: &[&str], fail: bool) -> (bool, String, String) {
         self.run_with(dir, program, args, fail, None)
     }
@@ -83,7 +73,6 @@ impl Lab {
             .env("AGENT_BOT", "demo.lead")
             .env("AGENT_BOT_ID", "1")
             .env("HOME", &self.home)
-            .env("SANDFS_HOME", self.home.join("sandfs"))
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
             .env("GIT_AUTHOR_NAME", "t")
@@ -320,88 +309,6 @@ fn setup_runs_in_the_tasks_folder_and_a_failing_one_starts_nothing() {
 }
 
 #[test]
-fn a_sandfs_task_copy_takes_the_checkout_and_pushes_back() {
-    let lab = Lab::new("sandfs");
-    lab.sandfs();
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    let copy = lab.home.join(".agent/tasks/demo.fix");
-    assert_eq!(lab.ran()[6], copy.join("src").to_string_lossy());
-    assert!(said.contains("agent/demo.fix"), "{said}");
-    // The uncommitted edit came along, on a branch of the task's own.
-    assert_eq!(
-        std::fs::read_to_string(copy.join("src/lib.rs")).unwrap(),
-        "two\n"
-    );
-    assert_eq!(
-        lab.git(&copy, &["branch", "--show-current"]),
-        "agent/demo.fix"
-    );
-    let sonny = env!("CARGO_BIN_EXE_sonny");
-    let (_, listed, _) = lab.run(&lab.repo, sonny, &["task", "changes", "demo.fix"], false);
-    assert_eq!(listed, "M src/lib.rs");
-    lab.git(&copy, &["commit", "-qam", "two"]);
-    // A commit only in the copy keeps the task, on whichever branch.
-    lab.git(&copy, &["checkout", "-q", "--detach", "HEAD~1"]);
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("commits not pushed"), "{err}");
-    assert!(err.contains("on agent/demo.fix"), "{err}");
-    lab.git(&copy, &["switch", "-q", "agent/demo.fix"]);
-    lab.git(&copy, &["push", "-q", "origin", "agent/demo.fix"]);
-    assert_eq!(
-        lab.git(&lab.repo, &["show", "agent/demo.fix:src/lib.rs"]),
-        "two"
-    );
-    // A new file, even one git status is set not to show, keeps it.
-    lab.git(&copy, &["config", "status.showUntrackedFiles", "no"]);
-    std::fs::write(copy.join("new.rs"), "new\n").unwrap();
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("uncommitted changes"), "{err}");
-    std::fs::remove_file(copy.join("new.rs")).unwrap();
-    // So does a commit on no branch.
-    lab.git(&copy, &["checkout", "-q", "--detach"]);
-    lab.git(&copy, &["commit", "-q", "--allow-empty", "-m", "loose"]);
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("on HEAD"), "{err}");
-    // A real mount left unmounted, as by a restart, is mounted again to be
-    // checked. Sandfs may instead keep the copy as a cloned folder.
-    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
-    if std::fs::metadata(&copy).unwrap().dev()
-        != std::fs::metadata(copy.parent().unwrap()).unwrap().dev()
-    {
-        sandfs.unmount("demo.fix").unwrap();
-        assert!(!copy.join(".git").exists());
-    }
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("on HEAD"), "{err}");
-    // A tag keeps it too, as does a stash.
-    lab.git(&copy, &["tag", "-a", "-m", "kept", "kept"]);
-    lab.git(&copy, &["switch", "-q", "agent/demo.fix"]);
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("on kept"), "{err}");
-    lab.git(&copy, &["tag", "-d", "kept"]);
-    std::fs::write(copy.join("src/lib.rs"), "three\n").unwrap();
-    lab.git(&copy, &["stash", "-q"]);
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("on stash@{0}"), "{err}");
-    lab.git(&copy, &["stash", "drop", "-q"]);
-    // The clean copy can now go with the test.
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(ok, "{err}");
-    assert!(sandfs.workspaces().unwrap().is_empty());
-}
-
-#[test]
-fn a_sandfs_task_that_does_not_start_leaves_no_copy() {
-    let lab = Lab::new("sandfs-fails");
-    lab.sandfs();
-    let (ok, said) = lab.task(true, false);
-    assert!(!ok, "{said}");
-    let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
-    assert!(sandfs.workspaces().unwrap().is_empty());
-}
-
-#[test]
 fn a_task_starts_with_the_agent_installed_beside_sonny() {
     let lab = Lab::new("terminal");
     // Installed as Homebrew lays it out: bin/sonny, and libexec/agent.
@@ -441,48 +348,6 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
 }
 
 #[test]
-fn a_plain_folder_on_another_disk_is_copied_on_that_disk() {
-    // /dev/shm is a disk of its own on Linux; elsewhere there is no
-    // second disk to try this on.
-    let shm = Path::new("/dev/shm");
-    if !shm.is_dir() {
-        return;
-    }
-    let lab = Lab::new("sandfs-disk");
-    lab.sandfs();
-    let folder = shm.join(format!("sonny-task-plain-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&folder);
-    std::fs::create_dir_all(&folder).unwrap();
-    std::fs::write(folder.join("notes.txt"), "one\n").unwrap();
-    let sonny = env!("CARGO_BIN_EXE_sonny");
-    let start = serde_json::json!({"name": "fix", "brief": "go"});
-    let (ok, said) = lab.tool(&folder, "start_task", start, false);
-    let copy = lab.home.join(".agent/tasks/demo.fix");
-    let finish = |lab: &Lab| {
-        let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
-        let _ = sandfs.remove("demo.fix", true);
-        let _ = std::fs::remove_dir_all(&folder);
-    };
-    if !ok {
-        finish(&lab);
-        panic!("{said}");
-    }
-    assert!(said.contains("as it is now"), "{said}");
-    assert_eq!(lab.ran()[6], copy.to_string_lossy());
-    // A change to the folder after the copy was made is not the task's.
-    std::fs::write(folder.join("later.txt"), "later\n").unwrap();
-    let later = copy.join("later.txt").exists();
-    // The task's edit stays in its copy until applied.
-    std::fs::write(copy.join("notes.txt"), "two\n").unwrap();
-    let (_, listed, _) = lab.run(&folder, sonny, &["task", "changes", "demo.fix"], false);
-    let source = std::fs::read_to_string(folder.join("notes.txt")).unwrap();
-    finish(&lab);
-    assert!(!later);
-    assert_eq!(listed, "M notes.txt");
-    assert_eq!(source, "one\n");
-}
-
-#[test]
 fn a_done_worktree_task_is_removed_with_its_merged_branch() {
     let lab = Lab::new("rm-worktree");
     let (ok, said) = lab.task(false, false);
@@ -505,106 +370,4 @@ fn a_done_worktree_task_is_removed_with_its_merged_branch() {
         lab.git(&lab.repo, &["branch", "--list", "agent/demo.fix"]),
         ""
     );
-}
-
-#[test]
-fn a_plain_folder_copy_turns_git_off_in_linked_worktrees_and_applies_what_it_lists() {
-    let shm = Path::new("/dev/shm");
-    if !shm.is_dir() {
-        return;
-    }
-    let lab = Lab::new("sandfs-linked");
-    lab.sandfs();
-    let folder = shm.join(format!("sonny-task-linked-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&folder);
-    let shop = folder.join("shop");
-    std::fs::create_dir_all(&shop).unwrap();
-    for (path, text) in [
-        ("notes.txt", "one\n"),
-        ("old.txt", "old\n"),
-        ("shop/a.py", "a\n"),
-        ("shop/.gitignore", "__pycache__/\n"),
-    ] {
-        std::fs::write(folder.join(path), text).unwrap();
-    }
-    lab.git(&shop, &["init", "-q", "-b", "main"]);
-    lab.git(&shop, &["add", "."]);
-    lab.git(&shop, &["commit", "-qm", "one"]);
-    lab.git(
-        &shop,
-        &["worktree", "add", "-q", ".worktrees/wt", "-b", "wt"],
-    );
-    let sonny = env!("CARGO_BIN_EXE_sonny");
-    let copy = lab.home.join(".agent/tasks/demo.fix");
-    let finish = |lab: &Lab| {
-        let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
-        let _ = sandfs.remove("demo.fix", true);
-        let _ = std::fs::remove_dir_all(&folder);
-    };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let start = serde_json::json!({"name": "fix", "brief": "go"});
-        let (ok, said) = lab.tool(&folder, "start_task", start, false);
-        assert!(ok, "{said}");
-        assert!(
-            said.contains("Git is off in its copy of 1 linked worktrees"),
-            "{said}"
-        );
-        // Git stops in the copy's worktree, and works in the real one.
-        // Which words git says it with depend on its version; the reason is
-        // in the .git file it stops at.
-        let wt = copy.join("shop/.worktrees/wt");
-        let (ok, _, said) = lab.run(&wt, "git", &["status"], false);
-        assert!(!ok, "{said}");
-        let reason = std::fs::read_to_string(wt.join(".git")).unwrap();
-        assert!(reason.contains("git is off here"), "{reason}");
-        lab.git(&shop.join(".worktrees/wt"), &["status"]);
-
-        std::fs::write(copy.join("notes.txt"), "two\n").unwrap();
-        std::fs::remove_file(copy.join("old.txt")).unwrap();
-        std::fs::create_dir_all(copy.join("shop/__pycache__")).unwrap();
-        std::fs::write(copy.join("shop/__pycache__/a.pyc"), "c").unwrap();
-        let (_, listed, err) = lab.run(&folder, sonny, &["task", "changes", "demo.fix"], false);
-        let mut lines: Vec<&str> = listed.lines().collect();
-        lines.sort();
-        assert_eq!(lines, ["D old.txt", "M notes.txt"], "{err}");
-        assert!(err.contains("1 files git ignores not listed"), "{err}");
-        assert!(err.contains("git's own files not listed"), "{err}");
-
-        // Not here yet, so not removed.
-        let (ok, err) = lab.remove(&folder, false);
-        assert!(!ok && err.contains("not applied here"), "{err}");
-        let args = [
-            "task",
-            "changes",
-            "demo.fix",
-            "--apply",
-            "--only",
-            "notes.txt",
-        ];
-        let (ok, _, err) = lab.run(&folder, sonny, &args, false);
-        assert!(ok, "{err}");
-        assert_eq!(
-            std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
-            "two\n"
-        );
-        assert!(folder.join("old.txt").exists());
-        let args = ["task", "changes", "demo.fix", "--apply"];
-        let (ok, _, err) = lab.run(&folder, sonny, &args, false);
-        assert!(ok, "{err}");
-        assert!(!folder.join("old.txt").exists());
-        assert!(!folder.join("shop/__pycache__").exists());
-        // The real worktree keeps its own .git.
-        let real = std::fs::read_to_string(shop.join(".worktrees/wt/.git")).unwrap();
-        assert!(!real.contains("git is off"), "{real}");
-
-        let (ok, err) = lab.remove(&folder, false);
-        assert!(ok, "{err}");
-        assert!(!copy.exists());
-        let sandfs = sandfs::Home::at(lab.home.join("sandfs")).unwrap();
-        assert!(sandfs.workspaces().unwrap().is_empty());
-    }));
-    finish(&lab);
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
 }
