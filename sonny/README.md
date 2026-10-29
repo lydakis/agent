@@ -516,7 +516,7 @@ turn of the task numbered after that one reopens it.
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
 the view (`verbose`, off by default), besides the efforts and the side chat
-above; only the screen is in `~/.agent/sonny/settings.json`.
+above.
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
