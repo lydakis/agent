@@ -1181,7 +1181,7 @@ fn context_after(event: &Value) -> Option<u64> {
 struct Paged {
     nodes: Vec<i64>,
     turns: HashMap<i64, i64>,
-    after: Vec<i64>,
+    after: Vec<(i64, Value)>,
     first: bool,
 }
 
@@ -1566,6 +1566,9 @@ struct App {
     pages: HashMap<u64, Paged>,
     /// The id the next page takes.
     next_page: u64,
+    /// A read of the bot's items came back short: what was drawn from it
+    /// is not all there was.
+    short_read: std::cell::Cell<bool>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2223,6 +2226,7 @@ impl App {
             unpaired: Vec::new(),
             pages: HashMap::new(),
             next_page: 0,
+            short_read: std::cell::Cell::new(false),
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2829,11 +2833,10 @@ impl App {
         let paged = Paged {
             nodes,
             turns,
-            after: self.unpaired.iter().map(|(node, _)| *node).collect(),
+            after: std::mem::take(&mut self.unpaired),
             first: self.older.is_none(),
         };
-        let after = std::mem::take(&mut self.unpaired);
-        let (lines, unpaired) = self.draw_page(&paged, after).await;
+        let (lines, unpaired) = self.draw_page(&paged).await;
         self.unpaired = unpaired;
         let id = self.next_page;
         self.next_page += 1;
@@ -2842,25 +2845,23 @@ impl App {
     }
 
     /// The page `id`, let go as the view moved away, drawn again as it
-    /// nears it.
+    /// nears it: once all its items are read, else asked for again.
     async fn draw_again(&mut self, id: u64) {
         let Some(paged) = self.pages.remove(&id) else {
             return;
         };
-        let after = self.items_at(&paged.after).await;
-        let (lines, _) = self.draw_page(&paged, after).await;
+        self.short_read.set(false);
+        let (lines, _) = self.draw_page(&paged).await;
         self.pages.insert(id, paged);
-        self.screen.fill(id, lines);
+        if !self.short_read.get() {
+            self.screen.fill(id, lines);
+        }
     }
 
     /// The rows of a page of older items, and what calls older than it
     /// returned: drawn on their own, what the newer rows were drawn with
     /// put by meanwhile.
-    async fn draw_page(
-        &mut self,
-        paged: &Paged,
-        after: Vec<(i64, Value)>,
-    ) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
+    async fn draw_page(&mut self, paged: &Paged) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
         let pending = std::mem::take(&mut self.pending);
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
@@ -2872,7 +2873,7 @@ impl App {
             self.commit(welcome);
         }
         let unpaired = self
-            .draw_nodes(&paged.nodes, &paged.turns, true, after)
+            .draw_nodes(&paged.nodes, &paged.turns, true, paged.after.clone())
             .await;
         let mut lines = std::mem::replace(&mut self.pending, pending);
         self.any_history = any_history;
@@ -3083,10 +3084,12 @@ impl App {
                 .request("history_items", json!({"bot": bot, "nodes": rest}))
                 .await
             else {
+                self.short_read.set(true);
                 break;
             };
             let entries = read["items"].as_array().cloned().unwrap_or_default();
             if entries.is_empty() {
+                self.short_read.set(true);
                 break;
             }
             rest = &rest[entries.len().min(rest.len())..];
