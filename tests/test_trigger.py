@@ -49,9 +49,9 @@ class TriggerFireTests(ModelFixture):
         return next(b['bot_id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
     def store_identity(self):
-        # What the daemon announces in `ready`, and `add` keeps.
+        # The lineage the daemon announces in `ready`, which `add` keeps.
         if not hasattr(self, '_store_id'):
-            self._store_id = json.loads(self.agent('start', '--store', str(self.store)).stdout)['store']['identity']
+            self._store_id = json.loads(self.agent('start', '--store', str(self.store)).stdout)['store']['lineage']
         return self._store_id
 
     def bundle(self):
@@ -130,8 +130,15 @@ class TriggerFireTests(ModelFixture):
         skipped = self.fire('p.task', 'Check the PR again.')
         self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
         self.model.release_headers.set()
-        self.settle('p.task')
-        self.assertEqual(len(self.turns('p.task')), 3)
+        busy = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'gate')
+        self.agent('wait', '--store', str(self.store), f'turn:p.task/{busy}')
+        # The skip starts no turn: the bot is told in its next model call.
+        told = self.turns('p.task')[-1]
+        self.assertGreater(told['turn'], busy)
+        self.assertIn(told['status'], ('attached', 'steered'))
+        self.assertRegex(told['prompt_preview'],
+                         r'^\[trigger p\.task · .* · every 30m not sent to p\.task: bot_busy')
+        self.assertEqual(len(self.turns('p.task')), 4)
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -195,10 +202,23 @@ class TriggerFireTests(ModelFixture):
 
     def test_a_fire_never_reaches_another_stores_daemon(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
-        other = self.fire('p.task', 'x', store_id='0' * 32)
+        other = self.fire('p.task', 'x', store_id='0' * 16)
         self.assertEqual(other['last']['outcome'], 'failed', other)
         self.assertIn('store_mismatch', other['last']['detail'])
         self.assertEqual(len(self.turns('p.task')), 1)
+
+    def test_a_fire_finds_its_store_after_the_file_was_replaced(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        target = ['--bot', 'p.task', '--bot-id', str(self.bot_id('p.task'))]
+        self.store_identity()
+        self.agent('shutdown', '--store', str(self.store))
+        # A copy put back in its place: the same store in a new file.
+        copy = self.path / 'copy.sqlite'
+        shutil.copy2(self.store, copy)
+        os.replace(copy, self.store)
+        self.agent('start', *self.common[:4])
+        sent = self.fire('p.task', 'Still here.', target=target)
+        self.assertEqual(sent['last']['outcome'], 'sent', sent)
 
     def test_a_fire_never_reaches_a_bot_made_again_under_the_name(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

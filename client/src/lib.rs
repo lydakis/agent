@@ -178,9 +178,12 @@ pub struct Client {
     /// Set by the reader on its way out. A request made after it can still
     /// be written, but nothing would ever answer; it fails here instead.
     closed: Arc<std::sync::atomic::AtomicBool>,
-    /// The store's identity from `ready`: the same file under the same
-    /// lineage, whichever socket its daemon listens on.
+    /// The store's lineage from `ready`: drawn when the store was made and
+    /// kept by a copy, whichever socket its daemon listens on.
     store: Option<String>,
+    /// The store's identity from `ready`: its lineage in this very file,
+    /// which a replaced or copied file does not keep.
+    identity: Option<String>,
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
 }
@@ -238,7 +241,8 @@ impl Client {
             error.facts = Some(Box::new(facts.collect()));
             return Err(error);
         }
-        let store = ready["store"]["identity"].as_str().map(str::to_owned);
+        let store = ready["store"]["lineage"].as_str().map(str::to_owned);
+        let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -306,6 +310,7 @@ impl Client {
                 next: std::sync::atomic::AtomicU64::new(0),
                 closed,
                 store,
+                identity,
                 providers,
             }),
             Events(receiver),
@@ -319,8 +324,15 @@ impl Client {
         let _ = self.writer.lock().await.shutdown().await;
     }
 
+    /// The lineage of the daemon's store, which a client keeps to know the
+    /// same store again, also once its file was replaced.
     pub fn store(&self) -> Option<&str> {
         self.store.as_deref()
+    }
+
+    /// The identity of the daemon's store file.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
     }
 
     /// The daemon's provider bindings as `ready` announced them.
@@ -437,6 +449,7 @@ mod tests {
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: None,
+            identity: None,
             providers: Value::Null,
         });
         let mut lines = BufReader::new(peer).lines();
@@ -467,6 +480,7 @@ mod tests {
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: None,
+            identity: None,
             providers: Value::Null,
         });
         let mut lines = BufReader::new(peer).lines();
@@ -505,6 +519,7 @@ mod tests {
             next: std::sync::atomic::AtomicU64::new(0),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: None,
+            identity: None,
             providers: Value::Null,
         });
         let request = tokio::spawn({

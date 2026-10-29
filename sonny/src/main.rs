@@ -700,6 +700,7 @@ async fn run() -> Result<(), String> {
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
     let (client, mut events) = connect(&options).await?;
+    trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
     // A lead moved elsewhere, and the folder it comes back to.
