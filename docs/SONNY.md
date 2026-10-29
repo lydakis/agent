@@ -290,20 +290,20 @@ posting, and record a post only once the destination confirms it.
 
 Memory is what earlier agents learned that a later one needs: decisions,
 the person's preferences and corrections, traps, pointers. Each fact is one
-Markdown file of at most 4 KiB with front matter (`name`, `description`,
+Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
 `verified`). The person's facts are in `~/.agents/memory`, a project's in
 `~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
 task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
 it). Each folder's `MEMORY.md` is an index generated from the front matter,
-one line per fact, and is held to 4 KiB so reading it at the start of
+one line per fact, and is held to 16 KiB so reading it at the start of
 every task stays cheap. The daemon knows nothing of memory.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 lookout answers outside the agent's sandbox, so a sandboxed agent still
-saves to `~/.agents/memory`: `save {name, type, description, source,
-text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
+saves to `~/.agents/memory`: `read` NAME, `save {name, type,
+description, source, text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
 or `project`, or nothing to show both indexes. It waits for no verdict.
 For people, scripts and other harnesses, Sonny writes `~/.agent/memory`
 each time it starts, a script that runs it as
@@ -311,6 +311,7 @@ each time it starts, a script that runs it as
 
 ```sh
 ~/.agent/memory show [SCOPE]
+~/.agent/memory read NAME [SCOPE]
 ~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
@@ -331,13 +332,24 @@ absolute path, the project null outside one, so an agent need not expand
 index under the folder's lock, so two agents saving at once cannot leave
 an index that misses one. Saving a fact unchanged is `"duplicate": true`,
 and so is removing one already gone. A save that would push the index past
-4 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
+16 KiB is `memory_full` and changes nothing; so is a folder holding a `.md`
 file that is not a valid fact (`memory_invalid` names it), rather than an
 index that quietly leaves it out. `check` reports such a file and an index
 that is out of date without changing anything; `index` rewrites the index,
-and refuses with `memory_full` an index of hand-added facts past 4 KiB. A
+and refuses with `memory_full` an index of hand-added facts past 16 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
-past 4 KiB is `fact_too_large` rather than cut.
+past 16 KiB is `fact_too_large` rather than cut.
+
+`read` gives one fact's whole file as `text` and records the read in the
+folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
+in the cleanup's git history, so a read changes no index, no cached prompt
+and no night's `changed`. Removing a fact drops its record. `cleanup start`
+lists as `unread` the facts no agent has read or saved in 30 days, oldest
+first, each with its `last_read` and `verified`, and the cleanup checks
+that they still hold, as Codex drops memories unused for 30 days and
+Copilot those unused for 28; unread alone removes nothing. Reads with the
+`read` tool are not counted, which is why the memory skill opens facts with
+the memory tool.
 
 A new agent starts with both indexes in its instructions: the person's
 and, when its folder is in a project (from a task's worktree too), the

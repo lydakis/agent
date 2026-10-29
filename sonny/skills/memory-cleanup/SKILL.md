@@ -21,7 +21,11 @@ command with `"$HOME/.agent/memory"`.
 2. Call it with `user`, then with `project` NAME for each folder in
    `projects/`, to show their indexes. Read the facts `start` listed as
    `saved` since the last cleanup (paths under `~/.agents/memory`), and any fact whose index line looks
-   like the same fact as one of those, or an older version of it. Read
+   like the same fact as one of those, or an older version of it, and
+   those `start` listed as `unread`: facts no agent has read or saved in
+   30 days, oldest first, each with its `last_read` (null when never) and
+   `verified`. Read them as files with the `read` tool, not with the
+   memory tool's `read`, so your reading is not counted as use. Read
    other facts only when an index line alone leaves a step unclear.
 3. Change only these, and only with its `save` and `remove` (each with
    `user` or `project` NAME), never by editing files:
@@ -34,6 +38,9 @@ command with `"$HOME/.agent/memory"`.
      does not, in which case save it without the part that changed.
    - **Relative dates.** "today", "last week" or "yesterday" in a fact:
      save it with the date, worked out from its `verified` date.
+   - **Unread facts.** An `unread` fact that a newer fact, or the file,
+     command or setting it names, shows no longer holds: remove it. One
+     that may still hold stays as it is; some facts are needed rarely.
 4. Call it with `cleanup` `finish`. It commits the cleanup, or
    refuses with `loss_guard` and puts memory back when the cleanup removed
    more than a quarter of the facts (two at least). A refusal means you
