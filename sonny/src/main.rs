@@ -122,6 +122,9 @@ const OLDER_ITEMS: u64 = 50;
 const WALKED_ITEMS: u64 = 400;
 /// About how many pages the way up to the first turn reads between frames.
 const WALKED_PAGES: usize = 32;
+/// How many pages of 400 nodes a task's history is read back to find
+/// where a note the margin shows of it starts.
+const REFERENCE_PAGES: usize = 25;
 /// The widest the conversation is written, however wide the window: a
 /// reply reads as a column, not a band across the screen. Prose reads
 /// best at 45 to 90 characters a line, but replies carry code, paths and
@@ -4084,34 +4087,53 @@ impl App {
                 }
             }
         }
-        let asked = match reference.node {
-            None => json!({"bot": bot, "limit": 400}),
-            Some(node) => {
-                json!({"bot": bot, "limit": 400, "min_node": node + 1, "oldest_first": true})
+        // The newest nodes first, read back as far as the note's start,
+        // then only what came after them.
+        let mut pages: Vec<Vec<Value>> = Vec::new();
+        let mut newest = None;
+        let mut from: Option<i64> = None;
+        while pages.len() < REFERENCE_PAGES {
+            let asked = match (reference.node, from) {
+                (Some(node), _) => {
+                    json!({"bot": bot, "limit": 400, "min_node": node + 1, "oldest_first": true})
+                }
+                (None, Some(from)) => json!({"bot": bot, "limit": 400, "from": from}),
+                (None, None) => json!({"bot": bot, "limit": 400}),
+            };
+            let page = match self.client.request("history_nodes", asked).await {
+                Ok(page) => page,
+                Err(error) => {
+                    reference.gone = error.code == "bot_not_found";
+                    return;
+                }
+            };
+            let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+                .filter_map(|node| node["node"].as_i64())
+                .collect();
+            nodes.sort_unstable();
+            let Some(&last) = nodes.last() else {
+                break;
+            };
+            newest = newest.max(Some(last));
+            // In the nodes' order, and each node's as it holds them.
+            let items: Vec<Value> = (self.items_of(bot, &nodes).await.into_iter())
+                .map(|(_, item)| item)
+                .collect();
+            let started = margin::Reference::starts(id, &items);
+            pages.push(items);
+            from = page["next_from"].as_i64();
+            if reference.node.is_some() || started || from.is_none() {
+                break;
             }
-        };
-        let page = match self.client.request("history_nodes", asked).await {
-            Ok(page) => page,
-            Err(error) => {
-                reference.gone = error.code == "bot_not_found";
-                return;
-            }
-        };
-        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
-            .filter_map(|node| node["node"].as_i64())
-            .collect();
-        nodes.sort_unstable();
-        if let Some(&newest) = nodes.last() {
-            // Each node's items come newest first: read oldest first.
-            let mut items: Vec<(i64, Value)> = self.items_of(bot, &nodes).await;
-            items.reverse();
-            items.sort_by_key(|(node, _)| *node);
-            let items: Vec<Value> = items.into_iter().map(|(_, item)| item).collect();
-            reference.read(id, &items);
-            reference.node = Some(newest);
+        }
+        for items in pages.iter().rev() {
+            reference.read(id, items);
+        }
+        if newest.is_some() {
+            reference.node = newest;
         }
         if let Some(path) = reference.file() {
-            reference.file_read(std::fs::read_to_string(path).ok());
+            reference.file_read(margin::read(&path).ok());
         }
     }
 
@@ -10526,6 +10548,63 @@ mod tests {
         app.read_references().await;
         assert!(app.references.values().all(|reference| reference.gone));
         assert_eq!(shown(&app), Some(margin::Body::Markdown("# Flow".into())));
+    }
+
+    #[tokio::test]
+    async fn a_task_s_note_is_found_far_back_in_order_and_follows_its_title() {
+        let call = |arguments: Value| {
+            json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
+                "arguments": arguments.to_string()})
+        };
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("inspect") => json!({"name": "calc.add", "workspace": "/nowhere"}),
+            Some("history_nodes") if asked["min_node"] == 6 => json!({"nodes": [{"node": 6}]}),
+            Some("history_nodes") if asked["min_node"] == 7 => json!({"nodes": [{"node": 7}]}),
+            Some("history_nodes") if asked["from"] == 3 => json!({"nodes": [{"node": 3}]}),
+            Some("history_nodes") if asked["min_node"].is_null() => {
+                json!({"nodes": [{"node": 5}, {"node": 4}], "next_from": 3})
+            }
+            Some("history_items") => {
+                json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                .map(|node| json!({"node": node, "item": match node.as_i64() {
+                    Some(3) => call(json!({"id": "flow", "title": "Flow", "markdown": "start"})),
+                    // A call its own margin turns down.
+                    Some(5) => call(json!({"id": "flow", "title": 1, "markdown": "wrong"})),
+                    // Two calls in one response, as some providers keep them.
+                    Some(4) => json!({"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "u1", "name": margin::TOOL,
+                            "input": {"id": "flow", "markdown": "a"}},
+                        {"type": "tool_use", "id": "u2", "name": margin::TOOL,
+                            "input": {"id": "flow", "markdown": "b"}}]}),
+                    Some(6) => call(json!({"id": "flow", "title": "Flow two", "markdown": "c"})),
+                    _ => call(json!({"id": "flow", "title": "Flow three", "markdown": "d"})),
+                }}))
+                .collect::<Vec<_>>()})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("b".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+        // Retitled there, it is here too.
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("c".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow two");
+        // Given its own title here, it keeps it.
+        let titled = json!({"id": "flow", "title": "Mine", "from": "calc.add/flow"});
+        app.note_call("c2", &titled, None);
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("d".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Mine");
     }
 
     #[tokio::test]

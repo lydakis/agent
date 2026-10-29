@@ -104,6 +104,8 @@ pub enum Body {
     From {
         bot: String,
         id: String,
+        /// Its title there, as this note last took it.
+        title: Option<String>,
         shown: Option<Box<Body>>,
     },
 }
@@ -186,8 +188,14 @@ fn body_json(body: &Body, json: &mut Value) {
     match body {
         Body::Markdown(text) => json["markdown"] = json!(text),
         Body::File(path) => json["file"] = json!(path),
-        Body::From { bot, id, shown } => {
+        Body::From {
+            bot,
+            id,
+            title,
+            shown,
+        } => {
             json["from"] = json!(format!("{bot}/{id}"));
+            json["shown_title"] = json!(title);
             if let Some(shown) = shown {
                 let mut kept = json!({});
                 body_json(shown, &mut kept);
@@ -204,7 +212,13 @@ fn body_read(json: &Value) -> Option<Body> {
         let shown = body_read(&json["shown"])
             .filter(|shown| !matches!(shown, Body::From { .. }))
             .map(Box::new);
-        return Some(Body::From { bot, id, shown });
+        let title = text("shown_title");
+        return Some(Body::From {
+            bot,
+            id,
+            title,
+            shown,
+        });
     }
     match text("file") {
         Some(path) => Some(Body::File(path)),
@@ -231,6 +245,8 @@ pub struct Reference {
     title: String,
     body: Option<Body>,
     file: Option<String>,
+    /// Taken away there since it was last posted.
+    removed: bool,
 }
 
 impl Reference {
@@ -244,7 +260,13 @@ impl Reference {
             let arguments = (item["arguments"].as_str())
                 .and_then(|text| serde_json::from_str::<Value>(text).ok())
                 .unwrap_or_default();
-            if arguments["id"].as_str() != Some(id) || arguments["remove"] == true {
+            // Only what its own margin takes.
+            if !fits(&arguments) || arguments["id"].as_str().map(str::trim) != Some(id) {
+                continue;
+            }
+            // Taken away there, it stays here, and a new one starts untitled.
+            if arguments["remove"] == true {
+                self.removed = true;
                 continue;
             }
             let body = match (arguments["file"].as_str(), arguments["markdown"].as_str()) {
@@ -255,14 +277,33 @@ impl Reference {
             // Kept, as there, when changed without one.
             match arguments["title"].as_str().map(str::trim) {
                 Some(title) if !title.is_empty() => self.title = title.to_owned(),
-                _ if self.title.is_empty() => self.title = id.to_owned(),
+                _ if self.title.is_empty() || self.removed => self.title = id.to_owned(),
                 _ => {}
             }
+            self.removed = false;
             if !matches!((&self.body, &body), (Some(Body::File(a)), Body::File(b)) if a == b) {
                 self.file = None;
             }
             self.body = Some(body);
         }
+    }
+
+    /// Whether the bot's `items` set the note `id`'s title, or take it
+    /// away: what is shown from there on can be read without older ones.
+    pub fn starts(id: &str, items: &[Value]) -> bool {
+        items.iter().any(|item| {
+            let arguments = (item["arguments"].as_str())
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or_default();
+            item["type"] == "function_call"
+                && item["name"] == TOOL
+                && fits(&arguments)
+                && arguments["id"].as_str().map(str::trim) == Some(id)
+                && (arguments["remove"] == true
+                    || arguments["title"]
+                        .as_str()
+                        .is_some_and(|t| !t.trim().is_empty()))
+        })
     }
 
     /// The file the note shows, its path in the bot's folder.
@@ -385,17 +426,22 @@ impl Margin {
             return;
         };
         let note = &mut self.kept.notes[at];
-        let Body::From { shown, .. } = &mut note.body else {
+        let Body::From {
+            title: took, shown, ..
+        } = &mut note.body
+        else {
             return;
         };
-        // Titled as there when it was given no title of its own.
-        let retitled = note.title == note.id && !title.is_empty() && title != note.id;
+        // Titled as there for as long as it was given no title of its own.
+        let inherited = note.title == note.id || Some(&note.title) == took.as_ref();
+        let retitled = inherited && !title.is_empty() && note.title != title;
         if shown.as_deref() == Some(&body) && !retitled {
             return;
         }
         *shown = Some(Box::new(body));
         if retitled {
             note.title = title.to_owned();
+            *took = Some(title.to_owned());
         }
         self.save();
     }
@@ -495,15 +541,18 @@ impl Margin {
                 Some(Body::From {
                     bot: b,
                     id: i,
+                    title,
                     shown,
                 }) if *b == bot && *i == id => Body::From {
                     bot,
                     id,
+                    title: title.clone(),
                     shown: shown.clone(),
                 },
                 _ => Body::From {
                     bot,
                     id,
+                    title: None,
                     shown: None,
                 },
             }),
@@ -788,7 +837,7 @@ fn leads() -> (Line<'static>, Line<'static>) {
 }
 
 /// The file at `path`, as much of it as a note shows.
-fn read(path: &Path) -> Result<String, String> {
+pub fn read(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let mut bytes = Vec::new();
     // A pipe or a device could hold the window up: only files are read.
