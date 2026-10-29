@@ -81,11 +81,18 @@ impl News {
     fn merge(&mut self, news: News) {
         fn one(had: Option<Turn>, new: Option<Turn>) -> Option<Turn> {
             match (had, new) {
-                (Some(a), Some(t)) => Some(Turn {
-                    first: a.first.min(t.first),
-                    count: a.count + t.count,
-                    ..if t.turn >= a.turn { t } else { a }
-                }),
+                (Some(a), Some(t)) => {
+                    let (first, count) = (a.first.min(t.first), a.count + t.count);
+                    let (newer, older) = if t.turn >= a.turn { (t, a) } else { (a, t) };
+                    // How a goal ended stays news when a later turn joins it.
+                    let goal = newer.goal.clone().or(older.goal);
+                    Some(Turn {
+                        first,
+                        count,
+                        goal,
+                        ..newer
+                    })
+                }
                 (a, t) => a.or(t),
             }
         }
@@ -514,6 +521,21 @@ impl Updates {
         which: Option<String>,
         origin: Option<String>,
     ) {
+        self.tell_ended(name, turn, status, from, which, origin, None);
+    }
+
+    /// `tell`, with how the task's goal ended with the turn.
+    #[allow(clippy::too_many_arguments)]
+    fn tell_ended(
+        &mut self,
+        name: &str,
+        turn: i64,
+        status: &str,
+        from: Option<String>,
+        which: Option<String>,
+        origin: Option<String>,
+        goal: Option<String>,
+    ) {
         // A note while the turn still runs leaves its resolve for the last.
         let resolved = ![APPROVAL, QUIET].contains(&status)
             && self.resolving.ended(name, turn)
@@ -545,7 +567,7 @@ impl Updates {
             count: 1,
             which,
             resolved,
-            goal: None,
+            goal,
         };
         news.merge(match theirs {
             true => News {
@@ -630,15 +652,8 @@ impl Updates {
         let Some(outcome) = outcome else {
             return;
         };
-        self.tell(name, turn, &status, from, None, origin);
-        let news = (self.tasks.iter_mut()).find(|(task, _)| task == name);
-        if let Some((_, news)) = news {
-            for told in [&mut news.act, &mut news.theirs].into_iter().flatten() {
-                if told.turn == turn && !outcome.is_empty() {
-                    told.goal = Some(outcome.to_owned());
-                }
-            }
-        }
+        let goal = Some(outcome.to_owned()).filter(|outcome| !outcome.is_empty());
+        self.tell_ended(name, turn, &status, from, None, origin, goal);
     }
 
     /// The lead read these turns with its wait tool: what they said is no
@@ -1248,6 +1263,16 @@ mod tests {
             text(&told),
             "- shop.fix: turn:shop.fix/5 completed, asked by goal, and met its goal: its check exits 0"
         );
+        updates.sent(told);
+        // How it ended stays news when a later turn joins it, whichever
+        // settles first.
+        updates.goal_turn("shop.fix", 6);
+        turn(&mut updates, "shop.fix", 6, goal.clone(), "completed");
+        turn(&mut updates, "shop.fix", 7, lead.clone(), "completed");
+        updates.goal_settled("shop.fix", 6, Some(", and met its goal: its check exits 0"));
+        turn(&mut updates, "shop.fix", 8, lead.clone(), "completed");
+        let told = updates.take();
+        assert!(text(&told).contains("met its goal"), "{}", text(&told));
         updates.sent(told);
         // Cleared while its check ran: plain news.
         updates.goal_turn("shop.docs", 2);

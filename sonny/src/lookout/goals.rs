@@ -320,6 +320,9 @@ pub struct Goals {
     /// Keyed by the goal's `set_ms` and the last turn counted, so a turn
     /// replayed after a reconnect is not counted again.
     idle: HashMap<String, (u64, i64, u32)>,
+    /// The folder each turn was sent to: a later turn can move its agent,
+    /// and the check runs where the turn worked.
+    worked: HashMap<(String, i64), PathBuf>,
 }
 
 impl Goals {
@@ -332,6 +335,7 @@ impl Goals {
             continued: HashSet::new(),
             checking: HashMap::new(),
             idle: HashMap::new(),
+            worked: HashMap::new(),
         }
     }
 
@@ -367,6 +371,14 @@ impl Goals {
     ) -> Option<(String, i64)> {
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
+        if let (Some("accepted" | "queued"), Some(turn), Some(workspace)) = (
+            event["event"].as_str(),
+            event["turn"].as_i64(),
+            data["workspace"].as_str(),
+        ) {
+            self.worked
+                .insert((bot.to_owned(), turn), PathBuf::from(workspace));
+        }
         match event["event"].as_str()? {
             "accepted" => {
                 self.called.remove(bot);
@@ -385,13 +397,18 @@ impl Goals {
             }
             // A new agent under the name has no goal of the last one's.
             "deleted" => {
+                self.worked.retain(|(name, _), _| name != bot);
                 if let Some(goal) = self.goals.remove(bot) {
                     end(&self.store, &goal);
                 }
                 None
             }
-            "turn_finished" if live => {
+            "turn_finished" => {
                 let turn = event["turn"].as_i64()?;
+                let worked = self.worked.remove(&(bot.to_owned(), turn));
+                if !live {
+                    return None;
+                }
                 let status = data["status"].as_str().unwrap_or_default();
                 // Its goal as it is now, which its lead may have set or
                 // cleared in the meantime.
@@ -399,7 +416,10 @@ impl Goals {
                     Some(goal) => self.goals.insert(bot.to_owned(), goal),
                     None => self.goals.remove(bot),
                 };
-                let goal = self.goals.get(bot)?.clone();
+                let mut goal = self.goals.get(bot)?.clone();
+                if let Some(worked) = worked {
+                    goal.workspace = worked;
+                }
                 // Left by an agent deleted while the lookout was away, whose
                 // name another has since.
                 if bot_id.is_some_and(|id| id != goal.bot_id) {
