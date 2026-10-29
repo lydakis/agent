@@ -324,6 +324,7 @@ impl Agent {
             cwd,
             state: AsyncMutex::new(State::default()),
             follower: Mutex::new(None),
+            switching: AsyncMutex::new(()),
         });
         // Open before it follows its bot; one it replaces stops following.
         let replaced = self
@@ -366,6 +367,8 @@ struct Session {
     state: AsyncMutex<State>,
     /// What follows its bot, stopped when the thread closes.
     follower: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Held while the bot's model changes: one change at a time.
+    switching: AsyncMutex<()>,
 }
 
 impl Session {
@@ -570,6 +573,7 @@ impl Session {
         let Some(value) = params["value"].as_str() else {
             return Err((INVALID_PARAMS, "a model is picked by its id".into()));
         };
+        let _one = self.switching.lock().await;
         {
             let mut state = self.state.lock().await;
             let picked = match &state.bound {
@@ -601,7 +605,49 @@ impl Session {
         Ok(json!({"configOptions": self.options(agent).await}))
     }
 
-    /// Give an idle bot the model the person picked.
+    /// Once the bot is idle, as before a prompt's turn or after a turn:
+    /// the model the person picked meanwhile, and the model it runs, as
+    /// another client may have changed it.
+    async fn settle(&self, agent: &Agent) {
+        let _one = self.switching.lock().await;
+        if let Err(error) = self.switch(agent).await {
+            agent.out.update(
+                &self.id,
+                json!({"sessionUpdate": "notice", "severity": "warning",
+                "title": "Sonny kept the model", "description": error}),
+            );
+        }
+        let Some((client, bot)) = (self.state.lock().await.bound.as_ref())
+            .map(|bound| (bound.client.clone(), bound.bot.clone()))
+        else {
+            return;
+        };
+        let Ok(record) = client.request("inspect", json!({"bot": bot})).await else {
+            return;
+        };
+        let model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or(""),
+            record["model"].as_str().unwrap_or("")
+        );
+        let changed = {
+            let mut state = self.state.lock().await;
+            match &mut state.bound {
+                Some(bound) if bound.bot == bot && bound.model != model => {
+                    bound.model = model;
+                    bound.effort = record["effort"].as_str().map(str::to_owned);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.show_options(agent).await;
+        }
+    }
+
+    /// Give an idle bot the model the person picked. The caller holds
+    /// `switching`.
     async fn switch(&self, agent: &Agent) -> Result<(), String> {
         let (client, asked, model) = {
             let state = self.state.lock().await;
@@ -614,10 +660,6 @@ impl Session {
         };
         let answer = client.request("configure", asked).await;
         let mut state = self.state.lock().await;
-        // Picked again meanwhile: that pick waits its turn.
-        if state.picked.as_ref() != Some(&model) {
-            return Ok(());
-        }
         match answer {
             Ok(_) => {
                 state.picked = None;
@@ -685,13 +727,7 @@ impl Session {
         }
         // A model picked while the bot worked, or before a lead that was
         // there already: the bot takes it before this turn.
-        if let Err(error) = self.switch(agent).await {
-            agent.out.update(
-                &self.id,
-                json!({"sessionUpdate": "notice", "severity": "warning",
-                "title": "Sonny kept the model", "description": error}),
-            );
-        }
+        self.settle(agent).await;
         let mut state = self.state.lock().await;
         if std::mem::take(&mut state.cancelled) {
             return Ok(json!({"stopReason": "cancelled"}));
@@ -814,6 +850,9 @@ impl Session {
                     break;
                 }
                 self.on(agent, &event).await;
+                if event["event"] == "turn_finished" {
+                    self.settle(agent).await;
+                }
             }
             let mut failed = false;
             events = loop {
@@ -922,20 +961,6 @@ impl Session {
                     state.calls.clear();
                 }
                 state.running = turn;
-                // What the turn runs on: another client may have picked
-                // another model for the bot.
-                if let (Some(bound), Some(model)) = (&mut state.bound, data["model"].as_str())
-                    && model != bound.model
-                {
-                    bound.model = model.to_owned();
-                    bound.effort = data["effort"].as_str().map(str::to_owned);
-                    let value = state.picked.as_deref().unwrap_or(model);
-                    let options = agent.options(value, Some((model, client.providers())));
-                    out.update(
-                        id,
-                        json!({"sessionUpdate": "config_option_update", "configOptions": options}),
-                    );
-                }
                 let ours = match &mut state.prompt {
                     Some((_, at @ None)) => {
                         *at = turn;
