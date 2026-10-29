@@ -248,9 +248,10 @@ a small 📎 (`📎 2` for two). `/react` picks an older reply, and sending an e
 reply takes it off. The agent reacts too, with a `react` tool Sonny
 declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
-once it answers. Its reactions are drawn under the message they answer
-when its turn ends, so one taken off again never shows, and a reaction of
-yours to an older reply goes under that reply.
+once it answers. Every reaction sits right under the message it is on,
+however far up that is, and never as a row of its own: yours under the
+reply, the agent's under your message, and a lead's under your words in
+one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 

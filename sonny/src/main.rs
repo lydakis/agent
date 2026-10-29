@@ -1468,6 +1468,10 @@ struct App {
     bot_reactions: Vec<String>,
     /// The bot's `react` calls not yet completed, by call id.
     react_calls: HashMap<String, (String, bool)>,
+    /// What other agents, such as its lead, reacted with to the person's
+    /// messages here, and when that was last looked at.
+    picked: reactions::Picked,
+    picked_read: Instant,
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
@@ -2141,6 +2145,8 @@ impl App {
             declare: None,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
+            picked: reactions::Picked::default(),
+            picked_read: Instant::now(),
             answering: None,
             rows_drawn: 0,
             thought: String::new(),
@@ -2207,6 +2213,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
         // Known to start the conversation only once its newest page is
         // read, the welcome goes above it.
@@ -2326,6 +2333,16 @@ impl App {
                 }
                 _ = tick.tick() => {}
                 _ = self.woken.notified() => {}
+            }
+            if self.picked_read.elapsed() > Duration::from_secs(1) {
+                self.picked_read = Instant::now();
+                let mut nodes: Vec<i64> = (self.picked.refresh().into_iter())
+                    .map(|(node, ..)| node)
+                    .collect();
+                nodes.dedup();
+                for node in nodes {
+                    self.place_picked(node);
+                }
             }
             if self
                 .watch
@@ -3247,6 +3264,10 @@ impl App {
             if !lines.is_empty() {
                 self.commit(lines);
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+                // What another agent reacted with before it was drawn.
+                if !self.picked.on(node).is_empty() {
+                    self.place_picked(node);
+                }
             }
         }
         self.answering = Some((first_words(said), self.rows_drawn, node));
@@ -3536,10 +3557,12 @@ impl App {
                         }
                     }
                     // Counted once it is known to have been taken.
+                    // One naming another agent is drawn in that agent's window.
                     (Some("function_call"), _) if item["name"] == reactions::TOOL => {
                         if let Some(reaction) = item["arguments"]
                             .as_str()
                             .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                            .filter(|arguments| reactions::target(arguments).is_none())
                             .as_ref()
                             .and_then(reactions::call)
                         {
@@ -4110,10 +4133,12 @@ impl App {
             }
             "tool_started" if data["name"] == reactions::TOOL => {
                 // Counted once it completes, and drawn when the turn ends,
-                // so one taken off again is never drawn.
+                // so one taken off again is never drawn; one naming another
+                // agent is drawn in that agent's window.
                 if let Some(reaction) = data["arguments"]
                     .as_str()
                     .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .filter(|arguments| reactions::target(arguments).is_none())
                     .as_ref()
                     .and_then(reactions::call)
                 {
@@ -6140,6 +6165,23 @@ impl App {
             || self.put_under(screen::Tag::Relayed(node), tag, row)
     }
 
+    /// What other agents, such as its lead, reacted with to the person's
+    /// message at `node`, each with who, as the row under it (under the
+    /// bot's own reactions when there are some). A message not drawn
+    /// shows them once it is.
+    fn place_picked(&mut self, node: i64) {
+        let on: Vec<String> = (self.picked.on(node).iter())
+            .map(|(by, emoji)| format!("{emoji} {by}"))
+            .collect();
+        let row = (!on.is_empty()).then(|| transcript::reacted(&on.join("  ")));
+        self.flush();
+        let under = match self.screen.has(screen::Tag::Reactions(node)) {
+            true => screen::Tag::Reactions(node),
+            false => screen::Tag::End(node),
+        };
+        self.screen.put_under(under, screen::Tag::Picked(node), row);
+    }
+
     /// The person's reactions to the reply at `node`, as its row.
     fn reacted_row(&self, node: i64) -> Option<Line<'static>> {
         let on = self.reactions.on(node);
@@ -6402,7 +6444,7 @@ impl App {
         let mut linked = Vec::new();
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
-        terminal.draw(|frame| {
+        let paint = |frame: &mut ratatui::Frame| {
             // The conversation above the rows that move, which sit right
             // under it until it fills the screen.
             let (area, pane) = self.split(frame.area());
@@ -6705,6 +6747,11 @@ impl App {
                 ));
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+        };
+        terminal.draw(|frame| {
+            paint(frame);
+            // The pictures it shows, sent before it is written.
+            image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at;
         // Over themselves, the cursor kept where the frame left it.
@@ -8329,6 +8376,37 @@ mod tests {
         let rows = drawn(&mut app);
         assert_eq!(rows[..2], ["› ship it", "   👀 👍 "], "{rows:?}");
         assert!(!rows.iter().any(|row| row.contains("reacted")), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn the_leads_reaction_goes_under_the_persons_message_wherever_it_is() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.land(5, "ship it", None, false);
+        app.commit(vec![Line::from("• Shipped.")]);
+        app.picked.set(5, "calc.lead", "👀", false);
+        app.place_picked(5);
+        assert_eq!(drawn(&mut app)[..2], ["› ship it", "   👀 calc.lead "]);
+        // The bot's own go first, the lead's under them.
+        app.bot_reactions = vec!["👍".into()];
+        app.draw_bot_reactions();
+        assert_eq!(
+            drawn(&mut app)[..3],
+            ["› ship it", "   👍 ", "   👀 calc.lead "]
+        );
+        // Taken off, its row goes; no row ever says so.
+        app.picked.set(5, "calc.lead", "👀", true);
+        app.place_picked(5);
+        let rows = drawn(&mut app);
+        assert_eq!(rows[..2], ["› ship it", "   👍 "], "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("calc.lead")),
+            "{rows:?}"
+        );
+        // Reacted to before it landed: under it once it does.
+        app.picked.set(7, "calc.lead", "👀", false);
+        app.land(7, "and the notes", None, false);
+        assert_eq!(drawn(&mut app).last().unwrap(), "   👀 calc.lead ");
     }
 
     #[tokio::test]

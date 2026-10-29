@@ -427,8 +427,7 @@ fn preview(
         .to_lowercase();
     if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
         let shown = match crate::term::graphics() {
-            true => crate::image::file(path, width, crate::image::tall())
-                .and_then(|drawn| crate::image::show(&drawn)),
+            true => crate::image::file(path, width, crate::image::tall()).map(crate::image::show),
             false => Err("this terminal draws no pictures (Kitty and Ghostty do)".into()),
         };
         match shown {
@@ -482,7 +481,7 @@ fn preview(
                 ),
                 _ => None,
             };
-        match drawn.map(|drawn| drawn.and_then(|drawn| crate::image::show(&drawn))) {
+        match drawn.map(|drawn| drawn.map(crate::image::show)) {
             Some(Ok(rows)) => {
                 screen.push(rows);
                 return Ok((0, false));
