@@ -1176,7 +1176,7 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     }
     let head = match (news(text), from) {
         (Some(parts), _) => parts[0].clone(),
-        (None, Some(from)) => format!("from {from}"),
+        (None, Some(from)) => format!("From {from}"),
         (None, None) => text.lines().next().unwrap_or("").to_owned(),
     };
     let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
@@ -1192,19 +1192,21 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     out.into_iter().map(|line| line.dim()).collect()
 }
 
-/// What the shut row of words between agents says: who sent them and
-/// their first words, or the news they bring, cut short enough to keep.
+/// What the shut row of words between agents says: who sent them, not
+/// what they said, which a click opens; or the news they bring, cut
+/// short enough to read at a glance.
 pub fn relayed_head(text: &str, from: Option<&str>) -> String {
-    let head = match (news(text), from) {
-        (Some(parts), _) => parts.join(" · "),
-        (None, Some(from)) => format!("{from}: {}", text.lines().next().unwrap_or("")),
-        (None, None) => text.lines().next().unwrap_or("").to_owned(),
-    };
-    cut(head.trim(), RELAYED_HEAD)
+    match (news(text), from) {
+        (Some(parts), _) => cut(parts.join(" · ").trim(), GLANCE + 16),
+        (None, Some(from)) => format!("From {from}"),
+        (None, None) => cut(text.lines().next().unwrap_or("").trim(), GLANCE),
+    }
 }
 
-/// The most columns of a shut row kept: wider than any conversation.
-const RELAYED_HEAD: usize = 200;
+/// The most columns of a glance at what a row stands for: an agent's
+/// message, a call's prompt, what a wait returned. A few words, well
+/// short of the window, so a row is read at a glance.
+pub const GLANCE: usize = 48;
 
 /// The shut row of words between agents, from [`relayed_head`].
 pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
@@ -1213,10 +1215,10 @@ pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'s
     // Who said it in the agents' color.
     let mut spans = vec![Span::raw("↳ ")];
     let rest = head.as_str();
-    match from.filter(|from| rest.starts_with(&format!("{from}:"))) {
+    match from.filter(|from| rest == format!("From {from}")) {
         Some(from) => {
+            spans.push(Span::raw("From "));
             spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
-            spans.push(Span::raw(rest[from.len()..].to_owned()));
         }
         None => spans.push(Span::raw(rest.to_owned())),
     }
@@ -1621,14 +1623,16 @@ fn kept(said: &crate::calls::Said) -> bool {
     KEPT.contains(&said.verb.as_str())
 }
 
-/// The calls that fold into one when several come in a row: those that
-/// start, message or change agents and what runs for them, which a lead
-/// often makes a few of at once.
-const FOLDS: [&str; 21] = [
+/// The calls drawn folded, one row that says what they did and to whom,
+/// and folded into one when several come in a row: those that start,
+/// message, wait for or change agents and what runs for them, which a
+/// lead often makes a few of at once. What they said opens on a click.
+const FOLDS: [&str; 22] = [
     "Started",
     "Messaged",
     "Steered",
     "Queued for",
+    "Waited for",
     "Forked",
     "Interrupted",
     "Removed",
@@ -1685,7 +1689,15 @@ pub fn folded(
     open: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let mut names = whats.join(", ");
+    // One call open is its own rows, its first marked open.
+    if let ([_], [call], true) = (whats, calls, open)
+        && let Some((first, rest)) = call.split_first()
+    {
+        let mut first = first.clone();
+        first.spans.push(Span::raw(" ▾").dim());
+        return [vec![first], rest.to_vec()].concat();
+    }
+    let mut names = crate::calls::once(whats.iter().cloned()).join(", ");
     if let Some(at) = names.rfind(", ") {
         names.replace_range(at..at + 2, " and ");
     }
@@ -1693,9 +1705,10 @@ pub fn folded(
         Span::raw(verb.to_owned()).bold(),
         Span::raw(" "),
         Span::raw(names),
-        Span::raw(match open {
-            true => " ▾",
-            false => " ▸",
+        Span::raw(match (unfolds(whats, calls), open) {
+            (false, _) => "",
+            (true, true) => " ▾",
+            (true, false) => " ▸",
         })
         .dim(),
     ]);
@@ -1709,6 +1722,12 @@ pub fn folded(
         out.extend(calls.iter().flatten().cloned());
     }
     out
+}
+
+/// Whether calls folded show more open than shut: more than one, or one
+/// with more to it than the row that says what it did.
+pub fn unfolds(whats: &[String], calls: &[Vec<Line<'static>>]) -> bool {
+    whats.len() > 1 || calls.iter().any(|call| call.len() > 1)
 }
 
 fn drawn(
@@ -1907,14 +1926,15 @@ fn drawn(
         ),
         "wait" => (
             "Waited for",
-            arguments["handles"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(crate::calls::handle_bot)
-                .collect::<Vec<_>>()
-                .join(", "),
+            crate::calls::once(
+                arguments["handles"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(crate::calls::handle_bot),
+            )
+            .join(", "),
         ),
         "write_stdin" if arguments["kill"] == true => ("Killed", field("handle")),
         "write_stdin" => (
@@ -2077,7 +2097,7 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
         } else {
             Span::raw("    ")
         };
-        out.extend(capped(line, width, lead, 2));
+        out.extend(capped(line, width, lead, UNDER_ROWS));
     }
     // A part of a longer command line has its output shown after the last.
     if let Some(output) = said.output.filter(|o| !o.trim().is_empty()) {
@@ -2085,6 +2105,10 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     }
     out
 }
+
+/// The most rows of each line under a call: what it was told or what it
+/// returned, which a call that folds shows only once opened.
+const UNDER_ROWS: usize = 4;
 
 /// A line wrapped to at most `rows` rows, the last ending in `…` when
 /// some was left out.
@@ -2428,9 +2452,59 @@ mod tests {
     }
 
     #[test]
+    fn a_call_and_an_agent_s_message_say_what_happened_not_what_was_said() {
+        let long =
+            "STOP code changes and test launches now; preserve any work, do not discard it. "
+                .repeat(3);
+        let command = format!("agent run --bot calc.add --delivery steer '{long}'");
+        let output = r#"{"bot": "calc.add", "turn": 381}"#;
+        let tool_rows = tool(
+            "shell",
+            &serde_json::json!({"command": command}),
+            Some(output),
+            false,
+            "",
+            200,
+        );
+        let rows = text(&tool_rows);
+        // What it was told shows once its fold opens, a few rows of it.
+        assert_eq!(rows[0], "• Steered calc.add · turn 381");
+        assert!(rows.len() <= 1 + UNDER_ROWS, "{rows:?}");
+        let calls = [tool_rows.clone()];
+        let fold = folded("Steered", &["calc.add".into()], &calls, false, 200);
+        assert_eq!(text(&fold), ["• Steered calc.add ▸"]);
+        let open = text(&folded("Steered", &["calc.add".into()], &calls, true, 200));
+        assert_eq!(open[0], "• Steered calc.add · turn 381 ▾");
+        assert_eq!(open[1..], rows[1..]);
+        // An agent's message is who sent it, its words opened on a click.
+        assert_eq!(relayed_head(&long, Some("errand.lead")), "From errand.lead");
+        let handles = ["turn:calc.add/1", "turn:calc.add/2", "turn:calc.add/3"];
+        let output = serde_json::json!({"results": {
+            "turn:calc.add/1": {"error": "cancelled"},
+            "turn:calc.add/2": {"status": "steered", "text": ""},
+            "turn:calc.add/3": {"status": "steered", "text": ""}}});
+        let rows = text(&tool(
+            "wait",
+            &serde_json::json!({"handles": handles}),
+            Some(&output.to_string()),
+            false,
+            "",
+            200,
+        ));
+        assert_eq!(
+            rows,
+            [
+                "• Waited for calc.add",
+                "  └ calc.add: cancelled",
+                "    calc.add steered"
+            ]
+        );
+    }
+
+    #[test]
     fn who_sent_words_between_agents_shows_in_the_agents_color() {
         let rows = relayed("Tests pass.", Some("calc.neg"), false, 80);
-        assert_eq!(text(&rows), ["↳ calc.neg: Tests pass. ▸"]);
+        assert_eq!(text(&rows), ["↳ From calc.neg ▸"]);
         let sender = rows[0].spans.iter().find(|s| s.content == "calc.neg");
         assert_eq!(sender.and_then(|s| s.style.fg), Some(Color::Blue));
         // A window too narrow for any of it still draws the arrow.
