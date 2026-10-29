@@ -3400,11 +3400,25 @@ impl App {
                 open: false,
             },
         );
+        // Drawn folded from the first: what it did, opened on a click.
+        let fold = &self.folds[&at];
+        let opens = transcript::unfolds(&fold.whats, &fold.calls);
+        let lines = transcript::quiet(transcript::folded(
+            &fold.verb,
+            &fold.whats,
+            &fold.calls,
+            false,
+            self.prose(),
+        ));
         let from = self.pending.len() + usize::from(self.any_history);
         self.commit(lines);
         let tag = screen::Mark::Tag(screen::Tag::Group(at as u64));
         self.marks
             .extend((from..self.pending.len()).map(|line| (line, tag.clone())));
+        if opens {
+            let open = screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON));
+            self.marks.push((from, open));
+        }
         self.folding = Some((at, self.rows_drawn));
     }
 
@@ -10377,16 +10391,7 @@ mod tests {
         ))
         .await;
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
-        assert_eq!(
-            rows[..5],
-            [
-                "• I'll look.",
-                "",
-                "• Started b.fix · turn 1",
-                "  └ Fix the tests.",
-                ""
-            ]
-        );
+        assert_eq!(rows[..4], ["• I'll look.", "", "• Started b.fix ▸", ""]);
         assert!(rows.iter().all(|row| !row.contains("Ran")), "{rows:?}");
         assert_eq!(rows.last().map(String::as_str), Some("• Done."));
     }
@@ -10414,7 +10419,7 @@ mod tests {
         assert_eq!(
             drawn(&mut app),
             [
-                "↳ calc.add: The build is green. ▸",
+                "↳ From calc.add ▸",
                 "",
                 "↳ Task updates · calc.neg completed ▸"
             ]
@@ -10426,7 +10431,7 @@ mod tests {
         assert_eq!(
             drawn(&mut app),
             [
-                "↳ from calc.add ▾",
+                "↳ From calc.add ▾",
                 "  The build is green.",
                 "  I pushed the fix to calc.add.",
                 "",
@@ -10434,7 +10439,7 @@ mod tests {
             ]
         );
         app.press("said/4").await;
-        assert_eq!(drawn(&mut app)[0], "↳ calc.add: The build is green. ▸");
+        assert_eq!(drawn(&mut app)[0], "↳ From calc.add ▸");
         // The person's own words are drawn as ever.
         app.land(6, "thanks", None, false);
         assert_eq!(drawn(&mut app).last().unwrap(), "› thanks");
@@ -10487,12 +10492,7 @@ mod tests {
         start(&mut app, "calc.add");
         assert_eq!(
             drawn(&mut app),
-            [
-                "› fix the three bugs",
-                "",
-                "• Messaged calc.add",
-                "  └ Fix calc.add"
-            ]
+            ["› fix the three bugs", "", "• Messaged calc.add ▸"]
         );
         start(&mut app, "calc.neg");
         start(&mut app, "calc.div");
@@ -10544,7 +10544,7 @@ mod tests {
             "• Messaged calc.add, calc.neg, calc.div and calc.mul ▸"
         );
         assert_eq!(rows[4], "• Removed calc.add");
-        assert_eq!(rows[8], "• Messaged calc.sub");
+        assert_eq!(rows[8], "• Messaged calc.sub ▸");
     }
 
     #[tokio::test]
