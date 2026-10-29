@@ -745,37 +745,49 @@ impl Screen {
     }
 
     /// A page let go between the place found and the next one, `older`
-    /// or newer, the nearest it, but those `looked` through already: to
-    /// draw before stepping, so what it holds is found too.
+    /// or newer, round past the last as stepping goes, the nearest it,
+    /// but those `looked` through already: to draw before stepping, so
+    /// what it holds is found too.
     pub fn find_gap(&mut self, older: bool, looked: &[u64]) -> Option<u64> {
         let finding = (self.finding.as_ref()).filter(|f| f.at != AGAIN && f.laid == self.laid)?;
         let bottom = self.shown.len() - self.back.min(self.shown.len());
-        let hits = &finding.hits;
-        let here = hits.get(finding.at).map_or(bottom, |(start, _)| start.0);
-        let (from, to) = match older {
-            true => (
-                finding
-                    .at
-                    .checked_sub(1)
-                    .and_then(|at| hits.get(at))
-                    .map_or(0, |hit| hit.0.0),
-                here,
-            ),
-            false => (
-                here,
-                hits.get(finding.at + 1)
-                    .map_or(self.shown.len(), |hit| hit.0.0),
-            ),
+        let starts: Vec<usize> = finding.hits.iter().map(|(start, _)| start.0).collect();
+        let at = finding.at;
+        let here = starts.get(at).copied().unwrap_or(bottom);
+        let end = self.shown.len();
+        // Up to the next place; past the last, round from the other end.
+        let ranges = match older {
+            true => [
+                (
+                    at.checked_sub(1)
+                        .and_then(|at| starts.get(at))
+                        .map_or(0, |s| *s),
+                    here,
+                ),
+                match at.checked_sub(1) {
+                    Some(_) => (end, end),
+                    None => (starts.last().copied().unwrap_or(here), end),
+                },
+            ],
+            false => [
+                (here, starts.get(at + 1).copied().unwrap_or(end)),
+                match starts.get(at + 1) {
+                    Some(_) => (0, 0),
+                    None => (0, starts.first().copied().unwrap_or(here)),
+                },
+            ],
         };
         let placed = self.placed();
-        let gaps = (self.pages.iter().zip(placed))
-            .filter(|(page, at)| !page.drawn && at.start < to && from < at.end)
-            .filter(|(page, _)| !looked.contains(&page.id));
-        let nearest = match older {
-            true => gaps.max_by_key(|(_, at)| at.start),
-            false => gaps.min_by_key(|(_, at)| at.start),
-        };
-        nearest.map(|(page, _)| page.id)
+        ranges.into_iter().find_map(|(from, to)| {
+            let gaps = (self.pages.iter().zip(&placed))
+                .filter(|(page, at)| !page.drawn && at.start < to && from < at.end)
+                .filter(|(page, _)| !looked.contains(&page.id));
+            let nearest = match older {
+                true => gaps.max_by_key(|(_, at)| at.start),
+                false => gaps.min_by_key(|(_, at)| at.start),
+            };
+            nearest.map(|(page, _)| page.id)
+        })
     }
 
     /// Stop finding, the view left where it is.
@@ -2030,9 +2042,9 @@ mod tests {
         assert!(!screen.pages[0].drawn && screen.pages[1].drawn);
         screen.find("old 1");
         drawn(&mut screen, area);
-        // Nothing found in the rows drawn; older, the page let go is.
+        // Nothing found in the rows drawn; either way round, the page let go is.
         assert_eq!(screen.found(), Some((0, 0)));
-        assert_eq!(screen.find_gap(false, &[]), None);
+        assert_eq!(screen.find_gap(false, &[]), Some(2));
         assert_eq!(screen.find_gap(true, &[]), Some(2));
         screen.fill(2, lines(0..7_000, "old"));
         drawn(&mut screen, area);
@@ -2043,6 +2055,30 @@ mod tests {
         assert!((0..200).any(|y| row(&buf, y).starts_with("old 1")));
         // Looked through already, a page let go again is not again.
         assert_eq!(screen.find_gap(true, &[2]), None);
+    }
+
+    #[test]
+    fn find_goes_round_through_the_pages_let_go_past_the_last_place() {
+        let area = Rect::new(0, 0, 20, 200);
+        let (mut screen, _) = screen(lines(0..50, "tail"), 20, 200);
+        screen.prepend(1, lines(0..7_000, "middle"));
+        screen.prepend(2, lines(0..7_000, "tail"));
+        drawn(&mut screen, area);
+        assert!(!screen.pages[0].drawn);
+        screen.find("tail 7");
+        drawn(&mut screen, area);
+        assert_eq!(screen.found(), Some((1, 1)));
+        // Newer than the newest place, round from the first row.
+        assert_eq!(screen.find_gap(false, &[]), Some(2));
+        // Older than the oldest, round from the newest row: none below.
+        assert_eq!(screen.find_gap(true, &[]), Some(2));
+        screen.fill(2, lines(0..7_000, "tail"));
+        drawn(&mut screen, area);
+        assert_eq!(screen.find_gap(false, &[2]), None);
+        screen.find_next(false);
+        let buf = drawn(&mut screen, area);
+        assert!((0..200).any(|y| row(&buf, y).trim_end() == "tail 7"));
+        assert_eq!(screen.found().map(|(at, _)| at), Some(1));
     }
 
     #[test]

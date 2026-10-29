@@ -2950,6 +2950,8 @@ impl App {
                 Ok(page) => page,
                 Err(error) => {
                     self.notice = Some(error.to_string());
+                    // Not asked again at once: the way up stops.
+                    self.to_first = false;
                     break;
                 }
             };
