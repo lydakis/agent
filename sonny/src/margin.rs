@@ -434,10 +434,11 @@ impl Reference {
         Some(Path::new(self.workspace.as_deref()?).join(path))
     }
 
-    /// The file's `text` as read now: kept once it can no longer be.
+    /// The file's `text` as read now, as [`read`] bounds it: kept once it
+    /// can no longer be.
     pub fn file_read(&mut self, text: Option<String>) {
         if let Some(text) = text {
-            self.file = Some(cut(&text, NOTE_BYTES).to_owned());
+            self.file = Some(text);
         }
     }
 
