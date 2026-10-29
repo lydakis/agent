@@ -291,7 +291,8 @@ impl Markdown {
         }
         let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-            let style = Style::new().add_modifier(Modifier::BOLD);
+            // A heading is the agent's own voice: the agents' color.
+            let style = Style::new().add_modifier(Modifier::BOLD).fg(Color::Blue);
             return Some(Line::from(inline(trimmed[hashes + 1..].trim(), style)));
         }
         let indent = &text[..text.len() - trimmed.len()];
@@ -1160,6 +1161,69 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     out
 }
 
+/// Whether a message is from another bot or tells the lead of its tasks:
+/// words between agents, drawn [`relayed`] and not as the person's.
+pub fn relays(text: &str, from: Option<&str>) -> bool {
+    from.is_some() || news(text).is_some()
+}
+
+/// Words between agents, kept quiet: one dim row, who sent it and its
+/// first words (or the news it brings), `▸` to open it; open, the same
+/// row with `▾` and the whole message under it.
+pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<Line<'static>> {
+    if !open {
+        return relayed_shut(&relayed_head(text, from), from, width);
+    }
+    let head = match (news(text), from) {
+        (Some(parts), _) => parts[0].clone(),
+        (None, Some(from)) => format!("from {from}"),
+        (None, None) => text.lines().next().unwrap_or("").to_owned(),
+    };
+    let head = cut(&format!("↳ {}", head.trim()), width.saturating_sub(2));
+    let mut out = vec![Line::from(format!("{head} ▾"))];
+    for line in text.lines() {
+        out.extend(wrap(
+            Line::from(line.to_string()),
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
+    }
+    out.into_iter().map(|line| line.dim()).collect()
+}
+
+/// What the shut row of words between agents says: who sent them and
+/// their first words, or the news they bring, cut short enough to keep.
+pub fn relayed_head(text: &str, from: Option<&str>) -> String {
+    let head = match (news(text), from) {
+        (Some(parts), _) => parts.join(" · "),
+        (None, Some(from)) => format!("{from}: {}", text.lines().next().unwrap_or("")),
+        (None, None) => text.lines().next().unwrap_or("").to_owned(),
+    };
+    cut(head.trim(), RELAYED_HEAD)
+}
+
+/// The most columns of a shut row kept: wider than any conversation.
+const RELAYED_HEAD: usize = 200;
+
+/// The shut row of words between agents, from [`relayed_head`].
+pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    // Cut apart from its arrow, which a narrow window would cut too.
+    let head = cut(head, width.saturating_sub(4));
+    // Who said it in the agents' color.
+    let mut spans = vec![Span::raw("↳ ")];
+    let rest = head.as_str();
+    match from.filter(|from| rest.starts_with(&format!("{from}:"))) {
+        Some(from) => {
+            spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
+            spans.push(Span::raw(rest[from.len()..].to_owned()));
+        }
+        None => spans.push(Span::raw(rest.to_owned())),
+    }
+    spans.push(Span::raw(" ▸"));
+    vec![Line::from(spans).dim()]
+}
+
 /// The most lines of a prompt shown above its reply.
 const PROMPT_LINES: usize = 6;
 
@@ -1175,6 +1239,15 @@ fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return Some(sourced(rest));
     }
+    // "- the lead role: theirs at …" is the lead role.
+    if let Some(rest) = text.strip_prefix(crate::skills::UPGRADED) {
+        let mut parts = vec!["Sonny upgraded".to_owned()];
+        parts.extend(rest.lines().filter_map(|line| {
+            let what = line.strip_prefix("- the ")?.split_once(": ")?.0;
+            Some(format!("{what} edited"))
+        }));
+        return Some(parts);
+    }
     let rest = text.strip_prefix(TASK_UPDATES)?;
     let kind = "Task updates";
     let mut parts = vec![kind.to_owned()];
@@ -1186,14 +1259,13 @@ fn news(text: &str) -> Option<Vec<String>> {
         let Some(item) = line.strip_prefix("- ") else {
             continue;
         };
-        // "- 2 more tasks in the next update", "- 2 more in the next note"
+        // "- 2 more tasks in the next note"
         if let Some((count, _)) = item.split_once(" more ")
             && count.parse::<usize>().is_ok()
         {
             parts.push(format!("+{count} more"));
         } else if let Some((name, turn)) = item.split_once(": turn:") {
-            // "- shop.fix: turn:shop.fix/5 failed, asked by you", and from
-            // the judge "- shop.fix: turn:shop.fix/5, turn failed (why; todo)"
+            // "- shop.fix: turn:shop.fix/5 failed, asked by you"
             let status = turn.split_once(' ').map_or("", |(_, s)| s);
             // A message in it: "the person wrote: \"…\"", "shop.api wrote
             // in it", "3 messages in it since turn:…, from a, b".
@@ -1549,6 +1621,96 @@ fn kept(said: &crate::calls::Said) -> bool {
     KEPT.contains(&said.verb.as_str())
 }
 
+/// The calls that fold into one when several come in a row: those that
+/// start, message or change agents and what runs for them, which a lead
+/// often makes a few of at once.
+const FOLDS: [&str; 21] = [
+    "Started",
+    "Messaged",
+    "Steered",
+    "Queued for",
+    "Forked",
+    "Interrupted",
+    "Removed",
+    "Discarded",
+    "Resolved",
+    "Saved to memory",
+    "Updated in memory",
+    "Removed from memory",
+    "Scheduled",
+    "Removed the trigger",
+    "Fired the trigger",
+    "Subscribed to",
+    "Unsubscribed from",
+    "Moved",
+    "Opened",
+    "Opened a tab",
+    "Opened a split",
+];
+
+/// What a call that folds with others like it did, said as Sonny says it
+/// (`Started`) and whom (`calc.fix-avg`): a call of one of Sonny's tools,
+/// or one command Sonny knows, that did not fail.
+pub fn folds(
+    name: &str,
+    arguments: &Value,
+    output: Option<&str>,
+    failed: bool,
+) -> Option<(String, String)> {
+    if failed {
+        return None;
+    }
+    let said = match name {
+        "shell" => crate::calls::said(arguments["command"].as_str()?, output.unwrap_or(""), false)?,
+        _ => crate::calls::declared(name, arguments, false)?,
+    };
+    // A task's name, not the turn it started.
+    let what = said
+        .what
+        .split(" · ")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    (FOLDS.contains(&said.verb.as_str()) && !what.is_empty()).then_some((said.verb, what))
+}
+
+/// Calls folded into one: what they did, said once with whom each did
+/// it to, `▸` to open them; open, the same row with `▾`, and each call's
+/// own rows under it.
+pub fn folded(
+    verb: &str,
+    whats: &[String],
+    calls: &[Vec<Line<'static>>],
+    open: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut names = whats.join(", ");
+    if let Some(at) = names.rfind(", ") {
+        names.replace_range(at..at + 2, " and ");
+    }
+    let line = Line::from(vec![
+        Span::raw(verb.to_owned()).bold(),
+        Span::raw(" "),
+        Span::raw(names),
+        Span::raw(match open {
+            true => " ▾",
+            false => " ▸",
+        })
+        .dim(),
+    ]);
+    let mut out = wrap(
+        line,
+        width,
+        Span::raw("• ").fg(Color::Green),
+        Span::raw("    "),
+    );
+    if open {
+        out.extend(calls.iter().flatten().cloned());
+    }
+    out
+}
+
 fn drawn(
     name: &str,
     arguments: &Value,
@@ -1561,7 +1723,7 @@ fn drawn(
     let bullet = if failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ")
+        Span::raw("• ").fg(Color::Green)
     };
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
@@ -1688,7 +1850,7 @@ fn drawn(
                     let bullet = if failed && i + 1 == count {
                         Span::raw("• ").fg(Color::Red)
                     } else {
-                        Span::raw("• ")
+                        Span::raw("• ").fg(Color::Green)
                     };
                     let commands: Vec<&str> = ran
                         .iter()
@@ -1892,7 +2054,7 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ")
+        Span::raw("• ").fg(Color::Green)
     };
     let mut spans = vec![Span::raw(said.verb).bold()];
     if !said.what.is_empty() {
@@ -2256,6 +2418,18 @@ mod tests {
     }
 
     #[test]
+    fn who_sent_words_between_agents_shows_in_the_agents_color() {
+        let rows = relayed("Tests pass.", Some("calc.neg"), false, 80);
+        assert_eq!(text(&rows), ["↳ calc.neg: Tests pass. ▸"]);
+        let sender = rows[0].spans.iter().find(|s| s.content == "calc.neg");
+        assert_eq!(sender.and_then(|s| s.style.fg), Some(Color::Blue));
+        // A window too narrow for any of it still draws the arrow.
+        for width in 0..8 {
+            relayed("Tests pass.", Some("calc.neg"), false, width);
+        }
+    }
+
+    #[test]
     fn a_line_of_pictures_is_read_as_markdown_and_html_write_them() {
         let picture = |alt: &str, src: &str| Picture {
             alt: alt.into(),
@@ -2397,19 +2571,33 @@ mod tests {
             ["↳ Task updates · shop.fix failed · shop…"]
         );
         let note = "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             Picked by your lookout:\n\
-             - shop.fix: turn:shop.fix/5, turn failed (interrupt 0.91; it cannot wait for your turn to end)\n\
-             In your tasks:\n\
+             - shop.fix: turn:shop.fix/5 failed, asked by you\n\
              - shop.docs: turn:shop.docs/2, the person wrote: \"Use tabs.\"\n\
              - shop.api: turn:shop.api/4, shop.fix wrote in it\n\
              - shop.web: turn:shop.web/3, 2 messages in it since turn:shop.web/1, from shop.fix, a trigger\n\
-             - 1 more in the next note\n\
-             A quoted message is the person's own words.";
+             - 1 more tasks in the next note\n\
+             A quoted message is the person's own words.\n\
+             This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.";
         assert_eq!(
             text(&super::prompt(note, None, 160)),
             [
-                "↳ Task updates · shop.fix turn failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
+                "↳ Task updates · shop.fix failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
             ]
+        );
+    }
+
+    #[test]
+    fn sonnys_upgrade_note_reads_as_one_quiet_row() {
+        let note = format!(
+            "{}this Sonny ships new text for skills or roles of its own that the person edited.\n\
+             - the lead role: theirs at /h/.agents/agents/lead.md; Sonny's new text at /u/lead.md; Sonny's previous text was not kept\n\
+             - the plan skill: theirs at /h/.agents/skills/plan; Sonny's new text at /u/plan; Sonny's previous text was not kept\n\
+             Tell the person, and ask whether they want you to bring Sonny's changes into their copies.",
+            crate::skills::UPGRADED
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 90)),
+            ["↳ Sonny upgraded · lead role edited · plan skill edited"]
         );
     }
 

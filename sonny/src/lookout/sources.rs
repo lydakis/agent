@@ -6,7 +6,7 @@
 //! runs again `every` while later (a minute unless set), so a poller that
 //! prints what is new and exits and a stream that never exits both work.
 //! Agents subscribe to a source by name and never set one up: the command
-//! runs as the person, outside any sandbox. No judge reads sources: every
+//! runs as the person, outside any sandbox. Nothing judges sources: every
 //! event is told, and the person's command says what is urgent.
 //!
 //! What a source says is no one's words here: its note goes with an

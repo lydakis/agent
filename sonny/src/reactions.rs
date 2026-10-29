@@ -184,6 +184,17 @@ impl Picked {
         picked
     }
 
+    /// `by`'s reaction to the person's message at `node` kept, or taken
+    /// off, as the lookout's write would.
+    #[cfg(test)]
+    pub fn set(&mut self, node: i64, by: &str, emoji: &str, remove: bool) {
+        let at = self.on.entry(node).or_default();
+        at.retain(|(b, e)| !(b == by && e == emoji));
+        if !remove {
+            at.push((by.to_owned(), emoji.to_owned()));
+        }
+    }
+
     /// Who reacted with what to the person's message at `node`.
     pub fn on(&self, node: i64) -> &[(String, String)] {
         self.on.get(&node).map_or(&[], Vec::as_slice)

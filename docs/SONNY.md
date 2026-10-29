@@ -486,7 +486,24 @@ Triggers); and, depending on where it runs, `pictures`, `rex-windows`,
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
 while it is as Sonny last wrote it: one the person edited, or one of that
 name Sonny never noted writing, is theirs and left alone (remove its folder
-to get Sonny's). A link the Agent app left there, into its bundle's
+to get Sonny's).
+
+When Sonny brings new text for a skill or role (`lead.md`, `task.md`) that
+the person edited, it writes that text beside theirs, in
+`~/.agent/sonny/upgrades/skills/NAME` or `upgrades/agents/NAME.md`, and
+notes it in `upgrades/pending`. Sonny also keeps whole what it last wrote
+of each, in `~/.agent/sonny/shipped`, which is what an edit started from.
+The first bot Sonny opens after that (not a side chat) is sent a note,
+queued after any turn it runs, naming the person's copy, Sonny's new text
+and the text the person started from, and asking it to offer the person a
+merge. The transcript shows it as one row, `↳ Sonny upgraded · lead role
+edited`. Each new text is told once, by one Sonny of several starting at
+once, and nothing is told when the person edits a file Sonny's text has
+not changed since; a copy left the same as it is Sonny's
+again from the next start. A file of the person's own that Sonny never
+wrote, or a link, is not offered.
+
+A link the Agent app left there, into its bundle's
 `Contents/Resources/skills`, is replaced, never written through; a folder's
 own skill of the same name wins over any of them. Agents already running
 keep the index they were created with.
