@@ -1476,7 +1476,7 @@ async fn services(
     if let Some(project) = project {
         lookout::subscribe_lead(&agent.options.store, bot, project)?;
     }
-    crate::start_lookout(&agent.options)?;
+    crate::start_lookout(client, &agent.options).await?;
     if approvals::mode(&record) == Some("auto") {
         let model = format!(
             "{}/{}",
@@ -1562,7 +1562,7 @@ async fn setup_lead(
         }
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
-    crate::start_lookout(&agent.options)?;
+    crate::start_lookout(client, &agent.options).await?;
     if gating.or(mode) == Some("auto") {
         let model = format!(
             "{}/{}",

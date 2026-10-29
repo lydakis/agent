@@ -1,5 +1,6 @@
 //! One process hosts every bot. Client sessions (stdio or Unix socket) speak
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
+mod companions;
 mod handles;
 mod hub;
 mod session;
@@ -488,6 +489,14 @@ enum Command {
         tag: String,
         lease: u64,
     },
+    /// The daemon's companions: with `add`, keep one running under its
+    /// name for as long as the daemon runs (the same again changes
+    /// nothing, another spec runs anew); with `remove`, stop and forget
+    /// one; with neither, list them.
+    Companions {
+        add: Option<companions::Added>,
+        remove: Option<String>,
+    },
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
     Stats,
@@ -889,6 +898,7 @@ fn gate(
 }
 struct Service {
     store: Store,
+    companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
     registry: Registry,
@@ -1253,6 +1263,16 @@ pub async fn run(config: Configuration) -> Result<()> {
         .socket
         .as_deref()
         .and_then(|socket| socket::capabilities(socket, sender.clone(), sessions_next.clone()));
+    // Where the daemon is, not a bot's shell's marks: a companion is no
+    // bot's command.
+    let mut companions = companions::Companions::new(
+        &config.store,
+        (environment.iter())
+            .filter(|(key, _)| key != "AGENT_SHELL_CONTEXT")
+            .cloned()
+            .collect(),
+        config.socket.is_some(),
+    );
     let registry = registry
         .with_credentials(credentials)
         .with_environment(environment)
@@ -1275,6 +1295,8 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
     let mut callers: HashMap<u64, i64> = HashMap::new();
+    // The process at each session's other end, where the system says.
+    let mut peers: HashMap<u64, u32> = HashMap::new();
     let (stdout, stdout_writer) = Output::stdout();
     let stdio_owner = config.socket.is_none();
     let mut socket_owner = None;
@@ -1361,8 +1383,13 @@ pub async fn run(config: Configuration) -> Result<()> {
             handles.wake(waiting.bot, waiting.turn);
         }
     }
+    // Companions start once the daemon listens, as they were last kept.
+    for (name, spec) in store.op("companions", |db| db.companions()).await? {
+        companions.keep(&name, companions::stored(&name, &spec)?);
+    }
     let mut service = Service {
         store,
+        companions,
         identity,
         transport,
         providers: Arc::new(providers),
@@ -1429,10 +1456,12 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = interrupt.recv() => break,
                 _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
                 _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
-                    // Idle means no client, no live turn, and no running command.
-                    // Parked turns are durable and resume on the next start.
+                    // Idle means no client but companions, no live turn, and no
+                    // running command. Parked turns are durable and resume on
+                    // the next start.
                     let running = service.store.op("running_processes", |db| db.running_processes()).await?;
-                    if sessions.is_empty() && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
+                    let clients = sessions.keys().any(|id| !peers.get(id).is_some_and(|pid| service.companions.runs_pid(*pid)));
+                    if !clients && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
                         if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                     } else {
                         last_activity = std::time::Instant::now();
@@ -1471,17 +1500,23 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 message = inbound.recv() => {
                     let Some(message) = message else { break };
-                    last_activity = std::time::Instant::now();
+                    // What a companion sends is no client's activity.
+                    let session = match &message { Inbound::Open(id, ..) | Inbound::Request(id, _) | Inbound::Closed(id) => *id };
+                    if !peers.get(&session).is_some_and(|pid| service.companions.runs_pid(*pid)) {
+                        last_activity = std::time::Instant::now();
+                    }
                     match message {
-                        Inbound::Open(id, output, caller) => {
+                        Inbound::Open(id, output, caller, peer) => {
                             let _ = output.try_send(ready.clone());
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
+                            if let Some(peer) = peer { peers.insert(id, peer); }
                             service.sessions = sessions.len();
                         }
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
                             callers.remove(&id);
+                            peers.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
@@ -1584,6 +1619,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         Ok(())
     }
     .await;
+    // Companions go with the daemon.
+    service.companions.stop().await;
     // The stdio owner's output is gone: no one is left to answer, and a
     // blocked stdout write cannot be cancelled. The next start ends the rest.
     if stdio_owner
@@ -1711,6 +1748,8 @@ impl Service {
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // A companion runs as the daemon does, outside any sandbox.
+            Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
         }
         let me = self
@@ -2951,6 +2990,32 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
+            Command::Companions { add, remove } => match (add, remove) {
+                (Some(_), Some(_)) => {
+                    fail_with("usage", "companions takes add or remove, not both")
+                }
+                (Some(added), None) => {
+                    let (name, spec) = added.split();
+                    spec.check(&name)?;
+                    let text = serde_json::to_string(&spec)
+                        .map_err(|e| Error::with("invalid_companion", e.to_string()))?;
+                    let kept = name.clone();
+                    let changed = store
+                        .op("put_companion", move |db| db.put_companion(&kept, &text))
+                        .await?;
+                    self.companions.keep(&name, spec);
+                    Ok(json!({"companion": self.companions.shown(&name), "changed": changed}))
+                }
+                (None, Some(name)) => {
+                    let gone = name.clone();
+                    let removed = store
+                        .op("remove_companion", move |db| db.remove_companion(&gone))
+                        .await?;
+                    self.companions.drop_one(&name);
+                    Ok(json!({"name": name, "removed": removed}))
+                }
+                (None, None) => Ok(json!({"companions": self.companions.listed()})),
+            },
             Command::Stats => {
                 let (waiting, running, queued, paced, pending_bytes, approvals) = store
                     .op("counts", |db| {
@@ -2979,6 +3044,7 @@ impl Service {
                     "paced_turns": paced,
                     "approval_requests": approvals,
                     "approvers": self.hub.served(),
+                    "companions": self.companions.listed(),
                     "queued_turns": queued,
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
@@ -4173,6 +4239,11 @@ mod tests {
         let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let mut service = Service {
             store: store.clone(),
+            companions: companions::Companions::new(
+                std::path::Path::new("/nonexistent"),
+                Vec::new(),
+                false,
+            ),
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
@@ -4338,6 +4409,11 @@ mod tests {
         let (cancel, cancelled) = watch::channel(None);
         let mut service = Service {
             store: store.clone(),
+            companions: companions::Companions::new(
+                std::path::Path::new("/nonexistent"),
+                Vec::new(),
+                false,
+            ),
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
@@ -4546,6 +4622,11 @@ mod tests {
         let mut service = Service {
             identity: 0,
             store: store.clone(),
+            companions: companions::Companions::new(
+                std::path::Path::new("/nonexistent"),
+                Vec::new(),
+                false,
+            ),
             transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
             registry,
@@ -4778,6 +4859,11 @@ mod tests {
         Service {
             identity: 0,
             store: store.clone(),
+            companions: companions::Companions::new(
+                std::path::Path::new("/nonexistent"),
+                Vec::new(),
+                false,
+            ),
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
             registry: Registry::new("echo").unwrap(),

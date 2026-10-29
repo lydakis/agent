@@ -118,7 +118,9 @@ class AcpTests(ModelFixture):
         super().setUp()
         self.sonny = self.binary.parent / 'sonny'
         self.store = self.path / 'state.sqlite'
-        self.daemon = SocketClient(self.binary, self.store, self.url, 'echo')
+        # Its companions, Sonny's lookout among them, have its environment.
+        self.daemon = SocketClient(self.binary, self.store, self.url, 'echo',
+                                   env={**clean_env(), 'HOME': str(self.path)})
         self.addCleanup(self.daemon.close)
         self.t3 = http.server.ThreadingHTTPServer(('127.0.0.1', 0), T3Tools)
         self.t3.calls, self.t3.headers, self.t3.delegating = queue.Queue(), [], True
@@ -130,12 +132,6 @@ class AcpTests(ModelFixture):
                     'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com',
                     'T3_ACP_MCP_ENDPOINT': f'http://127.0.0.1:{self.t3.server_port}/mcp',
                     'T3_ACP_MCP_AUTHORIZATION': 'Bearer thread-1'}
-        # The lookout the threads find running.
-        lookout = subprocess.Popen([str(self.sonny), 'lookout', '--store', str(self.store),
-                                    '--socket', str(self.daemon.socket_path)],
-                                   env=self.env, stdout=subprocess.PIPE, text=True)
-        self.addCleanup(lambda: (lookout.kill(), lookout.wait(timeout=5), lookout.stdout.close()))
-        self.assertEqual(json.loads(lookout.stdout.readline())['event'], 'watching')
 
     def repo(self):
         repo = self.path / 'calc'
@@ -179,6 +175,10 @@ class AcpTests(ModelFixture):
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
         answered, updates = thread.answer_of(prompt)
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        # The lookout that answered it is the daemon's, not the thread's.
+        [lookout] = self.daemon.request('companions')['result']['companions']
+        self.assertEqual((lookout['name'], lookout['command'], lookout['args'][0]),
+                         ('sonny-lookout', str(self.sonny.resolve()), 'lookout'))
         # The task was T3 Code's child of this prompt before it was answered.
         delegated = self.t3.calls.get_nowait()
         kinds = [u['sessionUpdate'] for u in updates]

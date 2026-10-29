@@ -153,6 +153,14 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "companion",
+        about: "Keep a command running for as long as the daemon runs, stop one, or list them",
+        usage: "companion (add NAME [--cwd DIR] [--env KEY=VALUE]... -- COMMAND [ARGS]... | rm NAME | ls)",
+        flags: "--cwd --env --pretty",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "start",
         about: "Start the store's daemon if none runs; prints its ready line",
         usage: "start [OPTIONS]",
@@ -379,6 +387,8 @@ fn print_flags(flags: &str) {
                 "MODE",
                 "A new bot's command sandbox: read-only, workspace-write or danger-full-access; default none",
             ),
+            "--cwd" => ("DIR", "The folder a companion runs in"),
+            "--env" => ("KEY=VALUE", "A variable a companion gets; repeat for more"),
             "--writable" => (
                 "PATH",
                 "Another folder a workspace-write bot may change; repeat for more",
@@ -537,7 +547,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let mut positional = 0;
     while let Some(arg) = iter.next() {
         if arg == "--" {
-            if matches!(c.name, "run" | "wait") {
+            if matches!(c.name, "run" | "wait" | "companion") {
                 out.push(arg);
             }
             for value in iter {
@@ -570,7 +580,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if flags.iter().any(|f| f == flag)
             && !matches!(
                 flag,
-                "--provider" | "--image" | "--writable" | "--unsandboxed"
+                "--provider" | "--image" | "--writable" | "--unsandboxed" | "--env"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
@@ -683,7 +693,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
         }
-    } else if !matches!(c.name, "run" | "wait") && positional != 0 {
+    } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
     if c.name == "run" && has("--fork") {

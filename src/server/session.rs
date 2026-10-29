@@ -12,8 +12,9 @@ use tokio::{
 // box for every request. Open/Closed messages are infrequent control traffic.
 #[allow(clippy::large_enum_variant)]
 pub enum Inbound {
-    /// A connection, and the sandboxed bot whose own socket it came in on.
-    Open(u64, Output, Option<i64>),
+    /// A connection, the sandboxed bot whose own socket it came in on, and
+    /// the process at its other end, where the system says.
+    Open(u64, Output, Option<i64>, Option<u32>),
     Request(u64, Result<Request>),
     Closed(u64),
 }
@@ -77,9 +78,14 @@ pub async fn accept(
 ) {
     while let Ok((stream, _)) = listener.accept().await {
         let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok());
         let (read, write) = stream.into_split();
         if sender
-            .send(Inbound::Open(id, Output::writer(write), caller))
+            .send(Inbound::Open(id, Output::writer(write), caller, peer))
             .await
             .is_err()
         {

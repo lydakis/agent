@@ -133,6 +133,9 @@ struct Options {
     settings: serde_json::Map<String, Value>,
     settings_flags: Vec<String>,
     positional: Vec<String>,
+    /// A companion's folder and variables.
+    cwd: Option<PathBuf>,
+    env: Vec<String>,
     /// The `--store` and `--socket` flags, shell-quoted, that reach this
     /// daemon from any shell; empty when both are the defaults.
     target: String,
@@ -202,6 +205,8 @@ fn parse(args: &[String]) -> Result<Options> {
         settings: serde_json::Map::new(),
         settings_flags: Vec::new(),
         positional: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
         target: String::new(),
     };
     let mut iter = args.iter();
@@ -240,6 +245,8 @@ fn parse(args: &[String]) -> Result<Options> {
                 match flag {
                     "--store" => store = Some(PathBuf::from(value)),
                     "--socket" => socket = Some(PathBuf::from(value)),
+                    "--cwd" => options.cwd = Some(std::path::absolute(&value)?),
+                    "--env" => options.env.push(value),
                     "--provider" => {
                         options.providers.push(value);
                         options.providers_explicit = true;
@@ -1120,6 +1127,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "approvals" => approvals(&options),
         "answer" => answer(&options),
         "approver" => approver(&options),
+        "companion" => companion(&options),
         "models" => models(&options),
         // The daemon's ready line, from the running one or one started now,
         // with the socket it answered on, so a caller that reached this
@@ -1928,6 +1936,50 @@ fn approver(options: &Options) -> Result<i32> {
         key: env(DECISIONS_KEY),
         note,
     })
+}
+
+/// `companion add`, `rm` or `ls`: what the daemon keeps running beside it.
+fn companion(options: &Options) -> Result<i32> {
+    let usage = || {
+        fail_with(
+            "usage",
+            "companion needs add NAME -- COMMAND..., rm NAME or ls",
+        )
+    };
+    let request = match options
+        .positional
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()[..]
+    {
+        ["ls"] => json!({}),
+        ["rm", name] => json!({"remove": name}),
+        ["add", name, command, ..] => {
+            let mut env = serde_json::Map::new();
+            for pair in &options.env {
+                let Some((key, value)) = pair.split_once('=') else {
+                    return fail_with("usage", format!("--env needs KEY=VALUE, not {pair}"));
+                };
+                env.insert(key.to_owned(), json!(value));
+            }
+            let cwd = (options.cwd.as_ref())
+                .map(|cwd| {
+                    cwd.to_str()
+                        .ok_or(Error::with("usage", "--cwd needs a UTF-8 path"))
+                })
+                .transpose()?;
+            json!({"add": {"name": name, "command": command,
+                "args": options.positional[3..], "env": env, "cwd": cwd}})
+        }
+        _ => return usage(),
+    };
+    if !request["add"].is_object() && (options.cwd.is_some() || !options.env.is_empty()) {
+        return fail_with("usage", "--cwd and --env go with companion add");
+    }
+    let mut connection = ensure_daemon(options)?;
+    let answer = connection.request("companions", request)?;
+    print_json(&answer, options.pretty)?;
+    Ok(0)
 }
 
 fn answer(options: &Options) -> Result<i32> {
