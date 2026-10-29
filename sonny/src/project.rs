@@ -18,9 +18,14 @@ pub const LEAD: &str = include_str!("../agents/lead.md");
 /// person's `~/.agents/agents/task.md` to edit, as [`LEAD`] is.
 pub const TASK: &str = include_str!("../agents/task.md");
 
+/// A lead for a folder that holds other projects: it watches their leads
+/// and routes between them. Sonny ships it beside the others, but no lead
+/// runs as it unless set to (`profile = "superlead"`).
+pub const SUPERLEAD: &str = include_str!("../agents/superlead.md");
+
 /// The roles Sonny ships, which the person's files of the same names
 /// replace, or build on with `extends`.
-pub const BUILTINS: [(&str, &str); 2] = [("lead", LEAD), ("task", TASK)];
+pub const BUILTINS: [(&str, &str); 3] = [("lead", LEAD), ("task", TASK), ("superlead", SUPERLEAD)];
 
 /// The profile `name` for an agent in `dir`, which must exist: the folder's
 /// or the person's file, else the one Sonny ships.
@@ -721,6 +726,16 @@ mod tests {
         assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
         assert!(!text.contains("- my-lead:"));
+        // Sonny ships the superlead, which a project opts into the same way.
+        std::fs::write(
+            dir.join(".agents/project.toml"),
+            "name = \"top\"\nprofile = \"superlead\"\n",
+        )
+        .unwrap();
+        let lead = role(&dir).unwrap();
+        assert!(lead.body.starts_with(&base));
+        assert!(lead.body.contains("they report to you"));
+        assert!(!instructions(&dir).unwrap().contains("- superlead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

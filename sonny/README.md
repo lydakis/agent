@@ -108,6 +108,13 @@ and a project file names it for its lead:
 | The profile a lead runs as | `[sonny] lead_profile` | `profile` |
 | The profile every other agent is told | `[sonny] task_profile` | `threads_profile` |
 
+Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
+written to `~/.agents/agents` beside the others and used by no lead
+unless a project sets `profile = "superlead"`. It builds on the lead's:
+the folder holds other projects, so the lead subscribes to their leads
+and routes work and answers between them as it does between tasks. Sonny
+itself knows only leads and tasks.
+
 The project's wins, then the config's, then `lead` and `task`. A name that
 is not a profile in the folder's or the person's `.agents/agents` (nor one
 Sonny ships) stops the lead or task from being made, with
