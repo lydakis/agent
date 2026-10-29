@@ -102,6 +102,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
+| The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -224,7 +225,7 @@ off again never shows.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `side_chat`) through them and its default; Enter types one that takes a
+  `side_chat`, `chime`, `verbose`) through them and its default; Enter types one that takes a
   name (`model`, `provider`, `judge.model`), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
@@ -357,7 +358,10 @@ turn of the task numbered after that one reopens it.
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
-Settings Sonny keeps for every folder are in `~/.agent/sonny/settings.json`.
+Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
+`[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
+the view (`verbose`, off by default), besides the efforts and the side chat
+above; only the screen is in `~/.agent/sonny/settings.json`.
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and

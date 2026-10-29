@@ -16,6 +16,8 @@
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
 //! side_chat = "fork"            # "answer", the default, calls no tool
+//! chime = false                 # rings when work ends or waits, the default
+//! verbose = true                # every tool call drawn, not the clean view
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -58,12 +60,29 @@ pub struct Judge {
     pub effort: Option<String>,
 }
 
-/// What Sonny starts its agents with.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// What Sonny starts its agents with, and how it shows them.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
     pub side_chat: SideChat,
+    /// Whether finished and waiting work rings. Notifications show either way.
+    pub chime: bool,
+    /// Whether every tool call is drawn, or only the bot's words and the
+    /// calls that move the work on (the clean view, the default).
+    pub verbose: bool,
+}
+
+impl Default for Sonny {
+    fn default() -> Self {
+        Sonny {
+            lead_effort: None,
+            task_effort: None,
+            side_chat: SideChat::default(),
+            chime: true,
+            verbose: false,
+        }
+    }
 }
 
 /// What the copy `/side` talks to may do: `"answer"`, the default, from
@@ -139,12 +158,28 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
-            "sonny" => &["lead_effort", "task_effort", "side_chat"],
+            "sonny" => &[
+                "lead_effort",
+                "task_effort",
+                "side_chat",
+                "chime",
+                "verbose",
+            ],
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
+            }
+            if let Some(switch) = match key.as_str() {
+                "chime" => Some(&mut config.sonny.chime),
+                "verbose" => Some(&mut config.sonny.verbose),
+                _ => None,
+            } {
+                *switch = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                continue;
             }
             let value = string(&format!("{name}.{key}"), value)?;
             if key == "side_chat" {
@@ -181,13 +216,15 @@ fn string(key: &str, value: &toml::Value) -> Result<String, String> {
 /// new one goes at the end of its table, or of the top level for a bare
 /// key. The file is written whole, and only if it still reads.
 pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
-    let pairs: Vec<(&str, Option<&str>)> = pairs.iter().map(|(k, v)| (*k, Some(*v))).collect();
+    let pairs: Vec<(&str, Option<toml::Value>)> = (pairs.iter())
+        .map(|(k, v)| (*k, Some(toml::Value::String((*v).to_owned()))))
+        .collect();
     write(path, &pairs)
 }
 
-/// As `set`, where a key with no value has its line taken out, so it is
-/// its default again; one the file does not name is left so.
-pub fn write(path: &Path, pairs: &[(&str, Option<&str>)]) -> Result<(), String> {
+/// As `set`, for any value, where a key with none has its line taken out,
+/// so it is its default again; one the file does not name is left so.
+pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), String> {
     let unwritable =
         |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
     read(path)?;
@@ -245,7 +282,7 @@ pub fn write(path: &Path, pairs: &[(&str, Option<&str>)]) -> Result<(), String> 
             }
             continue;
         };
-        let line = format!("{name} = {}", toml::Value::String((*value).to_owned()));
+        let line = format!("{name} = {value}");
         match named {
             Some(i) => lines[i] = line,
             None => {
@@ -304,6 +341,9 @@ mod tests {
         assert_eq!(config.sonny.side_chat, SideChat::Answer);
         let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
         assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert!(config.sonny.chime && !config.sonny.verbose);
+        let quiet = parse("[sonny]\nchime = false\nverbose = true").unwrap();
+        assert!(!quiet.sonny.chime && quiet.sonny.verbose);
         for (text, error) in [
             (
                 "web_search = \"cached\"",
@@ -316,6 +356,10 @@ mod tests {
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
             ("[judge]\neffort = 3", "judge.effort must be a string"),
             ("[judge]\nmodel = \"\"", "judge.model must not be empty"),
+            (
+                "[sonny]\nchime = \"no\"",
+                "sonny.chime must be true or false",
+            ),
             (
                 "[sonny]\nside_chat = \"all\"",
                 "sonny.side_chat is answer or fork, not all",
@@ -386,7 +430,8 @@ mod tests {
             &file,
             &[
                 ("sonny.lead_effort", None),
-                ("sonny.task_effort", Some("high")),
+                ("sonny.task_effort", Some("high".into())),
+                ("sonny.chime", Some(false.into())),
                 ("model", None),
                 ("judge.effort", None),
             ],
@@ -394,7 +439,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "# mine\n\n[sonny]\nside_chat = \"fork\"\ntask_effort = \"high\"\n"
+            "# mine\n\n[sonny]\nside_chat = \"fork\"\ntask_effort = \"high\"\nchime = false\n"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

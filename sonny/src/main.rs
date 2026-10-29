@@ -4994,6 +4994,13 @@ impl App {
             } else if let config::Key::Close = view.event(&event) {
                 self.config = None;
             }
+            // The chime and the view as the file now has them.
+            let settings = settings::Settings::load();
+            self.sounds.chime = settings.chime;
+            if self.verbose != settings.verbose {
+                self.verbose = settings.verbose;
+                self.repaint = true;
+            }
             return;
         }
         if let Some(picker) = &mut self.picker {

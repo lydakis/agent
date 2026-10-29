@@ -24,9 +24,11 @@ pub struct Setting {
 }
 
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+/// A switch, written as TOML's own true or false.
+const SWITCH: &[&str] = &["true", "false"];
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 8] = [
+pub const SETTINGS: [Setting; 10] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -75,6 +77,18 @@ pub const SETTINGS: [Setting; 8] = [
         values: &["answer", "fork"],
         default: "answer",
     },
+    Setting {
+        key: "sonny.chime",
+        about: "whether finished and waiting work rings; notifications show either way",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
+        key: "sonny.verbose",
+        about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
+        values: SWITCH,
+        default: "false",
+    },
 ];
 
 /// What the keys say: open in `/config`.
@@ -121,7 +135,10 @@ impl View {
                     Some((name, key)) => table.get(name).and_then(|t| t.get(key)),
                     None => table.get(setting.key),
                 };
-                value.and_then(|v| v.as_str()).map(str::to_owned)
+                value.and_then(|v| match v {
+                    toml::Value::Boolean(on) => Some(on.to_string()),
+                    v => v.as_str().map(str::to_owned),
+                })
             })
             .collect())
     }
@@ -129,15 +146,19 @@ impl View {
     /// Writes the picked setting's `value`, `None` for its default, and
     /// reads the file again.
     fn write(&mut self, value: Option<String>) {
-        let key = SETTINGS[self.pick].key;
-        let written = agent_client::config::write(&self.path, &[(key, value.as_deref())])
+        let setting = &SETTINGS[self.pick];
+        let value = value.map(|value| match setting.values == SWITCH {
+            true => toml::Value::Boolean(value == "true"),
+            false => toml::Value::String(value),
+        });
+        let written = agent_client::config::write(&self.path, &[(setting.key, value.clone())])
             .and_then(|()| self.read());
         self.said = Some(match written {
             Ok(values) => {
                 self.values = values;
                 Ok(match value {
-                    Some(value) => format!("{key} = \"{value}\""),
-                    None => format!("{key} is its default again"),
+                    Some(value) => format!("{} = {value}", setting.key),
+                    None => format!("{} is its default again", setting.key),
                 })
             }
             Err(error) => Err(error),
@@ -292,13 +313,24 @@ mod tests {
 
     #[test]
     fn every_key_the_file_takes_is_listed() {
-        // A value that is no key's would be refused by the reader.
-        let path = std::env::temp_dir().join(format!("sonny-config-keys-{}", std::process::id()));
-        for setting in &SETTINGS {
-            let value = setting.values.first().copied().unwrap_or("a/b");
-            agent_client::config::set(&path, &[(setting.key, value)]).unwrap();
+        // A key or value the reader does not take would be refused.
+        let dir = std::env::temp_dir().join(format!("sonny-config-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut view = View {
+            path: dir.join("config.toml"),
+            values: vec![None; SETTINGS.len()],
+            pick: 0,
+            typing: None,
+            said: None,
+        };
+        for (at, setting) in SETTINGS.iter().enumerate() {
+            view.pick = at;
+            let value = setting.values.last().copied().unwrap_or("a/b");
+            view.write(Some(value.to_owned()));
+            assert!(matches!(view.said, Some(Ok(_))), "{:?}", view.said);
+            assert_eq!(view.values[at].as_deref(), Some(value));
         }
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -352,6 +384,18 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "# mine\n[sonny]\nside_chat = \"fork\"\n"
         );
+        // A switch is written as TOML's own.
+        view.pick = 8;
+        press(&mut view, KeyCode::Right);
+        assert_eq!(view.values[8].as_deref(), Some("false"));
+        assert!(!agent_client::config::read(&path).unwrap().sonny.chime);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .ends_with("chime = false\n")
+        );
+        press(&mut view, KeyCode::Right);
+        assert_eq!(view.values[8], None);
         // A value the reader refuses is said, and the file kept.
         view.pick = 6;
         view.typing = None;
