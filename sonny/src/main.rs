@@ -53,6 +53,7 @@ mod shell;
 mod skills;
 mod sound;
 mod status;
+mod suggest;
 mod t3;
 mod table;
 mod task;
@@ -121,6 +122,8 @@ const OLDER_ITEMS: u64 = 50;
 /// width), so they stay whole at 100 and prose stays near the measure.
 const PROSE: usize = 100;
 /// How long a side chat's copy stays once idle.
+/// What follows a guess at the next message in the composer.
+const TAB: &str = "  tab";
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1594,6 +1597,13 @@ struct App {
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
+    /// The turn the person's words last went to from this window: only
+    /// its end is followed by a guess at their next message.
+    yours: Option<i64>,
+    /// That guess, being made.
+    suggesting: Option<tokio::task::JoinHandle<Option<String>>>,
+    /// The guess, shown in the empty composer for Tab to take.
+    suggestion: Option<String>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -2123,6 +2133,9 @@ impl App {
             pick: 0,
             watch: None,
             behind: (0, None),
+            yours: None,
+            suggesting: None,
+            suggestion: None,
             asks_seen: HashMap::new(),
             redraw: false,
             sounds: sound::Sounds::new(false),
@@ -2361,6 +2374,7 @@ impl App {
                 }
             }
             self.side_closed();
+            self.suggested_now().await;
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
@@ -3889,6 +3903,9 @@ impl App {
                 self.draw_bot_reactions();
                 self.approvals.clear();
                 self.notice = None;
+                if status == "completed" && !quiet && turn.is_some() && turn == self.yours {
+                    self.suggest();
+                }
                 status_report(
                     match status {
                         _ if quiet => "idle",
@@ -5009,6 +5026,20 @@ impl App {
             key.code = code;
             key.modifiers -= KeyModifiers::CONTROL;
         }
+        // Tab takes the guess at the next message into the composer, as
+        // Claude Code and Codex take theirs; it is not sent. Tab does what
+        // it does otherwise when none shows.
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Tab
+            && !self.pane_keys
+            && let Some(guess) = self.suggested()
+        {
+            let guess = guess.to_owned();
+            self.input.set(&guess);
+            self.suggestion = None;
+            return;
+        }
         if full() && !self.watching() && self.full_screen(&event) {
             return;
         }
@@ -5667,6 +5698,9 @@ impl App {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(turn) = reply["turn"].as_i64() {
+            if origin.is_none() {
+                self.yours = Some(turn);
+            }
             self.staged.push((turn, prompt));
         }
         if workspace.is_some() {
@@ -5873,6 +5907,58 @@ impl App {
             Span::raw("    "),
         );
         self.commit(transcript::quiet(rows));
+    }
+
+    /// A guess at the person's next message, after a turn of theirs ended
+    /// well, made by a copy of this bot on this window's model; unless the
+    /// config's `[sonny] suggest` is off, or the bot asked a question,
+    /// which its own card answers.
+    fn suggest(&mut self) {
+        self.suggestion = None;
+        if !self.asks.is_empty() || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest) {
+            return;
+        }
+        self.suggesting = Some(tokio::spawn(suggest::guess(
+            self.client.clone(),
+            self.bot.clone(),
+            self.turn_model.clone(),
+        )));
+    }
+
+    /// The guess, once made. A turn started since lets it go; a copy
+    /// still guessing finishes and is deleted on its own.
+    async fn suggested_now(&mut self) {
+        if self.running.is_some() || !self.staged.is_empty() {
+            self.suggesting = None;
+            self.suggestion = None;
+            return;
+        }
+        if self
+            .suggesting
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            let job = self.suggesting.take().unwrap();
+            self.suggestion = job.await.ok().flatten();
+        }
+    }
+
+    /// The guess, while the composer shows it: empty, with nothing running
+    /// and nothing open over it.
+    fn suggested(&self) -> Option<&str> {
+        let open = self.picker.is_some()
+            || self.choosing.is_some()
+            || self.approving.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
+            || self.react_to.is_some();
+        let shows = self.input.is_empty()
+            && self.running.is_none()
+            && self.asks.is_empty()
+            && self.approvals.is_empty()
+            && !open
+            && !self.watching();
+        self.suggestion.as_deref().filter(|_| shows)
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -6555,6 +6641,20 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         // What is sent answers the lead's first open question.
         let answering = (!self.chatting).then(|| self.asks.first()).flatten();
+        // The guess at the next message, for Tab to take.
+        if let Some(guess) = self.suggested() {
+            let room = width.saturating_sub(prompt::LEAD + TAB.width());
+            return (
+                vec![Line::from(vec![
+                    Span::raw("› ").bold(),
+                    // Italic too: a side chat's screen, read through vt100,
+                    // loses the dim.
+                    Span::raw(transcript::cut(guess, room)).dim().italic(),
+                    Span::raw(TAB).dim(),
+                ])],
+                (0, prompt::LEAD),
+            );
+        }
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
@@ -7150,6 +7250,96 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn after_a_turn_of_the_persons_a_copy_guesses_their_next_message_for_tab() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |asked| {
+            seen.lock().unwrap().push(asked.clone());
+            match (asked["op"].as_str(), asked["bot"].as_str()) {
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("submit"), Some("b")) => json!({"turn": 1}),
+                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
+                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                    {"status": "completed", "text": "Suggestion: run the tests"}}}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("fix the bug and run tests");
+        app.submit().await;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        for _ in 0..200 {
+            app.suggested_now().await;
+            if app.suggestion.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(app.suggested(), Some("run the tests"));
+        let (rows, _) = app.composer(80);
+        let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row, "› run the tests  tab");
+        // The copy forked from the bot, allowed no call, and was deleted.
+        let ops = asked.lock().unwrap().clone();
+        let fork = ops.iter().find(|op| op["op"] == "fork").unwrap();
+        assert_eq!(fork["source"], "b");
+        assert_eq!(fork["allow"], json!([]));
+        assert!(fork["expire_ms"].is_u64());
+        let copy = fork["bot"].as_str().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| op["op"] == "delete" && op["bot"] == copy)
+        );
+        // Something typed hides it; emptied again, it is back.
+        app.input.set("x");
+        assert_eq!(app.suggested(), None);
+        app.input.clear();
+        // Tab takes it into the composer, unsent.
+        app.key(Event::Key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert_eq!(&*app.input, "run the tests");
+        assert_eq!(app.suggestion, None);
+        assert_eq!(
+            ops.iter().filter(|op| op["op"] == "submit").count(),
+            2,
+            "the person's and the copy's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_person_did_not_start_here_is_not_followed_by_a_guess() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        // Started by the lead, the lookout, or another window.
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(app.suggesting.is_none());
+        // Nor one of the person's that failed or was stopped.
+        for status in ["failed", "interrupted"] {
+            app.yours = Some(4);
+            app.daemon(turn_event("accepted", 4, json!({}))).await;
+            app.daemon(turn_event("turn_finished", 4, json!({"status": status})))
+                .await;
+            assert!(app.suggesting.is_none(), "{status}");
+        }
     }
 
     #[tokio::test]

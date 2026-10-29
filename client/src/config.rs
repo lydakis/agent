@@ -18,6 +18,7 @@
 //! task_effort = "high"          # each new task's
 //! lead_profile = "my-lead"     # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
+//! suggest = false               # no guess at the next message, on by default
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
@@ -70,7 +71,7 @@ pub struct Judge {
 }
 
 /// What Sonny starts its agents with.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
@@ -81,6 +82,22 @@ pub struct Sonny {
     pub task_profile: Option<String>,
     /// The MCP servers Sonny's agents reach, by name.
     pub mcp_servers: BTreeMap<String, McpServer>,
+    /// Whether a copy of the agent guesses the person's next message after
+    /// a turn they started, shown in the empty composer for Tab to take.
+    pub suggest: bool,
+}
+
+impl Default for Sonny {
+    fn default() -> Self {
+        Sonny {
+            lead_effort: None,
+            task_effort: None,
+            lead_profile: None,
+            task_profile: None,
+            mcp_servers: BTreeMap::new(),
+            suggest: true,
+        }
+    }
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -289,7 +306,13 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
-            "sonny" => &["lead_effort", "task_effort", "lead_profile", "task_profile"],
+            "sonny" => &[
+                "lead_effort",
+                "task_effort",
+                "lead_profile",
+                "task_profile",
+                "suggest",
+            ],
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
@@ -305,6 +328,12 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
+            }
+            if key == "suggest" {
+                config.sonny.suggest = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                continue;
             }
             let value = string(&format!("{name}.{key}"), value)?;
             // The daemon judges models and levels when the agents are made.
@@ -477,6 +506,12 @@ mod tests {
             parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
         assert_eq!(roles.sonny.lead_profile.as_deref(), Some("my-lead"));
         assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
+        assert!(config.sonny.suggest);
+        assert!(!parse("[sonny]\nsuggest = false").unwrap().sonny.suggest);
+        assert_eq!(
+            parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
+            "sonny.suggest must be true or false"
+        );
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);
