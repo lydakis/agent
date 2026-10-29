@@ -111,6 +111,9 @@ const QUOTED: usize = 72;
 const DRAW_ATTEMPTS: u32 = 30;
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
+/// How much older history is drawn at a time as the view nears its top:
+/// a page drawn while the wheel turns, so small enough not to stall it.
+const OLDER_ITEMS: u64 = 50;
 /// The widest the conversation is written, however wide the window: a
 /// reply reads as a column, not a band across the screen. Prose reads
 /// best at 45 to 90 characters a line, but replies carry code, paths and
@@ -1495,10 +1498,9 @@ struct App {
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
     older: Option<i64>,
-    /// The full screen was scrolled past its first row: older items are
-    /// read, and the view held where it was while all is drawn again.
-    want_older: bool,
-    hold_view: bool,
+    /// What calls older than the first node drawn returned, from the top
+    /// of the oldest page: drawn with the older page that has the calls.
+    unpaired: Vec<(i64, Value)>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2137,8 +2139,7 @@ impl App {
             repaint: false,
             first_node: None,
             older: None,
-            want_older: false,
-            hold_view: false,
+            unpaired: Vec::new(),
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2336,7 +2337,8 @@ impl App {
             self.listed();
             self.follow_place().await;
             self.count_behind();
-            if std::mem::take(&mut self.want_older) {
+            // Older items drawn above before the view reaches the first row.
+            if full() && self.older.is_some() && self.screen.near_top() {
                 self.older().await;
             }
             self.repaint |= term::switched();
@@ -2623,11 +2625,7 @@ impl App {
             own_screen(!full());
         }
         // The full screen's rows are Sonny's own; inline, the scrollback's.
-        let back = self.screen.back();
         self.screen.clear();
-        if std::mem::take(&mut self.hold_view) {
-            self.screen.hold(back);
-        }
         if !full() {
             execute!(
                 std::io::stdout(),
@@ -2660,13 +2658,14 @@ impl App {
         Ok(())
     }
 
-    /// The page of items before the oldest drawn, read by drawing the
-    /// conversation again from there once idle.
+    /// The page of items before the oldest drawn, drawn on its own and
+    /// put above the rest, the view left where it is: the conversation
+    /// drawn so far is not drawn again, and a turn running goes on.
     async fn older(&mut self) {
         let Some(from) = self.older else {
             return;
         };
-        let asked = json!({"bot": self.bot, "from": from, "limit": HISTORY_ITEMS});
+        let asked = json!({"bot": self.bot, "from": from, "limit": OLDER_ITEMS});
         let page = match self.client.request("history_nodes", asked).await {
             Ok(page) => page,
             Err(error) => {
@@ -2674,20 +2673,46 @@ impl App {
                 return;
             }
         };
-        let Some(oldest) = (page["nodes"].as_array())
-            .and_then(|nodes| nodes.last())
-            .and_then(|node| node["node"].as_i64())
-        else {
+        let mut nodes: Vec<i64> = Vec::new();
+        let mut turns: HashMap<i64, i64> = HashMap::new();
+        for n in page["nodes"].as_array().into_iter().flatten() {
+            let Some(node) = n["node"].as_i64() else {
+                continue;
+            };
+            nodes.push(node);
+            if let Some(turn) = n["turn"].as_i64() {
+                turns.insert(node, turn);
+            }
+        }
+        nodes.reverse();
+        self.older = page["next_from"].as_i64();
+        let Some(&oldest) = nodes.first() else {
             self.older = None;
             return;
         };
         self.first_node = Some(oldest);
-        self.older = page["next_from"].as_i64();
-        self.hold_view = true;
-        self.repaint = true;
-        if self.running.is_some() {
-            self.notice = Some("older messages once this turn ends".into());
+        // What the newer rows were drawn with is put by meanwhile.
+        let pending = std::mem::take(&mut self.pending);
+        let any_history = std::mem::replace(&mut self.any_history, false);
+        let rows_drawn = self.rows_drawn;
+        let bot_reactions = std::mem::take(&mut self.bot_reactions);
+        let react_calls = std::mem::take(&mut self.react_calls);
+        let answering = self.answering.take();
+        let welcome = self.welcome();
+        self.commit(welcome);
+        let unpaired = std::mem::take(&mut self.unpaired);
+        self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
+        let mut lines = std::mem::replace(&mut self.pending, pending);
+        self.any_history = any_history;
+        self.rows_drawn = rows_drawn;
+        self.bot_reactions = bot_reactions;
+        self.react_calls = react_calls;
+        self.answering = answering;
+        // A blank row apart from what was the first.
+        if !lines.is_empty() {
+            lines.push(Line::default());
         }
+        self.screen.prepend(lines);
     }
 
     /// The connection is gone: the daemon drops a reader that falls
@@ -2978,7 +3003,8 @@ impl App {
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
         // The open questions are those the replay asks and does not answer.
-        if self.seen_node == 0 || after < self.seen_node {
+        let from_start = self.seen_node == 0 || after < self.seen_node;
+        if from_start {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
@@ -2989,11 +3015,40 @@ impl App {
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
         }
+        let unpaired = self.draw_nodes(&nodes, &turns, false, Vec::new()).await;
+        if from_start {
+            self.unpaired = unpaired;
+        }
+    }
+
+    /// The items at `nodes`, then `after` (what a newer page's calls
+    /// returned, its calls being here), drawn as they were live; what
+    /// returned from calls before them is given back. Those `older` than
+    /// any drawn change nothing but what is drawn: the questions, replies
+    /// to react to and calls still running are the newer items' to say.
+    async fn draw_nodes(
+        &mut self,
+        nodes: &[i64],
+        turns: &HashMap<i64, i64>,
+        older: bool,
+        after: Vec<(i64, Value)>,
+    ) -> Vec<(i64, Value)> {
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+        let mut unpaired = Vec::new();
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
-        for chunk in nodes.chunks(100) {
-            for (node, item) in self.items_at(chunk).await {
+        // A chunk read at a time, what it held let go before the next.
+        let mut chunks = nodes.chunks(100);
+        let mut after = Some(after);
+        loop {
+            let items = match chunks.next() {
+                Some(chunk) => self.items_at(chunk).await,
+                None => match after.take() {
+                    Some(after) => after,
+                    None => break,
+                },
+            };
+            for (node, item) in items {
                 // A reaction leaves the words before it as they were.
                 let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
                 if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
@@ -3009,10 +3064,15 @@ impl App {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
                         self.draw_bot_reactions();
-                        asks::close(&mut self.asks, &text(&item));
                         // What the person ran is shown as it was when it ran.
                         let prose = self.prose();
-                        let lines = landed(&text(&item), &mut self.ran_here, prose);
+                        let lines = match older {
+                            true => landed(&text(&item), &mut Vec::new(), prose),
+                            false => {
+                                asks::close(&mut self.asks, &text(&item));
+                                landed(&text(&item), &mut self.ran_here, prose)
+                            }
+                        };
                         self.commit(lines);
                         self.answering = Some((first_words(&text(&item)), self.rows_drawn));
                     }
@@ -3026,8 +3086,10 @@ impl App {
                             );
                             lines.extend(self.reacted_row(node));
                             said = Some(lines);
-                            self.saw_reply(node, &reply);
-                            self.last_reply = reply;
+                            if !older {
+                                self.saw_reply(node, &reply);
+                                self.last_reply = reply;
+                            }
                         }
                     }
                     // Counted once it is known to have been taken.
@@ -3070,30 +3132,37 @@ impl App {
                         let id = item["call_id"].as_str().unwrap_or("");
                         // A call this window kept before it lost the daemon
                         // may end in what it reads on reconnecting.
-                        if let Some((name, arguments)) =
-                            calls.remove(id).or_else(|| self.calls.remove(id))
+                        let call = match older {
+                            true => calls.remove(id),
+                            false => calls.remove(id).or_else(|| self.calls.remove(id)),
+                        };
+                        let Some((name, arguments)) = call else {
+                            unpaired.push((node, item));
+                            continue;
+                        };
+                        let (output, mut failed) = output(&item);
+                        match denial(&item) {
+                            Some(reason) => {
+                                // It never ran: nothing it would have done follows.
+                                failed = true;
+                                self.commit_denied(&name, &arguments, &reason);
+                            }
+                            None => self.commit_call(&name, &arguments, &output, failed),
+                        }
+                        if older {
+                            continue;
+                        }
+                        if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                            self.resolve(&arguments, id, turns.get(&node).copied(), false)
+                                .await;
+                        }
+                        if name == asks::TOOL
+                            && !failed
+                            && !reactions::refused(&item)
+                            && let Some(ask) = asks::call(id, &arguments)
+                            && !self.asks.iter().any(|open| open.id == ask.id)
                         {
-                            let (output, mut failed) = output(&item);
-                            match denial(&item) {
-                                Some(reason) => {
-                                    // It never ran: nothing it would have done follows.
-                                    failed = true;
-                                    self.commit_denied(&name, &arguments, &reason);
-                                }
-                                None => self.commit_call(&name, &arguments, &output, failed),
-                            }
-                            if name == resolved::TOOL && !failed && !reactions::refused(&item) {
-                                self.resolve(&arguments, id, turns.get(&node).copied(), false)
-                                    .await;
-                            }
-                            if name == asks::TOOL
-                                && !failed
-                                && !reactions::refused(&item)
-                                && let Some(ask) = asks::call(id, &arguments)
-                                && !self.asks.iter().any(|open| open.id == ask.id)
-                            {
-                                self.asks.push(ask);
-                            }
+                            self.asks.push(ask);
                         }
                     }
                     _ => {}
@@ -3103,12 +3172,17 @@ impl App {
         if let Some(lines) = said {
             self.commit(lines);
         }
+        if older {
+            self.draw_bot_reactions();
+            return unpaired;
+        }
         // A running turn's reactions are drawn when it ends.
         if self.running.is_none() {
             self.draw_bot_reactions();
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        unpaired
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
@@ -4523,10 +4597,6 @@ impl App {
                         pane.screen.mouse(*mouse)
                     }
                     _ => {
-                        let up = mouse.kind == MouseEventKind::ScrollUp;
-                        if up && self.screen.at_top() && self.older.is_some() {
-                            self.want_older = true;
-                        }
                         // A press here lets go of what was selected there.
                         if down {
                             self.input.unselect();
@@ -4785,11 +4855,8 @@ impl App {
         (chat, Some(pane))
     }
 
-    /// A page up the full screen, or the page before its first row.
+    /// A page up the full screen.
     fn page_up(&mut self) {
-        if self.screen.at_top() && self.older.is_some() {
-            self.want_older = true;
-        }
         self.screen.page(true);
     }
 
