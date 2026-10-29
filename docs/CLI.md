@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
+`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `models`, `companion`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -176,6 +176,40 @@ The lightweight command registry in `src/cli.rs` supplies help and option scope
 for both client commands and `serve`. Keep that registry, the implementation,
 and behavior tests aligned when adding an option. No CLI framework or runtime
 dependency is required.
+
+## Companions
+
+A companion is a command the daemon keeps running for as long as it runs:
+a client's helper that agents wait on, such as Sonny's lookout or the
+approver, so it lives as long as the daemon whoever started either. The
+daemon knows nothing of what one is.
+
+```sh
+agent companion add NAME [--cwd DIR] [--env KEY=VALUE]... -- COMMAND [ARGS]...
+agent companion rm NAME
+agent companion ls
+```
+
+`add` keeps the companion in the store under NAME (1 to 64 letters,
+digits, `.`, `_` or `-`, not starting with `.`) and starts it now; every
+later daemon on that store starts it once it listens. The same spec again
+changes nothing (`changed: false`); another spec under the name replaces
+the old one, which is stopped first. `rm` stops and forgets one
+(`removed: false` when there was none); `ls` lists them, as `stats` does
+under `companions`, each with its spec, `running`, `pid`, `started_ms`,
+`restarts` and `last_exit` (`code` and `signal`, or `spawn_failed` with
+why, and `at_ms`). Each runs in its own process group with the daemon's
+environment, its `--env` over that, and `AGENT_STORE`, `AGENT_SOCKET`,
+`AGENT_BIN` and `AGENT_COMPANION` (its name), never a bot shell's marks;
+its stdin is empty and its output goes to `STORE.companions/NAME.log`. One
+that exits starts again after 1 s, the wait doubling up to 60 s while it
+keeps exiting within a minute of starting. The daemon's shutdown stops
+each with SIGTERM to its group, then SIGKILL after 5 s. A companion's own
+sessions keep no daemon from `--idle-exit`, and a daemon on stdio, with no
+socket to reach it on, runs none. The request is `companions` with `add`
+(`name`, `command`, `args`, `env`, `cwd`), `remove` (a name) or neither;
+a sandboxed bot's commands may not make it, since a companion runs as the
+daemon does.
 
 ## Output and status
 

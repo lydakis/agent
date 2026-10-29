@@ -292,7 +292,7 @@ fn beside(store: &Path, suffix: &str) -> PathBuf {
 
 /// This Sonny, told apart from another build of it: its version and when
 /// its binary was written.
-fn identity() -> String {
+pub(crate) fn identity() -> String {
     let written = std::env::current_exe()
         .and_then(std::fs::metadata)
         .and_then(|meta| meta.modified())
@@ -308,7 +308,9 @@ fn identity() -> String {
 /// when the lookout holding it is this Sonny's own.
 fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
     let theirs = std::fs::read_to_string(beside(store, ".lookout.sonny")).unwrap_or_default();
-    if theirs == identity() {
+    // The daemon's own companion takes the place of one a window started
+    // before Sonny kept it as one, of this build too.
+    if theirs == identity() && std::env::var_os("AGENT_COMPANION").is_none() {
         return Ok(None);
     }
     let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
@@ -343,8 +345,14 @@ fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
         .open(&path)
         .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
-    // released when the process exits.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+    // released when the process exits. Tried twice, since `running` holds
+    // it for an instant.
+    let take = || unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    let taken = take() || {
+        std::thread::sleep(Duration::from_millis(50));
+        take()
+    };
+    if taken {
         // Its process, which `/status` asks after.
         use std::io::Write;
         let _ = file.set_len(0);
@@ -1010,14 +1018,24 @@ fn cursor_path(store: &Path) -> PathBuf {
 /// The most of the log `status` reads, from its end.
 const STATUS_BYTES: u64 = 1 << 20;
 
+/// Whether a lookout watches `store`'s daemon: one holds its lock. The pid
+/// the file names is no answer, since after a restart another process may
+/// have it. The lock is tried shared and let go at once; a lookout
+/// starting meanwhile tries again (`lock`).
+pub fn running(store: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(beside(store, ".lookout.lock")) else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor `file` owns; closing it lets go.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0;
+    !taken && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+}
+
 /// One line on the lookout for a subscriber, as `/status` shows it:
 /// whether one runs and watches it, and today's notes.
 pub fn status(store: &std::path::Path, lead: &str) -> String {
-    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
-        .ok()
-        .and_then(|pid| pid.trim().parse().ok());
-    // SAFETY: signal 0 sends nothing; it only asks whether the process lives.
-    if !pid.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0) {
+    if !running(store) {
         return "Lookout · not running".to_owned();
     }
     let (mut seated, mut notes) = (false, 0);
@@ -2337,6 +2355,24 @@ mod tests {
         assert!(!lookout.updates.due());
         turn(lookout, "calc.fix", 3);
         assert!(lookout.updates.due());
+    }
+
+    #[test]
+    fn a_lookout_runs_while_one_holds_its_lock_whatever_pid_it_names() {
+        let dir = std::env::temp_dir().join(format!("lookout-running-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        assert!(!running(&store));
+        // A lookout gone before a restart, its pid now another process's.
+        std::fs::write(dir.join("state.sqlite.lookout.lock"), "1").unwrap();
+        assert!(!running(&store));
+        let held = lock(&store).unwrap().unwrap();
+        assert!(running(&store));
+        // Asking leaves it held.
+        assert!(lock(&store).unwrap().is_none());
+        drop(held);
+        assert!(!running(&store));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

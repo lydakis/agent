@@ -1571,7 +1571,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 61;
+    pub const SCHEMA: i32 = 62;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1753,6 +1753,7 @@ impl Database {
             INSERT OR IGNORE INTO turn_sequence VALUES (1,0);
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
+            CREATE TABLE IF NOT EXISTS companions(name TEXT PRIMARY KEY, spec TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
@@ -4121,6 +4122,30 @@ impl Database {
     }
     /// Durable lineage, drawn at creation and copied with the database. The
     /// daemon also binds it to the physical file for its cache namespace.
+    /// Every companion, by name, as `put_companion` kept it.
+    pub fn companions(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT name,spec FROM companions ORDER BY name")?;
+        let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+    /// Keep a companion's spec under its name; whether it changed.
+    pub fn put_companion(&mut self, name: &str, spec: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT INTO companions(name,spec) VALUES(?1,?2)
+             ON CONFLICT(name) DO UPDATE SET spec=?2 WHERE spec<>?2",
+            params![name, spec],
+        )?;
+        Ok(changed == 1)
+    }
+    /// Forget a companion; whether there was one.
+    pub fn remove_companion(&mut self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM companions WHERE name=?", [name])?
+            == 1)
+    }
     pub fn store_identity(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -10433,6 +10458,8 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
             item BLOB NOT NULL);",
     )?;
+    // 61 -> 62: the daemon's companions, in a table the schema creates;
+    // there were none.
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
