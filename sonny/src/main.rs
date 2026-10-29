@@ -1066,6 +1066,15 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}-{}", now.as_millis(), std::process::id())
 }
 
+/// The agent a side chat is a copy of, from the name `/side` gives it,
+/// `SOURCE.side-HEX`; `None` for any other bot.
+pub fn side_source(bot: &str) -> Option<&str> {
+    let (source, stamp) = bot.rsplit_once(".side-")?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    (!source.is_empty() && (1..=6).contains(&stamp.len()) && stamp.bytes().all(hex))
+        .then_some(source)
+}
+
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
 /// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
 /// the same to Herdr, which takes it from its own CLI instead.
@@ -3948,9 +3957,9 @@ impl App {
     async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
         // A side chat forked from a lead resolves that lead's tasks.
         let side = (self.options.side.is_some())
-            .then(|| self.bot.rsplit_once(".side-"))
+            .then(|| side_source(&self.bot))
             .flatten()
-            .and_then(|(source, _)| source.strip_suffix(".lead"));
+            .and_then(|source| source.strip_suffix(".lead"));
         let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
             return;
         };

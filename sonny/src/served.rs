@@ -419,6 +419,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
     let text = |key: &str| arguments[key].as_str().map(str::to_owned);
     let caller =
         std::env::var("AGENT_BOT").map_err(|_| ("no_caller", "AGENT_BOT is not set".into()))?;
+    // A side chat forked with its agent's tools calls them as that agent:
+    // its tasks, panes and projects are the agent's, not the copy's.
+    let caller = crate::side_source(&caller).map_or(caller.clone(), str::to_owned);
     match name {
         START => {
             let start = crate::task::Start {
@@ -901,6 +904,14 @@ mod tests {
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
         assert_eq!(project_of("shop.fix"), "shop");
+        // A lead's side chat acts as the lead; a task named side-… is no copy.
+        assert_eq!(
+            crate::side_source("shop.web.lead.side-1a2b3c"),
+            Some("shop.web.lead")
+        );
+        assert_eq!(crate::side_source("shop.side-panel"), None);
+        assert_eq!(crate::side_source("shop.side-"), None);
+        assert_eq!(crate::side_source("shop.side-1A2B"), None);
     }
 
     #[test]
