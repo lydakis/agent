@@ -280,15 +280,22 @@ impl Run {
             let started = Instant::now();
             let exit = match self.spawn().await {
                 Ok(mut child) => {
+                    // Child::id becomes None once wait reaps the leader;
+                    // its process group may still have descendants to stop.
+                    let pid = child.id().expect("spawned companion");
                     {
                         let mut status = self.status();
-                        status.pid = child.id();
+                        status.pid = Some(pid);
                         status.started_ms = Some(epoch_ms());
                     }
                     let exit = tokio::select! {
-                        exit = child.wait() => exited(exit),
+                        exit = child.wait() => {
+                            let exit = exited(exit);
+                            terminate(&mut child, pid).await;
+                            exit
+                        },
                         _ = stop.changed() => {
-                            terminate(&mut child).await;
+                            terminate(&mut child, pid).await;
                             self.status().pid = None;
                             return;
                         }
@@ -363,8 +370,7 @@ fn exited(exit: std::io::Result<std::process::ExitStatus>) -> Value {
 
 /// SIGTERM to its group, then SIGKILL to what is left of it once its
 /// grace is up, the companion itself gone or not.
-async fn terminate(child: &mut tokio::process::Child) {
-    let Some(pid) = child.id() else { return };
+async fn terminate(child: &mut tokio::process::Child, pid: u32) {
     let group = -(pid as i32);
     let deadline = tokio::time::Instant::now() + GRACE;
     // SAFETY: a signal to the process group this companion leads.
@@ -462,6 +468,51 @@ mod tests {
         assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
         assert_eq!(companions.listed(), json!([]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_exited_companion_s_descendants_stop_before_it_restarts() {
+        let dir = std::env::temp_dir().join(format!("companions-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started");
+        let script = format!(
+            "(trap '' TERM; exec sleep 30) & echo $! >> {}; exit 7",
+            started.display()
+        );
+        let mut companions = Companions::new(&dir.join("state.sqlite"), vec![], true);
+        companions.keep("exits", spec("sh", &["-c", &script]));
+        until(|| std::fs::read_to_string(&started).is_ok_and(|pids| pids.ends_with('\n'))).await;
+        let pid: i32 = std::fs::read_to_string(&started)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        until(|| {
+            companions.shown("exits").unwrap()["restarts"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        })
+        .await;
+        // Before any replacement runs, the old command's descendants are gone.
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // SAFETY: signal 0 only asks whether this test's child lives.
+        let dead_before_restart = (unsafe { libc::kill(pid, 0) }) != 0 || state.contains(") Z ");
+        assert_eq!(companions.shown("exits").unwrap()["last_exit"]["code"], 7);
+        companions.stop().await;
+        // Clean up even when testing the broken implementation.
+        for pid in std::fs::read_to_string(&started).unwrap().lines() {
+            let pid: i32 = pid.parse().unwrap();
+            // SAFETY: these are descendants created by this test.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            dead_before_restart,
+            "the exited companion left its child running"
+        );
     }
 
     #[tokio::test]
