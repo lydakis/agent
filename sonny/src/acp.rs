@@ -497,12 +497,18 @@ impl Session {
             }
             if task {
                 let mut state = self.state.lock().await;
-                // Its turn ended before the thread came: nothing to wait for.
-                if state.running.is_none() {
-                    state.prompt = None;
-                    drop(state);
-                    self.say_last(agent).await;
-                    return Ok(json!({"stopReason": "end_turn"}));
+                match &state.prompt {
+                    // Its turn ended before the thread came: nothing to
+                    // wait for.
+                    Some((prompt, None)) if prompt == id => {
+                        state.prompt = None;
+                        drop(state);
+                        self.say_last(agent).await;
+                        return Ok(json!({"stopReason": "end_turn"}));
+                    }
+                    Some((prompt, Some(_))) if prompt == id => {}
+                    // It ended since, and the follower answered it.
+                    _ => return Ok(Value::Null),
                 }
                 if agent.v2() {
                     agent.out.update(
