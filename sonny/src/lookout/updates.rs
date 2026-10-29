@@ -689,11 +689,13 @@ impl Updates {
 
     /// Whether the lead is to hear now: there is news and it rests.
     pub fn due(&self) -> bool {
-        self.news()
-            && self
-                .bots
-                .get(&self.lead)
-                .is_some_and(|lead| lead.id.is_some() && !ACTIVE.contains(&lead.status.as_str()))
+        self.news() && self.idle()
+    }
+
+    /// Whether the lead rests, as its events say.
+    pub fn idle(&self) -> bool {
+        (self.bots.get(&self.lead))
+            .is_some_and(|lead| lead.id.is_some() && !ACTIVE.contains(&lead.status.as_str()))
     }
 
     /// Whether the lead is in the middle of a turn, as its events say.
@@ -705,8 +707,13 @@ impl Updates {
     /// has waited a while on a lead its events say is busy. A missed event
     /// would otherwise hold the note until the lead's next turn.
     pub fn doubt(&self, now: Instant, since: Instant) -> bool {
-        self.news()
-            && now >= since + DOUBT
+        self.news() && self.waited(now, since)
+    }
+
+    /// Whether news that came `since`, of whatever kind, has waited a while
+    /// on a lead its events say is busy, and the daemon was not asked lately.
+    pub fn waited(&self, now: Instant, since: Instant) -> bool {
+        now >= since + DOUBT
             && self.asked.is_none_or(|asked| now >= asked + DOUBT)
             && self
                 .bots

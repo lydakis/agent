@@ -109,13 +109,17 @@ class LookoutTests(ModelFixture):
         self.assertEqual(json.loads(service.stdout.readline())['event'], 'watching')
         return service
 
-    def note_for(self, bot, timeout=30, having=''):
+    def note_for(self, bot, timeout=30, having='', starting='Task updates: '):
+        prompt = self.prompt_for(bot, timeout, having, starting)
+        return prompt and prompt['text']
+
+    def prompt_for(self, bot, timeout=30, having='', starting='Task updates: '):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
                 text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
-                if text and text[0]['text'].startswith('Task updates: ') and having in text[0]['text']:
-                    return text[0]['text']
+                if text and text[0]['text'].startswith(starting) and having in text[0]['text']:
+                    return text[0]
             time.sleep(.2)
         return None
 
@@ -248,6 +252,37 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'the subscriber was not woken')
         self.assertIn('- ops.deploy: turn:ops.deploy/', woke)
         self.assertIn(' completed, asked by the person', woke)
+
+    def test_what_a_source_prints_reaches_who_subscribed_to_it(self):
+        # The person's poller prints a plain line and an event it gives an
+        # ID, which it prints again on its next run.
+        poller = self.path / 'poll.sh'
+        poller.write_text('echo "lunch?"\n'
+                          'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci", "urgent": true}\'\n'
+                          'echo \'{"text": "deploy failed on prod", "id": "d1", "from": "ci"}\'\n'
+                          'echo "$SONNY_SOURCE" > "$SONNY_SOURCE_DIR/ran"\n')
+        (self.path / '.agent').mkdir(exist_ok=True)
+        (self.path / '.agent' / 'config.toml').write_text(
+            f'[sonny.sources.chat]\ncommand = "sh {poller}"\nevery = "1h"\n')
+        self.make('reviewer')
+        folder = self.path / 'state.sqlite.lookout'
+        folder.mkdir(exist_ok=True)
+        subs = [{'name': 'all', 'sources': ['chat']}, {'name': 'deploys', 'sources': ['chat']}]
+        (folder / 'reviewer.json').write_text(json.dumps({'subscriptions': subs}))
+        self.start()
+        prompt = self.prompt_for('reviewer', starting='From your sources: ', having='deploy failed')
+        self.assertIsNotNone(prompt, 'the subscriber never heard its source')
+        # Not the person's words: the approver reads the origin.
+        self.assertEqual(prompt['origin'], 'lookout.sources')
+        self.assertIn('- chat, from "ci" (for your all, deploys, urgent): "deploy failed on prod"', prompt['text'])
+        self.assertIsNotNone(self.note_for('reviewer', starting='From your sources: ', having='"lunch?"'))
+        # An event printed again by its ID is told once.
+        time.sleep(3)
+        told = [p for t in self.daemon.request('turns', bot='reviewer')['result']['turns']
+                for p in self.daemon.request('prompts', bot='reviewer', turn=t['turn'])['result']['prompts']
+                if p['text'].startswith('From your sources: ')]
+        self.assertEqual(sum(p['text'].count('deploy failed on prod') for p in told), 1)
+        self.assertEqual((self.path / 'state.sqlite.sources' / 'chat' / 'ran').read_text(), 'chat\n')
 
 if __name__ == '__main__':
     unittest.main()

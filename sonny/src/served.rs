@@ -167,9 +167,12 @@ fn subscriptions() -> Value {
             what happens in them in a note starting \"Task updates\": every message someone other than you \
             writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
             The person's own words cut into your running turn; the rest waits until your turn ends. Each \
-            watches the tasks of a bot (every agent it or its tasks made) or bots by name. Add one, or remove \
-            one by name; with neither, or after either, the result lists them all. Adding one again changes \
-            nothing; one by a name in use that differs is refused with the field, so remove it first.",
+            watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
+            sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
+            \"From your sources\": every event, at once when the source marks it urgent. Add one, or remove \
+            one by name; with neither, or after either, the result lists them all, with the sources there \
+            are. Adding one again changes nothing; one by a name in use that differs is refused with the \
+            field, so remove it first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -181,7 +184,9 @@ fn subscriptions() -> Value {
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters; \
-                                another lead, which has subscriptions of its own, counts only where named as it is."}
+                                another lead, which has subscriptions of its own, counts only where named as it is."},
+                        "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
+                            "description": "Sources it hears, by name: every event each says."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -451,6 +456,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 &caller,
                 arguments.get("add"),
                 arguments["remove"].as_str(),
+                &crate::lookout::sources::names(),
             )
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))

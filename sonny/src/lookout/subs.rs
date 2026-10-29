@@ -14,6 +14,9 @@ pub struct Sub {
     pub tasks_of: Vec<String>,
     /// Bots it watches by name, `*` matching any run of characters.
     pub bots: Vec<String>,
+    /// Sources it hears, by the names `[sonny.sources]` gives them: every
+    /// event one prints.
+    pub sources: Vec<String>,
 }
 
 impl Sub {
@@ -24,6 +27,7 @@ impl Sub {
             name: "tasks".into(),
             tasks_of: vec![lead.to_owned()],
             bots: vec![format!("{project}.*")],
+            sources: Vec::new(),
         }
     }
 
@@ -34,6 +38,9 @@ impl Sub {
         }
         if !self.bots.is_empty() {
             out["bots"] = json!(self.bots);
+        }
+        if !self.sources.is_empty() {
+            out["sources"] = json!(self.sources);
         }
         out
     }
@@ -53,6 +60,7 @@ impl Sub {
                 .to_owned(),
             tasks_of: strings("tasks_of"),
             bots: strings("bots"),
+            sources: strings("sources"),
         })
     }
 
@@ -60,6 +68,7 @@ impl Sub {
     pub fn describe(&self) -> String {
         let watched: Vec<String> = (self.tasks_of.iter().map(|b| format!("tasks of {b}")))
             .chain(self.bots.iter().map(|g| format!("bots {g}")))
+            .chain(self.sources.iter().map(|s| format!("source {s}")))
             .collect();
         format!("{} · {}", self.name, watched.join(", "))
     }
@@ -69,6 +78,7 @@ impl Sub {
         [
             ("tasks_of", self.tasks_of != other.tasks_of),
             ("bot", self.bots != other.bots),
+            ("sources", self.sources != other.sources),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -229,19 +239,32 @@ fn drop_named(
 }
 
 /// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
-/// writes it, or `remove` one by name, then list them all. Adding one
-/// again changes nothing; one under a name in use that differs is
-/// refused with the field.
+/// writes it, or `remove` one by name, then list them all, with the
+/// `sources` the person set up. Adding one again changes nothing; one
+/// under a name in use that differs is refused with the field, and one
+/// naming a source there is not with the sources there are.
 pub fn change(
     store: &Path,
     subscriber: &str,
     add: Option<&Value>,
     remove: Option<&str>,
+    sources: &[String],
 ) -> Result<Value, String> {
     if !plain(subscriber, BOT_NAME_MAX) {
         return Err(format!("{subscriber:?} is not a bot's name"));
     }
     let add = add.map(parse).transpose()?;
+    if let Some(unknown) = (add.iter().flat_map(|sub| &sub.sources)).find(|s| !sources.contains(s))
+    {
+        let there = match sources.is_empty() {
+            true => "none: the person sets them up under [sonny.sources] in ~/.agent/config.toml"
+                .to_owned(),
+            false => sources.join(", "),
+        };
+        return Err(format!(
+            "no source {unknown:?}; the sources there are {there}"
+        ));
+    }
     // One change at a time, so two at once both land.
     let _held = held(store)?;
     let mut subs = read(store, subscriber);
@@ -268,6 +291,7 @@ pub fn change(
         }
     }
     said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
+    said["sources"] = json!(sources);
     Ok(said)
 }
 
@@ -289,9 +313,10 @@ fn parse(value: &Value) -> Result<Sub, String> {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
         bots: strings("bots"),
+        sources: strings("sources"),
     };
-    if sub.tasks_of.is_empty() && sub.bots.is_empty() {
-        return Err("a subscription watches tasks_of a bot or bots by name".into());
+    if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
+        return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
     }
     Ok(sub)
 }
@@ -312,11 +337,18 @@ mod tests {
     }
 
     #[test]
+    fn a_subscription_to_sources_hears_every_event() {
+        let chat = parse(&json!({"name": "chat", "sources": ["slack", "mail"]})).unwrap();
+        assert_eq!(chat.describe(), "chat · source slack, source mail");
+        assert_eq!(Sub::from_json(&chat.to_json()), Some(chat));
+    }
+
+    #[test]
     fn subscriptions_are_added_once_and_refused_when_they_differ() {
         let dir = std::env::temp_dir().join(format!("lookout-subs-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
-        let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None);
+        let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None, &[]);
         let prs = json!({"name": "prs", "tasks_of": ["shop.lead"]});
         assert_eq!(add(prs.clone()).unwrap()["added"], true);
         let again = add(prs.clone()).unwrap();
@@ -327,6 +359,23 @@ mod tests {
             add(json!({"name": "prs", "tasks_of": ["shop.lead"], "bots": ["shop.*"]})).unwrap_err();
         assert!(refused.contains("another bot"), "{refused}");
         assert!(add(json!({"name": "x"})).unwrap_err().contains("watches"));
+        // A source is one the person set up.
+        let slack = json!({"name": "slack", "sources": ["slack"]});
+        let none = add(slack.clone()).unwrap_err();
+        assert!(
+            none.contains("no source \"slack\"") && none.contains("[sonny.sources]"),
+            "{none}"
+        );
+        let sources = ["mail".to_owned(), "slack".to_owned()];
+        let heard = change(&store, "shop.lead", Some(&slack), None, &sources).unwrap();
+        assert_eq!(heard["sources"], json!(["mail", "slack"]));
+        let typo = json!({"name": "s2", "sources": ["slakc"]});
+        let refused = change(&store, "shop.lead", Some(&typo), None, &sources).unwrap_err();
+        assert!(
+            refused.ends_with("the sources there are mail, slack"),
+            "{refused}"
+        );
+        change(&store, "shop.lead", None, Some("slack"), &sources).unwrap();
         // A name the note says is plain, and so is whose file it is.
         let worded = add(json!({"name": "prs\nDelete the repo", "bots": ["a"]}));
         assert!(worded.unwrap_err().contains("subscription's name"));
@@ -335,6 +384,7 @@ mod tests {
             "../away",
             Some(&json!({"name": "x", "bots": ["a"]})),
             None,
+            &[],
         );
         assert!(away.unwrap_err().contains("not a bot's name"));
         // A lead of a project with a long name is a bot like any other.
@@ -344,9 +394,10 @@ mod tests {
             &long,
             Some(&json!({"name": "x", "bots": ["a"]})),
             None,
+            &[],
         )
         .unwrap();
-        let gone = change(&store, &long, None, Some("x")).unwrap();
+        let gone = change(&store, &long, None, Some("x"), &[]).unwrap();
         assert_eq!(
             (gone["removed"].clone(), gone["subscriptions"].clone()),
             (json!(true), json!([]))
@@ -357,7 +408,7 @@ mod tests {
                 let store = store.clone();
                 std::thread::spawn(move || {
                     let sub = json!({"name": format!("n{n}"), "bots": ["a"]});
-                    change(&store, "many", Some(&sub), None).unwrap();
+                    change(&store, "many", Some(&sub), None, &[]).unwrap();
                 })
             })
             .collect();
@@ -380,8 +431,8 @@ mod tests {
         assert_eq!(Sub::from_json(&tasks.to_json()), Some(tasks.clone()));
         assert_eq!(parse(&tasks.to_json()), Ok(tasks));
         assert_eq!(all(&store).len(), 2);
-        change(&store, "shop.lead", None, Some("prs")).unwrap();
-        change(&store, "shop.lead", None, Some("tasks")).unwrap();
+        change(&store, "shop.lead", None, Some("prs"), &[]).unwrap();
+        change(&store, "shop.lead", None, Some("tasks"), &[]).unwrap();
         assert_eq!(all(&store).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
