@@ -1,7 +1,11 @@
-//! What a finished piece of the conversation looks like once it is written
-//! into the terminal's scrollback: a prompt, a reply, a tool call. Each
-//! piece is a list of lines already wrapped to the terminal's width, so it
-//! can be inserted above the live area and left to the terminal.
+//! What a piece of the conversation looks like: a prompt, a reply, a tool
+//! call, each a list of lines already wrapped to a width. Markdown is
+//! drawn here for every surface, the one way it is drawn: [`markdown`],
+//! or [`Markdown`] for a reply as it streams, is what the conversation, a
+//! file in the pane, a note in the margin and a card all read what was
+//! written with, its pictures, diagrams, pages, math, tables and code
+//! included; [`crate::screen::Screen`] shows the lines, scrolls, selects,
+//! copies and opens their links, wherever they are.
 use ratatui::{
     layout::Alignment,
     style::{Color, Modifier, Style, Stylize},
@@ -1308,15 +1312,68 @@ pub fn reacted(emoji: &str) -> Line<'static> {
 /// A whole reply, as replayed history shows it, its pictures' paths
 /// read from `folder`.
 pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'static>> {
-    let mut markdown = Markdown::in_folder(folder);
-    let mut out = Vec::new();
+    let leads = (Line::from("• "), Line::from("  "));
+    markdown(&mut Markdown::in_folder(folder), text, width, leads)
+}
+
+/// Markdown as every surface draws it, the one way it is drawn: the
+/// conversation, the pane, the margin, a card. `text` at `width`, read
+/// by `markdown` (the folder its pictures are in, whether a document),
+/// its first row after the first of `leads` and the rest after the
+/// other, in place of the two columns every row of it starts with.
+pub fn markdown(
+    markdown: &mut Markdown,
+    text: &str,
+    width: usize,
+    (first, rest): (Line<'static>, Line<'static>),
+) -> Vec<Line<'static>> {
+    let wide = first.width().max(rest.width());
+    let inner = (width + 2).saturating_sub(wide).max(10);
+    let mut rows = Vec::new();
     for line in text.lines() {
-        let first = out.is_empty();
-        out.extend(markdown.feed(line, width, first));
+        rows.extend(markdown.feed(line, inner, false));
     }
-    let first = out.is_empty();
-    out.extend(markdown.end(width, first));
+    rows.extend(markdown.end(inner, false));
+    let mut out = Vec::with_capacity(rows.len());
+    for (at, row) in rows.into_iter().enumerate() {
+        let lead = if at == 0 { &first } else { &rest };
+        out.push(relead(row, lead));
+    }
     out
+}
+
+/// `row` with its first two columns, the lead Markdown draws, swapped
+/// for `lead`; where it says a wrapped row's lead is, moved to match.
+fn relead(mut row: Line<'static>, lead: &Line<'static>) -> Line<'static> {
+    let more = lead.width() as isize - 2;
+    let marks = row
+        .spans
+        .iter()
+        .take_while(|span| span.content.is_empty())
+        .count();
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(row.spans.len() + lead.spans.len());
+    for span in row.spans.drain(..marks) {
+        match mark(&Line::from(vec![span.clone()])) {
+            Some((columns, joins)) => {
+                spans.push(goes_on(columns.saturating_add_signed(more), joins))
+            }
+            None => spans.push(span),
+        }
+    }
+    spans.extend(lead.spans.iter().cloned());
+    let mut cut = 2usize;
+    for mut span in row.spans.drain(..) {
+        while cut > 0 && !span.content.is_empty() {
+            let c = span.content.chars().next().expect("a character");
+            let columns = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            cut = cut.saturating_sub(columns.max(1));
+            span.content = span.content[c.len_utf8()..].to_owned().into();
+        }
+        if !span.content.is_empty() {
+            spans.push(span);
+        }
+    }
+    Line { spans, ..row }
 }
 
 /// A step on the way to the reply, a call or what the bot said before
@@ -2347,6 +2404,30 @@ mod tests {
         assert_eq!(text(&rows), ["• Here:", "    -a", "    +b"]);
         let rows = reply("$$\nx^2", 40, std::path::Path::new("."));
         assert_eq!(text(&rows), ["•   x^2"]);
+    }
+
+    #[test]
+    fn markdown_reads_the_same_after_any_lead() {
+        let folder = std::path::Path::new(".");
+        let said = "Pick **one** of the `two` that still pass\n- a list";
+        let leads = (Line::from("? "), Line::from("     "));
+        let rows = markdown(&mut Markdown::in_folder(folder), said, 24, leads);
+        assert_eq!(
+            text(&rows),
+            [
+                "? Pick one of the two ",
+                "     that still pass",
+                "     - a list"
+            ]
+        );
+        // Where a wrapped row's lead ends moves with the lead, so the rows
+        // join again as the line they were.
+        assert_eq!(lead(&rows[1]), Some(5));
+        // A reply is Markdown after a bullet.
+        let reply = reply(said, 24, folder);
+        let bullet = (Line::from("• "), Line::from("  "));
+        let same = markdown(&mut Markdown::in_folder(folder), said, 24, bullet);
+        assert_eq!(reply, same);
     }
 
     #[test]
