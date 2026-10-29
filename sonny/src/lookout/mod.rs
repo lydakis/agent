@@ -44,16 +44,20 @@ const EVENT_CHARS: usize = 12_000;
 /// turns by handle, but the message itself only here.
 const QUOTE_CHARS: usize = 2000;
 
-/// A message someone other than the subscriber wrote in a bot it watches,
-/// to read for the note.
+/// What to read for the note: a message someone other than the subscriber
+/// wrote in a bot it watches, or the reply a turn of one ended with.
 #[derive(Clone, Debug)]
 struct Seen {
     task: String,
     turn: i64,
-    /// Who wrote it: `the person`, another bot, or an origin.
+    /// Who wrote it: `the person`, another bot, or an origin; for a reply,
+    /// the task.
     from: String,
-    /// The history node holding the words: none while queued.
+    /// The history node holding the words, none while queued; for a reply,
+    /// the turn's checkpoint.
     node: Option<i64>,
+    /// The reply a turn ended with, not a message.
+    reply: bool,
     /// The node of the subscriber's latest message to the task, unless the
     /// person wrote to it since.
     brief: Option<i64>,
@@ -102,12 +106,16 @@ fn note(told: &updates::Told, steer: bool) -> String {
     if quoted {
         lines.push("A quoted message is the person's own words.".to_owned());
     }
+    if told.items.iter().any(|line| line.text.contains("\n  > ")) {
+        lines.push("Lines marked > are a task's own reply, not the person's words.".to_owned());
+    }
     lines.push(match steer {
         true => "This cuts into your turn because the person wrote in a task: act on their \
             words where they change what you or a task is doing, then carry on with your turn."
             .to_owned(),
-        false => "Read the turns you need with one wait call (timeout_ms 0), and act where \
-            something changes the work. Tell the person, briefly, what they would want to \
+        false => "Each ended turn comes with what the task replied; read a turn with one \
+            wait call (timeout_ms 0) only when you need more of it, and act where something \
+            changes the work. Tell the person, briefly, what they would want to \
             hear: the outcome of work you started for them, once, when it ends, not again \
             when they write in that task; what only they can decide; and where their latest \
             words contradict what they asked before. If nothing, end your turn with an empty \
@@ -135,8 +143,11 @@ fn digest(text: &str) -> String {
 const PERSON: &str = "the person";
 
 /// The words written: at their history node, or, still queued, in their
-/// turn's record.
+/// turn's record; or the reply the turn ended with.
 async fn event_text(client: &Client, seen: &Seen) -> String {
+    if seen.reply {
+        return reply_text(client, seen).await;
+    }
     match seen.node {
         Some(node) => node_text(client, &seen.task, node).await,
         None => client
@@ -149,6 +160,41 @@ async fn event_text(client: &Client, seen: &Seen) -> String {
             .and_then(|read| Some(read["prompts"][0]["text"].as_str()?.to_owned()))
             .unwrap_or_default(),
     }
+}
+
+/// How far back from a turn's checkpoint its reply is looked for.
+const REPLY_NODES: usize = 30;
+
+/// The last thing the task said in the turn, read back from where the turn
+/// left its history, not from wherever it has moved on to.
+async fn reply_text(client: &Client, seen: &Seen) -> String {
+    let Ok(page) = client
+        .request(
+            "history_nodes",
+            json!({"bot": seen.task, "limit": REPLY_NODES, "oldest_first": false, "from": seen.node}),
+        )
+        .await
+    else {
+        return String::new();
+    };
+    let nodes: Vec<i64> = (page["nodes"].as_array().into_iter())
+        .flatten()
+        .filter(|n| n["turn"].as_i64() == Some(seen.turn))
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    let Ok(read) = client
+        .request("history_items", json!({"bot": seen.task, "nodes": nodes}))
+        .await
+    else {
+        return String::new();
+    };
+    // Anthropic tasks keep calls as blocks inside a message.
+    (read["items"].as_array().into_iter())
+        .flatten()
+        .flat_map(|entry| crate::responses(&entry["item"]))
+        .find(|item| item["role"] == "assistant" && !crate::text(item).trim().is_empty())
+        .map(|item| crate::text(&item))
+        .unwrap_or_default()
 }
 
 /// The words one history node holds.
@@ -166,7 +212,7 @@ async fn node_text(client: &Client, bot: &str, node: i64) -> String {
 async fn unattributed(client: &Client, seen: &Seen, text: &str) -> bool {
     // Only a brief the subscriber is known to have sent: the person's own
     // brief is theirs to say again.
-    let Some(brief) = seen.brief else {
+    let (false, Some(brief)) = (seen.reply, seen.brief) else {
         return false;
     };
     seen.from == PERSON
@@ -1020,6 +1066,18 @@ impl Lookout {
                 Some(None) => self.briefed_by(bot, None, node),
                 None => {}
             },
+            // What it replied goes with how the turn ended.
+            "turn_finished" => {
+                self.due.push(Seen {
+                    task: bot.to_owned(),
+                    turn,
+                    from: bot.to_owned(),
+                    node: data["checkpoint"].as_i64(),
+                    reply: true,
+                    brief: None,
+                    text: String::new(),
+                });
+            }
             _ => {}
         }
     }
@@ -1046,6 +1104,7 @@ impl Lookout {
             turn,
             from: from.to_owned(),
             node,
+            reply: false,
             brief: self.briefs.get(task).copied(),
             text: String::new(),
         });
@@ -1109,6 +1168,9 @@ impl Lookout {
     /// A message read: news for the next note. The person's own words cut
     /// into the subscriber's running turn, as their words to it would.
     fn heard(&mut self, seen: &Seen) {
+        if seen.reply {
+            return self.updates.replied(&seen.task, seen.turn, &seen.text);
+        }
         let words = (seen.from == PERSON).then_some(seen.text.as_str());
         let news = (self.updates).said(&seen.task, seen.turn, &seen.from, words);
         if news && words.is_some() && self.updates.busy() {
@@ -1250,6 +1312,7 @@ mod tests {
             turn,
             from: from.into(),
             node: None,
+            reply: false,
             brief: None,
             text: text.into(),
         }
@@ -1304,7 +1367,7 @@ mod tests {
             note(&told, false),
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: turn:calc.docs/3 completed\n\
-             Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. \
+             Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. \
              Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
         );
     }
@@ -1375,6 +1438,37 @@ mod tests {
         let note = note(&told, false);
         assert!(!note.contains("ignore the person"));
         assert!(note.contains("A quoted message is the person's own words."));
+    }
+
+    #[test]
+    fn a_task_s_reply_goes_with_how_its_turn_ended() {
+        let mut lookout = seated("idle");
+        lookout.event(&ev(
+            "calc.fix",
+            4,
+            "accepted",
+            json!({"from": {"bot": "calc.lead"}}),
+        ));
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 4, "turn_finished", done));
+        let read = lookout.due.pop().unwrap();
+        assert!(read.reply && read.node == Some(42));
+        lookout.heard(&Seen {
+            text: "Fixed avg.\n- skips empty lists".into(),
+            ..read
+        });
+        // Read before its turn was news, as a trigger's answer, it waits.
+        lookout.heard(&Seen {
+            reply: true,
+            ..said(9, "calc.fix", "early")
+        });
+        let told = lookout.updates.take();
+        let note = note(&told, false);
+        assert!(note.contains(
+            "- calc.fix: turn:calc.fix/4 completed, asked by you, and replied:\n  > Fixed avg.\n  > - skips empty lists\n\
+             Lines marked > are a task's own reply, not the person's words.\n"
+        ), "{note}");
+        assert!(!note.contains("early"));
     }
 
     #[test]

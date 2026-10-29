@@ -25,11 +25,17 @@ use std::{
 pub const DOUBT: Duration = Duration::from_secs(60);
 const WAKE_TASKS: usize = 32;
 /// About what one note may take, well under the daemon's prompt limit; a
-/// line other than the person's words counts as `LINE_BYTES`.
-const NOTE_BYTES: usize = 64 * 1024;
+/// line other than the person's words and the tasks' replies counts as
+/// `LINE_BYTES`.
+const NOTE_BYTES: usize = 192 * 1024;
 const LINE_BYTES: usize = 160;
 /// How many messages a task's news keeps the person's words for.
 const PENDING: usize = 128;
+/// How much of a task's reply a note carries, in characters: the whole of
+/// almost any, so the lead need not read the turn again.
+pub const REPLY_CHARS: usize = 32_000;
+/// How many replies read before their turn's news are kept for it.
+const EARLY_REPLIES: usize = 256;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
@@ -55,6 +61,8 @@ struct Turn {
     which: Option<String>,
     /// The turn resolved the task, with the task's own `resolve_task`.
     resolved: bool,
+    /// What the task replied, ending the turn.
+    reply: Option<String>,
 }
 
 /// A message written in a task: who wrote it, and the words, only when
@@ -178,6 +186,9 @@ pub struct Updates {
     opened: u64,
     /// Tasks' turns that resolved them, until they are told.
     resolving: crate::resolved::Own,
+    /// Replies read before their turn was news, as a trigger's answer the
+    /// lead hears only if the trigger does not pass it on.
+    replies: HashMap<Key, String>,
 }
 
 fn now_ms() -> u64 {
@@ -207,6 +218,7 @@ impl Updates {
             memory_seen: None,
             opened: now_ms(),
             resolving: Default::default(),
+            replies: HashMap::new(),
         }
     }
 
@@ -478,6 +490,32 @@ impl Updates {
         true
     }
 
+    /// What a task replied, ending a turn: told with that turn's news,
+    /// cut at `REPLY_CHARS`.
+    pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
+        let text = text.trim();
+        if !self.live || text.is_empty() {
+            return;
+        }
+        let reply = super::cut(text, REPLY_CHARS);
+        let news = (self.tasks.iter_mut()).find(|(task, _)| task == name);
+        let told = news.and_then(|(_, news)| {
+            [&mut news.act, &mut news.theirs]
+                .into_iter()
+                .flatten()
+                .find(|t| t.turn == turn && t.status != APPROVAL && t.status != QUIET)
+        });
+        match told {
+            Some(t) => t.reply = Some(reply),
+            None => {
+                if self.replies.len() >= EARLY_REPLIES {
+                    self.replies.clear();
+                }
+                self.replies.insert((name.to_owned(), turn), reply);
+            }
+        }
+    }
+
     fn tell(
         &mut self,
         name: &str,
@@ -503,6 +541,10 @@ impl Updates {
             _ if from.as_deref() == Some(self.lead.as_str()) => Some("you".to_owned()),
             _ => Some(from.or(origin).unwrap_or_else(|| "the person".into())),
         };
+        let reply = match status {
+            APPROVAL | QUIET => None,
+            _ => self.replies.remove(&(name.to_owned(), turn)),
+        };
         let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
@@ -518,6 +560,7 @@ impl Updates {
             count: 1,
             which,
             resolved,
+            reply,
         };
         news.merge(match theirs {
             true => News {
@@ -690,7 +733,12 @@ impl Updates {
                 (turns.into_iter())
                     .filter_map(|(theirs, t)| Some(line(&name, theirs, t.as_ref()?))),
             );
-            bytes += 2 * LINE_BYTES;
+            let replies = [&news.act, &news.theirs].into_iter().flatten();
+            bytes += 2 * LINE_BYTES
+                + replies
+                    .filter_map(|t| t.reply.as_ref())
+                    .map(String::len)
+                    .sum::<usize>();
             sent.push((name, news));
         }
         later.extend(rest);
@@ -854,6 +902,14 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
             t.count - 1,
             t.first
         ));
+    }
+    // The task's own words, apart from the person's: each line marked.
+    if let Some(reply) = &t.reply {
+        text.push_str(", and replied:");
+        for line in reply.lines() {
+            text.push_str("\n  > ");
+            text.push_str(line);
+        }
     }
     let which = t.which.as_deref().unwrap_or("");
     Line {
@@ -1162,7 +1218,7 @@ mod tests {
     fn messages_past_one_note_s_bytes_wait_for_the_next() {
         let mut updates = fleet();
         let words = "x".repeat(super::super::QUOTE_CHARS);
-        for turn in 1..=50 {
+        for turn in 1..=120 {
             updates.said(
                 "shop.fix",
                 turn,
@@ -1172,14 +1228,14 @@ mod tests {
         }
         let first = updates.take();
         let told = first.items.len();
-        assert!((20..50).contains(&told), "{told}");
+        assert!((60..120).contains(&told), "{told}");
         // The person's words left for the next note still wait.
         assert!(updates.quoting());
         assert!(first.items.iter().map(|i| i.text.len()).sum::<usize>() <= NOTE_BYTES);
         assert_eq!(first.more, 1);
         updates.sent(first);
         let second = updates.take();
-        assert_eq!(second.items.len(), 50 - told);
+        assert_eq!(second.items.len(), 120 - told);
         assert!(!updates.quoting());
         let next = format!("- shop.fix: turn:shop.fix/{},", told + 1);
         assert!(

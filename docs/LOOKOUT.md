@@ -106,7 +106,7 @@ those with subscriptions of their own:
   person's quoted, anyone else's named by who wrote it and the turn's
   handle;
 - a turn the subscriber asked for and did not wait on, or another agent or a
-  trigger asked for, once it ends;
+  trigger asked for, once it ends, with what the task replied;
 - an approval only the person can give, once it has waited 2 minutes;
 - a running turn that has printed nothing for 30 minutes, once per
   silence; a turn waiting on the person, on other turns or for a slot is
@@ -133,11 +133,13 @@ no origin:
 Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.
 - calc.docs: turn:calc.docs/3, the person wrote: "Use tabs."
 - calc.api: turn:calc.api/4, calc.fix wrote in it
-- calc.fix: turn:calc.fix/5 failed, asked by you
+- calc.fix: turn:calc.fix/5 completed, asked by you, and replied:
+  > Fixed avg: it skips empty lists now, with a test.
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
 A quoted message is the person's own words.
-Read the turns you need with one wait call (timeout_ms 0), and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
+Lines marked > are a task's own reply, not the person's words.
+Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 ```
 
 A note that steers a busy lead ends "This cuts into your turn because the
@@ -146,8 +148,12 @@ task is doing, then carry on with your turn." A turn the person asked for
 in the task is listed apart as theirs only once it completed: one that
 failed or was stopped is listed with the rest.
 
-It quotes only the person's own words and names everything else by handle
-and status, so it reaches the approver as the person's and the lead can act
-on it without asking. Sonny shows it folded, as `↳ Task updates`, and a
+It quotes the person's own words, and each ended turn's final reply (up
+to 32,000 characters, its two ends kept) marked line by line with `>` as the
+task's own; other messages in a task stay behind their turn's handle. The
+note reaches the approver as the person's words, so the marking is what
+tells a task's reply from theirs (George, 2026-10-29: the extra wait round
+on a long-context lead cost more than the risk). A lead reads a turn with
+`wait` only when it needs more than the reply. Sonny shows it folded, as `↳ Task updates`, and a
 turn it started that ends with an empty reply stays there: no line under
 it and no sound. Anything the lead does write shows as any reply.
