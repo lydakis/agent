@@ -1,4 +1,4 @@
-//! The pane beside the conversation on the full screen, where what the
+//! The pane beside the conversation, where what the
 //! person opens to look at goes instead of over the conversation: a file
 //! they clicked, as a preview, `/status`, or a side chat. Its rows are a [`Screen`] of
 //! their own, so they scroll, select, copy and follow links as the

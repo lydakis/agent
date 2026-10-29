@@ -1516,6 +1516,8 @@ struct App {
     starting: Option<(usize, usize)>,
     task_style: started::Style,
     tasks_read: Option<Instant>,
+    /// The width the tasks started were drawn at.
+    tasks_width: usize,
     /// A button clicked in the conversation, which [`App::press`] takes.
     pressed: Option<String>,
     /// How many triggers and subscriptions run for this agent, as the
@@ -2198,6 +2200,7 @@ impl App {
             starting: None,
             task_style: started::Style::chosen(),
             tasks_read: None,
+            tasks_width: 0,
             pressed: None,
         }
     }
@@ -2940,6 +2943,14 @@ impl App {
     /// What the tasks started are doing, read again every few seconds:
     /// those still at work, and every one when news of them came.
     async fn read_tasks(&mut self) {
+        // Drawn again at the width the conversation has now, as when the
+        // pane opened beside it.
+        if !self.tasks.is_empty() && self.tasks_width != self.prose() {
+            self.tasks_width = self.prose();
+            for at in 0..self.tasks.len() {
+                self.draw_started(at);
+            }
+        }
         if self.tasks.is_empty()
             || self
                 .tasks_read
@@ -8246,13 +8257,13 @@ mod tests {
         start(&mut app, "add");
         start(&mut app, "neg");
         let rows = drawn(&mut app);
-        assert_eq!(rows[0], "◆ Started 2 tasks");
-        assert!(rows[1].starts_with("  ○ add  Fix add") && rows[1].ends_with("starting ›"));
+        assert_eq!(rows[0], "◆ Started 2 tasks · click one to open it");
+        assert_eq!(rows[1], "  ○ add  starting  Fix add");
         // What each does is read, and drawn where they are.
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert!(rows[1].starts_with("  ✓ add") && rows[1].ends_with("done ›"));
-        assert!(rows[2].starts_with("  ● neg") && rows[2].ends_with("working ›"));
+        assert_eq!(rows[1], "  ✓ add  done     Fix add");
+        assert_eq!(rows[2], "  ● neg  working  Fix neg");
         // A click on a task's row opens that task.
         let links = app.screen.links();
         assert_eq!(links[0], None);

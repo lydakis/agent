@@ -192,12 +192,14 @@ agent then does. Esc stops a command still running.
 
 An emoji sent alone is a reaction, not a message: it goes under the
 agent's last reply and is attached to the agent's next call, so it starts
-no turn. `/react` picks an older reply, and sending an emoji already on a
+no turn. While something waits to go with the next call, the footer shows
+a small 📎 (`📎 2` for two). `/react` picks an older reply, and sending an emoji already on a
 reply takes it off. The agent reacts too, with a `react` tool Sonny
 declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
-once it answers. Its reactions are drawn when its turn ends, so one taken
-off again never shows.
+once it answers. Its reactions are drawn under the message they answer
+when its turn ends, so one taken off again never shows, and a reaction of
+yours to an older reply goes under that reply.
 
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
@@ -206,13 +208,13 @@ off again never shows.
 `/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
-  window, taken where it is now, mid-turn included: in the pane beside
-  the conversation on the full screen, on the alternate screen inline.
+  window, taken where it is now, mid-turn included, in the pane beside
+  the conversation.
   The copy answers from the agent's history and may call no tool;
   follow-ups stay with it, and Esc goes back. In the pane, every key goes
   to the side chat but Ctrl+], which goes back to the main composer
   while the side chat stays open. The agent carries on meanwhile, in
-  view on the full screen, waiting on the main screen inline. The daemon
+  view. The daemon
   deletes the copy once it has been idle 15 minutes (`fork --expires`), and
   no copy shows among the project's agents, in `/status`, or to the
   lookout.
@@ -251,7 +253,7 @@ off again never shows.
   the agent may retry it once; the retry is still reviewed, and the judge
   reads your words as consent. This is Codex's `/approve`.
 - `/status` shows the project's agents, and its running Errand jobs, in
-  the pane beside the conversation on the full screen. The
+  the pane beside the conversation. The
   lead comes first; its tasks follow grouped by where they stand: **Needs
   you** (waiting on your approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
@@ -268,7 +270,7 @@ off again never shows.
   turn took. An agent with triggers or lookout subscriptions of its own
   shows `↻ 2 triggers` beside its model.
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
-  conversation on the full screen, what runs for the project's agents with
+  conversation, what runs for the project's agents with
   no one typing: the triggers that wake them, with
   when each fires, its message and what its last fire did, and the
   lookout's subscriptions, with how many checks each asked for in the last
@@ -380,9 +382,7 @@ Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are
 answered.
 
-The look follows Codex's TUI (openai/codex, `codex-rs/tui`): finished history
-goes into the terminal's own scrollback above a small inline viewport,
-replies stream a line at a time, a tool call is one `• Ran …` line with a
+The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, a tool call is one `• Ran …` line with a
 short `└` look at its result, edits show as a diff, and a status row says
 `Working (12s • esc to interrupt)`. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
@@ -395,8 +395,33 @@ opened). Commands, reads and edits are left out. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-Sonny owns the whole screen, as Codex does. The conversation and the
-composer keep to a column 100 wide, however wide the window, so a reply
+Some rows are buttons. Calls of one kind in a row, such as three tasks
+messaged one after another, fold into one row (`• Messaged calc.add,
+calc.neg and calc.div ▸`) that a click opens to each call and folds
+again. A question the agent asks you lists its options, and a click on one
+answers with it. What agents tell each other stays quiet: a message from
+another agent, or the lead's task updates, is one dim row with who sent it
+and its first words, and a click opens the whole message. A turn that ends
+with the model saying nothing (`empty_completion`) ends quietly, not as a
+failure.
+
+![Memory saves folded into one row, and a question whose options are buttons](../docs/sonny/fold-and-ask.png)
+
+![A message from the task calc.neg opened under its row, and the lead's task updates as one row](../docs/sonny/agents-message-opened.png)
+
+The tasks the lead starts show where it started them, as one roster for
+the tasks started together, each task with what it is doing now (starting,
+working, needs you, done, failed), read again every few seconds. A click
+on a task opens it in the pane: its own Sonny, live, to watch and to talk
+to, as a side chat is. Ctrl+] takes the keys back to the conversation and
+gives them to the pane again; Esc in the conversation closes the pane.
+
+![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
+
+![The task calc.neg opened in the pane beside the lead's conversation](../docs/sonny/task-in-pane.png)
+
+Sonny owns the whole screen, as Codex does; there is no inline mode.
+The conversation and the composer keep to a column 100 wide, however wide the window, so a reply
 reads as a column rather than a band across the screen. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
 it, older messages loading as you go past the first; rows that arrive
@@ -420,13 +445,13 @@ the file in the app the system opens it with, and Esc closes it. Links
 are the terminal's own links too, so its link click (Cmd+click, or
 Shift+Cmd+click in Ghostty) opens a file outside Sonny from the
 conversation. Keys go
-to the pane after a click in it; Tab takes them back to the composer, and
-Tab with nothing typed puts them in the pane again. A window too narrow for
+to the pane after a click in it; Ctrl+] (or Tab, in a pane that is not a
+chat) takes them back to the composer, and Ctrl+], or Tab with nothing
+typed, puts them in the pane again. Sonny binds no Shift+Tab: multiplexers
+switch tabs with it. A window too narrow for
 both shows the one the keys are in. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
-newer, and Esc stops where you are. `/fullscreen` switches
-to inline, where Sonny writes into the terminal's own scrollback, and back;
-the choice is kept with the other settings.
+newer, and Esc stops where you are.
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 

@@ -90,7 +90,7 @@ pub fn draw(style: Style, tasks: &[Task], width: usize) -> Vec<(Line<'static>, O
 }
 
 /// `◆ Started 3 tasks`, then a row for each: its state's mark, its name,
-/// its brief cut to fit, and its state at the end.
+/// what it is doing, and its brief cut to fit.
 fn roster(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
     let count = match tasks.len() {
         1 => "1 task".to_owned(),
@@ -100,16 +100,15 @@ fn roster(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
         Line::from(vec![
             Span::raw("◆ ").fg(Color::Magenta),
             Span::raw(format!("Started {count}")).bold(),
+            Span::raw(" · click one to open it").dim(),
         ]),
         None,
     )];
     let names = tasks.iter().map(|t| t.name.width()).max().unwrap_or(0);
+    let states = tasks.iter().map(|t| t.state.width()).max().unwrap_or(0);
     for (at, task) in tasks.iter().enumerate() {
-        let end = format!("{} ›", task.state);
-        // "  ● name  brief   state ›"
-        let room = width.saturating_sub(4 + names + 2 + 2 + end.width());
-        let brief = cut(first(&task.brief), room);
-        let pad = room.saturating_sub(brief.width());
+        // "  ● name  state  brief"
+        let room = width.saturating_sub(4 + names + 2 + states + 2);
         out.push((
             Line::from(vec![
                 Span::raw("  "),
@@ -117,9 +116,9 @@ fn roster(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
                 Span::raw(" "),
                 Span::raw(format!("{:<names$}", task.name)).bold(),
                 Span::raw("  "),
-                Span::raw(brief),
-                Span::raw(" ".repeat(pad + 2)),
-                Span::raw(end).dim(),
+                Span::raw(format!("{:<states$}", task.state)).dim(),
+                Span::raw("  "),
+                Span::raw(cut(first(&task.brief), room)),
             ]),
             Some(at),
         ));
@@ -214,9 +213,9 @@ mod tests {
         assert_eq!(
             texts(roster(&tasks, 60)),
             [
-                "◆ Started 2 tasks",
-                "  ● add     Fix the add bug: 2+2 returns 5         working ›",
-                "  ✓ divide  Fix division by zero                      done ›",
+                "◆ Started 2 tasks · click one to open it",
+                "  ● add     working  Fix the add bug: 2+2 returns 5",
+                "  ✓ divide  done     Fix division by zero",
             ]
         );
         let rows = roster(&tasks, 60);
