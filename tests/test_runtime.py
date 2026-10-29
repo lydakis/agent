@@ -1228,6 +1228,12 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(sent[-2], [{'type': 'tool_result', 'tool_use_id': 'toolu_1',
                                      'content': f'[This tool result is left out: {why}.]'}])
         self.assertEqual(sent[-1], [{'type': 'text', 'text': 'again'}])
+        # The history reads give the originals back; only the model gets notes.
+        with closing(sqlite3.connect(path / 'state.sqlite')) as db:
+            kept = [row[0] for row in db.execute('SELECT node FROM declined ORDER BY node')]
+        items = [node_item(client, 'Bob', node)['result'] for node in kept]
+        self.assertEqual(items[0]['content'][0]['text'], words)
+        self.assertEqual(items[1]['content'][0]['content'], read[5:])
         # The person's words stay in the record, and a retry still matches them.
         turns = client.request('turns', bot='Bob', after=0, limit=8)['result']['turns']
         self.assertEqual(turns[0]['prompt_preview'], words[:200])

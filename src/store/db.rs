@@ -4438,10 +4438,10 @@ impl Database {
         // Already single-line items need no rewrite (escaped newlines are fine).
         // Pictures go without their bytes, as other history reads return them.
         let mut length = self.conn.prepare_cached(&format!(
-            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+            "SELECT length({READING_ITEM}) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut slice = self.conn.prepare_cached(&format!(
-            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+            "SELECT substr({READING_ITEM},?,?) FROM (SELECT {PICTURELESS} AS item FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut text = String::new();
         let mut position = 0_u64;
@@ -4541,13 +4541,15 @@ impl Database {
         // view has may not be in the item as stored: the view decides.
         let mut contains = self.conn.prepare_cached(
             "SELECT instr(item,x'0a')>0 OR instr(item,x'0d')>0
-                OR instr(lower(CAST(item AS TEXT)),?2)>0 FROM nodes WHERE id=?1",
+                OR instr(lower(CAST(item AS TEXT)),?2)>0
+             FROM (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)",
         )?;
         // The raw item may match only in what the view leaves out, such as
         // a picture's bytes, so a match counts once the view has it too.
         let mut reading = self.conn.prepare_cached(&format!(
             "SELECT CAST({READING_ITEM} AS TEXT),json_extract(CAST(item AS TEXT),'$.type')
-             FROM (SELECT {PICTURELESS} AS item FROM nodes WHERE id=?)"
+             FROM (SELECT {PICTURELESS} AS item FROM
+                (SELECT COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?))"
         ))?;
         let mut rows = chain.query(params![head])?;
         let mut skipping = own || before.is_some();
@@ -8505,7 +8507,8 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin
-             FROM (SELECT id,{PICTURELESS} AS item FROM nodes WHERE id=?1) n
+             FROM (SELECT id,{PICTURELESS} AS item FROM
+                (SELECT n.id,COALESCE(d.item,n.item) AS item FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
              LEFT JOIN senders s ON s.node=n.id"
         ))?;
         for &node in wanted {
@@ -8909,7 +8912,11 @@ impl Database {
         }
         let item: Vec<u8> =
             self.conn
-                .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+                .query_row(
+                    "SELECT COALESCE(d.item,n.item) FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
+                    [node],
+                    |r| r.get(0),
+                )?;
         let Some((_, _, output)) = super::context::tool_result(&item) else {
             return fail("result_not_found");
         };

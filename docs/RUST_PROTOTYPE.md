@@ -812,8 +812,9 @@ replaces, so the context's byte accounting does not change; a shorter wording
 is used where the full one does not fit, and an item too small for any keeps
 its own. Everything before it is unchanged, so no thinking binding or prompt
 cache is touched. The originals stay in the `declined` table (schema 61):
-turn listings show the person's prompt, and a retry with the same request id
-still matches it. A node another bot also reaches, as a fork taken while the
+turn listings and the history reads (`history_items`, `history_read`,
+`history_search`, `result`) show them, and a retry with the same request id
+still matches the person's prompt. A node another bot also reaches, as a fork taken while the
 request was out does, is that bot's history too: it and what came before it
 stay as they are.
 
