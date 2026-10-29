@@ -535,6 +535,11 @@ impl Screen {
         self.back = 0;
     }
 
+    /// How many rows it holds, wrapped or not.
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
     /// How many rows the view is up from the newest.
     pub fn back(&self) -> usize {
         self.back
@@ -544,6 +549,11 @@ impl Screen {
     /// were drawn again.
     pub fn hold(&mut self, back: usize) {
         self.back = back;
+    }
+
+    /// The oldest rows went to make room, and those above are not drawn.
+    pub fn trimmed(&self) -> bool {
+        self.trimmed
     }
 
     /// The view is a few screens from the first row, or nearer, and the
@@ -570,7 +580,44 @@ impl Screen {
         );
         self.placed = None;
         self.swap(0, older.rows);
-        self.let_go();
+        self.let_go(None);
+    }
+
+    /// Blank rows above the first row standing in for `pages`, from the
+    /// first, each as many rows as it says, until the view nears it.
+    pub fn prepend_blank(&mut self, pages: Vec<(u64, usize)>) {
+        if pages.is_empty() {
+            return;
+        }
+        let pages: Vec<Page> = (pages.into_iter())
+            .map(|(id, rows)| Page {
+                id,
+                rows: rows.max(1),
+                drawn: false,
+            })
+            .collect();
+        let rows = pages.iter().map(|page| page.rows).sum();
+        // One page as tall as them all, then each its own.
+        self.pages.insert(
+            0,
+            Page {
+                id: 0,
+                rows: 0,
+                drawn: false,
+            },
+        );
+        self.placed = None;
+        let blank = Arc::new(Line::default());
+        let rows = (0..rows).map(|_| Row {
+            line: blank.clone(),
+            rest: None,
+            link: None,
+            tag: None,
+            buttons: Vec::new(),
+        });
+        self.swap(0, rows.collect());
+        self.pages.splice(0..1, pages);
+        self.placed = None;
     }
 
     /// The page `id`, let go before, drawn again with the rows `older` was
@@ -581,7 +628,7 @@ impl Screen {
         };
         self.pages[page].drawn = true;
         self.swap(page, older.rows);
-        self.let_go();
+        self.let_go(Some(page));
     }
 
     /// The pages of older items, from the first, and how many rows each
@@ -591,44 +638,6 @@ impl Screen {
         (self.pages.iter().enumerate())
             .map(|(p, page)| (page.id, placed.get(p).map_or(page.rows, |at| at.len())))
             .collect()
-    }
-
-    /// Blank rows over the rest for each of `pages`, as tall as it was,
-    /// to be drawn again as the view nears it: the view stays as many
-    /// rows up from the newest.
-    pub fn blank(&mut self, pages: Vec<(u64, usize)>) {
-        let blank = Arc::new(Line::default());
-        let rows: usize = pages.iter().map(|(_, rows)| rows).sum();
-        self.rows.splice(
-            0..0,
-            (0..rows).map(|_| Row {
-                line: blank.clone(),
-                rest: None,
-                link: None,
-                tag: None,
-                buttons: Vec::new(),
-            }),
-        );
-        // Rows wrapped already are wrapped again under them.
-        self.shown.clear();
-        self.wrapped = 0;
-        self.relaid = 0;
-        self.selection = None;
-        self.linked = None;
-        for spot in [&mut self.go_to, &mut self.keep].into_iter().flatten() {
-            spot.0 += rows;
-        }
-        if let Some(top) = &mut self.top_row {
-            *top += rows;
-        }
-        let pages = pages.into_iter().map(|(id, rows)| Page {
-            id,
-            rows,
-            drawn: false,
-        });
-        self.pages.splice(0..0, pages);
-        self.placed = None;
-        self.laid += 1;
     }
 
     /// A page let go that the view is near, the nearest: to draw again.
@@ -730,8 +739,9 @@ impl Screen {
     }
 
     /// Past what pages keep drawn, those farthest from the view let go,
-    /// each for blank rows as tall, so nothing moves.
-    fn let_go(&mut self) {
+    /// each for blank rows as tall, so nothing moves; never `kept`, just
+    /// drawn.
+    fn let_go(&mut self, kept: Option<usize>) {
         let placed = self.placed();
         let drawn = |pages: &[Page]| -> usize {
             (pages.iter().zip(&placed))
@@ -748,7 +758,9 @@ impl Screen {
         let mut far: Vec<usize> = (0..self.pages.len())
             .filter(|&p| {
                 let at = &placed[p];
-                self.pages[p].drawn && !(at.start < near.end && near.start < at.end)
+                self.pages[p].drawn
+                    && Some(p) != kept
+                    && !(at.start < near.end && near.start < at.end)
             })
             .collect();
         far.sort_by_key(|&p| std::cmp::Reverse(placed[p].start.abs_diff(bottom)));
@@ -995,6 +1007,7 @@ impl Screen {
     /// The next place the text found is: older, or newer, round to the
     /// other end past the last.
     pub fn find_next(&mut self, older: bool) {
+        let bottom = self.shown.len() - self.back.min(self.shown.len());
         let Some(finding) = &mut self.finding else {
             return;
         };
@@ -1002,11 +1015,71 @@ impl Screen {
         if count == 0 {
             return;
         }
-        finding.at = match older {
-            true => (finding.at + count - 1) % count,
-            false => (finding.at + 1) % count,
+        let above = (finding.hits).partition_point(|(start, _)| start.0 < bottom);
+        finding.at = match (older, finding.at < count) {
+            (true, true) => (finding.at + count - 1) % count,
+            (false, true) => (finding.at + 1) % count,
+            // No place yet, as when none was until pages were drawn: the
+            // nearest the view, that way.
+            (true, false) => (above + count - 1) % count,
+            (false, false) => above % count,
         };
         self.reveal();
+    }
+
+    /// A page let go between the place found and the next one, `older`
+    /// or newer, round past the last as stepping goes, the nearest it,
+    /// but those `looked` through already: to draw before stepping, so
+    /// what it holds is found too.
+    pub fn find_gap(&mut self, older: bool, looked: &[u64]) -> Option<u64> {
+        // Nothing looked for, nothing to draw for it.
+        let finding = (self.finding.as_ref())
+            .filter(|f| !f.query.is_empty() && f.at != AGAIN && f.laid == self.laid)?;
+        let bottom = self.shown.len() - self.back.min(self.shown.len());
+        let starts: Vec<usize> = finding.hits.iter().map(|(start, _)| start.0).collect();
+        let at = finding.at;
+        // The place shown and those either side; with none, the view's.
+        let (here, prev, next) = match starts.get(at) {
+            Some(&here) => (
+                here,
+                at.checked_sub(1).map(|at| starts[at]),
+                starts.get(at + 1).copied(),
+            ),
+            None => (
+                bottom,
+                starts.iter().rev().find(|s| **s < bottom).copied(),
+                starts.iter().find(|s| **s >= bottom).copied(),
+            ),
+        };
+        let end = self.shown.len();
+        // Up to the next place; past the last, round from the other end.
+        let ranges = match older {
+            true => [
+                (prev.unwrap_or(0), here),
+                match prev {
+                    Some(_) => (end, end),
+                    None => (starts.last().copied().unwrap_or(here), end),
+                },
+            ],
+            false => [
+                (here, next.unwrap_or(end)),
+                match next {
+                    Some(_) => (0, 0),
+                    None => (0, starts.first().copied().unwrap_or(here)),
+                },
+            ],
+        };
+        let placed = self.placed();
+        ranges.into_iter().find_map(|(from, to)| {
+            let gaps = (self.pages.iter().zip(&placed))
+                .filter(|(page, at)| !page.drawn && at.start < to && from < at.end)
+                .filter(|(page, _)| !looked.contains(&page.id));
+            let nearest = match older {
+                true => gaps.max_by_key(|(_, at)| at.start),
+                false => gaps.min_by_key(|(_, at)| at.start),
+            };
+            nearest.map(|(page, _)| page.id)
+        })
     }
 
     /// Stop finding, the view left where it is.
@@ -2259,7 +2332,7 @@ mod tests {
         // rows as tall as they were, the view on the newest.
         screen.clear();
         screen.push(lines(20_000..20_050, "new"));
-        screen.blank(pages);
+        screen.prepend_blank(pages);
         let buf = drawn(&mut screen, area);
         assert_eq!(row(&buf, 4).trim_end(), "new 20049");
         assert_eq!(screen.height(20), 9_050);
@@ -2277,6 +2350,102 @@ mod tests {
         screen.fill(2, written(rows(0..3_000)));
         let buf = drawn(&mut screen, area);
         assert_eq!(row(&buf, 0).trim_end(), "row 0");
+    }
+
+    #[test]
+    fn pages_put_above_blank_wait_for_the_view_and_are_drawn_in_place() {
+        let area = Rect::new(0, 0, 20, 5);
+        let (mut screen, _) = screen(rows(20_000..20_050), 20, 5);
+        drawn(&mut screen, area);
+        // Guessed at 100 rows each; the view goes up to the first.
+        screen.prepend_blank(vec![(1, 100), (2, 100), (3, 100)]);
+        let buf = drawn(&mut screen, area);
+        assert_eq!(row(&buf, 4).trim_end(), "row 20049");
+        assert_eq!(screen.height(20), 350);
+        screen.scroll(isize::MAX);
+        drawn(&mut screen, area);
+        assert_eq!(screen.wanted(), Some(1));
+        // Drawn shorter than guessed, at the top all the same.
+        screen.fill(1, written(rows(0..30)));
+        let buf = drawn(&mut screen, area);
+        assert_eq!(row(&buf, 0).trim_end(), "row 0");
+        assert_eq!(screen.height(20), 280);
+        assert_eq!(screen.wanted(), Some(2));
+    }
+
+    #[test]
+    fn find_draws_the_pages_let_go_on_the_way_to_the_next_place() {
+        let area = Rect::new(0, 0, 20, 200);
+        let (mut screen, _) = screen(lines(0..50, "tail"), 20, 200);
+        screen.prepend(1, written(lines(0..7_000, "middle")));
+        screen.prepend(2, written(lines(0..7_000, "old")));
+        drawn(&mut screen, area);
+        assert!(!screen.pages[0].drawn && screen.pages[1].drawn);
+        screen.find("old 1");
+        drawn(&mut screen, area);
+        // Nothing found in the rows drawn; either way round, the page let go is.
+        assert_eq!(screen.found(), Some((0, 0)));
+        assert_eq!(screen.find_gap(false, &[]), Some(2));
+        assert_eq!(screen.find_gap(true, &[]), Some(2));
+        screen.fill(2, written(lines(0..7_000, "old")));
+        drawn(&mut screen, area);
+        assert!(screen.pages[0].drawn);
+        assert_eq!(screen.find_gap(true, &[2]), None);
+        screen.find_next(true);
+        let buf = drawn(&mut screen, area);
+        assert!((0..200).any(|y| row(&buf, y).starts_with("old 1")));
+        // Looked through already, a page let go again is not again.
+        assert_eq!(screen.find_gap(true, &[2]), None);
+    }
+
+    #[test]
+    fn find_from_nothing_found_lands_on_the_nearest_place_that_way() {
+        let area = Rect::new(0, 0, 20, 200);
+        for (older, place) in [(false, 1), (true, 11)] {
+            let (mut screen, _) = screen(lines(0..50, "tail"), 20, 200);
+            screen.prepend(1, written(lines(0..7_000, "middle")));
+            screen.prepend(2, written(lines(0..7_000, "old")));
+            drawn(&mut screen, area);
+            // Nothing typed yet, nothing to draw for it.
+            screen.find("");
+            drawn(&mut screen, area);
+            assert_eq!(screen.find_gap(older, &[]), None);
+            screen.find("old 699");
+            drawn(&mut screen, area);
+            assert_eq!(screen.found(), Some((0, 0)));
+            assert_eq!(screen.find_gap(older, &[]), Some(2));
+            screen.fill(2, written(lines(0..7_000, "old")));
+            drawn(&mut screen, area);
+            assert_eq!(screen.find_gap(older, &[2]), None);
+            // Newer than the view, round from the first row: the oldest
+            // place; older, the newest above it.
+            screen.find_next(older);
+            assert_eq!(screen.found(), Some((place, 11)));
+        }
+    }
+
+    #[test]
+    fn find_goes_round_through_the_pages_let_go_past_the_last_place() {
+        let area = Rect::new(0, 0, 20, 200);
+        let (mut screen, _) = screen(lines(0..50, "tail"), 20, 200);
+        screen.prepend(1, written(lines(0..7_000, "middle")));
+        screen.prepend(2, written(lines(0..7_000, "tail")));
+        drawn(&mut screen, area);
+        assert!(!screen.pages[0].drawn);
+        screen.find("tail 7");
+        drawn(&mut screen, area);
+        assert_eq!(screen.found(), Some((1, 1)));
+        // Newer than the newest place, round from the first row.
+        assert_eq!(screen.find_gap(false, &[]), Some(2));
+        // Older than the oldest, round from the newest row: none below.
+        assert_eq!(screen.find_gap(true, &[]), Some(2));
+        screen.fill(2, written(lines(0..7_000, "tail")));
+        drawn(&mut screen, area);
+        assert_eq!(screen.find_gap(false, &[2]), None);
+        screen.find_next(false);
+        let buf = drawn(&mut screen, area);
+        assert!((0..200).any(|y| row(&buf, y).trim_end() == "tail 7"));
+        assert_eq!(screen.found().map(|(at, _)| at), Some(1));
     }
 
     #[test]
