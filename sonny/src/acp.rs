@@ -526,16 +526,91 @@ impl Session {
 
     /// The bot's events, as this thread's updates, until it is closed.
     async fn follow(self: Arc<Self>, agent: &Arc<Agent>, mut events: Events) {
-        while let Some(event) = events.recv().await {
-            let open = agent
+        let open = || {
+            agent
                 .sessions
                 .lock()
-                .is_ok_and(|s| s.contains_key(&self.id));
-            if !open {
-                break;
+                .is_ok_and(|s| s.contains_key(&self.id))
+        };
+        loop {
+            while let Some(event) = events.recv().await {
+                if !open() {
+                    return;
+                }
+                // The daemon let this stream go, as when it fell behind.
+                if event["event"] == "follow_lagged" {
+                    break;
+                }
+                self.on(agent, &event).await;
             }
-            self.on(agent, &event).await;
+            let mut failed = false;
+            events = loop {
+                if !open() {
+                    return;
+                }
+                match self.reattach(agent).await {
+                    Ok(events) => break events,
+                    Err(error) => {
+                        // The person's prompt is not left waiting while the
+                        // daemon comes back.
+                        if !failed && let Some((prompt, _)) = self.state.lock().await.prompt.take()
+                        {
+                            agent.out.fail(&prompt, FAILED, &error);
+                        }
+                        failed = true;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            };
         }
+    }
+
+    /// Follow the bot again on a new connection, and settle what happened
+    /// while this thread was not following: a turn that ended, calls that
+    /// wait for the person.
+    async fn reattach(&self, agent: &Arc<Agent>) -> Result<Events, String> {
+        let bot = (self.state.lock().await.bound.as_ref())
+            .map(|b| b.bot.clone())
+            .ok_or("the thread has no bot")?;
+        let (client, mut events) = Client::connect(&agent.options.socket)
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .request("follow", json!({"bot": bot, "after": 0}))
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::caught_up(&mut events).await;
+        let record = client
+            .request("inspect", json!({"bot": bot}))
+            .await
+            .map_err(|e| e.to_string())?;
+        let running = record["running_turn"].as_i64();
+        {
+            let mut state = self.state.lock().await;
+            if let Some(bound) = &mut state.bound {
+                bound.client = client.clone();
+            }
+            let waited = state.prompt.as_ref().and_then(|(_, turn)| *turn);
+            let ended = |turn: Option<i64>| turn.is_some() && running != turn;
+            if ended(state.running) || ended(waited) {
+                if agent.v2() {
+                    agent.out.update(
+                        &self.id,
+                        json!({"sessionUpdate": "state_update",
+                        "state": "idle", "stopReason": "end_turn"}),
+                    );
+                }
+                if let Some((prompt, _)) = state.prompt.take() {
+                    agent.out.answer(&prompt, json!({"stopReason": "end_turn"}));
+                }
+                state.calls.clear();
+            }
+            state.running = running;
+        }
+        if running.is_some() {
+            self.approvals(agent, &client, &bot, running).await;
+        }
+        Ok(events)
     }
 
     async fn on(&self, agent: &Arc<Agent>, event: &Value) {
@@ -776,16 +851,37 @@ impl Session {
 async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Value) {
     let id = call["call_id"].as_str().unwrap_or("");
     let name = call["name"].as_str().unwrap_or("tool");
-    let mut update = tool_call(id, name, &call["arguments"]);
-    update["sessionUpdate"] = Value::Null;
+    // A long call is listed cut: the person is shown the whole of it, read
+    // from the node that planned it, or may only deny it.
+    let listed_whole = call["arguments"].is_object()
+        && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
+        && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
+    let arguments = match listed_whole {
+        true => Some(call["arguments"].clone()),
+        false => client
+            .request(
+                "history_items",
+                json!({"bot": bot, "nodes": [call["node"]]}),
+            )
+            .await
+            .ok()
+            .and_then(|read| agent_client::approver::call_arguments(&read["items"][0]["item"], id)),
+    };
+    let mut update = tool_call(id, name, arguments.as_ref().unwrap_or(&Value::Null));
     if let Value::Object(fields) = &mut update {
         fields.remove("sessionUpdate");
     }
-    let options = json!([
-        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
-        {"optionId": "deny", "name": "Deny", "kind": "reject_once"}
-    ]);
-    let title = update["title"].as_str().unwrap_or(name).to_owned();
+    let mut options = vec![json!({"optionId": "deny", "name": "Deny", "kind": "reject_once"})];
+    let mut title = update["title"].as_str().unwrap_or(name).to_owned();
+    match arguments {
+        Some(_) => options.insert(
+            0,
+            json!({"optionId": "allow", "name": "Allow", "kind": "allow_once"}),
+        ),
+        None => {
+            title = format!("{title} (its whole call could not be read, so it can only be denied)")
+        }
+    }
     let answer = agent
         .out
         .ask(
