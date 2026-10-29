@@ -1746,6 +1746,9 @@ struct App {
     margin: margin::Margin,
     under: Option<pane::Pane>,
     margin_focus: Option<u64>,
+    /// Notes the person took away here whose message has not landed yet:
+    /// it takes away nothing more once it does.
+    closing: std::collections::HashSet<String>,
     /// Notes drawn in the conversation where they were put, while the
     /// margin is closed or the window has no room for it: by pin, each
     /// note's id and title; whether the margin was beside the
@@ -2544,6 +2547,7 @@ impl App {
             margin: margin::Margin::default(),
             under: None,
             margin_focus: None,
+            closing: std::collections::HashSet::new(),
             inline: HashMap::new(),
             marked: HashMap::new(),
             references: HashMap::new(),
@@ -4034,17 +4038,24 @@ impl App {
         }
     }
 
-    /// Whether the person's message `said` at `node`, in `turn`, took a
-    /// note away, from this window or another: the margin shows it, once.
-    fn note_closed(&mut self, node: i64, said: &str, turn: Option<i64>) -> bool {
+    /// Whether the person's message `said` at `node` took a note away,
+    /// from this window or another: the margin shows it, once, keyed by
+    /// the node it landed at whichever turn took it in. One this window
+    /// took away when the person asked takes nothing more away.
+    fn note_closed(&mut self, node: i64, said: &str) -> bool {
         let Some(id) = margin::closed(said) else {
             return false;
         };
-        let key = match turn {
-            Some(turn) => format!("t{turn}"),
-            None => format!("m{node}"),
-        };
-        self.margin.remove(id, Some((node, &key)));
+        let key = format!("m{node}");
+        if self.margin.holds(node) {
+            return true;
+        }
+        match self.closing.remove(id) {
+            true => self.margin.applied(&key),
+            false => {
+                self.margin.remove(id, Some((node, &key)));
+            }
+        }
         true
     }
 
@@ -4468,6 +4479,14 @@ impl App {
             asked["from"] = page["next_from"].clone();
         }
         nodes.reverse();
+        // What changed the margin while no window drew it: the calls and
+        // closes between where it was brought up to and this page.
+        if !every
+            && let (Some(through), Some(&first)) = (self.margin.through(), nodes.first())
+            && first > through + 1
+        {
+            self.margin_since(through, self.older).await;
+        }
         // Drawn from the start (attaching, or a repaint), the bot's
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
@@ -4487,6 +4506,64 @@ impl App {
         let unpaired = self.draw_nodes(&nodes, &turns, false, Vec::new()).await;
         if from_start {
             self.unpaired = unpaired;
+        }
+    }
+
+    /// The margin brought up from node `through` to the page of history
+    /// drawn, which starts before `from`: only its `margin` calls that ran
+    /// and the person's closes are read again, oldest first, whatever the
+    /// conversation shows. Read short, it stays where it was.
+    async fn margin_since(&mut self, through: i64, mut from: Option<i64>) {
+        let mut nodes: Vec<i64> = Vec::new();
+        while let Some(at) = from {
+            let asked = json!({"bot": self.bot, "limit": HISTORY_ITEMS,
+                "min_node": through + 1, "from": at});
+            let Ok(page) = self.client.request("history_nodes", asked).await else {
+                return;
+            };
+            nodes.extend(
+                (page["nodes"].as_array().into_iter().flatten())
+                    .filter_map(|n| n["node"].as_i64())
+                    .filter(|node| *node > through),
+            );
+            from = page["next_from"].as_i64();
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        let mut calls: HashMap<String, Value> = HashMap::new();
+        for chunk in nodes.chunks(100) {
+            let short = self.short_read.replace(false);
+            let items = self.items_at(chunk).await;
+            if self.short_read.replace(short) {
+                return;
+            }
+            for (node, item) in items {
+                let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                match (item["type"].as_str(), item["role"].as_str()) {
+                    (_, Some("user")) => {
+                        self.note_closed(node, &text(&item));
+                    }
+                    (Some("function_call"), _) if item["name"] == margin::TOOL => {
+                        let arguments = (item["arguments"].as_str())
+                            .and_then(|a| serde_json::from_str(a).ok())
+                            .unwrap_or(Value::Null);
+                        calls.insert(id, arguments);
+                    }
+                    (Some("function_call_output"), _) => {
+                        if let Some(arguments) = calls.remove(&id)
+                            && !output(&item).1
+                            && denial(&item).is_none()
+                            && !reactions::refused(&item)
+                        {
+                            self.margin.apply(&id, &arguments, None, None);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(&last) = nodes.last() {
+            self.margin.advance(last);
         }
     }
 
@@ -4532,7 +4609,7 @@ impl App {
                     (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
                     // The person took a note away: the margin shows it.
                     (_, Some("user")) if margin::closed(&text(&item)).is_some() => {
-                        self.note_closed(node, &text(&item), turns.get(&node).copied());
+                        self.note_closed(node, &text(&item));
                     }
                     (_, Some("user")) => {
                         // The bot's reactions to the message before, as they
@@ -4605,6 +4682,7 @@ impl App {
                         // page's calls are in the margin kept already.
                         if name == margin::TOOL
                             && !older
+                            && !self.margin.holds(node)
                             && !failed
                             && denial(&item).is_none()
                             && !reactions::refused(&item)
@@ -4645,6 +4723,10 @@ impl App {
         if older {
             self.draw_bot_reactions();
             return unpaired;
+        }
+        // The margin holds what these nodes did to it.
+        if let Some(&last) = nodes.iter().max() {
+            self.margin.advance(last);
         }
         // A running turn's reactions are drawn when it ends.
         if self.running.is_none() {
@@ -4974,7 +5056,7 @@ impl App {
                 if !drawn
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
-                    && !self.note_closed(node, &text(item), turn)
+                    && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
                     self.land(node, &text(item), item["from"].as_str(), false);
@@ -4987,7 +5069,7 @@ impl App {
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
-                    && !self.note_closed(node, &text(item), turn)
+                    && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
                     self.end_live(Words::Reply);
@@ -6633,10 +6715,8 @@ impl App {
                     // close again when it could not be told.
                     Ok(reply) => {
                         self.margin.remove(id, None);
+                        self.closing.insert(id.to_owned());
                         self.reaction_turn = reply["turn"].as_i64();
-                        if let Some(turn) = reply["turn"].as_i64() {
-                            self.margin.applied(&format!("t{turn}"));
-                        }
                     }
                     Err(error) => self.notice = Some(error.to_string()),
                 }
@@ -12007,6 +12087,84 @@ mod tests {
         app.history().await;
         assert!(app.margin.note("kept").is_some());
         assert!(app.margin.note("never").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_margin_catches_up_on_what_changed_past_the_page_drawn() {
+        let call = |id: &str, arguments: Value| {
+            json!({"type": "function_call", "call_id": id, "name": "margin",
+                   "arguments": arguments.to_string()})
+        };
+        let told = margin::closed_message("gone");
+        let items = json!({
+            "3": call("c5", json!({"id": "kept", "markdown": "new"})),
+            "4": {"type": "function_call_output", "call_id": "c5", "output": "In the margin."},
+            "5": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": told}]},
+            "9": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]},
+            "10": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Still done."}]},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            // The newest page; then, asked from where it starts, the rest
+            // since the margin was brought up to node 2.
+            Some("history_nodes") if asked["min_node"].is_null() => json!({
+                "nodes": [{"node": 10}, {"node": 9}], "next_from": 8,
+            }),
+            Some("history_nodes") => {
+                assert_eq!(asked["min_node"], 3);
+                assert_eq!(asked["from"], 8);
+                json!({"nodes": (3..=8).rev().map(|node| json!({"node": node})).collect::<Vec<_>>(),
+                    "next_from": null})
+            }
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items.get(node.to_string())
+                    .cloned().unwrap_or(json!({"type": "reasoning"}))}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        let post = |id: &str| json!({"id": id, "title": id, "markdown": "old"});
+        app.margin.apply("c1", &post("kept"), None, None);
+        app.margin.apply("c2", &post("gone"), None, None);
+        app.margin.advance(2);
+        app.history().await;
+        let kept = app.margin.note("kept").expect("kept");
+        assert_eq!(kept.body, margin::Body::Markdown("new".into()));
+        assert!(app.margin.note("gone").is_none());
+        assert_eq!(app.margin.through(), Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_note_taken_away_here_and_put_back_stays_on_a_repaint() {
+        let told = margin::closed_message("repro");
+        let landed = told.clone();
+        let call = json!({"type": "function_call", "call_id": "c9", "name": "margin",
+            "arguments": json!({"id": "repro", "title": "Repro", "markdown": "again"}).to_string()});
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({
+                "nodes": [{"node": 9}, {"node": 8}, {"node": 7}], "next_from": null,
+            }),
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": match node.as_i64() {
+                    Some(7) => json!({"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": landed}]}),
+                    Some(8) => call.clone(),
+                    _ => json!({"type": "function_call_output", "call_id": "c9", "output": "In the margin."}),
+                }}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("c1", &post, None, None);
+        // Taken away here; its message lands in a turn already running,
+        // after which the agent puts the note back.
+        app.margin.remove("repro", None);
+        app.closing.insert("repro".into());
+        assert!(app.note_closed(7, &told));
+        let again = json!({"id": "repro", "title": "Repro", "markdown": "again"});
+        app.margin.apply("c9", &again, None, None);
+        app.history().await;
+        assert!(app.margin.note("repro").is_some());
     }
 
     #[tokio::test]

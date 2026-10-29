@@ -149,6 +149,9 @@ struct Kept {
     seen: VecDeque<String>,
     /// The person closed the margin: it stays closed until they open it.
     closed: bool,
+    /// The newest node of the bot's history the notes were brought up to:
+    /// a window replays only the `margin` calls and closes after it.
+    through: Option<i64>,
 }
 
 impl Kept {
@@ -161,7 +164,7 @@ impl Kept {
                 json
             })
             .collect();
-        json!({"notes": notes, "seen": self.seen, "closed": self.closed})
+        json!({"notes": notes, "seen": self.seen, "closed": self.closed, "through": self.through})
     }
 
     /// What [`Kept::json`] wrote; a note it cannot read is left out.
@@ -187,6 +190,7 @@ impl Kept {
             notes,
             seen,
             closed: json["closed"] == true,
+            through: json["through"].as_i64(),
         }
     }
 }
@@ -591,6 +595,24 @@ impl Margin {
     /// Whether it holds no note and no plan.
     pub fn is_empty(&self) -> bool {
         self.kept.notes.is_empty() && self.plan.is_empty()
+    }
+
+    /// The newest node of the bot's history the notes were brought up to.
+    pub fn through(&self) -> Option<i64> {
+        self.kept.through
+    }
+
+    /// Whether what the history holds at `node` is in the notes already.
+    pub fn holds(&self, node: i64) -> bool {
+        self.kept.through.is_some_and(|through| node <= through)
+    }
+
+    /// The notes brought up to `node` of the bot's history.
+    pub fn advance(&mut self, node: i64) {
+        if !self.holds(node) {
+            self.kept.through = Some(node);
+            self.save();
+        }
     }
 
     /// Whether the person closed the margin.
@@ -1177,6 +1199,19 @@ mod tests {
             Some(Change::Removed("Repro".into()))
         );
         assert!(margin.notes().is_empty());
+    }
+
+    #[test]
+    fn a_margin_holds_the_history_it_was_brought_up_to() {
+        let mut margin = margin();
+        assert_eq!(margin.through(), None);
+        assert!(!margin.holds(1));
+        margin.advance(9);
+        margin.advance(4);
+        assert_eq!(margin.through(), Some(9));
+        assert!(margin.holds(9) && !margin.holds(10));
+        let again = Kept::read(&margin.kept.json());
+        assert_eq!(again.through, Some(9));
     }
 
     #[test]
