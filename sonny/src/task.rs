@@ -641,7 +641,7 @@ fn within(copy: &Path, prefix: &Path) -> PathBuf {
 /// The provider credentials this process may hold, as the daemon keeps
 /// them from a bot's shell: the well-known keys, Bedrock's, the key a
 /// provider in `AGENT_PROVIDER` names, and what `~/.agent/env` sets.
-fn kept_keys() -> Vec<String> {
+pub(crate) fn kept_keys() -> Vec<String> {
     let mut keys: Vec<String> = [
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",

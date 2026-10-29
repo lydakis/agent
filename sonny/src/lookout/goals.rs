@@ -13,8 +13,8 @@
 //! its `goal` tool writes (a lead's for its tasks too) and the lookout
 //! reads again when a call changed it, and removes when the goal ends. A
 //! check runs as the person, outside every sandbox, as a trigger's `if`
-//! does, without the provider keys in ~/.agent/env: setting one waits for
-//! a verdict where the agent's other calls do.
+//! does, without the provider keys an agent's shell goes without:
+//! setting one waits for a verdict where the agent's other calls do.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -557,12 +557,10 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
         .stderr(std::process::Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    // The provider keys in ~/.agent/env are the daemon's: no agent's own
-    // command has them, nor does its check.
-    if let Some(file) = agent_client::env_file::path() {
-        for (key, _) in agent_client::env_file::read(&file).unwrap_or_default() {
-            command.env_remove(key);
-        }
+    // The provider keys are the daemon's: no agent's own command has them,
+    // nor does its check.
+    for key in crate::task::kept_keys() {
+        command.env_remove(key);
     }
     let mut child = match command.spawn() {
         Ok(child) => child,

@@ -296,7 +296,7 @@ give its own up, `clear` NAME, or nothing to list them. The check is a
 shell command (`cargo test`, `make lint`, `test -z "$(git status --short)"`)
 that exits 0 once done; the lookout runs it in the agent's folder, as the
 person and outside any sandbox like a trigger's `if`, though without the
-provider keys in `~/.agent/env`, so `set` waits for a verdict wherever the
+provider keys an agent's shell goes without, so `set` waits for a verdict wherever the
 agent's other calls do (`/approvals`). Each goal is
 `STORE.lookout/goals/BOT.json`; setting the same goal again changes
 nothing.
