@@ -1,6 +1,6 @@
 //! `/background`: what runs for the project's agents with no one typing,
 //! read from files with no model or daemon call: the triggers that wake
-//! them, which launchd keeps (`trigger`), and the lookout's subscriptions
+//! them, which the system's scheduler keeps (`trigger`), and the lookout's subscriptions
 //! for them (`lookout::subs`). From there a trigger is fired now or
 //! removed, and a subscription removed; the one Sonny writes for a lead
 //! stays, since its project opening writes it again. How many an agent
@@ -320,7 +320,7 @@ impl View {
     fn remove(&mut self, item: &Item) {
         let done = match item.kind {
             Kind::Trigger => trigger::Places::home()
-                .and_then(|places| trigger::remove(&places, &item.name, &trigger::launchctl)),
+                .and_then(|places| trigger::remove(&places, &item.name, &trigger::schedule)),
             Kind::Subscription => {
                 lookout::subs::remove(&self.store, &item.bot, &item.name).map(drop)
             }
