@@ -1,8 +1,6 @@
-//! What the person set in Sonny, kept for every folder it opens:
-//! `~/.agent/sonny/settings.json`. A missing or unreadable file is the
-//! defaults.
-use serde_json::{Value, json};
-use std::path::PathBuf;
+//! What the person set in Sonny, kept for every folder it opens: the chime
+//! and the view in `~/.agent/config.toml`'s `[sonny]`, as `/config` shows
+//! them. A missing or unreadable file is the defaults.
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -15,44 +13,42 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
-            chime: true,
-            verbose: false,
-        }
+        Self::from(agent_client::config::Sonny::default())
     }
-}
-
-fn path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/sonny/settings.json"))
 }
 
 impl Settings {
     pub fn load() -> Self {
-        let text = path().and_then(|path| std::fs::read_to_string(path).ok());
-        text.and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .map(|saved| Self::from(&saved))
-            .unwrap_or_default()
+        let sonny = agent_client::config::load().map(|config| config.sonny);
+        Self::from(sonny.unwrap_or_default())
     }
 
-    fn from(saved: &Value) -> Self {
-        let defaults = Settings::default();
+    fn from(sonny: agent_client::config::Sonny) -> Self {
         Settings {
-            chime: saved["chime"].as_bool().unwrap_or(defaults.chime),
-            verbose: saved["verbose"].as_bool().unwrap_or(defaults.verbose),
+            chime: sonny.chime,
+            verbose: sonny.verbose,
         }
     }
 
+    /// The chime and the view into the config, where one changed: its
+    /// default as no line at all.
     pub fn save(&self) -> Result<(), String> {
-        let path = path().ok_or("HOME is not set")?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let was = Self::load();
+        let defaults = Settings::default();
+        let mut pairs = Vec::new();
+        for (key, now, then, default) in [
+            ("sonny.chime", self.chime, was.chime, defaults.chime),
+            ("sonny.verbose", self.verbose, was.verbose, defaults.verbose),
+        ] {
+            if now != then {
+                pairs.push((key, (now != default).then(|| now.into())));
+            }
         }
-        let text = serde_json::to_string_pretty(&json!({
-            "chime": self.chime,
-            "verbose": self.verbose,
-        }))
-        .map_err(|e| e.to_string())?;
-        std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let config = agent_client::config::path().ok_or("HOME is not set")?;
+        agent_client::config::write(&config, &pairs)
     }
 }
 
@@ -61,11 +57,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_is_not_saved_keeps_its_default() {
-        assert_eq!(Settings::from(&json!({})), Settings::default());
-        assert!(!Settings::from(&json!({"chime": false})).chime);
-        assert!(Settings::from(&json!({"chime": "no"})).chime);
-        assert!(Settings::from(&json!({"verbose": true})).verbose);
-        assert!(!Settings::from(&json!({"verbose": "yes"})).verbose);
+    fn the_config_says_what_rings_and_what_is_drawn() {
+        let sonny = agent_client::config::Sonny::default;
+        assert_eq!(Settings::from(sonny()), Settings::default());
+        let quiet = agent_client::config::Sonny {
+            chime: false,
+            verbose: true,
+            ..sonny()
+        };
+        let settings = Settings::from(quiet);
+        assert!(!settings.chime && settings.verbose);
     }
 }

@@ -31,9 +31,13 @@ running a while, call the memory tool with nothing, or run
 `"$HOME/.agent/memory" show` where you have no memory tool. Either gives both
 indexes as JSON: `user` and `project`, each with its folder's absolute
 `dir` and its `index` text, and the project's `name`. `project` is null
-outside a project. Open a fact's file, `DIR/NAME.md`, with the `read` tool
-when its description bears on the task. An empty index means nothing is
-saved yet.
+outside a project. When a fact's description bears on the task, open it
+with the memory tool's `read` NAME, with `user` or `project` NAME for its
+scope, or with `"$HOME/.agent/memory" read NAME [SCOPE]`. Either gives the
+fact's whole file as `text` and records that an agent read it; the nightly
+cleanup checks facts no agent has read in 30 days, so open facts this way
+rather than with the `read` tool. An empty index means nothing is saved
+yet.
 
 A fact can be out of date. Before acting on one that names code, a file, a
 command or a setting, check that thing in the current tree. If the fact is
@@ -44,8 +48,8 @@ the person's latest word win over memory.
 ## Saving
 
 Save with the memory tool when you have it, which Sonny's agents do: `save`
-with `name`, `type`, `description`, `source` and `text`, `remove` NAME,
-`index` or `check`, and `user` or `project` NAME for the scope. It writes
+with `name`, `type`, `description`, `source` and `text`, `read` NAME,
+`remove` NAME, `index` or `check`, and `user` or `project` NAME for the scope. It writes
 memory for you even where your shell cannot. Without the tool, use
 `"$HOME/.agent/memory"`, the script Sonny writes, with the same fields as
 below. Every reply is one JSON object on stdout; a failure is one
@@ -53,6 +57,7 @@ below. Every reply is one JSON object on stdout; a failure is one
 
 ```sh
 "$HOME/.agent/memory" show [SCOPE]
+"$HOME/.agent/memory" read NAME [SCOPE]
 "$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT
 "$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- - <<'EOF'
 longer text
