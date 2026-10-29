@@ -1637,6 +1637,8 @@ struct App {
     /// area, the first of its rows shown there, and the width it was laid
     /// out at; none while something else is drawn over it.
     composer_at: Option<(Rect, usize, usize)>,
+    /// Where the footer counts the agents at work: its row and columns.
+    counter_at: Option<(u16, std::ops::Range<u16>)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -1656,6 +1658,13 @@ struct App {
     /// conversation and how often it had changed when they were last
     /// drawn so, and whether a note put since waits to be.
     inline: HashMap<u64, (String, String)>,
+    /// The title each note's marker says, by pin: drawn again when the
+    /// note's changes, as a task's note read for the first time does.
+    marked: HashMap<u64, String>,
+    /// Other bots' notes the margin shows, by bot and note, as read from
+    /// them; and when they were last read.
+    references: HashMap<(String, String), margin::Reference>,
+    references_read: Option<Instant>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -2344,12 +2353,16 @@ impl App {
             pane_mouse: false,
             closed: None,
             composer_at: None,
+            counter_at: None,
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
             under: None,
             margin_focus: None,
             inline: HashMap::new(),
+            marked: HashMap::new(),
+            references: HashMap::new(),
+            references_read: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -2568,6 +2581,7 @@ impl App {
             self.follow_place().await;
             self.count_behind();
             self.read_tasks().await;
+            self.read_references().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
@@ -3613,6 +3627,7 @@ impl App {
             let link = format!("{}note/{id}", screen::BUTTON);
             self.mark_last(screen::Mark::Tag(screen::Tag::Note(pin)));
             self.mark_last(screen::Mark::Link(link));
+            self.marked.insert(pin, note.title);
         }
     }
 
@@ -3648,10 +3663,32 @@ impl App {
         for pin in back {
             let (id, title) = self.inline.remove(&pin).expect("drawn out");
             let link = screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
-            let line = note_marker(title, true);
+            let line = note_marker(title.clone(), true);
             (self.screen).replace_tagged(screen::Tag::Note(pin), vec![line], vec![(0, link)]);
+            self.marked.insert(pin, title);
+        }
+        // A note taken away, by the person's × or by the agent, is gone
+        // from the conversation too, as it is once drawn again.
+        let gone: Vec<u64> = (self.marked.keys())
+            .filter(|pin| !notes.iter().any(|(at, ..)| at == *pin))
+            .copied()
+            .collect();
+        for pin in gone {
+            self.marked.remove(&pin);
+            (self.screen).replace_tagged(screen::Tag::Note(pin), Vec::new(), Vec::new());
         }
         if beside {
+            // A marker says its note's title as it is now.
+            for (pin, id, title) in notes {
+                let tag = screen::Tag::Note(pin);
+                if self.marked.get(&pin) == Some(&title) || !self.screen.has(tag) {
+                    continue;
+                }
+                let link = screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
+                let line = note_marker(title.clone(), true);
+                (self.screen).replace_tagged(tag, vec![line], vec![(0, link)]);
+                self.marked.insert(pin, title);
+            }
             return;
         }
         let width = self.prose();
@@ -3869,6 +3906,74 @@ impl App {
             .into_iter()
             .map(|(_, item)| item)
             .collect()
+    }
+
+    /// The other bots' notes the margin shows, read again every few
+    /// seconds while their bots are there: what each shows is kept once
+    /// its bot is gone.
+    async fn read_references(&mut self) {
+        let shown = self.margin.references();
+        (self.references).retain(|(bot, id), _| shown.iter().any(|(_, b, i)| b == bot && i == id));
+        if shown.is_empty()
+            || (self.references_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.references_read = Some(Instant::now());
+        let mut read = std::collections::HashSet::new();
+        for (note, bot, id) in shown {
+            let key = (bot, id);
+            let mut reference = self.references.remove(&key).unwrap_or_default();
+            if read.insert(key.clone()) && !reference.gone {
+                self.read_reference(&key.0, &key.1, &mut reference).await;
+            }
+            if let Some((title, body)) = reference.shown() {
+                self.margin.resolved(&note, title, body);
+            }
+            self.references.insert(key, reference);
+        }
+    }
+
+    /// What `bot` did since `reference` was last read of its note `id`.
+    async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
+        if reference.workspace.is_none() {
+            match self.client.request("inspect", json!({"bot": bot})).await {
+                Ok(record) => reference.workspace = record["workspace"].as_str().map(str::to_owned),
+                Err(error) => {
+                    reference.gone = error.code == "bot_not_found";
+                    return;
+                }
+            }
+        }
+        let asked = match reference.node {
+            None => json!({"bot": bot, "limit": 400}),
+            Some(node) => {
+                json!({"bot": bot, "limit": 400, "min_node": node + 1, "oldest_first": true})
+            }
+        };
+        let page = match self.client.request("history_nodes", asked).await {
+            Ok(page) => page,
+            Err(error) => {
+                reference.gone = error.code == "bot_not_found";
+                return;
+            }
+        };
+        let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| node["node"].as_i64())
+            .collect();
+        nodes.sort_unstable();
+        if let Some(&newest) = nodes.last() {
+            // Each node's items come newest first: read oldest first.
+            let mut items: Vec<(i64, Value)> = self.items_of(bot, &nodes).await;
+            items.reverse();
+            items.sort_by_key(|(node, _)| *node);
+            let items: Vec<Value> = items.into_iter().map(|(_, item)| item).collect();
+            reference.read(id, &items);
+            reference.node = Some(newest);
+        }
+        if let Some(path) = reference.file() {
+            reference.file_read(std::fs::read_to_string(path).ok());
+        }
     }
 
     /// [`App::items`], each with the node it is kept at.
@@ -5609,6 +5714,15 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
+                // The agents counted under the composer: /status.
+                if down
+                    && let Some((row, columns)) = &self.counter_at
+                    && mouse.row == *row
+                    && columns.contains(&mouse.column)
+                {
+                    self.follow(&format!("{}status", screen::BUTTON));
+                    return true;
+                }
                 if !in_pane && self.composer_mouse(mouse) {
                     // A press here lets go of what was selected there.
                     if down {
@@ -5954,21 +6068,35 @@ impl App {
         }
     }
 
-    /// What runs for the agent, for the margin's first row: its tasks at
-    /// work, what waits on the person, its background, its context.
+    /// What runs for the agent, for the margin's first row: its
+    /// background and its context.
     fn glance(&self) -> margin::Glance {
-        let doing = |state: &str| {
-            (self.fleet.iter().flat_map(|fleet| fleet.doing.iter()))
-                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
-                .count()
-        };
         margin::Glance {
             name: self.bot.clone(),
-            running: doing("working"),
-            waiting: self.asks.len() + doing("needs you"),
             behind: self.behind.0,
             context: self.context,
         }
+    }
+
+    /// The other agents at work, and what waits on the person: questions
+    /// and calls here, and agents that need them. Without windows for the
+    /// project's agents, the tasks this one started, as their rosters
+    /// read them.
+    fn agents(&self) -> (usize, usize) {
+        let doing: HashMap<&str, &str> = match &self.fleet {
+            Some(fleet) => (fleet.doing.iter())
+                .map(|(bot, doing)| (bot.as_str(), *doing))
+                .collect(),
+            None => (self.tasks.values().flatten())
+                .map(|task| (task.bot.as_str(), task.state.as_str()))
+                .collect(),
+        };
+        let count = |state: &str| {
+            (doing.iter())
+                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
+                .count()
+        };
+        (count("working"), self.asks.len() + count("needs you"))
     }
 
     /// A button clicked: what Sonny does for it now, or once the loop
@@ -7356,6 +7484,7 @@ impl App {
             }),
         };
         let mut composer_at = None;
+        let mut counter_at = None;
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(PROSE));
@@ -7768,7 +7897,9 @@ impl App {
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+            let (line, counter) = self.footer(width);
+            frame.render_widget(Paragraph::new(line), footer);
+            counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
         terminal.draw(|frame| {
             paint(frame);
@@ -7776,6 +7907,7 @@ impl App {
             image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at;
+        self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -7937,7 +8069,32 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn footer_line(&self, width: usize) -> Line<'static> {
+        self.footer(width).0
+    }
+
+    /// The footer, and where on it the agents at work are counted, as
+    /// they are in a roster: a click opens `/status`.
+    fn footer(&self, width: usize) -> (Line<'static>, Option<std::ops::Range<u16>>) {
+        let (working, waiting) = match self.options.side {
+            Some(_) => (0, 0),
+            None => self.agents(),
+        };
+        let mut counted = Vec::new();
+        for (n, color) in [(working, Color::Cyan), (waiting, Color::Yellow)] {
+            if n > 0 {
+                counted.push(Span::raw("●").fg(color));
+                counted.push(Span::raw(format!(" {n} ")));
+            }
+        }
+        let counted_width = (counted.iter())
+            .map(|span| span.content.width())
+            .sum::<usize>();
+        let counted_width = match counted_width {
+            0 => 0,
+            n => n + 2,
+        };
         let folder = tilde(&self.workspace);
         let mut left = format!("  {}", self.model);
         if let Some(effort) = &self.effort {
@@ -7996,23 +8153,31 @@ impl App {
             None => String::new(),
         };
         // A long folder keeps its end, the part that tells folders apart.
-        let room = width.saturating_sub(left.width() + branch.width() + right.width() + 4);
+        let room =
+            width.saturating_sub(left.width() + branch.width() + right.width() + counted_width + 4);
         let mut folder = folder.as_str();
         let cut = folder.width() > room;
         while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
         let place = format!(" · {}{folder}", if cut { "…" } else { "" });
-        let fill =
-            width.saturating_sub(left.width() + place.width() + branch.width() + right.width());
+        let fill = width.saturating_sub(
+            left.width() + place.width() + branch.width() + right.width() + counted_width,
+        );
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
+        let at = left.width() + place.width() + branch.width() + fill;
         let mut spans = vec![Span::raw(left), Span::raw(place)];
         if let Some(name) = branch.strip_prefix(" on ") {
             spans.push(Span::raw(" on "));
             spans.push(Span::raw(name.to_owned()).fg(Color::Green));
         }
         spans.push(Span::raw(" ".repeat(fill)));
+        let counter = (counted_width > 0).then(|| at as u16..(at + counted_width - 3) as u16);
+        if !counted.is_empty() {
+            spans.extend(counted);
+            spans.push(Span::raw("· ").dim());
+        }
         match right.rfind(&self.bot) {
             Some(at) => {
                 spans.push(Span::raw(right[..at].to_owned()));
@@ -8040,7 +8205,7 @@ impl App {
             }
             None => spans.push(Span::raw(right)),
         }
-        Line::from(spans).dim()
+        (Line::from(spans).dim(), counter)
     }
 }
 
@@ -10105,6 +10270,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_s_note_the_margin_shows_is_read_as_it_changes_and_kept() {
+        let folder = std::env::temp_dir().join(unique("task-folder"));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("flow.md"), "# Flow").unwrap();
+        let workspace = folder.display().to_string();
+        let call = |arguments: Value| {
+            json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
+                "arguments": arguments.to_string()})
+        };
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = gone.clone();
+        let client = daemon_answering(move |asked| {
+            if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                return json!({"error": "bot_not_found"});
+            }
+            match asked["op"].as_str() {
+                Some("inspect") => json!({"name": "calc.add", "workspace": workspace}),
+                Some("history_nodes") if asked["min_node"].is_null() => {
+                    json!({"nodes": [{"node": 2}, {"node": 1}]})
+                }
+                Some("history_nodes") => json!({"nodes": [{"node": 3}]}),
+                Some("history_items") => {
+                    json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                    .map(|node| json!({"node": node, "item": match node.as_i64() {
+                        Some(1) => call(json!({"id": "flow", "title": "Flow", "markdown": "one"})),
+                        Some(2) => json!({"type": "message", "role": "assistant", "content": []}),
+                        _ => call(json!({"id": "flow", "file": "flow.md"})),
+                    }}))
+                    .collect::<Vec<_>>()})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+        // What it did since, a few seconds on.
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("# Flow".into())));
+        // The task gone, with its folder, what it showed stays.
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::remove_dir_all(&folder).unwrap();
+        app.references_read = None;
+        app.read_references().await;
+        assert!(app.references.values().all(|reference| reference.gone));
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("# Flow".into())));
+    }
+
+    #[tokio::test]
     async fn a_task_that_ended_with_nothing_to_say_said_nothing_and_did_not_fail() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("wait") => json!({"results": {"turn:calc.quiet/1":
@@ -10256,6 +10480,66 @@ mod tests {
             written.last().unwrap(),
             "• The pay step is the regression at p95."
         );
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_what_needs_the_person_and_a_click_opens_status() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.model = "opus".into();
+        // Nothing counted while nothing runs or waits.
+        let (line, counter) = app.footer(100);
+        assert!(counter.is_none() && !line.to_string().contains('●'));
+        let ask = |id: &str| {
+            asks::call(
+                id,
+                &json!({"question": "Merge?", "options": [
+                {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
+            )
+            .unwrap()
+        };
+        app.asks = vec![ask("c1"), ask("c2")];
+        // With no windows for them, the tasks started, as their roster reads them.
+        let task = |name: &str, state: &str| started::Task {
+            bot: format!("calc.{name}"),
+            name: name.into(),
+            brief: "b".into(),
+            state: state.into(),
+        };
+        app.tasks
+            .insert(0, vec![task("add", "working"), task("neg", "done")]);
+        app.tasks
+            .insert(1, vec![task("add", "working"), task("div", "working")]);
+        let (line, counter) = app.footer(100);
+        let text = line.to_string();
+        let counter = counter.unwrap();
+        let shown: String = (text.chars())
+            .skip(counter.start as usize)
+            .take(counter.len())
+            .collect();
+        assert_eq!(shown, "● 2 ● 2");
+        assert!(text.contains("● 2 ● 2 · b"), "{text}");
+        assert_eq!(text.width(), 100);
+        // Its colors as a roster's: cyan at work, yellow for what needs
+        // the person.
+        let dots: Vec<_> = (line.spans.iter())
+            .filter(|span| span.content == "●")
+            .map(|span| span.style.fg)
+            .collect();
+        assert_eq!(dots, [Some(Color::Cyan), Some(Color::Yellow)]);
+        app.counter_at = Some((20, 10 + counter.start..10 + counter.end));
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 20,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.key(click(9 + counter.start)).await;
+        assert!(app.pane.is_none());
+        app.key(click(10 + counter.start)).await;
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
     }
 
     #[tokio::test]
@@ -10696,17 +10980,25 @@ mod tests {
             texts(&app)[..],
             ["✎ Routing today · in the margin", "after"]
         );
-        // Closed, out again; taken away, its marker alone.
+        // Retitled, as a task's note read for the first time is, its
+        // marker says so.
+        let retitle = json!({"id": "routing", "title": "Routing now", "markdown": "a to c"});
+        app.daemon(turn_event("tool_started", 3, call("m3", retitle)))
+            .await;
+        app.fold_notes(true);
+        assert_eq!(texts(&app)[..], ["✎ Routing now · in the margin", "after"]);
+        // Closed, out again; taken away, by a × or the agent, gone from
+        // the conversation too, the margin shown or not.
         app.fold_notes(false);
         assert_eq!(texts(&app).len(), 3);
-        app.margin.remove("routing", None);
-        app.fold_notes(false);
-        assert_eq!(
-            texts(&app)[..],
-            ["✎ Routing today · in the margin", "after"]
-        );
         let link = Some("sonny:note/routing".to_owned());
         assert!(app.screen.links().contains(&link));
+        app.margin.remove("routing", None);
+        app.fold_notes(false);
+        assert_eq!(texts(&app)[..], ["after"]);
+        app.fold_notes(true);
+        assert_eq!(texts(&app)[..], ["after"]);
+        assert!(!app.screen.links().contains(&link));
     }
 
     #[tokio::test]

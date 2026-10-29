@@ -24,7 +24,7 @@ use crate::transcript::Markdown;
 /// The name of the tool a bot keeps notes in the margin with.
 pub const TOOL: &str = "margin";
 /// The most notes a margin holds: a new one past it lets the oldest go.
-const MOST_NOTES: usize = 20;
+pub const MOST_NOTES: usize = 20;
 /// The most of a note's Markdown kept, and of a file read for one.
 const NOTE_BYTES: usize = 64 * 1024;
 /// The most lines of a file a note shows.
@@ -62,8 +62,10 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          no longer holds. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
          fences and pictures included) or file (a path in your own folder, shown as the file \
          stands and kept fresh as it changes; for a file in a task's copy, put its content in \
-         markdown instead, since that copy goes away with the task). Never put a question or \
-         anything the person must answer in a note.";
+         markdown instead, since that copy goes away with the task), or from (a task's note as \
+         \"task/id\", as your task updates name it, shown here as the task keeps it and kept once \
+         the task is gone, rather than copied). Never put a question or anything the person must \
+         answer in a note.";
 
 /// The `margin` tool as Sonny declares it on a bot.
 pub fn tool() -> Value {
@@ -81,6 +83,8 @@ pub fn tool() -> Value {
                     "description": "The note, as Markdown."},
                 "file": {"type": "string", "minLength": 1,
                     "description": "Or a file to show, absolute or from your folder."},
+                "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
+                    "description": "Or a task's note to show, as \"task/id\"."},
                 "remove": {"type": "boolean", "description": "true takes the note away."}
             },
             "required": ["id"],
@@ -95,6 +99,13 @@ pub fn tool() -> Value {
 pub enum Body {
     Markdown(String),
     File(String),
+    /// Another bot's note `id`, as it was last read there: kept once that
+    /// bot or its note is gone.
+    From {
+        bot: String,
+        id: String,
+        shown: Option<Box<Body>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,12 +145,10 @@ impl Kept {
     fn json(&self) -> Value {
         let notes: Vec<Value> = (self.notes.iter())
             .map(|note| {
-                let (kind, body) = match &note.body {
-                    Body::Markdown(text) => ("markdown", text),
-                    Body::File(path) => ("file", path),
-                };
-                json!({"id": note.id, "title": note.title, kind: body, "call": note.call,
-                    "after": note.after, "turn": note.turn})
+                let mut json = json!({"id": note.id, "title": note.title, "call": note.call,
+                    "after": note.after, "turn": note.turn});
+                body_json(&note.body, &mut json);
+                json
             })
             .collect();
         json!({"notes": notes, "seen": self.seen, "closed": self.closed})
@@ -150,10 +159,7 @@ impl Kept {
         let text = |note: &Value, key: &str| note[key].as_str().map(str::to_owned);
         let notes = (json["notes"].as_array().into_iter().flatten())
             .filter_map(|note| {
-                let body = match text(note, "file") {
-                    Some(path) => Body::File(path),
-                    None => Body::Markdown(text(note, "markdown")?),
-                };
+                let body = body_read(note)?;
                 Some(Note {
                     id: text(note, "id")?,
                     title: text(note, "title")?,
@@ -172,6 +178,134 @@ impl Kept {
             seen,
             closed: json["closed"] == true,
         }
+    }
+}
+
+/// `body` written into a kept note's `json`.
+fn body_json(body: &Body, json: &mut Value) {
+    match body {
+        Body::Markdown(text) => json["markdown"] = json!(text),
+        Body::File(path) => json["file"] = json!(path),
+        Body::From { bot, id, shown } => {
+            json["from"] = json!(format!("{bot}/{id}"));
+            if let Some(shown) = shown {
+                let mut kept = json!({});
+                body_json(shown, &mut kept);
+                json["shown"] = kept;
+            }
+        }
+    }
+}
+
+/// What [`body_json`] wrote.
+fn body_read(json: &Value) -> Option<Body> {
+    let text = |key: &str| json[key].as_str().map(str::to_owned);
+    if let Some((bot, id)) = json["from"].as_str().and_then(from) {
+        let shown = body_read(&json["shown"])
+            .filter(|shown| !matches!(shown, Body::From { .. }))
+            .map(Box::new);
+        return Some(Body::From { bot, id, shown });
+    }
+    match text("file") {
+        Some(path) => Some(Body::File(path)),
+        None => Some(Body::Markdown(text("markdown")?)),
+    }
+}
+
+/// The bot and the note a `from` names, as `bot/id`.
+pub fn from(text: &str) -> Option<(String, String)> {
+    let (bot, id) = text.trim().rsplit_once('/')?;
+    let named = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    (!bot.is_empty() && bot.len() <= 128 && bot.chars().all(named) && is_id(id))
+        .then(|| (bot.to_owned(), id.to_owned()))
+}
+
+/// Another bot's note, as read from its history: the newest node read,
+/// the folder its files are read from, whether the bot is gone, and the
+/// note as last posted there with its file's text, when it shows one.
+#[derive(Default)]
+pub struct Reference {
+    pub node: Option<i64>,
+    pub workspace: Option<String>,
+    pub gone: bool,
+    title: String,
+    body: Option<Body>,
+    file: Option<String>,
+}
+
+impl Reference {
+    /// The bot's `items` read, oldest first: its margin calls for note
+    /// `id` change what is shown.
+    pub fn read(&mut self, id: &str, items: &[Value]) {
+        for item in items {
+            if item["type"] != "function_call" || item["name"] != TOOL {
+                continue;
+            }
+            let arguments = (item["arguments"].as_str())
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or_default();
+            if arguments["id"].as_str() != Some(id) || arguments["remove"] == true {
+                continue;
+            }
+            let body = match (arguments["file"].as_str(), arguments["markdown"].as_str()) {
+                (Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
+                (_, Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
+                _ => continue,
+            };
+            // Kept, as there, when changed without one.
+            match arguments["title"].as_str().map(str::trim) {
+                Some(title) if !title.is_empty() => self.title = title.to_owned(),
+                _ if self.title.is_empty() => self.title = id.to_owned(),
+                _ => {}
+            }
+            if !matches!((&self.body, &body), (Some(Body::File(a)), Body::File(b)) if a == b) {
+                self.file = None;
+            }
+            self.body = Some(body);
+        }
+    }
+
+    /// The file the note shows, its path in the bot's folder.
+    pub fn file(&self) -> Option<PathBuf> {
+        let Some(Body::File(path)) = &self.body else {
+            return None;
+        };
+        Some(Path::new(self.workspace.as_deref()?).join(path))
+    }
+
+    /// The file's `text` as read now: kept once it can no longer be.
+    pub fn file_read(&mut self, text: Option<String>) {
+        if let Some(text) = text {
+            self.file = Some(cut(&text, NOTE_BYTES).to_owned());
+        }
+    }
+
+    /// The note's title there, and what it shows: a file as the text
+    /// read of it, so that it stays once the bot's folder is gone.
+    pub fn shown(&self) -> Option<(&str, Body)> {
+        let body = match self.body.as_ref()? {
+            Body::File(path) => {
+                let Some(text) = &self.file else {
+                    return Some((
+                        &self.title,
+                        Body::Markdown(format!("*{path} is not read yet.*")),
+                    ));
+                };
+                let extension = (Path::new(path).extension().and_then(|e| e.to_str()))
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if ["md", "markdown", "mdx"].contains(&extension.as_str()) {
+                    Body::Markdown(text.clone())
+                } else {
+                    // Fenced past any run of backticks it holds.
+                    let most = (text.split(|c| c != '`').map(str::len).max()).unwrap_or(0);
+                    let fence = "`".repeat(most.max(2) + 1);
+                    Body::Markdown(format!("{fence}{extension}\n{text}\n{fence}"))
+                }
+            }
+            body => body.clone(),
+        };
+        Some((&self.title, body))
     }
 }
 
@@ -231,6 +365,39 @@ impl Margin {
             kept,
             ..Margin::default()
         }
+    }
+
+    /// The notes that show another bot's: each note's id, the bot, and
+    /// the note there.
+    pub fn references(&self) -> Vec<(String, String, String)> {
+        (self.kept.notes.iter())
+            .filter_map(|note| match &note.body {
+                Body::From { bot, id, .. } => Some((note.id.clone(), bot.clone(), id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The note `note` shows of another bot's, read there as `body`,
+    /// with that note's `title` when this one was given none.
+    pub fn resolved(&mut self, note: &str, title: &str, body: Body) {
+        let Some(at) = self.kept.notes.iter().position(|n| n.id == note) else {
+            return;
+        };
+        let note = &mut self.kept.notes[at];
+        let Body::From { shown, .. } = &mut note.body else {
+            return;
+        };
+        // Titled as there when it was given no title of its own.
+        let retitled = note.title == note.id && !title.is_empty() && title != note.id;
+        if shown.as_deref() == Some(&body) && !retitled {
+            return;
+        }
+        *shown = Some(Box::new(body));
+        if retitled {
+            note.title = title.to_owned();
+        }
+        self.save();
     }
 
     /// The plan shown over the notes now `steps`, none taking it away.
@@ -317,9 +484,33 @@ impl Margin {
             .as_str()
             .map(str::trim)
             .filter(|t| !t.is_empty());
-        let body = match (arguments["file"].as_str(), arguments["markdown"].as_str()) {
-            (Some(file), _) if !file.trim().is_empty() => Some(Body::File(file.trim().to_owned())),
-            (_, Some(markdown)) => Some(Body::Markdown(cut(markdown, NOTE_BYTES).to_owned())),
+        let had = at.map(|at| &self.kept.notes[at].body);
+        let body = match (
+            arguments["from"].as_str().and_then(from),
+            arguments["file"].as_str(),
+            arguments["markdown"].as_str(),
+        ) {
+            // The same note again keeps what was read of it.
+            (Some((bot, id)), ..) => Some(match had {
+                Some(Body::From {
+                    bot: b,
+                    id: i,
+                    shown,
+                }) if *b == bot && *i == id => Body::From {
+                    bot,
+                    id,
+                    shown: shown.clone(),
+                },
+                _ => Body::From {
+                    bot,
+                    id,
+                    shown: None,
+                },
+            }),
+            (_, Some(file), _) if !file.trim().is_empty() => {
+                Some(Body::File(file.trim().to_owned()))
+            }
+            (.., Some(markdown)) => Some(Body::Markdown(cut(markdown, NOTE_BYTES).to_owned())),
             _ => None,
         };
         match at {
@@ -421,7 +612,7 @@ impl Margin {
         let files: Vec<PathBuf> = (self.kept.notes.iter())
             .filter_map(|note| match &note.body {
                 Body::File(path) => Some(workspace.join(path)),
-                Body::Markdown(_) => None,
+                Body::Markdown(_) | Body::From { .. } => None,
             })
             .collect();
         self.reads.retain(|path, _| files.contains(path));
@@ -446,12 +637,22 @@ impl Margin {
         most: usize,
     ) -> Option<Vec<Line<'static>>> {
         let note = self.note(id)?.body.clone();
-        let mut body = match &note {
+        let shown = match &note {
+            Body::From {
+                shown: Some(shown), ..
+            } => shown.as_ref(),
+            body => body,
+        };
+        let mut body = match shown {
             Body::Markdown(text) => {
                 let mut markdown = Markdown::in_folder(workspace);
                 crate::transcript::markdown(&mut markdown, text, width, leads())
             }
             Body::File(path) => self.file_lines(workspace, path, width),
+            Body::From { bot, id, .. } => {
+                let line = format!("{BODY}{bot}'s note {id}, once it is read");
+                vec![Line::from(line).dim()]
+            }
         };
         if body.len() > most {
             let more = body.len() - most;
@@ -664,6 +865,21 @@ pub fn closed(text: &str) -> Option<&str> {
     is_id(id).then_some(id)
 }
 
+/// The note a `margin` call's `tool_started` event names, and whether the
+/// call takes it away. The event may carry only the start of a long
+/// call's arguments: the id is read from where it shows then.
+pub fn called(data: &Value) -> Option<(String, bool)> {
+    let text = data["arguments"].as_str()?;
+    if let Ok(arguments) = serde_json::from_str::<Value>(text) {
+        let id = arguments["id"].as_str().filter(|id| is_id(id))?;
+        return Some((id.to_owned(), arguments["remove"] == true));
+    }
+    let rest = text.split_once("\"id\"")?.1.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let id = rest.split_once('"')?.0;
+    is_id(id).then(|| (id.to_owned(), false))
+}
+
 /// Whether `arguments` are a call the daemon runs, as it checks one: only
 /// the tool's fields, each of its type. Applied as the call starts, a
 /// call it would refuse changes nothing.
@@ -697,10 +913,6 @@ fn is_id(id: &str) -> bool {
 #[derive(Default)]
 pub struct Glance {
     pub name: String,
-    /// Its tasks at work.
-    pub running: usize,
-    /// Questions and calls waiting on the person.
-    pub waiting: usize,
     /// Triggers and subscriptions.
     pub behind: usize,
     pub context: Option<u64>,
@@ -725,24 +937,6 @@ impl Glance {
             spans.push(span);
             at += width;
         };
-        if self.running > 0 {
-            let text = format!("{} running", self.running);
-            fact(
-                &mut spans,
-                text.clone(),
-                Span::raw(text).fg(Color::Cyan),
-                Some("status"),
-            );
-        }
-        if self.waiting > 0 {
-            let text = format!("{} need you", self.waiting);
-            fact(
-                &mut spans,
-                text.clone(),
-                Span::raw(text).fg(Color::Yellow),
-                Some("status"),
-            );
-        }
         if self.behind > 0 {
             let text = format!("↻ {}", self.behind);
             fact(
@@ -815,6 +1009,73 @@ mod tests {
         assert_eq!(again.notes, margin.kept.notes);
         assert_eq!(again.seen, margin.kept.seen);
         assert!(again.closed);
+    }
+
+    #[test]
+    fn a_task_s_note_is_shown_as_it_stands_there_and_kept() {
+        let mut margin = margin();
+        let post = json!({"id": "flow", "from": "calc.add/flow"});
+        assert!(fits(&post));
+        margin.apply("c1", &post, None, None);
+        assert_eq!(
+            margin.references(),
+            [("flow".into(), "calc.add".into(), "flow".into())]
+        );
+        // Read there: its calls for that note, oldest first.
+        let call = |arguments: Value| json!({"type": "function_call", "name": TOOL, "arguments": arguments.to_string()});
+        let mut reference = Reference::default();
+        reference.read(
+            "flow",
+            &[
+                call(json!({"id": "flow", "title": "Request flow", "markdown": "one"})),
+                call(json!({"id": "other", "markdown": "not this"})),
+                call(json!({"id": "flow", "markdown": "two"})),
+                call(json!({"id": "flow", "remove": true})),
+            ],
+        );
+        let (title, body) = reference.shown().unwrap();
+        margin.resolved("flow", title, body);
+        let note = margin.note("flow").unwrap();
+        // Titled as the task titled it, it showing what the task's shows.
+        assert_eq!(note.title, "Request flow");
+        let Body::From { shown, .. } = &note.body else {
+            panic!()
+        };
+        assert_eq!(shown.as_deref(), Some(&Body::Markdown("two".into())));
+        // A file, as its text: kept once the task's folder is gone.
+        reference.workspace = Some("/work/calc.add".into());
+        reference.read(
+            "flow",
+            &[call(json!({"id": "flow", "file": "src/flow.rs"}))],
+        );
+        assert_eq!(
+            reference.file(),
+            Some(PathBuf::from("/work/calc.add/src/flow.rs"))
+        );
+        reference.file_read(Some("fn flow() {}".into()));
+        reference.file_read(None);
+        let (_, body) = reference.shown().unwrap();
+        assert_eq!(body, Body::Markdown("```rs\nfn flow() {}\n```".into()));
+        let changes = margin.changes();
+        margin.resolved("flow", "Request flow", body.clone());
+        margin.resolved("flow", "Request flow", body);
+        assert_eq!(margin.changes(), changes + 1);
+        // Posted again, it keeps what was read; and it is kept.
+        margin.apply(
+            "c2",
+            &json!({"id": "flow", "from": "calc.add/flow"}),
+            None,
+            None,
+        );
+        let again = Kept::read(&margin.kept.json());
+        assert_eq!(again.notes, margin.kept.notes);
+        let Body::From { shown: Some(_), .. } = &margin.note("flow").unwrap().body else {
+            panic!()
+        };
+        // Only a bot's note names one.
+        for named in ["calc.add", "/flow", "calc.add/Flow", "a b/flow"] {
+            assert_eq!(from(named), None, "{named}");
+        }
     }
 
     #[test]
@@ -1061,26 +1322,20 @@ mod tests {
         assert_eq!(quiet.line().0.to_string(), " calc");
         let busy = Glance {
             name: "calc".into(),
-            running: 2,
-            waiting: 1,
             behind: 3,
             context: Some(41_000),
         };
         let (line, buttons) = busy.line();
         let text = line.to_string();
-        assert!(
-            text.starts_with(" calc · 2 running · 1 need you · ↻ 3 · "),
-            "{text}"
-        );
+        assert!(text.starts_with(" calc · ↻ 3 · "), "{text}");
         let urls: Vec<&str> = buttons.iter().map(|b| b.2.as_str()).collect();
-        assert_eq!(urls, ["sonny:status", "sonny:status", "sonny:background"]);
+        assert_eq!(urls, ["sonny:background"]);
         let slice = |(from, to): (u16, u16)| -> String {
             text.chars()
                 .skip(from as usize)
                 .take((to - from) as usize)
                 .collect()
         };
-        assert_eq!(slice((buttons[0].0, buttons[0].1)), "2 running");
-        assert_eq!(slice((buttons[2].0, buttons[2].1)), "↻ 3");
+        assert_eq!(slice((buttons[0].0, buttons[0].1)), "↻ 3");
     }
 }
