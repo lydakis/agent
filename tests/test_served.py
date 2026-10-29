@@ -223,8 +223,11 @@ class ServedToolTests(ModelFixture):
         (self.path / '.agent/config.toml').write_text(
             f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n'
             f'env = {{ MCP_STARTS = {json.dumps(str(self.path / "starts"))} }}\n')
-        script = {'name': 'exec', 'description': 'exec', 'answered_by': 'sonny', 'grammar': 'start: /[\\s\\S]+/',
-                  'parameters': {'type': 'object', 'properties': {'input': {'type': 'string'}}, 'required': ['input']}}
+        # The tool as Sonny gives it to the agents it opens.
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        self.assertEqual((script['name'], script['answered_by']), ('exec', 'sonny'))
+        self.assertIn('## test', script['description'])
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[script])
         self.lookout()

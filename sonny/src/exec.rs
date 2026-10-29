@@ -548,8 +548,9 @@ fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
         return body;
     }
     let saved = dir.and_then(|dir| {
-        let file = dir.join("output").join(format!("{}.txt", stamp()));
-        std::fs::create_dir_all(file.parent()?).ok()?;
+        let file = fresh(&dir.join("output"))
+            .ok()?
+            .join(format!("{}.txt", stamp()));
         std::fs::write(&file, &body).ok()?;
         Some(file)
     });
@@ -575,6 +576,24 @@ fn budgeted(body: String, tokens: usize, dir: Option<&Path>) -> String {
 }
 
 /// A name no other file of this lookout's takes.
+/// How long the outputs and images scripts save are kept.
+const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// `dir`, made, with what was saved there over `KEPT` ago removed, so
+/// saved outputs and images hold a week's worth rather than ever more.
+fn fresh(dir: &Path) -> Result<&Path, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let old = (entry.metadata().and_then(|m| m.modified()).ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > KEPT);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(dir)
+}
+
 fn stamp() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
@@ -948,8 +967,7 @@ fn image(dir: &Path, item: &str) -> Result<String, String> {
         "image/svg+xml" => "svg",
         _ => "img",
     };
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let file = dir.join(format!("{}.{extension}", stamp()));
+    let file = fresh(dir)?.join(format!("{}.{extension}", stamp()));
     std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
     Ok(format!("[image saved to {}]", file.display()))
 }
@@ -1290,6 +1308,58 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             "{long}"
         );
         assert!(long.len() < 700, "{}", long.len());
+        hub.stop().await;
+    }
+
+    #[test]
+    fn saved_outputs_and_images_are_kept_a_week() {
+        let dir = scratch("kept").join("output");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));
+        for file in [&old, &new] {
+            std::fs::write(file, "x").unwrap();
+        }
+        let week_ago = std::time::SystemTime::now() - KEPT - Duration::from_secs(60);
+        (std::fs::File::options().write(true).open(&old).unwrap())
+            .set_modified(week_ago)
+            .unwrap();
+        budgeted("y".repeat(100), 1, dir.parent());
+        let left: Vec<String> = (std::fs::read_dir(&dir).unwrap().flatten())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!left.contains(&"old.txt".to_owned()), "{left:?}");
+        assert!(
+            left.contains(&"new.txt".to_owned()) && left.len() == 2,
+            "{left:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_server_stops_and_the_next_call_starts_it_again() {
+        let dir = scratch("idle");
+        let hub = hub(&dir).await;
+        ran(&hub, &dir, "await tools.mcp__test__echo({text: 'a'});").await;
+        let first = std::fs::read_to_string(dir.join("starts")).unwrap();
+        let alive = |pid: &str| {
+            (std::process::Command::new("kill").args(["-0", pid.trim()]))
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive(&first));
+        // Used within the idle time, it stays.
+        hub.reap(Duration::from_secs(60)).await;
+        assert!(alive(&first));
+        hub.reap(Duration::ZERO).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(&first) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(&first), "server {first} outlived its idle time");
+        ran(&hub, &dir, "await tools.mcp__test__echo({text: 'b'});").await;
+        let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 2, "{starts}");
         hub.stop().await;
     }
 }
