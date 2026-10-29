@@ -1240,10 +1240,31 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
     }
 }
 
+/// Whom a message between agents is from or about: its sender, the tasks
+/// task updates name, the sources that reported.
+pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
+    if let Some(from) = from {
+        return vec![from.to_owned()];
+    }
+    if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
+        return (sourced(rest).into_iter().skip(1))
+            .filter(|source| !source.starts_with('+'))
+            .collect();
+    }
+    let Some(rest) = text.strip_prefix(TASK_UPDATES) else {
+        return Vec::new();
+    };
+    crate::calls::once(rest.lines().filter_map(|line| {
+        let (name, _) = line.strip_prefix("- ")?.split_once(": turn:")?;
+        Some(name.to_owned())
+    }))
+}
+
 /// The row that gathers messages between agents that came one after
-/// another, each `kinds`' [`relayed_kind`]: how many of each, `▸` to
-/// list them; open, `▾`, each one's own row under it.
-pub fn gathered(kinds: &[&str], open: bool, width: usize) -> Line<'static> {
+/// another, each `kinds`' [`relayed_kind`]: how many of each and whom
+/// they name, so the row says whose news it holds, `▸` to list them;
+/// open, `▾`, each one's own row under it.
+pub fn gathered(kinds: &[&str], names: &[String], open: bool, width: usize) -> Line<'static> {
     let mut counts: Vec<(&str, usize)> = Vec::new();
     for kind in kinds {
         match counts.iter_mut().find(|(k, _)| k == kind) {
@@ -1257,7 +1278,14 @@ pub fn gathered(kinds: &[&str], open: bool, width: usize) -> Line<'static> {
             n => format!("{n} {kind}s"),
         })
         .collect();
-    let head = cut(&format!("↳ {}", said.join(", ")), width.saturating_sub(2));
+    let room = width.saturating_sub(2);
+    let mut head = cut(&format!("↳ {}", said.join(", ")), room);
+    // The names in the room left, cut, or none when only a few columns are.
+    let names = crate::calls::once(names.iter().cloned()).join(", ");
+    let left = room.saturating_sub(head.width() + 3);
+    if !names.is_empty() && left >= 8.min(names.width()) {
+        head.push_str(&format!(" · {}", cut(&names, left).replace(",…", "…")));
+    }
     Line::from(format!("{head} {}", if open { "▾" } else { "▸" })).dim()
 }
 
@@ -2771,13 +2799,24 @@ mod tests {
             "task update",
             "task update",
         ];
+        assert_eq!(relayed_names(updates, None), ["a.b"]);
+        assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
+        let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(
-            gathered(&kinds, false, 80).to_string(),
+            gathered(&kinds, &names, false, 80).to_string(),
+            "↳ 3 task updates, 1 message · a.b, a.c, a.d ▸"
+        );
+        assert_eq!(
+            gathered(&kinds[..2], &names[..2], true, 80).to_string(),
+            "↳ 1 task update, 1 message · a.b, a.c ▾"
+        );
+        assert_eq!(
+            gathered(&kinds, &names, false, 32).to_string(),
             "↳ 3 task updates, 1 message ▸"
         );
         assert_eq!(
-            gathered(&kinds[..2], true, 80).to_string(),
-            "↳ 1 task update, 1 message ▾"
+            gathered(&kinds, &names, false, 42).to_string(),
+            "↳ 3 task updates, 1 message · a.b, a.c… ▸"
         );
     }
 

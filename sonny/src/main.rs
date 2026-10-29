@@ -1353,6 +1353,8 @@ struct Cluster {
 struct Clustered {
     node: i64,
     kind: &'static str,
+    /// Whom it is from or about, which the row gathering it names.
+    names: Vec<String>,
     calls: Vec<Vec<Line<'static>>>,
 }
 
@@ -4168,6 +4170,7 @@ impl App {
         let message = Clustered {
             node,
             kind: transcript::relayed_kind(said, from),
+            names: transcript::relayed_names(said, from),
             calls: Vec::new(),
         };
         if let Some((at, drawn)) = self.clustering
@@ -4250,7 +4253,10 @@ impl App {
             return (lines, vec![(0, said_button(message.node))]);
         }
         let kinds: Vec<&str> = cluster.messages.iter().map(|m| m.kind).collect();
-        let mut lines = vec![transcript::gathered(&kinds, cluster.open, width)];
+        let names: Vec<String> = (cluster.messages.iter())
+            .flat_map(|m| m.names.iter().cloned())
+            .collect();
+        let mut lines = vec![transcript::gathered(&kinds, &names, cluster.open, width)];
         let mut marks = vec![(
             0,
             screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON)),
@@ -5616,12 +5622,6 @@ impl App {
                 let words =
                     (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
                 let ended = matches!(status, "completed" | "steered");
-                // The line sets a reply apart from the steps drawn above
-                // it, or says how long a long turn took: a reply right
-                // under its message, from a short turn, needs none.
-                let ruled = (self.answering.as_ref())
-                    .is_none_or(|(_, at, _)| *at != self.rows_drawn)
-                    || seconds.is_some_and(|s| s >= 60);
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
                     && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
@@ -5638,9 +5638,7 @@ impl App {
                 match self.live.take() {
                     _ if (only_reacted || quiet) && ended => {}
                     Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
-                        if ruled {
-                            self.commit(vec![line]);
-                        }
+                        self.commit(vec![line]);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
                     }
                     live => {
@@ -10450,37 +10448,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_right_under_its_message_has_no_line_above_it() {
-        let client = daemon_answering(|asked| {
-            let node = asked["nodes"][0].as_i64().unwrap_or(0);
-            let item = match node {
-                1 => json!({"type": "message", "role": "user", "content": "status?"}),
-                _ => json!({"type": "message", "role": "assistant",
-                    "content": [{"type": "output_text", "text": "All green."}]}),
-            };
-            json!({"items": [{"node": node, "item": item}]})
-        })
-        .await;
-        let mut app = app(client);
-        let lines = |app: &App| -> Vec<String> {
-            app.pending.iter().map(|line| line.to_string()).collect()
-        };
-        app.daemon(turn_event("accepted", 1, json!({"node": 1})))
-            .await;
-        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "All green."}))
-            .await;
-        app.daemon(turn_event("message", 1, json!({"node": 2})))
-            .await;
-        app.daemon(turn_event(
-            "turn_finished",
-            1,
-            json!({"status": "completed"}),
-        ))
-        .await;
-        assert_eq!(lines(&app), ["› status?", "", "• All green."]);
-    }
-
-    #[tokio::test]
     async fn an_empty_completion_ends_the_turn_with_no_failure_shown() {
         let client = daemon_answering(|_| {
             json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
@@ -10735,11 +10702,9 @@ mod tests {
         ))
         .await;
         let rows = drawn(&mut app);
-        // With no steps above it, the reply needs no line setting it apart.
-        assert_eq!(
-            rows[2..],
-            ["", "› and the notes?", "   🎉 ", "", "• Updated."]
-        );
+        assert_eq!(rows[2..5], ["", "› and the notes?", "   🎉 "]);
+        assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
+        assert_eq!(rows[7..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
         app.seen_node = 0;
@@ -11097,13 +11062,16 @@ mod tests {
             "turn:calc.neg/4",
             false,
         );
-        assert_eq!(drawn(&mut app), ["↳ 1 message, 1 task update ▸"]);
+        assert_eq!(
+            drawn(&mut app),
+            ["↳ 1 message, 1 task update · calc.add, calc.neg ▸"]
+        );
         // A click lists them; a click on one opens it, the calls under it.
         app.press("fold/0").await;
         assert_eq!(
             drawn(&mut app),
             [
-                "↳ 1 message, 1 task update ▾",
+                "↳ 1 message, 1 task update · calc.add, calc.neg ▾",
                 "  ↳ From calc.add ▸",
                 "  ↳ Task updates · calc.neg completed ▸",
             ]
@@ -11114,7 +11082,10 @@ mod tests {
         assert_eq!(open[4], "    - calc.neg: turn:calc.neg/3 completed");
         assert!(open[5].starts_with("    • Steered calc.neg"), "{open:?}");
         app.press("fold/0").await;
-        assert_eq!(drawn(&mut app), ["↳ 1 message, 1 task update ▸"]);
+        assert_eq!(
+            drawn(&mut app),
+            ["↳ 1 message, 1 task update · calc.add, calc.neg ▸"]
+        );
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
         app.land(6, updates, None, false);

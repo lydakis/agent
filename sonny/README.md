@@ -589,8 +589,7 @@ The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a li
 short `└` look at its result, edits show as a diff, and a status row says
 `Working (12s • esc to interrupt)`. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
-turn's `Worked for …` line. A reply right under its message, from a turn
-of under a minute, has no line: there are no steps to set it apart from.
+turn's `Worked for …` line.
 
 The view is clean by default: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, messaged or
