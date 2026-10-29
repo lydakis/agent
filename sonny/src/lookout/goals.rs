@@ -315,7 +315,8 @@ pub struct Goals {
     continued: HashSet<String>,
     /// Agents whose goal's check runs: a turn that ends meanwhile is
     /// plain news, and the check's own turn is checked in its place.
-    checking: HashMap<String, tokio::task::AbortHandle>,
+    /// Each with the cursor of the turn's end, which a restart replays.
+    checking: HashMap<String, (tokio::task::AbortHandle, Option<i64>)>,
     /// Turns in a row the goal started that called no tool.
     /// Keyed by the goal's `set_ms` and the last turn counted, so a turn
     /// replayed after a reconnect is not counted again.
@@ -347,9 +348,16 @@ impl Goals {
     /// Checks under way answer a connection since dropped, never the next:
     /// they stop, and the replay runs them again.
     pub fn reconnected(&mut self) {
-        for (_, check) in self.checking.drain() {
+        for (_, (check, _)) in self.checking.drain() {
             check.abort();
         }
+    }
+
+    /// The end of the oldest turn whose check is under way: what the
+    /// lookout keeps for the next one is from before it, so a restart, or
+    /// one with no subscriber to hold the turn, runs its check again.
+    pub fn floor(&self) -> Option<i64> {
+        self.checking.values().filter_map(|(_, at)| *at).min()
     }
 
     pub fn reread(&mut self) {
@@ -458,7 +466,8 @@ impl Goals {
                     let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
                     let _ = done.send(Settled { bot, turn, outcome }).await;
                 });
-                self.checking.insert(checking, pursuit.abort_handle());
+                self.checking
+                    .insert(checking, (pursuit.abort_handle(), event["cursor"].as_i64()));
                 Some(held)
             }
             _ => None,

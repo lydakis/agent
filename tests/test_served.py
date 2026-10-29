@@ -408,6 +408,25 @@ class ServedToolTests(ModelFixture):
         self.assertIn('- calc.fix: turn:calc.fix/1 completed, asked by the person, and met its goal:', note)
         self.assertEqual(len(self.lines_of(runs, 2)), 2)
 
+    def test_a_goal_no_one_watches_is_checked_again_after_a_restart(self):
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('goal')])
+        old = self.lookout()
+        runs = self.path / 'runs'
+        self.call('calc.lead', 'goal', {'set': {'done_when': 'it ran again', 'check': f'echo . >> {runs}; sleep 30'}})
+        self.lines_of(runs, 1)
+        [ended] = [e['cursor'] for e in self.daemon.request('events', bot='calc.lead', after=0, limit=256)
+                   ['result']['events'] if e['event'] == 'turn_finished']
+        # Past a save of the cursor, which stays before the turn's end
+        # though no subscriber holds it.
+        time.sleep(1.5)
+        saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
+        self.assertLess(int(saved[0]), ended)
+        old.kill()
+        old.wait(timeout=10)
+        self.lookout()
+        self.assertEqual(len(self.lines_of(runs, 2)), 2)
+
     @unittest.skipIf(sys.platform == 'darwin', 'launchd keeps triggers on a Mac')
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',

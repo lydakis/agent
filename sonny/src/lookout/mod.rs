@@ -965,16 +965,19 @@ impl Service {
         }
     }
 
-    /// Up to just before the oldest news a lookout has not told, which a
-    /// restart or a reconnect takes up again: news only in memory, or a
-    /// read a dropped connection cut short, is told again, not lost.
+    /// Up to just before the oldest news a lookout has not told, or the
+    /// oldest turn whose goal's check runs, which a restart or a reconnect
+    /// takes up again: news only in memory, or a read or check a dropped
+    /// connection cut short, is told or run again, not lost.
     fn floor(&mut self) -> Option<i64> {
         for lookout in self.lookouts.values_mut() {
             if !lookout.untold() {
                 lookout.from = None;
             }
         }
-        let floor = self.lookouts.values().filter_map(|l| l.from).min();
+        let floor = (self.lookouts.values().filter_map(|l| l.from))
+            .chain(self.goals.floor())
+            .min();
         match (self.cursor, floor) {
             (Some(at), Some(floor)) => Some(at.min(floor - 1)),
             (at, _) => at,
