@@ -790,11 +790,20 @@ impl Session {
             // Words that did not stream, as from a thread that came late or
             // whose stream dropped partway: what was not sent yet.
             "message" => {
+                // Only the assistant's words settle what streamed: a
+                // reasoning item before them leaves it as it is.
+                let Some(node) = data["node"].as_i64() else {
+                    return;
+                };
+                let Some(item) = items(&client, &bot, &[node]).await.into_iter().next() else {
+                    return;
+                };
+                let text = crate::text(&item);
+                if item["role"] != "assistant" || text.is_empty() {
+                    return;
+                }
                 let streamed = std::mem::take(&mut state.streamed);
-                if let Some(node) = data["node"].as_i64()
-                    && let Some(item) = items(&client, &bot, &[node]).await.into_iter().next()
-                    && item["role"] == "assistant"
-                    && let Some(rest) = crate::text(&item).strip_prefix(streamed.as_str())
+                if let Some(rest) = text.strip_prefix(streamed.as_str())
                     && !rest.is_empty()
                 {
                     out.update(

@@ -238,9 +238,16 @@ class AcpTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.')
         thread, session = self.open(repo)
-        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session,
-                                                                      'prompt': self.wrapped('hello')}))
+        # A model that reasons before it answers: the reply, which
+        # streamed, is said once.
+        self.model.history_reasoning = {'type': 'reasoning', 'id': 'rs_1',
+                                        'summary': [{'type': 'summary_text', 'text': 'Thought.'}]}
+        answered, updates = thread.answer_of(thread.ask('session/prompt', {'sessionId': session,
+                                                                            'prompt': self.wrapped('hello')}))
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(''.join(u['content']['text'] for u in updates
+                                 if u['sessionUpdate'] == 'agent_message_chunk'), 'reply:hello')
+        self.model.history_reasoning = None
         # The lookout wakes the lead, as when a task finished: no prompt of
         # the thread's, so the thread is told what started it.
         self.daemon.request('submit', bot='calc.lead', request_id='lookout-1', prompt='fix finished')
