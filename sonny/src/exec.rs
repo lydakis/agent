@@ -511,7 +511,6 @@ async fn run(
     })
     .await
     .map_err(|e| e.to_string())??;
-    give_back_memory();
     let status = match &ended {
         Ended::Completed => "Script completed".to_owned(),
         Ended::Failed(_) => "Script failed".to_owned(),
@@ -538,20 +537,6 @@ async fn run(
         body.push_str(&format!("Script error:\n{error}"));
     }
     Ok(head + &budgeted(body, budget, dir))
-}
-
-/// Return the memory freed scripts held to the system. macOS's malloc
-/// keeps it otherwise: five scripts at the 256 MB cap left the lookout at
-/// 365 MB for good.
-fn give_back_memory() {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        // SAFETY: a null zone asks every zone to release what it can.
-        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-    }
 }
 
 /// Sets the script's stop flag when the answer is dropped or done.
