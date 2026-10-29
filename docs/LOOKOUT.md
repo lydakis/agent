@@ -149,8 +149,8 @@ in the task is listed apart as theirs only once it completed: one that
 failed or was stopped is listed with the rest.
 
 It quotes the person's own words, and each ended turn's final reply (up
-to 32,000 characters, its two ends kept) marked line by line with `>` as the
-task's own; other messages in a task stay behind their turn's handle. The
+to 32,000 characters and 80 KB as it reads, its two ends kept) marked line
+by line with `>` as the task's own; other messages in a task stay behind their turn's handle. The
 note reaches the approver as the person's words, so the marking is what
 tells a task's reply from theirs (George, 2026-10-29: the extra wait round
 on a long-context lead cost more than the risk). A lead reads a turn with

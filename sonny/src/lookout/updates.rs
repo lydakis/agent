@@ -34,6 +34,9 @@ const PENDING: usize = 128;
 /// How much of a task's reply a note carries, in characters: the whole of
 /// almost any, so the lead need not read the turn again.
 pub const REPLY_CHARS: usize = 32_000;
+/// And in bytes as it reads, marked line by line: a task's two replies fit
+/// one note with room to spare, wide characters or many lines alike.
+const REPLY_BYTES: usize = 80 * 1024;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
@@ -193,6 +196,23 @@ struct Forward {
     from: Option<String>,
     origin: Option<String>,
     reply: Option<String>,
+}
+
+/// A reply cut to `REPLY_CHARS`, and further while it reads past
+/// `REPLY_BYTES`.
+fn quotable(text: &str) -> String {
+    let mut max = REPLY_CHARS;
+    let mut reply = super::cut(text, max);
+    while quoted_len(&reply) > REPLY_BYTES {
+        max = (max * REPLY_BYTES / quoted_len(&reply)).min(max - 1);
+        reply = super::cut(text, max);
+    }
+    reply
+}
+
+/// What a reply takes in a note, each line marked.
+fn quoted_len(reply: &str) -> usize {
+    reply.len() + reply.lines().count() * "\n  > ".len()
 }
 
 fn now_ms() -> u64 {
@@ -509,7 +529,7 @@ impl Updates {
         if !self.live || text.is_empty() {
             return;
         }
-        let reply = super::cut(text, REPLY_CHARS);
+        let reply = quotable(text);
         let news = (self.tasks.iter_mut()).find(|(task, _)| task == name);
         let told = news.and_then(|(_, news)| {
             [&mut news.act, &mut news.theirs]
@@ -928,6 +948,7 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
         ));
     }
     // The task's own words, apart from the person's: each line marked.
+    // `quoted_len` counts what this adds.
     if let Some(reply) = &t.reply {
         text.push_str(", and replied:");
         for line in reply.lines() {
@@ -1432,6 +1453,30 @@ mod tests {
         updates.unsent(told);
         let again = updates.take();
         assert!(text(&again).contains("shop.docs/2 waiting for the person's approval"));
+    }
+
+    #[test]
+    fn a_reply_reads_within_its_bytes_however_wide_or_long() {
+        let lines = format!("a{}b", "\n".repeat(REPLY_CHARS - 2));
+        for text in [lines, "😀".repeat(REPLY_CHARS), "x".repeat(REPLY_CHARS * 2)] {
+            let reply = quotable(&text);
+            assert!(quoted_len(&reply) <= REPLY_BYTES, "{}", quoted_len(&reply));
+            assert!(reply.contains("characters left out"));
+        }
+        assert_eq!(quotable("Fixed."), "Fixed.");
+        let mut updates = fleet();
+        for turn in [4, 5] {
+            let from = match turn {
+                4 => json!({"from": {"bot": "shop.lead"}}),
+                _ => json!({}),
+            };
+            super::tests::turn(&mut updates, "shop.fix", turn, from, "completed");
+            updates.replied("shop.fix", turn, &format!("a{}b", "\n".repeat(REPLY_CHARS)));
+        }
+        let told = updates.take();
+        let size: usize = told.items.iter().map(|i| i.text.len() + 1).sum();
+        assert_eq!(told.items.len(), 2, "both of the first task's turns");
+        assert!(size + 8 * 1024 < 256 * 1024, "{size}");
     }
 
     #[test]
