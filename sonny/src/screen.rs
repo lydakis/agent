@@ -127,6 +127,8 @@ pub struct Screen {
     /// The oldest rows went to make room: those above them are not drawn
     /// again.
     trimmed: bool,
+    /// Rows were written under the newest since the oldest last went.
+    grew: bool,
 }
 
 /// The place found is to be picked again, the rows having been drawn anew.
@@ -162,6 +164,7 @@ impl Screen {
     }
 
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
+        self.grew |= !lines.is_empty();
         for line in lines {
             let Some(lead) = crate::transcript::lead(&line).filter(|_| !self.rows.is_empty())
             else {
@@ -195,6 +198,7 @@ impl Screen {
     /// A line whose rows after its first start with `rest` when wrapped,
     /// as a numbered line of code goes on under its code.
     pub fn push_hanging(&mut self, line: Line<'static>, rest: Line<'static>) {
+        self.grew = true;
         self.rows.push(Row {
             line: Arc::new(line),
             rest: Some(rest),
@@ -206,6 +210,7 @@ impl Screen {
     /// anything else a link read from words would stop at: a row of a
     /// list each row of opens, as a folder's entries, so not underlined.
     pub fn push_linked(&mut self, line: Line<'static>, url: String) {
+        self.grew = true;
         self.rows.push(Row {
             line: Arc::new(line),
             rest: None,
@@ -363,13 +368,13 @@ impl Screen {
     /// the view is scrolled up, and the oldest let go once there are too
     /// many.
     fn layout(&mut self, width: usize) {
-        let before = self.wrap(width);
-        self.trim(before);
+        self.wrap(width);
+        self.trim();
     }
 
     /// The rows not yet wrapped to `width` wrapped, all of them when it
-    /// changed; how many rows were shown before.
-    fn wrap(&mut self, width: usize) -> usize {
+    /// changed.
+    fn wrap(&mut self, width: usize) {
         if width != self.width {
             self.width = width;
             self.shown.clear();
@@ -420,15 +425,13 @@ impl Screen {
             self.back =
                 (self.back.saturating_add(self.shown.len() - before)).saturating_sub(relaid);
         }
-        before
     }
 
-    /// The oldest rows let go, `before` of those shown having been there
-    /// before the last wrap.
-    fn trim(&mut self, before: usize) {
-        // The oldest rows go, a batch at a time, once new ones pass what
-        // is kept and the view is below them.
-        if self.rows.len() > KEEP + KEEP / 4 && self.shown.len() > before {
+    /// The oldest rows let go, a batch at a time, once new ones written
+    /// pass what is kept and the view is below them: not for older ones
+    /// drawn above, nor for the rows wrapped anew at another width.
+    fn trim(&mut self) {
+        if std::mem::take(&mut self.grew) && self.rows.len() > KEEP + KEEP / 4 {
             let drop = self.rows.len() - KEEP;
             let mut firsts = 0;
             let gone = (self.shown.iter())
@@ -1470,6 +1473,17 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0), shown);
         assert!(!screen.near_top());
+    }
+
+    #[test]
+    fn older_rows_drawn_above_stay_at_another_width() {
+        let (mut screen, _) = screen(rows(13_000..13_100), 20, 5);
+        screen.prepend(rows(0..13_000));
+        let area = Rect::new(0, 0, 30, 5);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert_eq!(screen.height(30), 13_100);
+        screen.scroll(isize::MAX);
+        assert!(screen.near_top());
     }
 
     #[test]

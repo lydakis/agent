@@ -1468,6 +1468,9 @@ struct App {
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
     older: Option<i64>,
+    /// What calls older than the first node drawn returned, from the top
+    /// of the oldest page: drawn with the older page that has the calls.
+    unpaired: Vec<(i64, Value)>,
     /// The window's width, the pane's included.
     full_width: u16,
     /// The pane beside the conversation on the full screen, with what the
@@ -2095,6 +2098,7 @@ impl App {
             repaint: false,
             first_node: None,
             older: None,
+            unpaired: Vec::new(),
             full_width: 0,
             pane: None,
             pane_keys: false,
@@ -2652,7 +2656,8 @@ impl App {
         let answering = self.answering.take();
         let welcome = self.welcome();
         self.commit(welcome);
-        self.draw_nodes(&nodes, &turns, true).await;
+        let unpaired = std::mem::take(&mut self.unpaired);
+        self.unpaired = self.draw_nodes(&nodes, &turns, true, unpaired).await;
         let mut lines = std::mem::replace(&mut self.pending, pending);
         self.any_history = any_history;
         self.rows_drawn = rows_drawn;
@@ -2954,7 +2959,8 @@ impl App {
         // reactions are read again with the rest; after a gap, those it
         // made before the gap are still held.
         // The open questions are those the replay asks and does not answer.
-        if self.seen_node == 0 || after < self.seen_node {
+        let from_start = self.seen_node == 0 || after < self.seen_node;
+        if from_start {
             self.bot_reactions.clear();
             self.react_calls.clear();
             self.answering = None;
@@ -2965,134 +2971,151 @@ impl App {
         if let Some(&first) = nodes.first() {
             self.first_node = Some(self.first_node.map_or(first, |n| n.min(first)));
         }
-        self.draw_nodes(&nodes, &turns, false).await;
+        let unpaired = self.draw_nodes(&nodes, &turns, false, Vec::new()).await;
+        if from_start {
+            self.unpaired = unpaired;
+        }
     }
 
-    /// The items at `nodes`, drawn as they were live. Those `older` than
+    /// The items at `nodes`, then `after` (what a newer page's calls
+    /// returned, its calls being here), drawn as they were live; what
+    /// returned from calls before them is given back. Those `older` than
     /// any drawn change nothing but what is drawn: the questions, replies
     /// to react to and calls still running are the newer items' to say.
-    async fn draw_nodes(&mut self, nodes: &[i64], turns: &HashMap<i64, i64>, older: bool) {
+    async fn draw_nodes(
+        &mut self,
+        nodes: &[i64],
+        turns: &HashMap<i64, i64>,
+        older: bool,
+        after: Vec<(i64, Value)>,
+    ) -> Vec<(i64, Value)> {
         let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+        let mut unpaired = Vec::new();
         // The bot's words, quiet if a call follows them, as they were live.
         let mut said: Option<Vec<Line<'static>>> = None;
+        let mut items = Vec::new();
         for chunk in nodes.chunks(100) {
-            for (node, item) in self.items_at(chunk).await {
-                // A reaction leaves the words before it as they were.
-                let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
-                if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
-                    self.commit(match call {
-                        true => transcript::quiet(lines),
-                        false => lines,
-                    });
+            items.extend(self.items_at(chunk).await);
+        }
+        items.extend(after);
+        for (node, item) in items {
+            // A reaction leaves the words before it as they were.
+            let call = item["type"] == "function_call" && item["name"] != reactions::TOOL;
+            if let Some(lines) = said.take_if(|_| call || item["role"].is_string()) {
+                self.commit(match call {
+                    true => transcript::quiet(lines),
+                    false => lines,
+                });
+            }
+            match (item["type"].as_str(), item["role"].as_str()) {
+                // A reaction is drawn under the reply it answers.
+                (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
+                (_, Some("user")) => {
+                    // The bot's reactions to the message before, as they
+                    // were drawn live.
+                    self.draw_bot_reactions();
+                    // What the person ran is shown as it was when it ran.
+                    let prose = self.prose();
+                    let lines = match older {
+                        true => landed(&text(&item), &mut Vec::new(), prose),
+                        false => {
+                            asks::close(&mut self.asks, &text(&item));
+                            landed(&text(&item), &mut self.ran_here, prose)
+                        }
+                    };
+                    self.commit(lines);
+                    self.answering = Some((first_words(&text(&item)), self.rows_drawn));
                 }
-                match (item["type"].as_str(), item["role"].as_str()) {
-                    // A reaction is drawn under the reply it answers.
-                    (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
-                    (_, Some("user")) => {
-                        // The bot's reactions to the message before, as they
-                        // were drawn live.
-                        self.draw_bot_reactions();
-                        // What the person ran is shown as it was when it ran.
-                        let prose = self.prose();
-                        let lines = match older {
-                            true => landed(&text(&item), &mut Vec::new(), prose),
-                            false => {
-                                asks::close(&mut self.asks, &text(&item));
-                                landed(&text(&item), &mut self.ran_here, prose)
-                            }
-                        };
-                        self.commit(lines);
-                        self.answering = Some((first_words(&text(&item)), self.rows_drawn));
-                    }
-                    (_, Some("assistant")) => {
-                        let reply = text(&item);
-                        if !reply.is_empty() {
-                            let mut lines = transcript::reply(
-                                &reply,
-                                self.prose(),
-                                std::path::Path::new(&self.workspace),
-                            );
-                            lines.extend(self.reacted_row(node));
-                            said = Some(lines);
-                            if !older {
-                                self.saw_reply(node, &reply);
-                                self.last_reply = reply;
-                            }
-                        }
-                    }
-                    // Counted once it is known to have been taken.
-                    (Some("function_call"), _) if item["name"] == reactions::TOOL => {
-                        if let Some(reaction) = item["arguments"]
-                            .as_str()
-                            .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                            .as_ref()
-                            .and_then(reactions::call)
-                        {
-                            let id = item["call_id"].as_str().unwrap_or("").to_owned();
-                            self.react_calls.insert(id, reaction);
-                        }
-                    }
-                    (Some("function_call"), _) => {
-                        let arguments = item["arguments"]
-                            .as_str()
-                            .and_then(|a| serde_json::from_str(a).ok())
-                            .unwrap_or(Value::Null);
-                        let name = item["name"].as_str().unwrap_or("tool").to_owned();
-                        calls.insert(
-                            item["call_id"].as_str().unwrap_or("").to_owned(),
-                            (name, arguments),
+                (_, Some("assistant")) => {
+                    let reply = text(&item);
+                    if !reply.is_empty() {
+                        let mut lines = transcript::reply(
+                            &reply,
+                            self.prose(),
+                            std::path::Path::new(&self.workspace),
                         );
-                    }
-                    (Some("function_call_output"), _)
-                        if self
-                            .react_calls
-                            .contains_key(item["call_id"].as_str().unwrap_or("")) =>
-                    {
-                        let id = item["call_id"].as_str().unwrap_or("");
-                        if let Some((emoji, remove)) = self.react_calls.remove(id)
-                            && !output(&item).1
-                            && !reactions::refused(&item)
-                        {
-                            reactions::apply(&mut self.bot_reactions, &emoji, remove);
+                        lines.extend(self.reacted_row(node));
+                        said = Some(lines);
+                        if !older {
+                            self.saw_reply(node, &reply);
+                            self.last_reply = reply;
                         }
                     }
-                    (Some("function_call_output"), _) => {
-                        let id = item["call_id"].as_str().unwrap_or("");
-                        // A call this window kept before it lost the daemon
-                        // may end in what it reads on reconnecting.
-                        let call = match older {
-                            true => calls.remove(id),
-                            false => calls.remove(id).or_else(|| self.calls.remove(id)),
-                        };
-                        if let Some((name, arguments)) = call {
-                            let (output, mut failed) = output(&item);
-                            match denial(&item) {
-                                Some(reason) => {
-                                    // It never ran: nothing it would have done follows.
-                                    failed = true;
-                                    self.commit_denied(&name, &arguments, &reason);
-                                }
-                                None => self.commit_call(&name, &arguments, &output, failed),
-                            }
-                            if older {
-                                continue;
-                            }
-                            if name == resolved::TOOL && !failed && !reactions::refused(&item) {
-                                self.resolve(&arguments, id, turns.get(&node).copied(), false)
-                                    .await;
-                            }
-                            if name == asks::TOOL
-                                && !failed
-                                && !reactions::refused(&item)
-                                && let Some(ask) = asks::call(id, &arguments)
-                                && !self.asks.iter().any(|open| open.id == ask.id)
-                            {
-                                self.asks.push(ask);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                // Counted once it is known to have been taken.
+                (Some("function_call"), _) if item["name"] == reactions::TOOL => {
+                    if let Some(reaction) = item["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                        .as_ref()
+                        .and_then(reactions::call)
+                    {
+                        let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                        self.react_calls.insert(id, reaction);
+                    }
+                }
+                (Some("function_call"), _) => {
+                    let arguments = item["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or(Value::Null);
+                    let name = item["name"].as_str().unwrap_or("tool").to_owned();
+                    calls.insert(
+                        item["call_id"].as_str().unwrap_or("").to_owned(),
+                        (name, arguments),
+                    );
+                }
+                (Some("function_call_output"), _)
+                    if self
+                        .react_calls
+                        .contains_key(item["call_id"].as_str().unwrap_or("")) =>
+                {
+                    let id = item["call_id"].as_str().unwrap_or("");
+                    if let Some((emoji, remove)) = self.react_calls.remove(id)
+                        && !output(&item).1
+                        && !reactions::refused(&item)
+                    {
+                        reactions::apply(&mut self.bot_reactions, &emoji, remove);
+                    }
+                }
+                (Some("function_call_output"), _) => {
+                    let id = item["call_id"].as_str().unwrap_or("");
+                    // A call this window kept before it lost the daemon
+                    // may end in what it reads on reconnecting.
+                    let call = match older {
+                        true => calls.remove(id),
+                        false => calls.remove(id).or_else(|| self.calls.remove(id)),
+                    };
+                    let Some((name, arguments)) = call else {
+                        unpaired.push((node, item));
+                        continue;
+                    };
+                    let (output, mut failed) = output(&item);
+                    match denial(&item) {
+                        Some(reason) => {
+                            // It never ran: nothing it would have done follows.
+                            failed = true;
+                            self.commit_denied(&name, &arguments, &reason);
+                        }
+                        None => self.commit_call(&name, &arguments, &output, failed),
+                    }
+                    if older {
+                        continue;
+                    }
+                    if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                        self.resolve(&arguments, id, turns.get(&node).copied(), false)
+                            .await;
+                    }
+                    if name == asks::TOOL
+                        && !failed
+                        && !reactions::refused(&item)
+                        && let Some(ask) = asks::call(id, &arguments)
+                        && !self.asks.iter().any(|open| open.id == ask.id)
+                    {
+                        self.asks.push(ask);
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(lines) = said {
@@ -3100,7 +3123,7 @@ impl App {
         }
         if older {
             self.draw_bot_reactions();
-            return;
+            return unpaired;
         }
         // A running turn's reactions are drawn when it ends.
         if self.running.is_none() {
@@ -3108,6 +3131,7 @@ impl App {
         }
         // A call still running finishes live, after the history.
         self.calls.extend(calls);
+        unpaired
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
