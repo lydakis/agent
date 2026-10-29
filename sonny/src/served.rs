@@ -162,16 +162,15 @@ fn project() -> Value {
 }
 
 fn subscriptions() -> Value {
-    let questions: Vec<&str> = crate::lookout::QUESTIONS.iter().map(|q| q.id).collect();
     json!({
         "name": SUBSCRIPTIONS,
-        "description": "Your subscriptions in the person's lookout, which watches agents for you and wakes you \
-            with a note starting \"Task updates\" when one needs you. Each watches the tasks of a bot (every \
-            agent it or its tasks made) or bots by name, and asks a judge model the lookout's built-in \
-            questions about what they say and how their turns end, or what you look for in your own words, \
-            with what you do on a yes. A note that names a subscription means do what it says. Add one, or \
-            remove one by name; with neither, or after either, the result lists them all. Adding one again \
-            changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
+        "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
+            what happens in them in a note starting \"Task updates\": every message someone other than you \
+            writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
+            The person's own words cut into your running turn; the rest waits until your turn ends. Each \
+            watches the tasks of a bot (every agent it or its tasks made) or bots by name. Add one, or remove \
+            one by name; with neither, or after either, the result lists them all. Adding one again changes \
+            nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -182,27 +181,7 @@ fn subscriptions() -> Value {
                         "tasks_of": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots it watches by name, * matching any run of characters."},
-                        "on": {"type": "array", "items": {"type": "string", "enum": ["said", "ended"]},
-                            "description": "What it watches: what the bots say, how their turns end; both \
-                                when left out."},
-                        "ask": {"type": "array", "items": {"type": "string", "enum": questions},
-                            "description": "Which built-in questions it asks; every one that fits when left \
-                                out, unless it looks for something of its own."},
-                        "look_for": {"type": "array", "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string", "minLength": 1, "description": "What to look for."},
-                                "then": {"type": "string", "minLength": 1, "description": "What you do on a yes."},
-                                "urgent": {"type": "boolean", "description": "A yes cuts into your running turn."}
-                            },
-                            "required": ["text", "then"],
-                            "additionalProperties": false
-                        }},
-                        "context": {"type": "string", "minLength": 1,
-                            "description": "A line every check reads: what you care about."},
-                        "updates": {"type": "boolean",
-                            "description": "Also hear how the turns of the bots you made ended, unjudged."}
+                            "description": "Bots it watches by name, * matching any run of characters."}
                     },
                     "required": ["name"],
                     "additionalProperties": false

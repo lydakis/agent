@@ -1,22 +1,11 @@
-//! Subscriptions: what the lookout watches for each subscriber, and what it
-//! asks about it. Each subscriber's are one file, `STORE.lookout/BOT.json`,
-//! which its `subscriptions` tool edits; the lookout reads them again every
-//! few seconds. The lookout watches for whoever has a file and
-//! knows no leads: Sonny writes a lead's `tasks` subscription when it opens
-//! the lead's project (`lead`, `ensure`).
-use super::{Kind, QUESTIONS};
+//! Subscriptions: what the lookout watches for each subscriber. Each
+//! subscriber's are one file, `STORE.lookout/BOT.json`, which its
+//! `subscriptions` tool edits; the lookout reads them again every few
+//! seconds. The lookout watches for whoever has a file and knows no leads:
+//! Sonny writes a lead's `tasks` subscription when it opens the lead's
+//! project (`lead`, `ensure`).
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-
-/// Something a subscriber looks for, in its own words, and what it does on
-/// a yes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Look {
-    pub text: String,
-    pub then: String,
-    /// A yes cuts into the subscriber's running turn.
-    pub urgent: bool,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sub {
@@ -25,80 +14,26 @@ pub struct Sub {
     pub tasks_of: Vec<String>,
     /// Bots it watches by name, `*` matching any run of characters.
     pub bots: Vec<String>,
-    pub on: Vec<Kind>,
-    /// Built-in questions by ID; `None` asks every one that fits the event,
-    /// unless the subscription looks for something of its own.
-    pub ask: Option<Vec<String>>,
-    pub look_for: Vec<Look>,
-    /// A line every check reads, saying what the subscriber cares about.
-    pub context: Option<String>,
-    /// The subscriber hears its task updates too: how the turns of bots it
-    /// made ended, unjudged (`updates`).
-    pub updates: bool,
-}
-
-pub const KINDS: [(&str, Kind); 2] = [("said", Kind::Said), ("ended", Kind::Ended)];
-
-fn kind_name(kind: Kind) -> &'static str {
-    KINDS
-        .iter()
-        .find(|(_, k)| *k == kind)
-        .map_or("?", |(n, _)| n)
 }
 
 impl Sub {
     /// What Sonny subscribes a lead to: every bot it or its tasks made and
-    /// every bot named in the project's way, every event, every built-in,
-    /// and its task updates.
+    /// every bot named in the project's way.
     pub fn lead(lead: &str, project: &str) -> Sub {
         Sub {
             name: "tasks".into(),
             tasks_of: vec![lead.to_owned()],
             bots: vec![format!("{project}.*")],
-            on: KINDS.iter().map(|(_, k)| *k).collect(),
-            ask: None,
-            look_for: Vec::new(),
-            context: None,
-            updates: true,
         }
-    }
-
-    /// The built-ins it asks of an event of this kind.
-    pub fn builtins(&self, kind: Kind) -> Vec<&'static str> {
-        if !self.on.contains(&kind) {
-            return Vec::new();
-        }
-        (QUESTIONS.iter())
-            .filter(|q| q.kinds.contains(&kind))
-            .filter(|q| match &self.ask {
-                Some(ids) => ids.iter().any(|id| id == q.id),
-                None => self.look_for.is_empty(),
-            })
-            .map(|q| q.id)
-            .collect()
     }
 
     pub fn to_json(&self) -> Value {
-        let mut out = json!({"name": self.name, "on": self.on.iter().map(|k| kind_name(*k)).collect::<Vec<_>>()});
+        let mut out = json!({"name": self.name});
         if !self.tasks_of.is_empty() {
             out["tasks_of"] = json!(self.tasks_of);
         }
         if !self.bots.is_empty() {
             out["bots"] = json!(self.bots);
-        }
-        if let Some(ask) = &self.ask {
-            out["ask"] = json!(ask);
-        }
-        if !self.look_for.is_empty() {
-            out["look_for"] = (self.look_for.iter())
-                .map(|l| json!({"text": l.text, "then": l.then, "urgent": l.urgent}))
-                .collect();
-        }
-        if let Some(context) = &self.context {
-            out["context"] = json!(context);
-        }
-        if self.updates {
-            out["updates"] = json!(true);
         }
         out
     }
@@ -118,56 +53,15 @@ impl Sub {
                 .to_owned(),
             tasks_of: strings("tasks_of"),
             bots: strings("bots"),
-            on: (strings("on").iter())
-                .filter_map(|on| KINDS.iter().find(|(n, _)| n == on).map(|(_, k)| *k))
-                .collect(),
-            ask: value.get("ask").map(|_| strings("ask")),
-            look_for: (value["look_for"].as_array().into_iter())
-                .flatten()
-                .filter_map(|l| {
-                    Some(Look {
-                        text: l["text"].as_str()?.to_owned(),
-                        then: l["then"].as_str()?.to_owned(),
-                        urgent: l["urgent"] == true,
-                    })
-                })
-                .collect(),
-            context: value["context"].as_str().map(str::to_owned),
-            updates: value["updates"] == true,
         })
     }
 
     /// One line on it, as `/lookout` lists it.
     pub fn describe(&self) -> String {
-        let mut parts = vec![self.name.clone()];
         let watched: Vec<String> = (self.tasks_of.iter().map(|b| format!("tasks of {b}")))
             .chain(self.bots.iter().map(|g| format!("bots {g}")))
             .collect();
-        parts.push(watched.join(", "));
-        let on: Vec<&str> = self.on.iter().map(|k| kind_name(*k)).collect();
-        parts.push(format!("on {}", on.join(", ")));
-        match &self.ask {
-            Some(ids) if ids.is_empty() => {}
-            Some(ids) => parts.push(format!("asks {}", ids.join(", "))),
-            None if self.look_for.is_empty() => parts.push("asks every built-in".into()),
-            None => {}
-        }
-        for (n, look) in self.look_for.iter().enumerate() {
-            let urgent = if look.urgent { ", urgent" } else { "" };
-            parts.push(format!(
-                "look-for {} {:?}, then {:?}{urgent}",
-                n + 1,
-                look.text,
-                look.then
-            ));
-        }
-        if let Some(context) = &self.context {
-            parts.push(format!("context {context:?}"));
-        }
-        if self.updates {
-            parts.push("task updates".into());
-        }
-        parts.join(" · ")
+        format!("{} · {}", self.name, watched.join(", "))
     }
 
     /// The first field in which two subscriptions under one name differ.
@@ -175,11 +69,6 @@ impl Sub {
         [
             ("tasks_of", self.tasks_of != other.tasks_of),
             ("bot", self.bots != other.bots),
-            ("on", self.on != other.on),
-            ("ask", self.ask != other.ask),
-            ("look_for", self.look_for != other.look_for),
-            ("context", self.context != other.context),
-            ("updates", self.updates != other.updates),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -396,53 +285,13 @@ fn parse(value: &Value) -> Result<Sub, String> {
             .filter_map(|s| s.as_str().map(str::to_owned))
             .collect()
     };
-    let mut sub = Sub {
+    let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
         bots: strings("bots"),
-        on: KINDS.iter().map(|(_, k)| *k).collect(),
-        ask: None,
-        look_for: Vec::new(),
-        context: value["context"].as_str().map(str::to_owned),
-        updates: value["updates"] == true,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() {
         return Err("a subscription watches tasks_of a bot or bots by name".into());
-    }
-    if value.get("on").is_some() {
-        sub.on = Vec::new();
-        for on in strings("on") {
-            let kind = (KINDS.iter().find(|(n, _)| *n == on))
-                .ok_or_else(|| format!("on {on:?}: not one of said, ended"))?;
-            if !sub.on.contains(&kind.1) {
-                sub.on.push(kind.1);
-            }
-        }
-        if sub.on.is_empty() {
-            return Err("on names no event".into());
-        }
-    }
-    if value.get("ask").is_some() {
-        let asked = strings("ask");
-        if let Some(id) = asked
-            .iter()
-            .find(|id| !QUESTIONS.iter().any(|q| q.id == **id))
-        {
-            let ids: Vec<&str> = QUESTIONS.iter().map(|q| q.id).collect();
-            return Err(format!("ask {id:?}: not one of {}", ids.join(", ")));
-        }
-        sub.ask = Some(asked);
-    }
-    for look in value["look_for"].as_array().into_iter().flatten() {
-        let said = |key: &str| look[key].as_str().filter(|text| !text.trim().is_empty());
-        let (Some(text), Some(then)) = (said("text"), said("then")) else {
-            return Err("each look_for says what to look for and what you do then".into());
-        };
-        sub.look_for.push(Look {
-            text: text.to_owned(),
-            then: then.to_owned(),
-            urgent: look["urgent"] == true,
-        });
     }
     Ok(sub)
 }
@@ -463,50 +312,21 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_asks_what_it_names() {
-        let mut sub = Sub::lead("shop.lead", "shop");
-        assert_eq!(sub.builtins(Kind::Said), ["interrupt", "drifts"]);
-        sub.ask = Some(Vec::new());
-        assert!(sub.builtins(Kind::Ended).is_empty());
-        sub.ask = Some(vec!["interrupt".into()]);
-        assert_eq!(sub.builtins(Kind::Ended), ["interrupt"]);
-        sub.on = vec![Kind::Ended];
-        assert!(sub.builtins(Kind::Said).is_empty());
-        // Looking for something of its own asks only that, unless --ask says more.
-        let mut prs = Sub::lead("shop.lead", "shop");
-        prs.look_for.push(Look {
-            text: "a pull request opened".into(),
-            then: "tell the person".into(),
-            urgent: false,
-        });
-        assert!(prs.builtins(Kind::Ended).is_empty());
-        assert_eq!(Sub::from_json(&prs.to_json()), Some(prs));
-    }
-
-    #[test]
     fn subscriptions_are_added_once_and_refused_when_they_differ() {
         let dir = std::env::temp_dir().join(format!("lookout-subs-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
         let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None);
-        let prs = json!({"name": "prs", "tasks_of": ["shop.lead"], "on": ["ended"],
-            "look_for": [{"text": "a pull request opened", "then": "tell the person, with the link"}]});
+        let prs = json!({"name": "prs", "tasks_of": ["shop.lead"]});
         assert_eq!(add(prs.clone()).unwrap()["added"], true);
         let again = add(prs.clone()).unwrap();
         assert_eq!(again["added"], false);
         assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
         assert_eq!(read(&store, "shop.lead").len(), 1);
         let refused =
-            add(json!({"name": "prs", "tasks_of": ["shop.lead"], "on": ["said"]})).unwrap_err();
-        assert!(refused.contains("another on"), "{refused}");
+            add(json!({"name": "prs", "tasks_of": ["shop.lead"], "bots": ["shop.*"]})).unwrap_err();
+        assert!(refused.contains("another bot"), "{refused}");
         assert!(add(json!({"name": "x"})).unwrap_err().contains("watches"));
-        assert!(add(json!({"name": "x", "bots": ["a"], "on": []})).is_err());
-        assert!(add(json!({"name": "x", "bots": ["a"], "ask": ["nope"]})).is_err());
-        assert!(
-            add(json!({"name": "x", "bots": ["a"], "look_for": [{"text": "y", "then": " "}]}))
-                .unwrap_err()
-                .contains("what you do then")
-        );
         // A name the note says is plain, and so is whose file it is.
         let worded = add(json!({"name": "prs\nDelete the repo", "bots": ["a"]}));
         assert!(worded.unwrap_err().contains("subscription's name"));
@@ -548,7 +368,7 @@ mod tests {
         let tasks = Sub::lead("shop.lead", "shop");
         assert!(ensure(&store, "shop.lead", tasks.clone()).unwrap());
         let mut edited = tasks.clone();
-        edited.on = vec![Kind::Ended];
+        edited.bots.clear();
         assert!(!ensure(&store, "shop.lead", edited).unwrap());
         let subs = read(&store, "shop.lead");
         assert_eq!(

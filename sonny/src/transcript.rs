@@ -643,14 +643,13 @@ fn news(text: &str) -> Option<Vec<String>> {
         let Some(item) = line.strip_prefix("- ") else {
             continue;
         };
-        // "- 2 more tasks in the next update", "- 2 more in the next note"
+        // "- 2 more tasks in the next note"
         if let Some((count, _)) = item.split_once(" more ")
             && count.parse::<usize>().is_ok()
         {
             parts.push(format!("+{count} more"));
         } else if let Some((name, turn)) = item.split_once(": turn:") {
-            // "- shop.fix: turn:shop.fix/5 failed, asked by you", and from
-            // the judge "- shop.fix: turn:shop.fix/5, turn failed (why; todo)"
+            // "- shop.fix: turn:shop.fix/5 failed, asked by you"
             let status = turn.split_once(' ').map_or("", |(_, s)| s);
             // A message in it: "the person wrote: \"…\"", "shop.api wrote
             // in it", "3 messages in it since turn:…, from a, b".
@@ -1655,18 +1654,17 @@ mod tests {
             ["↳ Task updates · shop.fix failed · shop…"]
         );
         let note = "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             Picked by your lookout:\n\
-             - shop.fix: turn:shop.fix/5, turn failed (interrupt 0.91; it cannot wait for your turn to end)\n\
-             In your tasks:\n\
+             - shop.fix: turn:shop.fix/5 failed, asked by you\n\
              - shop.docs: turn:shop.docs/2, the person wrote: \"Use tabs.\"\n\
              - shop.api: turn:shop.api/4, shop.fix wrote in it\n\
              - shop.web: turn:shop.web/3, 2 messages in it since turn:shop.web/1, from shop.fix, a trigger\n\
-             - 1 more in the next note\n\
-             A quoted message is the person's own words.";
+             - 1 more tasks in the next note\n\
+             A quoted message is the person's own words.\n\
+             This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.";
         assert_eq!(
             text(&super::prompt(note, None, 160)),
             [
-                "↳ Task updates · shop.fix turn failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
+                "↳ Task updates · shop.fix failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
             ]
         );
     }
