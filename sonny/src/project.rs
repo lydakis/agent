@@ -539,11 +539,14 @@ pub async fn open(
     let Some(found) = found else {
         // The folder's first lead, whatever was asked: its name is the
         // project's, so the others can be found by it.
-        if let Pick::Named(name) = pick
-            && lead_bot(&project, name) != first
-        {
-            // Another lead of the folder outlives the first.
-            let bot = lead_bot(&project, name);
+        // Another lead of the folder outlives the first: the one named, or
+        // the one last written to.
+        let other = match pick {
+            Pick::Named(name) => Some(lead_bot(&project, name)),
+            Pick::Last => last_lead(&dir).filter(|bot| lead_project(bot) == Some(project.as_str())),
+            _ => None,
+        };
+        if let Some(bot) = other.filter(|bot| *bot != first) {
             let there = find(client, &bot).await?;
             if there.is_some_and(|found| found["workspace"].as_str() == dir.to_str()) {
                 return Ok(Lead {
@@ -554,7 +557,9 @@ pub async fn open(
                     above: above(&dir),
                 });
             }
-            return Err(format!("lead_missing: {project} has no lead {name} yet"));
+            if let Pick::Named(name) = pick {
+                return Err(format!("lead_missing: {project} has no lead {name} yet"));
+            }
         }
         create(client, &dir, model, None).await?;
         return Ok(Lead {
