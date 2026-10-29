@@ -713,7 +713,7 @@ impl Service {
                     }
                 }
                 Some(goals::Settled { bot, turn, outcome }) = settled.recv() => {
-                    self.goals.settled(&bot);
+                    self.goals.settled(&bot, turn);
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
                     }

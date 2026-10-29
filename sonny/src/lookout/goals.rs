@@ -315,8 +315,7 @@ pub struct Goals {
     continued: HashSet<String>,
     /// Agents whose goal's check runs: a turn that ends meanwhile is
     /// plain news, and the check's own turn is checked in its place.
-    /// Each with the cursor of the turn's end, which a restart replays.
-    checking: HashMap<String, (tokio::task::AbortHandle, Option<i64>)>,
+    checking: HashMap<String, Check>,
     /// Turns in a row the goal started that called no tool.
     /// Keyed by the goal's `set_ms` and the last turn counted, so a turn
     /// replayed after a reconnect is not counted again.
@@ -324,6 +323,16 @@ pub struct Goals {
     /// The folder each turn was sent to: a later turn can move its agent,
     /// and the check runs where the turn worked.
     worked: HashMap<(String, i64), PathBuf>,
+}
+
+/// A goal's check under way.
+struct Check {
+    pursuit: tokio::task::AbortHandle,
+    /// The cursor of the turn's end, which a restart replays.
+    at: Option<i64>,
+    turn: i64,
+    /// The goal checked: one set since is checked afresh.
+    set_ms: u64,
 }
 
 impl Goals {
@@ -340,16 +349,22 @@ impl Goals {
         }
     }
 
-    /// The check of `bot` said how its goal stands.
-    pub fn settled(&mut self, bot: &str) {
-        self.checking.remove(bot);
+    /// The check of `bot`'s `turn` said how its goal stands.
+    pub fn settled(&mut self, bot: &str, turn: i64) {
+        if self
+            .checking
+            .get(bot)
+            .is_some_and(|check| check.turn == turn)
+        {
+            self.checking.remove(bot);
+        }
     }
 
     /// Checks under way answer a connection since dropped, never the next:
     /// they stop, and the replay runs them again.
     pub fn reconnected(&mut self) {
-        for (_, (check, _)) in self.checking.drain() {
-            check.abort();
+        for (_, check) in self.checking.drain() {
+            check.pursuit.abort();
         }
     }
 
@@ -357,7 +372,7 @@ impl Goals {
     /// lookout keeps for the next one is from before it, so a restart, or
     /// one with no subscriber to hold the turn, runs its check again.
     pub fn floor(&self) -> Option<i64> {
-        self.checking.values().filter_map(|(_, at)| *at).min()
+        self.checking.values().filter_map(|check| check.at).min()
     }
 
     pub fn reread(&mut self) {
@@ -406,8 +421,8 @@ impl Goals {
             // A new agent under the name has no goal of the last one's.
             "deleted" => {
                 self.worked.retain(|(name, _), _| name != bot);
-                if let Some((check, _)) = self.checking.remove(bot) {
-                    check.abort();
+                if let Some(check) = self.checking.remove(bot) {
+                    check.pursuit.abort();
                 }
                 if let Some(goal) = self.goals.remove(bot) {
                     end(&self.store, &goal);
@@ -438,8 +453,20 @@ impl Goals {
                     self.goals.remove(bot);
                     return None;
                 }
-                if self.checking.contains_key(bot) {
-                    return None;
+                match self.checking.get(bot) {
+                    Some(check) if check.set_ms == goal.set_ms => return None,
+                    // The goal it checks was set again: its turn is plain
+                    // news, and this one is checked for the new goal.
+                    Some(_) => {
+                        let check = self.checking.remove(bot)?;
+                        check.pursuit.abort();
+                        let _ = done.try_send(Settled {
+                            bot: bot.to_owned(),
+                            turn: check.turn,
+                            outcome: Some(String::new()),
+                        });
+                    }
+                    None => {}
                 }
                 // An interrupted or failed turn pauses it: the next turn
                 // that completes is checked. A steer's is part of another.
@@ -463,14 +490,20 @@ impl Goals {
                     self.socket.clone(),
                 );
                 let held = (bot.to_owned(), turn);
+                let set_ms = goal.set_ms;
                 let bot = bot.to_owned();
                 let checking = bot.clone();
                 let pursuit = tokio::spawn(async move {
                     let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
                     let _ = done.send(Settled { bot, turn, outcome }).await;
                 });
-                self.checking
-                    .insert(checking, (pursuit.abort_handle(), event["cursor"].as_i64()));
+                let check = Check {
+                    pursuit: pursuit.abort_handle(),
+                    at: event["cursor"].as_i64(),
+                    turn,
+                    set_ms,
+                };
+                self.checking.insert(checking, check);
                 Some(held)
             }
             _ => None,
