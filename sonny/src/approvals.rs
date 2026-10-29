@@ -71,20 +71,44 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
 /// hold them, for an agent working in `workspace`: Codex's
 /// `workspace-write`, reaching the network, with the folder's repository
 /// writable too so a commit runs without asking (its hooks and config stay
-/// read-only). A lead in `full` mode runs unconfined, as Codex's full
-/// access does; a task is always confined.
-pub fn sandbox(mode: &str, lead: bool, workspace: &std::path::Path) -> Map<String, Value> {
+/// read-only), and the commands the person's config lets out of it
+/// (`[sonny] unsandboxed`). In `full` mode an agent runs unconfined, as
+/// under Codex's full access, where nothing would answer a call that asks
+/// to leave the sandbox.
+pub fn sandbox(mode: &str, workspace: &std::path::Path) -> Map<String, Value> {
+    sandbox_with(mode, workspace, &unsandboxed())
+}
+
+/// [`sandbox`]'s fields, with `unsandboxed` the commands let out of it.
+fn sandbox_with(
+    mode: &str,
+    workspace: &std::path::Path,
+    unsandboxed: &[String],
+) -> Map<String, Value> {
     let fields = match mode {
-        "full" if lead => json!({"sandbox": "danger-full-access"}),
+        "full" => json!({"sandbox": "danger-full-access"}),
         _ => {
             let writable: Vec<String> = repository(workspace).into_iter().collect();
-            json!({"sandbox": "workspace-write", "writable": writable, "network": true})
+            let mut fields =
+                json!({"sandbox": "workspace-write", "writable": writable, "network": true});
+            if !unsandboxed.is_empty() {
+                fields["unsandboxed"] = json!(unsandboxed);
+            }
+            fields
         }
     };
     match fields {
         Value::Object(fields) => fields,
         _ => Map::new(),
     }
+}
+
+/// The commands the person's config lets agents run outside their
+/// sandboxes; none when it can't be read, which Sonny reports on start.
+pub fn unsandboxed() -> Vec<String> {
+    agent_client::config::load()
+        .map(|config| config.sonny.unsandboxed)
+        .unwrap_or_default()
 }
 
 /// The git folder of the repository `dir` is in, which its linked
@@ -110,9 +134,10 @@ pub fn repository(dir: &std::path::Path) -> Option<String> {
 pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
     let fields = Value::Object(fields.clone());
     let settings = &record["settings"];
-    let writable = |value: &Value| value["writable"].as_array().cloned().unwrap_or_default();
+    let list = |value: &Value, key: &str| value[key].as_array().cloned().unwrap_or_default();
     settings["sandbox"] == fields["sandbox"]
-        && writable(settings) == writable(&fields)
+        && list(settings, "writable") == list(&fields, "writable")
+        && list(settings, "unsandboxed") == list(&fields, "unsandboxed")
         && settings["network"].as_bool().unwrap_or(false)
             == fields["network"].as_bool().unwrap_or(false)
 }
@@ -158,8 +183,9 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     made
 }
 
-/// The `configure` fields that give a bot `mode`, or `None` when its gate
-/// is already the one `gate` makes: the same approver over the same tools,
+/// The `configure` fields that give a bot `mode`, with the sandbox the
+/// mode gives an agent in its folder, or `None` when its gate is already
+/// the one `gate` makes and its sandbox the mode's: the same approver over the same tools,
 /// with no expiry. `record` is the bot as `inspect` gives it, with the
 /// tools its client declared.
 pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
@@ -193,7 +219,14 @@ pub fn regate(record: &Value, mode: &str) -> Option<Map<String, Value>> {
                 && sorted(&gate["tools"]) == sorted(&want["tools"])
                 && gate["expire_ms"].is_null()
         });
-    (!has).then_some(fields)
+    let mut fields = fields;
+    let mut confined = true;
+    if let Some(workspace) = record["workspace"].as_str() {
+        let sandbox = sandbox(mode, std::path::Path::new(workspace));
+        confined = sandboxed_as(record, &sandbox);
+        fields.extend(sandbox);
+    }
+    (!has || !confined).then_some(fields)
 }
 
 #[cfg(test)]
@@ -201,7 +234,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lead_is_confined_but_in_full_mode_and_a_task_always() {
+    fn an_agent_is_confined_but_in_full_mode() {
         let dir = std::env::temp_dir().join(format!("sonny-sandbox-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
@@ -209,30 +242,55 @@ mod tests {
         let git = dir.join(".git").display().to_string();
         let confined = json!({"sandbox": "workspace-write", "writable": [git], "network": true});
         for (mode, _) in MODES {
-            let fields = sandbox(mode, false, &dir);
+            let fields = sandbox_with(mode, &dir, &[]);
+            if mode == "full" {
+                continue;
+            }
             assert_eq!(Value::Object(fields.clone()), confined);
             assert!(sandboxed_as(&json!({"settings": fields}), &fields));
         }
-        assert_eq!(Value::Object(sandbox("auto", true, &dir)), confined);
-        let full = sandbox("full", true, &dir);
+        assert_eq!(Value::Object(sandbox_with("auto", &dir, &[])), confined);
+        let full = sandbox_with("full", &dir, &[]);
         assert_eq!(
             Value::Object(full.clone()),
             json!({"sandbox": "danger-full-access"})
         );
+        // A task the person moves to `full` leaves its sandbox with the
+        // gate, and one already there is left alone.
+        let task = json!({"workspace": dir, "gates": [],
+            "settings": {"sandbox": "workspace-write", "writable": [git], "network": true}});
+        assert_eq!(
+            regate(&task, "full").unwrap()["sandbox"],
+            "danger-full-access"
+        );
+        let freed = json!({"workspace": dir, "gates": [],
+            "settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
+        assert_eq!(regate(&freed, "full"), None);
         let unconfined = json!({"settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
         assert!(sandboxed_as(&unconfined, &full));
         // A lead made before leads were confined is confined again, and
         // one whose repository moved is given it where it is now.
-        let auto = sandbox("auto", true, &dir);
+        let auto = sandbox_with("auto", &dir, &[]);
         assert!(!sandboxed_as(&json!({"settings": {}}), &auto));
         let moved = json!({"settings": {"sandbox": "workspace-write", "writable": ["/gone/.git"],
             "network": true}});
         assert!(!sandboxed_as(&moved, &auto));
+        // The commands the config lets out of the sandbox go with it, and
+        // a lead made before they were named takes them.
+        let mcpx = sandbox_with("auto", &dir, &["mcpx".to_owned()]);
+        assert_eq!(mcpx["unsandboxed"], json!(["mcpx"]));
+        assert!(!sandboxed_as(&json!({"settings": auto}), &mcpx));
+        assert!(sandboxed_as(&json!({"settings": mcpx}), &mcpx));
+        assert!(
+            sandbox_with("full", &dir, &["mcpx".to_owned()])
+                .get("unsandboxed")
+                .is_none()
+        );
         // Outside a repository, only its own folder; with a git folder
         // named otherwise, whose hooks the daemon wouldn't know to keep,
         // commits ask.
         let plain = std::env::temp_dir();
-        assert_eq!(sandbox("ask", true, &plain)["writable"], json!([]));
+        assert_eq!(sandbox_with("ask", &plain, &[])["writable"], json!([]));
         let apart = dir.join("apart");
         let tree = dir.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
@@ -241,7 +299,7 @@ mod tests {
             &["init", "-q", "--separate-git-dir", apart.to_str().unwrap()],
         )
         .unwrap();
-        assert_eq!(sandbox("ask", true, &tree)["writable"], json!([]));
+        assert_eq!(sandbox_with("ask", &tree, &[])["writable"], json!([]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

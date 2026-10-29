@@ -3,8 +3,8 @@
 //! thread. A thread in a folder is that folder's lead, as `sonny` there
 //! finds or makes it, set up the same way: its rules and skills, its tools,
 //! its approval mode, and the lookout. Each task the lead starts opens as a
-//! thread of its own, through T3 Code's tools, and that thread is the
-//! task's.
+//! thread through T3 Code's tools, the lead thread's child while the
+//! person's prompt runs, and that thread is the task's.
 //!
 //! It speaks the protocol's version 2 draft as T3 Code does: the turns a
 //! bot takes on its own, as when the lookout wakes a lead because a task
@@ -28,6 +28,9 @@ const VERSION: i64 = 2;
 
 /// The most of a call's output a thread is shown.
 const OUTPUT_BYTES: usize = 8 * 1024;
+
+/// The longest the person's prompt waits for its tasks' threads to open.
+const OPENING: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// JSON-RPC's codes for what Sonny refuses.
 const INVALID_PARAMS: i64 = -32602;
@@ -146,8 +149,10 @@ struct Agent {
     options: crate::Options,
     t3: Option<t3::T3>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// The daemon, reached once, with Sonny's skills installed first.
-    ready: OnceCell<Result<(), String>>,
+    /// The daemon, reached once, with Sonny's skills installed first. A
+    /// failure is not kept: the next thread tries again, so a daemon
+    /// restarted under a running T3 is reached without restarting T3.
+    ready: OnceCell<()>,
     /// The version the client asked for, when older.
     version: AtomicI64,
 }
@@ -286,23 +291,23 @@ impl Agent {
         if !choices.iter().any(|choice| choice["value"] == value) {
             choices.push(json!({"value": value, "name": value}));
         }
-        let mut option = json!({"name": "Model", "category": "model", "type": "select",
-            "currentValue": value, "options": choices});
-        option[if self.v2() { "configId" } else { "id" }] = json!("model");
-        json!([option])
+        // Both names: version 2's schema says `configId`, but T3 Code finds
+        // the model option by `id` whatever the version.
+        json!([{"id": "model", "configId": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": value, "options": choices}])
     }
 
     /// The daemon, started as `sonny` starts it, with Sonny's skills
     /// installed before any lead is made, so its instructions list them.
     async fn ready(&self) -> Result<(), String> {
         self.ready
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 crate::skills::install_own();
                 crate::trigger::at_start();
                 crate::connect(&self.options).await.map(drop)
             })
             .await
-            .clone()
+            .map(drop)
     }
 
     /// A thread starts (`session/new`) or comes back (`session/resume`).
@@ -406,6 +411,11 @@ struct State {
     /// The model the person picked, which the bot takes when it is next
     /// idle; a new lead starts on it.
     picked: Option<String>,
+    /// Tasks whose threads are opening, as children of the person's prompt
+    /// while it runs, and the answers of the prompts whose turns ended
+    /// meanwhile, held until they are open.
+    opening: usize,
+    held: Vec<(Value, Value)>,
 }
 
 struct Bound {
@@ -564,11 +574,9 @@ impl Session {
     /// only, at once when the bot is idle and with its next turn when it
     /// is not; a thread that is no bot yet keeps it for the lead it makes.
     async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
-        if params["configId"] != "model" {
-            return Err((
-                INVALID_PARAMS,
-                format!("Sonny has no option {}", params["configId"]),
-            ));
+        let option = params.get("configId").unwrap_or(&params["id"]);
+        if option != "model" {
+            return Err((INVALID_PARAMS, format!("Sonny has no option {option}")));
         }
         let Some(value) = params["value"].as_str() else {
             return Err((INVALID_PARAMS, "a model is picked by its id".into()));
@@ -683,6 +691,9 @@ impl Session {
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
         let (text, images) = words(&params["prompt"]);
+        if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
+            return Ok(json!({"stopReason": "end_turn"}));
+        }
         let bound = {
             let mut state = self.state.lock().await;
             state.cancelled = false;
@@ -1088,13 +1099,35 @@ impl Session {
                         .as_ref()
                         .map(|b| b.workspace.clone())
                         .unwrap_or_default();
-                    let (agent, session) = (agent.clone(), self.id.clone());
-                    tokio::spawn(async move {
-                        open_task(
-                            &agent, &session, &client, &project, &arguments, &workspace, &call,
-                        )
-                        .await
-                    });
+                    let this = (agent.sessions.lock().ok())
+                        .and_then(|sessions| sessions.get(&self.id).cloned());
+                    if let Some(session) = this {
+                        state.opening += 1;
+                        let session_id = session.id.clone();
+                        let agent = agent.clone();
+                        tokio::spawn(async move {
+                            let (opener, thread) = (agent.clone(), session.cwd.clone());
+                            let opening = tokio::spawn(async move {
+                                let at = Where {
+                                    project: &project,
+                                    workspace: &workspace,
+                                    thread: &thread,
+                                };
+                                let session = &session_id;
+                                open_task(&opener, session, &client, &at, &arguments, &call).await;
+                            });
+                            // The person's prompt waits for its tasks' threads,
+                            // not for ever: one still opening opens on its own.
+                            let _ = tokio::time::timeout(OPENING, opening).await;
+                            let mut state = session.state.lock().await;
+                            state.opening -= 1;
+                            if state.opening == 0 {
+                                for (prompt, result) in std::mem::take(&mut state.held) {
+                                    agent.out.answer(&prompt, result);
+                                }
+                            }
+                        });
+                    }
                 }
             }
             "approval_requested" | "approval_asked" => {
@@ -1144,7 +1177,13 @@ impl Session {
                         result["error"] = json!({"code": FAILED,
                             "message": data["error"].as_str().unwrap_or("the turn failed")});
                     }
-                    out.answer(&prompt, result);
+                    // A task T3 Code opens as a child of this prompt opens
+                    // while its run is on.
+                    if state.opening > 0 {
+                        state.held.push((prompt, result));
+                    } else {
+                        out.answer(&prompt, result);
+                    }
                 }
             }
             "deleted" => {
@@ -1375,10 +1414,7 @@ async fn setup_lead(
     let mut gating = lead.new.then_some(approvals::MODES[0].0);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(
-            &record,
-            &approvals::sandbox(mode, true, Path::new(&workspace)),
-        )
+        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
     {
         gating = Some(mode);
     }
@@ -1396,7 +1432,7 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.extend(approvals::sandbox(mode, true, Path::new(&workspace)));
+        fields.extend(approvals::sandbox(mode, Path::new(&workspace)));
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {
@@ -1430,18 +1466,28 @@ async fn setup_lead(
     Ok(())
 }
 
+/// Where a lead's thread is: its project, the lead's workspace, and the
+/// folder T3 Code opened the thread in.
+struct Where<'a> {
+    project: &'a str,
+    workspace: &'a str,
+    thread: &'a Path,
+}
+
 /// Open the task a lead's `start_task` call started as a thread of its
 /// own, with the task's brief as its first message; the thread is the
-/// task's when that message reaches it. The lead's call says where.
+/// task's when that message reaches it. While the person's prompt runs it
+/// is the lead thread's child, which T3 Code opens in the lead's folder;
+/// otherwise a thread of its own, where the lead's call says.
 async fn open_task(
     agent: &Agent,
     session: &str,
     client: &Client,
-    project: &str,
+    at: &Where<'_>,
     arguments: &Value,
-    lead_workspace: &str,
     call: &str,
 ) {
+    let (project, lead_workspace) = (at.project, at.workspace);
     let Some(t3) = &agent.t3 else { return };
     let Some(name) = arguments["name"].as_str() else {
         return;
@@ -1472,6 +1518,17 @@ async fn open_task(
             .ok_or("the task has no brief")?
             .to_owned();
         let workspace = record["workspace"].as_str().unwrap_or_default();
+        let message = t3::expect(&bot, &brief, at.thread)?;
+        let child = json!({"task": message, "title": name, "clientRequestId": bot});
+        // The person's prompt waits for it: not for ever. One that is late
+        // may open yet, so its task still waits for it and no other thread
+        // is opened for it.
+        let delegating = t3.call("delegate_task", child);
+        match tokio::time::timeout(OPENING, delegating).await {
+            Ok(Ok(delegated)) => return Ok(delegated),
+            Ok(Err(_)) => {}
+            Err(_) => return Ok(Value::Null),
+        }
         let message = t3::expect(&bot, &brief, Path::new(workspace))?;
         let mut launch = json!({"title": name, "message": message, "clientRequestId": bot});
         if workspace != lead_workspace {

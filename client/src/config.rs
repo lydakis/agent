@@ -16,9 +16,13 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
-//! lead_profile = "my-lead"     # the role a new lead starts in, not lead
+//! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
+//! side_chat = "fork"            # "answer", the default, calls no tool
+//! chime = false                 # rings when work ends or waits, the default
+//! verbose = true                # every tool call drawn, not the clean view
 //! suggest = false               # no guess at the next message, on by default
+//! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
 //! url = "https://mcp.linear.app/mcp"
@@ -73,7 +77,7 @@ pub struct Judge {
     pub effort: Option<String>,
 }
 
-/// What Sonny starts its agents with.
+/// What Sonny starts its agents with, and how it shows them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sonny {
     pub lead_effort: Option<String>,
@@ -83,8 +87,18 @@ pub struct Sonny {
     /// The profile every other agent Sonny starts is told, in place of
     /// `task`.
     pub task_profile: Option<String>,
+    /// Commands, by their first words, that its sandboxed agents run
+    /// outside their sandboxes without asking, as Codex's rules that allow
+    /// a command prefix do: a tool with a daemon of its own, such as mcpx.
+    pub unsandboxed: Vec<String>,
     /// The MCP servers Sonny's agents reach, by name.
     pub mcp_servers: BTreeMap<String, McpServer>,
+    pub side_chat: SideChat,
+    /// Whether finished and waiting work rings. Notifications show either way.
+    pub chime: bool,
+    /// Whether every tool call is drawn, or only the bot's words and the
+    /// calls that move the work on (the clean view, the default).
+    pub verbose: bool,
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
@@ -99,11 +113,25 @@ impl Default for Sonny {
             task_effort: None,
             lead_profile: None,
             task_profile: None,
+            unsandboxed: Vec::new(),
             mcp_servers: BTreeMap::new(),
+            side_chat: SideChat::default(),
             suggest: true,
+            chime: true,
+            verbose: false,
             sources: Vec::new(),
         }
     }
+}
+
+/// What the copy `/side` talks to may do: `"answer"`, the default, from
+/// what its agent knows, calling no tool; or `"fork"`, anything its agent
+/// may, with its tools, in its folder, under its approvals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SideChat {
+    #[default]
+    Answer,
+    Fork,
 }
 
 /// A command Sonny's lookout runs, whose every printed line is news for
@@ -329,7 +357,11 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_effort",
                 "lead_profile",
                 "task_profile",
+                "side_chat",
+                "chime",
+                "verbose",
                 "suggest",
+                "unsandboxed",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -351,13 +383,38 @@ fn parse(text: &str) -> Result<Config, String> {
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
             }
-            if key == "suggest" {
-                config.sonny.suggest = value
+            if let Some(switch) = match key.as_str() {
+                "chime" => Some(&mut config.sonny.chime),
+                "suggest" => Some(&mut config.sonny.suggest),
+                "verbose" => Some(&mut config.sonny.verbose),
+                _ => None,
+            } {
+                *switch = value
                     .as_bool()
                     .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
                 continue;
             }
+            if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
+                let invalid = || format!("{name}.{key} must be a list of commands");
+                let commands = value.as_array().ok_or_else(invalid)?;
+                config.sonny.unsandboxed = commands
+                    .iter()
+                    .map(|command| match command.as_str() {
+                        Some(command) if !command.trim().is_empty() => Ok(command.to_owned()),
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
+                continue;
+            }
             let value = string(&format!("{name}.{key}"), value)?;
+            if key == "side_chat" {
+                config.sonny.side_chat = match value.as_str() {
+                    "answer" => SideChat::Answer,
+                    "fork" => SideChat::Fork,
+                    other => return Err(format!("sonny.side_chat is answer or fork, not {other}")),
+                };
+                continue;
+            }
             // The daemon judges models and levels when the agents are made.
             *match (name.as_str(), key.as_str()) {
                 ("judge", "model") => &mut config.judge.model,
@@ -420,6 +477,15 @@ fn string(key: &str, value: &toml::Value) -> Result<String, String> {
 /// new one goes at the end of its table, or of the top level for a bare
 /// key. The file is written whole, and only if it still reads.
 pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
+    let pairs: Vec<(&str, Option<toml::Value>)> = (pairs.iter())
+        .map(|(k, v)| (*k, Some(toml::Value::String((*v).to_owned()))))
+        .collect();
+    write(path, &pairs)
+}
+
+/// As `set`, for any value, where a key with none has its line taken out,
+/// so it is its default again; one the file does not name is left so.
+pub fn write(path: &Path, pairs: &[(&str, Option<toml::Value>)]) -> Result<(), String> {
     read(path)?;
     let text = match std::fs::read_to_string(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -428,7 +494,6 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     for (key, value) in pairs {
         let (table, name) = key.split_once('.').unwrap_or(("", key));
-        let line = format!("{name} = {}", toml::Value::String((*value).to_owned()));
         let at = |line: &str| {
             line.trim_start().strip_prefix('[').map(|h| {
                 h.trim_start_matches('[')
@@ -441,10 +506,12 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         };
         // The lines of `table`: after its header, or the top level's
         // before the first header, up to the next header.
+        let header = lines.iter().position(|l| at(l).as_deref() == Some(table));
         let begin = match table {
             "" => 0,
-            _ => match lines.iter().position(|l| at(l).as_deref() == Some(table)) {
+            _ => match header {
                 Some(header) => header + 1,
+                None if value.is_none() => continue,
                 None => {
                     if lines.last().is_some_and(|l| !l.trim().is_empty()) {
                         lines.push(String::new());
@@ -462,6 +529,19 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
                 .split_once('=')
                 .is_some_and(|(k, _)| k.trim().trim_matches('"') == name)
         });
+        let Some(value) = value else {
+            if let Some(i) = named {
+                lines.remove(i);
+                // A table left with nothing in it goes too.
+                if let Some(header) = header
+                    && lines[begin..end - 1].iter().all(|l| l.trim().is_empty())
+                {
+                    lines.drain(header..end - 1);
+                }
+            }
+            continue;
+        };
+        let line = format!("{name} = {value}");
         match named {
             Some(i) => lines[i] = line,
             None => {
@@ -476,8 +556,34 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
             }
         }
     }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let before = text;
     let mut text = lines.join("\n");
     text.push('\n');
+    // A key written another way, as a dotted key or an inline table, is
+    // not one the lines above find: it is refused, not left as it was.
+    let table: toml::Table = text.parse().unwrap_or_default();
+    for (key, value) in pairs {
+        let (name, inner) = key
+            .split_once('.')
+            .map_or((*key, None), |(t, k)| (t, Some(k)));
+        let found = match inner {
+            Some(inner) => table.get(name).and_then(|t| t.get(inner)),
+            None => table.get(name),
+        };
+        if found != value.as_ref() {
+            return Err(format!(
+                "config_unwritable: {}: {key} is written in a form only an editor can change",
+                path.display()
+            ));
+        }
+    }
+    // Nothing changed, as a default taken out of a file without it.
+    if text == before || (before.is_empty() && lines.is_empty()) {
+        return Ok(());
+    }
     replace(path, &text)
 }
 
@@ -549,7 +655,7 @@ mod tests {
     fn the_file_sets_what_it_names_and_refuses_the_rest() {
         assert_eq!(parse("").unwrap(), Config::default());
         let config = parse(
-            "# mine\n[judge]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\n",
+            "# mine\n[judge]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
         )
         .unwrap();
         assert_eq!(config.judge.model.as_deref(), Some("openai/luna"));
@@ -557,6 +663,7 @@ mod tests {
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
+        assert_eq!(config.sonny.unsandboxed, ["mcpx", "docker compose"]);
         assert_eq!(config.web_search, WebSearch::Live);
         let roles =
             parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
@@ -571,6 +678,12 @@ mod tests {
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);
+        assert_eq!(config.sonny.side_chat, SideChat::Answer);
+        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
+        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert!(config.sonny.chime && !config.sonny.verbose);
+        let quiet = parse("[sonny]\nchime = false\nverbose = true").unwrap();
+        assert!(!quiet.sonny.chime && quiet.sonny.verbose);
         assert!(parse("senders = \"hidden\"").unwrap().hide_senders);
         assert!(!parse("senders = \"shown\"").unwrap().hide_senders);
         for (text, error) in [
@@ -580,12 +693,28 @@ mod tests {
             ),
             ("web_search = false", "web_search must be a string"),
             ("senders = \"off\"", "senders is shown or hidden, not off"),
+            (
+                "[sonny]\nchime = \"no\"",
+                "sonny.chime must be true or false",
+            ),
+            (
+                "[sonny]\nside_chat = \"all\"",
+                "sonny.side_chat is answer or fork, not all",
+            ),
             ("colour = \"red\"", "unknown key colour"),
             ("model = 3", "model must be a string"),
             ("[web]\nsearch = true", "unknown table [web]"),
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
             ("[judge]\neffort = 3", "judge.effort must be a string"),
             ("[judge]\nmodel = \"\"", "judge.model must not be empty"),
+            (
+                "[sonny]\nunsandboxed = \"mcpx\"",
+                "sonny.unsandboxed must be a list of commands",
+            ),
+            (
+                "[sonny]\nunsandboxed = [\" \"]",
+                "sonny.unsandboxed must be a list of commands",
+            ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
         }
@@ -722,6 +851,47 @@ mod tests {
                 .contains("unknown key colour")
         );
         assert_eq!(read(&file).unwrap(), config);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_written_with_no_value_is_its_default_again() {
+        let dir = std::env::temp_dir().join(format!("agent-config-unset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("config.toml");
+        // Nothing to take out leaves no file and no table behind.
+        write(&file, &[("judge.model", None)]).unwrap();
+        assert!(!file.exists());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &file,
+            "# mine\nmodel = \"a/b\"\n\n[judge]\neffort = \"low\"\n\n[sonny]\nlead_effort = \"low\" # cheap\nside_chat = \"fork\"\n",
+        )
+        .unwrap();
+        write(
+            &file,
+            &[
+                ("sonny.lead_effort", None),
+                ("sonny.task_effort", Some("high".into())),
+                ("sonny.chime", Some(false.into())),
+                ("model", None),
+                ("judge.effort", None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "# mine\n\n[sonny]\nside_chat = \"fork\"\ntask_effort = \"high\"\nchime = false\n"
+        );
+        // A key the lines cannot find is refused, the file kept.
+        for text in ["sonny.chime = false\n", "sonny = { chime = false }\n"] {
+            std::fs::write(&file, text).unwrap();
+            for value in [None, Some(true.into())] {
+                let error = write(&file, &[("sonny.chime", value)]).unwrap_err();
+                assert!(error.starts_with("config_"), "{text}: {error}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

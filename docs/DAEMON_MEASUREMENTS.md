@@ -5692,3 +5692,28 @@ Store jobs per turn did not change (7.5 on both). Every change is within the
 gate's 15%. The benches' calls are short, so `tool_started` takes its old path:
 the new parse runs only for a write or edit past the 2 KiB preview, once, on
 arguments the daemon already holds, as a cut patch's parse already did.
+
+## Commands a client trusts leave the sandbox (#309)
+
+A sandboxed bot may now name commands, `unsandboxed`, that run outside its
+sandbox without asking. Every shell call of a sandboxed bot looks at that
+list; only a non-empty list parses the command. Bots without a sandbox, as
+in every bench, skip the look. The Perf workflow's matched screen, base main
+7cb4221 against the PR head 9d5c0fd, on the GitHub runner (2026-10-29):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.951 | 30.049 | +0.3% |
+| admission | burst submit p99, ms | 4.027 | 3.99 | -0.9% |
+| completion | release to terminal p99, ms | 9.28 | 8.892 | -4.2% |
+| footprint | idle RSS, MiB | 18.949 | 18.824 | -0.7% |
+| footprint | per idle bot, KiB | 1.454 | 1.45 | -0.3% |
+| footprint | RSS after a turn each, MiB | 28.65 | 28.865 | +0.7% |
+| footprint | CPU per turn, ms | 0.877 | 0.875 | -0.3% |
+| lifecycle | CPU, s | 0.895 | 0.88 | -1.7% |
+| lifecycle | p95 turn, ms | 698.223 | 629.455 | -9.8% |
+| lifecycle | peak RSS, MiB | 25.547 | 25.078 | -1.8% |
+
+Store jobs per turn did not change, and every change is within the gate's
+15%. Sandboxed bots and the parse itself are not measured: it walks the
+command's characters once, against a list of at most 64 prefixes.

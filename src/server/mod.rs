@@ -266,13 +266,14 @@ enum Command {
         /// removes them.
         declare: Option<Vec<Declared>>,
         /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable` and `network`, which
-        /// otherwise go back to none and off.
+        /// settings name it: with `writable`, `network` and `unsandboxed`,
+        /// which otherwise go back to none, off and none.
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
+        unsandboxed: Option<Vec<String>>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -2730,6 +2731,7 @@ impl Service {
                 writable,
                 network,
                 cache_ttl,
+                unsandboxed,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
@@ -2740,6 +2742,7 @@ impl Service {
                             sandbox: Some(mode),
                             writable: writable.unwrap_or_default(),
                             network: network.unwrap_or(false),
+                            unsandboxed: unsandboxed.unwrap_or_default(),
                             ..Settings::default()
                         };
                         settings.validate()?;
@@ -2750,12 +2753,12 @@ impl Service {
                         })
                         .await
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
-                        Some((settings.sandbox, settings.writable, settings.network))
+                        Some(settings)
                     }
-                    None if writable.is_some() || network.is_some() => {
+                    None if writable.is_some() || network.is_some() || unsandboxed.is_some() => {
                         return fail_with(
                             "invalid_setting",
-                            "writable and network go with sandbox",
+                            "writable, network and unsandboxed go with sandbox",
                         );
                     }
                     None => None,

@@ -227,6 +227,11 @@ pub struct Settings {
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_senders: bool,
+    /// Command prefixes, each of words, that run outside the sandbox
+    /// without asking, as a Codex rule that allows a prefix runs it
+    /// ([`crate::sandbox::unsandboxed`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsandboxed: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -291,7 +296,8 @@ impl Settings {
     /// makes: no weaker a sandbox than its creator's, as Codex's subagents
     /// inherit their parent's. A sandboxed creator's child takes the
     /// creator's sandbox and writable folders unless it names a stricter
-    /// sandbox, and reaches the network only if both do.
+    /// sandbox, and reaches the network only if both do; it runs outside
+    /// the sandbox only commands its creator does.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         let sandboxed = |settings: &Settings| {
@@ -306,7 +312,10 @@ impl Settings {
         if !sandboxed(&self) {
             self.writable = creator.writable.clone();
             self.network = creator.network;
+            self.unsandboxed = creator.unsandboxed.clone();
         }
+        self.unsandboxed
+            .retain(|prefix| creator.unsandboxed.contains(prefix));
         self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
         if self.sandbox != Some(Mode::WorkspaceWrite) {
             self.writable.clear();
@@ -362,6 +371,21 @@ impl Settings {
         if !confined && (!self.writable.is_empty() || self.network) {
             return refuse("writable and network go with sandbox workspace-write");
         }
+        let sandboxed = matches!(
+            self.sandbox,
+            Some(crate::sandbox::Mode::ReadOnly | crate::sandbox::Mode::WorkspaceWrite)
+        );
+        if !sandboxed && !self.unsandboxed.is_empty() {
+            return refuse("unsandboxed goes with sandbox read-only or workspace-write");
+        }
+        if self.unsandboxed.len() > 64
+            || self
+                .unsandboxed
+                .iter()
+                .any(|prefix| prefix.split_whitespace().next().is_none() || prefix.len() > 1024)
+        {
+            return refuse("unsandboxed names at most 64 commands, each words of at most 1 KiB");
+        }
         if self.writable.len() > 64
             || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
         {
@@ -386,7 +410,7 @@ impl Settings {
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
-            "hide_senders":self.hide_senders})
+            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -453,6 +477,21 @@ impl Bot {
             self.settings.sandbox,
             Some(Mode::ReadOnly | Mode::WorkspaceWrite)
         )
+    }
+    /// Whether this call is a command the bot's client lets run outside its
+    /// sandbox without asking: one the bot doesn't ask to escalate, which
+    /// runs nothing but its `unsandboxed` commands.
+    pub fn unsandboxed(&self, call: &ToolCall) -> bool {
+        if call.name != "shell" || self.settings.unsandboxed.is_empty() || !self.sandboxed() {
+            return false;
+        }
+        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
+            return false;
+        };
+        arguments["sandbox_permissions"] != "require_escalated"
+            && arguments["command"].as_str().is_some_and(|command| {
+                crate::sandbox::unsandboxed(&self.settings.unsandboxed, command)
+            })
     }
     /// Whether this call runs inside the bot's sandbox: the bot has one, the
     /// tool is one a sandbox holds, and the call doesn't ask to leave it.
@@ -2299,20 +2338,26 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
-    /// Replace a bot's sandbox: its mode, the folders it may write besides
-    /// its own and whether it reaches the network. A bot another bot made
+    /// Replace a bot's sandbox with `sandbox`'s: its mode, the folders it
+    /// may write besides its own, whether it reaches the network and the
+    /// commands that run outside it. A bot another bot made
     /// keeps no weaker a sandbox than its creator's, as when it was made.
     /// Whether anything changed.
     pub fn set_sandbox(
         &mut self,
         name: &str,
         bot_id: Option<i64>,
-        sandbox: (Option<crate::sandbox::Mode>, Vec<String>, bool),
+        sandbox: Settings,
     ) -> Result<bool> {
         let id = self.identity(name, bot_id)?;
         let bot = self.inspect(name)?;
-        let mut settings = bot.settings;
-        (settings.sandbox, settings.writable, settings.network) = sandbox;
+        let settings = Settings {
+            sandbox: sandbox.sandbox,
+            writable: sandbox.writable,
+            network: sandbox.network,
+            unsandboxed: sandbox.unsandboxed,
+            ..bot.settings
+        };
         let creator = match bot.created_by_id {
             Some(creator) => self
                 .conn
@@ -2327,9 +2372,10 @@ impl Database {
                 .transpose()?,
             None => None,
         };
-        if let Some(creator) = &creator {
-            settings = settings.under(creator);
-        }
+        let settings = match &creator {
+            Some(creator) => settings.under(creator),
+            None => settings,
+        };
         settings.validate()?;
         let stored = settings.stored()?;
         let changed = self.conn.execute(

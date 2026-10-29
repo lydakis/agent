@@ -294,6 +294,8 @@ fn memory() -> Value {
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
         },
+        "read": {"type": "string", "minLength": 1,
+            "description": "The name of a fact to open: its whole file. The read is recorded, so the nightly cleanup can check facts no agent has read in 30 days."},
         "remove": {"type": "string", "minLength": 1, "description": "The name of a fact to remove."},
         "index": {"type": "boolean", "description": "Rewrite the index from the facts."},
         "check": {"type": "boolean",
@@ -307,7 +309,7 @@ fn memory() -> Value {
     json!({
         "name": MEMORY,
         "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
-            says how to read and what to save. Save one fact, or remove one; index or check a folder's facts; \
+            says how to read and what to save. Read one fact, save one, or remove one; index or check a folder's facts; \
             with none of these, the result shows both indexes (the person's and this project's), each with its \
             folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
             nothing: merge or remove facts first.",
@@ -690,6 +692,27 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .get(0)
         .filter(|record| record["name"] == bot)
         .ok_or(("caller_unknown", format!("{bot} is gone")))?;
+    // A side chat forked with its agent's tools calls them as that agent:
+    // its tasks, panes and projects are the agent's, not the copy's.
+    let caller = match crate::side_copy(record) {
+        Some(source) => {
+            let page = client
+                .request("bots", json!({"name": source, "limit": 1}))
+                .await
+                .map_err(|e| ("caller_unknown", e.to_string()))?;
+            page["bots"]
+                .get(0)
+                .filter(|found| {
+                    found["name"] == source && found["bot_id"] == record["created_by_id"]
+                })
+                .cloned()
+                .ok_or((
+                    "caller_unknown",
+                    format!("{source}, which {bot} copies, is gone"),
+                ))?
+        }
+        None => record.clone(),
+    };
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -724,8 +747,8 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .arg(call["name"].as_str().unwrap_or_default())
         .current_dir(workspace)
         .env("PWD", workspace)
-        .env("AGENT_BOT", bot)
-        .env("AGENT_BOT_ID", record["bot_id"].to_string())
+        .env("AGENT_BOT", str_of(&caller["name"]))
+        .env("AGENT_BOT_ID", caller["bot_id"].to_string())
         .env("AGENT_TURN", call["turn"].to_string())
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
@@ -886,6 +909,22 @@ mod tests {
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
         assert_eq!(project_of("shop.fix"), "shop");
+        // A lead's side chat acts as the lead; a task named side-… is no copy.
+        assert_eq!(
+            crate::side_source("shop.web.lead.side-1a2b3c"),
+            Some("shop.web.lead")
+        );
+        assert_eq!(crate::side_source("shop.side-panel"), None);
+        assert_eq!(crate::side_source("shop.side-"), None);
+        assert_eq!(crate::side_source("shop.side-1A2B"), None);
+        let copy = json!({"name": "shop.web.lead.side-1a2b3c", "created_by": "shop.web.lead",
+            "expire_ms": 900_000});
+        assert_eq!(crate::side_copy(&copy), Some("shop.web.lead"));
+        // `feed` is hex: a task under that name is still its own caller.
+        let task = json!({"name": "shop.side-feed", "created_by": "shop.lead"});
+        assert_eq!(crate::side_copy(&task), None);
+        let named = json!({"name": "shop.side-feed", "created_by": "shop", "expire_ms": null});
+        assert_eq!(crate::side_copy(&named), None);
     }
 
     #[test]
