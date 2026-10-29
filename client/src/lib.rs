@@ -85,7 +85,15 @@ pub fn default_tools(
         Some("responses") => "apply_patch",
         _ => "edit",
     };
-    let mut tools = vec!["shell", "read", "write", editor, "wait", "history"];
+    let mut tools = vec![
+        "shell",
+        "write_stdin",
+        "read",
+        "write",
+        editor,
+        "wait",
+        "history",
+    ];
     if search == config::WebSearch::Live {
         // Search is the provider's to offer; the daemon fetches a page
         // for any.
@@ -410,6 +418,7 @@ mod tests {
             default_tools(&providers, "chatgpt/gpt-6-sol", live),
             [
                 "shell",
+                "write_stdin",
                 "read",
                 "write",
                 "apply_patch",
@@ -424,6 +433,7 @@ mod tests {
             default_tools(&providers, "anthropic/claude-opus-5-5", live),
             [
                 "shell",
+                "write_stdin",
                 "read",
                 "write",
                 "edit",
@@ -439,7 +449,7 @@ mod tests {
             config::WebSearch::Disabled,
         );
         assert!(!off.contains(&"web_search") && !off.contains(&"web_fetch"));
-        assert_eq!(default_tools(&providers, "unknown/model", live)[3], "edit");
+        assert_eq!(default_tools(&providers, "unknown/model", live)[4], "edit");
     }
 
     #[tokio::test]

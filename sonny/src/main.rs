@@ -6637,6 +6637,17 @@ fn output(item: &Value) -> (String, bool) {
     };
     let failed = item["failed"] == true;
     match serde_json::from_str::<Value>(&raw) {
+        // A terminal's: what it wrote, while it runs or as it ended.
+        Ok(terminal)
+            if terminal["output"].is_string()
+                && (terminal["running"] == true || terminal.get("exit_code").is_some()) =>
+        {
+            let shown = terminal["output"].as_str().unwrap_or("").to_owned();
+            (
+                shown,
+                failed || terminal["exit_code"].as_i64().is_some_and(|code| code != 0),
+            )
+        }
         Ok(shell) if shell.get("exit_code").is_some() => {
             let mut shown = shell["stdout"].as_str().unwrap_or("").to_owned();
             shown.push_str(shell["stderr"].as_str().unwrap_or(""));
@@ -8091,5 +8102,12 @@ mod tests {
         );
         let done = json!({"type": "custom_tool_call_output", "call_id": "p", "output": "Success."});
         assert_eq!(output(&responses(&done)[0]), ("Success.".into(), false));
+        // A terminal's result shows what it wrote.
+        let typed = json!({"type": "function_call_output", "call_id": "t",
+            "output": r#"{"output":">>> ","handle":"proc:1","running":true}"#});
+        assert_eq!(output(&typed), (">>> ".into(), false));
+        let ended = json!({"type": "function_call_output", "call_id": "t",
+            "output": r#"{"output":"Traceback\n","exit_code":1}"#});
+        assert_eq!(output(&ended), ("Traceback\n".into(), true));
     }
 }

@@ -1720,6 +1720,11 @@ fn drawn(
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
+        "write_stdin" if arguments["kill"] == true => ("Killed", field("handle")),
+        "write_stdin" => (
+            "Typed into",
+            format!("{} {:?}", field("handle"), field("chars")),
+        ),
         "echo" | "note" => ("Noted", field("text")),
         "exec" => ("Ran", scripted(output.unwrap_or(""))),
         _ => ("Called", format!("{name} {arguments}")),
