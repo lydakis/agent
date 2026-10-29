@@ -6494,20 +6494,35 @@ impl Database {
             let call_id = data["call_id"].as_str().unwrap_or_default().to_owned();
             let mut arguments = data["arguments"].as_str().unwrap_or_default().to_owned();
             let mut truncated = data["arguments_truncated"].as_bool().unwrap_or(false);
+            // The files a call changes come before its arguments: a call cut
+            // here, at what is left, still names them when it was not cut
+            // at its preview, which named them then.
+            let paths = match data.get("paths") {
+                Some(paths) => Some(paths.clone()),
+                None if !truncated && arguments.len() > calls_left => {
+                    changed_paths(data["name"].as_str().unwrap_or_default(), &arguments)
+                        .map(|(paths, _)| json!(paths))
+                }
+                None => None,
+            };
+            let (mut named, mut paths_cut) = (None, data["paths_cut"] == true);
+            if let Some(paths) = paths {
+                let size = paths.to_string().len();
+                if size <= calls_left {
+                    calls_left -= size;
+                    named = Some(paths);
+                } else {
+                    paths_cut = true;
+                }
+            }
             truncated |= cut(&mut arguments, &mut calls_left);
             let mut call = json!({"call_id":call_id,"name":data["name"],"arguments":arguments,
                 "arguments_truncated":truncated,"done":done.contains(&call_id)});
-            // The files a cut patch changes, when they fit what is left.
-            if let Some(paths) = data.get("paths") {
-                let size = paths.to_string().len();
-                let fits = size <= calls_left;
-                if fits {
-                    calls_left -= size;
-                    call["paths"] = paths.clone();
-                }
-                if !fits || data["paths_cut"] == true {
-                    call["paths_cut"] = json!(true);
-                }
+            if let Some(paths) = named {
+                call["paths"] = paths;
+            }
+            if paths_cut {
+                call["paths_cut"] = json!(true);
             }
             if failed.contains(&call_id) {
                 call["failed"] = json!(true);
@@ -8596,28 +8611,50 @@ fn started(call: &ToolCall) -> Value {
     let truncated = preview.len() < call.arguments.len();
     let mut data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
         "arguments_truncated":truncated});
-    // A cut patch still names every file it changes, for a judge of a later
-    // call that runs one.
-    if truncated
-        && call.name == "apply_patch"
-        && let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments)
-        && let Some(Ok(patch)) = arguments["input"].as_str().map(crate::tools::Patch::parse)
-    {
-        // Within what an event page carries: past it, the rest is marked
-        // as left out.
-        let (mut paths, mut size) = (Vec::new(), 0);
-        for path in patch.paths() {
-            size += path.len() + 3;
-            if size > STARTED_PATHS_BYTES {
-                data["paths_cut"] = json!(true);
-                break;
-            }
-            paths.push(path);
+    // A cut write, edit or patch still names every file it changes, for a
+    // judge of a later call that runs one.
+    if truncated && let Some((paths, whole)) = changed_paths(&call.name, &call.arguments) {
+        if !whole {
+            data["paths_cut"] = json!(true);
         }
         data["paths"] = json!(paths);
     }
     data
 }
+
+/// The files a write, edit or patch with `arguments` changes, and whether
+/// that is all of them: past what an event page carries, the rest are left
+/// out.
+fn changed_paths(name: &str, arguments: &str) -> Option<(Vec<String>, bool)> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        path: String,
+    }
+    match name {
+        "write" | "edit" => serde_json::from_str::<Named>(arguments)
+            .ok()
+            .filter(|named| named.path.len() <= STARTED_PATHS_BYTES)
+            .map(|named| (vec![named.path], true)),
+        "apply_patch" => {
+            let arguments = serde_json::from_str::<Value>(arguments).ok()?;
+            let patch = arguments["input"]
+                .as_str()
+                .map(crate::tools::Patch::parse)?
+                .ok()?;
+            let (mut paths, mut size) = (Vec::new(), 0);
+            for path in patch.paths() {
+                size += path.len() + 3;
+                if size > STARTED_PATHS_BYTES {
+                    return Some((paths, false));
+                }
+                paths.push(path.to_owned());
+            }
+            Some((paths, true))
+        }
+        _ => None,
+    }
+}
+
 /// The most of a cut patch's paths a `tool_started` event names.
 const STARTED_PATHS_BYTES: usize = 64 * 1024;
 /// In an answered call's start, note it as waiting for its client, and
@@ -10427,6 +10464,30 @@ mod tests {
         let data = started(&many);
         assert_eq!(data["paths_cut"], true);
         assert!(data.to_string().len() < 80 * 1024);
+    }
+
+    #[test]
+    fn a_cut_write_or_edit_still_names_its_file() {
+        for (name, arguments) in [
+            (
+                "write",
+                json!({"path":"notes.txt","content":"x".repeat(3000)}),
+            ),
+            (
+                "edit",
+                json!({"path":"notes.txt","old":"a","new":"x".repeat(3000)}),
+            ),
+        ] {
+            let call = ToolCall {
+                name: name.into(),
+                call_id: "c".into(),
+                arguments: arguments.to_string(),
+                custom: false,
+            };
+            let data = started(&call);
+            assert_eq!(data["arguments_truncated"], true, "{name}");
+            assert_eq!(data["paths"], json!(["notes.txt"]), "{name}");
+        }
     }
 
     #[test]
