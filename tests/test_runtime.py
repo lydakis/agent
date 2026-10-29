@@ -2108,6 +2108,16 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='h9', prompt='history:9')['result']['turn']
         client.finished(turn)
         self.assertIn('turn_not_in_history', poll(client, 'Bob', turn)['result']['text'])
+        self.assertIn('or with query to search them for text', texts[3][0])
+        # A search finds text in the omitted turns, and not in the turn it
+        # runs in, whose prompt names the same text.
+        prompt = 'calls:' + json.dumps([['history', {'query': 'REPLY:P2'}]])
+        turn = client.request('submit', bot='Bob', request_id='s', prompt=prompt)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        found = json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
+        self.assertEqual([m['turn'] for m in found['matches']], [2])
+        self.assertIn('reply:p2', found['matches'][0]['text'])
+        self.assertTrue(found['done'])
         # A fork sees the same lineage and computes its own window over it.
         client.request('fork', source='Bob', bot='branch', workspace=str(self.path))
         turn = client.request('submit', bot='branch', request_id='b', prompt='history:2')['result']['turn']
