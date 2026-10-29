@@ -1,0 +1,441 @@
+"""Does calling MCP tools from code beat calling them one by one?
+
+Four tasks against one synthetic shop MCP server (bench/code_mode_shop.py),
+each with one checkable answer: a fan-out aggregation over dozens of
+customers, a count over a 100 KB log the tool cannot filter, a four-step
+lookup chain, and a single lookup as the control. The same model runs every
+task in eight arms:
+
+  codex-native  Codex with the shop server configured as an MCP server. On
+                models where Codex runs its code mode (GPT-6 Luna in 0.158),
+                the model's only tool is a JavaScript `exec` whose scripts call
+                the MCP tools, so this arm is Codex's own code mode.
+  codex-direct  codex-native plus one paragraph asking for one tool call per
+                step, each result read whole: the one-by-one baseline.
+  codex-mcpx    Codex with no MCP server; the shop is reachable through mcpx
+                from the shell, and the workspace AGENTS.md holds mcpx's own
+                skill text (`mcpx skill install`).
+  codex-code    codex-mcpx plus one paragraph asking the model to combine
+                calls in a script and print only what it needs.
+  agent-direct  Agent with the mcpx skill text, composed with --agents, plus
+                the one-call-per-step paragraph.
+  agent-mcpx    Agent with the mcpx skill text alone.
+  agent-code    agent-mcpx plus the combine-in-a-script paragraph.
+  sonny-exec    Agent with the shop configured as Sonny's MCP server: the bot
+                carries the `exec` tool Sonny gives the agents it opens
+                (`sonny mcp tool`), and a running `sonny lookout` runs its
+                scripts. No mcpx text, no hint: Sonny's own code mode.
+
+Direct versus the others compares call styles inside one harness; the Codex
+and Agent mcpx arms compare harnesses on the same call style, and
+codex-native against sonny-exec compares two code modes. The shop
+server logs every tool call it serves, so calls made inside scripts are
+counted too. Each run gets
+a fresh workspace outside any repository, a fresh HOME, its own mcpx state
+and, for Codex, its own CODEX_HOME holding a copy of the login, so neither
+harness reads the person's own AGENTS.md, skills, MCP servers or mcpx
+configuration. Sonny's arm lists the shop with `sonny mcp add` before the
+clock, as a person who added the server once would have, so its agent is
+told the shop's tools; Codex lists its servers inside its own clock. The arms of one task and trial start together.
+
+Recorded per run: the answer and whether it is right, input (and cached
+input) and output tokens (for Agent, of every bot in the run, since a bot
+may delegate to peers it starts), the tool calls the model issued, the shop calls
+the server served, the shell commands, and wall time. Codex's wall time
+includes its process start; Agent's daemon, and for Sonny its lookout, are
+started before the clock.
+
+Real model, real spend. Run it on the ChatGPT plan with Codex's login
+(`codex login`), naming the model as Codex's /model picker shows it:
+
+    .local/venv/bin/python -m bench.code_mode_eval --model gpt-6-luna \\
+        --trials 3 --out .local/code-mode-eval/gpt-6-luna.json
+"""
+import argparse
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bench.code_mode_shop import ANSWER_FORMAT, TASKS, answer_of, expected  # noqa: E402
+from bench.socket_client import Connection  # noqa: E402
+
+SHOP = Path(__file__).resolve().with_name('code_mode_shop.py')
+ARMS = ('codex-native', 'codex-direct', 'codex-mcpx', 'codex-code', 'agent-direct', 'agent-mcpx', 'agent-code',
+        'sonny-exec')
+NATIVE = ('codex-native', 'codex-direct', 'sonny-exec')  # the shop is the harness's own MCP server
+AGENT_TOOLS = 'shell,read,write,apply_patch,wait,history'
+CODE_HINT = ('When a task needs several tool calls or a large tool output, write one short script (shell, '
+             'Python or jq) that makes the mcpx calls and prints only what you need, instead of calling '
+             'tools one at a time and reading every result.')
+DIRECT_HINT = ('Make one tool call per step and read its full result before deciding the next call. Do not '
+               'write loops, scripts or pipelines that make several calls or filter their results.')
+_auth_lock = threading.Lock()
+
+
+def _text(value):
+    return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+
+
+def prompt(task):
+    return f'{TASKS[task]}\n\nEnd your reply with one line: {ANSWER_FORMAT[task]}'
+
+
+def mcpx_skill(mcpx):
+    """mcpx's own skill text, as `mcpx skill install` writes it."""
+    home = Path(tempfile.mkdtemp(prefix='code-mode-skill-'))
+    try:
+        subprocess.run([mcpx, 'skill', 'install'], env=dict(os.environ, HOME=str(home)), check=True,
+                       capture_output=True)
+        return (home / '.agents/skills/mcpx/SKILL.md').read_text()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def guidance(arm, skill):
+    parts = []
+    if arm not in NATIVE:
+        parts.append(skill.split('\n---\n', 1)[-1].strip() if skill.startswith('---') else skill.strip())
+    if arm.endswith('-code'):
+        parts.append(CODE_HINT)
+    if arm.endswith('-direct'):
+        parts.append(DIRECT_HINT)
+    return '\n\n'.join(parts) + '\n' if parts else None
+
+
+def shop_args(run_dir):
+    return f'args = ["{SHOP}", "--log", "{run_dir / "calls.log"}"]'
+
+
+def isolated(run_dir, mcpx, with_shop):
+    """Environment for one run: its own HOME and mcpx state, and mcpx on PATH."""
+    home = run_dir / 'home'
+    config = run_dir / 'xdg/config/mcpx'
+    config.mkdir(parents=True)
+    home.mkdir()
+    servers = (f'[servers.shop]\ncommand = "{sys.executable}"\n{shop_args(run_dir)}\n' if with_shop else '')
+    # No fallback discovery: never import the person's Claude or Codex servers.
+    (config / 'config.toml').write_text('fallback_sources = []\n' + servers)
+    runtime = Path(tempfile.mkdtemp(prefix='cm-', dir='/tmp'))  # Unix socket paths are length-limited
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(run_dir / 'xdg/config'),
+               XDG_CACHE_HOME=str(run_dir / 'xdg/cache'), XDG_STATE_HOME=str(run_dir / 'xdg/state'),
+               XDG_RUNTIME_DIR=str(runtime))
+    if shutil.which(mcpx):  # Sonny's arm runs without it
+        env['PATH'] = str(Path(shutil.which(mcpx)).parent) + os.pathsep + env['PATH']
+    for name in ('AGENTS_MD', 'CLAUDE_CONFIG_DIR'):
+        env.pop(name, None)
+    return env, runtime
+
+
+def run_codex(arm, task, work, run_dir, env, args):
+    codex_home = run_dir / 'codex'
+    codex_home.mkdir()
+    real = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'auth.json'
+    shutil.copy2(real, codex_home / 'auth.json')
+    config = [f'model = "{args.model}"', f'model_reasoning_effort = "{args.reasoning}"', *args.codex_config]
+    if arm in NATIVE:
+        config += ['[mcp_servers.shop]', f'command = "{sys.executable}"', shop_args(run_dir)]
+    (codex_home / 'config.toml').write_text('\n'.join(config) + '\n')
+    last = run_dir / 'last.txt'
+    command = [args.codex, 'exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox',
+               '-C', str(work), '-o', str(last), prompt(task)]
+    started = time.monotonic()
+    try:
+        done = subprocess.run(command, env=dict(env, CODEX_HOME=str(codex_home)), capture_output=True, text=True,
+                              timeout=args.timeout, cwd=work, stdin=subprocess.DEVNULL)
+        stdout, status = done.stdout, 'completed' if done.returncode == 0 else f'exit {done.returncode}'
+        stderr = done.stderr
+    except subprocess.TimeoutExpired as error:
+        stdout, status, stderr = _text(error.stdout), 'timeout', _text(error.stderr)
+    wall = time.monotonic() - started
+    # A refreshed login must reach the person's own file, or their next
+    # refresh uses a token this copy already spent.
+    with _auth_lock:
+        copy = codex_home / 'auth.json'
+        if copy.stat().st_mtime > real.stat().st_mtime and copy.read_bytes() != real.read_bytes():
+            shutil.copy2(copy, real)
+    (run_dir / 'events.jsonl').write_text(stdout)
+    (run_dir / 'stderr.txt').write_text(stderr[-20000:])
+    # Tool calls made inside code mode's scripts, MCP and shell alike, come
+    # as items of their own.
+    usage = {'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0}
+    commands = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get('type') == 'turn.completed':
+            for key in usage:
+                usage[key] += (event.get('usage') or {}).get(key, 0) or 0
+        item = event.get('item') or {}
+        if event.get('type') == 'item.completed' and item.get('type') == 'command_execution':
+            commands.append(str(item.get('command', ''))[:300])
+    # The calls the model itself issued, and its model requests, come from
+    # the session's own record.
+    tools, requests = {}, 0
+    for rollout in sorted(codex_home.glob('sessions/**/*.jsonl')):
+        for line in rollout.read_text().splitlines():
+            record = json.loads(line)
+            payload = record.get('payload') or {}
+            if record.get('type') == 'token_usage_record':
+                requests += 1
+            if record.get('type') != 'response_item' or payload.get('type') not in ('function_call', 'custom_tool_call'):
+                continue
+            name = payload.get('name', '?')
+            if payload.get('namespace'):
+                name = f"{payload['namespace']}.{name}"
+            tools[name] = tools.get(name, 0) + 1
+            if payload.get('type') == 'custom_tool_call':
+                commands.append(f"[{name}] {payload.get('input', '')}"[:600])
+        shutil.copy2(rollout, run_dir / 'rollout.jsonl')
+    answer = last.read_text() if last.exists() else ''
+    return dict(status=status, answer=answer, usage=usage, tools=tools, commands=commands,
+                model_requests=requests, wall_s=round(wall, 1))
+
+
+def sonny_bot(work, run_dir, env, args, socket, store):
+    """The task bot as Sonny would give it the shop: the shop listed once,
+    the bot made as the Agent arms make theirs plus Sonny's `exec` tool,
+    and Sonny's lookout up to run its scripts. Returns the lookout."""
+    subprocess.run([args.sonny, 'mcp', 'add', 'shop', '--', sys.executable, str(SHOP), '--log',
+                    str(run_dir / 'calls.log')], env=env, check=True, capture_output=True, text=True)
+    exec_tool = json.loads(subprocess.run([args.sonny, 'mcp', 'tool'], env=env, check=True, capture_output=True,
+                                          text=True).stdout)
+    # The Agent arms' bot, made with no turn started: a message attached to
+    # a new bot waits for its next turn. Its record is copied, with `exec`
+    # declared, into the bot that runs the task. An attached message takes
+    # no workspace, so the bot takes the one it is run from.
+    flags = ['--socket', str(socket), '--store', str(store), '--no-spawn']
+    subprocess.run([args.agent, 'run', *flags, '--new', '--bot', 'probe', '--agents', '--delivery', 'attach',
+                    '--model', f"{args.provider.split('=')[0]}/{args.model}", '--effort', args.reasoning,
+                    '--tools', AGENT_TOOLS, '--', '.'],
+                   env=env, check=True, capture_output=True, text=True, cwd=work)
+    probe = json.loads(subprocess.run([args.agent, 'inspect', *flags, '--bot', 'probe'], env=env, check=True,
+                                      capture_output=True, text=True).stdout)
+    subprocess.run([args.agent, 'rm', *flags, '--bot', 'probe'], env=env, check=True, capture_output=True)
+    connection = Connection(socket)
+    try:
+        made = connection.request('create', bot='task', workspace=probe['workspace'],
+                                  model=f"{probe['provider']}/{probe['model']}", effort=probe['effort'],
+                                  instructions=probe['instructions'], tools=probe['tools'],
+                                  compaction_instructions=probe['compaction_instructions'], declare=[exec_tool])
+    finally:
+        connection.close()
+    if 'result' not in made:
+        raise RuntimeError(f'create: {made}')
+    lookout = subprocess.Popen([args.sonny, 'lookout', '--judge', 'off', '--store', str(store), '--socket',
+                                str(socket)], env=dict(env, AGENT_BIN=args.agent), stdout=subprocess.PIPE,
+                               stderr=open(run_dir / 'lookout.log', 'w'), text=True)
+    watching = json.loads(lookout.stdout.readline() or '{}')
+    if watching.get('event') != 'watching':
+        lookout.kill()
+        raise RuntimeError(f'lookout: {watching}')
+    return lookout
+
+
+def run_agent(arm, task, work, run_dir, env, args):
+    socket = Path(tempfile.mkdtemp(prefix='cm-', dir='/tmp')) / 'agent.sock'
+    store = run_dir / 'store.sqlite'
+    daemon_env = dict(env, CODEX_HOME=os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
+    log = open(run_dir / 'daemon.log', 'w')
+    daemon = subprocess.Popen([args.agent, 'serve', '--store', str(store), '--socket', str(socket),
+                               '--provider', args.provider], env=daemon_env, stdout=subprocess.DEVNULL, stderr=log)
+    lookout = None
+    try:
+        for _ in range(200):
+            if socket.exists():
+                break
+            time.sleep(0.05)
+        if arm == 'sonny-exec':
+            lookout = sonny_bot(work, run_dir, env, args, socket, store)
+            command = [args.agent, 'run', '--socket', str(socket), '--store', str(store), '--no-spawn',
+                       '--bot', 'task', '--', prompt(task)]
+        else:
+            command = [args.agent, 'run', '--socket', str(socket), '--store', str(store), '--no-spawn', '--new',
+                       '--bot', 'task', '--agents', '--model', f"{args.provider.split('=')[0]}/{args.model}",
+                       '--effort', args.reasoning, '--tools', AGENT_TOOLS, '--workspace', str(work), '--',
+                       prompt(task)]
+        started = time.monotonic()
+        try:
+            done = subprocess.run(command, env=env, capture_output=True, text=True, timeout=args.timeout, cwd=work,
+                                  stdin=subprocess.DEVNULL)
+            stdout, stderr = done.stdout, done.stderr
+        except subprocess.TimeoutExpired as error:
+            stdout, stderr = _text(error.stdout), 'timeout'
+        wall = time.monotonic() - started
+        # A bot may delegate to peers it starts; their tokens are the task's too.
+        listed = subprocess.run([args.agent, 'ls', '--socket', str(socket)], env=env, capture_output=True, text=True)
+        bots = json.loads(listed.stdout) if listed.returncode == 0 else None
+    finally:
+        if lookout:
+            lookout.terminate()
+            try:
+                lookout.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                lookout.kill()
+            lookout.stdout.close()
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+        log.close()
+        shutil.rmtree(socket.parent, ignore_errors=True)
+    (run_dir / 'events.jsonl').write_text(stdout)
+    (run_dir / 'stderr.txt').write_text(stderr[-20000:])
+    usage = {'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0}
+    tools, commands, text, status, requests = {}, [], [], 'timeout', 0
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind, data = event.get('event'), event.get('data') or {}
+        if kind == 'usage':
+            requests += 1
+            for key in usage:
+                usage[key] += data.get(key, 0) or 0
+        elif kind == 'tool_started':
+            tools[data.get('name')] = tools.get(data.get('name'), 0) + 1
+            try:
+                called = json.loads(data.get('arguments', '{}'))
+            except json.JSONDecodeError:
+                called = {'command': str(data.get('arguments', ''))}
+            if data.get('name') == 'shell':
+                commands.append(str(called.get('command', ''))[:300])
+            elif data.get('name') == 'exec':
+                commands.append(f"[exec] {called.get('input', '')}"[:600])
+        elif kind == 'text_delta':
+            text.append(event.get('text', ''))
+        elif kind == 'message':
+            text.append('\n')
+        elif kind == 'turn_finished':
+            status = data.get('status')
+    record = dict(status=status, answer=''.join(text), usage=usage, tools=tools, commands=commands,
+                  model_requests=requests, wall_s=round(wall, 1))
+    if bots is None:
+        record['status'] = f'{status}; bot listing failed'
+    elif len(bots) > 1:
+        record['task_bot_usage'] = usage
+        record['bots'] = len(bots)
+        record['usage'] = {'input_tokens': sum(b['input_tokens'] for b in bots),
+                           'cached_input_tokens': sum(b['cached_input_tokens'] for b in bots),
+                           'output_tokens': sum(b['tokens_used'] - b['input_tokens'] for b in bots)}
+    return record
+
+
+def run_one(arm, task, trial, root, args, skill):
+    run_dir = root / f'{task}-{trial}-{arm}'
+    run_dir.mkdir(parents=True)
+    work = Path(tempfile.mkdtemp(prefix=f'code-mode-{task}-{arm}-'))  # outside any repository's AGENTS.md
+    text = guidance(arm, skill)
+    if text:
+        (work / 'AGENTS.md').write_text(text)
+    env, runtime = isolated(run_dir, args.mcpx, with_shop=arm not in ('codex-native', 'sonny-exec'))
+    try:
+        runner = run_codex if arm.startswith('codex') else run_agent
+        record = runner(arm, task, work, run_dir, env, args)
+    except Exception as error:  # a broken run is recorded, never dropped
+        record = dict(status=f'error: {error}', answer='', usage={}, tools={}, commands=[], model_requests=None,
+                      wall_s=None)
+    finally:
+        # mcpx's daemon and the shop server exit on their own after mcpx's idle keepalive.
+        shutil.rmtree(runtime, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
+    served = (run_dir / 'calls.log').read_text().split() if (run_dir / 'calls.log').exists() else []
+    record['shop_calls'] = {name: served.count(name) for name in sorted(set(served))}
+    got = answer_of(record['answer'])
+    record.update(arm=arm, task=task, trial=trial, got=got, want=expected()[task],
+                  correct=got is not None and got.lower() == expected()[task].lower(),
+                  tool_calls=sum(record['tools'].values()), shop_call_count=len(served),
+                  answer=record['answer'][-2000:])
+    return record
+
+
+def summarize(records):
+    rows = []
+    for arm in ARMS:
+        for task in TASKS:
+            mine = [r for r in records if r['arm'] == arm and r['task'] == task]
+            if not mine:
+                continue
+
+            def med(values):
+                values = [v for v in values if v is not None]
+                return statistics.median(values) if values else None
+            rows.append(dict(arm=arm, task=task, correct=f"{sum(r['correct'] for r in mine)}/{len(mine)}",
+                             input_tokens=med([r['usage'].get('input_tokens') for r in mine]),
+                             cached_input_tokens=med([r['usage'].get('cached_input_tokens') for r in mine]),
+                             output_tokens=med([r['usage'].get('output_tokens') for r in mine]),
+                             tool_calls=med([r['tool_calls'] for r in mine]),
+                             shop_calls=med([r['shop_call_count'] for r in mine]),
+                             wall_s=med([r['wall_s'] for r in mine])))
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument('--model', required=True, help="the model id Codex's /model picker shows, e.g. gpt-6-luna")
+    parser.add_argument('--reasoning', default='high')
+    parser.add_argument('--trials', type=int, default=3)
+    parser.add_argument('--tasks', default=','.join(TASKS))
+    parser.add_argument('--arms', default=','.join(ARMS))
+    parser.add_argument('--timeout', type=int, default=900, help='seconds per run')
+    parser.add_argument('--agent', default='.local/target/release/agent')
+    parser.add_argument('--sonny', default='.local/target/release/sonny')
+    parser.add_argument('--codex', default='codex')
+    parser.add_argument('--mcpx', default='mcpx')
+    parser.add_argument('--provider', default='chatgpt', help="Agent's provider SPEC; default the ChatGPT plan")
+    parser.add_argument('--codex-config', action='append', default=[],
+                        help="an extra line for each Codex run's config.toml (tests point Codex at a local model)")
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    args.agent = str(Path(args.agent).resolve())
+    args.sonny = str(Path(args.sonny).resolve())
+    arms, tasks = args.arms.split(','), args.tasks.split(',')
+    for name in arms:
+        if name not in ARMS:
+            parser.error(f'unknown arm {name}')
+    args.out = args.out.resolve()  # runs change directory, so every path they get is absolute
+    root = args.out.with_suffix('')
+    root.mkdir(parents=True, exist_ok=False)
+    skill = mcpx_skill(args.mcpx)
+    versions = {'codex': subprocess.run([args.codex, '--version'], capture_output=True, text=True).stdout.strip(),
+                'mcpx': subprocess.run([args.mcpx, '--version'], capture_output=True, text=True).stdout.strip(),
+                'agent': subprocess.run([args.agent, '--version'], capture_output=True, text=True).stdout.strip(),
+                'sonny': subprocess.run([args.sonny, '--version'], capture_output=True, text=True).stdout.strip()}
+    records = []
+    started = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    for trial in range(args.trials):
+        for task in tasks:
+            results = {}
+
+            def go(arm):
+                results[arm] = run_one(arm, task, trial, root, args, skill)
+            threads = [threading.Thread(target=go, args=(arm,)) for arm in arms]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            for arm in arms:
+                r = results[arm]
+                records.append(r)
+                print(json.dumps({k: r[k] for k in ('arm', 'task', 'trial', 'status', 'correct', 'got', 'tool_calls',
+                                                     'shop_call_count', 'wall_s')} | {'usage': r['usage']}), flush=True)
+            args.out.write_text(json.dumps({'model': args.model, 'reasoning': args.reasoning, 'versions': versions,
+                                            'started': started, 'summary': summarize(records),
+                                            'runs': records}, indent=1))
+    for row in summarize(records):
+        print(json.dumps(row))
+
+
+if __name__ == '__main__':
+    main()
