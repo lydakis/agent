@@ -40,6 +40,8 @@ const REPLY_BYTES: usize = 80 * 1024;
 /// How long a trigger has to pass a task's answer on before the turn is
 /// news after all.
 const FORWARD: Duration = Duration::from_secs(15);
+/// How long a goal's turn waits for its check, which says sooner.
+const GOAL_HOLD: Duration = Duration::from_secs(super::goals::TIMEOUT_MAX_S + 60);
 const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
@@ -62,6 +64,8 @@ struct Turn {
     which: Option<String>,
     /// The turn resolved the task, with the task's own `resolve_task`.
     resolved: bool,
+    /// How the task's goal ended with this turn.
+    goal: Option<String>,
     /// What the task replied, ending the turn.
     reply: Option<String>,
 }
@@ -86,11 +90,18 @@ impl News {
     fn merge(&mut self, news: News) {
         fn one(had: Option<Turn>, new: Option<Turn>) -> Option<Turn> {
             match (had, new) {
-                (Some(a), Some(t)) => Some(Turn {
-                    first: a.first.min(t.first),
-                    count: a.count + t.count,
-                    ..if t.turn >= a.turn { t } else { a }
-                }),
+                (Some(a), Some(t)) => {
+                    let (first, count) = (a.first.min(t.first), a.count + t.count);
+                    let (newer, older) = if t.turn >= a.turn { (t, a) } else { (a, t) };
+                    // How a goal ended stays news when a later turn joins it.
+                    let goal = newer.goal.clone().or(older.goal);
+                    Some(Turn {
+                        first,
+                        count,
+                        goal,
+                        ..newer
+                    })
+                }
                 (a, t) => a.or(t),
             }
         }
@@ -175,8 +186,11 @@ pub struct Updates {
     from: HashMap<Key, String>,
     origin: HashMap<Key, String>,
     answer_to: HashMap<Key, i64>,
-    /// Turns whose answer a trigger passes to the lead.
+    /// Turns whose answer a trigger passes to the lead, or whose end
+    /// waits for their goal's check.
     forwarding: HashMap<Key, Forward>,
+    /// Turns whose end waits for their goal's check, until it says.
+    goaled: HashSet<Key>,
     /// Approvals not yet answered: when they become news, and the call.
     approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Each task's news, in the order it first came.
@@ -241,6 +255,7 @@ impl Updates {
             origin: HashMap::new(),
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
+            goaled: HashSet::new(),
             approvals: HashMap::new(),
             tasks: Vec::new(),
             quiet: HashMap::new(),
@@ -340,7 +355,19 @@ impl Updates {
                     if let (Some(task), Some(of)) =
                         (data["from"]["bot"].as_str(), data["from"]["turn"].as_i64())
                     {
-                        self.forwarding.remove(&(task.to_owned(), of));
+                        let key = (task.to_owned(), of);
+                        // How its goal ends is still to tell: only its
+                        // answer went on.
+                        match self.goaled.contains(&key) {
+                            true => {
+                                if let Some(forward) = self.forwarding.get_mut(&key) {
+                                    forward.reply = None;
+                                }
+                            }
+                            false => {
+                                self.forwarding.remove(&key);
+                            }
+                        }
                     }
                 } else if let Some(origin) = data["origin"].as_str() {
                     self.origin.insert(key(turn), origin.to_owned());
@@ -438,11 +465,17 @@ impl Updates {
                     .creator(name)
                     .and_then(|c| self.bots.get(c))
                     .and_then(|c| c.id);
-                if answered.is_some() && answered == creator {
+                let hold = match self.goaled.contains(&key(turn)) {
+                    // News once its goal's check says, or once a check
+                    // could have run its longest.
+                    true => Some(GOAL_HOLD),
+                    false => (answered.is_some() && answered == creator).then_some(FORWARD),
+                };
+                if let Some(hold) = hold {
                     self.forwarding.insert(
                         key(turn),
                         Forward {
-                            at: now + FORWARD,
+                            at: now + hold,
                             status,
                             from,
                             origin,
@@ -564,6 +597,21 @@ impl Updates {
         which: Option<String>,
         origin: Option<String>,
     ) {
+        self.tell_ended(name, turn, status, from, which, origin, None);
+    }
+
+    /// `tell`, with how the task's goal ended with the turn.
+    #[allow(clippy::too_many_arguments)]
+    fn tell_ended(
+        &mut self,
+        name: &str,
+        turn: i64,
+        status: &str,
+        from: Option<String>,
+        which: Option<String>,
+        origin: Option<String>,
+        goal: Option<String>,
+    ) {
         // A note while the turn still runs leaves its resolve for the last.
         let resolved = ![APPROVAL, QUIET].contains(&status)
             && self.resolving.ended(name, turn)
@@ -572,7 +620,8 @@ impl Updates {
             return;
         }
         let handle = format!("turn:{name}/{turn}");
-        if self.bots[&self.lead].waiting_on.contains(&handle) {
+        // A wait returns the turn, never how its goal ended.
+        if goal.is_none() && self.bots[&self.lead].waiting_on.contains(&handle) {
             return;
         }
         let by = match status {
@@ -595,6 +644,7 @@ impl Updates {
             count: 1,
             which,
             resolved,
+            goal,
             reply: None,
         };
         news.merge(match theirs {
@@ -633,6 +683,7 @@ impl Updates {
             .map(|(key, _)| key.clone())
             .collect();
         for key in late {
+            self.goaled.remove(&key);
             if let Some(forward) = self.forwarding.remove(&key) {
                 let Forward {
                     status,
@@ -658,14 +709,55 @@ impl Updates {
         }
     }
 
+    /// A turn about to end whose goal's check runs once it does: its end
+    /// waits for `goal_settled`, if it is the turn of a task whose updates
+    /// the lead hears; another's end is judged as any turn's.
+    pub fn goal_turn(&mut self, name: &str, turn: i64) {
+        if self.live && self.task(name) {
+            self.goaled.insert((name.to_owned(), turn));
+        }
+    }
+
+    /// Whether a turn waits for its goal's check: the replay after a
+    /// restart starts before it, so the check runs again.
+    pub fn goal_pending(&self) -> bool {
+        !self.goaled.is_empty()
+    }
+
+    /// The goal's check of a turn said: no news when the task works again
+    /// (`None`), else the turn, with how its goal ended after its status.
+    pub fn goal_settled(&mut self, name: &str, turn: i64, outcome: Option<&str>) {
+        self.goaled.remove(&(name.to_owned(), turn));
+        let Some(forward) = self.forwarding.remove(&(name.to_owned(), turn)) else {
+            return;
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let Forward {
+            status,
+            from,
+            origin,
+            reply,
+            ..
+        } = forward;
+        let goal = Some(outcome.to_owned()).filter(|outcome| !outcome.is_empty());
+        self.tell_ended(name, turn, &status, from, None, origin, goal);
+        if let Some(reply) = reply {
+            self.replied(name, turn, &reply);
+        }
+    }
+
     /// The lead read these turns with its wait tool: what they said is no
     /// news to it any more.
     pub fn read(&mut self, handles: &HashSet<String>) {
         for (name, news) in &mut self.tasks {
             for kind in [&mut news.act, &mut news.theirs] {
+                // How a goal ended is no part of what the wait read.
                 if kind.as_ref().is_some_and(|t| {
                     t.status != APPROVAL
                         && t.status != QUIET
+                        && t.goal.is_none()
                         && handles.contains(&format!("turn:{name}/{}", t.turn))
                 }) {
                     *kind = None;
@@ -673,8 +765,11 @@ impl Updates {
             }
         }
         self.tasks.retain(|(_, news)| !news.empty());
-        self.forwarding
-            .retain(|(name, turn), _| !handles.contains(&format!("turn:{name}/{turn}")));
+        // A turn its goal's check holds stays: the wait read how it ended,
+        // not how its goal did.
+        self.forwarding.retain(|key, _| {
+            self.goaled.contains(key) || !handles.contains(&format!("turn:{}/{}", key.0, key.1))
+        });
     }
 
     /// Whether there is news for the lead.
@@ -853,6 +948,7 @@ impl Updates {
     pub fn forget(&mut self) {
         self.tasks.clear();
         self.forwarding.clear();
+        self.goaled.clear();
         self.approvals.clear();
     }
 
@@ -882,6 +978,7 @@ impl Updates {
     fn drop_news(&mut self, name: &str) {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
+        self.goaled.retain(|(task, _)| task != name);
         self.approvals.retain(|(task, _), _| task != name);
         self.noted.retain(|(task, _)| task != name);
     }
@@ -959,6 +1056,9 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     }
     if t.resolved {
         text.push_str(", and resolved itself");
+    }
+    if let Some(goal) = &t.goal {
+        text.push_str(goal);
     }
     if t.count > 1 {
         text.push_str(&format!(
@@ -1259,6 +1359,123 @@ mod tests {
             "completed",
         );
         assert!(updates.due());
+    }
+
+    #[test]
+    fn a_goal_s_turns_are_news_only_once_it_ends() {
+        let mut updates = fleet();
+        let lead = json!({"from": {"bot": "shop.lead", "turn": 9}});
+        let goal = json!({"origin": "goal"});
+        // The check failed and the task works again: no news.
+        updates.goal_turn("shop.fix", 4);
+        turn(&mut updates, "shop.fix", 4, lead.clone(), "completed");
+        assert!(!updates.due(), "held for its check");
+        updates.goal_settled("shop.fix", 4, None);
+        assert!(!updates.due(), "it works again");
+        // The check passed: the turn, with how the goal ended.
+        updates.goal_turn("shop.fix", 5);
+        turn(&mut updates, "shop.fix", 5, goal.clone(), "completed");
+        updates.goal_settled("shop.fix", 5, Some(", and met its goal: its check exits 0"));
+        let told = updates.take();
+        assert_eq!(
+            text(&told),
+            "- shop.fix: turn:shop.fix/5 completed, asked by goal, and met its goal: its check exits 0"
+        );
+        updates.sent(told);
+        // How it ended stays news when a later turn joins it, whichever
+        // settles first.
+        updates.goal_turn("shop.fix", 6);
+        turn(&mut updates, "shop.fix", 6, goal.clone(), "completed");
+        turn(&mut updates, "shop.fix", 7, lead.clone(), "completed");
+        updates.goal_settled("shop.fix", 6, Some(", and met its goal: its check exits 0"));
+        turn(&mut updates, "shop.fix", 8, lead.clone(), "completed");
+        let told = updates.take();
+        assert!(text(&told).contains("met its goal"), "{}", text(&told));
+        updates.sent(told);
+        // The lead's wait read the turn while its check ran: how the goal
+        // ended is still news.
+        updates.goal_turn("shop.fix", 9);
+        turn(&mut updates, "shop.fix", 9, goal.clone(), "completed");
+        updates.read(&["turn:shop.fix/9".to_owned()].into());
+        updates.goal_settled("shop.fix", 9, Some(", and met its goal: its check exits 0"));
+        let told = updates.take();
+        assert!(text(&told).contains("turn:shop.fix/9 completed, asked by goal, and met its goal"));
+        updates.sent(told);
+        // Or read it once its check had said.
+        updates.goal_turn("shop.fix", 10);
+        turn(&mut updates, "shop.fix", 10, goal.clone(), "completed");
+        updates.goal_settled(
+            "shop.fix",
+            10,
+            Some(", and met its goal: its check exits 0"),
+        );
+        updates.read(&["turn:shop.fix/10".to_owned()].into());
+        let told = updates.take();
+        assert!(
+            text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
+        );
+        updates.sent(told);
+        // Its check said while the lead's wait still held the turn.
+        updates.goal_turn("shop.fix", 12);
+        turn(&mut updates, "shop.fix", 12, goal.clone(), "completed");
+        updates
+            .bots
+            .get_mut("shop.lead")
+            .unwrap()
+            .waiting_on
+            .push("turn:shop.fix/12".to_owned());
+        updates.goal_settled(
+            "shop.fix",
+            12,
+            Some(", and met its goal: its check exits 0"),
+        );
+        updates
+            .bots
+            .get_mut("shop.lead")
+            .unwrap()
+            .waiting_on
+            .clear();
+        let told = updates.take();
+        assert!(
+            text(&told).contains("turn:shop.fix/12 completed, asked by goal, and met its goal")
+        );
+        updates.sent(told);
+        // A trigger passed its answer on while its check ran: how the goal
+        // ended is still news, without the answer.
+        updates.goal_turn("shop.fix", 11);
+        let fire = json!({"origin": "goal", "request_id": "trigger_t1.to.1"});
+        turn(&mut updates, "shop.fix", 11, fire, "completed");
+        updates.replied("shop.fix", 11, "passed on");
+        let passed = json!({"from": {"bot": "shop.fix", "turn": 11}});
+        updates.event(
+            &ev("shop.lead", Some(10), "accepted", passed),
+            Instant::now(),
+        );
+        updates.goal_settled(
+            "shop.fix",
+            11,
+            Some(", and met its goal: its check exits 0"),
+        );
+        let told = text(&updates.take());
+        assert!(told.contains("turn:shop.fix/11 completed"), "{told}");
+        assert!(
+            told.contains("met its goal") && !told.contains("passed on"),
+            "{told}"
+        );
+        // Cleared while its check ran: plain news.
+        updates.goal_turn("shop.docs", 2);
+        turn(&mut updates, "shop.docs", 2, lead, "completed");
+        updates.goal_settled("shop.docs", 2, Some(""));
+        assert_eq!(
+            text(&updates.take()),
+            "- shop.docs: turn:shop.docs/2 completed, asked by you"
+        );
+        // A check that never says lets the turn go once it could have run
+        // its longest.
+        updates.goal_turn("shop.docs", 3);
+        turn(&mut updates, "shop.docs", 3, goal, "completed");
+        updates.expire(Instant::now() + GOAL_HOLD);
+        assert!(text(&updates.take()).starts_with("- shop.docs: turn:shop.docs/3 completed"));
     }
 
     #[test]

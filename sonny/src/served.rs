@@ -30,6 +30,7 @@ pub const PROJECT: &str = "new_project";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const TRIGGERS: &str = "triggers";
 pub const MEMORY: &str = "memory";
+pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 
 /// The tools whose calls wait for a verdict wherever the agent's other
@@ -37,9 +38,18 @@ pub const EXEC: &str = crate::exec::NAME;
 /// lead, outside the agent's sandbox as a pane's command is, a removal can
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
-/// command outside any sandbox, and a script calls MCP servers, which run
-/// as the person too.
-pub const GATED: [&str; 7] = [START, REMOVE, PROJECT, SUBSCRIPTIONS, RUN, TRIGGERS, EXEC];
+/// command outside any sandbox, a script calls MCP servers, which run
+/// as the person too, and so does a goal's check.
+pub const GATED: [&str; 8] = [
+    START,
+    REMOVE,
+    PROJECT,
+    SUBSCRIPTIONS,
+    RUN,
+    TRIGGERS,
+    EXEC,
+    GOAL,
+];
 
 /// The most of what a call printed that its result holds, under the
 /// daemon's bound on an answer.
@@ -59,7 +69,13 @@ pub fn tools(lead: bool) -> Vec<Value> {
     if lead {
         tools.extend([start(), remove(), project(), subscriptions()]);
     }
-    tools.extend([show(), run(), triggers(), memory()]);
+    tools.extend([
+        show(),
+        run(),
+        triggers(),
+        memory(),
+        crate::lookout::goals::tool(GOAL, TAG),
+    ]);
     tools.extend(crate::exec::tool());
     tools
 }
@@ -468,6 +484,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
         }
+        GOAL => {
+            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (client, _events) = Client::connect(&socket)
+                .await
+                .map_err(|e| ("goal_refused", e.to_string()))?;
+            crate::lookout::goals::call(&store, &client, &caller, arguments)
+                .await
+                .map(|said| said.to_string())
+                .map_err(|e| ("goal_refused", e))
+        }
         MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
             .await
             .map(|said| said.to_string())
@@ -605,7 +631,8 @@ async fn serve(
                                 "call_id": call["call_id"]});
                             match answer {
                                 Ok(output) => {
-                                    if call["name"] == SUBSCRIPTIONS {
+                                    // Files the lookout reads, read now.
+                                    if call["name"] == SUBSCRIPTIONS || call["name"] == GOAL {
                                         subscribed.store(true, Ordering::Relaxed);
                                     }
                                     asked["output"] = json!(cut(output))
@@ -976,7 +1003,7 @@ mod tests {
                 .filter(|name| name != EXEC)
                 .collect()
         };
-        assert_eq!(names(tools(false)), [SHOW, RUN, TRIGGERS, MEMORY]);
+        assert_eq!(names(tools(false)), [SHOW, RUN, TRIGGERS, MEMORY, GOAL]);
         assert_eq!(
             names(tools(true)),
             [
@@ -987,7 +1014,8 @@ mod tests {
                 SHOW,
                 RUN,
                 TRIGGERS,
-                MEMORY
+                MEMORY,
+                GOAL
             ]
         );
         for tool in tools(true).into_iter().filter(|t| t["name"] != EXEC) {

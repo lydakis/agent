@@ -12,6 +12,7 @@
 //! agents' calls of the tools Sonny answers (`served`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
+pub(crate) mod goals;
 pub(crate) mod sources;
 pub(crate) mod subs;
 mod updates;
@@ -369,13 +370,14 @@ async fn serve(settings: Settings) -> Result<(), String> {
         store: settings.store.clone(),
         records: HashMap::new(),
         subscribers: HashMap::new(),
-        socket: settings.socket,
+        socket: settings.socket.clone(),
         lookouts: HashMap::new(),
         log: PathBuf::from(log),
         seated: 0,
         live: false,
         cursor: None,
         saved: None,
+        goals: goals::Goals::new(&settings.store, &settings.socket),
         resume: std::fs::read_to_string(cursor_path(&settings.store))
             .ok()
             .and_then(|text| text.trim().parse().ok()),
@@ -395,6 +397,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
             term.recv().await;
             crate::served::stop();
             sources::stop();
+            goals::stop();
             std::process::exit(0);
         });
     }
@@ -441,6 +444,8 @@ struct Service {
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
     saved: Option<i64>,
+    /// The agents' goals, whose turns it holds until their checks say.
+    goals: goals::Goals,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
     /// Lead `react` calls naming another agent, by bot, turn and call,
@@ -617,11 +622,15 @@ impl Service {
         // a message whose read the dropped connection cut short is read
         // again.
         self.resume = self.floor().or(self.resume);
+        // Goal checks a dropped connection left under way answer the old
+        // channel, never this one: none is under way here yet.
+        let (checked, mut settled) = tokio::sync::mpsc::channel(64);
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
             lookout.reading = 0;
         }
+        self.goals.reconnected();
         let (done, mut results) = tokio::sync::mpsc::channel(64);
         // Often enough for a note whose news has settled; subscription
         // files less often.
@@ -667,6 +676,16 @@ impl Service {
                         self.records.remove(name);
                         self.lookouts.remove(name);
                     }
+                    // A turn whose goal's check is to run is news only once
+                    // it says how the goal stands.
+                    let bot_id = (event["bot"].as_str())
+                        .and_then(|bot| self.records.get(bot))
+                        .and_then(|record| record["bot_id"].as_i64());
+                    if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.updates.goal_turn(&bot, turn);
+                        }
+                    }
                     for lookout in self.lookouts.values_mut() {
                         lookout.event(&event);
                         // The oldest event whose news is not told yet: a
@@ -693,6 +712,12 @@ impl Service {
                         continue;
                     }
                 }
+                Some(goals::Settled { bot, turn, outcome }) = settled.recv() => {
+                    self.goals.settled(&bot, turn);
+                    for lookout in self.lookouts.values_mut() {
+                        lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
+                    }
+                }
                 // What sources say is news once the stream is live; until
                 // then it waits in the channel.
                 Some(event) = from_sources.recv(), if self.live => {
@@ -716,6 +741,7 @@ impl Service {
                     // one this lookout answered, else now and then.
                     if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
+                        self.goals.reread();
                         self.runner.reload();
                         self.reread(&client).await;
                     }
@@ -939,16 +965,19 @@ impl Service {
         }
     }
 
-    /// Up to just before the oldest news a lookout has not told, which a
-    /// restart or a reconnect takes up again: news only in memory, or a
-    /// read a dropped connection cut short, is told again, not lost.
+    /// Up to just before the oldest news a lookout has not told, or the
+    /// oldest turn whose goal's check runs, which a restart or a reconnect
+    /// takes up again: news only in memory, or a read or check a dropped
+    /// connection cut short, is told or run again, not lost.
     fn floor(&mut self) -> Option<i64> {
         for lookout in self.lookouts.values_mut() {
             if !lookout.untold() {
                 lookout.from = None;
             }
         }
-        let floor = self.lookouts.values().filter_map(|l| l.from).min();
+        let floor = (self.lookouts.values().filter_map(|l| l.from))
+            .chain(self.goals.floor())
+            .min();
         match (self.cursor, floor) {
             (Some(at), Some(floor)) => Some(at.min(floor - 1)),
             (at, _) => at,
@@ -1203,8 +1232,11 @@ impl Lookout {
     /// Who wrote a turn, as the note names them; `None` for the
     /// subscriber, whose words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
-        // A lookout's own note to a lead another subscriber watches.
-        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
+        // A lookout's own note to a lead another subscriber watches, or a
+        // goal's next turn, whose end alone is news.
+        if (data["request_id"].as_str())
+            .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
+        {
             return None;
         }
         match (data["from"]["bot"].as_str(), data["origin"].as_str()) {
@@ -1406,9 +1438,12 @@ impl Lookout {
     }
 
     /// Whether anything it heard is not told yet: messages to read or
-    /// being read, or news.
+    /// being read, a turn waiting on its goal's check, or news.
     fn untold(&self) -> bool {
-        !self.due.is_empty() || self.reading > 0 || self.updates.news()
+        !self.due.is_empty()
+            || self.reading > 0
+            || self.updates.goal_pending()
+            || self.updates.news()
     }
 
     /// Tell the subscriber what happened: at once, cutting into its turn,
@@ -2068,6 +2103,7 @@ mod tests {
             resume: None,
             reacting: HashMap::new(),
             taken: HashMap::new(),
+            goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
         }
     }
 

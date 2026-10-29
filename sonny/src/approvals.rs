@@ -391,7 +391,8 @@ mod tests {
                 "new_project",
                 "subscriptions",
                 "run_in_pane",
-                "triggers"
+                "triggers",
+                "goal"
             ])
         );
     }
