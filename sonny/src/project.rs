@@ -569,7 +569,9 @@ pub async fn open(
     let make = |bot: String| {
         let (dir, project) = (dir.clone(), project.clone());
         async move {
-            if !lead_named(lead_short(&bot)) {
+            // The whole of the name after `{project}.lead.`, dots and all.
+            let name = bot.strip_prefix(&format!("{project}.lead.")).unwrap_or("");
+            if !lead_named(name) {
                 return Err(
                     "lead_invalid: a lead's name is lowercase letters, digits and hyphens, \
                      at most 32, as billing or fix-login"
