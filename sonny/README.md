@@ -138,6 +138,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
+| A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -258,6 +259,27 @@ and three a line. Typing replaces the selection, Backspace or Delete takes it
 out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
 
 ![A selection in the composer](../docs/sonny/composer-selection.png)
+
+After a turn you started from this window ends well, a copy of the agent
+guesses what you will type next, as Claude Code's prompt suggestions and
+Codex's composer predictions do, and the empty composer shows it dim for
+Tab to take. Tab puts it in the composer to edit or send; it never sends
+itself. The copy is forked where the turn ended, with the agent's tools and
+model so its prompt cache is warm, but allowed no call; it is asked for 2 to
+12 words in your style, or nothing when the next step is not obvious, and is
+deleted once it answers. That is one small model call per turn of yours
+(a steer counts for the turn it joins): none follows a turn the lead, the
+lookout or another window started, one that failed or was stopped, or one
+that ended on a question, so watching a task costs nothing.
+`[sonny] suggest = false` turns it off. Typing hides the guess, a new turn
+drops it, and Tab does what it does otherwise while none shows. Every Sonny
+has it, so a side chat or a task opened in the pane does too.
+
+![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
+
+![Tab took it into the composer, unsent](../docs/sonny/suggest-taken.png)
+
+![The same in a side chat in the pane](../docs/sonny/suggest-side.png)
 
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file
