@@ -940,7 +940,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let instructions = project::as_task(&workspace, &composed.text)?;
+    let info = agent_client::project::read(&workspace)?;
+    let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let declare = json!(declared::tools(false));
     let config = agent_client::config::load()?;
     let tools = agent_client::default_tools(client.providers(), &model, config.web_search);
@@ -6239,6 +6240,7 @@ impl App {
                 let workspace = std::path::Path::new(&self.workspace);
                 terminal.insert_before(rows.len() as u16, |buf| {
                     Paragraph::new(rows.to_vec()).render(buf.area, buf);
+                    image::send_shown(buf);
                     linked = links::cells(buf, &cut, |word| links::file(workspace, word));
                 })?;
                 // The rows sit just above the viewport now; those still on
@@ -6296,7 +6298,7 @@ impl App {
         let mut linked = Vec::new();
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
-        terminal.draw(|frame| {
+        let paint = |frame: &mut ratatui::Frame| {
             // The full screen: the conversation above the rows that move,
             // which sit right under it until it fills the screen, as inline.
             let view = match full() {
@@ -6629,6 +6631,11 @@ impl App {
                 ));
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+        };
+        terminal.draw(|frame| {
+            paint(frame);
+            // The pictures it shows, sent before it is written.
+            image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at.filter(|_| full());
         // Over themselves, the cursor kept where the frame left it.

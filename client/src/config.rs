@@ -16,6 +16,8 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
+//! lead_profile = "my-lead"      # the role a new lead starts in, not lead
+//! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "fork"            # "answer", the default, calls no tool
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
@@ -75,6 +77,11 @@ pub struct Judge {
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
+    /// The profile a lead runs as, in place of `lead`.
+    pub lead_profile: Option<String>,
+    /// The profile every other agent Sonny starts is told, in place of
+    /// `task`.
+    pub task_profile: Option<String>,
     /// The MCP servers Sonny's agents reach, by name.
     pub mcp_servers: BTreeMap<String, McpServer>,
     pub side_chat: SideChat,
@@ -90,6 +97,8 @@ impl Default for Sonny {
         Sonny {
             lead_effort: None,
             task_effort: None,
+            lead_profile: None,
+            task_profile: None,
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             chime: true,
@@ -317,6 +326,8 @@ fn parse(text: &str) -> Result<Config, String> {
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
+                "lead_profile",
+                "task_profile",
                 "side_chat",
                 "chime",
                 "verbose",
@@ -361,6 +372,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 ("judge", "model") => &mut config.judge.model,
                 ("judge", "effort") => &mut config.judge.effort,
                 ("sonny", "lead_effort") => &mut config.sonny.lead_effort,
+                ("sonny", "lead_profile") => &mut config.sonny.lead_profile,
+                ("sonny", "task_profile") => &mut config.sonny.task_profile,
                 _ => &mut config.sonny.task_effort,
             } = Some(value);
         }
@@ -567,7 +580,12 @@ mod tests {
         assert_eq!(config.judge.effort, None);
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
+        assert_eq!(config.sonny.lead_profile, None);
         assert_eq!(config.web_search, WebSearch::Live);
+        let roles =
+            parse("[sonny]\nlead_profile = \"my-lead\"\ntask_profile = \"worker\"").unwrap();
+        assert_eq!(roles.sonny.lead_profile.as_deref(), Some("my-lead"));
+        assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
         assert!(!config.hide_senders);

@@ -28,7 +28,7 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SWITCH: &[&str] = &["true", "false"];
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 11] = [
+pub const SETTINGS: [Setting; 13] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -76,6 +76,18 @@ pub const SETTINGS: [Setting; 11] = [
         about: "each new task's effort",
         values: EFFORTS,
         default: "its lead's",
+    },
+    Setting {
+        key: "sonny.lead_profile",
+        about: "the profile a new lead runs as",
+        values: &[],
+        default: "lead",
+    },
+    Setting {
+        key: "sonny.task_profile",
+        about: "the profile every other agent Sonny starts is told",
+        values: &[],
+        default: "task",
     },
     Setting {
         key: "sonny.side_chat",
@@ -356,13 +368,13 @@ mod tests {
         view.values = view.read().unwrap();
         assert_eq!(view.values[6].as_deref(), Some("low"));
         // The side chat: a fork, then its default again either way.
-        view.pick = 8;
+        view.pick = 10;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[8].as_deref(), Some("fork"));
+        assert_eq!(view.values[10].as_deref(), Some("fork"));
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[8], None);
+        assert_eq!(view.values[10], None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[8].as_deref(), Some("fork"));
+        assert_eq!(view.values[10].as_deref(), Some("fork"));
         // Efforts step through every level.
         view.pick = 5;
         press(&mut view, KeyCode::Left);
@@ -391,9 +403,9 @@ mod tests {
             "# mine\n[sonny]\nside_chat = \"fork\"\n"
         );
         // A switch is written as TOML's own.
-        view.pick = 9;
+        view.pick = 11;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[9].as_deref(), Some("false"));
+        assert_eq!(view.values[11].as_deref(), Some("false"));
         assert!(!agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
@@ -401,7 +413,7 @@ mod tests {
                 .ends_with("chime = false\n")
         );
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[9], None);
+        assert_eq!(view.values[11], None);
         // A value the reader refuses is said, and the file kept.
         view.pick = 7;
         view.typing = None;
