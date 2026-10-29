@@ -1188,8 +1188,9 @@ anything is written. `sandbox`, with `writable` and `network` (as `create`'s
 settings name them), replaces the bot's sandbox, and the two left out go back
 to none and off; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
-at all. It answers `{bot, bot_id, changed}`, `changed` naming the fields
-(`model`, `instructions`, `gates`, `declared`, `sandbox`) that differed; the same request again
+at all. `cache_ttl` (`5m` or `1h`, as `create`'s settings name it) sets the
+bot's prompt-cache lifetime from its next model call. It answers `{bot, bot_id, changed}`, `changed` naming the fields
+(`model`, `instructions`, `gates`, `declared`, `sandbox`, `cache_ttl`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`

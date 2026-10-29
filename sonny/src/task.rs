@@ -144,6 +144,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
+    with_cache(&mut flags);
     // Every task works in a sandbox, whatever its lead's mode, and may
     // commit to its repository.
     flags.extend(["--sandbox", "workspace-write", "--network"].map(String::from));
@@ -256,6 +257,26 @@ fn with_defaults(
         }
     }
     flags
+}
+
+/// The run flags with the prompt-cache lifetime Sonny gives the model it
+/// names, unless they name their own, as a bot Sonny makes has it.
+fn with_cache(flags: &mut Vec<String>) {
+    let named = |name: &str| {
+        let at = flags.iter().position(|flag| {
+            flag == name || flag.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+        })?;
+        Some(match flags[at].split_once('=') {
+            Some((_, value)) => value.to_owned(),
+            None => flags.get(at + 1).cloned().unwrap_or_default(),
+        })
+    };
+    if named("--cache-ttl").is_some() {
+        return;
+    }
+    if let Some(ttl) = named("--model").and_then(|model| agent_client::policy::cache_ttl(&model)) {
+        flags.extend(["--cache-ttl".to_owned(), ttl.to_owned()]);
+    }
 }
 
 /// The run flags with what `--agents` or `--profile ROLE` would compose
@@ -868,6 +889,37 @@ mod tests {
             run(none, &["--model", "a/lead"], None),
             ["--model", "a/lead", "--effort", "high"]
         );
+    }
+
+    #[test]
+    fn a_claude_task_keeps_its_cache_for_an_hour() {
+        let run = |flags: &[&str]| {
+            let mut flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            with_cache(&mut flags);
+            flags
+        };
+        assert_eq!(
+            run(&["--model", "anthropic/claude-opus-5-5"]),
+            ["--model", "anthropic/claude-opus-5-5", "--cache-ttl", "1h"]
+        );
+        assert_eq!(
+            run(&["--model=bedrock/us.anthropic.claude-opus-5-5"]),
+            [
+                "--model=bedrock/us.anthropic.claude-opus-5-5",
+                "--cache-ttl",
+                "1h"
+            ]
+        );
+        // Other providers have no such lifetime; one the lead names stays.
+        assert_eq!(
+            run(&["--model", "openai/gpt-6"]),
+            ["--model", "openai/gpt-6"]
+        );
+        assert_eq!(
+            run(&["--model", "anthropic/claude-opus-5-5", "--cache-ttl=5m"]),
+            ["--model", "anthropic/claude-opus-5-5", "--cache-ttl=5m"]
+        );
+        assert_eq!(run(&[]), Vec::<String>::new());
     }
 
     #[test]

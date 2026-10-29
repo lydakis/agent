@@ -271,6 +271,8 @@ enum Command {
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
+        /// Its prompt-cache lifetime, as `create`'s settings name it.
+        cache_ttl: Option<agent_runtime::store::CacheTtl>,
     },
     /// Summarize a bot's context with its compaction instructions before
     /// its next model call: a running turn's next round boundary, or an
@@ -2688,6 +2690,7 @@ impl Service {
                 sandbox,
                 writable,
                 network,
+                cache_ttl,
             } => {
                 if effort.is_some() && model.is_none() {
                     return fail_with("invalid_effort", "effort goes with model");
@@ -2808,6 +2811,11 @@ impl Service {
                             && db.set_sandbox(&bot, Some(id), sandbox)?
                         {
                             changed.push("sandbox");
+                        }
+                        if let Some(ttl) = cache_ttl
+                            && db.set_cache_ttl(&bot, Some(id), ttl)?
+                        {
+                            changed.push("cache_ttl");
                         }
 
                         Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))

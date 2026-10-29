@@ -1059,6 +1059,18 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([(u['cache_write_tokens'], u['cache_write_1h_tokens']) for u in usage], [(3, 3)] * 2)
 
+    def test_configure_moves_a_bot_to_the_hour_long_cache(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        moved = client.request('configure', bot='Bob', cache_ttl='1h')['result']
+        self.assertEqual(moved['changed'], ['cache_ttl'])
+        self.assertEqual(client.request('configure', bot='Bob', cache_ttl='1h')['result']['changed'], [])
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['cache_ttl'], '1h')
+        # Its next call marks the cache for an hour.
+        model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
+        turn = client.request('submit', bot='Bob', request_id='c1', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), effort='low')

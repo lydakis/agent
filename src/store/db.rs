@@ -2286,6 +2286,23 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
+    /// The bot's prompt-cache lifetime; whether that changed it.
+    pub fn set_cache_ttl(
+        &mut self,
+        name: &str,
+        bot_id: Option<i64>,
+        ttl: CacheTtl,
+    ) -> Result<bool> {
+        let id = self.identity(name, bot_id)?;
+        let mut settings = self.inspect(name)?.settings;
+        settings.cache_ttl = Some(ttl);
+        let stored = settings.stored()?;
+        let changed = self.conn.execute(
+            "UPDATE bots SET settings=? WHERE id=? AND settings IS NOT ?",
+            params![stored, id, stored],
+        )?;
+        Ok(changed == 1)
+    }
     /// Bounded keyset pages. Full instructions remain available through inspect.
     /// A page of bots in name order after `after`. `name` keeps those whose
     /// name matches a GLOB pattern, which reads only its literal prefix's
