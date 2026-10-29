@@ -541,6 +541,12 @@ impl Service {
                 event = events.recv() => {
                     let Some(event) = event else { return };
                     served.event(&event);
+                    // A `subscriptions` call this lookout answered counts
+                    // from the next event on, not from the next tick.
+                    if served.subscribed() {
+                        reread = Some(Instant::now());
+                        self.reread(&client).await;
+                    }
                     let cursor = event["cursor"].as_i64();
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
@@ -607,17 +613,7 @@ impl Service {
                     // one this lookout answered, else now and then.
                     if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
-                        let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
-                        if read != self.subscribers {
-                            self.subscribers = read;
-                            let records: Vec<Value> = (self.subscribers.keys())
-                                .filter_map(|name| self.records.get(name).cloned())
-                                .collect();
-                            for record in records {
-                                self.seat(&client, &record).await;
-                            }
-                            self.resubscribe();
-                        }
+                        self.reread(&client).await;
                     }
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.expire(now);
@@ -639,6 +635,23 @@ impl Service {
                 lookout.wake(&client).await;
             }
         }
+    }
+
+    /// The subscription files as they are now: a bot that subscribed is
+    /// watched, and each lookout watches what its file says.
+    async fn reread(&mut self, client: &Client) {
+        let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+        if read == self.subscribers {
+            return;
+        }
+        self.subscribers = read;
+        let records: Vec<Value> = (self.subscribers.keys())
+            .filter_map(|name| self.records.get(name).cloned())
+            .collect();
+        for record in records {
+            self.seat(client, &record).await;
+        }
+        self.resubscribe();
     }
 
     /// The subscriber's lookout, made once while its file lasts: whether it

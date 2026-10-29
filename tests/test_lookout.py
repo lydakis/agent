@@ -242,7 +242,7 @@ class LookoutTests(ModelFixture):
         self.assertEqual(listed['subscriptions'][0]['bots'], ['ops.*'])
         saved = json.loads((self.path / 'state.sqlite.lookout' / 'reviewer.json').read_text())
         self.assertEqual(saved['subscriptions'], listed['subscriptions'])
-        time.sleep(1)
+        # Heard from the next event on, with no wait for a reread.
         self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
         woke = self.note_for('reviewer')
         self.assertIsNotNone(woke, 'the subscriber was not woken')
