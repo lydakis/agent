@@ -46,12 +46,14 @@ pub fn tool() -> Value {
         "name": TOOL,
         "description": "Keep something beside the conversation, in the margin the person sees next to it: \
             a diagram, a table of findings, the file you are discussing, or a live view you update while \
-            you work. A note stays pinned to this point in the conversation, and the person can jump \
-            between it and here. Posting an id again replaces that note in place, so update one note \
-            rather than posting many; remove takes it away. Give markdown (rendered as your replies are, \
-            Mermaid included) or file (a path, shown as the file stands and kept fresh as it changes). \
-            Never put a question or anything the person must answer there, and never say the same thing \
-            in your reply: point to the note instead.",
+            you work. Use it for what the person will want to look at again as the conversation goes on, \
+            not for your answer itself. A note stays pinned to this point in the conversation, and the \
+            person can jump between it and here. Posting an id again replaces that note in place, so \
+            update one note rather than posting many; remove takes it away, and take away a note that \
+            no longer holds. Give markdown (rendered as your replies are: tables, math, Mermaid, html \
+            fences and pictures included) or file (a path, shown as the file stands and kept fresh as it \
+            changes). Never put a question or anything the person must answer there, and never say the \
+            same thing in your reply: point to the note instead.",
         "parameters": {
             "type": "object",
             "properties": {
