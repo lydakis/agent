@@ -59,6 +59,8 @@ pub enum Tag {
     End(i64),
     /// The reactions under the message at this node.
     Reactions(i64),
+    /// Other agents' reactions under the person's message at this node.
+    Picked(i64),
     /// A group of calls, by the client's number for it.
     Group(u64),
     /// The rows of the message at this node that one bot sent another.

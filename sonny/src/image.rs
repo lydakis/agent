@@ -1,14 +1,16 @@
 //! Pictures in the transcript: an SVG a reply carries in a ```svg fence,
 //! drawn with resvg and shown through Kitty graphics. The image is sent
-//! once and placed with Unicode placeholder cells, so it is text to the
-//! terminal and scrolls, and stays, with the rest of the history.
+//! the first time a frame shows it and placed with Unicode placeholder
+//! cells, so it is text to the terminal and scrolls, and stays, with the
+//! rest of the history.
 use ratatui::{
+    buffer::Buffer,
     style::{Color, Stylize},
     text::{Line, Span},
 };
 use resvg::{tiny_skia, usvg};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Write,
     sync::{Arc, Mutex, OnceLock, atomic::AtomicU32, atomic::Ordering},
 };
@@ -81,11 +83,77 @@ pub struct Drawn {
     pub cut: bool,
 }
 
-/// The picture sent to the terminal, as the rows of cells that show it.
-pub fn show(drawn: &Drawn) -> Result<Vec<Line<'static>>, String> {
+/// The rows of cells that show the picture, sent to the terminal by
+/// [`send_shown`] the first time a frame draws one of them.
+pub fn show(drawn: Drawn) -> Vec<Line<'static>> {
     let id = next_id();
-    send(id, drawn.cols, drawn.rows, &drawn.png).map_err(|e| e.to_string())?;
-    Ok(placeholders(id, drawn.cols, drawn.rows))
+    let rows = placeholders(id, drawn.cols, drawn.rows);
+    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    waiting.get_or_insert_with(Waiting::default).add(id, drawn);
+    rows
+}
+
+/// How many bytes of pictures not yet shown are kept; past it the oldest
+/// are sent now, as every picture was before, so rows dropped or a pane
+/// left behind never hold their pictures here for good.
+const WAITING_BYTES: usize = 64 << 20;
+
+/// Pictures made and not yet sent, by image id: a long history's are
+/// many, and only those scrolled to are sent.
+static WAITING: Mutex<Option<Waiting>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Waiting {
+    pictures: HashMap<u32, Drawn>,
+    /// The ids in the order made, sent ones among them until pruned.
+    order: VecDeque<u32>,
+    bytes: usize,
+}
+
+impl Waiting {
+    fn add(&mut self, id: u32, drawn: Drawn) {
+        self.bytes += drawn.png.len();
+        self.order.push_back(id);
+        if let Some(old) = self.pictures.insert(id, drawn) {
+            self.bytes -= old.png.len();
+        }
+        while self.bytes > WAITING_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.send(oldest);
+        }
+        if self.order.len() > 2 * self.pictures.len() + 16 {
+            let pictures = &self.pictures;
+            self.order.retain(|id| pictures.contains_key(id));
+        }
+    }
+
+    fn send(&mut self, id: u32) {
+        if let Some(drawn) = self.pictures.remove(&id) {
+            self.bytes -= drawn.png.len();
+            // A picture the terminal would not take shows as its cells.
+            let _ = send(id, drawn.cols, drawn.rows, &drawn.png);
+        }
+    }
+}
+
+/// Send the pictures `buf` shows that the terminal does not have yet,
+/// before the frame that shows them is written.
+pub fn send_shown(buf: &Buffer) {
+    let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(waiting) = waiting.as_mut().filter(|w| !w.pictures.is_empty()) else {
+        return;
+    };
+    for cell in &buf.content {
+        if !cell.symbol().starts_with(PLACEHOLDER) {
+            continue;
+        }
+        let Color::Rgb(r, g, b) = cell.fg else {
+            continue;
+        };
+        waiting.send(u32::from_be_bytes([0, r, g, b]));
+    }
 }
 
 /// What a picture shown with [`show_linked`] opens, by its image id.
@@ -93,13 +161,13 @@ static SOURCES: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
 
 /// [`show`], a click on the picture opening `url`: the file it was drawn
 /// from, shown bigger in the pane.
-pub fn show_linked(drawn: &Drawn, url: Option<String>) -> Result<Vec<Line<'static>>, String> {
-    let rows = show(drawn)?;
+pub fn show_linked(drawn: Drawn, url: Option<String>) -> Vec<Line<'static>> {
+    let rows = show(drawn);
     if let (Some(url), Some(id)) = (url, rows.first().and_then(|row| id(row.spans.get(1)?))) {
         let mut sources = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
         sources.get_or_insert_with(HashMap::new).insert(id, url);
     }
-    Ok(rows)
+    rows
 }
 
 /// The image a span of placeholder cells shows, by the id its colour

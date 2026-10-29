@@ -86,6 +86,43 @@ person's. A folder's own `.agents/agents/lead.md` or `task.md` comes
 first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
+#### Roles for leads and tasks
+
+A lead runs as the `lead` profile and every other agent is told the `task`
+one, unless set to another. Another kind of lead is a profile of its own,
+say `~/.agents/agents/my-lead.md`, that builds on the lead's:
+
+```markdown
+---
+extends: lead
+description: A lead that reviews each change before it lands
+skills: [triage]
+---
+Review each change a task makes before it lands.
+```
+
+and a project file names it for its lead:
+
+| What | `~/.agent/config.toml` | `.agents/project.toml` |
+| --- | --- | --- |
+| The profile a lead runs as | `[sonny] lead_profile` | `profile` |
+| The profile every other agent is told | `[sonny] task_profile` | `threads_profile` |
+
+Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
+written to `~/.agents/agents` beside the others and used by no lead
+unless a project sets `profile = "superlead"`. It builds on the lead's:
+the folder holds other projects, so the lead subscribes to their leads
+and routes work and answers between them as it does between tasks. Sonny
+itself knows only leads and tasks.
+
+The project's wins, then the config's, then `lead` and `task`. A name that
+is not a profile in the folder's or the person's `.agents/agents` (nor one
+Sonny ships) stops the lead or task from being made, with
+`profile_not_found`. The profile is read when the lead's instructions are
+composed, so `/instructions` takes a change. `extends` and `skills` work
+in any profile ([CLIENT.md](../docs/CLIENT.md)); a profile that extends
+`lead` or `task` is not offered to agents as a role to start a peer in.
+
 #### Effort for leads and tasks
 
 Each agent's effort is the daemon's to keep; Sonny only picks what a new
@@ -101,6 +138,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
+| A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -222,6 +260,27 @@ out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
 
 ![A selection in the composer](../docs/sonny/composer-selection.png)
 
+After a turn you started from this window ends well, a copy of the agent
+guesses what you will type next, as Claude Code's prompt suggestions and
+Codex's composer predictions do, and the empty composer shows it dim for
+Tab to take. Tab puts it in the composer to edit or send; it never sends
+itself. The copy is forked where the turn ended, with the agent's tools and
+model so its prompt cache is warm, but allowed no call; it is asked for 2 to
+12 words in your style, or nothing when the next step is not obvious, and is
+deleted once it answers. That is one small model call per turn of yours
+(a steer counts for the turn it joins): none follows a turn the lead, the
+lookout or another window started, one that failed or was stopped, or one
+that ended on a question, so watching a task costs nothing.
+`[sonny] suggest = false` turns it off. Typing hides the guess, a new turn
+drops it, and Tab does what it does otherwise while none shows. Every Sonny
+has it, so a side chat or a task opened in the pane does too.
+
+![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
+
+![Tab took it into the composer, unsent](../docs/sonny/suggest-taken.png)
+
+![The same in a side chat in the pane](../docs/sonny/suggest-side.png)
+
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file
 dropped on the terminal, or its path pasted, is attached rather than typed.
@@ -248,9 +307,10 @@ a small 📎 (`📎 2` for two). `/react` picks an older reply, and sending an e
 reply takes it off. The agent reacts too, with a `react` tool Sonny
 declares on it: 👍 or 🎉 under
 your message when that is all it needs, or 👀 while it looks, taken off
-once it answers. Its reactions are drawn under the message they answer
-when its turn ends, so one taken off again never shows, and a reaction of
-yours to an older reply goes under that reply.
+once it answers. Every reaction sits right under the message it is on,
+however far up that is, and never as a row of its own: yours under the
+reply, the agent's under your message, and a lead's under your words in
+one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
@@ -527,7 +587,8 @@ Shift+Cmd+click in Ghostty) opens a file outside Sonny from the
 conversation. Keys go
 to the pane after a click in it; Ctrl+\ (or Tab, in a pane that is not a
 chat) takes them back to the composer, and Ctrl+\, or Tab with nothing
-typed, puts them in the pane again. Sonny binds no Shift+Tab: multiplexers
+typed and no guess showing, puts them in the pane again; the pane's title
+names the key that does. Sonny binds no Shift+Tab: multiplexers
 switch tabs with it. A window too narrow for
 both shows the one the keys are in. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓

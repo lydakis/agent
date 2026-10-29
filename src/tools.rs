@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    sync::Semaphore,
+    sync::{Semaphore, watch},
 };
 
 mod fetch;
@@ -412,6 +412,9 @@ pub struct Registry {
     /// Running terminals, by proc handle, each its bot's own.
     #[cfg(unix)]
     terminals: terminal::Terminals,
+    /// Set once as the daemon stops: background commands still running
+    /// end then rather than outlive it.
+    stopping: Arc<watch::Sender<bool>>,
     credentials: Credentials,
     environment: Arc<Vec<(String, String)>>,
     /// What the daemon keeps that a sandbox leaves alone or lets through.
@@ -894,6 +897,7 @@ impl Registry {
             detached_budget: DEFAULT_DETACHED_BUDGET,
             #[cfg(unix)]
             terminals: Arc::default(),
+            stopping: Arc::new(watch::Sender::new(false)),
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
@@ -1714,6 +1718,7 @@ impl Registry {
     ) {
         let registry = self.clone();
         let mut queued = queued;
+        let mut stopping = self.stopping.subscribe();
         tokio::spawn(async move {
             let result = async {
                 let slot = match queued.permit.take() {
@@ -1733,10 +1738,22 @@ impl Registry {
                 )
                 .await?;
                 Ok(registry.shell_outcome(stdout, stderr, exit, elapsed))
+            };
+            // A command still running as the daemon stops is dropped, which
+            // kills its group; its handle then reports the process lost, as
+            // the next start would.
+            tokio::select! {
+                result = result => {
+                    let _ = done.send(result);
+                }
+                _ = stopping.wait_for(|stopping| *stopping) => {}
             }
-            .await;
-            let _ = done.send(result);
         });
+    }
+
+    /// End every background command still running, as the daemon stops.
+    pub fn end_background(&self) {
+        self.stopping.send_replace(true);
     }
 }
 

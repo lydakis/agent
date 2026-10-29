@@ -108,6 +108,24 @@ class WaitTests(ModelFixture):
             self.assertLess(process.memory_info().rss - baseline, 8 * 1024 * 1024, phase)
         self.assertEqual(client.request('wait', handles=[pending], timeout_ms=0)['result']['pending'], [pending])
 
+    def test_a_clean_stop_ends_a_running_background_command_and_records_it_lost(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='bg',
+                              prompt='bg:while [ ! -f finish ]; do sleep .01; done')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        # The stop ends the command and records its end itself, instead of
+        # leaving the row running for the next start to find.
+        client.close()
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            rows = db.execute('SELECT status,result FROM processes').fetchall()
+        self.assertEqual([(status, json.loads(result)['error']) for status, result in rows],
+                         [('finished', 'process_lost')])
+        again = self.client('echo,shell,wait')
+        result = again.request('wait', handles=[handle])['result']['results'][handle]
+        self.assertEqual(result['error'], 'process_lost')
+
     def test_old_turn_outcomes_use_indexed_event_lookups(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -759,9 +777,24 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait')
         for bot in ('Bob', 'Carol'):
             client.request('create', bot=bot, workspace=str(self.path))
+        # The service looks for ready turns once as it starts and again as
+        # each turn ends, on its own loop and through the store. A look still
+        # to come when the lock below is taken would hold that loop, so it
+        # would read the admissions only after the failure: wait for each.
+        def looks(at_least):
+            deadline = time.monotonic() + 10
+            while True:
+                operations = client.request('stats')['result']['store']['operations']
+                count = operations.get('next_ready', {}).get('count', 0)
+                if count >= at_least:
+                    return count
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+        before = looks(1)
         started = client.request('submit', bot='Bob', request_id='bg',
                                  prompt="bg:while [ ! -f release ]; do sleep .01; done; printf done > marker")['result']['turn']
         self.assertEqual(client.finished(started)['data']['status'], 'completed')
+        looks(before + 1)
         with sqlite3.connect(database) as db:
             db.execute("CREATE TRIGGER reject_completion BEFORE UPDATE OF result ON processes BEGIN "
                        "SELECT RAISE(ABORT, 'synthetic write failure'); END")

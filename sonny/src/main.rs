@@ -55,6 +55,7 @@ mod skills;
 mod sound;
 mod started;
 mod status;
+mod suggest;
 mod t3;
 mod table;
 mod task;
@@ -120,6 +121,8 @@ const OLDER_ITEMS: u64 = 50;
 /// width), so they stay whole at 100 and prose stays near the measure.
 const PROSE: usize = 100;
 /// How long a side chat's copy stays once idle.
+/// What follows a guess at the next message in the composer.
+const TAB: &str = "  tab";
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -908,7 +911,8 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let memory = agent_client::policy::memory_indexes(&workspace).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(&workspace, None, &memory).map_err(|e| e.to_string())?;
-    let instructions = project::as_task(&workspace, &composed.text)?;
+    let info = agent_client::project::read(&workspace)?;
+    let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let declare = json!(declared::tools(false));
     let config = agent_client::config::load()?;
     let tools = agent_client::default_tools(client.providers(), &model, config.web_search);
@@ -1473,6 +1477,10 @@ struct App {
     bot_reactions: Vec<String>,
     /// The bot's `react` calls not yet completed, by call id.
     react_calls: HashMap<String, (String, bool)>,
+    /// What other agents, such as its lead, reacted with to the person's
+    /// messages here, and when that was last looked at.
+    picked: reactions::Picked,
+    picked_read: Instant,
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
@@ -1607,6 +1615,12 @@ struct App {
     /// it joins while nothing else was drawn.
     folds: BTreeMap<usize, Fold>,
     folding: Option<(usize, usize)>,
+    /// The number the next group of rows (a fold, a roster) takes: never
+    /// one taken before, on whatever page.
+    next_group: usize,
+    /// The conversation's screen, put by while an older page is written
+    /// on one of its own.
+    newer: Option<screen::Screen>,
     /// Words between agents drawn quiet, by node: what was said, who
     /// said it, and whether a click opened it.
     relayed: HashMap<i64, Relayed>,
@@ -1624,6 +1638,13 @@ struct App {
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
+    /// The turn the person's words last went to from this window: only
+    /// its end is followed by a guess at their next message.
+    yours: Option<i64>,
+    /// That guess, being made.
+    suggesting: Option<tokio::task::JoinHandle<Option<String>>>,
+    /// The guess, shown in the empty composer for Tab to take.
+    suggestion: Option<String>,
 }
 
 /// The lead's tasks, laid out in the project's Rex session: a window for
@@ -2154,6 +2175,9 @@ impl App {
             pick: 0,
             watch: None,
             behind: (0, None),
+            yours: None,
+            suggesting: None,
+            suggestion: None,
             asks_seen: HashMap::new(),
             sounds: sound::Sounds::new(false),
             said: String::new(),
@@ -2169,6 +2193,8 @@ impl App {
             declare: None,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
+            picked: reactions::Picked::default(),
+            picked_read: Instant::now(),
             answering: None,
             rows_drawn: 0,
             thought: String::new(),
@@ -2230,6 +2256,8 @@ impl App {
             ran_here: Vec::new(),
             screen: screen::Screen::default(),
             folds: BTreeMap::new(),
+            next_group: 0,
+            newer: None,
             folding: None,
             relayed: HashMap::new(),
             tasks: BTreeMap::new(),
@@ -2246,6 +2274,7 @@ impl App {
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
         self.margin = margin::Margin::load(self.reactions_key.as_deref());
+        self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
         // Known to start the conversation only once its newest page is
         // read, the welcome goes above it.
@@ -2366,6 +2395,16 @@ impl App {
                 _ = tick.tick() => {}
                 _ = self.woken.notified() => {}
             }
+            if self.picked_read.elapsed() > Duration::from_secs(1) {
+                self.picked_read = Instant::now();
+                let mut nodes: Vec<i64> = (self.picked.refresh().into_iter())
+                    .map(|(node, ..)| node)
+                    .collect();
+                nodes.dedup();
+                for node in nodes {
+                    self.place_picked(node);
+                }
+            }
             if self
                 .watch
                 .as_ref()
@@ -2387,6 +2426,7 @@ impl App {
                 }
             }
             self.side_closed();
+            self.suggested_now().await;
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
@@ -2743,12 +2783,14 @@ impl App {
         // page is written on a screen of its own: a group of calls in it
         // drawn again is found there, not among the newer rows.
         self.flush();
-        let screen = std::mem::take(&mut self.screen);
+        self.newer = Some(std::mem::take(&mut self.screen));
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
         let bot_reactions = std::mem::take(&mut self.bot_reactions);
         let react_calls = std::mem::take(&mut self.react_calls);
         let answering = self.answering.take();
+        let folding = self.folding.take();
+        let starting = self.starting.take();
         let welcome = self.welcome();
         self.commit(welcome);
         let unpaired = std::mem::take(&mut self.unpaired);
@@ -2758,12 +2800,15 @@ impl App {
         self.bot_reactions = bot_reactions;
         self.react_calls = react_calls;
         self.answering = answering;
+        self.folding = folding;
+        self.starting = starting;
         // A blank row apart from what was the first.
         if wrote {
             self.pending.push(Line::default());
         }
         self.flush();
-        let older = std::mem::replace(&mut self.screen, screen);
+        let newer = self.newer.take().unwrap_or_default();
+        let older = std::mem::replace(&mut self.screen, newer);
         self.screen.prepend(older);
     }
 
@@ -2962,14 +3007,12 @@ impl App {
         // Folds whose rows the conversation let go keep nothing: the
         // oldest go first, as rows do.
         while let Some(&first) = self.folds.keys().next() {
-            let tag = screen::Tag::Group(first as u64);
-            let waiting = (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag));
-            if waiting || self.screen.has(tag) {
+            if self.kept(screen::Tag::Group(first as u64)) {
                 break;
             }
             self.folds.remove(&first);
         }
-        let at = self.folds.keys().next_back().map_or(0, |at| at + 1);
+        let at = self.group();
         self.folds.insert(
             at,
             Fold {
@@ -3015,7 +3058,7 @@ impl App {
             // Gone from the conversation: this task starts a group of its own.
             self.tasks.remove(&at);
         }
-        let at = self.tasks.keys().next_back().map_or(0, |at| at + 1);
+        let at = self.group();
         self.tasks.insert(at, vec![task]);
         let (lines, marks) = self.started_lines(at);
         let count = lines.len();
@@ -3055,6 +3098,20 @@ impl App {
         (self.screen).replace_tagged(screen::Tag::Tasks(at as u64), lines, marks)
     }
 
+    /// Whether rows tagged `tag` are in the conversation, drawn or waiting
+    /// to be, the rows put by while an older page is written included.
+    fn kept(&self, tag: screen::Tag) -> bool {
+        (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
+            || self.screen.has(tag)
+            || (self.newer.as_ref()).is_some_and(|newer| newer.has(tag))
+    }
+
+    /// A number for a new group of rows, unlike any before it.
+    fn group(&mut self) -> usize {
+        self.next_group += 1;
+        self.next_group - 1
+    }
+
     /// What the tasks started are doing, read again every few seconds:
     /// those still at work, and every one when news of them came.
     async fn read_tasks(&mut self) {
@@ -3062,11 +3119,7 @@ impl App {
         // read again.
         let gone: Vec<usize> = (self.tasks.keys())
             .copied()
-            .filter(|at| {
-                let tag = screen::Tag::Tasks(*at as u64);
-                !self.screen.has(tag)
-                    && !(self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag))
-            })
+            .filter(|at| !self.kept(screen::Tag::Tasks(*at as u64)))
             .collect();
         for at in gone {
             self.tasks.remove(&at);
@@ -3109,7 +3162,29 @@ impl App {
                 .request("turns", json!({"bot": bot, "newest": true, "limit": 8}))
                 .await;
             let state = match read {
-                Ok(page) => started::state(&self.task_turn(&page).await),
+                Ok(page) => {
+                    let turn = self.task_turn(&page).await;
+                    let state = started::state(&turn);
+                    // A turn that ended on a question waits on the person,
+                    // as `/status` says; read once per turn it ended.
+                    match (state.as_str(), turn["turn"].as_i64()) {
+                        ("done", Some(last)) => {
+                            let seen = match self.asks_seen.get(&bot) {
+                                Some((at, seen)) if *at == last => seen.clone(),
+                                _ => {
+                                    let seen = self.scan(&bot, Some(last)).await;
+                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                    seen
+                                }
+                            };
+                            match seen.ask.is_some() && !seen.itself {
+                                true => "needs you".to_owned(),
+                                false => state,
+                            }
+                        }
+                        _ => state,
+                    }
+                }
                 Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
                 // Not read this time: it stays as it was.
                 Err(_) => continue,
@@ -3464,6 +3539,10 @@ impl App {
             if !lines.is_empty() {
                 self.commit(lines);
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+                // What another agent reacted with before it was drawn.
+                if !self.picked.on(node).is_empty() {
+                    self.place_picked(node);
+                }
             }
         }
         self.answering = Some((first_words(said), self.rows_drawn, node));
@@ -3757,10 +3836,12 @@ impl App {
                         }
                     }
                     // Counted once it is known to have been taken.
+                    // One naming another agent is drawn in that agent's window.
                     (Some("function_call"), _) if item["name"] == reactions::TOOL => {
                         if let Some(reaction) = item["arguments"]
                             .as_str()
                             .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                            .filter(|arguments| reactions::target(arguments).is_none())
                             .as_ref()
                             .and_then(reactions::call)
                         {
@@ -4049,6 +4130,11 @@ impl App {
         self.any_history = true;
         if let Some(node) = live.node {
             self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+            // The person's reactions made while it was being written.
+            if let Some(row) = self.reacted_row(node) {
+                self.commit_after(vec![row], false);
+                self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
+            }
         }
     }
 
@@ -4162,8 +4248,12 @@ impl App {
                 }
                 self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
-                self.bot_reactions.clear();
-                self.answering = None;
+                // A turn the history drew still answers the message it
+                // drew, with what the bot reacted to it with so far.
+                if !drawn {
+                    self.bot_reactions.clear();
+                    self.answering = None;
+                }
                 if !drawn
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -4332,10 +4422,12 @@ impl App {
             }
             "tool_started" if data["name"] == reactions::TOOL => {
                 // Counted once it completes, and drawn when the turn ends,
-                // so one taken off again is never drawn.
+                // so one taken off again is never drawn; one naming another
+                // agent is drawn in that agent's window.
                 if let Some(reaction) = data["arguments"]
                     .as_str()
                     .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .filter(|arguments| reactions::target(arguments).is_none())
                     .as_ref()
                     .and_then(reactions::call)
                 {
@@ -4551,6 +4643,9 @@ impl App {
                 self.draw_bot_reactions();
                 self.approvals.clear();
                 self.notice = None;
+                if status == "completed" && !quiet && turn.is_some() && turn == self.yours {
+                    self.suggest();
+                }
                 status_report(
                     match status {
                         _ if quiet => "idle",
@@ -5872,6 +5967,20 @@ impl App {
             key.code = code;
             key.modifiers -= KeyModifiers::CONTROL;
         }
+        // Tab takes the guess at the next message into the composer, as
+        // Claude Code and Codex take theirs; it is not sent. Tab does what
+        // it does otherwise when none shows.
+        if let Event::Key(key) = &event
+            && key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Tab
+            && !self.pane_keys
+            && let Some(guess) = self.suggested()
+        {
+            let guess = guess.to_owned();
+            self.input.set(&guess);
+            self.suggestion = None;
+            return;
+        }
         if self.full_screen(&event) {
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
@@ -6475,6 +6584,16 @@ impl App {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(turn) = reply["turn"].as_i64() {
+            // A steer is a submission of its own that ends as steered; the
+            // person's is the turn it joins: the running one, or the one the
+            // message before it started.
+            if origin.is_none() {
+                self.yours = match delivery {
+                    None => Some(turn),
+                    Some(_) => (self.running.as_ref().map(|r| r.turn))
+                        .or_else(|| self.staged.last().map(|(started, _)| *started)),
+                };
+            }
             self.staged.push((turn, prompt));
         }
         if workspace.is_some() {
@@ -6557,39 +6676,10 @@ impl App {
     }
 
     /// The bot's reactions so far to the person's message, right under
-    /// it; or, when that message is no longer in the conversation, under
-    /// what was drawn last, with a row of their own that says which.
+    /// it, wherever it is: never a row of their own. A message no longer
+    /// in the conversation, or not drawn yet, shows them once it is.
     fn draw_bot_reactions(&mut self) {
-        if self.place_bot_reactions() {
-            return;
-        }
-        let on = std::mem::take(&mut self.bot_reactions);
-        if on.is_empty() {
-            return;
-        }
-        let emoji = on.join(" ");
-        match &self.answering {
-            Some((_, at, _)) if *at == self.rows_drawn => {
-                self.commit_after(vec![transcript::reacted(&emoji)], false);
-            }
-            answering => {
-                let what = match answering {
-                    Some((first, ..)) => format!("↳ reacted {emoji} to “{first}”"),
-                    None => format!("↳ reacted {emoji}"),
-                };
-                let rows = transcript::wrap(
-                    Line::from(what),
-                    self.prose(),
-                    Span::raw("  "),
-                    Span::raw("    "),
-                );
-                self.commit(transcript::quiet(rows));
-            }
-        }
-        // Another reaction now goes under this one's row.
-        if let Some((_, at, _)) = &mut self.answering {
-            *at = self.rows_drawn;
-        }
+        self.place_bot_reactions();
     }
 
     /// The bot's reactions so far, none included, as the row under the
@@ -6611,6 +6701,23 @@ impl App {
             .then(|| transcript::reacted(&self.bot_reactions.join(" ")));
         self.put_under(screen::Tag::End(node), tag, row.clone())
             || self.put_under(screen::Tag::Relayed(node), tag, row)
+    }
+
+    /// What other agents, such as its lead, reacted with to the person's
+    /// message at `node`, each with who, as the row under it (under the
+    /// bot's own reactions when there are some). A message not drawn
+    /// shows them once it is.
+    fn place_picked(&mut self, node: i64) {
+        let on: Vec<String> = (self.picked.on(node).iter())
+            .map(|(by, emoji)| format!("{emoji} {by}"))
+            .collect();
+        let row = (!on.is_empty()).then(|| transcript::reacted(&on.join("  ")));
+        self.flush();
+        let under = match self.screen.has(screen::Tag::Reactions(node)) {
+            true => screen::Tag::Reactions(node),
+            false => screen::Tag::End(node),
+        };
+        self.screen.put_under(under, screen::Tag::Picked(node), row);
     }
 
     /// The person's reactions to the reply at `node`, as its row.
@@ -6669,22 +6776,66 @@ impl App {
         if self.put_under(screen::Tag::End(node), screen::Tag::Reactions(node), row) {
             return;
         }
-        if added && last && self.running.is_none() {
-            self.commit_after(vec![transcript::reacted(&emoji)], false);
+        // A reply still being written gets them under it once it is; one
+        // not drawn here, once it is drawn.
+        if (self.live.as_ref()).is_some_and(|live| live.node == Some(node)) {
             return;
         }
-        let what = if added {
-            format!("↳ {emoji} on “{first}”")
-        } else {
-            format!("↳ took back {emoji} on “{first}”")
-        };
-        let rows = transcript::wrap(
-            Line::from(what),
-            self.prose(),
-            Span::raw("  "),
-            Span::raw("    "),
-        );
-        self.commit(transcript::quiet(rows));
+        self.notice = Some(match added {
+            true => format!("{emoji} on “{first}”"),
+            false => format!("took back {emoji} on “{first}”"),
+        });
+    }
+
+    /// A guess at the person's next message, after a turn of theirs ended
+    /// well, made by a copy of this bot on this window's model; unless the
+    /// config's `[sonny] suggest` is off, or the bot asked a question,
+    /// which its own card answers.
+    fn suggest(&mut self) {
+        self.suggestion = None;
+        if !self.asks.is_empty() || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest) {
+            return;
+        }
+        self.suggesting = Some(tokio::spawn(suggest::guess(
+            self.client.clone(),
+            self.bot.clone(),
+            self.turn_model.clone(),
+        )));
+    }
+
+    /// The guess, once made. A turn started since lets it go; a copy
+    /// still guessing finishes and is deleted on its own.
+    async fn suggested_now(&mut self) {
+        if self.running.is_some() || !self.staged.is_empty() {
+            self.suggesting = None;
+            self.suggestion = None;
+            return;
+        }
+        if self
+            .suggesting
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            let job = self.suggesting.take().unwrap();
+            self.suggestion = job.await.ok().flatten();
+        }
+    }
+
+    /// The guess, while the composer shows it: empty, with nothing running
+    /// and nothing open over it.
+    fn suggested(&self) -> Option<&str> {
+        let open = self.picker.is_some()
+            || self.choosing.is_some()
+            || self.approving.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
+            || self.react_to.is_some();
+        let shows = self.input.is_empty()
+            && self.running.is_none()
+            && self.asks.is_empty()
+            && self.approvals.is_empty()
+            && !open;
+        self.suggestion.as_deref().filter(|_| shows)
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -6899,7 +7050,12 @@ impl App {
         let mut linked = Vec::new();
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
-        terminal.draw(|frame| {
+        // Tab takes a guess at the next message while one shows.
+        let switch = match self.suggested() {
+            Some(_) => "ctrl+\\",
+            None => "tab",
+        };
+        let paint = |frame: &mut ratatui::Frame| {
             // The conversation above the rows that move, which sit right
             // under it until it fills the screen.
             let (area, pane) = self.split(frame.area());
@@ -6909,7 +7065,7 @@ impl App {
                 let file = |word: &str| {
                     links::file_line(&base, word).or_else(|| links::file_line(&workspace, word))
                 };
-                pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, file);
+                pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
                 // The line between them, as a split's.
                 if area.width > 0 {
@@ -7202,6 +7358,11 @@ impl App {
                 ));
             }
             frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+        };
+        terminal.draw(|frame| {
+            paint(frame);
+            // The pictures it shows, sent before it is written.
+            image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at;
         // Over themselves, the cursor kept where the frame left it.
@@ -7229,6 +7390,20 @@ impl App {
     fn composer(&self, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
         // What is sent answers the lead's first open question.
         let answering = (!self.chatting).then(|| self.asks.first()).flatten();
+        // The guess at the next message, for Tab to take.
+        if let Some(guess) = self.suggested() {
+            let room = width.saturating_sub(prompt::LEAD + TAB.width());
+            return (
+                vec![Line::from(vec![
+                    Span::raw("› ").bold(),
+                    // Italic too: a side chat's screen, read through vt100,
+                    // loses the dim.
+                    Span::raw(transcript::cut(guess, room)).dim().italic(),
+                    Span::raw(TAB).dim(),
+                ])],
+                (0, prompt::LEAD),
+            );
+        }
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
             let name = match &self.project {
@@ -7834,6 +8009,124 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn after_a_turn_of_the_persons_a_copy_guesses_their_next_message_for_tab() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |asked| {
+            seen.lock().unwrap().push(asked.clone());
+            match (asked["op"].as_str(), asked["bot"].as_str()) {
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("submit"), Some("b")) => json!({"turn": 1}),
+                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
+                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                    {"status": "completed", "text": "Suggestion: run the tests"}}}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("fix the bug and run tests");
+        app.submit().await;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        for _ in 0..200 {
+            app.suggested_now().await;
+            if app.suggestion.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(app.suggested(), Some("run the tests"));
+        let (rows, _) = app.composer(80);
+        let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row, "› run the tests  tab");
+        // The copy forked from the bot, allowed no call, and was deleted.
+        let ops = asked.lock().unwrap().clone();
+        let fork = ops.iter().find(|op| op["op"] == "fork").unwrap();
+        assert_eq!(fork["source"], "b");
+        assert_eq!(fork["allow"], json!([]));
+        assert!(fork["expire_ms"].is_u64());
+        let copy = fork["bot"].as_str().unwrap();
+        assert!(
+            ops.iter()
+                .any(|op| op["op"] == "delete" && op["bot"] == copy)
+        );
+        // Something typed hides it; emptied again, it is back.
+        app.input.set("x");
+        assert_eq!(app.suggested(), None);
+        app.input.clear();
+        // Tab takes it into the composer, unsent.
+        app.key(Event::Key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert_eq!(&*app.input, "run the tests");
+        assert_eq!(app.suggestion, None);
+        assert_eq!(
+            ops.iter().filter(|op| op["op"] == "submit").count(),
+            2,
+            "the person's and the copy's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_person_steered_from_here_is_theirs() {
+        let next = std::sync::atomic::AtomicI64::new(2);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        // The lead's turn 1 runs; the person steers it, a submission of its own.
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.input.set("and the reversed range too");
+        app.submit().await;
+        assert_eq!(app.yours, Some(1));
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
+            .await;
+        assert!(app.suggesting.is_none());
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(app.suggesting.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_person_did_not_start_here_is_not_followed_by_a_guess() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        // Started by the lead, the lookout, or another window.
+        app.daemon(turn_event("accepted", 3, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            3,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(app.suggesting.is_none());
+        // Nor one of the person's that failed or was stopped.
+        for status in ["failed", "interrupted"] {
+            app.yours = Some(4);
+            app.daemon(turn_event("accepted", 4, json!({}))).await;
+            app.daemon(turn_event("turn_finished", 4, json!({"status": status})))
+                .await;
+            assert!(app.suggesting.is_none(), "{status}");
+        }
     }
 
     #[tokio::test]
@@ -8633,17 +8926,18 @@ mod tests {
         let mut app = app(client);
         app.turn_model = Some("opus".into());
         app.any_history = true;
-        let rows = |app: &mut App| {
-            std::mem::take(&mut app.pending)
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-        };
         app.input.set("👍");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("no reply to react to yet"));
-        app.saw_reply(4, "Merged it.\nThe notes are updated.");
-        app.saw_reply(8, "Tagged 0.4.0.");
+        for (node, reply) in [
+            (4, "Merged it.\nThe notes are updated."),
+            (8, "Tagged 0.4.0."),
+        ] {
+            let lines = transcript::reply(reply, 80, std::path::Path::new("/"));
+            app.commit_said(node, lines);
+            app.saw_reply(node, reply);
+        }
+        app.flush();
         // The last reply: the emoji alone, attached, right under it.
         app.input.set(":+1:");
         app.submit().await;
@@ -8652,7 +8946,11 @@ mod tests {
         assert_eq!(first["delivery"], "attach");
         assert!(first["model"].is_null() && first["workspace"].is_null());
         assert!(app.input.is_empty());
-        assert_eq!(rows(&mut app), ["   👍 "], "no blank row above it");
+        assert_eq!(
+            drawn(&mut app)[4..],
+            ["• Tagged 0.4.0.", "   👍 "],
+            "no blank row above it"
+        );
         assert_eq!(app.reactions.on(8), ["👍"]);
         app.daemon(turn_event("attached", 9, json!({}))).await;
         assert_eq!(app.notice, None, "a reaction attaching says nothing");
@@ -8666,18 +8964,31 @@ mod tests {
         app.input.set("🎉");
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Merged it.\n\n🎉");
-        assert_eq!(rows(&mut app), ["", "  ↳ 🎉 on “Merged it.”"]);
+        let rows = drawn(&mut app);
+        assert_eq!(
+            rows[1..4],
+            ["• Merged it.", "  The notes are updated.", "   🎉 "],
+            "{rows:?}"
+        );
         // The same emoji again takes it off, telling the bot nothing.
         app.input.set("👍");
         app.submit().await;
         assert_eq!(sent.lock().unwrap().len(), 2);
-        assert_eq!(rows(&mut app), ["", "  ↳ took back 👍 on “Tagged 0.4.0.”"]);
+        assert_eq!(drawn(&mut app).last().unwrap(), "• Tagged 0.4.0.");
         assert!(app.reactions.on(8).is_empty());
+        // A reply no longer in the conversation gets it all the same, and
+        // no row says so: the footer does.
+        app.saw_reply(10, "Gone.");
+        app.input.set("🚀");
+        app.submit().await;
+        assert_eq!(app.reactions.on(10), ["🚀"]);
+        assert_eq!(drawn(&mut app).last().unwrap(), "• Tagged 0.4.0.");
+        assert_eq!(app.notice.as_deref(), Some("🚀 on “Gone.”"));
         // Words with an emoji are a message, sent as one.
         app.input.set("👍 ship it");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[2]["prompt"], "👍 ship it");
-        assert!(sent.lock().unwrap()[2]["delivery"].is_null());
+        assert_eq!(sent.lock().unwrap()[3]["prompt"], "👍 ship it");
+        assert!(sent.lock().unwrap()[3]["delivery"].is_null());
     }
 
     #[tokio::test]
@@ -8792,7 +9103,7 @@ mod tests {
         assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
         assert_eq!(rows[7..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
-        // goes under what was drawn last, saying which message.
+        // to it draws no row of its own.
         app.seen_node = 0;
         app.daemon(turn_event("accepted", 3, json!({"node": 5})))
             .await;
@@ -8809,10 +9120,75 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
+        let rows = drawn(&mut app);
+        assert!(!rows.iter().any(|row| row.contains("👀")), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn a_running_turn_the_history_drew_reacts_under_its_message() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let react = |id: &str, emoji: &str| {
+            turn_event(
+                "tool_started",
+                4,
+                json!({"call_id": id, "name": "react",
+                    "arguments": json!({"emoji": emoji}).to_string()}),
+            )
+        };
+        // Attached mid-turn: the history drew the message and what the bot
+        // reacted with so far, and the turn's start comes again after it.
+        app.land(5, "ship it", None, false);
+        app.daemon(react("c1", "👀")).await;
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c1"})))
+            .await;
+        app.seen_node = 5;
+        app.daemon(turn_event("accepted", 4, json!({"node": 5})))
+            .await;
+        app.commit(vec![Line::from("• Ran the tests")]);
+        app.daemon(react("c2", "👍")).await;
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c2"})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[..2], ["› ship it", "   👀 👍 "], "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("reacted")), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn the_leads_reaction_goes_under_the_persons_message_wherever_it_is() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.land(5, "ship it", None, false);
+        app.commit(vec![Line::from("• Shipped.")]);
+        app.picked.set(5, "calc.lead", "👀", false);
+        app.place_picked(5);
+        assert_eq!(drawn(&mut app)[..2], ["› ship it", "   👀 calc.lead "]);
+        // The bot's own go first, the lead's under them.
+        app.bot_reactions = vec!["👍".into()];
+        app.draw_bot_reactions();
         assert_eq!(
-            drawn(&mut app).last().map(String::as_str),
-            Some("  ↳ reacted 👀 to “and the notes?”")
+            drawn(&mut app)[..3],
+            ["› ship it", "   👍 ", "   👀 calc.lead "]
         );
+        // Taken off, its row goes; no row ever says so.
+        app.picked.set(5, "calc.lead", "👀", true);
+        app.place_picked(5);
+        let rows = drawn(&mut app);
+        assert_eq!(rows[..2], ["› ship it", "   👍 "], "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("calc.lead")),
+            "{rows:?}"
+        );
+        // Reacted to before it landed: under it once it does.
+        app.picked.set(7, "calc.lead", "👀", false);
+        app.land(7, "and the notes", None, false);
+        assert_eq!(drawn(&mut app).last().unwrap(), "   👀 calc.lead ");
     }
 
     #[tokio::test]
@@ -9061,6 +9437,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_older_page_s_folds_leave_the_newer_ones_and_their_numbers() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        let start = |app: &mut App, name: &str| {
+            let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
+            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+        };
+        start(&mut app, "calc.add");
+        start(&mut app, "calc.neg");
+        app.flush();
+        // An older page written on a screen of its own, as older() does.
+        app.newer = Some(std::mem::take(&mut app.screen));
+        app.any_history = false;
+        let folding = app.folding.take();
+        start(&mut app, "calc.old");
+        start(&mut app, "calc.older");
+        app.flush();
+        app.folding = folding;
+        let older = std::mem::replace(&mut app.screen, app.newer.take().unwrap());
+        app.screen.prepend(older);
+        assert_eq!(app.folds.len(), 2, "the newer fold is kept");
+        app.follow("sonny:fold/0");
+        let button = app.pressed.pop().unwrap();
+        app.press(&button).await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[0], "• Messaged calc.old and calc.older ▸", "{rows:?}");
+        assert!(
+            rows.contains(&"• Messaged calc.add and calc.neg ▾".to_string()),
+            "{rows:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn agents_messaged_in_a_row_fold_into_one_row_a_click_opens() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
@@ -9206,6 +9616,37 @@ mod tests {
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ✓ quiet  done    Fix quiet");
         assert_eq!(rows[2], "  ✗ bad    failed  Fix bad");
+    }
+
+    #[tokio::test]
+    async fn a_task_that_ended_on_a_question_needs_you() {
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scanned = scans.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"nodes": [{"node": 3, "turn": 1}]})
+            }
+            Some("history_items") => {
+                let arguments = json!({"question": "Merge?", "options": [
+                    {"label": "Yes", "explanation": "Now."},
+                    {"label": "No", "explanation": "Later."}]});
+                json!({"items": [{"node": 3, "item": {"type": "function_call", "name": "ask",
+                    "call_id": "a1", "arguments": arguments.to_string()}}]})
+            }
+            _ => json!({"turns": [{"turn": 1, "status": "completed"}]}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"name": "ask", "brief": "Fix ask"});
+        app.commit_call("c", served::START, &arguments, "turn:calc.ask/1", false);
+        app.read_tasks().await;
+        assert_eq!(drawn(&mut app)[1], "  ● ask  needs you  Fix ask");
+        // Its history is read once for the turn it ended.
+        app.tasks_read = None;
+        app.read_tasks().await;
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

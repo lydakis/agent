@@ -7,6 +7,9 @@
 //!
 //! A bot reacts too, with the `react` tool Sonny declares on it: the
 //! daemon records the call and Sonny draws it under the person's message.
+//! A lead reacts to the person's newest message in one of its tasks by
+//! naming the task: the lookout keeps that reaction in the task's
+//! [`Picked`] file, which the task's window draws.
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -123,12 +126,15 @@ pub fn tool() -> Value {
             replaces an answer: when the person asked something, answer in words. When a reaction is all \
             their message needs, react and end your turn without words. `remove` takes off a reaction you \
             added, such as 👀 once you have answered. React only to the person, never to another agent's \
-            messages.",
+            messages. With `bot`, it reacts to the person's newest message in that agent instead, such as \
+            what they wrote in one of your tasks that you picked up.",
         "parameters": {
             "type": "object",
             "properties": {
                 "emoji": {"type": "string", "description": "One emoji, such as 👍."},
-                "remove": {"type": "boolean", "description": "Take this reaction off instead."}
+                "remove": {"type": "boolean", "description": "Take this reaction off instead."},
+                "bot": {"type": "string", "minLength": 1,
+                    "description": "Another agent, to react to the person's newest message there."}
             },
             "required": ["emoji"],
             "additionalProperties": false
@@ -141,6 +147,121 @@ pub fn tool() -> Value {
 pub fn call(arguments: &Value) -> Option<(String, bool)> {
     let emoji = arguments["emoji"].as_str().map(str::trim)?;
     (!emoji.is_empty()).then(|| (emoji.to_owned(), arguments["remove"] == true))
+}
+
+/// The other agent a `react` call names, whose person's message it is for
+/// rather than the caller's own.
+pub fn target(arguments: &Value) -> Option<&str> {
+    arguments["bot"]
+        .as_str()
+        .map(str::trim)
+        .filter(|bot| !bot.is_empty())
+}
+
+/// What other agents reacted with to the person's messages in one bot,
+/// by node, each with who reacted, in a file beside the bot's own
+/// reactions: the lookout writes it, and the bot's window draws it.
+#[derive(Default)]
+pub struct Picked {
+    file: Option<PathBuf>,
+    on: BTreeMap<i64, Vec<(String, String)>>,
+    read: Option<std::time::SystemTime>,
+}
+
+impl Picked {
+    fn path(key: &str) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(format!(".agent/sonny/reactions/{key}.by.json")))
+    }
+
+    /// The reactions kept for the bot under `key`, its [`key`].
+    pub fn load(key: Option<&str>) -> Self {
+        let mut picked = Picked {
+            file: key.and_then(Self::path),
+            ..Picked::default()
+        };
+        picked.refresh();
+        picked
+    }
+
+    /// `by`'s reaction to the person's message at `node` kept, or taken
+    /// off, as the lookout's write would.
+    #[cfg(test)]
+    pub fn set(&mut self, node: i64, by: &str, emoji: &str, remove: bool) {
+        let at = self.on.entry(node).or_default();
+        at.retain(|(b, e)| !(b == by && e == emoji));
+        if !remove {
+            at.push((by.to_owned(), emoji.to_owned()));
+        }
+    }
+
+    /// Who reacted with what to the person's message at `node`.
+    pub fn on(&self, node: i64) -> &[(String, String)] {
+        self.on.get(&node).map_or(&[], Vec::as_slice)
+    }
+
+    /// Reads the file again when it changed since: the reactions it holds
+    /// now that it did not, and those it no longer holds, by node, each
+    /// with whether it was added.
+    pub fn refresh(&mut self) -> Vec<(i64, String, String, bool)> {
+        let Some(file) = &self.file else {
+            return Vec::new();
+        };
+        let modified = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+        if modified.is_none() || modified == self.read {
+            return Vec::new();
+        }
+        self.read = modified;
+        let now: BTreeMap<i64, Vec<(String, String)>> = std::fs::read(file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let gone = |from: &BTreeMap<i64, Vec<(String, String)>>,
+                    to: &BTreeMap<i64, Vec<(String, String)>>,
+                    added: bool| {
+            (from.iter())
+                .flat_map(|(node, on)| on.iter().map(move |(by, emoji)| (*node, by, emoji)))
+                .filter(|(node, by, emoji)| {
+                    !(to.get(node).into_iter().flatten()).any(|(b, e)| b == *by && e == *emoji)
+                })
+                .map(|(node, by, emoji)| (node, by.clone(), emoji.clone(), added))
+                .collect::<Vec<_>>()
+        };
+        let mut changed = gone(&now, &self.on, true);
+        changed.extend(gone(&self.on, &now, false));
+        self.on = now;
+        changed
+    }
+
+    /// Keeps `by`'s reaction to the person's message at `node` in the bot
+    /// under `key`, or takes it off.
+    pub fn apply(key: &str, node: i64, by: &str, emoji: &str, remove: bool) -> Result<(), String> {
+        let file = Self::path(key).ok_or("HOME is not set")?;
+        Self::apply_in(&file, node, by, emoji, remove)
+    }
+
+    fn apply_in(file: &Path, node: i64, by: &str, emoji: &str, remove: bool) -> Result<(), String> {
+        let failed = |e: std::io::Error| format!("{}: {e}", file.display());
+        let mut on: BTreeMap<i64, Vec<(String, String)>> = std::fs::read(file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let at = on.entry(node).or_default();
+        at.retain(|(b, e)| !(b == by && e == emoji));
+        if !remove {
+            at.push((by.to_owned(), emoji.to_owned()));
+        }
+        if at.is_empty() {
+            on.remove(&node);
+        }
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(failed)?;
+        }
+        let json = serde_json::to_vec(&on).map_err(|e| e.to_string())?;
+        let next = file.with_extension("json.next");
+        std::fs::write(&next, json).map_err(failed)?;
+        std::fs::rename(&next, file).map_err(failed)
+    }
 }
 
 /// Whether a call's kept result is the daemon refusing it.
@@ -162,6 +283,41 @@ pub fn apply(on: &mut Vec<String>, emoji: &str, remove: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_s_reaction_in_a_task_is_kept_by_the_person_s_message_and_read_once() {
+        let dir = std::env::temp_dir().join(format!("sonny-picked-{}", std::process::id()));
+        let file = dir.join("t.by.json");
+        let mut picked = Picked {
+            file: Some(file.clone()),
+            ..Picked::default()
+        };
+        assert!(picked.refresh().is_empty());
+        Picked::apply_in(&file, 12, "calc.lead", "👀", false).unwrap();
+        assert_eq!(
+            picked.refresh(),
+            [(12, "calc.lead".into(), "👀".into(), true)]
+        );
+        assert!(picked.refresh().is_empty());
+        assert_eq!(picked.on(12), [("calc.lead".into(), "👀".into())]);
+        // Taken off again, it is gone, and read as taken back once.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Picked::apply_in(&file, 12, "calc.lead", "👀", true).unwrap();
+        assert_eq!(
+            picked.refresh(),
+            [(12, "calc.lead".into(), "👀".into(), false)]
+        );
+        assert!(picked.refresh().is_empty());
+        assert!(picked.on(12).is_empty());
+        let target = |arguments: Value| target(&arguments).map(str::to_owned);
+        assert_eq!(
+            target(json!({"emoji": "👀", "bot": "calc.tui"})).as_deref(),
+            Some("calc.tui")
+        );
+        assert_eq!(target(json!({"emoji": "👀", "bot": " "})), None);
+        assert_eq!(target(json!({"emoji": "👀"})), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_reaction_is_kept_by_its_reply_and_picking_it_again_takes_it_off() {
