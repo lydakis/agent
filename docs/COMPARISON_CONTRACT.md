@@ -153,8 +153,8 @@ it asked for and what actually answered, each from that harness's own records:
   response, and its per-model totals, which include any auxiliary model it
   calls.
 - **Fallback policy as configured.** Our adapter creates task bots with
-  `--fallbacks`, so a declined Anthropic request finishes on the model
-  Anthropic recommends; the flag does nothing on the OpenAI or ChatGPT
+  `--fallback` when given one, so a request a safety classifier declined is
+  answered by that model; it does nothing on the OpenAI or ChatGPT
   providers. A bot the task delegates to sets its own, and the trial
   metadata's `bot_settings` records each counted bot's choice. Each
   baseline's flags or settings come from its adapter's source at the pinned

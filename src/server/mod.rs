@@ -110,6 +110,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             created_by,
             compaction_instructions,
             compaction_model,
+            fallback,
             declare,
             settings,
             ..
@@ -126,6 +127,7 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                 created_by,
                 compaction_instructions,
                 compaction_model,
+                fallback,
             ))
             .map(|bytes| {
                 bytes
@@ -218,9 +220,9 @@ enum Command {
         /// the client's; without instructions the bot never compacts.
         compaction_instructions: Option<String>,
         compaction_model: Option<String>,
-        /// Anthropic server-side fallbacks for this bot; off unless asked.
-        #[serde(default)]
-        fallbacks: bool,
+        /// The model, as `provider/model` in the bot's family, that answers
+        /// a request a safety classifier declined, that request alone.
+        fallback: Option<String>,
         /// A gate: tools whose calls wait for a verdict, the approver tag
         /// that answers them, and how long a call may wait for it.
         approve: Option<Vec<String>>,
@@ -2469,7 +2471,7 @@ impl Service {
                 created_by_id,
                 compaction_instructions,
                 compaction_model,
-                fallbacks,
+                fallback,
                 approve,
                 approver,
                 approve_expire_ms,
@@ -2549,12 +2551,13 @@ impl Service {
                 }
                 // The summarizer must speak the bot's family: its items are
                 // stored in that encoding and go to the summarizer as they are.
-                if let Some(reference) = &compaction_model {
-                    let (summarizer, _) = split_model(reference)?;
+                // So must a fallback, which is sent the same request.
+                for reference in compaction_model.iter().chain(&fallback) {
+                    let (other, _) = split_model(reference)?;
                     let known = self
                         .providers
-                        .get(summarizer)
-                        .ok_or(Error::with("provider_unavailable", summarizer))?;
+                        .get(other)
+                        .ok_or(Error::with("provider_unavailable", other))?;
                     if known.family() != family {
                         return fail_with("provider_family_mismatch", reference.clone());
                     }
@@ -2578,7 +2581,7 @@ impl Service {
                                 created_by_id,
                                 compaction_instructions: compaction_instructions.as_deref(),
                                 compaction_model: compaction_model.as_deref(),
-                                fallbacks,
+                                fallback: fallback.as_deref(),
                                 gate: gate.as_ref(),
                                 settings: *settings,
                                 declared: declare.as_deref(),
@@ -4146,7 +4149,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -4290,7 +4293,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -4507,7 +4510,7 @@ mod tests {
             created_by_id: None,
             compaction_instructions: None,
             compaction_model: None,
-            fallbacks: false,
+            fallback: None,
             gate: None,
             settings: Default::default(),
             declared: None,
@@ -4747,7 +4750,7 @@ mod tests {
                                 created_by_id: None,
                                 compaction_instructions: None,
                                 compaction_model: None,
-                                fallbacks: false,
+                                fallback: None,
                                 gate: None,
                                 settings: Default::default(),
                                 declared: None,
@@ -5043,7 +5046,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -5130,7 +5133,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: None,
                         settings: Default::default(),
                         declared: None,
@@ -5376,7 +5379,7 @@ mod tests {
             created_by_id: None,
             compaction_instructions: None,
             compaction_model: None,
-            fallbacks: false,
+            fallback: None,
             approve: None,
             approver: None,
             approve_expire_ms: None,
@@ -5960,7 +5963,7 @@ mod tests {
                             created_by_id: creator.as_ref().map(|c| c.bot_id),
                             compaction_instructions: None,
                             compaction_model: None,
-                            fallbacks: false,
+                            fallback: None,
                             gate: Some(&gate),
                             settings: Default::default(),
                             declared: None,
@@ -6241,7 +6244,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
-                        fallbacks: false,
+                        fallback: None,
                         gate: Some(&gate),
                         settings: Default::default(),
                         declared: None,

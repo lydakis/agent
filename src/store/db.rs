@@ -98,10 +98,10 @@ pub struct Bot {
     pub thinking: Strip,
     #[serde(skip)]
     pub thinking_elided: i64,
-    /// Anthropic server-side fallbacks: a declined request is rerun on the
-    /// model Anthropic recommends instead of failing the turn. The client's
-    /// choice at creation; forks inherit it.
-    pub fallbacks: bool,
+    /// The model, as `provider/model` in the bot's family, that answers a
+    /// request a safety classifier declined, that request alone, instead of
+    /// the turn failing. The client's choice at creation; forks inherit it.
+    pub fallback: Option<String>,
     /// Tools whose calls wait for a verdict, per approver tag. Fixed at
     /// creation, except a root bot's through `configure`: a bot keeps every
     /// gate it descends from.
@@ -580,8 +580,8 @@ pub struct Binding<'a> {
     /// client's; with no instructions the bot never compacts.
     pub compaction_instructions: Option<&'a str>,
     pub compaction_model: Option<&'a str>,
-    /// Anthropic server-side fallbacks for this bot.
-    pub fallbacks: bool,
+    /// The model that answers a request a classifier declined.
+    pub fallback: Option<&'a str>,
     /// The bot's own gate; its creator's, if any, is added by the store.
     pub gate: Option<&'a Gate>,
     pub settings: Settings,
@@ -1559,7 +1559,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 59;
+    pub const SCHEMA: i32 = 60;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1689,7 +1689,7 @@ impl Database {
                 compaction_instructions TEXT, compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
                 thinking_floor INTEGER NOT NULL DEFAULT 0,
-                fallbacks INTEGER NOT NULL DEFAULT 0,
+                fallback TEXT,
                 elision INTEGER REFERENCES elisions(node),
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
@@ -2105,7 +2105,7 @@ impl Database {
                 to: r.get(28)?,
             },
             thinking_elided: r.get(29)?,
-            fallbacks: r.get::<_, i64>(25)? != 0,
+            fallback: r.get(25)?,
             elision: r.get(26)?,
             gates: match r.get::<_, Option<String>>(30)? {
                 None => Vec::new(),
@@ -2164,7 +2164,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -2569,7 +2569,7 @@ impl Database {
             "provider":binding.provider,"model":binding.model,"effort":binding.effort,
             "budget_tokens":binding.budget_tokens,"tools":binding.tools,"created_by":binding.created_by,
             "created_by_id":binding.created_by_id,"compaction_model":binding.compaction_model,
-            "fallbacks":binding.fallbacks,"gate":binding.gate,"settings":binding.settings,
+            "fallback":binding.fallback,"gate":binding.gate,"settings":binding.settings,
             "declare":binding.declared}));
         if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
             if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
@@ -2605,7 +2605,7 @@ impl Database {
             None => binding.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2621,7 +2621,7 @@ impl Database {
                 created_by_id,
                 binding.compaction_instructions,
                 binding.compaction_model,
-                binding.fallbacks,
+                binding.fallback,
                 gates,
                 settings.stored()?,
                 creation(binding.request_id, request),
@@ -7735,7 +7735,7 @@ impl Database {
             None => parent.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -7760,7 +7760,7 @@ impl Database {
                 // its own context against it.
                 thinking.0,
                 thinking.1.below,
-                parent.fallbacks,
+                parent.fallback,
                 thinking.1.from,
                 thinking.1.to,
                 thinking.2,
@@ -10315,6 +10315,19 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 58 -> 59: a Responses custom tool's call is answered in its own
         // kind of item. No custom tool was declared before.
         conn.execute_batch("ALTER TABLE tools ADD COLUMN custom INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='fallback')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 59 -> 60: a bot names the model a declined request falls back to,
+        // retried by the daemon, rather than asking Anthropic for its own
+        // fallback, which sticks to that model. No bot names one yet.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN fallback TEXT;
+             ALTER TABLE bots DROP COLUMN fallbacks;",
+        )?;
     }
     Ok(())
 }

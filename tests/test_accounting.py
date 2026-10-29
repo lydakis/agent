@@ -276,6 +276,31 @@ class AccountingTests(ModelFixture):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class IdleExitTests(ModelFixture):
+    def test_a_new_bot_takes_the_person_s_fallback_for_its_model(self):
+        self.model.models = ('synthetic-model', 'synthetic-other')
+        (self.path / '.agent').mkdir()
+        (self.path / '.agent/config.toml').write_text(
+            '[fallbacks]\n"openai/synthetic-model" = "openai/synthetic-backup"\n')
+        store = self.path / 'state.sqlite'
+        common = ['--store', str(store), '--provider', f'openai=responses,{self.url}', '--detach']
+        env = {**clean_env(), 'HOME': str(self.path)}
+
+        def made(bot, *flags):
+            run = subprocess.run([str(self.binary), 'run', *common, '--new', '--bot', bot, *flags, 'hello'],
+                                 env=env, capture_output=True, text=True, timeout=30, cwd=self.path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            inspected = subprocess.run([str(self.binary), 'inspect', '--store', str(store), '--bot', bot],
+                                       env=env, capture_output=True, text=True, timeout=10)
+            return json.loads(inspected.stdout)['fallback']
+
+        self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(store)],
+                        env=env, capture_output=True, timeout=5)
+        # --fallback wins; a model the table does not name has none.
+        self.assertEqual(made('Bob', '--model', 'openai/synthetic-model'), 'openai/synthetic-backup')
+        self.assertEqual(made('Ann', '--model', 'openai/synthetic-model', '--fallback', 'openai/other'),
+                         'openai/other')
+        self.assertIsNone(made('Cy', '--model', 'openai/synthetic-other'))
+
     def test_socket_daemon_exits_when_idle_and_parked_turns_survive(self):
         store = self.path / 'state.sqlite'
         socket = self.path / 'state.sqlite.sock'

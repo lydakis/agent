@@ -283,6 +283,18 @@ impl TokenTotals {
     }
 }
 
+/// The model a refused request is sent to next: the bot's fallback.
+struct Fallback {
+    provider: Arc<Provider>,
+    /// Its provider binding and model, which its usage is priced at.
+    name: String,
+    model: String,
+    /// The refusal's credit, when the retry stays on the same provider.
+    credit: Option<String>,
+    /// Chosen, and not yet sent.
+    pending: bool,
+}
+
 /// The last model call of a turn, kept so its prompt cache can be refreshed
 /// while the calls it planned run: see [`Turn::run_tool`].
 struct Warm<'a> {
@@ -294,8 +306,6 @@ struct Warm<'a> {
     context: &'a Context,
     /// The items the call sent without thinking: a refresh sends the same.
     thinking: Strip,
-    /// The call's fallback choice: a refresh renders the same request.
-    fallbacks: bool,
     /// Whether the call offered web search; a refresh offers the same.
     web_search: bool,
     after: std::time::Duration,
@@ -1151,7 +1161,7 @@ impl Turn {
     /// each sends at most `view` bytes, the tools and both instructions, a
     /// token to a byte at most, and generates at most the summarizer's
     /// output bound. Nothing without a budget; `None` when that bound is
-    /// unknown, as with fallbacks on, and then the summary goes before the call.
+    /// unknown, and then the summary goes before the call.
     fn summary_bound(
         &self,
         record: &agent_runtime::store::Bot,
@@ -1160,10 +1170,6 @@ impl Turn {
     ) -> Option<u64> {
         if record.ceiling().is_none() {
             return Some(0);
-        }
-        // Server-side fallbacks may bill any number of attempts per request.
-        if record.fallbacks {
-            return None;
         }
         let reference = summarizer(record);
         let (name, model) = split_model(&reference).ok()?;
@@ -1535,9 +1541,7 @@ impl Turn {
                     .saturating_add(usage.input_tokens)
                     .saturating_add(usage.output_tokens);
             }
-            let usage = completion
-                .usage
-                .map(|usage| summarizer_usage(usage, name, model));
+            let usage = completion.usage.map(|usage| priced_at(usage, name, model));
             let summary = completion_text(&completion.items);
             // A copy offers the bot's tools; a call there is not a summary.
             let invalid = if !completion.calls.is_empty() {
@@ -2577,7 +2581,6 @@ impl Turn {
                     tools: &tools,
                     context: &context,
                     thinking: context.thinking,
-                    fallbacks: record.fallbacks,
                     web_search: searches(&record),
                     after,
                     read_at,
@@ -2780,6 +2783,9 @@ impl Turn {
         // Replayed thinking a 400 may have come from, withheld from this
         // call's later attempts.
         let mut withheld = None;
+        // The bot's fallback model, once a classifier declined this request:
+        // it answers this request alone, and the next goes to the bot's model.
+        let mut fallback: Option<Fallback> = None;
         let mut tool_calls = tool_calls;
         loop {
             // A billed attempt that failed counts as a round: the retry that
@@ -2803,6 +2809,11 @@ impl Turn {
             accounting.begin(attempt > 0);
             (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
             let sent = agent_runtime::provider::Sent::default();
+            let target = (fallback.as_ref()).map(|to| (to.provider.clone(), to.model.clone()));
+            let (provider, model) = match &target {
+                Some((to, model)) => (to.as_ref(), model.as_str()),
+                None => (provider, model),
+            };
             let call = provider.complete_accounted(
                     ModelRequest {
                         model,
@@ -2813,7 +2824,7 @@ impl Turn {
                         // A summary offers it too, so its request reads
                         // the cache the bot's calls write.
                         web_search: searches(record),
-                        fallbacks: record.fallbacks,
+                        fallback_credit: fallback.as_ref().and_then(|to| to.credit.as_deref()),
                         cache_key: Some(&cache_key),
                         items,
                         // A summary beside the turn's call keeps off the
@@ -2836,7 +2847,8 @@ impl Turn {
                     },
                     &mut accounting.report,
                 );
-            let result = match (warm_after, body) {
+            // The fallback's answer is not the request a refresh renders.
+            let result = match (warm_after.filter(|_| fallback.is_none()), body) {
                 (Some(after), Body::Window(context)) => {
                     let mut warm = Warm {
                         provider,
@@ -2846,7 +2858,6 @@ impl Turn {
                         tools,
                         context,
                         thinking: withheld.unwrap_or(context.thinking),
-                        fallbacks: record.fallbacks,
                         web_search: searches(record),
                         after,
                         read_at: tokio::time::Instant::now(),
@@ -2871,6 +2882,13 @@ impl Turn {
             let sent_ms = sent.get().map_or(0, epoch_ms);
             let error = match result {
                 Ok(mut completion) => {
+                    if let Some(to) = &fallback {
+                        completion.usage = (completion.usage.take())
+                            .map(|usage| priced_at(usage, &to.name, &to.model));
+                        completion
+                            .fallbacks
+                            .push((Some(record.model.clone()), to.model.clone()));
+                    }
                     if let Some(usage) = &mut completion.usage {
                         usage.sent_ms = sent_ms;
                         self.tokens.add(usage);
@@ -2913,8 +2931,45 @@ impl Turn {
                     }
                     return Ok(Some(completion));
                 }
-                Err(error) => error,
+                Err(mut error) => {
+                    // A refusal's credit is for the retry below, not the record.
+                    let credit = error
+                        .facts
+                        .as_mut()
+                        .and_then(|facts| facts.remove("fallback_credit_token"));
+                    if error.facts.as_ref().is_some_and(|facts| facts.is_empty()) {
+                        error.facts = None;
+                    }
+                    let credit = credit.and_then(|token| token.as_str().map(str::to_owned));
+                    // A classifier declined: the bot's fallback model answers
+                    // this request, on the same body. The refusal's credit
+                    // prices the retry as if it had run there all along,
+                    // when it stays on the same provider.
+                    if fallback.is_none()
+                        && error.code == "provider_refusal"
+                        && matches!(body, Body::Window(_))
+                        && let Some(reference) = &record.fallback
+                    {
+                        let (name, to) = split_model(reference)?;
+                        if let Some(known) = self.providers.get(name) {
+                            fallback = Some(Fallback {
+                                provider: Arc::new(shaped(known, self.settings())?.into_owned()),
+                                name: name.to_owned(),
+                                model: to.to_owned(),
+                                credit: credit.filter(|_| name == record.provider),
+                                pending: true,
+                            });
+                        }
+                    }
+                    error
+                }
             };
+            // What the fallback's own attempt billed is priced at its model.
+            if let Some(to) = fallback.as_ref().filter(|to| !to.pending)
+                && let Some(usage) = accounting.report.usage.take()
+            {
+                accounting.report.usage = Some(priced_at(usage, &to.name, &to.model));
+            }
             let paced_ms = accounting.totals().1 - paced_before;
             let spent = prior_spent
                 + started
@@ -2942,7 +2997,7 @@ impl Turn {
             if summary {
                 if let Some(usage) = usage {
                     let reference = summarizer(record);
-                    let usage = summarizer_usage(usage, split_model(&reference)?.0, model);
+                    let usage = priced_at(usage, split_model(&reference)?.0, model);
                     self.store
                         .op("compaction_usage", move |db| {
                             db.compaction_usage(turn, Some(&usage))
@@ -2953,7 +3008,21 @@ impl Turn {
                 self.failed_usage(usage).await?;
             }
             let mut resend = false;
-            if let Body::Window(context) = body
+            let mut retry = json!({"thinking_withheld":true});
+            if let Some(to) = fallback.as_mut().filter(|to| to.pending) {
+                // Sent next on the fallback model.
+                to.pending = false;
+                resend = true;
+                retry = json!({"fallback":format!("{}/{}", to.name, to.model)});
+            } else if let Some(to) = (fallback.as_mut())
+                .filter(|to| to.credit.is_some() && error.code == "provider_http_400")
+            {
+                // A credit the provider would not take: the same retry
+                // without it, before anything else the 400 could be.
+                to.credit = None;
+                resend = true;
+                retry = json!({"fallback_credit":false});
+            } else if let Body::Window(context) = body
                 && withheld.is_none()
                 && record.thinking_prefix.is_some()
                 && let Some(strip) = withhold_thinking(context, &error)
@@ -2973,14 +3042,15 @@ impl Turn {
             } else {
                 MAX_ATTEMPTS
             };
-            // Sent again at once without the thinking, within the same
-            // attempt and time limits as any retry.
+            // Sent again at once, without the thinking or on the fallback
+            // model, within the same attempt and time limits as any retry.
             if resend && capped.is_none() && attempt < cap && spent < RETRY_BUDGET {
-                self.retried(
-                    json!({"attempt":attempt,"error":error.code,"detail":error.detail,
-                    "delay_ms":0,"parked":false,"thinking_withheld":true}),
-                )
-                .await?;
+                let mut data = json!({"attempt":attempt,"error":error.code,"detail":error.detail,
+                    "delay_ms":0,"parked":false});
+                if let (Some(data), Value::Object(retry)) = (data.as_object_mut(), retry) {
+                    data.extend(retry);
+                }
+                self.retried(data).await?;
                 continue;
             }
             // Final provider errors are kept.
@@ -3262,7 +3332,7 @@ impl Turn {
         let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
         let reasoning = warm.reasoning.map(str::to_owned);
         let tools = warm.tools.to_owned();
-        let (fallbacks, web_search) = (warm.fallbacks, warm.web_search);
+        let web_search = warm.web_search;
         let items = self.items(warm.context, warm.thinking);
         let sent = refresh.clone();
         let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
@@ -3274,7 +3344,7 @@ impl Turn {
                 tools: &tools,
                 allow_tool_calls: true,
                 web_search,
-                fallbacks,
+                fallback_credit: None,
                 cache_key: None,
                 items,
                 chain: None,
@@ -5056,10 +5126,11 @@ fn summarizer(record: &agent_runtime::store::Bot) -> String {
         .unwrap_or_else(|| format!("{}/{}", record.provider, record.model))
 }
 
-/// A summary is charged to the turn that needed it, but the summarizer may
-/// be another model on another provider; name both, as a fallback names its
-/// attempts, so the call is priced at that model's rates.
-fn summarizer_usage(
+/// A call another model may have answered on another provider binding: a
+/// summary, charged to the turn that needed it, or a refused request's
+/// fallback. Name both, as a server-side fallback names its attempts, so
+/// the call is priced at that model's rates.
+fn priced_at(
     mut usage: agent_runtime::provider::Usage,
     provider: &str,
     model: &str,
@@ -5180,7 +5251,7 @@ mod tests {
                             created_by_id: None,
                             compaction_instructions: None,
                             compaction_model: None,
-                            fallbacks: false,
+                            fallback: None,
                             gate: None,
                             settings: Default::default(),
                             declared: None,
