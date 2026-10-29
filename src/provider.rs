@@ -1183,6 +1183,15 @@ impl Provider {
                     body.detail.unwrap_or_else(|| format!("HTTP {status}")),
                 ));
             }
+            // A signature refused for its time is made again on the retry,
+            // as AWS's SDKs retry their clock-skew codes.
+            if matches!(status, 401 | 403) && signer.is_some() && aws::clock_skewed(&headers) {
+                reservation.settle(0);
+                return Err(Error::with(
+                    "provider_signature_expired",
+                    body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                ));
+            }
             let quota = status == 429 && body.quota;
             if !quota {
                 reservation.learn(&headers, self.family);

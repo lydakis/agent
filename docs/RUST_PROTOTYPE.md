@@ -490,7 +490,11 @@ A call with no usable keys fails before it is paced, admitted or its body
 read.
 Temporary keys are re-resolved in the
 background five minutes before they expire, at most every ten seconds, and
-once on a 401 or 403, which retries the call as `provider_login_refreshed`;
+once on a 401 or 403, which retries the call as `provider_login_refreshed`.
+A 401 or 403 whose `x-amzn-ErrorType` is one of the AWS SDKs' clock-skew
+codes (`RequestExpired`, `InvalidSignatureException` and the rest), as for
+a request signed before the machine slept, retries at once as
+`provider_signature_expired`, signed again with the time now.
 Bedrock URLs must be https; the key id, secret and session token are
 redacted from tool output and, from the environment, kept out of shells, as
 are the `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_REGION` and

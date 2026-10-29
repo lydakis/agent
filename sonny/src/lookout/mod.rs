@@ -647,6 +647,7 @@ impl Service {
         for bot in &bots {
             self.seat(&client, bot).await;
         }
+        tokio::spawn(refresh_tools(client.clone(), bots.clone()));
         self.resubscribe();
         if client
             .request("follow", json!({"bot": "*", "after": 0}))
@@ -1128,6 +1129,49 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
 }
 
 /// Every bot the daemon lists, page by page.
+/// Bring every agent Sonny declared on up to this build's tools, as
+/// opening its window would, so one no one opens after an upgrade, such
+/// as a task out of sight, gets a tool added since. A busy one is tried
+/// again each minute, for an hour.
+async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
+    let mut left = bots;
+    for _ in 0..60 {
+        let mut busy = Vec::new();
+        for bot in left {
+            let Ok(mut record) = client
+                .request(
+                    "inspect",
+                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
+                )
+                .await
+            else {
+                continue;
+            };
+            record["name"] = bot["name"].clone();
+            record["bot_id"] = bot["bot_id"].clone();
+            let Some(fields) = crate::declared::refresh(&record) else {
+                continue;
+            };
+            match client.request("configure", Value::Object(fields)).await {
+                Ok(_) => println!(
+                    "{}",
+                    json!({"event": "tools_refreshed", "bot": bot["name"]})
+                ),
+                Err(error) if error.code == "bot_busy" => busy.push(bot),
+                Err(error) => println!(
+                    "{}",
+                    json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": error.code})
+                ),
+            }
+        }
+        if busy.is_empty() {
+            return;
+        }
+        left = busy;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn all_bots(client: &Client) -> Vec<Value> {
     let mut bots = Vec::new();
     let mut after = Value::Null;
