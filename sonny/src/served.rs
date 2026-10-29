@@ -419,9 +419,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
     let text = |key: &str| arguments[key].as_str().map(str::to_owned);
     let caller =
         std::env::var("AGENT_BOT").map_err(|_| ("no_caller", "AGENT_BOT is not set".into()))?;
-    // A side chat forked with its agent's tools calls them as that agent:
-    // its tasks, panes and projects are the agent's, not the copy's.
-    let caller = crate::side_source(&caller).map_or(caller.clone(), str::to_owned);
     match name {
         START => {
             let start = crate::task::Start {
@@ -708,6 +705,27 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .get(0)
         .filter(|record| record["name"] == bot)
         .ok_or(("caller_unknown", format!("{bot} is gone")))?;
+    // A side chat forked with its agent's tools calls them as that agent:
+    // its tasks, panes and projects are the agent's, not the copy's.
+    let caller = match crate::side_copy(record) {
+        Some(source) => {
+            let page = client
+                .request("bots", json!({"name": source, "limit": 1}))
+                .await
+                .map_err(|e| ("caller_unknown", e.to_string()))?;
+            page["bots"]
+                .get(0)
+                .filter(|found| {
+                    found["name"] == source && found["bot_id"] == record["created_by_id"]
+                })
+                .cloned()
+                .ok_or((
+                    "caller_unknown",
+                    format!("{source}, which {bot} copies, is gone"),
+                ))?
+        }
+        None => record.clone(),
+    };
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -742,8 +760,8 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .arg(call["name"].as_str().unwrap_or_default())
         .current_dir(workspace)
         .env("PWD", workspace)
-        .env("AGENT_BOT", bot)
-        .env("AGENT_BOT_ID", record["bot_id"].to_string())
+        .env("AGENT_BOT", str_of(&caller["name"]))
+        .env("AGENT_BOT_ID", caller["bot_id"].to_string())
         .env("AGENT_TURN", call["turn"].to_string())
         .env("AGENT_STORE", store)
         .env("AGENT_SOCKET", socket)
@@ -912,6 +930,14 @@ mod tests {
         assert_eq!(crate::side_source("shop.side-panel"), None);
         assert_eq!(crate::side_source("shop.side-"), None);
         assert_eq!(crate::side_source("shop.side-1A2B"), None);
+        let copy = json!({"name": "shop.web.lead.side-1a2b3c", "created_by": "shop.web.lead",
+            "expire_ms": 900_000});
+        assert_eq!(crate::side_copy(&copy), Some("shop.web.lead"));
+        // `feed` is hex: a task under that name is still its own caller.
+        let task = json!({"name": "shop.side-feed", "created_by": "shop.lead"});
+        assert_eq!(crate::side_copy(&task), None);
+        let named = json!({"name": "shop.side-feed", "created_by": "shop", "expire_ms": null});
+        assert_eq!(crate::side_copy(&named), None);
     }
 
     #[test]

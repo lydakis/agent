@@ -1067,12 +1067,21 @@ fn unique(prefix: &str) -> String {
 }
 
 /// The agent a side chat is a copy of, from the name `/side` gives it,
-/// `SOURCE.side-HEX`; `None` for any other bot.
+/// `SOURCE.side-HEX`; `None` for any other bot. A name alone can be a
+/// task's, so `side_copy` checks the record too.
 pub fn side_source(bot: &str) -> Option<&str> {
     let (source, stamp) = bot.rsplit_once(".side-")?;
     let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
     (!source.is_empty() && (1..=6).contains(&stamp.len()) && stamp.bytes().all(hex))
         .then_some(source)
+}
+
+/// The agent `record`, a bot as `bots` lists it, is a side chat of: named
+/// as `/side` names one, made by that agent, and expiring as a side chat
+/// does. `None` for any other bot, a task named `NAME.side-feed` included.
+pub fn side_copy(record: &Value) -> Option<&str> {
+    let source = side_source(record["name"].as_str()?)?;
+    (record["created_by"] == source && record["expire_ms"].is_u64()).then_some(source)
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
@@ -5949,7 +5958,24 @@ impl App {
             .unwrap_or_default()
             .as_millis();
         let name = format!("{}.side-{:x}", self.bot, stamp % 0x100_0000);
+        // Made by the agent it copies, which is how Sonny's own tools know
+        // the copy for one rather than by its name alone.
+        let page = self
+            .client
+            .request("bots", json!({"name": self.bot, "limit": 1}));
+        let source = match page.await {
+            Ok(page) if page["bots"][0]["name"] == self.bot.as_str() => page["bots"][0].clone(),
+            Ok(_) => {
+                self.notice = Some(format!("no side chat: {} is gone", self.bot));
+                return;
+            }
+            Err(error) => {
+                self.notice = Some(format!("no side chat: {error}"));
+                return;
+            }
+        };
         let mut fork = json!({"source": self.bot, "bot": name,
+            "created_by": self.bot, "created_by_id": source["bot_id"],
             "expire_ms": SIDE_EXPIRE.as_millis() as u64, "request_id": name});
         // A fork with no list keeps its source's tools.
         if tools == agent_client::config::SideChat::Answer {
