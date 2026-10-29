@@ -4109,8 +4109,27 @@ impl App {
         );
     }
 
-    /// What `bot` did since `reference` was last read of its note `id`.
+    /// What `bot` did since `reference` was last read of its note `id`,
+    /// and, when that note shows another bot's, what that one did.
     async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
+        self.read_history(bot, id, reference).await;
+        let Some((through, note)) = reference.shows() else {
+            reference.through = None;
+            return;
+        };
+        // Read again where it was read from, while it shows the same one.
+        let mut shown = (reference.through.take())
+            .filter(|shown| shown.names.as_ref() == Some(&(through.clone(), note.clone())))
+            .unwrap_or_default();
+        shown.names = Some((through.clone(), note.clone()));
+        if !shown.gone {
+            self.read_history(&through, &note, &mut shown).await;
+        }
+        reference.through = Some(shown);
+    }
+
+    /// What `bot` did since `reference` was last read of its note `id`.
+    async fn read_history(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
         // The bot first read, every time: another given its name once it
         // is gone is not the one shown, and what was read of it stays.
         let asked = json!({"bot": bot, "bot_id": reference.bot_id});
@@ -6283,6 +6302,13 @@ impl App {
         }
         let empty = self.margin.is_empty();
         let emptied = std::mem::replace(&mut self.margin_held, !empty) && empty;
+        // Emptied under what is open over it, there is none to go back to.
+        if emptied
+            && self.under.take().is_some()
+            && let Some(over) = &mut self.pane
+        {
+            over.over = false;
+        }
         if empty
             && (emptied || !self.pane_keys)
             && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
@@ -10627,6 +10653,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_s_note_that_shows_its_own_task_s_is_read_through() {
+        let client = daemon_answering(|asked| {
+            let arguments = match asked["bot"].as_str() {
+                Some("calc.add") => json!({"id": "flow", "title": "Flow", "from": "calc.sub/flow"}),
+                _ => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
+            };
+            match asked["op"].as_str() {
+                Some("inspect") => json!({"bot_id": 1, "workspace": "/nowhere"}),
+                Some("history_nodes") => json!({"nodes": [{"node": 1}]}),
+                _ => json!({"items": [{"node": 1, "item": {"type": "function_call",
+                    "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}}]}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        app.read_references().await;
+        let note = app.margin.note("flow").unwrap();
+        let margin::Body::From { shown, .. } = &note.body else {
+            panic!()
+        };
+        assert_eq!(
+            shown.as_deref(),
+            Some(&margin::Body::Markdown("deep".into()))
+        );
+        assert_eq!(note.title, "Flow");
+    }
+
+    #[tokio::test]
     async fn a_task_s_note_is_not_read_from_another_bot_given_its_name() {
         let reused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let again = reused.clone();
@@ -11353,6 +11408,18 @@ mod tests {
         app.margin.apply("m3", &post, None, None);
         app.margin_back();
         assert!(!margin(&app) && app.margin.closed());
+        // Emptied under /status, Esc there goes back to no margin.
+        app.toggle_margin();
+        app.margin_back();
+        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        assert!(app.under.is_some());
+        app.margin
+            .apply("m4", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin_back();
+        assert!(app.under.is_none() && !app.pane.as_ref().unwrap().over);
+        app.close_pane(true);
+        app.margin_back();
+        assert!(app.pane.is_none());
     }
 
     #[tokio::test]

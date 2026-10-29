@@ -253,6 +253,11 @@ pub struct Reference {
     file: Option<String>,
     /// Taken away there since it was last posted.
     removed: bool,
+    /// The note it shows of another bot's, when it shows one, as read
+    /// from there: one step on, no further.
+    pub through: Option<Box<Reference>>,
+    /// The bot and note it was read from, when read through another.
+    pub names: Option<(String, String)>,
 }
 
 impl Reference {
@@ -282,9 +287,20 @@ impl Reference {
                 _ => {}
             }
             self.removed = false;
-            let body = match (arguments["file"].as_str(), arguments["markdown"].as_str()) {
-                (Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
-                (_, Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
+            let body = match (
+                arguments["from"].as_str().and_then(from),
+                arguments["file"].as_str(),
+                arguments["markdown"].as_str(),
+            ) {
+                (Some((bot, id)), ..) => Body::From {
+                    bot,
+                    id,
+                    title: None,
+                    shown: None,
+                    folder: None,
+                },
+                (_, Some(file), _) if !file.trim().is_empty() => Body::File(file.trim().to_owned()),
+                (.., Some(markdown)) => Body::Markdown(cut(markdown, NOTE_BYTES).to_owned()),
                 // Retitled only.
                 _ => continue,
             };
@@ -312,10 +328,19 @@ impl Reference {
                         .as_str()
                         .is_some_and(|t| !t.trim().is_empty())
                         && (arguments["markdown"].is_string()
+                            || arguments["from"].as_str().and_then(from).is_some()
                             || arguments["file"]
                                 .as_str()
                                 .is_some_and(|f| !f.trim().is_empty())))
         })
+    }
+
+    /// The other bot's note this one shows, by bot and id.
+    pub fn shows(&self) -> Option<(String, String)> {
+        match &self.body {
+            Some(Body::From { bot, id, .. }) => Some((bot.clone(), id.clone())),
+            _ => None,
+        }
     }
 
     /// The file the note shows, its path in the bot's folder.
@@ -339,6 +364,11 @@ impl Reference {
     pub fn shown(&self) -> Option<(&str, Body, Option<PathBuf>)> {
         let workspace = self.workspace.as_deref().map(PathBuf::from);
         let body = match self.body.as_ref()? {
+            // As read there, under this one's title.
+            Body::From { .. } => {
+                let (_, body, folder) = self.through.as_ref()?.shown()?;
+                return Some((&self.title, body, folder));
+            }
             Body::File(path) => {
                 let folder = (workspace.map(|w| w.join(path)))
                     .and_then(|file| file.parent().map(Path::to_path_buf));
