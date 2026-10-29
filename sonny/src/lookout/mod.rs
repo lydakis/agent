@@ -1495,10 +1495,17 @@ impl Service {
                         {
                             record["workspace"] = listed["workspace"].clone();
                         }
+                        // A project's lead made below a subscriber's folder;
+                        // a task, or a lead listed as it is, changes no one's.
+                        let nests = name.ends_with(".lead")
+                            && (self.records.get(name)).is_none_or(|had| {
+                                had["workspace"] != record["workspace"] || had["expire_ms"] != record["expire_ms"]
+                            });
                         self.records.insert(name.to_owned(), record.clone());
-                        // A project's lead made below a subscriber's folder.
-                        for lookout in self.lookouts.values_mut() {
-                            lookout.nest(&self.records);
+                        if nests {
+                            for lookout in self.lookouts.values_mut() {
+                                lookout.nest(&self.records);
+                            }
                         }
                         // Its judge is picked once the stream is live.
                         self.seat(&client, &record, live).await;
@@ -1511,8 +1518,10 @@ impl Service {
                     {
                         self.records.remove(name);
                         self.lookouts.remove(name);
-                        for lookout in self.lookouts.values_mut() {
-                            lookout.nest(&self.records);
+                        if name.ends_with(".lead") {
+                            for lookout in self.lookouts.values_mut() {
+                                lookout.nest(&self.records);
+                            }
                         }
                     }
                     for lookout in self.lookouts.values_mut() {
