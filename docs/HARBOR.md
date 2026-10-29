@@ -220,8 +220,8 @@ the same model can drive each harness on the same tasks.
    empty when any model used is missing from the table, rather than reported low.
    The trial's metadata records the requested model, `served_calls` (billed
    calls per model, fallbacks and delegated bots included) and
-   `bot_settings` (each counted bot's reasoning level and whether it takes
-   fallbacks, since a delegated bot sets its own), so a comparison can check
+   `bot_settings` (each counted bot's reasoning level and fallback model,
+   since a delegated bot sets its own), so a comparison can check
    that both arms ran the same model the same way
    ([COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons)).
    A call counts under the model the provider named in its response, each
@@ -274,10 +274,12 @@ harbor run -d terminal-bench/terminal-bench-2-1 -a strands -m anthropic/claude-f
 ```
 
 To run on a ChatGPT plan instead of an API key, sign in with `agent login
-chatgpt` and name the model `chatgpt/MODEL`, using an id `agent models` lists. Every
-task bot is created with `--fallbacks`, so a declined Anthropic request finishes
-on the model Anthropic recommends instead of failing the task; a fleet opts in
-per bot, and so does a bot the task delegates to. The
+chatgpt` and name the model `chatgpt/MODEL`, using an id `agent models` lists. With
+`--ak fallback=PROVIDER/MODEL` the task bot is created with `--fallback`, so a
+request a safety classifier declined is answered by that model instead of
+failing the task; runs before 2026-10-29 created it with `--fallbacks`, which
+asked Anthropic for its server-side fallback. A bot the task delegates to sets
+its own. The
 adapter copies the access token, client and expiry from `~/.agent/chatgpt.json`
 (or `AGENT_CHATGPT_LOGIN`) into each task container, readable only by the agent
 user, points `AGENT_CHATGPT_LOGIN` at it, and adds `--provider chatgpt`. The
@@ -301,7 +303,7 @@ PYTHONPATH=. harbor run -d terminal-bench/terminal-bench-2-1 -a bench.harbor_age
 CODEX_FORCE_AUTH_JSON=1 harbor run -d terminal-bench/terminal-bench-2-1 -a codex -m MODEL -n 2 -l 5
 ```
 
-Pass `--ak KEY=VALUE` for adapter options: `reasoning`, `max_output_tokens`,
+Pass `--ak KEY=VALUE` for adapter options: `reasoning`, `fallback`, `max_output_tokens`,
 `stall_timeout`, `context_bytes`, `compact_at`, `binary` (another build),
 `chatgpt_login` (another login file for `chatgpt/` models), and
 `provider` (a `--provider` spec for a gateway such as Bedrock, whose named key

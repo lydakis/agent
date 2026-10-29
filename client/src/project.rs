@@ -297,6 +297,8 @@ pub struct Picks {
     pub threads: Option<ThreadPicks>,
     /// The person's `web_search`, for a coordinator its role gives no tools.
     pub web_search: crate::config::WebSearch,
+    /// The person's fallback for each model, from their config.
+    pub fallbacks: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -407,6 +409,9 @@ pub async fn create(
     });
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
+    }
+    if let Some(fallback) = picks.fallbacks.get(model) {
+        params["fallback"] = json!(fallback);
     }
     // The client's settings, such as a sandbox, with the model's.
     let mut settings = policy["settings"].as_object().cloned().unwrap_or_default();
@@ -559,6 +564,7 @@ mod tests {
                 in_project: true,
             }),
             web_search: Default::default(),
+            fallbacks: [("alpha/one".into(), "alpha/two".into())].into(),
         };
         let made = make(&daemon, &dir, &policy, &picks).unwrap();
         assert_eq!(
@@ -589,6 +595,8 @@ mod tests {
                 &json!("high")
             )
         );
+        // The person's fallback for its model.
+        assert_eq!(create["fallback"], "alpha/two");
         assert_eq!(
             create["instructions"],
             "rules\n\nEvery task works in this folder, with no worktree of its own."
@@ -773,6 +781,7 @@ mod tests {
             effort: Some("max".into()),
             threads: None,
             web_search: Default::default(),
+            fallbacks: [("alpha/one".into(), "alpha/two".into())].into(),
         };
         let made = make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();
         assert_eq!(
@@ -785,6 +794,8 @@ mod tests {
             (&create["bot"], &create["model"], &create["effort"]),
             (&json!("demo.lead"), &json!("alpha/one"), &json!("low"))
         );
+        // The fallback follows the model the file kept, not the pick.
+        assert_eq!(create["fallback"], "alpha/two");
         // A kept file that names no effort takes the picked one.
         let dir = root("kept-effort");
         write(&dir, "plain", "alpha/one", None, &Threads::default()).unwrap();

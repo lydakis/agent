@@ -46,7 +46,7 @@ fn binding() -> Binding<'static> {
         created_by_id: None,
         compaction_instructions: None,
         compaction_model: None,
-        fallbacks: false,
+        fallback: None,
         gate: None,
         settings: Default::default(),
         declared: None,
@@ -356,7 +356,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                     family,
                     compaction_instructions: None,
                     compaction_model: None,
-                    fallbacks: false,
+                    fallback: None,
                     gate: None,
                     ..binding()
                 },
@@ -466,7 +466,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                     family,
                     compaction_instructions: None,
                     compaction_model: None,
-                    fallbacks: false,
+                    fallback: None,
                     gate: None,
                     ..binding()
                 },
@@ -4485,7 +4485,7 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
             tools: &tools,
             compaction_instructions: None,
             compaction_model: None,
-            fallbacks: false,
+            fallback: None,
             gate: None,
             ..binding()
         },
@@ -5522,7 +5522,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             family: Family::Anthropic,
             compaction_instructions: None,
             compaction_model: None,
-            fallbacks: false,
+            fallback: None,
             gate: None,
             ..binding()
         },
@@ -6032,7 +6032,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
                 family,
                 compaction_instructions: None,
                 compaction_model: None,
-                fallbacks: false,
+                fallback: None,
                 gate: None,
                 ..binding()
             },
@@ -9776,26 +9776,30 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
 }
 
 #[test]
-fn a_store_keeps_its_identity_and_forks_inherit_fallbacks() {
+fn a_store_keeps_its_identity_and_forks_inherit_a_fallback() {
     let dir = std::env::temp_dir().join(format!("agent-identity-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("state.sqlite");
     let identity = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let identity = db.store_identity().unwrap();
-        // Off unless the client asks; asked for, forks keep it.
+        // None unless the client names one; named, forks keep it.
         let plain = db.create("plain", None, binding()).unwrap().0;
-        assert!(!plain.fallbacks);
+        assert_eq!(plain.fallback, None);
         let mut asked = binding();
-        asked.fallbacks = true;
+        asked.fallback = Some("anthropic/claude-opus-4-8");
         let bot = db.create("bot", None, asked).unwrap().0;
-        assert!(bot.fallbacks);
-        assert!(db.fork("bot", "fork", Fork::default()).unwrap().0.fallbacks);
-        assert!(
-            !db.fork("plain", "plain-fork", Fork::default())
+        assert_eq!(bot.fallback.as_deref(), Some("anthropic/claude-opus-4-8"));
+        assert_eq!(
+            (db.fork("bot", "fork", Fork::default()).unwrap().0.fallback).as_deref(),
+            Some("anthropic/claude-opus-4-8")
+        );
+        assert_eq!(
+            db.fork("plain", "plain-fork", Fork::default())
                 .unwrap()
                 .0
-                .fallbacks
+                .fallback,
+            None
         );
         identity
     };

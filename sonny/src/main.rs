@@ -986,6 +986,9 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
         settings.insert("hide_senders".into(), json!(true));
     }
     asked["settings"] = Value::Object(settings);
+    if let Some(fallback) = config.fallbacks.get(&model) {
+        asked["fallback"] = json!(fallback);
+    }
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = &mut asked {

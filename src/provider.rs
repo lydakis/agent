@@ -105,12 +105,13 @@ impl Refresh {
 }
 
 /// Betas every Anthropic API request opts into: the thinking-binding check,
-/// dropping rather than failing on a mismatch (the drops are reported), and
-/// server-side fallbacks, which rerun a declined request on another model
-/// instead of ending the turn with a refusal, which a bot opts into. Bedrock
-/// and bots that did not ask take only the first.
-const ANTHROPIC_BETAS: &str =
-    "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01";
+/// dropping rather than failing on a mismatch (the drops are reported);
+/// fallback credit, which a refusal mints so a retry on another model is
+/// priced as if it had run there all along; and server-side fallbacks, whose
+/// blocks a history from before the daemon retried on its own may still
+/// hold. No request asks for a server-side fallback: it sticks to the
+/// fallback model for later requests. Bedrock takes only the first.
+const ANTHROPIC_BETAS: &str = "thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,server-side-fallback-2026-07-01";
 const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
 
 /// HTTP connections and the startup-admission budget shared by every
@@ -212,8 +213,8 @@ pub struct Provider {
     sockets: Option<Arc<Sockets>>,
     /// Bedrock signs every request with SigV4 instead of sending a key.
     aws: Option<Arc<aws::Aws>>,
-    /// A Bedrock endpoint, however it authenticates: it runs no server-side
-    /// fallbacks and serves no WebSocket.
+    /// A Bedrock endpoint, however it authenticates: it takes no fallback
+    /// credit and serves no WebSocket.
     bedrock: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
@@ -292,7 +293,8 @@ pub struct Completion {
     /// Replayed thinking blocks the provider dropped because the history
     /// before them changed. The runtime avoids this, so any is a bug.
     pub thinking_dropped: usize,
-    /// Each model switch a provider-side fallback made, as (from, to).
+    /// Each model switch a fallback made, as (from, to): one a history from
+    /// before the daemon retried on its own still holds, or the daemon's.
     pub fallbacks: Vec<(Option<String>, String)>,
     /// The provider paused a long run of its own tools (Anthropic's
     /// `pause_turn`): sending the history again, reply included, resumes it.
@@ -356,8 +358,9 @@ pub struct Request<'a> {
     pub allow_tool_calls: bool,
     /// Offer the provider's web search beside `tools`, as it declares it.
     pub web_search: bool,
-    /// Anthropic server-side fallbacks for a declined request; Bedrock has none.
-    pub fallbacks: bool,
+    /// The credit a refusal minted, sent with this retry of the refused
+    /// request on another model. Bedrock takes none.
+    pub fallback_credit: Option<&'a str>,
     /// Groups calls that share a prefix for the Responses prompt cache. All
     /// bots share their leading instructions, so without a key their calls
     /// route by that prefix alone, pile onto the same cache machines and
@@ -721,11 +724,8 @@ impl Provider {
             thinking: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             output_config: Option<Value>,
-            /// A request a safety classifier declines is rerun on the model
-            /// Anthropic recommends for that refusal category. Bedrock does
-            /// not run server-side fallbacks.
             #[serde(skip_serializing_if = "Option::is_none")]
-            fallbacks: Option<&'static str>,
+            fallback_credit_token: Option<&'a str>,
         }
         let search = request
             .web_search
@@ -824,7 +824,7 @@ impl Provider {
                         .reasoning
                         .filter(|_| !legacy_thinking(request.model))
                         .map(|level| json!({"effort":level})),
-                    fallbacks: (!self.bedrock && request.fallbacks).then_some("default"),
+                    fallback_credit_token: request.fallback_credit.filter(|_| !self.bedrock),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -901,7 +901,7 @@ impl Provider {
             .header("content-length", len)
             .header("accept", "application/json")
             .body(body);
-        let http = self.anthropic_headers(http, self.key.as_ref(), request.fallbacks);
+        let http = self.anthropic_headers(http, self.key.as_ref());
         if !refresh.send() {
             return fail("keep_warm_cancelled");
         }
@@ -977,14 +977,12 @@ impl Provider {
         &self,
         http: reqwest::RequestBuilder,
         key: Option<&String>,
-        fallbacks: bool,
     ) -> reqwest::RequestBuilder {
         let http = http.header("anthropic-version", "2023-06-01").header(
             "anthropic-beta",
-            if self.bedrock || !fallbacks {
-                BEDROCK_BETAS
-            } else {
-                ANTHROPIC_BETAS
+            match self.bedrock {
+                true => BEDROCK_BETAS,
+                false => ANTHROPIC_BETAS,
             },
         );
         match key {
@@ -1124,7 +1122,7 @@ impl Provider {
             .body(body);
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
-            (Family::Anthropic, key) => self.anthropic_headers(http, key, request.fallbacks),
+            (Family::Anthropic, key) => self.anthropic_headers(http, key),
             (Family::Responses, None) => http,
         };
         // The ChatGPT Codex endpoint takes cache affinity from this header, not
@@ -2046,7 +2044,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2078,7 +2076,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: true,
+                fallback_credit: Some("credit"),
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
@@ -2091,8 +2089,10 @@ mod tests {
         assert!(text.ends_with(",\"messages\":["));
         assert!(text.contains("\"type\":\"adaptive\""));
         assert!(text.contains("\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}"));
-        assert!(text.contains("\"fallbacks\":\"default\""));
-        // Off unless the bot asked: neither the field nor its beta header.
+        // A retry on another model redeems the refusal's credit; no request
+        // asks for a server-side fallback, which would stick to its model.
+        assert!(text.contains("\"fallback_credit_token\":\"credit\""));
+        assert!(!text.contains("fallbacks"), "{text}");
         let plain = String::from_utf8(
             provider
                 .prefix(&Request {
@@ -2102,7 +2102,7 @@ mod tests {
                     tools: &none(),
                     allow_tool_calls: true,
                     web_search: false,
-                    fallbacks: false,
+                    fallback_credit: None,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -2112,7 +2112,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(!plain.contains("fallbacks"), "{plain}");
+        assert!(!plain.contains("fallback"), "{plain}");
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
         let legacy = provider
@@ -2123,7 +2123,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: true,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2136,7 +2136,6 @@ mod tests {
         assert!(legacy.contains("\"max_tokens\":64000"));
         assert!(text.contains("\"max_tokens\":128000"));
         assert!(legacy.contains("\"prefix_mismatch_behavior\":\"drop_block\""));
-        assert!(legacy.contains("\"fallbacks\":\"default\""));
         assert!(!legacy.contains("output_config"));
         assert!(!text.contains("budget_tokens"));
         let mut empty_prefix = provider
@@ -2147,7 +2146,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2174,7 +2173,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
@@ -2210,7 +2209,7 @@ mod tests {
                             tools,
                             allow_tool_calls: allow,
                             web_search: false,
-                            fallbacks: false,
+                            fallback_credit: None,
                             cache_key: None,
                             items: Items::empty(),
                             chain: None,
@@ -2293,7 +2292,7 @@ mod tests {
                     tools: &none(),
                     allow_tool_calls: true,
                     web_search: false,
-                    fallbacks: false,
+                    fallback_credit: None,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -2369,10 +2368,10 @@ mod tests {
         );
     }
 
-    /// Bedrock runs no server-side fallbacks, so its requests do not ask for
-    /// them, whichever endpoint and however they authenticate.
+    /// Bedrock takes no fallback credit, so a retry there redeems none,
+    /// whichever endpoint and however it authenticates.
     #[test]
-    fn bedrock_requests_ask_for_no_server_side_fallbacks() {
+    fn bedrock_requests_redeem_no_fallback_credit() {
         let transport = Transport::new(64, 1).unwrap();
         for (url, key) in [
             (
@@ -2393,7 +2392,7 @@ mod tests {
                     tools: &none(),
                     allow_tool_calls: true,
                     web_search: false,
-                    fallbacks: true,
+                    fallback_credit: Some("credit"),
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -2402,7 +2401,7 @@ mod tests {
                 })
                 .unwrap();
             let text = String::from_utf8(prefix).unwrap();
-            assert!(!text.contains("fallbacks"), "{text}");
+            assert!(!text.contains("fallback"), "{text}");
             assert!(text.contains("\"block_binding\""), "{text}");
         }
     }
@@ -2427,7 +2426,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2470,7 +2469,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2537,7 +2536,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2714,7 +2713,7 @@ mod tests {
             )
             .unwrap();
             let request = provider
-                .anthropic_headers(reqwest::Client::new().post(base), Some(&key), false)
+                .anthropic_headers(reqwest::Client::new().post(base), Some(&key))
                 .build()
                 .unwrap();
             assert_eq!(request.headers()[header], value, "{base}");
@@ -2753,7 +2752,7 @@ mod tests {
                     tools: &none(),
                     allow_tool_calls: true,
                     web_search: false,
-                    fallbacks: false,
+                    fallback_credit: None,
                     cache_key: None,
                     items,
                     chain: None,
@@ -2844,7 +2843,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2912,7 +2911,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2981,7 +2980,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3055,7 +3054,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3164,7 +3163,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: Some(Chain {
@@ -3252,7 +3251,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: Some(Chain {
@@ -3304,7 +3303,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3355,7 +3354,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3410,7 +3409,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -3463,7 +3462,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -3531,7 +3530,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -3581,7 +3580,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -3627,7 +3626,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 web_search: false,
-                fallbacks: false,
+                fallback_credit: None,
                 items: Items::empty(),
                 chain: None,
                 route: None,
@@ -3664,7 +3663,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -3713,7 +3712,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             web_search: false,
-            fallbacks: false,
+            fallback_credit: None,
             cache_key: None,
             items: Items::empty(),
             chain: None,

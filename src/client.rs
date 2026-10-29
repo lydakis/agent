@@ -77,7 +77,7 @@ struct Options {
     /// own, or none with --no-compaction.
     compaction_instructions: Option<String>,
     compaction_model: Option<String>,
-    fallbacks: bool,
+    fallback: Option<String>,
     discover: bool,
     after: i64,
     /// Listing filters: a GLOB on bot names, bots with a turn running,
@@ -161,7 +161,7 @@ fn parse(args: &[String]) -> Result<Options> {
         bot_id: None,
         compaction_instructions: Some(DEFAULT_COMPACTION_INSTRUCTIONS.to_owned()),
         compaction_model: None,
-        fallbacks: false,
+        fallback: None,
         discover: false,
         after: 0,
         name: None,
@@ -214,7 +214,6 @@ fn parse(args: &[String]) -> Result<Options> {
             "--new" => options.new = true,
             "--agents" => options.agents = true,
             "--no-compaction" => options.compaction_instructions = None,
-            "--fallbacks" => options.fallbacks = true,
             "--discover" => options.discover = true,
             "--detach" => options.detach = true,
             "--all" => options.all = true,
@@ -295,6 +294,7 @@ fn parse(args: &[String]) -> Result<Options> {
                             })?)
                     }
                     "--compaction-model" => options.compaction_model = Some(value),
+                    "--fallback" => options.fallback = Some(value),
                     "--effort" => options.effort = Some(value),
                     "--workspace" => options.workspace = Some(value.into()),
                     "--bot" => options.bot = Some(value),
@@ -1399,6 +1399,11 @@ fn run(options: &Options) -> Result<i32> {
                 "a new bot needs a model: pass --model PROVIDER/MODEL, set AGENT_MODEL, or set model in ~/.agent/config.toml",
             ))?,
         };
+        // --fallback, else the person's for its model.
+        let fallback = match &options.fallback {
+            Some(fallback) => Some(fallback.clone()),
+            None => config()?.fallbacks.remove(&model),
+        };
         let instructions = composed_instructions(options, workspace, role.as_ref())?;
         let (created_by, created_by_id) = created_by()?;
         // --tools, else the role's, else the default set for its model.
@@ -1427,7 +1432,7 @@ fn run(options: &Options) -> Result<i32> {
             "budget_tokens":options.budget_tokens,"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
-            "compaction_model":options.compaction_model,"fallbacks":options.fallbacks,
+            "compaction_model":options.compaction_model,"fallback":fallback,
             "settings":settings,"request_id":request_id});
         if let Value::Object(gate) = requested_gate(options, &tools)? {
             // Its approver first, so a missing judge leaves no bot behind.
