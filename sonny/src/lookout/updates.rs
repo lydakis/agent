@@ -620,7 +620,8 @@ impl Updates {
             return;
         }
         let handle = format!("turn:{name}/{turn}");
-        if self.bots[&self.lead].waiting_on.contains(&handle) {
+        // A wait returns the turn, never how its goal ended.
+        if goal.is_none() && self.bots[&self.lead].waiting_on.contains(&handle) {
             return;
         }
         let by = match status {
@@ -1412,6 +1413,31 @@ mod tests {
         let told = updates.take();
         assert!(
             text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
+        );
+        updates.sent(told);
+        // Its check said while the lead's wait still held the turn.
+        updates.goal_turn("shop.fix", 12);
+        turn(&mut updates, "shop.fix", 12, goal.clone(), "completed");
+        updates
+            .bots
+            .get_mut("shop.lead")
+            .unwrap()
+            .waiting_on
+            .push("turn:shop.fix/12".to_owned());
+        updates.goal_settled(
+            "shop.fix",
+            12,
+            Some(", and met its goal: its check exits 0"),
+        );
+        updates
+            .bots
+            .get_mut("shop.lead")
+            .unwrap()
+            .waiting_on
+            .clear();
+        let told = updates.take();
+        assert!(
+            text(&told).contains("turn:shop.fix/12 completed, asked by goal, and met its goal")
         );
         updates.sent(told);
         // A trigger passed its answer on while its check ran: how the goal
