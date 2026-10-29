@@ -5909,6 +5909,157 @@ fn history_search_follows_the_lineage_of_a_fork() {
 }
 
 #[test]
+fn history_search_of_a_pattern_searches_every_bot_it_matches_newest_first() {
+    let mut db = db();
+    db.create("p.lead", Some("/synthetic"), binding()).unwrap();
+    db.create("p.task", Some("/synthetic"), binding()).unwrap();
+    db.create("other", Some("/synthetic"), binding()).unwrap();
+    searched_turn(&mut db, "p.lead", "k1", "plan the needle", "ok", true);
+    searched_turn(&mut db, "p.task", "k1", "build", "needle built", true);
+    searched_turn(&mut db, "other", "k1", "needle elsewhere", "ok", true);
+    db.fork(
+        "p.lead",
+        "p.side",
+        Fork {
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    searched_turn(&mut db, "p.side", "k2", "side needle", "ok", true);
+    searched_turn(&mut db, "p.lead", "k2", "nothing here", "ok", true);
+    let found = db.history_search_bots("p.*", "needle", None, None).unwrap();
+    let matches = found["matches"].as_array().unwrap();
+    let bots: Vec<&str> = matches.iter().map(|m| m["bot"].as_str().unwrap()).collect();
+    // Newest first by turn ID; the fork's shared first turn is listed once,
+    // under the lead it came from, and `other` is not searched.
+    assert_eq!(bots, vec!["p.side", "p.task", "p.lead"]);
+    assert_eq!(matches[0]["turn"], 2);
+    assert_eq!(matches[2]["turn"], 1);
+    let handle = matches[1]["handle"].as_str().unwrap();
+    assert!(handle.starts_with("turn:p.task/"), "{handle}");
+    assert_eq!(found["done"], true);
+    // The turn a search runs in is left out.
+    let side: i64 = matches[0]["handle"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let skipped = db
+        .history_search_bots("*", "needle", None, Some(side))
+        .unwrap();
+    let bots: Vec<&str> = skipped["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["bot"].as_str().unwrap())
+        .collect();
+    assert_eq!(bots, vec!["other", "p.task", "p.lead"]);
+    assert!(
+        db.history_search_bots("nobody*", "needle", None, None)
+            .unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.history_search_bots("*", "", None, None)
+            .unwrap_err()
+            .code,
+        "invalid_history_search"
+    );
+}
+
+#[test]
+fn history_search_of_a_pattern_credits_a_fork_with_what_only_it_has() {
+    let mut db = db();
+    db.create("src", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "src",
+            "k1",
+            "the prompt",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let mut heads = Vec::new();
+    for text in ["alpha", "between", "omega"] {
+        db.append(turn, vec![assistant(text)], &[], None).unwrap();
+        heads.push(db.inspect("src").unwrap().head.unwrap());
+    }
+    db.finish(turn, None).unwrap();
+    // Two forks cut the same turn at different points; the source is not
+    // searched.
+    for (name, head) in [("f.one", heads[0]), ("f.two", heads[1])] {
+        db.fork(
+            "src",
+            name,
+            Fork {
+                checkpoint: Some(head),
+                workspace: Some("/synthetic"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    }
+    let bots = |query: &str| -> Vec<String> {
+        db.history_search_bots("f.*", query, None, None).unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["bot"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // What both have is listed once, under the older fork; what only the
+    // later one has, under it, where its handle reads it.
+    assert_eq!(bots("the prompt"), ["f.one"]);
+    assert_eq!(bots("alpha"), ["f.one"]);
+    assert_eq!(bots("between"), ["f.two"]);
+    assert!(bots("omega").is_empty());
+    let found = db
+        .history_search_bots("f.*", "between", None, None)
+        .unwrap();
+    assert_eq!(found["matches"][0]["handle"], format!("turn:f.two/{turn}"));
+    assert_eq!(found["matches"][0]["turn"], 1);
+}
+
+#[test]
+fn history_search_of_a_pattern_goes_on_from_where_it_had_enough() {
+    let mut db = db();
+    db.create("a", Some("/synthetic"), binding()).unwrap();
+    db.create("b", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=15 {
+        for bot in ["a", "b"] {
+            searched_turn(
+                &mut db,
+                bot,
+                &format!("k{n}"),
+                &format!("{bot} {n} zq"),
+                "ok",
+                true,
+            );
+        }
+    }
+    let found = db.history_search_bots("[ab]", "zq", None, None).unwrap();
+    assert_eq!(found["matches"].as_array().unwrap().len(), 20);
+    assert_eq!(found["done"], false);
+    let next = found["next_before"].as_i64().unwrap();
+    let rest = db
+        .history_search_bots("[ab]", "zq", Some(next), None)
+        .unwrap();
+    assert_eq!(rest["matches"].as_array().unwrap().len(), 10);
+    assert_eq!(rest["done"], true);
+    assert_eq!(rest["matches"][9]["bot"], "a");
+    assert_eq!(rest["matches"][9]["turn"], 1);
+}
+
+#[test]
 fn history_preserves_content_beyond_the_preview() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

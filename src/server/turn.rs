@@ -4355,8 +4355,9 @@ impl Turn {
         }
     }
 
-    /// Matches of literal text in a bot's history, newest first; the
-    /// caller's own turn is left out of a search of its own.
+    /// Matches of literal text in a bot's history, or with a GLOB pattern
+    /// every matching bot's, newest first; the caller's own turn is left
+    /// out of a search that holds it.
     async fn history_search(
         &self,
         call_id: &str,
@@ -4367,10 +4368,14 @@ impl Turn {
         let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
         let own = bot.is_none() || bot.as_deref() == Some(self.bot.as_str());
         let bot = bot.unwrap_or_else(|| self.bot.clone());
+        // No name holds a GLOB's metacharacters, so one names many bots.
+        let many = bot.contains(['*', '?', '[']);
+        let turn = self.turn;
         let found = self
             .store
-            .read("history_search", move |db| {
-                db.history_search(&bot, &query, before, own)
+            .read("history_search", move |db| match many {
+                true => db.history_search_bots(&bot, &query, before, Some(turn)),
+                false => db.history_search(&bot, &query, before, own),
             })
             .await?;
         let output = self.registry.redact_text(found.to_string());
