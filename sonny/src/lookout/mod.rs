@@ -1261,6 +1261,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
             term.recv().await;
             crate::served::stop();
             sources::stop();
+            goals::stop();
             std::process::exit(0);
         });
     }
@@ -2455,7 +2456,8 @@ impl Lookout {
                     status.push_str(&format!(", after {denied} calls denied by the approver"));
                 }
                 // A turn its goal's check holds is not judged: the lead
-                // hears how the goal ended in its task updates.
+                // hears how the goal ended in its task updates, which hold
+                // only the turns of tasks it hears of.
                 if !self.updates.goal_held(bot, turn) {
                     self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint);
                 }

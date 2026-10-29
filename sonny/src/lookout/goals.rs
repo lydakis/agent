@@ -550,7 +550,7 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
     };
     // Whatever the check started goes with it, however it ends: done, past
     // its timeout, or its pursuit stopped.
-    let _group = child.id().map(|id| Group(id as i32));
+    let _group = child.id().map(|id| Group::new(id as i32));
     // Read as it prints, keeping only the end, so a check that prints
     // without end holds a few KB, not all of it.
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
@@ -580,13 +580,37 @@ async fn run(goal: &Goal, store: &Path, socket: &Path) -> (Option<i32>, String) 
     (status.code(), tail(&text))
 }
 
+/// The process groups of the checks running now.
+static GROUPS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// Stop every check under way: the lookout is giving way, and the one
+/// that takes over runs them again.
+pub fn stop() {
+    for group in GROUPS.lock().map(|g| g.clone()).unwrap_or_default() {
+        // SAFETY: a signal to a process group a check leads.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+}
+
 /// A check's process group, killed when dropped.
 struct Group(i32);
+
+impl Group {
+    fn new(id: i32) -> Group {
+        if let Ok(mut groups) = GROUPS.lock() {
+            groups.push(id);
+        }
+        Group(id)
+    }
+}
 
 impl Drop for Group {
     fn drop(&mut self) {
         // SAFETY: a signal to the process group the check leads.
         unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        if let Ok(mut groups) = GROUPS.lock() {
+            groups.retain(|g| *g != self.0);
+        }
     }
 }
 

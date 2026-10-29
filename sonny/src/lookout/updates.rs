@@ -600,9 +600,10 @@ impl Updates {
     }
 
     /// A turn about to end whose goal's check runs once it does: its end
-    /// waits for `goal_settled`.
+    /// waits for `goal_settled`, if it is the turn of a task whose updates
+    /// the lead hears; another's end is judged as any turn's.
     pub fn goal_turn(&mut self, name: &str, turn: i64) {
-        if self.live {
+        if self.live && self.task(name) {
             self.goaled.insert((name.to_owned(), turn));
         }
     }
