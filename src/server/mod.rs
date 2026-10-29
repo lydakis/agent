@@ -1455,7 +1455,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = terminate.recv() => break,
                 _ = interrupt.recv() => break,
                 _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
-                _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
+                // Due from the last client's activity, so what a companion
+                // sends, which wakes this loop, never puts it off.
+                _ = tokio::time::sleep_until(idle_due(last_activity, idle_exit)), if idle_exit.is_some() => {
                     // Idle means no client but companions, no live turn, and no
                     // running command. Parked turns are durable and resume on
                     // the next start.
@@ -3704,6 +3706,18 @@ impl Service {
             }
         }
     }
+}
+
+/// When the daemon next looks whether it has been idle `idle_exit` since
+/// `last_activity`: then, or within the hour for a wait too long to add.
+fn idle_due(
+    last_activity: std::time::Instant,
+    idle_exit: Option<Duration>,
+) -> tokio::time::Instant {
+    let last = tokio::time::Instant::from_std(last_activity);
+    idle_exit
+        .and_then(|idle| last.checked_add(idle))
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))
 }
 
 /// Commit a finished turn. A group that cannot commit (a full disk, say)

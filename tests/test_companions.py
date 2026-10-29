@@ -90,6 +90,22 @@ class CompanionTests(ModelFixture):
         self.until(lambda: not alive(daemon), timeout=20)
         self.until(lambda: not alive(pid))
 
+    def test_a_companion_that_keeps_asking_keeps_no_daemon_from_going_idle(self):
+        daemon = json.loads(self.agent('start', *self.daemon, '--idle-exit', '2s').stdout)['pid']
+        # One connection, a request every 0.3 s, from a process the
+        # companion's script starts rather than the companion itself.
+        asker = ('import json, os, socket, time\n'
+                 's = socket.socket(socket.AF_UNIX); s.connect(os.environ["AGENT_SOCKET"])\n'
+                 'r = s.makefile("r"); r.readline()\n'
+                 'n = 0\n'
+                 'while True:\n'
+                 '    n += 1; s.sendall((json.dumps({"id": n, "op": "stats"}) + "\\n").encode()); r.readline()\n'
+                 '    time.sleep(0.3)\n')
+        self.agent('companion', '--store', str(self.store), 'add', 'asker', '--env', f'ASKER={asker}', '--',
+                   'sh', '-c', 'python3 -c "$ASKER"; exit 1')
+        self.until(lambda: self.listed()['asker']['pid'])
+        self.until(lambda: not alive(daemon), timeout=20)
+
     def test_a_bad_companion_is_refused_by_name(self):
         refused = self.agent('companion', *self.daemon, 'add', '.x', '--', 'true', check=False)
         self.assertNotEqual(refused.returncode, 0)

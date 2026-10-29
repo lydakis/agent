@@ -218,12 +218,15 @@ impl Companions {
         futures_util::future::join_all(tasks).await;
     }
 
-    /// Whether `pid` is a companion's process: its sessions keep no daemon
-    /// from going idle.
+    /// Whether `pid` is a companion's process, or one in its group (what a
+    /// companion's script runs): its sessions keep no daemon from going idle.
     pub fn runs_pid(&self, pid: u32) -> bool {
-        self.kept
-            .values()
-            .any(|kept| kept.status.lock().unwrap_or_else(|e| e.into_inner()).pid == Some(pid))
+        // SAFETY: getpgid only reads the process's group.
+        let group = unsafe { libc::getpgid(pid as i32) };
+        self.kept.values().any(|kept| {
+            let leader = kept.status.lock().unwrap_or_else(|e| e.into_inner()).pid;
+            leader.is_some_and(|leader| leader == pid || leader as i32 == group)
+        })
     }
 
     /// Each companion, by name, with what it runs and how it is doing.
@@ -315,14 +318,20 @@ impl Run {
         tokio::fs::create_dir_all(self.log.parent().expect("in its folder"))
             .await
             .map_err(|e| e.to_string())?;
+        // Nonblocking, so a FIFO there with no reader fails at once rather
+        // than holding the companion, and its stopping, for ever.
         let log = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&self.log)
             .await
-            .map_err(|e| format!("{}: {e}", self.log.display()))?
-            .into_std()
-            .await;
+            .map_err(|e| format!("{}: {e}", self.log.display()))?;
+        let regular = log.metadata().await.is_ok_and(|meta| meta.is_file());
+        if !regular {
+            return Err(format!("{}: not a regular file", self.log.display()));
+        }
+        let log = log.into_std().await;
         let mut command = tokio::process::Command::new(&self.spec.command);
         command
             .args(&self.spec.args)
@@ -452,6 +461,27 @@ mod tests {
         // SAFETY: signal 0 only asks whether it lives.
         assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
         assert_eq!(companions.listed(), json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_log_that_is_no_file_fails_its_companion_at_once() {
+        let dir = std::env::temp_dir().join(format!("companions-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("state.sqlite.companions")).unwrap();
+        let fifo = std::ffi::CString::new(
+            dir.join("state.sqlite.companions/piped.log")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        // SAFETY: a FIFO made at a path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut companions = Companions::new(&dir.join("state.sqlite"), vec![], true);
+        companions.keep("piped", spec("sleep", &["30"]));
+        until(|| companions.shown("piped").unwrap()["last_exit"]["error"] == "spawn_failed").await;
+        tokio::time::timeout(Duration::from_secs(5), companions.stop())
+            .await
+            .expect("stops");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
