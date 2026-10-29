@@ -252,12 +252,15 @@ lead's thread, which no program Sonny starts inherits. Sonny takes the person's 
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
-same bot. T3 Code's model picker lists `~/.agent/models` (the list `agent
-models` shows) after "Default", the model the lead or task runs: a model
-picked before the first prompt is the one a new lead starts on, and one
-picked later is the lead's from its next turn. A thread offers only its
-bot's provider family, since a bot changes model only within it, and a task's
-thread keeps the model its lead gave the task.
+same bot. T3 Code's model picker lists what the providers list, as `/model`
+does, with `~/.agent/models`' notes and the models only it names, after
+"Default", the model the lead or task runs; its effort picker lists the
+family's efforts after "Default" too. A pick made before the first prompt is
+for a lead Sonny makes: the folder's lead that is there already keeps its own,
+since T3 Code puts its last pick to every new thread. One made later is the
+lead's from its next turn. A thread offers only its bot's provider family,
+since a bot changes model only within it, and a task's thread keeps the model
+its lead gave the task.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
@@ -489,11 +492,12 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
-person sees, as a checklist), `resolve_task`, `show_agent` and
+person sees, as a checklist), `margin` (notes beside the conversation),
+`resolve_task`, `show_agent` and
 `run_in_pane`; a lead's own, which its tasks don't take, are `start_task`,
 `remove_task`, `new_project` and `subscriptions`. The daemon shows them to
-the model and records each call: `react`, `ask`, `plan` and `resolve_task`
-run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
+the model and records each call: `react`, `ask`, `plan`, `margin` and
+`resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
@@ -653,6 +657,49 @@ switch tabs with it. A window too narrow for
 both shows the one the keys are in. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are.
+
+The pane's place, when nothing else is open there, is the margin. Its
+first row is a glance at what runs for the agent: its tasks at work and
+what waits on you (a click opens `/status`), `↻` for its triggers and
+subscriptions (a click opens `/background`), and its context, each left
+out when there is nothing to say; the footer stops saying them while it
+shows. Under it are the notes the agent keeps there with its `margin`
+tool: a diagram, a table of findings, a file it is discussing (kept fresh
+as the file changes), or a live view it updates while it works. Each
+note is pinned where the agent first put it: a quiet `✎ title · in the
+margin` row there scrolls the margin to it when clicked, and the note's
+`↑` scrolls the conversation back there, drawing older messages again
+when it is further back. Its `×` takes the note away and tells the agent
+with its next call. Posting a note's id again changes it in place, so a
+live note stays one note. A file, `/status`, `/background` or a side
+chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
+Esc in the margin closes it, and `/margin` brings it back. The margin
+shows by itself when the window leaves the conversation its 100 columns
+and the margin 40 more; in a narrower one the footer counts the notes
+(`✎ 3`), and Tab with nothing typed shows the margin. Where the margin
+cannot show, because the window is narrower or it is closed, each note is
+drawn in the conversation where it was put instead of its marker, up to
+40 rows with the rest a click away, and it goes back beside the
+conversation once there is room again. The agent's plan sits over the
+notes, one plan however often it changes; each `plan` call in the
+conversation is a row of how far it had got, and where the margin cannot
+show, the newest is the whole checklist. The notes are kept by agent in
+`~/.agent/sonny/margin/`, and the calls stay in its history.
+A note is drawn the way the conversation and the pane draw things:
+Markdown with its tables and math, Mermaid diagrams, HTML pages,
+pictures, and code in syntax colors.
+
+![The agent puts a diagram and a live table in the margin while it works; × takes the table away, /status opens over the margin and Esc goes back, Esc closes the margin and /margin brings it back](../docs/sonny/margin.gif)
+
+![Margin notes in Markdown with a table and math, a Mermaid diagram and a picture, each pinned to a row in the conversation](../docs/sonny/margin-rich.png)
+
+![Further down the same margin: the picture, an HTML dashboard page, and a file note in syntax colors](../docs/sonny/margin-rich-more.png)
+
+![The plan over the margin's notes, and each plan call a row of how far it had got](../docs/sonny/margin-plan-wide.png)
+
+![The same conversation in a narrower window: the notes drawn where they were put, and the newest plan as the whole checklist](../docs/sonny/margin-inline-narrow.png)
+
+![/status laid over the margin: its title's ← goes back, and the footer counts the note the margin holds](../docs/sonny/margin-status.png)
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 

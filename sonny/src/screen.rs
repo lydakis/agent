@@ -75,7 +75,14 @@ pub enum Tag {
     Relayed(i64),
     /// Tasks the lead started together, by the client's number for them.
     Tasks(u64),
+    /// Where a note was put in the margin, by [`crate::margin::anchor`].
+    Note(u64),
+    /// A `plan` call, by the client's number for it.
+    Plan(u64),
 }
+
+/// Buttons on a row: the columns each takes, and what it does.
+pub type Buttons = Vec<(u16, u16, String)>;
 
 /// What a line pushed is besides its text: a [`Tag`], or a link its row
 /// opens across its text, a [`BUTTON`] or a page.
@@ -83,6 +90,9 @@ pub enum Tag {
 pub enum Mark {
     Tag(Tag),
     Link(String),
+    /// Links on parts of the row's first line, by the columns they take:
+    /// several buttons on one row.
+    Buttons(Buttons),
 }
 
 /// A row on the screen: one of the conversation's rows, or the part of
@@ -98,6 +108,8 @@ struct Shown {
     opens: usize,
     /// It is the first of its row's.
     first: bool,
+    /// Its row's buttons, on the first of its rows.
+    buttons: Buttons,
 }
 
 /// A line of the conversation, its wrapped rows joined again, so it can
@@ -109,6 +121,7 @@ struct Row {
     /// Where its text opens, whatever its words are.
     link: Option<String>,
     tag: Option<Tag>,
+    buttons: Buttons,
 }
 
 impl Row {
@@ -118,6 +131,7 @@ impl Row {
             rest: None,
             link: None,
             tag: None,
+            buttons: Vec::new(),
         }
     }
 
@@ -125,6 +139,7 @@ impl Row {
         match mark {
             Mark::Tag(tag) => self.tag = Some(tag),
             Mark::Link(url) => self.link = Some(url),
+            Mark::Buttons(buttons) => self.buttons = buttons,
         }
     }
 }
@@ -302,6 +317,12 @@ impl Screen {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
     }
 
+    /// The tags the lines kept carry, oldest first: what is still there
+    /// of what was tagged.
+    pub fn tags(&self) -> impl Iterator<Item = Tag> + '_ {
+        self.rows.iter().filter_map(|row| row.tag)
+    }
+
     /// Whether a row is tagged `tag`.
     pub fn has(&self, tag: Tag) -> bool {
         self.tagged(tag).is_some()
@@ -451,19 +472,40 @@ impl Screen {
     /// Its lines replaced by `lines`, the view kept as far down from the
     /// first row as it was.
     pub fn replace(&mut self, lines: Vec<Line<'static>>) {
+        self.replace_marked(lines, Vec::new());
+    }
+
+    /// [`Screen::replace`], with `marks` as [`Screen::push_marked`] puts them.
+    pub fn replace_marked(&mut self, lines: Vec<Line<'static>>, marks: Vec<(usize, Mark)>) {
         let top = self.top;
         *self = Self {
             area: self.area,
             clicks: self.clicks.take(),
             ..Self::default()
         };
-        self.push(lines);
+        self.push_marked(lines, marks);
         self.top_row = Some(top);
+    }
+
+    /// The view put with the row tagged `tag`, the newest if more are,
+    /// `above` drawn rows under its top; whether a row is.
+    pub fn show_tagged(&mut self, tag: Tag, above: usize) -> bool {
+        let Some(mut row) = self.tagged(tag) else {
+            return false;
+        };
+        // From the first of the rows tagged so together.
+        while row > 0 && self.rows[row - 1].tag == Some(tag) {
+            row -= 1;
+        }
+        self.show_row(row, above);
+        true
     }
 
     /// The view put with the line `row` of those pushed `above` drawn
     /// rows under its top.
     pub fn show_row(&mut self, row: usize, above: usize) {
+        // Asked for, it wins over the view kept as it was.
+        self.top_row = None;
         self.go_to = Some((row, above));
     }
 
@@ -564,6 +606,7 @@ impl Screen {
                 rest: None,
                 link: None,
                 tag: None,
+                buttons: Vec::new(),
             }),
         );
         // Rows wrapped already are wrapped again under them.
@@ -724,6 +767,7 @@ impl Screen {
                     rest: None,
                     link: None,
                     tag: None,
+                    buttons: Vec::new(),
                 }),
             );
             self.shown.splice(
@@ -734,6 +778,7 @@ impl Screen {
                     joins: None,
                     opens: 0,
                     first: true,
+                    buttons: Vec::new(),
                 }),
             );
             self.wrapped = self.wrapped + at.len() - rows;
@@ -861,6 +906,7 @@ impl Screen {
                     || span.content.contains(['▀', '▄'])
             });
             let link = row.link.clone();
+            let buttons = row.buttons.clone();
             let rows = match line.width() <= width || picture {
                 true => vec![line],
                 false => {
@@ -882,6 +928,10 @@ impl Screen {
                     joins,
                     opens,
                     first,
+                    buttons: match first {
+                        true => buttons.clone(),
+                        false => Vec::new(),
+                    },
                 });
             }
         }
@@ -1344,6 +1394,19 @@ impl Screen {
                 x += width;
             }
         }
+        // Buttons on parts of a row, over whatever else is there.
+        for row in top..bottom {
+            let y = drawn.y + (row - top) as u16;
+            for (from, to, url) in &self.shown[row].buttons {
+                let to = (*to).min(drawn.width);
+                if *from >= to {
+                    continue;
+                }
+                let (from, to) = (drawn.x + from, drawn.x + to);
+                links.retain(|link| link.0 != y || link.2 <= from || link.1 >= to);
+                links.push((y, from, to, url.clone()));
+            }
+        }
         links
     }
 
@@ -1717,6 +1780,25 @@ mod tests {
             Some(Action::Copy(
                 "The stub answers after the 2s timeout, so the test reads an empty cart.".into()
             ))
+        );
+    }
+
+    #[test]
+    fn markdown_led_further_still_copies_as_one_line() {
+        let text = "The stub answers after the 2s timeout, see https://example.com/a/very/long/path/to/the/stub";
+        let mut markdown = crate::transcript::Markdown::in_folder(std::path::Path::new("."));
+        let leads = (Line::from("     "), Line::from("     "));
+        let rows = crate::transcript::markdown(&mut markdown, text, 30, leads);
+        assert!(
+            rows.iter()
+                .any(|line| line.alignment == Some(crate::transcript::CUT))
+        );
+        let (mut screen, buf) = screen(rows, 30, 10);
+        assert!(row(&buf, 1).starts_with("     "), "{:?}", row(&buf, 1));
+        let last = screen.shown.len() as u16 - 1;
+        assert_eq!(
+            drag(&mut screen, (0, 0), (29, last)),
+            Some(Action::Copy(text.into()))
         );
     }
 

@@ -2,8 +2,8 @@
 //! the model and records each call, with a fixed result or with the one
 //! Sonny's lookout answers (`served`), and Sonny gives the calls their
 //! meaning. A bot reacts to the person, asks them to decide something,
-//! keeps its plan where they see it, and puts windows and panes where they
-//! look; a lead also starts, removes and resolves its tasks, makes
+//! keeps its plan where they see it, keeps notes in the margin beside the
+//! conversation, and puts windows and panes where they look; a lead also starts, removes and resolves its tasks, makes
 //! projects and subscribes to the lookout, and a task resolves itself.
 use serde_json::Value;
 
@@ -18,6 +18,7 @@ pub fn tools(lead: bool) -> Vec<Value> {
         crate::reactions::tool(),
         crate::asks::tool(),
         crate::plan::tool(),
+        crate::margin::tool(),
     ];
     if lead {
         tools.push(crate::resolved::tool());

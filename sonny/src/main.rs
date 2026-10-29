@@ -32,6 +32,7 @@ mod login;
 mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
+mod margin;
 mod math;
 mod mcp;
 mod mermaid;
@@ -1382,7 +1383,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 17] = [
+const COMMANDS: [(&str, &str); 18] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1399,6 +1400,10 @@ const COMMANDS: [(&str, &str); 17] = [
     ),
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
+    (
+        "/margin",
+        "the agent's notes beside the conversation, shown or closed",
+    ),
     (
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
@@ -1639,6 +1644,31 @@ struct App {
     /// press, to count clicks.
     composing: Option<(std::ops::Range<usize>, (Rect, usize, usize))>,
     composer_click: Option<(Instant, u16, u16, u8)>,
+    /// The agent's notes beside the conversation; the margin's pane while
+    /// something opened is laid over it; a note to scroll the margin to
+    /// once it is drawn, one just put there or clicked in the conversation.
+    margin: margin::Margin,
+    under: Option<pane::Pane>,
+    margin_focus: Option<u64>,
+    /// Notes drawn in the conversation where they were put, while the
+    /// margin is closed or the window has no room for it: by pin, each
+    /// note's id and title; whether the margin was beside the
+    /// conversation and how often it had changed when they were last
+    /// drawn so, and whether a note put since waits to be.
+    inline: HashMap<u64, (String, String)>,
+    folded: Option<(bool, u64)>,
+    refold: bool,
+    /// The `plan` calls drawn, by the number each is tagged with, and the
+    /// one drawn in full: the newest, where the margin cannot show it.
+    plans: HashMap<u64, Vec<String>>,
+    plan_count: u64,
+    plan_full: Option<u64>,
+    /// Where a note was put, to show in the conversation once it is drawn
+    /// back that far; and how many more older pages may be read for it.
+    jump: Option<(screen::Tag, u8)>,
+    /// Buttons pressed whose work waits for the loop: a note the person
+    /// took away, to tell the agent; a view to open.
+    pressed: Vec<String>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -1729,8 +1759,6 @@ struct App {
     tasks_all_read: Option<Instant>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
-    /// A button clicked in the conversation, which [`App::press`] takes.
-    pressed: Option<String>,
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
@@ -2318,6 +2346,17 @@ impl App {
             composer_at: None,
             composing: None,
             composer_click: None,
+            margin: margin::Margin::default(),
+            under: None,
+            margin_focus: None,
+            inline: HashMap::new(),
+            folded: None,
+            refold: false,
+            plans: HashMap::new(),
+            plan_count: 0,
+            plan_full: None,
+            jump: None,
+            pressed: Vec::new(),
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -2362,7 +2401,6 @@ impl App {
             tasks_read: None,
             tasks_all_read: None,
             tasks_width: 0,
-            pressed: None,
         }
     }
 
@@ -2371,6 +2409,7 @@ impl App {
         let _ = terminal.autoresize();
         self.width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
         self.reactions = reactions::Reactions::load(self.reactions_key.as_deref());
+        self.margin = margin::Margin::load(self.reactions_key.as_deref());
         self.picked = reactions::Picked::load(self.reactions_key.as_deref());
         self.history().await;
         // Known to start the conversation only once its newest page is
@@ -2529,6 +2568,9 @@ impl App {
             self.follow_place().await;
             self.count_behind();
             self.read_tasks().await;
+            for what in std::mem::take(&mut self.pressed) {
+                self.press(&what).await;
+            }
             // Older items drawn above before the view reaches the first row.
             if self.older.is_some() && self.screen.near_top() {
                 self.older().await;
@@ -2537,6 +2579,7 @@ impl App {
             if let Some(page) = self.screen.wanted() {
                 self.draw_again(page).await;
             }
+            self.jumped().await;
             self.repaint |= term::switched();
             if self.repaint && self.running.is_none() {
                 self.repaint = false;
@@ -2864,6 +2907,9 @@ impl App {
         self.folds.clear();
         self.folding = None;
         self.relayed.clear();
+        self.plans.clear();
+        self.plan_full = None;
+        self.refold = true;
         self.tasks.clear();
         self.starting = None;
         self.held.clear();
@@ -3109,6 +3155,10 @@ impl App {
     /// Calls like the one before it, with nothing drawn between, fold
     /// into one: several tasks started at once read as one row.
     fn commit_call(&mut self, id: &str, name: &str, arguments: &Value, output: &str, failed: bool) {
+        if name == margin::TOOL {
+            self.commit_note(id, arguments, failed);
+            return;
+        }
         // A decision for the person stands out where it was asked, each
         // option a button that answers with it.
         if name == asks::TOOL
@@ -3123,6 +3173,25 @@ impl App {
                     let button = format!("{}answer/{at}/{id}", screen::BUTTON);
                     (from + row, screen::Mark::Link(button))
                 }));
+            return;
+        }
+        // A plan said in a row of how far it has got: the newest shows
+        // in full in the margin, or here when the margin cannot show it.
+        if name == plan::TOOL
+            && !failed
+            && let Some(steps) = plan::steps(arguments)
+        {
+            let at = self.plan_count;
+            self.plan_count += 1;
+            let lines = transcript::plan_lines(&steps, false, self.prose());
+            let from = self.pending.len() + usize::from(self.any_history);
+            let rows = lines.len();
+            self.commit(lines);
+            let tag = screen::Mark::Tag(screen::Tag::Plan(at));
+            self.marks
+                .extend((from..from + rows).map(|row| (row, tag.clone())));
+            self.plans.insert(at, steps);
+            self.refold = true;
             return;
         }
         // A task started stands out, and a click opens it in the pane.
@@ -3458,7 +3527,7 @@ impl App {
     /// between agents at NODE; `task/BOT` opens the task BOT in the pane;
     /// `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
-    async fn press(&mut self, button: &str) {
+    async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
             .strip_prefix("fold/")
             .and_then(|at| at.parse::<usize>().ok())
@@ -3516,6 +3585,154 @@ impl App {
                 Err(error) => self.notice = Some(error),
             }
         }
+    }
+
+    /// A `margin` call where it was made: the note's first post as a
+    /// marker pinned there, which a click scrolls the margin to; what
+    /// changed it later only when verbose, the margin showing that.
+    fn commit_note(&mut self, call: &str, arguments: &Value, failed: bool) {
+        let Some(id) = arguments["id"].as_str() else {
+            return;
+        };
+        let note = self
+            .margin
+            .note(id)
+            .filter(|note| note.call == call)
+            .cloned();
+        let what = match (&note, arguments["remove"] == true) {
+            (Some(note), _) if !failed => note.title.clone(),
+            _ if !self.verbose => return,
+            (_, true) => format!("took {id} away"),
+            _ => format!("changed {id}"),
+        };
+        self.commit(vec![note_marker(what, true)]);
+        // Drawn out where it was put, when the margin cannot show it.
+        self.refold = true;
+        if let Some(note) = note {
+            let pin = margin::anchor(&note.call);
+            let link = format!("{}note/{id}", screen::BUTTON);
+            self.mark_last(screen::Mark::Tag(screen::Tag::Note(pin)));
+            self.mark_last(screen::Mark::Link(link));
+        }
+    }
+
+    /// The notes drawn out in the conversation where they were put when
+    /// the margin is not `beside` it, each its marker alone where it is:
+    /// done again only once that, or a note, changed.
+    fn fold_notes(&mut self, beside: bool) {
+        let workspace = std::path::PathBuf::from(&self.workspace);
+        if !beside {
+            self.margin.freshen(&workspace);
+        }
+        let key = (beside, self.margin.changes());
+        if !std::mem::take(&mut self.refold) && self.folded == Some(key) {
+            return;
+        }
+        self.folded = Some(key);
+        self.fold_plan(beside);
+        let notes: Vec<(u64, String, String)> = (self.margin.notes().iter())
+            .map(|note| {
+                (
+                    margin::anchor(&note.call),
+                    note.id.clone(),
+                    note.title.clone(),
+                )
+            })
+            .collect();
+        // Back to their markers: all of them beside the margin, else those
+        // taken away.
+        let back: Vec<u64> = (self.inline.keys())
+            .filter(|pin| beside || !notes.iter().any(|(at, ..)| at == *pin))
+            .copied()
+            .collect();
+        for pin in back {
+            let (id, title) = self.inline.remove(&pin).expect("drawn out");
+            let link = screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
+            let line = note_marker(title, true);
+            (self.screen).replace_tagged(screen::Tag::Note(pin), vec![line], vec![(0, link)]);
+        }
+        if beside {
+            return;
+        }
+        let width = self.prose();
+        for (pin, id, title) in notes {
+            let tag = screen::Tag::Note(pin);
+            if !self.screen.has(tag) {
+                continue;
+            }
+            let body = (self.margin.body(&id, width, &workspace, INLINE_ROWS)).unwrap_or_default();
+            let link = || screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
+            let mut marks = vec![(0, link())];
+            // The rest of it a click away, in the margin.
+            if body.len() > INLINE_ROWS {
+                marks.push((body.len(), link()));
+            }
+            let mut lines = vec![note_marker(title.clone(), false)];
+            lines.extend(body);
+            self.screen.replace_tagged(tag, lines, marks);
+            self.inline.insert(pin, (id, title));
+        }
+    }
+
+    /// The newest plan drawn shown in the margin, and in full where it
+    /// was set when the margin is not `beside` the conversation; every
+    /// other plan call a row of how far it had got.
+    fn fold_plan(&mut self, beside: bool) {
+        // Those the screen no longer keeps are forgotten.
+        let kept: std::collections::HashSet<u64> = (self.screen.tags())
+            .filter_map(|tag| match tag {
+                screen::Tag::Plan(at) => Some(at),
+                _ => None,
+            })
+            .collect();
+        self.plans.retain(|at, _| kept.contains(at));
+        let newest = (self.screen.tags())
+            .filter_map(|tag| match tag {
+                screen::Tag::Plan(at) => Some(at),
+                _ => None,
+            })
+            .last();
+        let steps = newest.and_then(|at| self.plans.get(&at)).cloned();
+        self.margin.set_plan(steps.as_deref().unwrap_or_default());
+        let full = newest.filter(|_| !beside);
+        if full == self.plan_full {
+            return;
+        }
+        let width = self.prose();
+        for (at, full) in [(self.plan_full, false), (full, true)] {
+            let Some(steps) = at.and_then(|at| self.plans.get(&at)) else {
+                continue;
+            };
+            let lines = transcript::plan_lines(steps, full, width);
+            let tag = screen::Tag::Plan(at.expect("found"));
+            self.screen.replace_tagged(tag, lines, Vec::new());
+        }
+        self.plan_full = full;
+    }
+
+    /// A `margin` call applied as it starts, so a note shows while the
+    /// agent works, and the margin scrolled to it.
+    fn note_call(&mut self, call: &str, arguments: &Value, turn: Option<i64>) {
+        let after = self.answering.as_ref().map(|(.., node)| *node);
+        if let Some(margin::Change::Posted(id) | margin::Change::Updated(id)) =
+            self.margin.apply(call, arguments, after, turn)
+        {
+            self.margin_focus = self.margin.note(&id).map(|note| margin::anchor(&note.call));
+        }
+    }
+
+    /// Whether the person's message `said` at `node`, in `turn`, took a
+    /// note away, from this window or another: the margin shows it, once.
+    fn note_closed(&mut self, node: i64, said: &str, turn: Option<i64>) -> bool {
+        let Some(id) = margin::closed(said) else {
+            return false;
+        };
+        let key = match turn {
+            Some(turn) => format!("t{turn}"),
+            None => format!("m{node}"),
+        };
+        self.margin.remove(id, Some((node, &key)));
+        true
     }
 
     /// Commit a denied call, in either view.
@@ -3826,6 +4043,10 @@ impl App {
                 match (item["type"].as_str(), item["role"].as_str()) {
                     // A reaction is drawn under the reply it answers.
                     (_, Some("user")) if reactions::is_reaction(&text(&item)) => {}
+                    // The person took a note away: the margin shows it.
+                    (_, Some("user")) if margin::closed(&text(&item)).is_some() => {
+                        self.note_closed(node, &text(&item), turns.get(&node).copied());
+                    }
                     (_, Some("user")) => {
                         // The bot's reactions to the message before, as they
                         // were drawn live.
@@ -3870,10 +4091,8 @@ impl App {
                             .and_then(|a| serde_json::from_str(a).ok())
                             .unwrap_or(Value::Null);
                         let name = item["name"].as_str().unwrap_or("tool").to_owned();
-                        calls.insert(
-                            item["call_id"].as_str().unwrap_or("").to_owned(),
-                            (name, arguments),
-                        );
+                        let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                        calls.insert(id, (name, arguments));
                     }
                     (Some("function_call_output"), _)
                         if self
@@ -3901,6 +4120,16 @@ impl App {
                             continue;
                         };
                         let (output, mut failed) = output(&item);
+                        // A note as the call that ran left it; an older
+                        // page's calls are in the margin kept already.
+                        if name == margin::TOOL
+                            && !older
+                            && !failed
+                            && denial(&item).is_none()
+                            && !reactions::refused(&item)
+                        {
+                            self.note_call(id, &arguments, turns.get(&node).copied());
+                        }
                         match denial(&item) {
                             Some(reason) => {
                                 // It never ran: nothing it would have done follows.
@@ -4264,7 +4493,8 @@ impl App {
                 if !drawn
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
-                    && !reactions::is_reaction(&text(item))
+                    && !self.note_closed(node, &text(item), turn)
+                    && !quiet_message(&text(item))
                 {
                     self.land(node, &text(item), item["from"].as_str(), false);
                     self.answered(&text(item));
@@ -4276,7 +4506,8 @@ impl App {
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
-                    && !reactions::is_reaction(&text(item))
+                    && !self.note_closed(node, &text(item), turn)
+                    && !quiet_message(&text(item))
                 {
                     self.end_live(Words::Reply);
                     // What the bot reacted with so far answered the
@@ -4478,6 +4709,9 @@ impl App {
                         _ => format!("Calling {name}"),
                     };
                 }
+                if name == margin::TOOL {
+                    self.note_call(id, &arguments, turn);
+                }
                 self.calls.insert(id.to_owned(), (name, arguments));
             }
             "tool_completed" => {
@@ -4533,6 +4767,11 @@ impl App {
                         }
                     }
                 } else {
+                    // Started before this window read the conversation, it
+                    // ends here; once applied, it counts once.
+                    if name == margin::TOOL && !shown.1 {
+                        self.note_call(id, &arguments, turn);
+                    }
                     self.commit_call(id, &name, &arguments, &shown.0, shown.1);
                 }
                 if name == asks::TOOL && !shown.1 {
@@ -5382,6 +5621,15 @@ impl App {
                 }
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
+                        // A button on its first row: the margin's glance, or
+                        // the arrow back to the margin.
+                        if down
+                            && pane.on_title(mouse.column, mouse.row)
+                            && let Some(button) = pane.head_button(mouse.column)
+                        {
+                            self.follow(&button);
+                            return true;
+                        }
                         // ‹ and › go back and forward, as a browser's do.
                         if down && let Some(back) = pane.on_arrow(mouse.column, mouse.row) {
                             self.go(back);
@@ -5489,7 +5737,7 @@ impl App {
                     KeyCode::End => pane.screen.latest(),
                     _ => {
                         if view.key(*key) == background::Key::Close {
-                            self.close_pane();
+                            self.close_pane(true);
                         }
                     }
                 }
@@ -5514,7 +5762,7 @@ impl App {
                     KeyCode::End => pane.screen.latest(),
                     _ => {
                         if view.key(*key) == usage::Key::Close {
-                            self.close_pane();
+                            self.close_pane(true);
                         }
                     }
                 }
@@ -5522,7 +5770,8 @@ impl App {
             }
             if self.pane_keys {
                 match key.code {
-                    KeyCode::Esc => self.close_pane(),
+                    // Back to the margin from what is over it; the margin closed.
+                    KeyCode::Esc => self.close_pane(true),
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -5628,8 +5877,16 @@ impl App {
 
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
-    fn open_pane(&mut self, pane: pane::Pane) {
+    fn open_pane(&mut self, mut pane: pane::Pane) {
         self.closed = None;
+        // Over the margin, kept under it to go back to; what else was
+        // open goes.
+        if let Some(open) = self.pane.take()
+            && open.is_margin()
+        {
+            self.under = Some(open);
+        }
+        pane.over = self.under.is_some();
         self.pane = Some(pane);
         self.pane_keys = true;
         self.screen.unselect();
@@ -5638,11 +5895,192 @@ impl App {
         }
     }
 
+    /// What is open beside the conversation closed, as Esc does: what was
+    /// laid over the margin goes, back to it, `keep` saying whether the
+    /// keys stay there, and is put aside for Ctrl+]; the margin itself
+    /// stays closed until asked for.
+    fn close_pane(&mut self, keep: bool) {
+        match self.pane.take() {
+            Some(open) if open.is_margin() => {
+                self.margin.close(true);
+                self.pane_keys = false;
+            }
+            // Put aside, with its card, for Ctrl+] to open again.
+            Some(open) => {
+                self.closed = Some((open, self.watch.take()));
+                self.pane = self.under.take();
+                self.pane_keys &= keep && self.pane.is_some();
+            }
+            None => {}
+        }
+    }
+
+    /// The margin back beside the conversation when nothing else is
+    /// there, unless the person closed it.
+    fn margin_back(&mut self) {
+        if self.margin.closed() {
+            self.under = None;
+            if let Some(over) = &mut self.pane {
+                over.over = false;
+            }
+        }
+        if self.pane.is_none() && !self.margin.closed() {
+            self.pane = Some(self.under.take().unwrap_or_else(pane::Pane::margin));
+        }
+    }
+
+    /// `/margin`: the margin shown, with the keys, or closed.
+    fn toggle_margin(&mut self) {
+        let shown = !self.margin.closed();
+        self.margin.close(shown);
+        if shown {
+            if self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
+                self.pane = None;
+                self.pane_keys = false;
+            }
+            self.margin_back();
+            return;
+        }
+        match &mut self.pane {
+            // Under what is open, to go back to.
+            Some(over) => {
+                over.over = true;
+                self.under = Some(pane::Pane::margin());
+            }
+            None => {
+                self.margin_back();
+                self.pane_keys = true;
+            }
+        }
+    }
+
+    /// What runs for the agent, for the margin's first row: its tasks at
+    /// work, what waits on the person, its background, its context.
+    fn glance(&self) -> margin::Glance {
+        let doing = |state: &str| {
+            (self.fleet.iter().flat_map(|fleet| fleet.doing.iter()))
+                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
+                .count()
+        };
+        margin::Glance {
+            name: self.bot.clone(),
+            running: doing("working"),
+            waiting: self.asks.len() + doing("needs you"),
+            behind: self.behind.0,
+            context: self.context,
+        }
+    }
+
+    /// A button clicked: what Sonny does for it now, or once the loop
+    /// gets to it.
+    fn act(&mut self, what: &str) {
+        let (verb, id) = what.split_once('/').unwrap_or((what, ""));
+        match verb {
+            // The margin scrolled to the note, shown if it was not.
+            "note" => {
+                if self.margin.closed() {
+                    self.toggle_margin();
+                }
+                if !self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
+                    self.close_pane(true);
+                    self.margin_back();
+                }
+                // Shown where there is no room for it beside the
+                // conversation too: the keys go to it.
+                self.pane_keys = true;
+                self.margin_focus = self.margin.note(id).map(|note| margin::anchor(&note.call));
+            }
+            // The conversation back where the note was put.
+            "jump" => {
+                let Some(note) = self.margin.note(id) else {
+                    return;
+                };
+                // The conversation in view again, where the margin
+                // covered it.
+                self.pane_keys = false;
+                let pin = screen::Tag::Note(margin::anchor(&note.call));
+                if self.screen.show_tagged(pin, 2) {
+                    return;
+                }
+                // Older pages drawn above, a page at a time, until it is.
+                if self.older.is_none() {
+                    self.notice = Some("that note's place is no longer in the conversation".into());
+                    return;
+                }
+                self.jump = Some((pin, JUMP_PAGES));
+            }
+            "back" => self.close_pane(true),
+            _ => self.pressed.push(what.to_owned()),
+        }
+    }
+
+    /// A button's work that waits on the daemon: a note taken away, the
+    /// agent told; `/status` or `/background` opened; a row's button in
+    /// the conversation.
+    async fn press(&mut self, what: &str) {
+        let (verb, id) = what.split_once('/').unwrap_or((what, ""));
+        match verb {
+            "close" => {
+                if self.margin.note(id).is_none() {
+                    return;
+                }
+                // The person's click, said in Sonny's words: nothing the
+                // agent wrote, and asking for nothing.
+                let told = margin::closed_message(id);
+                let sent = self
+                    .client
+                    .request(
+                        "submit",
+                        json!({"bot": self.bot, "request_id": unique("tui"), "prompt": told,
+                            "delivery": "attach", "origin": "margin"}),
+                    )
+                    .await;
+                match sent {
+                    // No clip in the footer: the margin says it.
+                    // Taken away once the agent will hear of it; kept to
+                    // close again when it could not be told.
+                    Ok(reply) => {
+                        self.margin.remove(id, None);
+                        self.reaction_turn = reply["turn"].as_i64();
+                        if let Some(turn) = reply["turn"].as_i64() {
+                            self.margin.applied(&format!("t{turn}"));
+                        }
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+            "status" if self.options.side.is_none() => self.status().await,
+            "background" if self.options.side.is_none() => self.background(),
+            "status" | "background" => {}
+            _ => self.press_row(what).await,
+        }
+    }
+
+    /// A jump to where a note was put, once the conversation is drawn
+    /// back far enough: shown, or the next page older read.
+    async fn jumped(&mut self) {
+        let Some((pin, pages)) = self.jump else {
+            return;
+        };
+        if self.repaint {
+            return;
+        }
+        if self.screen.show_tagged(pin, 2) {
+            self.jump = None;
+        } else if pages > 0 && self.older.is_some() {
+            self.jump = Some((pin, pages - 1));
+            self.older().await;
+        } else {
+            self.jump = None;
+            self.notice = Some("that note's place is no longer in the conversation".into());
+        }
+    }
+
     /// A link clicked in the conversation: a file is shown in the pane, as
     /// a preview, and anything else opened as the system opens it.
     fn follow(&mut self, link: &str) {
-        if let Some(button) = link.strip_prefix(screen::BUTTON) {
-            self.pressed = Some(button.to_owned());
+        if let Some(what) = link.strip_prefix(screen::BUTTON) {
+            self.act(what);
             return;
         }
         if link.starts_with("file://") {
@@ -5650,7 +6088,11 @@ impl App {
                 // After the file shown, as a browser goes on to a page.
                 Ok(pane) => match self.pane.take() {
                     Some(shown) if shown.url().is_some() => self.open_pane(pane.after(shown)),
-                    _ => self.open_pane(pane),
+                    // The margin goes under it, as under anything opened.
+                    shown => {
+                        self.pane = shown;
+                        self.open_pane(pane)
+                    }
                 },
                 Err(error) => self.notice = Some(error),
             }
@@ -5668,14 +6110,6 @@ impl App {
         pane::Pane::preview(link, workspace, width)
     }
 
-    /// The pane put aside, with its card, for Ctrl+] to open again.
-    fn close_pane(&mut self) {
-        if let Some(pane) = self.pane.take() {
-            self.closed = Some((pane, self.watch.take()));
-        }
-        self.pane_keys = false;
-    }
-
     /// Ctrl+[ (`back`) or Ctrl+]: the pane back or forward through what
     /// it showed, the keys staying where they are; back from the first
     /// thing it showed closes it, and forward with it closed opens again
@@ -5687,8 +6121,13 @@ impl App {
                 self.go(back);
                 self.pane_keys = keys;
             }
-            Some(_) if back => self.close_pane(),
-            None if !back && self.closed.is_some() => {
+            // Back from the first thing shown over the margin is the margin;
+            // the margin has nothing before it.
+            Some(pane) if back && !pane.is_margin() => self.close_pane(true),
+            _ if !back
+                && self.closed.is_some()
+                && self.pane.as_ref().is_none_or(pane::Pane::is_margin) =>
+            {
                 let (pane, watch) = self.closed.take().expect("a closed pane");
                 self.open_pane(pane);
                 self.watch = watch;
@@ -5709,10 +6148,19 @@ impl App {
     /// none when the pane takes the whole of a narrow window, and the
     /// pane none when it is closed or the conversation is shown instead.
     fn split(&self, area: Rect) -> (Rect, Option<Rect>) {
-        if self.pane.is_none() {
+        let Some(open) = &self.pane else {
+            return (area, None);
+        };
+        // The margin where the conversation leaves room for it, or while
+        // the keys are in it; out of the way otherwise.
+        let margin = pane::margin_width(area.width, PROSE as u16);
+        if open.is_margin() && margin.is_none() && !self.pane_keys {
             return (area, None);
         }
-        let pane = pane::width(area.width, PROSE as u16);
+        let pane = match margin.filter(|_| open.is_margin()) {
+            Some(margin) => margin,
+            None => pane::width(area.width, PROSE as u16),
+        };
         if pane == area.width {
             return match self.pane_keys {
                 true => (Rect { width: 0, ..area }, Some(area)),
@@ -5853,8 +6301,8 @@ impl App {
             return;
         }
         if self.full_screen(&event) {
-            if let Some(button) = self.pressed.take() {
-                self.press(&button).await;
+            for what in std::mem::take(&mut self.pressed) {
+                self.press(&what).await;
             }
             return;
         }
@@ -6193,6 +6641,11 @@ impl App {
                     Err(error) => self.notice = Some(error),
                 }
             }
+            return;
+        }
+        if prompt == "/margin" {
+            self.input.clear();
+            self.toggle_margin();
             return;
         }
         if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
@@ -6825,8 +7278,7 @@ impl App {
             && let Some(program) = &mut pane.program
             && program.ended()
         {
-            self.pane = None;
-            self.pane_keys = false;
+            self.close_pane(false);
         }
     }
 
@@ -6868,6 +7320,7 @@ impl App {
 
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
         self.show_asked();
+        self.margin_back();
         // /status beside the conversation, gone once the pane is.
         if self.watch.is_some() && !self.pane.as_ref().is_some_and(|p| p.is_card()) {
             self.watch = None;
@@ -6914,8 +7367,25 @@ impl App {
         open_rows.drain(..hidden);
         let live_rows = open_rows.len().max(1) as u16;
         self.flush();
+        let beside =
+            !self.margin.closed() && pane::margin_width(size.width, PROSE as u16).is_some();
+        self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
+        if let Some(at) = shown
+            && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
+        {
+            let live = self.running.as_ref().map(|running| running.turn);
+            let width = at.width.saturating_sub(1) as usize;
+            let (lines, marks) = self.margin.lines(width, &workspace, live);
+            let glance = self.glance().line();
+            if let Some(pane) = &mut self.pane {
+                pane.set_margin(lines, marks, glance);
+                if let Some(pin) = self.margin_focus.take() {
+                    pane.screen.show_tagged(screen::Tag::Note(pin), 1);
+                }
+            }
+        }
         if let (Some(watch), Some(pane)) = (&mut self.watch, &mut self.pane)
             && pane.is_card()
         {
@@ -7497,10 +7967,22 @@ impl App {
             (None, Some(size)) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
             (None, None) => format!("{}  ", self.bot),
         };
+        // The margin's glance says these while it is in view; the notes
+        // are counted while it is not.
+        let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
+        let right = match (glancing, self.context) {
+            (true, Some(_)) if self.options.side.is_none() => format!("{}  ", self.bot),
+            _ => right,
+        };
         // Something runs for it with no one typing: /background lists it.
         let right = match self.behind.0 {
             0 => right,
+            _ if glancing => right,
             n => format!("↻ {n} in background · {right}"),
+        };
+        let right = match self.margin.notes().len() {
+            n if n > 0 && !glancing => format!("✎ {n} · {right}"),
+            _ => right,
         };
         // Messages its next call takes in, which need nothing of the person.
         let right = match self.attached.len() {
@@ -7667,6 +8149,33 @@ fn first_line(text: &str) -> String {
         cut.push('…');
     }
     cut
+}
+
+/// How many pages older a jump to a note's place reads before giving up.
+const JUMP_PAGES: u8 = 20;
+
+/// The most rows of a note drawn in the conversation, when the margin
+/// cannot show it: a picture and a few lines around it.
+const INLINE_ROWS: usize = 40;
+
+/// Where a note was put in the conversation: `title`, said to be in the
+/// margin when it is `beside` the conversation, else the note's own head
+/// over its rows.
+fn note_marker(title: String, beside: bool) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  ✎ ").fg(Color::Yellow).dim(),
+        Span::raw(title).dim().underlined(),
+    ];
+    if beside {
+        spans.push(Span::raw(" · in the margin").dim());
+    }
+    Line::from(spans)
+}
+
+/// Whether a message of the person's is drawn elsewhere than as a
+/// message: a reaction under its reply, a note taken away in the margin.
+fn quiet_message(text: &str) -> bool {
+    reactions::is_reaction(text) || margin::closed(text).is_some()
 }
 
 /// A message item's text: a prompt's own words, without the line the
@@ -9419,7 +9928,7 @@ mod tests {
         );
         // A click on one opens it whole, and again shuts it.
         app.follow("sonny:said/4");
-        let button = app.pressed.take().unwrap();
+        let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         assert_eq!(
             drawn(&mut app),
@@ -9462,7 +9971,7 @@ mod tests {
         app.screen.prepend(0, older);
         assert_eq!(app.folds.len(), 2, "the newer fold is kept");
         app.follow("sonny:fold/0");
-        let button = app.pressed.take().unwrap();
+        let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         let rows = drawn(&mut app);
         assert_eq!(rows[0], "• Messaged calc.old and calc.older ▸", "{rows:?}");
@@ -9504,7 +10013,7 @@ mod tests {
         );
         // A click on it opens it, and again folds it.
         app.follow("sonny:fold/0");
-        let button = app.pressed.take().unwrap();
+        let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         let open = drawn(&mut app);
         assert_eq!(open[2], "• Messaged calc.add, calc.neg and calc.div ▾");
@@ -9520,7 +10029,7 @@ mod tests {
             ]
         );
         app.follow("sonny:fold/0");
-        let button = app.pressed.take().unwrap();
+        let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         assert_eq!(drawn(&mut app).len(), 3);
         // Something drawn between, or another kind of call, starts anew;
@@ -10059,5 +10568,322 @@ mod tests {
         let ended = json!({"type": "function_call_output", "call_id": "t",
             "output": r#"{"output":"Traceback\n","exit_code":1}"#});
         assert_eq!(output(&ended), ("Traceback\n".into(), true));
+    }
+
+    #[tokio::test]
+    async fn a_note_shows_in_the_margin_as_its_call_starts_and_a_marker_pins_where() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
+        let post = json!({"id": "routing", "title": "Routing today", "markdown": "a → b"});
+        app.daemon(turn_event("tool_started", 3, call("m1", post)))
+            .await;
+        // In the margin before the call is done.
+        assert_eq!(app.margin.note("routing").unwrap().title, "Routing today");
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m1"})))
+            .await;
+        let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rows.iter()
+                .any(|r| r == "  ✎ Routing today · in the margin"),
+            "{rows:?}"
+        );
+        let pin = screen::Tag::Note(margin::anchor("m1"));
+        assert!(app.marks.iter().any(|(_, m)| *m == screen::Mark::Tag(pin)));
+        let link = screen::Mark::Link("sonny:note/routing".into());
+        assert!(app.marks.iter().any(|(_, m)| *m == link));
+        // Changed in place: the margin shows it, the conversation does not.
+        let drawn = app.pending.len();
+        let update = json!({"id": "routing", "markdown": "a → c"});
+        app.daemon(turn_event("tool_started", 3, call("m2", update)))
+            .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m2"})))
+            .await;
+        assert_eq!(app.pending.len(), drawn);
+        let note = app.margin.note("routing").unwrap();
+        assert_eq!(
+            (note.call.as_str(), &note.body),
+            ("m1", &margin::Body::Markdown("a → c".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn what_opens_lays_over_the_margin_and_esc_steps_back_to_it() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.margin_back();
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
+        assert!(app.under.is_some());
+        // Esc: back to the margin, the keys with it.
+        app.close_pane(true);
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        assert!(app.pane_keys);
+        // Esc again closes the margin, and it stays closed.
+        app.close_pane(true);
+        app.margin_back();
+        assert!(app.pane.is_none() && app.margin.closed());
+        // A card opened now has no margin under it.
+        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        assert!(!app.pane.as_ref().unwrap().over);
+        app.close_pane(true);
+        assert!(app.pane.is_none());
+        // /margin brings it back, with the keys.
+        app.toggle_margin();
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        assert!(app.pane_keys && !app.margin.closed());
+    }
+
+    #[tokio::test]
+    async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.margin_back();
+        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        assert!(app.step_pane(true));
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        // The margin has nothing before it, and stays.
+        assert!(!app.step_pane(true));
+        assert!(!app.margin.closed());
+        assert!(app.step_pane(false));
+        assert!(app.pane.as_ref().is_some_and(|p| p.is_card() && p.over));
+    }
+
+    #[tokio::test]
+    async fn a_file_link_opens_over_the_margin_too() {
+        let dir = std::env::temp_dir().join(format!("sonny-over-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        let mut app = app(daemon_with(json!([])).await);
+        app.margin_back();
+        app.follow(&format!("file://{}", dir.join("a.md").display()));
+        assert!(app.pane.as_ref().is_some_and(|p| !p.is_margin() && p.over));
+        app.close_pane(true);
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_note_the_margin_cannot_show_is_drawn_where_it_was_put() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
+        let post = json!({"id": "routing", "title": "Routing today", "markdown": "a to b"});
+        app.daemon(turn_event("tool_started", 3, call("m1", post)))
+            .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m1"})))
+            .await;
+        app.flush();
+        app.commit(vec![Line::from("after")]);
+        app.flush();
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        // Too narrow for the margin: the note where it was put.
+        app.fold_notes(false);
+        assert_eq!(texts(&app)[..], ["✎ Routing today", "a to b", "after"]);
+        // Changed, it changes there.
+        let update = json!({"id": "routing", "markdown": "a to c"});
+        app.daemon(turn_event("tool_started", 3, call("m2", update)))
+            .await;
+        app.fold_notes(false);
+        assert_eq!(texts(&app)[..], ["✎ Routing today", "a to c", "after"]);
+        // With room for the margin, its marker alone again.
+        app.fold_notes(true);
+        assert_eq!(
+            texts(&app)[..],
+            ["✎ Routing today · in the margin", "after"]
+        );
+        // Closed, out again; taken away, its marker alone.
+        app.fold_notes(false);
+        assert_eq!(texts(&app).len(), 3);
+        app.margin.remove("routing", None);
+        app.fold_notes(false);
+        assert_eq!(
+            texts(&app)[..],
+            ["✎ Routing today · in the margin", "after"]
+        );
+        let link = Some("sonny:note/routing".to_owned());
+        assert!(app.screen.links().contains(&link));
+    }
+
+    #[tokio::test]
+    async fn one_plan_shows_however_often_it_changes() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        let plans = [
+            json!({"steps": ["[>] Read", "[ ] Fix", "[ ] Test"]}),
+            json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]}),
+        ];
+        for (n, plan) in plans.iter().enumerate() {
+            app.commit_call(&format!("p{n}"), "plan", plan, "Plan set.", false);
+            app.commit(vec![Line::from(format!("reply {n}"))]);
+        }
+        app.flush();
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        // Beside the margin: each a row, the newest plan in the margin.
+        app.fold_notes(true);
+        assert_eq!(
+            texts(&app)[..],
+            [
+                "• Updated the plan · 0/3 · → Read",
+                "reply 0",
+                "• Updated the plan · 1/3 · → Fix",
+                "reply 1"
+            ]
+        );
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
+        assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
+        assert!(margin.iter().any(|r| r.contains("→ Fix")));
+        assert!(!margin.iter().any(|r| r.contains("→ Read")));
+        // Without it: the newest in full where it was set, the rest a row.
+        app.fold_notes(false);
+        let rows = texts(&app);
+        assert_eq!(rows[0], "• Updated the plan · 0/3 · → Read");
+        assert_eq!(rows[2], "• Updated the plan");
+        assert!(rows[3..6].iter().any(|r| r.contains("→ Fix")), "{rows:?}");
+        assert_eq!(rows.last().unwrap(), "reply 1");
+        // A newer plan takes the full rows over.
+        let done = json!({"steps": ["[x] Read", "[x] Fix", "[x] Test"]});
+        app.commit_call("p2", "plan", &done, "Plan set.", false);
+        app.flush();
+        app.fold_notes(false);
+        let rows = texts(&app);
+        assert_eq!(rows[2], "• Updated the plan · 1/3 · → Fix");
+        assert!(rows.iter().any(|r| r.contains("✔ Test")), "{rows:?}");
+        // Gone from the screen, they are forgotten.
+        app.screen.clear();
+        app.refold = true;
+        app.fold_notes(false);
+        assert!(app.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_margin_shows_by_itself_only_where_the_conversation_keeps_its_width() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.margin_back();
+        let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
+        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(69)));
+        let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!((chat.width, margin), (130, None));
+        // Asked for with Tab, it takes its half as anything opened does.
+        app.pane_keys = true;
+        let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!(margin.map(|m| m.width), Some(64));
+        // A note's marker clicked shows it there too.
+        app.pane_keys = false;
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.follow("sonny:note/repro");
+        let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
+        assert!(margin.is_some());
+        // Its ↑ gives the conversation the room back.
+        app.follow("sonny:jump/repro");
+        let (chat, _) = app.split(Rect::new(0, 0, 130, 40));
+        assert_eq!(chat.width, 130);
+    }
+
+    #[tokio::test]
+    async fn a_note_taken_away_in_another_window_goes_from_this_one() {
+        let told = margin::closed_message("repro");
+        let client = daemon_answering(move |_| {
+            json!({"items": [{"node": 7, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": told}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.daemon(turn_event("steered", 4, json!({"node": 7})))
+            .await;
+        assert!(app.margin.note("repro").is_none());
+        // Not drawn as the person's words.
+        assert!(
+            app.pending
+                .iter()
+                .all(|l| !l.to_string().contains("margin note"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_note_call_that_never_ran_leaves_the_margin_as_it_was() {
+        let call = |id: &str, arguments: Value| {
+            json!({"type": "function_call", "call_id": id, "name": "margin",
+                   "arguments": arguments.to_string()})
+        };
+        let denied = r#"{"error":"approval_denied","detail":"no"}"#;
+        let items = json!({
+            "1": call("m1", json!({"id": "kept", "title": "Kept", "markdown": "x"})),
+            "2": {"type": "function_call_output", "call_id": "m1", "output": "In the margin."},
+            "3": call("m2", json!({"id": "kept", "remove": true})),
+            "4": {"type": "function_call_output", "call_id": "m2", "output": denied},
+            "5": call("m3", json!({"id": "never", "title": "Never", "markdown": "y"})),
+            "6": {"type": "function_call_output", "call_id": "m3", "output": denied},
+        });
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({
+                "nodes": (1..=6).rev().map(|node| json!({"node": node})).collect::<Vec<_>>(),
+                "next_from": null,
+            }),
+            _ => json!({"items": asked["nodes"].as_array().into_iter().flatten()
+                .map(|node| json!({"node": node, "item": items[node.to_string()]}))
+                .collect::<Vec<_>>()}),
+        })
+        .await;
+        let mut app = app(client);
+        app.history().await;
+        assert!(app.margin.note("kept").is_some());
+        assert!(app.margin.note("never").is_none());
+    }
+
+    #[tokio::test]
+    async fn taking_a_note_away_tells_the_agent_which_with_its_next_call() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+            }
+            json!({"turn": 12})
+        })
+        .await;
+        let mut app = app(client);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.follow("sonny:close/repro");
+        for what in std::mem::take(&mut app.pressed) {
+            app.press(&what).await;
+        }
+        assert!(app.margin.note("repro").is_none());
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent[0]["delivery"], "attach");
+        let told = sent[0]["prompt"].as_str().unwrap();
+        assert_eq!(margin::closed(told), Some("repro"));
+        assert_eq!(sent[0]["origin"], "margin");
+        assert!(quiet_message(told));
+        // No clip in the footer for it.
+        assert_eq!(app.reaction_turn, Some(12));
+    }
+
+    #[tokio::test]
+    async fn a_note_the_agent_could_not_be_told_of_stays_to_close_again() {
+        let client = daemon_answering(|_| json!({"error": "bot_busy", "detail": "busy"})).await;
+        let mut app = app(client);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.follow("sonny:close/repro");
+        for what in std::mem::take(&mut app.pressed) {
+            app.press(&what).await;
+        }
+        assert!(app.margin.note("repro").is_some());
+        assert!(app.notice.is_some());
     }
 }
