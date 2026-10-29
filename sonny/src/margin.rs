@@ -29,6 +29,8 @@ const MOST_NOTES: usize = 20;
 const NOTE_BYTES: usize = 64 * 1024;
 /// The most lines of a file a note shows.
 const FILE_LINES: usize = 400;
+/// What a note's rows start with, under its title.
+const BODY: &str = "     ";
 /// The most rows a note is drawn in, so all the notes together stay
 /// under what a [`crate::screen::Screen`] keeps.
 const NOTE_ROWS: usize = 600;
@@ -404,7 +406,6 @@ impl Margin {
             );
             return (lines, marks);
         }
-        let inner = width.saturating_sub(3).max(10);
         let notes = self.kept.notes.clone();
         for note in &notes {
             lines.push(Line::default());
@@ -414,18 +415,18 @@ impl Margin {
             marks.push((at, Mark::Tag(Tag::Note(anchor(&note.call)))));
             marks.push((at, Mark::Buttons(buttons)));
             let mut body = match &note.body {
-                Body::Markdown(text) => markdown(text, inner, Markdown::in_folder(workspace)),
-                Body::File(path) => self.file_lines(workspace, path, inner),
+                Body::Markdown(text) => {
+                    let mut markdown = Markdown::in_folder(workspace);
+                    crate::transcript::markdown(&mut markdown, text, width, leads())
+                }
+                Body::File(path) => self.file_lines(workspace, path, width),
             };
             if body.len() > NOTE_ROWS {
                 let more = body.len() - NOTE_ROWS;
                 body.truncate(NOTE_ROWS);
-                body.push(Line::from(format!("  … {more} more rows")).dim());
+                body.push(Line::from(format!("{BODY}  … {more} more rows")).dim());
             }
-            lines.extend(
-                body.into_iter()
-                    .map(|line| crate::transcript::indent(line, 3)),
-            );
+            lines.extend(body);
         }
         (lines, marks)
     }
@@ -461,7 +462,7 @@ impl Margin {
         let read = &self.reads[&path];
         let text = match &read.text {
             Ok(text) => text,
-            Err(error) => return vec![Line::from(error.clone()).dim()],
+            Err(error) => return vec![Line::from(format!("{BODY}{error}")).dim()],
         };
         let extension = (path.extension().and_then(|e| e.to_str()))
             .unwrap_or_default()
@@ -471,15 +472,19 @@ impl Margin {
         // Its pictures read from beside it.
         let folder = path.parent().unwrap_or(workspace);
         let mut out = match extension.as_str() {
-            "md" | "markdown" | "mdx" => markdown(
-                &lines[..shown].join("\n"),
-                width,
-                Markdown::document(folder),
-            ),
+            "md" | "markdown" | "mdx" => {
+                let mut markdown = Markdown::document(folder);
+                crate::transcript::markdown(
+                    &mut markdown,
+                    &lines[..shown].join("\n"),
+                    width,
+                    leads(),
+                )
+            }
             // Code as code, whatever it holds.
             _ => {
                 let mut code = crate::highlight::Code::file(&path, lines.first().unwrap_or(&""));
-                let lead = || Span::raw("  ");
+                let lead = || Span::raw(BODY);
                 (lines[..shown].iter())
                     .flat_map(|text| {
                         let text = text.replace('\t', "    ");
@@ -493,21 +498,16 @@ impl Margin {
             }
         };
         if lines.len() > shown {
-            out.push(Line::from(format!("… {} more lines", lines.len() - shown)).dim());
+            let more = lines.len() - shown;
+            out.push(Line::from(format!("{BODY}… {more} more lines")).dim());
         }
         out
     }
 }
 
-/// `text` read by `markdown`, as a preview draws a `.md` file: as
-/// replies read, without a reply's bullet.
-fn markdown(text: &str, width: usize, mut markdown: Markdown) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        out.extend(markdown.feed(line, width, false));
-    }
-    out.extend(markdown.end(width, false));
-    out
+/// A note's rows' leads, as the shared Markdown renderer takes them.
+fn leads() -> (Line<'static>, Line<'static>) {
+    (Line::from(BODY), Line::from(BODY))
 }
 
 /// The file at `path`, as much of it as a note shows.

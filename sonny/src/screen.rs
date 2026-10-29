@@ -1339,19 +1339,14 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_indented_further_still_copies_as_one_line() {
+    fn markdown_led_further_still_copies_as_one_line() {
         let text = "The stub answers after the 2s timeout, see https://example.com/a/very/long/path/to/the/stub";
-        let reply = crate::transcript::reply(text, 27, std::path::Path::new("."));
-        let cut = reply
-            .iter()
-            .any(|line| line.alignment == Some(crate::transcript::CUT));
-        let rows: Vec<_> = (reply.into_iter())
-            .map(|line| crate::transcript::indent(line, 3))
-            .collect();
-        assert_eq!(
+        let mut markdown = crate::transcript::Markdown::in_folder(std::path::Path::new("."));
+        let leads = (Line::from("     "), Line::from("     "));
+        let rows = crate::transcript::markdown(&mut markdown, text, 30, leads);
+        assert!(
             rows.iter()
-                .any(|line| line.alignment == Some(crate::transcript::CUT)),
-            cut
+                .any(|line| line.alignment == Some(crate::transcript::CUT))
         );
         let (mut screen, buf) = screen(rows, 30, 10);
         assert!(row(&buf, 1).starts_with("     "), "{:?}", row(&buf, 1));
