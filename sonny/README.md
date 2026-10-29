@@ -252,12 +252,15 @@ lead's thread, which no program Sonny starts inherits. Sonny takes the person's 
 wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
-same bot. T3 Code's model picker lists `~/.agent/models` (the list `agent
-models` shows) after "Default", the model the lead or task runs: a model
-picked before the first prompt is the one a new lead starts on, and one
-picked later is the lead's from its next turn. A thread offers only its
-bot's provider family, since a bot changes model only within it, and a task's
-thread keeps the model its lead gave the task.
+same bot. T3 Code's model picker lists what the providers list, as `/model`
+does, with `~/.agent/models`' notes and the models only it names, after
+"Default", the model the lead or task runs; its effort picker lists the
+family's efforts after "Default" too. A pick made before the first prompt is
+for a lead Sonny makes: the folder's lead that is there already keeps its own,
+since T3 Code puts its last pick to every new thread. One made later is the
+lead's from its next turn. A thread offers only its bot's provider family,
+since a bot changes model only within it, and a task's thread keeps the model
+its lead gave the task.
 
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
