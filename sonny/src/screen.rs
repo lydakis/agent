@@ -25,7 +25,7 @@ use unicode_width::UnicodeWidthStr;
 /// How far one notch of the wheel scrolls.
 const WHEEL: usize = 3;
 /// How soon a second click counts as a double click.
-const DOUBLE: Duration = Duration::from_millis(400);
+pub const DOUBLE: Duration = Duration::from_millis(400);
 /// How many of the conversation's rows new ones leave to scroll back to,
 /// as a terminal keeps its scrollback; the whole conversation stays in
 /// the bot's history. Older rows drawn above on asking for them stay.

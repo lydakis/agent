@@ -139,9 +139,11 @@ command (`cmux surface resume set`, shown as `Sonny: NAME`), so after cmux
 relaunches the tab runs `sonny` on the same bot again, once you allow
 commands starting with `sonny` from the tab's Resume Commands menu (until
 then cmux offers it to run by hand); quitting Sonny clears it. cmux lets
-only programs started in its tabs reach it, by default: the lookout Sonny
-starts there is one, and one started outside cmux needs Settings >
-Automation set to allow local automation.
+only programs started in its tabs reach it, by default; agents' shells run
+in the daemon, not in cmux, so set cmux's Settings > Automation to
+"Automation mode" (your own programs, no ancestry check) for agents to run
+commands in tabs and read them. The lookout Sonny starts in cmux reaches it
+either way; one started outside cmux needs Automation mode too.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
@@ -175,6 +177,32 @@ a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
+#### T3 Code
+
+`sonny acp` is Sonny for [T3 Code](https://github.com/pingdotgg/t3code): it
+speaks the Agent Client Protocol on stdio, so T3 Code runs it as a provider,
+one process for each thread. In T3 Code's Settings, add an "ACP Registry"
+provider, configure it by hand as a local command, and give it the
+executable `sonny` (or the full path `command -v sonny` prints) with the one
+argument `acp`. A thread opened in a folder is that folder's lead, the
+one `sonny` there opens, set up the same way: its rules, skills and memory,
+Sonny's tools, its approval mode and sandbox, and the lookout. A call that
+waits for you is asked in the thread (Allow or Deny); one the judge passes
+runs without asking. The turns the lead takes on its own, as when the lookout
+wakes it because a task finished, show in the thread between yours, as work
+the agent started (the protocol's version 2 draft, which T3 Code speaks).
+Each task the lead starts opens as a T3 Code thread of its own, in the task's
+worktree (in the project's folder when T3 Code does not take the worktree as
+one of the project's), with the task's brief as its first message; that
+thread is the task's, so it shows the task's work and steers it. Sonny opens
+it with the `t3_thread_launch` tool T3 Code gives each thread it runs, by the
+credential T3 Code scopes to that thread, which no program Sonny starts
+inherits. Sonny takes the person's words out of the instructions T3 Code
+wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
+Plan mode does not reach them; plan with the lead instead. What thread is
+which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
+same bot.
+
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
@@ -182,7 +210,17 @@ keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
 Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
 character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
 Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
-last of those took.
+last of those took. Shift-Enter needs a terminal that speaks the kitty
+keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
+WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
+or Ctrl-J still start a line.
+
+On the full screen the mouse edits the composer too, as in Codex: a click
+puts the cursor there, a drag selects (and copies), two clicks select a word
+and three a line. Typing replaces the selection, Backspace or Delete takes it
+out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
+
+![A selection in the composer](../docs/sonny/composer-selection.png)
 
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file
