@@ -5698,8 +5698,15 @@ impl App {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(turn) = reply["turn"].as_i64() {
+            // A steer is a submission of its own that ends as steered; the
+            // person's is the turn it joins: the running one, or the one the
+            // message before it started.
             if origin.is_none() {
-                self.yours = Some(turn);
+                self.yours = match delivery {
+                    None => Some(turn),
+                    Some(_) => (self.running.as_ref().map(|r| r.turn))
+                        .or_else(|| self.staged.last().map(|(started, _)| *started)),
+                };
             }
             self.staged.push((turn, prompt));
         }
@@ -7317,6 +7324,34 @@ mod tests {
             2,
             "the person's and the copy's"
         );
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_person_steered_from_here_is_theirs() {
+        let next = std::sync::atomic::AtomicI64::new(2);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("submit") => {
+                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        // The lead's turn 1 runs; the person steers it, a submission of its own.
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.input.set("and the reversed range too");
+        app.submit().await;
+        assert_eq!(app.yours, Some(1));
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
+            .await;
+        assert!(app.suggesting.is_none());
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert!(app.suggesting.is_some());
     }
 
     #[tokio::test]

@@ -207,7 +207,6 @@ fn unwrap(text: &str) -> &str {
 
 /// The text after a label the model put before it, as `Suggestion:`.
 fn unlabel(text: &str) -> &str {
-    let lower = text.to_lowercase();
     for label in [
         "suggested response",
         "suggested reply",
@@ -220,10 +219,13 @@ fn unlabel(text: &str) -> &str {
         "output",
         "result",
     ] {
-        if let Some(rest) = lower.strip_prefix(label)
-            && let Some(after) = rest.trim_start().strip_prefix(':')
+        // The labels are ASCII, so the label's bytes are the text's.
+        if let Some(after) = text
+            .get(..label.len())
+            .filter(|head| head.eq_ignore_ascii_case(label))
+            .and_then(|_| text[label.len()..].trim_start().strip_prefix(':'))
         {
-            return &text[text.len() - after.len()..];
+            return after;
         }
     }
     text
@@ -282,6 +284,9 @@ mod tests {
         );
         assert_eq!(clean("Suggestion: push it").as_deref(), Some("push it"));
         assert_eq!(clean("\"try it out\"").as_deref(), Some("try it out"));
+        // A letter whose lowercase is longer, as İ's is.
+        assert_eq!(clean("Suggestion: İleri git").as_deref(), Some("İleri git"));
+        assert_eq!(clean("SUGGESTION: İİİ İİİ").as_deref(), Some("İİİ İİİ"));
     }
 
     #[test]
