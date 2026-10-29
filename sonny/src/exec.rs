@@ -453,7 +453,7 @@ async fn run(
 ) -> Result<String, String> {
     let script = parse(input)?;
     let waiting = Instant::now();
-    let _running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
+    let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
     let left = left.saturating_sub(waiting.elapsed());
     let mut nested: BTreeMap<String, Nested> = BTreeMap::new();
     let mut listed = Vec::new();
@@ -503,6 +503,9 @@ async fn run(
     let deadline = started + timeout;
     let (said, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
     let ended = tokio::task::spawn_blocking(move || {
+        // Held until the script's runtime is gone, so an interrupted turn
+        // frees its place only once its script has stopped.
+        let _running = running;
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
