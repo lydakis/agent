@@ -212,6 +212,8 @@ goes in your shell profile. Bots search the web where their provider offers
 it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Every
 bot can also read a page with `web_fetch`, which the daemon runs itself. Put
 `web_search = "disabled"` in `config.toml` to leave both out of new bots.
+A message one agent sends another reaches its model with a line naming the
+sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
 
 ## How fast is it?
 

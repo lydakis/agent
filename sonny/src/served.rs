@@ -201,7 +201,8 @@ fn subscriptions() -> Value {
                         "context": {"type": "string", "minLength": 1,
                             "description": "A line every check reads: what you care about."},
                         "updates": {"type": "boolean",
-                            "description": "Also hear how the turns of the bots you made ended, unjudged."}
+                            "description": "Also hear, unjudged, how the turns of the bots it watches end, as you hear \
+                                your tasks'; another lead counts only where bots names it as it is."}
                     },
                     "required": ["name"],
                     "additionalProperties": false

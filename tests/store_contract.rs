@@ -2265,19 +2265,29 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|n| json!([n["item"]["content"][0]["text"], n["from"], n["origin"]]))
+            .map(|n| {
+                let content = &n["item"]["content"];
+                json!([
+                    content[0]["text"],
+                    content[1]["text"],
+                    n["from"],
+                    n["origin"]
+                ])
+            })
             .collect()
     };
+    // The model reads who sent each prompt no person wrote, after its words.
+    let by = format!("[Written by the agent Bob in turn:Bob/{person}, not by a person.]");
     let expected = [
-        json!(["ran", null, null]),
-        json!(["nightly", null, "schedule"]),
-        json!(["noted", null, null]),
-        json!(["then the changelog", bob, null]),
-        json!(["done", null, null]),
-        json!(["and the tests", null, null]),
-        json!(["task update", null, "tasks"]),
-        json!(["also the docs", bob, null]),
-        json!(["delegated work", bob, null]),
+        json!(["ran", null, null, null]),
+        json!(["nightly", "[Sent by schedule.]", null, "schedule"]),
+        json!(["noted", null, null, null]),
+        json!(["then the changelog", by, bob, null]),
+        json!(["done", null, null, null]),
+        json!(["and the tests", null, null, null]),
+        json!(["task update", "[Sent by tasks.]", null, "tasks"]),
+        json!(["also the docs", by, bob, null]),
+        json!(["delegated work", by, bob, null]),
     ];
     assert_eq!(senders(&db, "Carol"), expected);
     // A fork shares the nodes; the sender outlives the source's turns and
@@ -2286,6 +2296,50 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     db.delete_bot("Carol").unwrap();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     assert_eq!(senders(&db, "Branch"), expected);
+}
+
+#[test]
+fn a_bot_that_hides_senders_reads_only_the_words() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut quiet = binding();
+    quiet.settings.hide_senders = true;
+    db.create("Carol", Some("/synthetic"), quiet).unwrap();
+    let person = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let from_bob = TurnOptions {
+        from: Some(("Bob".into(), person)),
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin(
+            "Carol",
+            "b1",
+            "delegated work",
+            true,
+            &from_bob,
+            allow_provider,
+        )
+        .unwrap();
+    let node = started.entry.unwrap()["data"]["node"].as_i64().unwrap();
+    let item = read_item(&db, "Carol", node).unwrap();
+    assert_eq!(
+        item["content"],
+        json!([{"type": "input_text", "text": "delegated work"}])
+    );
+    assert_eq!(
+        db.inspect("Carol").unwrap().settings.resolved()["hide_senders"],
+        true
+    );
 }
 
 #[test]
@@ -3142,7 +3196,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false})
+            "keep_warm":0,"cache_ttl":"1h","sandbox":null,"writable":[],"network":false,"hide_senders":false})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {

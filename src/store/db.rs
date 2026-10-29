@@ -223,6 +223,10 @@ pub struct Settings {
     /// Whether a workspace-write sandbox reaches the network.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
+    /// Whether a prompt another bot or a named client sent reaches the
+    /// model without the line saying so after its words.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_senders: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -381,7 +385,8 @@ impl Settings {
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
-            "sandbox":self.sandbox,"writable":self.writable,"network":self.network})
+            "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
+            "hide_senders":self.hide_senders})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -5106,12 +5111,22 @@ impl Database {
                 bytes += size;
                 picture_bytes += pictured_size;
                 let id: i64 = row.get(0)?;
-                let images: Option<String> = self
+                let (images, sender) = self
                     .conn
-                    .prepare_cached("SELECT images FROM turns WHERE id=?")?
-                    .query_row([id], |r| r.get(0))?;
+                    .prepare_cached(
+                        "SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?",
+                    )?
+                    .query_row([id], |r| {
+                        Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+                    })?;
                 let pictures = images_from(images.as_deref())?;
-                let prompted = prompt_item(family, &row.get::<_, String>(1)?, &pictures)?;
+                let sender = sender.filter(|_| !bot.settings.hide_senders);
+                let prompted = prompt_item(
+                    family,
+                    &row.get::<_, String>(1)?,
+                    sender.as_deref(),
+                    &pictures,
+                )?;
                 // Its pictures count at their weight, as the node will.
                 let weight = (prompted.0.len() as i64 - prompted.1.extra) as usize;
                 if weight + 1 > room_bytes || room_items == 0 {
@@ -9112,6 +9127,21 @@ fn sender_fields(
         data["origin"] = json!(origin);
     }
 }
+/// The line a prompt carries to the model after its words when another
+/// bot's turn or a named client sent it, read from a turn's `from_bot`,
+/// `from_turn` and `origin` at `at`, so the model does not take it for a
+/// person's.
+fn sent_by(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<String>> {
+    let (bot, turn, origin): (Option<String>, Option<i64>, Option<String>) =
+        (r.get(at)?, r.get(at + 1)?, r.get(at + 2)?);
+    Ok(match (bot, turn, origin) {
+        (Some(bot), Some(turn), _) => Some(format!(
+            "[Written by the agent {bot} in turn:{bot}/{turn}, not by a person.]"
+        )),
+        (_, _, Some(origin)) => Some(format!("[Sent by {origin}.]")),
+        _ => None,
+    })
+}
 /// Put a turn's user item on the lineage and mark the bot busy with it,
 /// adding who sent it to `data`, the turn's `accepted` event.
 fn start_locked(
@@ -9121,11 +9151,14 @@ fn start_locked(
     prompt: &str,
     data: &mut Value,
 ) -> Result<Option<i64>> {
-    let images: Option<String> = tx
-        .prepare_cached("SELECT images FROM turns WHERE id=?")?
-        .query_row([turn], |r| r.get(0))?;
+    let (images, sender) = tx
+        .prepare_cached("SELECT images,from_bot,from_turn,origin FROM turns WHERE id=?")?
+        .query_row([turn], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, sent_by(r, 1)?))
+        })?;
     let pictures = images_from(images.as_deref())?;
-    let prompted = prompt_item(bot.family()?, prompt, &pictures)?;
+    let sender = sender.filter(|_| !bot.settings.hide_senders);
+    let prompted = prompt_item(bot.family()?, prompt, sender.as_deref(), &pictures)?;
     let head = prompt_node(tx, bot.head, &prompted, Some(turn))?;
     keep_once(tx, turn, images.as_deref())?;
     data["node"] = json!(head);
@@ -10325,15 +10358,16 @@ impl Pictured {
 fn prompt_item(
     family: Family,
     prompt: &str,
+    sender: Option<&str>,
     images: &[crate::codec::Image],
 ) -> Result<(Vec<u8>, Pictured, Option<Vec<u8>>)> {
-    let item = family.user_item_with(prompt, images)?;
+    let item = family.user_item_from(prompt, sender, images)?;
     let pictured = Pictured::of(images);
     let stub = match images.len() {
         0 => None,
         count => {
             let weight = (item.len() as i64 - pictured.extra) as usize;
-            super::context::prompt_stub(family, prompt, count, weight)?
+            super::context::prompt_stub(family, prompt, sender, count, weight)?
         }
     };
     Ok((item, pictured, stub))
