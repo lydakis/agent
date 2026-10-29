@@ -82,7 +82,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Write,
     path::PathBuf,
     sync::Arc,
@@ -1533,7 +1533,7 @@ struct App {
     /// Calls drawn folded into one, by number; and the one the last call
     /// went into, with the rows drawn by then, which the next call like
     /// it joins while nothing else was drawn.
-    folds: Vec<Fold>,
+    folds: BTreeMap<usize, Fold>,
     folding: Option<(usize, usize)>,
     /// Words between agents drawn quiet, by node: what was said, who
     /// said it, and whether a click opened it.
@@ -2146,7 +2146,7 @@ impl App {
             unsent: Vec::new(),
             ran_here: Vec::new(),
             screen: screen::Screen::default(),
-            folds: Vec::new(),
+            folds: BTreeMap::new(),
             folding: None,
             relayed: HashMap::new(),
             tasks: Vec::new(),
@@ -2172,6 +2172,10 @@ impl App {
                 welcome.push(Line::default());
             }
             self.any_history = true;
+            // What marks the history's rows moves down with them.
+            for (at, _) in &mut self.marks {
+                *at += welcome.len();
+            }
             self.pending.splice(0..0, welcome);
         }
         // A turn already running: its clock, and any call it waits on.
@@ -2803,24 +2807,37 @@ impl App {
         };
         if let Some((at, drawn)) = self.folding
             && drawn == self.rows_drawn
-            && self.folds[at].verb == verb
+            && let Some(fold) = self.folds.get_mut(&at)
+            && fold.verb == verb
         {
-            self.folds[at].whats.push(what.clone());
-            self.folds[at].calls.push(lines.clone());
+            fold.whats.push(what.clone());
+            fold.calls.push(lines.clone());
             if self.draw_fold(at) {
                 return;
             }
             // Gone from the conversation: this call starts a fold of its own.
-            self.folds[at].whats.pop();
-            self.folds[at].calls.pop();
+            self.folds.remove(&at);
         }
-        let at = self.folds.len();
-        self.folds.push(Fold {
-            verb,
-            whats: vec![what],
-            calls: vec![lines.clone()],
-            open: false,
-        });
+        // Folds whose rows the conversation let go keep nothing: the
+        // oldest go first, as rows do.
+        while let Some(&first) = self.folds.keys().next() {
+            let tag = screen::Tag::Group(first as u64);
+            let waiting = (self.marks.iter()).any(|(_, mark)| *mark == screen::Mark::Tag(tag));
+            if waiting || self.screen.has(tag) {
+                break;
+            }
+            self.folds.remove(&first);
+        }
+        let at = self.folds.keys().next_back().map_or(0, |at| at + 1);
+        self.folds.insert(
+            at,
+            Fold {
+                verb,
+                whats: vec![what],
+                calls: vec![lines.clone()],
+                open: false,
+            },
+        );
         let from = self.pending.len() + usize::from(self.any_history);
         self.commit(lines);
         let tag = screen::Mark::Tag(screen::Tag::Group(at as u64));
@@ -2934,10 +2951,10 @@ impl App {
         for bot in bots {
             let read = self
                 .client
-                .request("turns", json!({"bot": bot, "newest": true, "limit": 1}))
+                .request("turns", json!({"bot": bot, "newest": true, "limit": 8}))
                 .await;
             let state = match read {
-                Ok(page) => started::state(&page["turns"][0]),
+                Ok(page) => started::state(&self.task_turn(&page).await),
                 Err(error) if error.code == "bot_not_found" => "removed".to_owned(),
                 // Not read this time: it stays as it was.
                 Err(_) => continue,
@@ -2958,6 +2975,27 @@ impl App {
                 self.draw_started(at);
             }
         }
+    }
+
+    /// The turn that says what a task does, from its newest `turns`: a
+    /// message steered into a running turn is a turn of its own, settled
+    /// at once, so the turn it joined is read instead. A failed one with
+    /// why it failed, which `turns` leaves out, as `wait` has it.
+    async fn task_turn(&self, page: &Value) -> Value {
+        let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
+        let Some(turn) = turns.iter().find(|t| t["status"] != "steered") else {
+            return turns.first().cloned().unwrap_or(Value::Null);
+        };
+        let mut turn = turn.clone();
+        if turn["status"] == "failed"
+            && let Some(handle) = turn["handle"].as_str().map(str::to_owned)
+            && let Ok(answer) = (self.client)
+                .request("wait", json!({"handles": [handle], "timeout_ms": 0}))
+                .await
+        {
+            turn["error"] = answer["results"][&handle]["error"].clone();
+        }
+        turn
     }
 
     /// The task `bot` opened in the pane: its own Sonny, to watch it and
@@ -3004,7 +3042,9 @@ impl App {
     /// The calls folded at `at` drawn again where they are, folded or
     /// open; whether they are still in the conversation.
     fn draw_fold(&mut self, at: usize) -> bool {
-        let fold = &self.folds[at];
+        let Some(fold) = self.folds.get(&at) else {
+            return false;
+        };
         let lines = transcript::quiet(transcript::folded(
             &fold.verb,
             &fold.whats,
@@ -3027,9 +3067,9 @@ impl App {
         if let Some(at) = button
             .strip_prefix("fold/")
             .and_then(|at| at.parse::<usize>().ok())
-            .filter(|at| *at < self.folds.len())
+            && let Some(fold) = self.folds.get_mut(&at)
         {
-            self.folds[at].open = !self.folds[at].open;
+            fold.open = !fold.open;
             self.draw_fold(at);
         }
         if let Some(bot) = button.strip_prefix("task/") {
@@ -8297,6 +8337,9 @@ mod tests {
             let n = read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match asked["bot"].as_str() {
                 Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
+                // A message steered into a running turn: the task still works.
+                Some("calc.neg") if n < 3 => json!({"turns": [
+                    {"turn": 2, "status": "steered"}, {"turn": 1, "status": "running"}]}),
                 Some("calc.gone") => json!({"error": "bot_not_found"}),
                 // The daemon not there for a moment, then there again.
                 _ if (3..5).contains(&n) => json!({"error": "daemon_unavailable"}),
@@ -8332,6 +8375,33 @@ mod tests {
         let links = app.screen.links();
         assert_eq!(links[0], None);
         assert_eq!(links[2].as_deref(), Some("sonny:task/calc.neg"));
+    }
+
+    #[tokio::test]
+    async fn a_task_that_ended_with_nothing_to_say_is_done() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("wait") => json!({"results": {"turn:calc.quiet/1":
+                {"status": "failed", "error": "empty_completion"}}}),
+            _ => match asked["bot"].as_str() {
+                Some("calc.quiet") => json!({"turns": [
+                    {"turn": 1, "status": "failed", "handle": "turn:calc.quiet/1"}]}),
+                _ => {
+                    json!({"turns": [{"turn": 1, "status": "failed", "handle": "turn:calc.bad/1"}]})
+                }
+            },
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        for name in ["quiet", "bad"] {
+            let arguments = json!({"name": name, "brief": format!("Fix {name}")});
+            let output = format!("turn:calc.{name}/1");
+            app.commit_call("c", served::START, &arguments, &output, false);
+        }
+        app.read_tasks().await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[1], "  ✓ quiet  done    Fix quiet");
+        assert_eq!(rows[2], "  ✗ bad    failed  Fix bad");
     }
 
     #[tokio::test]
