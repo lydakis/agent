@@ -3820,6 +3820,11 @@ impl App {
         self.any_history = true;
         if let Some(node) = live.node {
             self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
+            // The person's reactions made while it was being written.
+            if let Some(row) = self.reacted_row(node) {
+                self.commit_after(vec![row], false);
+                self.mark_last(screen::Mark::Tag(screen::Tag::Reactions(node)));
+            }
         }
     }
 
@@ -3933,8 +3938,12 @@ impl App {
                 }
                 self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
-                self.bot_reactions.clear();
-                self.answering = None;
+                // A turn the history drew still answers the message it
+                // drew, with what the bot reacted to it with so far.
+                if !drawn {
+                    self.bot_reactions.clear();
+                    self.answering = None;
+                }
                 if !drawn
                     && let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -6104,39 +6113,10 @@ impl App {
     }
 
     /// The bot's reactions so far to the person's message, right under
-    /// it; or, when that message is no longer in the conversation, under
-    /// what was drawn last, with a row of their own that says which.
+    /// it, wherever it is: never a row of their own. A message no longer
+    /// in the conversation, or not drawn yet, shows them once it is.
     fn draw_bot_reactions(&mut self) {
-        if self.place_bot_reactions() {
-            return;
-        }
-        let on = std::mem::take(&mut self.bot_reactions);
-        if on.is_empty() {
-            return;
-        }
-        let emoji = on.join(" ");
-        match &self.answering {
-            Some((_, at, _)) if *at == self.rows_drawn => {
-                self.commit_after(vec![transcript::reacted(&emoji)], false);
-            }
-            answering => {
-                let what = match answering {
-                    Some((first, ..)) => format!("↳ reacted {emoji} to “{first}”"),
-                    None => format!("↳ reacted {emoji}"),
-                };
-                let rows = transcript::wrap(
-                    Line::from(what),
-                    self.prose(),
-                    Span::raw("  "),
-                    Span::raw("    "),
-                );
-                self.commit(transcript::quiet(rows));
-            }
-        }
-        // Another reaction now goes under this one's row.
-        if let Some((_, at, _)) = &mut self.answering {
-            *at = self.rows_drawn;
-        }
+        self.place_bot_reactions();
     }
 
     /// The bot's reactions so far, none included, as the row under the
@@ -6216,22 +6196,15 @@ impl App {
         if self.put_under(screen::Tag::End(node), screen::Tag::Reactions(node), row) {
             return;
         }
-        if added && last && self.running.is_none() {
-            self.commit_after(vec![transcript::reacted(&emoji)], false);
+        // A reply still being written gets them under it once it is; one
+        // not drawn here, once it is drawn.
+        if (self.live.as_ref()).is_some_and(|live| live.node == Some(node)) {
             return;
         }
-        let what = if added {
-            format!("↳ {emoji} on “{first}”")
-        } else {
-            format!("↳ took back {emoji} on “{first}”")
-        };
-        let rows = transcript::wrap(
-            Line::from(what),
-            self.prose(),
-            Span::raw("  "),
-            Span::raw("    "),
-        );
-        self.commit(transcript::quiet(rows));
+        self.notice = Some(match added {
+            true => format!("{emoji} on “{first}”"),
+            false => format!("took back {emoji} on “{first}”"),
+        });
     }
 
     /// `/side`: a side chat with a copy of this bot, taken where it is now,
@@ -8124,17 +8097,18 @@ mod tests {
         let mut app = app(client);
         app.turn_model = Some("opus".into());
         app.any_history = true;
-        let rows = |app: &mut App| {
-            std::mem::take(&mut app.pending)
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-        };
         app.input.set("👍");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("no reply to react to yet"));
-        app.saw_reply(4, "Merged it.\nThe notes are updated.");
-        app.saw_reply(8, "Tagged 0.4.0.");
+        for (node, reply) in [
+            (4, "Merged it.\nThe notes are updated."),
+            (8, "Tagged 0.4.0."),
+        ] {
+            let lines = transcript::reply(reply, 80, std::path::Path::new("/"));
+            app.commit_said(node, lines);
+            app.saw_reply(node, reply);
+        }
+        app.flush();
         // The last reply: the emoji alone, attached, right under it.
         app.input.set(":+1:");
         app.submit().await;
@@ -8143,7 +8117,11 @@ mod tests {
         assert_eq!(first["delivery"], "attach");
         assert!(first["model"].is_null() && first["workspace"].is_null());
         assert!(app.input.is_empty());
-        assert_eq!(rows(&mut app), ["   👍 "], "no blank row above it");
+        assert_eq!(
+            drawn(&mut app)[4..],
+            ["• Tagged 0.4.0.", "   👍 "],
+            "no blank row above it"
+        );
         assert_eq!(app.reactions.on(8), ["👍"]);
         app.daemon(turn_event("attached", 9, json!({}))).await;
         assert_eq!(app.notice, None, "a reaction attaching says nothing");
@@ -8157,18 +8135,31 @@ mod tests {
         app.input.set("🎉");
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[1]["prompt"], "> Merged it.\n\n🎉");
-        assert_eq!(rows(&mut app), ["", "  ↳ 🎉 on “Merged it.”"]);
+        let rows = drawn(&mut app);
+        assert_eq!(
+            rows[1..4],
+            ["• Merged it.", "  The notes are updated.", "   🎉 "],
+            "{rows:?}"
+        );
         // The same emoji again takes it off, telling the bot nothing.
         app.input.set("👍");
         app.submit().await;
         assert_eq!(sent.lock().unwrap().len(), 2);
-        assert_eq!(rows(&mut app), ["", "  ↳ took back 👍 on “Tagged 0.4.0.”"]);
+        assert_eq!(drawn(&mut app).last().unwrap(), "• Tagged 0.4.0.");
         assert!(app.reactions.on(8).is_empty());
+        // A reply no longer in the conversation gets it all the same, and
+        // no row says so: the footer does.
+        app.saw_reply(10, "Gone.");
+        app.input.set("🚀");
+        app.submit().await;
+        assert_eq!(app.reactions.on(10), ["🚀"]);
+        assert_eq!(drawn(&mut app).last().unwrap(), "• Tagged 0.4.0.");
+        assert_eq!(app.notice.as_deref(), Some("🚀 on “Gone.”"));
         // Words with an emoji are a message, sent as one.
         app.input.set("👍 ship it");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[2]["prompt"], "👍 ship it");
-        assert!(sent.lock().unwrap()[2]["delivery"].is_null());
+        assert_eq!(sent.lock().unwrap()[3]["prompt"], "👍 ship it");
+        assert!(sent.lock().unwrap()[3]["delivery"].is_null());
     }
 
     #[tokio::test]
@@ -8283,7 +8274,7 @@ mod tests {
         assert!(rows[6].starts_with("─ Worked"), "{rows:?}");
         assert_eq!(rows[7..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
-        // goes under what was drawn last, saying which message.
+        // to it draws no row of its own.
         app.seen_node = 0;
         app.daemon(turn_event("accepted", 3, json!({"node": 5})))
             .await;
@@ -8300,10 +8291,44 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert_eq!(
-            drawn(&mut app).last().map(String::as_str),
-            Some("  ↳ reacted 👀 to “and the notes?”")
-        );
+        let rows = drawn(&mut app);
+        assert!(!rows.iter().any(|row| row.contains("👀")), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn a_running_turn_the_history_drew_reacts_under_its_message() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let react = |id: &str, emoji: &str| {
+            turn_event(
+                "tool_started",
+                4,
+                json!({"call_id": id, "name": "react",
+                    "arguments": json!({"emoji": emoji}).to_string()}),
+            )
+        };
+        // Attached mid-turn: the history drew the message and what the bot
+        // reacted with so far, and the turn's start comes again after it.
+        app.land(5, "ship it", None, false);
+        app.daemon(react("c1", "👀")).await;
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c1"})))
+            .await;
+        app.seen_node = 5;
+        app.daemon(turn_event("accepted", 4, json!({"node": 5})))
+            .await;
+        app.commit(vec![Line::from("• Ran the tests")]);
+        app.daemon(react("c2", "👍")).await;
+        app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c2"})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let rows = drawn(&mut app);
+        assert_eq!(rows[..2], ["› ship it", "   👀 👍 "], "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("reacted")), "{rows:?}");
     }
 
     #[tokio::test]
