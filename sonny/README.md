@@ -313,8 +313,9 @@ off again never shows.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`) through them and its default; Enter types one that takes a
-  name (`model`, `provider`, `judge.model`), empty for its default; ⌫
+  `senders`, `side_chat`, `chime`, `verbose`) through them and its
+  default; Enter types one that takes a name (`model`, `provider`,
+  `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it.
