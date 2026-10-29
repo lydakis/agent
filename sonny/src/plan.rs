@@ -5,6 +5,13 @@ use serde_json::{Value, json};
 /// The name of the tool a bot sets its plan with.
 pub const TOOL: &str = "plan";
 
+/// The steps a `plan` call sets, none clearing the plan.
+pub fn steps(arguments: &Value) -> Option<Vec<String>> {
+    (arguments["steps"].as_array()?.iter())
+        .map(|step| step.as_str().map(str::to_owned))
+        .collect()
+}
+
 /// The `plan` tool as Sonny declares it on a bot.
 pub fn tool() -> Value {
     json!({

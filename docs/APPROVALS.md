@@ -730,17 +730,17 @@ so only one instance runs at a time, and answers in layers:
 
 #### Which model judges
 
-The approver and Sonny's lookout pick their judge the same way, in
+The approver picks its judge in
 `agent_client::judge`: `agent approver --judge PROVIDER/MODEL`, else
 `[judge] model` in `~/.agent/config.toml`, else the bot's own model:
 `AGENT_MODEL` for `agent approver`, the bot's model for the approver the
 CLI starts. No smaller model is guessed for a provider (George,
 2026-10-27): a cheaper judge is one the config names. `[judge]` is the one
-decision-model setting, which the lookout reads too; its `effort` sets a
-model judge's effort for both (`agent approver --effort` over it), and
-unset it is the model's own. Jev was dropped on
-2026-10-27 (George's call): nobody ran it, and on the lookout it woke the
-lead correctly 0.47 of the time against `gpt-6-luna`'s 0.92.
+decision-model setting; its `effort` sets a model judge's effort
+(`agent approver --effort` over it), and unset it is the model's own. Jev
+was dropped on 2026-10-27 (George's call): nobody ran it, and on the
+lookout's old judge it woke the lead correctly 0.47 of the time against
+`gpt-6-luna`'s 0.92.
 
 - **OpenAI's Decisions API** (`openai-decisions/gpt-6-luna`, key
   `OPENAI_API_KEY`) is called from the approver on `POST /v1/decisions`: the

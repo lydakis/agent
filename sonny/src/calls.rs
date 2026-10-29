@@ -215,6 +215,7 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
         }
         Some("rm") => ("Removed from memory".into(), name()),
         Some("read") => ("Read from memory".into(), name()),
+        Some("said") => ("Read what the person wrote".into(), String::new()),
         Some(other) => (format!("Used memory {other}"), String::new()),
     };
     Said {
@@ -742,6 +743,7 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                 (None, None, Some(read)) => said("Read from memory", read),
                 _ if arguments["index"] == true => said("Indexed memory", ""),
                 _ if arguments["check"] == true => said("Checked memory", ""),
+                _ if arguments["said"] == true => said("Read what the person wrote", ""),
                 _ if arguments.get("cleanup").is_some() || arguments["changed"] == true => {
                     said("Cleaned up memory", "")
                 }
@@ -823,8 +825,26 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     }
 }
 
+/// A `plan` call said in one row: how far it has got and the step under
+/// way, as an earlier plan reads once a newer one shows in full.
+pub fn plan_short(items: &[String]) -> Said {
+    let mut said = plan(items);
+    said.under.clear();
+    if items.is_empty() {
+        return said;
+    }
+    let done = items.iter().filter(|item| item.starts_with("[x]")).count();
+    let doing = (items.iter()).find_map(|item| item.strip_prefix("[>]").map(str::trim));
+    said.what = match doing {
+        _ if done == items.len() => format!("· all {done} done"),
+        Some(step) => format!("· {done}/{} · → {step}", items.len()),
+        None => format!("· {done}/{}", items.len()),
+    };
+    said
+}
+
 /// A `plan` call, as the plan it sets; no steps clears it.
-fn plan(items: &[String]) -> Said {
+pub fn plan(items: &[String]) -> Said {
     let mut said = Said {
         verb: "Updated the plan".into(),
         what: String::new(),

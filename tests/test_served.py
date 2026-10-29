@@ -38,7 +38,7 @@ class ServedToolTests(ModelFixture):
         env = {**clean_env(), 'HOME': str(self.path), 'AGENT_BIN': str(self.binary),
                'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com',
                'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com', **extra}
-        service = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'off', '--store', str(self.store),
+        service = subprocess.Popen([str(self.sonny), 'lookout', '--store', str(self.store),
                                     '--socket', str(self.daemon.socket_path)],
                                    env=env, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (service.kill(), service.wait(timeout=5), service.stdout.close()))

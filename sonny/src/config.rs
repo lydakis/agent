@@ -55,7 +55,7 @@ pub const SETTINGS: [Setting; 14] = [
     },
     Setting {
         key: "judge.model",
-        about: "who judges for auto approvals and the lookout (provider/model)",
+        about: "who judges for auto approvals (provider/model)",
         values: &[],
         default: "the agent's own model",
     },

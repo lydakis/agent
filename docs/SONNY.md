@@ -292,7 +292,7 @@ Memory is what earlier agents learned that a later one needs: decisions,
 the person's preferences and corrections, traps, pointers. Each fact is one
 Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
-`verified`). The person's facts are in `~/.agents/memory`, a project's in
+`verified`, and `external` when it is so). The person's facts are in `~/.agents/memory`, a project's in
 `~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
 task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
@@ -312,10 +312,11 @@ each time it starts, a script that runs it as
 ```sh
 ~/.agent/memory show [SCOPE]
 ~/.agent/memory read NAME [SCOPE]
-~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [SCOPE] -- TEXT|-
+~/.agent/memory save NAME --type TYPE --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-
 ~/.agent/memory rm NAME [SCOPE]
 ~/.agent/memory index [SCOPE]
 ~/.agent/memory check [SCOPE]
+~/.agent/memory said [SINCE_MS]
 ~/.agent/memory changed | cleanup start | cleanup finish
 ~/.agent/memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']
   SCOPE: --user | --project NAME; none: the project of this folder
@@ -339,6 +340,33 @@ that is out of date without changing anything; `index` rewrites the index,
 and refuses with `memory_full` an index of hand-added facts past 16 KiB. A
 removal reads the folder before deleting anything, and text piped on stdin
 past 16 KiB is `fact_too_large` rather than cut.
+
+A save the memory tool answers in a turn that had already read outside
+content, a provider's web search or fetch, `web_fetch`, or an MCP server
+through `exec`, is marked `external: true` in its front matter and
+`, external` in its index line, as Codex leaves out of memory the sessions
+that used MCP or web search and OpenClaw's dreaming drops untrusted
+sources. Sonny reads the whole turn so far, whichever provider stored its
+calls; a turn whose history, or an item of it, it cannot read counts as
+having read. The tool's `save` takes `external` and the script
+`--external` for the same. Agents treat such a fact as a lead to check,
+and the cleanup removes one that reads as an instruction to agents and
+keeps the mark on one it merges or re-dates. Saving the fact again
+without it, say on the person's word, clears the mark.
+
+The cleanup also reads what the person wrote to any agent since the last
+finished cleanup started (`finish` keeps that time in `.said`, out of git,
+and `cleanup start` gives it as `since_ms`, null the first night, when it
+looks back a day; a refused cleanup leaves it, so its night is read again): the memory tool's `said` with
+`since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
+daemon: every message in a turn that ran since then that carries no other
+agent's or named client's mark, steers included, newest first and at most
+56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
+that turn ran in. It saves what no
+agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
+the day's notes, taking only the person's own words and their scope, as
+Codex's extraction does. The trigger still wakes it only when memory
+changed; words from a quiet night are read the next time it runs.
 
 `read` gives one fact's whole file as `text` and records the read in the
 folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
@@ -421,7 +449,24 @@ Triggers); and, depending on where it runs, `pictures`, `rex-windows`,
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
 while it is as Sonny last wrote it: one the person edited, or one of that
 name Sonny never noted writing, is theirs and left alone (remove its folder
-to get Sonny's). A link the Agent app left there, into its bundle's
+to get Sonny's).
+
+When Sonny brings new text for a skill or role (`lead.md`, `task.md`) that
+the person edited, it writes that text beside theirs, in
+`~/.agent/sonny/upgrades/skills/NAME` or `upgrades/agents/NAME.md`, and
+notes it in `upgrades/pending`. Sonny also keeps whole what it last wrote
+of each, in `~/.agent/sonny/shipped`, which is what an edit started from.
+The first bot Sonny opens after that (not a side chat) is sent a note,
+queued after any turn it runs, naming the person's copy, Sonny's new text
+and the text the person started from, and asking it to offer the person a
+merge. The transcript shows it as one row, `↳ Sonny upgraded · lead role
+edited`. Each new text is told once, by one Sonny of several starting at
+once, and nothing is told when the person edits a file Sonny's text has
+not changed since; a copy left the same as it is Sonny's
+again from the next start. A file of the person's own that Sonny never
+wrote, or a link, is not offered.
+
+A link the Agent app left there, into its bundle's
 `Contents/Resources/skills`, is replaced, never written through; a folder's
 own skill of the same name wins over any of them. Agents already running
 keep the index they were created with.

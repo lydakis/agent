@@ -130,8 +130,8 @@ class AcpTests(ModelFixture):
                     'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com',
                     'T3_ACP_MCP_ENDPOINT': f'http://127.0.0.1:{self.t3.server_port}/mcp',
                     'T3_ACP_MCP_AUTHORIZATION': 'Bearer thread-1'}
-        # The lookout the threads find running, judging nothing.
-        lookout = subprocess.Popen([str(self.sonny), 'lookout', '--judge', 'off', '--store', str(self.store),
+        # The lookout the threads find running.
+        lookout = subprocess.Popen([str(self.sonny), 'lookout', '--store', str(self.store),
                                     '--socket', str(self.daemon.socket_path)],
                                    env=self.env, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (lookout.kill(), lookout.wait(timeout=5), lookout.stdout.close()))
@@ -285,15 +285,22 @@ class AcpTests(ModelFixture):
         (self.path / '.agent').mkdir(exist_ok=True)
         (self.path / '.agent' / 'models').write_text(
             'openai/synthetic-model\nopenai/other-model # faster\nanthropic/claude-x\n')
-        self.model.models = ('synthetic-model', 'other-model')
+        # The provider lists a model the file does not name yet.
+        self.model.models = ('synthetic-model', 'other-model', 'newer-model')
+        self.model.context_window = 1_000_000
         thread, session = self.open(repo)
-        [option] = self.opened['result']['configOptions']
+        option, effort = self.opened['result']['configOptions']
         # T3 Code reads `id` even on version 2, which names it `configId`.
         self.assertEqual((option['id'], option['configId'], option['category'], option['currentValue']),
                          ('model', 'model', 'model', 'default'))
         self.assertEqual([c['value'] for c in option['options']],
-                         ['default', 'openai/synthetic-model', 'openai/other-model', 'anthropic/claude-x'])
+                         ['default', 'openai/synthetic-model', 'openai/other-model', 'openai/newer-model',
+                          'anthropic/claude-x'])
         self.assertEqual(option['options'][2]['description'], 'faster')
+        self.assertEqual((effort['id'], effort['category'], effort['currentValue']),
+                         ('effort', 'thought_level', 'default'))
+        self.assertEqual([c['value'] for c in effort['options']],
+                         ['default', 'low', 'medium', 'high', 'xhigh'])
         # Picked before there is a lead: the lead Sonny makes runs it.
         picked, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'openai/other-model'}))
@@ -305,10 +312,10 @@ class AcpTests(ModelFixture):
         self.assertEqual((lead['provider'], lead['model']), ('openai', 'other-model'))
         # A lead's thread offers its family's models only.
         [shown] = [u for u in updates if u['sessionUpdate'] == 'config_option_update']
-        [option] = shown['configOptions']
+        option, _ = shown['configOptions']
         self.assertEqual(option['currentValue'], 'openai/other-model')
         self.assertEqual([c['value'] for c in option['options']],
-                         ['default', 'openai/synthetic-model', 'openai/other-model'])
+                         ['default', 'openai/synthetic-model', 'openai/other-model', 'openai/newer-model'])
         refused, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'anthropic/claude-x'}))
         self.assertEqual(refused['error']['code'], -32602)
@@ -317,6 +324,26 @@ class AcpTests(ModelFixture):
             'sessionId': session, 'configId': 'model', 'type': 'id', 'value': 'openai/synthetic-model'}))
         self.assertEqual(switched['result']['configOptions'][0]['currentValue'], 'openai/synthetic-model')
         self.assertEqual(self.daemon.request('inspect', bot='calc.lead')['result']['model'], 'synthetic-model')
+        # An effort the family takes, at once too; one it does not is refused.
+        refused, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'effort', 'type': 'id', 'value': 'max'}))
+        self.assertEqual(refused['error']['code'], -32602)
+        raised, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'effort', 'type': 'id', 'value': 'high'}))
+        self.assertEqual(raised['result']['configOptions'][1]['currentValue'], 'high')
+        lead = self.daemon.request('inspect', bot='calc.lead')['result']
+        self.assertEqual((lead['model'], lead['effort']), ('synthetic-model', 'high'))
+        # Another thread in the folder opens on T3 Code's last pick: the
+        # lead that is there keeps its own.
+        other, again = self.open(repo)
+        for option, value in (('model', 'openai/other-model'), ('effort', 'low')):
+            other.answer_of(other.ask('session/set_config_option', {
+                'sessionId': again, 'configId': option, 'type': 'id', 'value': value}))
+        answered, _ = other.answer_of(other.ask('session/prompt', {'sessionId': again,
+                                                                    'prompt': self.wrapped('again')}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        lead = self.daemon.request('inspect', bot='calc.lead')['result']
+        self.assertEqual((lead['model'], lead['effort']), ('synthetic-model', 'high'))
 
     def test_a_thread_sonny_does_not_know_does_not_come_back(self):
         repo = self.repo()

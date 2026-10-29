@@ -161,18 +161,18 @@ fn project() -> Value {
 }
 
 fn subscriptions() -> Value {
-    let questions: Vec<&str> = crate::lookout::QUESTIONS.iter().map(|q| q.id).collect();
     json!({
         "name": SUBSCRIPTIONS,
-        "description": "Your subscriptions in the person's lookout, which watches agents for you and wakes you \
-            with a note starting \"Task updates\" when one needs you. Each watches the tasks of a bot (every \
-            agent it or its tasks made) or bots by name, and asks a judge model the lookout's built-in \
-            questions about what they say and how their turns end, or what you look for in your own words, \
-            with what you do on a yes. It also hears the sources the person set up outside (a chat, a mailbox, \
-            a feed), each by name, in a note starting \"From your sources\": every event, unjudged, at once when \
-            the source marks it urgent. A note that names a subscription means do what it says. Add one, or remove one by name; with \
-            neither, or after either, the result lists them all, with the sources there are. Adding one again \
-            changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
+        "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
+            what happens in them in a note starting \"Task updates\": every message someone other than you \
+            writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
+            The person's own words cut into your running turn; the rest waits until your turn ends. Each \
+            watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
+            sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
+            \"From your sources\": every event, at once when the source marks it urgent. Add one, or remove \
+            one by name; with neither, or after either, the result lists them all, with the sources there \
+            are. Adding one again changes nothing; one by a name in use that differs is refused with the \
+            field, so remove it first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -183,31 +183,10 @@ fn subscriptions() -> Value {
                         "tasks_of": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Bots it watches by name, * matching any run of characters."},
+                            "description": "Bots it watches by name, * matching any run of characters; \
+                                another lead, which has subscriptions of its own, counts only where named as it is."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Sources it hears, by name: every event each says. A \
-                                subscription with sources looks for nothing."},
-                        "on": {"type": "array", "items": {"type": "string", "enum": ["said", "ended"]},
-                            "description": "What it watches: what the bots say, how their turns end; both \
-                                when left out."},
-                        "ask": {"type": "array", "items": {"type": "string", "enum": questions},
-                            "description": "Which built-in questions it asks; every one that fits when left \
-                                out, unless it looks for something of its own."},
-                        "look_for": {"type": "array", "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string", "minLength": 1, "description": "What to look for."},
-                                "then": {"type": "string", "minLength": 1, "description": "What you do on a yes."},
-                                "urgent": {"type": "boolean", "description": "A yes cuts into your running turn."}
-                            },
-                            "required": ["text", "then"],
-                            "additionalProperties": false
-                        }},
-                        "context": {"type": "string", "minLength": 1,
-                            "description": "A line every check reads: what you care about."},
-                        "updates": {"type": "boolean",
-                            "description": "Also hear, unjudged, how the turns of the bots it watches end, as you hear \
-                                your tasks'; another lead counts only where bots names it as it is."}
+                            "description": "Sources it hears, by name: every event each says."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -310,7 +289,9 @@ fn memory() -> Value {
                 "source": {"type": "string", "minLength": 1,
                     "description": "Where it comes from: turn:BOT/N, a commit, path:line, or the person and a date."},
                 "text": {"type": "string", "minLength": 1,
-                    "description": "The fact, then Why: and, where it helps, How to apply:."}
+                    "description": "The fact, then Why: and, where it helps, How to apply:."},
+                "external": {"type": "boolean",
+                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
@@ -322,6 +303,9 @@ fn memory() -> Value {
         "check": {"type": "boolean",
             "description": "Report files that are not valid facts and an index out of date."},
         "changed": {"type": "boolean", "description": "For the nightly cleanup only."},
+        "said": {"type": "boolean",
+            "description": "For the nightly cleanup only: what the person wrote to any agent since since_ms, else over the last day."},
+        "since_ms": {"type": "integer", "description": "With said: unix milliseconds."},
         "cleanup": {"type": "string", "enum": ["start", "finish"], "description": "For the nightly cleanup only."}
     });
     if let (Value::Object(properties), Value::Object(scope)) = (&mut properties, scope) {
@@ -484,6 +468,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
         }
+        MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
+            .await
+            .map(|said| said.to_string())
+            .map_err(|e| ("memory_refused", e)),
         MEMORY => {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -701,6 +689,48 @@ fn left(call: &Value) -> Duration {
     Duration::from_millis(expires.saturating_sub(now))
 }
 
+/// Whether turn `turn` of `bot` has read outside content so far, so a fact
+/// it saves may carry words no person wrote, as Codex leaves out of memory
+/// the sessions that used MCP or web search. A turn whose history, or an
+/// item of it, cannot be read counts as having read.
+async fn read_outside(client: &Client, bot: &str, turn: i64) -> bool {
+    let mut read = false;
+    let walked = crate::said::walk(client, bot, turn, |_, entry| {
+        // An item too large to read back may be what came in.
+        read = entry["item"].is_null() || outside(&entry["item"]);
+        read
+    })
+    .await;
+    walked.is_err() || read
+}
+
+/// A history item that brought in outside content: a provider's own web
+/// search or fetch, `web_fetch`, or an MCP server through `exec`, as any
+/// provider stores the call.
+fn outside(item: &Value) -> bool {
+    let hosted = item["content"].as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            part["type"]
+                .as_str()
+                .is_some_and(|kind| kind == "server_tool_use" || kind.ends_with("_tool_result"))
+        })
+    });
+    hosted
+        || crate::responses(item)
+            .iter()
+            .any(|call| match call["type"].as_str() {
+                Some("web_search_call") => true,
+                Some("function_call") => {
+                    call["namespace"] == "web"
+                        || matches!(
+                            call["name"].as_str(),
+                            Some("web_fetch" | "web_search" | crate::exec::NAME)
+                        )
+                }
+                _ => false,
+            })
+}
+
 /// One call answered by `sonny tool NAME`, run as the calling agent's shell
 /// would run it, and stopped when the call's time is up.
 async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: &Path) -> Answer {
@@ -787,15 +817,20 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     if let Some(bin) = crate::agent_bin() {
         command.env("AGENT_BIN", bin);
     }
+    let mut arguments = call["arguments"].clone();
+    if call["name"] == MEMORY
+        && arguments["save"].is_object()
+        && read_outside(client, bot, turn).await
+    {
+        arguments["save"]["external"] = json!(true);
+    }
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
     let group = child.id().map(Group::new);
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        let _ = stdin
-            .write_all(call["arguments"].to_string().as_bytes())
-            .await;
+        let _ = stdin.write_all(arguments.to_string().as_bytes()).await;
     }
     let output = tokio::time::timeout(left(call), child.wait_with_output())
         .await
@@ -897,6 +932,41 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outside_content_is_a_search_a_fetched_page_or_an_mcp_server() {
+        let read = [
+            json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+            json!({"type": "function_call", "namespace": "web", "name": "run", "call_id": "c1"}),
+            json!({"type": "function_call", "name": "web_fetch", "call_id": "c2"}),
+            json!({"type": "custom_tool_call", "name": "exec", "call_id": "c3"}),
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"}]}),
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_2"}]}),
+            // Anthropic keeps the daemon's own tools' calls in its message.
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Reading."},
+                {"type": "tool_use", "id": "t2", "name": "web_fetch", "input": {}}]}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t3", "name": "exec", "input": {}}]}),
+        ];
+        for item in &read {
+            assert!(outside(item), "{item}");
+        }
+        let own = [
+            json!({"type": "function_call", "name": "shell", "call_id": "c4"}),
+            json!({"type": "function_call", "namespace": "other", "name": "run", "call_id": "c5"}),
+            json!({"type": "function_call_output", "call_id": "c2", "output": "page"}),
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1"}, {"type": "input_text", "text": "hi"}]}),
+            json!({"type": "reasoning"}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t4", "name": "shell", "input": {}}]}),
+        ];
+        for item in &own {
+            assert!(!outside(item), "{item}");
+        }
+    }
 
     #[test]
     fn a_lead_answers_more_than_its_tasks_and_keeps_its_own() {
