@@ -2004,6 +2004,10 @@ impl Fleet {
                 // whether a turn the lookout started said anything.
                 "done" if bot == self.lead => None,
                 "done" => Some((sound::Alert::TaskDone, format!("{short} is done"))),
+                started::QUIET => Some((
+                    sound::Alert::TaskDone,
+                    format!("{short} is done, saying nothing"),
+                )),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
                 "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
                 _ => None,
@@ -2113,7 +2117,9 @@ impl Fleet {
                         bot,
                         match data["status"].as_str() {
                             Some("completed" | "steered") => "done",
-                            Some("failed") if data["error"] == EMPTY => "done",
+                            // A lead says nothing to news by design.
+                            Some("failed") if data["error"] == EMPTY && bot == self.lead => "done",
+                            Some("failed") if data["error"] == EMPTY => started::QUIET,
                             Some("interrupted") => "stopped",
                             _ => "failed",
                         },
@@ -3219,15 +3225,19 @@ impl App {
     /// message steered into a running turn is a turn of its own, settled
     /// at once, so the turn it joined is read instead, and one attached to
     /// the next call (a reaction) waits for work that is not there, so the
-    /// turn before it is read too. A failed one with
-    /// why it failed, which `turns` leaves out, as `wait` has it.
+    /// turn before it is read too. A failed one with why it failed.
     async fn task_turn(&self, page: &Value) -> Value {
         let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
         let passive = |t: &&Value| matches!(t["status"].as_str(), Some("steered" | "attached"));
         let Some(turn) = turns.iter().find(|t| !passive(t)) else {
             return turns.first().cloned().unwrap_or(Value::Null);
         };
-        let mut turn = turn.clone();
+        self.with_error(turn.clone()).await
+    }
+
+    /// A failed `turn` with why it failed, which `turns` leaves out, as
+    /// `wait` has it: a model that said nothing is no failure.
+    async fn with_error(&self, mut turn: Value) -> Value {
         if turn["status"] == "failed"
             && let Some(handle) = turn["handle"].as_str().map(str::to_owned)
             && let Ok(answer) = (self.client)
@@ -4783,11 +4793,16 @@ impl App {
             let ran = turns
                 .iter()
                 .find(|turn| !matches!(turn["status"].as_str(), Some("steered" | "attached")))
-                .unwrap_or(&Value::Null);
+                .cloned()
+                .unwrap_or(Value::Null);
             let running = !bot["running_turn"].is_null();
+            let ran = match running {
+                true => ran,
+                false => self.with_error(ran).await,
+            };
             let state = match (
                 running,
-                if running { &turn } else { ran }["status"].as_str(),
+                if running { &turn } else { &ran }["status"].as_str(),
             ) {
                 (true, Some("waiting")) if turn["waiting_on"]["approval"] == true => {
                     "needs you".into()
@@ -4807,6 +4822,7 @@ impl App {
                 (true, Some("queued")) => "queued".into(),
                 (true, _) => "working".into(),
                 (false, Some("completed" | "steered")) => "done".into(),
+                (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
                 (false, Some("interrupted")) => "stopped".into(),
                 (false, Some(other)) => other.to_owned(),
                 (false, None) => "idle".into(),
@@ -9360,7 +9376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_that_ended_with_nothing_to_say_is_done() {
+    async fn a_task_that_ended_with_nothing_to_say_said_nothing_and_did_not_fail() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("wait") => json!({"results": {"turn:calc.quiet/1":
                 {"status": "failed", "error": "empty_completion"}}}),
@@ -9382,8 +9398,8 @@ mod tests {
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ✓ quiet  done    Fix quiet");
-        assert_eq!(rows[2], "  ✗ bad    failed  Fix bad");
+        assert_eq!(rows[1], "  ✓ quiet  said nothing  Fix quiet");
+        assert_eq!(rows[2], "  ✗ bad    failed        Fix bad");
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ pub fn state(turn: &Value) -> String {
         None => "starting",
         Some("waiting") if turn["waiting_on"]["approval"] == true => "needs you",
         Some("completed" | "steered") => "done",
-        Some("failed") if turn["error"] == "empty_completion" => "done",
+        Some("failed") if turn["error"] == "empty_completion" => QUIET,
         Some("failed") => "failed",
         Some("interrupted") => "stopped",
         Some(_) => "working",
@@ -36,15 +36,20 @@ pub fn state(turn: &Value) -> String {
     .to_owned()
 }
 
+/// The state of a task whose turn ended with the model saying nothing: no
+/// failure, and not a reply either.
+pub const QUIET: &str = "said nothing";
+
 /// Whether a task in `state` waits on nothing more of its own.
 pub fn settled(state: &str) -> bool {
-    matches!(state, "done" | "failed" | "stopped" | "removed")
+    matches!(state, "done" | QUIET | "failed" | "stopped" | "removed")
 }
 
 /// A state's mark and its color.
 fn sign(state: &str) -> Span<'static> {
     match state {
         "done" => Span::raw("✓").fg(Color::Green),
+        QUIET => Span::raw("✓").dim(),
         "failed" => Span::raw("✗").fg(Color::Red),
         "needs you" => Span::raw("●").fg(Color::Yellow),
         "stopped" | "removed" => Span::raw("■").dim(),
@@ -130,7 +135,7 @@ mod tests {
         assert_eq!(state(&json!({"status": "waiting"})), "working");
         assert_eq!(state(&json!({"status": "completed"})), "done");
         let empty = json!({"status": "failed", "error": "empty_completion"});
-        assert_eq!(state(&empty), "done");
+        assert_eq!(state(&empty), "said nothing");
         assert_eq!(state(&json!({"status": "failed"})), "failed");
     }
 

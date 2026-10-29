@@ -581,7 +581,10 @@ failure.
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
-working, needs you, done, failed), read again every few seconds. A click
+working, needs you, done, said nothing, failed), read again every few
+seconds. A task whose model ended its turn with nothing to say did not
+fail, but did not reply either, so it reads `said nothing`, not `done`, in
+the roster and in `/status`. A click
 on a task opens it in the pane: its own Sonny, live, to watch and to talk
 to, as a side chat is. Ctrl+\ takes the keys back to the conversation and
 gives them to the pane again; from the conversation Ctrl+[ hides the task
