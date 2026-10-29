@@ -406,6 +406,9 @@ impl Goals {
             // A new agent under the name has no goal of the last one's.
             "deleted" => {
                 self.worked.retain(|(name, _), _| name != bot);
+                if let Some((check, _)) = self.checking.remove(bot) {
+                    check.abort();
+                }
                 if let Some(goal) = self.goals.remove(bot) {
                     end(&self.store, &goal);
                 }
