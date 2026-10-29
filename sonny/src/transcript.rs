@@ -1170,7 +1170,7 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
 /// row with `▾` and the whole message under it.
 pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<Line<'static>> {
     if !open {
-        return relayed_shut(&relayed_head(text, from), width);
+        return relayed_shut(&relayed_head(text, from), from, width);
     }
     let head = match (news(text), from) {
         (Some(parts), _) => parts[0].clone(),
@@ -1205,9 +1205,20 @@ pub fn relayed_head(text: &str, from: Option<&str>) -> String {
 const RELAYED_HEAD: usize = 200;
 
 /// The shut row of words between agents, from [`relayed_head`].
-pub fn relayed_shut(head: &str, width: usize) -> Vec<Line<'static>> {
+pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let head = cut(&format!("↳ {head}"), width.saturating_sub(2));
-    vec![Line::from(format!("{head} ▸")).dim()]
+    // Who said it in the agents' color.
+    let mut spans = vec![Span::raw("↳ ")];
+    let rest = &head["↳ ".len()..];
+    match from.filter(|from| rest.starts_with(&format!("{from}:"))) {
+        Some(from) => {
+            spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
+            spans.push(Span::raw(rest[from.len()..].to_owned()));
+        }
+        None => spans.push(Span::raw(rest.to_owned())),
+    }
+    spans.push(Span::raw(" ▸"));
+    vec![Line::from(spans).dim()]
 }
 
 /// The most lines of a prompt shown above its reply.
@@ -1644,7 +1655,12 @@ pub fn folded(
         })
         .dim(),
     ]);
-    let mut out = wrap(line, width, Span::raw("• "), Span::raw("    "));
+    let mut out = wrap(
+        line,
+        width,
+        Span::raw("• ").fg(Color::Green),
+        Span::raw("    "),
+    );
     if open {
         out.extend(calls.iter().flatten().cloned());
     }
@@ -1663,7 +1679,7 @@ fn drawn(
     let bullet = if failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ")
+        Span::raw("• ").fg(Color::Green)
     };
     let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
     let elbow = || Span::raw("  └ ").dim();
@@ -1790,7 +1806,7 @@ fn drawn(
                     let bullet = if failed && i + 1 == count {
                         Span::raw("• ").fg(Color::Red)
                     } else {
-                        Span::raw("• ")
+                        Span::raw("• ").fg(Color::Green)
                     };
                     let commands: Vec<&str> = ran
                         .iter()
@@ -1994,7 +2010,7 @@ fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     let bullet = if said.failed {
         Span::raw("• ").fg(Color::Red)
     } else {
-        Span::raw("• ")
+        Span::raw("• ").fg(Color::Green)
     };
     let mut spans = vec![Span::raw(said.verb).bold()];
     if !said.what.is_empty() {
@@ -2355,6 +2371,14 @@ mod tests {
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn who_sent_words_between_agents_shows_in_the_agents_color() {
+        let rows = relayed("Tests pass.", Some("calc.neg"), false, 80);
+        assert_eq!(text(&rows), ["↳ calc.neg: Tests pass. ▸"]);
+        let sender = rows[0].spans.iter().find(|s| s.content == "calc.neg");
+        assert_eq!(sender.and_then(|s| s.style.fg), Some(Color::Blue));
     }
 
     #[test]

@@ -73,7 +73,7 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
     };
     let mut out = vec![(
         Line::from(vec![
-            Span::raw("◆ ").fg(Color::Magenta),
+            Span::raw("◆ ").fg(Color::Blue),
             Span::raw(format!("Started {count}")).bold(),
             Span::raw(" · click one to open it").dim(),
         ]),
@@ -89,7 +89,9 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
                 Span::raw("  "),
                 sign(&task.state),
                 Span::raw(" "),
-                Span::raw(format!("{:<names$}", task.name)).bold(),
+                Span::raw(format!("{:<names$}", task.name))
+                    .bold()
+                    .fg(Color::Blue),
                 Span::raw("  "),
                 Span::raw(format!("{:<states$}", task.state)).dim(),
                 Span::raw("  "),

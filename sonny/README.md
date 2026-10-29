@@ -477,6 +477,12 @@ and Ctrl+] shows it again.
 
 ![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
 
+Sonny keeps to the terminal's own 16 colors, so a theme sets their
+shades, and each means one thing: magenta is you (your `›`), blue the
+agents (task names, who sent a message, the lead in the footer), green
+what worked (a call's dot, the git branch), yellow what needs you, red
+what failed, and cyan code and work under way.
+
 ![The task calc.neg opened in the pane beside the lead's conversation](../docs/sonny/task-in-pane.png)
 
 Sonny owns the whole screen, as Codex does; there is no inline mode.

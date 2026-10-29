@@ -3224,7 +3224,7 @@ impl App {
         };
         match &relayed.text {
             Some(text) => transcript::relayed(text, relayed.from.as_deref(), true, self.prose()),
-            None => transcript::relayed_shut(&relayed.head, self.prose()),
+            None => transcript::relayed_shut(&relayed.head, relayed.from.as_deref(), self.prose()),
         }
     }
 
@@ -6859,12 +6859,26 @@ impl App {
         while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
-        left.push_str(&format!(
-            " · {}{folder}{branch}",
-            if cut { "…" } else { "" }
-        ));
-        let fill = width.saturating_sub(left.width() + right.width());
-        Line::from(format!("{left}{}{right}", " ".repeat(fill))).dim()
+        let place = format!(" · {}{folder}", if cut { "…" } else { "" });
+        let fill =
+            width.saturating_sub(left.width() + place.width() + branch.width() + right.width());
+        // The branch in green, as shells show it; the agent's name in the
+        // agents' color.
+        let mut spans = vec![Span::raw(left), Span::raw(place)];
+        if let Some(name) = branch.strip_prefix(" on ") {
+            spans.push(Span::raw(" on "));
+            spans.push(Span::raw(name.to_owned()).fg(Color::Green));
+        }
+        spans.push(Span::raw(" ".repeat(fill)));
+        match right.rfind(&self.bot) {
+            Some(at) => {
+                spans.push(Span::raw(right[..at].to_owned()));
+                spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
+                spans.push(Span::raw(right[at + self.bot.len()..].to_owned()));
+            }
+            None => spans.push(Span::raw(right)),
+        }
+        Line::from(spans).dim()
     }
 }
 
