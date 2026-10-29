@@ -607,6 +607,11 @@ impl Updates {
         }
     }
 
+    /// Whether this turn waits for its goal's check.
+    pub fn goal_held(&self, name: &str, turn: i64) -> bool {
+        self.goaled.contains(&(name.to_owned(), turn))
+    }
+
     /// Whether a turn waits for its goal's check: the replay after a
     /// restart starts before it, so the check runs again.
     pub fn goal_pending(&self) -> bool {

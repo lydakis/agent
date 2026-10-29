@@ -451,9 +451,16 @@ async fn pursue(
     }
     let check = format!("`{}`", goal.check);
     let (code, output) = run(goal, store, socket).await;
-    // Cleared or set again while the check ran: this turn is plain news.
-    if read(store, &goal.bot).is_none_or(|now| now.set_ms != goal.set_ms) {
-        return Some(String::new());
+    // Cleared or set again while the check ran: this turn is plain news;
+    // given up meanwhile, it ends so.
+    match read(store, &goal.bot) {
+        Some(now) if now.set_ms == goal.set_ms => {
+            if let Some(why) = &now.blocked {
+                end(store, &now);
+                return Some(format!(", and gave up its goal: {why}"));
+            }
+        }
+        _ => return Some(String::new()),
     }
     if code == Some(0) {
         end(store, goal);

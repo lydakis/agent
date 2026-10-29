@@ -2454,7 +2454,11 @@ impl Lookout {
                 if denied > 0 {
                     status.push_str(&format!(", after {denied} calls denied by the approver"));
                 }
-                self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint);
+                // A turn its goal's check holds is not judged: the lead
+                // hears how the goal ended in its task updates.
+                if !self.updates.goal_held(bot, turn) {
+                    self.due(bot, turn, Kind::Ended, None, Some(status), checkpoint);
+                }
                 self.passed(bot, reply);
             }
             _ => {}
