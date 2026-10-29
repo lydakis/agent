@@ -575,19 +575,25 @@ opened). Commands, reads and edits are left out. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-Some rows are buttons. Calls of one kind in a row, such as three tasks
-messaged one after another, fold into one row (`• Messaged calc.add,
-calc.neg and calc.div ▸`) that a click opens to each call and folds
-again. A question the agent asks you lists its options, and a click on one
-answers with it. What agents tell each other stays quiet: a message from
-another agent, or the lead's task updates, is one dim row with who sent it
-and its first words, and a click opens the whole message. A turn that ends
+Some rows are buttons. A call that starts, messages, steers, queues for,
+waits for or changes agents is one row that says what it did and to whom
+(`• Steered calc.neg ▸`), never what it said: a click opens it to the
+message it sent or what came back, and folds it again. Calls of one kind
+in a row, such as three tasks messaged one after another, fold into one
+such row (`• Messaged calc.add, calc.neg and calc.div ▸`). A question the
+agent asks you lists its options, and a click on one answers with it.
+What agents tell each other stays quiet too: a message from another agent
+is one dim row naming who sent it (`↳ From calc.neg ▸`), the lead's task
+updates one row with what happened in them, and a click opens the whole
+message. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 
 ![Memory saves folded into one row, and a question whose options are buttons](../docs/sonny/fold-and-ask.png)
 
-![A message from the task calc.neg opened under its row, and the lead's task updates as one row](../docs/sonny/agents-message-opened.png)
+![A message from calc.neg, the task updates and a steer, each one row](../docs/sonny/agent-calls-folded.png)
+
+![The steer opened to what it told calc.neg](../docs/sonny/agent-call-opened.png)
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,

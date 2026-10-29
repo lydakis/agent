@@ -181,6 +181,18 @@ fn first_line(text: &str) -> String {
         .to_owned()
 }
 
+/// Each of `names` once, in the order first named: a wait on three turns
+/// of one agent names it once.
+pub fn once(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn dim(text: impl Into<String>) -> Line<'static> {
     Line::from(text.into()).dim()
 }
@@ -388,12 +400,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         "wait" => {
             said.verb = "Waited for".into();
             if said.what.is_empty() {
-                said.what = args
-                    .plain(0)
-                    .iter()
-                    .map(|h| handle_bot(h))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                said.what = once(args.plain(0).iter().map(|h| handle_bot(h))).join(", ");
             }
             if let Some(lines) = reply.as_ref().and_then(waited) {
                 said.under.extend(lines.into_iter().map(dim));
@@ -540,13 +547,15 @@ pub fn waited(reply: &Value) -> Option<Vec<String>> {
             .unwrap_or_else(|| handle_bot(handle));
         let line = match (result["status"].as_str(), result["error"].as_str()) {
             (_, Some(error)) => format!("{who}: {error}"),
-            (Some(status), _) => {
-                let text = result["text"].as_str().unwrap_or("");
-                format!("{who} {status}: {}", first_line(text))
-            }
+            (Some(status), _) => match first_line(result["text"].as_str().unwrap_or("")) {
+                text if text.is_empty() => format!("{who} {status}"),
+                text => format!("{who} {status}: {text}"),
+            },
             _ => continue,
         };
-        lines.push(line);
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
     }
     let pending = reply["pending"].as_array().map_or(0, Vec::len);
     if pending > 0 {
