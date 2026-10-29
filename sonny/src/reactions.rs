@@ -189,9 +189,10 @@ impl Picked {
         self.on.get(&node).map_or(&[], Vec::as_slice)
     }
 
-    /// Reads the file again when it changed since: the reactions it
-    /// holds now that it did not, by node.
-    pub fn refresh(&mut self) -> Vec<(i64, String, String)> {
+    /// Reads the file again when it changed since: the reactions it holds
+    /// now that it did not, and those it no longer holds, by node, each
+    /// with whether it was added.
+    pub fn refresh(&mut self) -> Vec<(i64, String, String, bool)> {
         let Some(file) = &self.file else {
             return Vec::new();
         };
@@ -204,15 +205,21 @@ impl Picked {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        let added = (now.iter())
-            .flat_map(|(node, on)| on.iter().map(move |(by, emoji)| (*node, by, emoji)))
-            .filter(|(node, by, emoji)| {
-                !self.on(*node).iter().any(|(b, e)| b == *by && e == *emoji)
-            })
-            .map(|(node, by, emoji)| (node, by.clone(), emoji.clone()))
-            .collect();
+        let gone = |from: &BTreeMap<i64, Vec<(String, String)>>,
+                    to: &BTreeMap<i64, Vec<(String, String)>>,
+                    added: bool| {
+            (from.iter())
+                .flat_map(|(node, on)| on.iter().map(move |(by, emoji)| (*node, by, emoji)))
+                .filter(|(node, by, emoji)| {
+                    !(to.get(node).into_iter().flatten()).any(|(b, e)| b == *by && e == *emoji)
+                })
+                .map(|(node, by, emoji)| (node, by.clone(), emoji.clone(), added))
+                .collect::<Vec<_>>()
+        };
+        let mut changed = gone(&now, &self.on, true);
+        changed.extend(gone(&self.on, &now, false));
         self.on = now;
-        added
+        changed
     }
 
     /// Keeps `by`'s reaction to the person's message at `node` in the bot
@@ -276,12 +283,19 @@ mod tests {
         };
         assert!(picked.refresh().is_empty());
         Picked::apply_in(&file, 12, "calc.lead", "👀", false).unwrap();
-        assert_eq!(picked.refresh(), [(12, "calc.lead".into(), "👀".into())]);
+        assert_eq!(
+            picked.refresh(),
+            [(12, "calc.lead".into(), "👀".into(), true)]
+        );
         assert!(picked.refresh().is_empty());
         assert_eq!(picked.on(12), [("calc.lead".into(), "👀".into())]);
-        // Taken off again, it is gone, and nothing new is drawn.
+        // Taken off again, it is gone, and read as taken back once.
         std::thread::sleep(std::time::Duration::from_millis(5));
         Picked::apply_in(&file, 12, "calc.lead", "👀", true).unwrap();
+        assert_eq!(
+            picked.refresh(),
+            [(12, "calc.lead".into(), "👀".into(), false)]
+        );
         assert!(picked.refresh().is_empty());
         assert!(picked.on(12).is_empty());
         let target = |arguments: Value| target(&arguments).map(str::to_owned);

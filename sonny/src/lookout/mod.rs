@@ -1323,8 +1323,9 @@ fn grow(made: &mut HashSet<String>, records: &HashMap<String, Value>) {
 
 /// The person's newest message in `bot`: one no agent or client sent,
 /// with words of theirs, not only tool results, and no reaction of theirs.
-/// Read newest first, as far back as a long turn of tool calls reaches.
-async fn newest_said(client: &Client, bot: &str) -> Option<i64> {
+/// Read newest first, as far back as a long turn of tool calls reaches;
+/// an error when the daemon did not answer.
+async fn newest_said(client: &Client, bot: &str) -> Result<Option<i64>, ()> {
     const READ: usize = 2000;
     let (mut from, mut read) = (Value::Null, 0);
     while read < READ {
@@ -1334,7 +1335,7 @@ async fn newest_said(client: &Client, bot: &str) -> Option<i64> {
                 json!({"bot": bot, "from": from, "limit": 200}),
             )
             .await
-            .ok()?;
+            .map_err(drop)?;
         let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
             .filter_map(|n| n["node"].as_i64())
             .collect();
@@ -1345,23 +1346,23 @@ async fn newest_said(client: &Client, bot: &str) -> Option<i64> {
             let items = client
                 .request("history_items", json!({"bot": bot, "nodes": wanted}))
                 .await
-                .ok()?;
+                .map_err(drop)?;
             // Fewer than asked when they are large; at least one.
             let items = items["items"].as_array().cloned().unwrap_or_default();
             if items.is_empty() {
-                return None;
+                return Ok(None);
             }
             next += items.len();
             if let Some(node) = items.iter().find_map(said_by_person) {
-                return Some(node);
+                return Ok(Some(node));
             }
         }
         from = page["next_from"].clone();
         if from.is_null() || nodes.is_empty() {
-            return None;
+            return Ok(None);
         }
     }
-    None
+    Ok(None)
 }
 
 /// The node of a history entry the person wrote: words of theirs, as an
@@ -1484,14 +1485,14 @@ impl Service {
                     // after the lookout last watched still lands.
                     let news =
                         live || cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen));
-                    self.picked(&client, &event, news);
+                    let held = self.picked(&client, &event, news).await;
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
                     if !live && cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen)) {
                         live = true;
                         self.go_live(&client).await;
                     }
-                    if live && cursor > self.cursor {
+                    if live && !held && cursor > self.cursor {
                         self.cursor = cursor;
                     }
                     if let (Some("created" | "forked"), Some(name)) =
@@ -1664,19 +1665,31 @@ impl Service {
 
     /// A lead's `react` call naming one of its project's agents: once it
     /// succeeds as news, its reaction kept under the person's newest message
-    /// there, for that agent's window to draw.
-    fn picked(&mut self, client: &Arc<Client>, event: &Value, news: bool) {
+    /// there, for that agent's window to draw. Whether it waits on the
+    /// daemon still, so the event is read again after a restart.
+    async fn picked(&mut self, client: &Client, event: &Value, news: bool) -> bool {
         let Some((by, bot, id, emoji, remove)) = self.reacted(event, news) else {
-            return;
+            return false;
         };
         let store = std::fs::canonicalize(&self.store).unwrap_or_else(|_| self.store.clone());
         let key = crate::reactions::key(&store, id);
-        let client = client.clone();
-        tokio::spawn(async move {
-            if let Some(node) = newest_said(&client, &bot).await {
-                let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
+        match newest_said(client, &bot).await {
+            Ok(node) => {
+                if let Some(node) = node {
+                    let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
+                }
+                false
             }
-        });
+            Err(()) => true,
+        }
+    }
+
+    /// The project a bot is in: the longest start of its name whose lead
+    /// the daemon lists.
+    fn project<'a>(&self, bot: &'a str) -> Option<&'a str> {
+        (bot.match_indices('.').rev())
+            .map(|(at, _)| &bot[..at])
+            .find(|start| self.records.contains_key(&format!("{start}.lead")))
     }
 
     /// A targeted `react` call that ended well as news: who called, the
@@ -1709,9 +1722,13 @@ impl Service {
                 if !news || data["failed"] == true || data["denied"] == true {
                     return None;
                 }
-                let project = by.split('.').next().unwrap_or(by);
                 let id = (self.records.get(&bot))
-                    .filter(|_| bot != by && bot.starts_with(&format!("{project}.")))
+                    .filter(|_| {
+                        bot != by
+                            && self
+                                .project(&bot)
+                                .is_some_and(|p| self.project(by) == Some(p))
+                    })
                     .and_then(|record| record["bot_id"].as_i64())?;
                 Some((by.to_owned(), bot, id, emoji, remove))
             }
@@ -3116,6 +3133,10 @@ mod tests {
             records: [
                 record("calc.lead", 1, None),
                 record("calc.speed", 2, Some("calc.lead")),
+                record("ws.lead", 3, None),
+                record("ws.fix", 4, Some("ws.lead")),
+                record("ws.web.lead", 5, None),
+                record("ws.web.fix", 6, Some("ws.web.lead")),
             ]
             .into_iter()
             .map(|r| (r["name"].as_str().unwrap().to_owned(), r))
@@ -3170,6 +3191,17 @@ mod tests {
             true,
         );
         assert!(service.reacted(&ended("calc.lead", false), true).is_none());
+        // A project inside another is a project of its own.
+        let across = |by: &str, bot: &str, service: &mut Service| {
+            service.reacted(&started(by, json!({"emoji": "👀", "bot": bot})), true);
+            service
+                .reacted(&ended(by, false), true)
+                .map(|landed| landed.2)
+        };
+        assert_eq!(across("ws.web.lead", "ws.fix", &mut service), None);
+        assert_eq!(across("ws.lead", "ws.web.fix", &mut service), None);
+        assert_eq!(across("ws.web.lead", "ws.web.fix", &mut service), Some(6));
+        assert_eq!(across("ws.lead", "ws.fix", &mut service), Some(4));
         assert!(service.reacting.is_empty());
     }
 

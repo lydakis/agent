@@ -2280,8 +2280,18 @@ impl App {
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
-                for (node, by, emoji) in self.picked.refresh() {
-                    self.draw_picked(node, &by, &emoji);
+                for (node, by, emoji, added) in self.picked.refresh() {
+                    if added {
+                        self.draw_picked(node, &by, &emoji);
+                    } else if let Some(first) = self.said_at.get(&node).cloned() {
+                        let rows = transcript::wrap(
+                            Line::from(format!("↳ {by} took back {emoji} on “{first}”")),
+                            self.prose(),
+                            Span::raw("  "),
+                            Span::raw("    "),
+                        );
+                        self.commit(transcript::quiet(rows));
+                    }
                 }
             }
             if self
