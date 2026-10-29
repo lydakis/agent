@@ -8,7 +8,10 @@
 //! that does not drag opens the link under it. What is copied is the text
 //! as written: a line wrapped over rows comes back as one line, without
 //! the rows' leads or the indent every copied line shares.
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ratatui::{
     buffer::{Buffer, Cell},
@@ -23,10 +26,13 @@ use unicode_width::UnicodeWidthStr;
 const WHEEL: usize = 3;
 /// How soon a second click counts as a double click.
 pub const DOUBLE: Duration = Duration::from_millis(400);
-/// How many of the conversation's rows are kept to scroll back to, as a
-/// terminal keeps its scrollback; the whole conversation stays in the
-/// bot's history.
+/// How many of the conversation's rows new ones leave to scroll back to,
+/// as a terminal keeps its scrollback; the whole conversation stays in
+/// the bot's history. Older rows drawn above on asking for them stay.
 const KEEP: usize = 10_000;
+/// How many screens above the view the older rows are asked for, so the
+/// wheel finds them drawn rather than waits at the first row.
+const AHEAD: usize = 3;
 /// How far past a link's rows on screen to look for the rest of it.
 const LINK_ROWS: usize = 16;
 
@@ -72,7 +78,8 @@ pub enum Mark {
 /// A row on the screen: one of the conversation's rows, or the part of
 /// one that did not fit the width.
 struct Shown {
-    line: Line<'static>,
+    /// The row's line itself when it fits, so it is kept once.
+    line: Arc<Line<'static>>,
     /// Where its text opens, when its line said so rather than its words.
     link: Option<String>,
     /// The columns of the row's lead, when it goes on with the row above.
@@ -86,7 +93,7 @@ struct Shown {
 /// A line of the conversation, its wrapped rows joined again, so it can
 /// be wrapped anew at any width.
 struct Row {
-    line: Line<'static>,
+    line: Arc<Line<'static>>,
     /// The lead the rows it goes on to start with, as it was written.
     rest: Option<Line<'static>>,
     /// Where its text opens, whatever its words are.
@@ -97,7 +104,7 @@ struct Row {
 impl Row {
     fn new(line: Line<'static>) -> Self {
         Row {
-            line,
+            line: Arc::new(line),
             rest: None,
             link: None,
             tag: None,
@@ -166,6 +173,11 @@ pub struct Screen {
     top_row: Option<usize>,
     /// A line to scroll to, as little as it takes, with rows under it.
     keep: Option<(usize, usize)>,
+    /// The oldest rows went to make room: those above them are not drawn
+    /// again.
+    trimmed: bool,
+    /// Rows were written under the newest since the oldest last went.
+    grew: bool,
 }
 
 /// The place found is to be picked again, the rows having been drawn anew.
@@ -209,6 +221,7 @@ impl Screen {
     pub fn push_marked(&mut self, lines: Vec<Line<'static>>, mut marks: Vec<(usize, Mark)>) {
         marks.sort_by_key(|(at, _)| *at);
         let mut marks = marks.into_iter().peekable();
+        self.grew |= !lines.is_empty();
         for (at, line) in lines.into_iter().enumerate() {
             self.push_line(line);
             while let Some((_, mark)) = marks.next_if(|(on, _)| *on == at) {
@@ -249,13 +262,14 @@ impl Screen {
         }
         let (rest, text) = split(line, lead);
         let row = self.rows.last_mut().expect("a row to join");
+        let line = Arc::make_mut(&mut row.line);
         // Spans alike join too, so a word cut over rows is one again.
         for span in text {
-            match row.line.spans.last_mut() {
+            match line.spans.last_mut() {
                 Some(last) if last.style == span.style => {
                     last.content.to_mut().push_str(&span.content)
                 }
-                _ => row.line.spans.push(span),
+                _ => line.spans.push(span),
             }
         }
         row.rest.get_or_insert(rest);
@@ -281,7 +295,7 @@ impl Screen {
         let shown = self.shown_at(at);
         let there = (self.rows.get(at)).is_some_and(|row| row.tag == Some(tag));
         match (line, there) {
-            (Some(line), true) => self.rows[at].line = line,
+            (Some(line), true) => self.rows[at].line = Arc::new(line),
             (Some(line), false) => {
                 let mut row = Row::new(line);
                 row.tag = Some(tag);
@@ -367,15 +381,17 @@ impl Screen {
             return;
         }
         let back = std::mem::take(&mut self.back);
-        self.layout(self.width);
+        self.wrap(self.width);
         self.back = match hold {
             true => (back + self.shown.len()).saturating_sub(before),
             false => back,
         };
     }
+
     /// A line whose rows after its first start with `rest` when wrapped,
     /// as a numbered line of code goes on under its code.
     pub fn push_hanging(&mut self, line: Line<'static>, rest: Line<'static>) {
+        self.grew = true;
         let mut row = Row::new(line);
         row.rest = Some(rest);
         self.rows.push(row);
@@ -385,6 +401,7 @@ impl Screen {
     /// anything else a link read from words would stop at: a row of a
     /// list each row of opens, as a folder's entries, so not underlined.
     pub fn push_linked(&mut self, line: Line<'static>, url: String) {
+        self.grew = true;
         let mut row = Row::new(line);
         row.link = Some(url);
         self.rows.push(row);
@@ -446,9 +463,59 @@ impl Screen {
         self.back = back;
     }
 
-    /// The view is at the first row, and there is room for older ones.
-    pub fn at_top(&self) -> bool {
-        self.back >= self.most(self.area.height as usize) && self.rows.len() < KEEP
+    /// The view is a few screens from the first row, or nearer, and the
+    /// rows above it can still be drawn: time to ask for older ones.
+    pub fn near_top(&self) -> bool {
+        let height = self.area.height as usize;
+        !self.trimmed && self.back + AHEAD * height >= self.most(height)
+    }
+
+    /// `lines` drawn above the first row, older than any shown, each of
+    /// `marks` on its line's row as [`Screen::push_marked`] puts it, the
+    /// view left on the rows it shows.
+    pub fn prepend(&mut self, lines: Vec<Line<'static>>, marks: Vec<(usize, Mark)>) {
+        let mut older = Self::default();
+        older.push_marked(lines, marks);
+        let added = older.rows.len();
+        if added == 0 {
+            return;
+        }
+        // Rows already wrapped take theirs at the same width.
+        let mut shown = 0;
+        if self.wrapped > 0 {
+            older.wrap(self.width);
+            shown = older.shown.len();
+            self.shown.splice(0..0, older.shown);
+            self.wrapped += added;
+        }
+        self.rows.splice(0..0, older.rows);
+        // The view counts from the newest row, so it stays where it was;
+        // what counts from the first moves down with it.
+        self.top += shown;
+        if let Some(selection) = &mut self.selection {
+            selection.anchor.0 += shown;
+            selection.head.0 += shown;
+        }
+        for at in [&mut self.go_to, &mut self.keep].into_iter().flatten() {
+            at.0 += added;
+        }
+        if let Some(top) = &mut self.top_row {
+            *top += shown;
+        }
+        self.linked = None;
+        // The place found stays the one shown, those above it counted.
+        let found = (self.finding.as_ref())
+            .filter(|f| shown > 0 && f.at != AGAIN && f.laid == self.laid)
+            .map(|f| (f.query.clone(), f.hits.len()));
+        self.laid += 1;
+        if let Some((query, before)) = found {
+            let hits = self.hits(&query);
+            let laid = self.laid;
+            let finding = self.finding.as_mut().expect("a finding");
+            finding.at += hits.len().saturating_sub(before);
+            finding.hits = hits;
+            finding.laid = laid;
+        }
     }
 
     /// Up (`rows` > 0) or down the conversation.
@@ -488,8 +555,16 @@ impl Screen {
     }
 
     /// The rows wrapped to `width`, those written since kept in view while
-    /// the view is scrolled up.
+    /// the view is scrolled up, and the oldest let go once there are too
+    /// many.
     fn layout(&mut self, width: usize) {
+        self.wrap(width);
+        self.trim();
+    }
+
+    /// The rows not yet wrapped to `width` wrapped, all of them when it
+    /// changed.
+    fn wrap(&mut self, width: usize) {
         if width != self.width {
             self.width = width;
             self.shown.clear();
@@ -514,7 +589,11 @@ impl Screen {
                 true => vec![line],
                 false => {
                     let rest = row.rest.clone().unwrap_or(Line::from("    "));
-                    crate::transcript::wrap_lines(line, width, Line::default(), rest)
+                    let line = Arc::unwrap_or_clone(line);
+                    (crate::transcript::wrap_lines(line, width, Line::default(), rest))
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect()
                 }
             };
             for (at, line) in rows.into_iter().enumerate() {
@@ -536,11 +615,14 @@ impl Screen {
             self.back =
                 (self.back.saturating_add(self.shown.len() - before)).saturating_sub(relaid);
         }
-        // The oldest rows go, a batch at a time.
-        if self.rows.len() > KEEP + KEEP / 4 {
+    }
+
+    /// The oldest rows let go, a batch at a time, once new ones written
+    /// pass what is kept and the view is below them: not for older ones
+    /// drawn above, nor for the rows wrapped anew at another width.
+    fn trim(&mut self) {
+        if std::mem::take(&mut self.grew) && self.rows.len() > KEEP + KEEP / 4 {
             let drop = self.rows.len() - KEEP;
-            self.rows.drain(..drop);
-            self.wrapped -= drop;
             let mut firsts = 0;
             let gone = (self.shown.iter())
                 .position(|shown| {
@@ -548,10 +630,19 @@ impl Screen {
                     firsts > drop
                 })
                 .unwrap_or(self.shown.len());
-            self.shown.drain(..gone);
-            self.selection = None;
-            self.linked = None;
-            self.laid += 1;
+            let view = self
+                .shown
+                .len()
+                .saturating_sub(self.back + self.area.height as usize);
+            if gone <= view {
+                self.rows.drain(..drop);
+                self.wrapped -= drop;
+                self.shown.drain(..gone);
+                self.trimmed = true;
+                self.selection = None;
+                self.linked = None;
+                self.laid += 1;
+            }
         }
     }
 
@@ -1561,22 +1652,68 @@ mod tests {
         assert_eq!(screen.text(start, end), "test reads an");
     }
 
+    fn rows(range: std::ops::Range<usize>) -> Vec<Line<'static>> {
+        range.map(|i| Line::from(format!("row {i}"))).collect()
+    }
+
     #[test]
-    fn the_view_holds_while_older_rows_are_drawn_above() {
-        let lines: Vec<Line> = (10..20).map(|i| Line::from(format!("row {i}"))).collect();
-        let (mut screen, _) = screen(lines, 20, 5);
-        screen.page(true);
-        screen.page(true);
-        assert!(screen.at_top());
-        let back = screen.back();
-        screen.clear();
-        screen.hold(back);
-        screen.push((0..20).map(|i| Line::from(format!("row {i}"))).collect());
+    fn older_rows_drawn_above_leave_the_view_where_it_was() {
+        let (mut screen, _) = screen(rows(100..160), 20, 5);
+        assert!(!screen.near_top());
+        screen.scroll(45);
+        assert!(screen.near_top());
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf, |_| None);
-        assert_eq!(row(&buf, 0).trim_end(), "row 10");
-        assert!(!screen.at_top());
+        let shown = row(&buf, 0);
+        screen.prepend(rows(0..100), Vec::new());
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0), shown);
+        assert!(!screen.near_top());
+    }
+
+    #[test]
+    fn older_rows_drawn_above_stay_at_another_width() {
+        let (mut screen, _) = screen(rows(13_000..13_100), 20, 5);
+        screen.prepend(rows(0..13_000), Vec::new());
+        let area = Rect::new(0, 0, 30, 5);
+        screen.render(area, &mut Buffer::empty(area), |_| None);
+        assert_eq!(screen.height(30), 13_100);
+        screen.scroll(isize::MAX);
+        assert!(screen.near_top());
+    }
+
+    #[test]
+    fn the_place_found_stays_while_older_rows_are_drawn_above() {
+        let (mut screen, _) = screen(rows(100..160), 20, 5);
+        screen.find("row 15");
+        assert_eq!(screen.found(), Some((10, 10)));
+        screen.prepend(rows(0..100), Vec::new());
+        assert_eq!(screen.found(), Some((11, 11)));
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(screen.found(), Some((11, 11)));
+        assert!((0..5).any(|y| row(&buf, y).trim_end() == "row 159"));
+    }
+
+    #[test]
+    fn the_oldest_rows_go_only_from_under_the_view() {
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        let (mut screen, _) = screen(rows(0..12_000), 20, 5);
+        screen.scroll(isize::MAX);
+        screen.push(rows(12_000..13_000));
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "row 0");
+        assert!(screen.near_top());
+        screen.latest();
+        screen.push(rows(13_000..13_001));
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(screen.height(20), KEEP);
+        assert_eq!(row(&buf, 4).trim_end(), "row 13000");
+        screen.scroll(isize::MAX);
+        assert!(!screen.near_top());
     }
 
     #[test]
@@ -1732,5 +1869,23 @@ mod tests {
         ));
         assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
         assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn older_rows_drawn_above_keep_their_marks() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("newest")]);
+        screen.prepend(
+            vec![Line::from("older"), Line::from("• Started a ▸")],
+            vec![
+                (0, Mark::Tag(Tag::End(1))),
+                (1, Mark::Link(format!("{BUTTON}fold/1"))),
+            ],
+        );
+        assert_eq!(screen.texts(), ["older", "• Started a ▸", "newest"]);
+        assert!(screen.has(Tag::End(1)));
+        assert_eq!(screen.links()[1].as_deref(), Some("sonny:fold/1"));
+        assert!(screen.put_under(Tag::End(1), Tag::Reactions(1), Some(Line::from("  👍"))));
+        assert_eq!(screen.texts()[1], "  👍");
     }
 }
