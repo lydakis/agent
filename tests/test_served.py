@@ -215,7 +215,7 @@ class ServedToolTests(ModelFixture):
             time.sleep(.05)
         self.lookout()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': []})
+        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': []})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_lookout_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')

@@ -139,6 +139,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | The approver's and lookout's judge | `[judge] model`, `effort` | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
 effort; the lead names a `model` or `effort` only for one the person asks
@@ -507,7 +508,8 @@ note, with no sound. It judges with the config's `[judge] model`, the
 approver's setting, else the lead's own model, at `[judge] effort` when
 set, and with the judge `off` sends the task updates alone. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
-by name, questions of its own), and `/background` lists what it watches;
+by name, sources outside such as a chat you poll, questions of its own),
+and `/background` lists what it watches;
 see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout also answers
 Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are
