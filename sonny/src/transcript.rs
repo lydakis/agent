@@ -1,7 +1,11 @@
-//! What a finished piece of the conversation looks like once it is written
-//! into the terminal's scrollback: a prompt, a reply, a tool call. Each
-//! piece is a list of lines already wrapped to the terminal's width, so it
-//! can be inserted above the live area and left to the terminal.
+//! What a piece of the conversation looks like: a prompt, a reply, a tool
+//! call, each a list of lines already wrapped to a width. Markdown is
+//! drawn here for every surface, the one way it is drawn: [`markdown`],
+//! or [`Markdown`] for a reply as it streams, is what the conversation, a
+//! file in the pane, a note in the margin and a card all read what was
+//! written with, its pictures, diagrams, pages, math, tables and code
+//! included; [`crate::screen::Screen`] shows the lines, scrolls, selects,
+//! copies and opens their links, wherever they are.
 use ratatui::{
     layout::Alignment,
     style::{Color, Modifier, Style, Stylize},
@@ -24,8 +28,9 @@ pub struct Markdown {
     hang: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
-    /// Inside `$$` display math, gathered in `picture`.
-    math: bool,
+    /// Inside display math, gathered in `picture`: what closes it,
+    /// `$$` or `\]`.
+    math: Option<&'static str>,
     /// The open fence's code, in its language's colors when known.
     code: Option<crate::highlight::Code>,
     /// The folder a picture's relative path is read from: the file's,
@@ -60,7 +65,7 @@ impl Markdown {
     /// says nothing of the reply is shown yet, so it gets the bullet.
     pub fn feed(&mut self, text: &str, width: usize, first: bool) -> Vec<Line<'static>> {
         let mut text = text;
-        if !self.fence && !self.math {
+        if !self.fence && self.math.is_none() {
             // An HTML comment over lines says nothing; what follows it does.
             if self.comment {
                 match text.split_once("-->") {
@@ -210,26 +215,37 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        // $$ display math $$, on one line or around several.
-        if !self.fence && trimmed.trim_end().starts_with("$$") {
-            let inner = trimmed.trim_end().trim_start_matches("$$");
-            if let Some(math) = inner.strip_suffix("$$") {
-                self.ready = Some(("math".into(), math.to_owned()));
-                return None;
-            }
-            match self.picture.take() {
-                Some((lang, math)) if lang == "math" && self.math => {
-                    self.math = false;
-                    self.ready = Some((lang, math));
+        // $$ display math $$, on one line or around several, and the
+        // \[ display math \] many models write.
+        let line = trimmed.trim_end();
+        if !self.fence && self.math.is_none() {
+            let open = [("$$", "$$"), ("\\[", "\\]")]
+                .into_iter()
+                .find(|(open, _)| line.starts_with(open));
+            if let Some((open, close)) = open {
+                let inner = &line[open.len()..];
+                if let Some(math) = inner.strip_suffix(close) {
+                    self.ready = Some(("math".into(), math.to_owned()));
+                    return None;
                 }
-                held => {
+                // `\[` opens display math only alone on its line: one that
+                // runs on is an escaped bracket.
+                if open == "$$" || inner.is_empty() {
+                    let held = self.picture.take();
                     self.picture = held.or(Some(("math".into(), format!("{inner}\n"))));
-                    self.math = true;
+                    self.math = Some(close);
+                    return None;
                 }
             }
+        }
+        if let Some(close) = self.math
+            && line.starts_with(close)
+        {
+            self.math = None;
+            self.ready = self.picture.take();
             return None;
         }
-        if self.math
+        if self.math.is_some()
             && let Some((_, math)) = &mut self.picture
         {
             math.push_str(text);
@@ -679,6 +695,17 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         }
     };
     while let Some(c) = rest.chars().next() {
+        // \(math\), as many models write it.
+        if let Some(after) = rest.strip_prefix("\\(")
+            && let Some(end) = after.find("\\)")
+            && end > 0
+        {
+            flush(&mut plain, &mut spans);
+            let math = crate::math::unicode(after[..end].trim());
+            spans.push(Span::styled(math, base.italic()));
+            rest = &after[end + 2..];
+            continue;
+        }
         // A mark and its closer, with the style of what is between.
         let pairs: [(&str, &str, Style, bool); 11] = [
             ("`", "`", base.fg(Color::Cyan), false),
@@ -1285,15 +1312,68 @@ pub fn reacted(emoji: &str) -> Line<'static> {
 /// A whole reply, as replayed history shows it, its pictures' paths
 /// read from `folder`.
 pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'static>> {
-    let mut markdown = Markdown::in_folder(folder);
-    let mut out = Vec::new();
+    let leads = (Line::from("• "), Line::from("  "));
+    markdown(&mut Markdown::in_folder(folder), text, width, leads)
+}
+
+/// Markdown as every surface draws it, the one way it is drawn: the
+/// conversation, the pane, the margin, a card. `text` at `width`, read
+/// by `markdown` (the folder its pictures are in, whether a document),
+/// its first row after the first of `leads` and the rest after the
+/// other, in place of the two columns every row of it starts with.
+pub fn markdown(
+    markdown: &mut Markdown,
+    text: &str,
+    width: usize,
+    (first, rest): (Line<'static>, Line<'static>),
+) -> Vec<Line<'static>> {
+    let wide = first.width().max(rest.width());
+    let inner = (width + 2).saturating_sub(wide).max(10);
+    let mut rows = Vec::new();
     for line in text.lines() {
-        let first = out.is_empty();
-        out.extend(markdown.feed(line, width, first));
+        rows.extend(markdown.feed(line, inner, false));
     }
-    let first = out.is_empty();
-    out.extend(markdown.end(width, first));
+    rows.extend(markdown.end(inner, false));
+    let mut out = Vec::with_capacity(rows.len());
+    for (at, row) in rows.into_iter().enumerate() {
+        let lead = if at == 0 { &first } else { &rest };
+        out.push(relead(row, lead));
+    }
     out
+}
+
+/// `row` with its first two columns, the lead Markdown draws, swapped
+/// for `lead`; where it says a wrapped row's lead is, moved to match.
+fn relead(mut row: Line<'static>, lead: &Line<'static>) -> Line<'static> {
+    let more = lead.width() as isize - 2;
+    let marks = row
+        .spans
+        .iter()
+        .take_while(|span| span.content.is_empty())
+        .count();
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(row.spans.len() + lead.spans.len());
+    for span in row.spans.drain(..marks) {
+        match mark(&Line::from(vec![span.clone()])) {
+            Some((columns, joins)) => {
+                spans.push(goes_on(columns.saturating_add_signed(more), joins))
+            }
+            None => spans.push(span),
+        }
+    }
+    spans.extend(lead.spans.iter().cloned());
+    let mut cut = 2usize;
+    for mut span in row.spans.drain(..) {
+        while cut > 0 && !span.content.is_empty() {
+            let c = span.content.chars().next().expect("a character");
+            let columns = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            cut = cut.saturating_sub(columns.max(1));
+            span.content = span.content[c.len_utf8()..].to_owned().into();
+        }
+        if !span.content.is_empty() {
+            spans.push(span);
+        }
+    }
+    Line { spans, ..row }
 }
 
 /// A step on the way to the reply, a call or what the bot said before
@@ -1640,7 +1720,13 @@ fn drawn(
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
+        "write_stdin" if arguments["kill"] == true => ("Killed", field("handle")),
+        "write_stdin" => (
+            "Typed into",
+            format!("{} {:?}", field("handle"), field("chars")),
+        ),
         "echo" | "note" => ("Noted", field("text")),
+        "exec" => ("Ran", scripted(output.unwrap_or(""))),
         _ => ("Called", format!("{name} {arguments}")),
     };
     let mut header = Line::from(vec![
@@ -1710,9 +1796,38 @@ fn drawn(
             }
         }
         "shell" | "wait" => out.extend(preview(output.unwrap_or(""), width)),
+        "exec" => {
+            let output = output.unwrap_or("");
+            let printed = output
+                .split_once("Output:\n")
+                .map_or(output, |(_, printed)| printed);
+            out.extend(preview(printed, width));
+        }
         _ => {}
     }
     out
+}
+
+/// An `exec` call as one line: the MCP calls its script made, by server,
+/// from the head of its result, and how it ended when not well.
+fn scripted(output: &str) -> String {
+    let head = output.split_once("Output:\n").map_or("", |(head, _)| head);
+    let mut line = match head.lines().find_map(|l| l.strip_prefix("MCP calls: ")) {
+        Some(calls) => {
+            let total: usize = (calls.split(", "))
+                .filter_map(|each| each.rsplit_once(' ')?.1.parse::<usize>().ok())
+                .sum();
+            let noun = if total == 1 { "call" } else { "calls" };
+            format!("a script: {total} MCP {noun} ({calls})")
+        }
+        None => "a script".to_owned(),
+    };
+    if let Some(status) = head.lines().next().filter(|l| *l != "Script completed")
+        && let Some(how) = status.strip_prefix("Script ")
+    {
+        line.push_str(&format!(", {how}"));
+    }
+    line
 }
 
 /// The most rows an edit's diff, or a diff a command printed, takes.
@@ -2327,6 +2442,48 @@ mod tests {
     }
 
     #[test]
+    fn markdown_reads_the_same_after_any_lead() {
+        let folder = std::path::Path::new(".");
+        let said = "Pick **one** of the `two` that still pass\n- a list";
+        let leads = (Line::from("? "), Line::from("     "));
+        let rows = markdown(&mut Markdown::in_folder(folder), said, 24, leads);
+        assert_eq!(
+            text(&rows),
+            [
+                "? Pick one of the two ",
+                "     that still pass",
+                "     - a list"
+            ]
+        );
+        // Where a wrapped row's lead ends moves with the lead, so the rows
+        // join again as the line they were.
+        assert_eq!(lead(&rows[1]), Some(5));
+        // A reply is Markdown after a bullet.
+        let reply = reply(said, 24, folder);
+        let bullet = (Line::from("• "), Line::from("  "));
+        let same = markdown(&mut Markdown::in_folder(folder), said, 24, bullet);
+        assert_eq!(reply, same);
+    }
+
+    #[test]
+    fn math_in_brackets_reads_as_math_in_dollars_does() {
+        let folder = std::path::Path::new(".");
+        let dollars = reply("$$\nx^2\n$$\nafter", 40, folder);
+        let brackets = reply("\\[\nx^2\n\\]\nafter", 40, folder);
+        assert_eq!(text(&brackets), text(&dollars));
+        assert_eq!(
+            text(&reply("\\[ x^2 \\]", 40, folder)),
+            text(&reply("$$ x^2 $$", 40, folder))
+        );
+        assert_eq!(
+            text(&reply("so \\(x^2\\) holds", 40, folder)),
+            text(&reply("so $x^2$ holds", 40, folder))
+        );
+        // An escaped bracket that runs on is words.
+        assert_eq!(text(&reply("\\[not math", 40, folder)), ["• \\[not math"]);
+    }
+
+    #[test]
     fn a_long_shell_output_shows_its_head_and_the_count_left() {
         let output = (1..=9)
             .map(|n| format!("line {n}"))
@@ -2454,6 +2611,21 @@ mod tests {
         std::fs::write(dir.join("f"), "a\n").unwrap();
         assert_eq!(current(&dir.join("f")).as_deref(), Some("a\n"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_script_is_one_line_of_its_mcp_calls_over_what_it_printed() {
+        let input = serde_json::json!({"input": "await tools.mcp__github__a({});"});
+        let output = "Script completed\nWall time 1.2 seconds\nMCP calls: github 10, linear 2\nOutput:\n3 open issues";
+        let rows = text(&tool("exec", &input, Some(output), false, "/", 80));
+        assert_eq!(
+            rows[0],
+            "• Ran a script: 12 MCP calls (github 10, linear 2)"
+        );
+        assert!(rows[1].contains("3 open issues"), "{rows:#?}");
+        let failed = "Script terminated: it ran out of time\nWall time 600.0 seconds\nOutput:\n";
+        let rows = text(&tool("exec", &input, Some(failed), true, "/", 80));
+        assert_eq!(rows[0], "• Ran a script, terminated: it ran out of time");
     }
 
     #[test]

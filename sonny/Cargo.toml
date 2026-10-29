@@ -21,9 +21,10 @@ libc = "0.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
 ratatui = { version = "0.29", features = ["scrolling-regions"] }
 # Syntax colors for code, as bat draws them: syntect with bat's own
-# syntaxes and themes, read with the pure-Rust regex engine.
-syntect = { version = "5", default-features = false, features = ["parsing", "regex-fancy"] }
-two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+# syntaxes and themes, read with Oniguruma as bat reads them: about three
+# times faster than the pure-Rust regex engine on code-heavy history.
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
 # A side chat in the pane beside the conversation: its Sonny runs on a
 # terminal of its own, whose screen is read as a terminal would draw it.
 portable-pty = "0.9"
@@ -31,6 +32,12 @@ vt100 = "0.15"
 resvg = "0.45"
 # Picture files in the pane and in Markdown, as the runtime reads them.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# The MCP servers the lookout keeps for agents' scripts: the official Rust
+# SDK, which Codex uses too, as a client over stdio and streamable HTTP.
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+# Runs agents' `exec` scripts: QuickJS, as Pi's code mode does, small
+# beside V8, with a memory limit and an interrupt for a script's time.
+rquickjs = { version = "0.14", features = ["futures", "disable-assertions"] }
 serde_json = "1"
 # Checks an edited project file before it replaces the person's, as the
 # client reads it.

@@ -9,7 +9,7 @@ cmux is the terminal the person watches the work in. Your shell is not in a cmux
 
 A tab is the default. It is one more stream of work, beside the lead's tab, that the person can click into when they choose, to watch it, steer it and manage it there. A split puts something beside you, in the workspace the person is looking at, so it asks for their attention now. Open one only when you want them to see something right away: a server or a CLI's output you are showing them, or an agent they should watch or talk to side by side with you. When unsure, use a tab.
 
-Workspaces are for leads: each project's lead has a cmux workspace of its own, and its agents and commands get tabs and splits in it.
+Workspaces are for leads: each project's lead has a cmux workspace of its own, and its agents and commands get tabs and splits in it. When the person asks for a workspace, they mean a project's: open another project's lead in its own with `show_agent`, or make the project with `new_project` and then show its lead.
 
 ## Where things go
 
@@ -42,4 +42,4 @@ Close each tab you opened once you have what you need from it: a build or test r
 
 ## When cmux refuses
 
-cmux lets only programs it started, or ones the person allows in cmux's Settings > Automation, reach it. When a call says cmux refused or denied the connection, tell the person, with what cmux said; never change cmux's settings yourself.
+Your shell is not a program cmux started, so cmux takes its calls only in Automation mode, which lets the person's own programs reach it. When a call says cmux refused or denied the connection ("only processes started inside cmux can connect"), tell the person, with what cmux said, that cmux's Settings > Automation needs "Automation mode" for agents to reach it; never change cmux's settings yourself.

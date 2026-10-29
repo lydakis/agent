@@ -233,7 +233,8 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         ));
     }
     if !row.latest.is_empty() {
-        let line = Line::from(row.latest.clone()).dim();
+        // The agent's words, read as the Markdown they are.
+        let line = Line::from(crate::transcript::inline(&row.latest, Default::default())).dim();
         out.extend(crate::transcript::capped(
             line,
             width,

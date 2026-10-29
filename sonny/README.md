@@ -66,11 +66,11 @@ Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
 
-A new project's empty transcript opens with a welcome: Sonny, the robot
-the client is named for, drawn in half blocks, as a portrait the first
-time Sonny ever runs (noted in `~/.agent/sonny/welcomed`) and as a small
-icon for each project after that. A folder that already has a lead opens
-on its history, with no welcome over it.
+A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
+the robot the client is named for, as a portrait drawn in half blocks,
+beside the folder, the lead's model and a few commands. A new lead opens
+on it; a long conversation shows it above its first message, once scrolling
+up has reached it. A side chat has none.
 
 Sonny's two roles are normal profiles the person can read and edit in
 `~/.agents/agents`, beside their own: `lead.md`
@@ -141,9 +141,11 @@ command (`cmux surface resume set`, shown as `Sonny: NAME`), so after cmux
 relaunches the tab runs `sonny` on the same bot again, once you allow
 commands starting with `sonny` from the tab's Resume Commands menu (until
 then cmux offers it to run by hand); quitting Sonny clears it. cmux lets
-only programs started in its tabs reach it, by default: the lookout Sonny
-starts there is one, and one started outside cmux needs Settings >
-Automation set to allow local automation.
+only programs started in its tabs reach it, by default; agents' shells run
+in the daemon, not in cmux, so set cmux's Settings > Automation to
+"Automation mode" (your own programs, no ancestry check) for agents to run
+commands in tabs and read them. The lookout Sonny starts in cmux reaches it
+either way; one started outside cmux needs Automation mode too.
 The place a
 project was laid out in is kept in `~/.agent/sonny/places`, so an agent's
 `run_in_pane` and `show_agent` calls go to that Herdr or cmux workspace or
@@ -177,6 +179,32 @@ a line to wait for.
 The skill tells agents to close what they opened once read; whatever a task
 left open closes with its window.
 
+#### T3 Code
+
+`sonny acp` is Sonny for [T3 Code](https://github.com/pingdotgg/t3code): it
+speaks the Agent Client Protocol on stdio, so T3 Code runs it as a provider,
+one process for each thread. In T3 Code's Settings, add an "ACP Registry"
+provider, configure it by hand as a local command, and give it the
+executable `sonny` (or the full path `command -v sonny` prints) with the one
+argument `acp`. A thread opened in a folder is that folder's lead, the
+one `sonny` there opens, set up the same way: its rules, skills and memory,
+Sonny's tools, its approval mode and sandbox, and the lookout. A call that
+waits for you is asked in the thread (Allow or Deny); one the judge passes
+runs without asking. The turns the lead takes on its own, as when the lookout
+wakes it because a task finished, show in the thread between yours, as work
+the agent started (the protocol's version 2 draft, which T3 Code speaks).
+Each task the lead starts opens as a T3 Code thread of its own, in the task's
+worktree (in the project's folder when T3 Code does not take the worktree as
+one of the project's), with the task's brief as its first message; that
+thread is the task's, so it shows the task's work and steers it. Sonny opens
+it with the `t3_thread_launch` tool T3 Code gives each thread it runs, by the
+credential T3 Code scopes to that thread, which no program Sonny starts
+inherits. Sonny takes the person's words out of the instructions T3 Code
+wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
+Plan mode does not reach them; plan with the lead instead. What thread is
+which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
+same bot.
+
 Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
@@ -184,7 +212,17 @@ keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
 Ctrl-arrows) move a word, Ctrl-P/N move a row, Ctrl-H and Ctrl-D delete a
 character, Ctrl-W (or Alt-Backspace) and Alt-D (or Alt-Delete) a word,
 Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
-last of those took.
+last of those took. Shift-Enter needs a terminal that speaks the kitty
+keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
+WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
+or Ctrl-J still start a line.
+
+On the full screen the mouse edits the composer too, as in Codex: a click
+puts the cursor there, a drag selects (and copies), two clicks select a word
+and three a line. Typing replaces the selection, Backspace or Delete takes it
+out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
+
+![A selection in the composer](../docs/sonny/composer-selection.png)
 
 Pictures go with a message: Ctrl-V takes the one on the clipboard, as in
 Codex and Claude Code (terminals paste only text), and an image file
@@ -238,7 +276,7 @@ off again never shows.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `side_chat`, `chime`, `verbose`) through them and its default; Enter types one that takes a
+  `senders`, `side_chat`, `chime`, `verbose`) through them and its default; Enter types one that takes a
   name (`model`, `provider`, `judge.model`), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
@@ -306,6 +344,16 @@ off again never shows.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+- `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
+  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
+  its tools or why it did not start. Agents reach them through one `exec`
+  tool: a script that calls many tools at once and returns only what it
+  prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
+  ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)).
+
+  ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
+
+  ![/mcp in the pane](../docs/sonny/pane-mcp.png)
 - Every task works in a git worktree of its own, at the last commit on
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
@@ -328,7 +376,8 @@ off again never shows.
   architectural choice or a step that cannot be undone, it calls its `ask`
   tool with the question, why it asks, two to four options each with what
   picking it means, and the one it recommends and why. Sonny draws the
-  decision in the conversation where it was asked, and the composer's hint
+  decision in the conversation where it was asked, its words read as
+  Markdown with the same renderer a reply uses, and the composer's hint
   names it: what you type next answers it (an option's number picks it),
   and goes to the lead as `You asked: QUESTION` and your answer. Esc sets
   it aside for a message of your own, and Esc again goes back to it. The
@@ -367,7 +416,7 @@ turn of the task numbered after that one reopens it.
 
 ![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 
-![A decision the lead asked with the ask tool, drawn where it asked it](../docs/sonny/ask-asked.png)
+![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
 ![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
 
@@ -388,8 +437,8 @@ text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
-[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory and
-skills.
+[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
+skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
 subscribes each lead to its tasks. As soon as the lead rests, it tells it
@@ -438,11 +487,19 @@ Sonny drew around it. A click on a web link opens it in the browser, and
 a click on a file opens it in a pane beside the conversation: code in
 syntax colors with its line numbers, at the line the link names
 (`src/main.rs:120`), Markdown as replies read, with its pictures and
-the HTML a README is written with, and a picture, SVG, Mermaid file or
-HTML page drawn as it looks. Markdown and plain text read at the 100
+the HTML a README is written with and its math (`$$ … $$`, `\[ … \]`,
+`$…$` and `\(…\)`) drawn as in a reply, and a picture, SVG, Mermaid
+file or HTML page drawn as it looks. Markdown and plain text read at the 100
 columns the conversation is written at; code, pictures, diagrams and
-pages fill the pane. A click on a picture, diagram or page in the
-conversation opens it in the pane, bigger. The pane scrolls,
+pages fill the pane. A folder shows as a tree, folders first: a click
+on a folder opens it in place, a chain of folders that each hold only
+the next shows on one row, and what git says of a file shows at its
+row's end (M changed, A added, D deleted, R renamed, U new, a dot on a
+folder that holds a change, ignored ones dim). A click on a picture,
+diagram or page in the conversation opens it in the pane, bigger. A
+link in what the pane shows opens there too, and the pane goes back and
+forward as a browser does: ‹ and › in its title, or ← and → (Backspace
+back) while keys go to it, each page as it was left. The pane scrolls,
 selects and copies as the conversation does; a click on its name opens
 the file in the app the system opens it with, and Esc closes it. Links
 are the terminal's own links too, so its link click (Cmd+click, or
@@ -469,6 +526,12 @@ the choice is kept with the other settings.
 ![A Mermaid diagram clicked in the conversation, drawn across the pane](../docs/sonny/pane-mermaid.png)
 
 ![An HTML page clicked in the conversation, drawn in the pane](../docs/sonny/pane-html.png)
+
+![A folder beside the chat as a tree: docs opened in place, what git says of each file at its row's end, ignored build dim](../docs/sonny/pane-tree.png)
+
+![The tree, then a guide opened from it, then the math notes it links to; ‹ goes back to the guide and to the tree as it was left, › forward again](../docs/sonny/pane-tree-back.gif)
+
+![A Markdown file's math beside the chat, drawn as the reply draws it, in dollars and in brackets](../docs/sonny/pane-math.png)
 
 ![A screenshot the agent named in its reply, drawn in the conversation](../docs/sonny/chat-picture.png)
 

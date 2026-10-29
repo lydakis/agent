@@ -28,7 +28,7 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SWITCH: &[&str] = &["true", "false"];
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 10] = [
+pub const SETTINGS: [Setting; 11] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -43,9 +43,15 @@ pub const SETTINGS: [Setting; 10] = [
     },
     Setting {
         key: "web_search",
-        about: "whether new agents search the web where their provider offers it",
+        about: "whether new agents search and fetch the web where their provider offers it",
         values: &["live", "disabled"],
         default: "live",
+    },
+    Setting {
+        key: "senders",
+        about: "whether a new agent's model reads a line naming who sent it each message",
+        values: &["shown", "hidden"],
+        default: "shown",
     },
     Setting {
         key: "judge.model",
@@ -348,21 +354,21 @@ mod tests {
             said: None,
         };
         view.values = view.read().unwrap();
-        assert_eq!(view.values[5].as_deref(), Some("low"));
+        assert_eq!(view.values[6].as_deref(), Some("low"));
         // The side chat: a fork, then its default again either way.
-        view.pick = 7;
+        view.pick = 8;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[7].as_deref(), Some("fork"));
+        assert_eq!(view.values[8].as_deref(), Some("fork"));
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[7], None);
+        assert_eq!(view.values[8], None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[7].as_deref(), Some("fork"));
+        assert_eq!(view.values[8].as_deref(), Some("fork"));
         // Efforts step through every level.
-        view.pick = 4;
+        view.pick = 5;
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[4].as_deref(), Some("max"));
+        assert_eq!(view.values[5].as_deref(), Some("max"));
         press(&mut view, KeyCode::Enter);
-        assert_eq!(view.values[4], None);
+        assert_eq!(view.values[5], None);
         // A model is typed whole, and an empty one is the default.
         view.pick = 0;
         for c in "a/b".chars() {
@@ -378,16 +384,16 @@ mod tests {
         press(&mut view, KeyCode::Enter);
         assert_eq!(view.values[0], None);
         // The lead's effort back to its default.
-        view.pick = 5;
+        view.pick = 6;
         press(&mut view, KeyCode::Backspace);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "# mine\n[sonny]\nside_chat = \"fork\"\n"
         );
         // A switch is written as TOML's own.
-        view.pick = 8;
+        view.pick = 9;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[8].as_deref(), Some("false"));
+        assert_eq!(view.values[9].as_deref(), Some("false"));
         assert!(!agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
@@ -395,9 +401,9 @@ mod tests {
                 .ends_with("chime = false\n")
         );
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[8], None);
+        assert_eq!(view.values[9], None);
         // A value the reader refuses is said, and the file kept.
-        view.pick = 6;
+        view.pick = 7;
         view.typing = None;
         std::fs::write(&path, "[sonny]\nbogus = \"x\"\n").unwrap();
         press(&mut view, KeyCode::Right);

@@ -579,7 +579,16 @@ mod tests {
         assert_eq!(
             (&create["tools"], &create["compaction_instructions"]),
             (
-                &json!(["shell", "read", "write", "apply_patch", "wait", "history"]),
+                &json!([
+                    "shell",
+                    "write_stdin",
+                    "read",
+                    "write",
+                    "apply_patch",
+                    "wait",
+                    "history",
+                    "web_fetch"
+                ]),
                 &json!("keep")
             )
         );
