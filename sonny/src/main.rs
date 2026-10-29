@@ -1177,12 +1177,35 @@ fn context_after(event: &Value) -> Option<u64> {
 
 /// What a page of older items was drawn from: its nodes, the turn each
 /// was made in, what newer pages' calls returned that it has the calls
-/// of, and whether it is the first page, the welcome over it.
+/// of (the nodes to read, and the calls), and whether it is the first
+/// page, the welcome over it.
 struct Paged {
     nodes: Vec<i64>,
     turns: HashMap<i64, i64>,
-    after: Vec<(i64, Value)>,
+    after: Vec<i64>,
+    returned: std::collections::HashSet<String>,
     first: bool,
+}
+
+impl Paged {
+    fn new(nodes: Vec<i64>, turns: HashMap<i64, i64>, after: &[(i64, Value)], first: bool) -> Self {
+        let mut read = Vec::new();
+        for (node, _) in after {
+            if read.last() != Some(node) {
+                read.push(*node);
+            }
+        }
+        let returned = (after.iter())
+            .map(|(_, item)| item["call_id"].as_str().unwrap_or("").to_owned())
+            .collect();
+        Self {
+            nodes,
+            turns,
+            after: read,
+            returned,
+            first,
+        }
+    }
 }
 
 /// What the bot is saying: its rows stay in the viewport until what comes
@@ -2830,13 +2853,9 @@ impl App {
             return;
         };
         self.first_node = Some(oldest);
-        let paged = Paged {
-            nodes,
-            turns,
-            after: std::mem::take(&mut self.unpaired),
-            first: self.older.is_none(),
-        };
-        let (lines, unpaired) = self.draw_page(&paged).await;
+        let after = std::mem::take(&mut self.unpaired);
+        let paged = Paged::new(nodes, turns, &after, self.older.is_none());
+        let (lines, unpaired) = self.draw_page(&paged, after).await;
         self.unpaired = unpaired;
         let id = self.next_page;
         self.next_page += 1;
@@ -2851,7 +2870,13 @@ impl App {
             return;
         };
         self.short_read.set(false);
-        let (lines, _) = self.draw_page(&paged).await;
+        let mut after = self.items_at(&paged.after).await;
+        after.retain(|(_, item)| {
+            paged
+                .returned
+                .contains(item["call_id"].as_str().unwrap_or(""))
+        });
+        let (lines, _) = self.draw_page(&paged, after).await;
         self.pages.insert(id, paged);
         if !self.short_read.get() {
             self.screen.fill(id, lines);
@@ -2861,7 +2886,11 @@ impl App {
     /// The rows of a page of older items, and what calls older than it
     /// returned: drawn on their own, what the newer rows were drawn with
     /// put by meanwhile.
-    async fn draw_page(&mut self, paged: &Paged) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
+    async fn draw_page(
+        &mut self,
+        paged: &Paged,
+        after: Vec<(i64, Value)>,
+    ) -> (Vec<Line<'static>>, Vec<(i64, Value)>) {
         let pending = std::mem::take(&mut self.pending);
         let any_history = std::mem::replace(&mut self.any_history, false);
         let rows_drawn = self.rows_drawn;
@@ -2873,7 +2902,7 @@ impl App {
             self.commit(welcome);
         }
         let unpaired = self
-            .draw_nodes(&paged.nodes, &paged.turns, true, paged.after.clone())
+            .draw_nodes(&paged.nodes, &paged.turns, true, after)
             .await;
         let mut lines = std::mem::replace(&mut self.pending, pending);
         self.any_history = any_history;
