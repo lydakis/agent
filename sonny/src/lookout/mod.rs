@@ -205,6 +205,49 @@ async fn reply_text(client: &Client, seen: &Seen) -> String {
         .unwrap_or_default()
 }
 
+/// `event`, a `margin` call's start whose arguments were cut before the
+/// note's id, with the call's arguments whole, as the bot's history keeps
+/// them; any other event as it is.
+async fn whole_margin_call(client: &Client, mut event: Value) -> Value {
+    let data = &event["data"];
+    if event["event"] != "tool_started"
+        || data["name"] != crate::margin::TOOL
+        || data["arguments_truncated"] != true
+        || crate::margin::called(data).is_some()
+    {
+        return event;
+    }
+    let (Some(bot), Some(call)) = (event["bot"].as_str(), data["call_id"].as_str()) else {
+        return event;
+    };
+    let (bot, call) = (bot.to_owned(), call.to_owned());
+    let Ok(page) = client
+        .request("history_nodes", json!({"bot": bot, "limit": REPLY_NODES}))
+        .await
+    else {
+        return event;
+    };
+    let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    let Ok(read) = client
+        .request("history_items", json!({"bot": bot, "nodes": nodes}))
+        .await
+    else {
+        return event;
+    };
+    // Anthropic tasks keep calls as blocks inside a message.
+    let arguments = (read["items"].as_array().into_iter().flatten())
+        .flat_map(|entry| crate::responses(&entry["item"]))
+        .find(|item| item["type"] == "function_call" && item["call_id"] == call.as_str())
+        .and_then(|item| item["arguments"].as_str().map(str::to_owned));
+    if let Some(arguments) = arguments {
+        event["data"]["arguments"] = json!(arguments);
+        event["data"]["arguments_truncated"] = json!(false);
+    }
+    event
+}
+
 /// The words one history node holds.
 async fn node_text(client: &Client, bot: &str, node: i64) -> String {
     client
@@ -648,6 +691,7 @@ impl Service {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { return };
+                    let event = whole_margin_call(&client, event).await;
                     served.event(&event);
                     // A `subscriptions` call this lookout answered counts
                     // from the next event on, not from the next tick.
@@ -1706,6 +1750,31 @@ fn epoch_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_long_margin_call_is_read_whole_for_its_note_s_id() {
+        // The id after a long text, as a model may write it.
+        let whole = format!(r#"{{"markdown": "{}", "id": "results"}}"#, "x".repeat(3000));
+        let kept = whole.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 5}]}),
+            _ => json!({"items": [{"node": 5, "item": {"type": "function_call",
+                "call_id": "c9", "name": crate::margin::TOOL, "arguments": kept}}]}),
+        })
+        .await;
+        let started = json!({"event": "tool_started", "bot": "calc.quick", "data": {
+            "name": crate::margin::TOOL, "call_id": "c9",
+            "arguments": whole[..2048], "arguments_truncated": true}});
+        assert_eq!(crate::margin::called(&started["data"]), None);
+        let event = whole_margin_call(&client, started).await;
+        assert_eq!(
+            crate::margin::called(&event["data"]),
+            Some(("results".into(), false))
+        );
+        // Any other event is left as it is.
+        let other = json!({"event": "tool_started", "data": {"name": "shell"}});
+        assert_eq!(whole_margin_call(&client, other.clone()).await, other);
+    }
 
     fn lookout() -> Lookout {
         let mut lookout = Lookout::new("calc.lead");

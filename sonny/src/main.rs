@@ -122,6 +122,9 @@ const OLDER_ITEMS: u64 = 50;
 const WALKED_ITEMS: u64 = 400;
 /// About how many pages the way up to the first turn reads between frames.
 const WALKED_PAGES: usize = 32;
+/// How many pages of 400 nodes a task's history is read back to find
+/// where a note the margin shows of it starts.
+const REFERENCE_PAGES: usize = 25;
 /// The widest the conversation is written, however wide the window: a
 /// reply reads as a column, not a band across the screen. Prose reads
 /// best at 45 to 90 characters a line, but replies carry code, paths and
@@ -1718,6 +1721,9 @@ struct App {
     pane: Option<pane::Pane>,
     pane_keys: bool,
     pane_mouse: bool,
+    /// Whether the margin held anything when last looked at: emptied, it
+    /// goes, keys or not.
+    margin_held: bool,
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
@@ -1725,6 +1731,8 @@ struct App {
     /// area, the first of its rows shown there, and the width it was laid
     /// out at; none while something else is drawn over it.
     composer_at: Option<(Rect, usize, usize)>,
+    /// Where the footer counts the agents at work: its row and columns.
+    counter_at: Option<(u16, std::ops::Range<u16>)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -1744,6 +1752,18 @@ struct App {
     /// conversation and how often it had changed when they were last
     /// drawn so, and whether a note put since waits to be.
     inline: HashMap<u64, (String, String)>,
+    /// The title each note's marker says, by pin: drawn again when the
+    /// note's changes, as a task's note read for the first time does.
+    marked: HashMap<u64, String>,
+    /// Other bots' notes the margin shows, by bot and note, as read from
+    /// them; and when they were last read.
+    references: HashMap<(String, String), margin::Reference>,
+    references_read: Option<Instant>,
+    /// The tasks this agent started that have a turn running, as the
+    /// daemon says without windows for the project's agents; and when
+    /// they were last read.
+    tasks_running: Option<std::collections::HashSet<String>>,
+    tasks_running_read: Option<Instant>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -2514,15 +2534,22 @@ impl App {
             full_width: 0,
             pane: None,
             pane_keys: false,
+            margin_held: false,
             pane_mouse: false,
             closed: None,
             composer_at: None,
+            counter_at: None,
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
             under: None,
             margin_focus: None,
             inline: HashMap::new(),
+            marked: HashMap::new(),
+            references: HashMap::new(),
+            references_read: None,
+            tasks_running: None,
+            tasks_running_read: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -2728,6 +2755,8 @@ impl App {
             self.follow_place().await;
             self.count_behind();
             self.read_tasks().await;
+            self.read_running_tasks().await;
+            self.read_references().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
@@ -3874,6 +3903,7 @@ impl App {
             let link = format!("{}note/{id}", screen::BUTTON);
             self.mark_last(screen::Mark::Tag(screen::Tag::Note(pin)));
             self.mark_last(screen::Mark::Link(link));
+            self.marked.insert(pin, note.title);
         }
     }
 
@@ -3909,10 +3939,32 @@ impl App {
         for pin in back {
             let (id, title) = self.inline.remove(&pin).expect("drawn out");
             let link = screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
-            let line = note_marker(title, true);
+            let line = note_marker(title.clone(), true);
             (self.screen).replace_tagged(screen::Tag::Note(pin), vec![line], vec![(0, link)]);
+            self.marked.insert(pin, title);
+        }
+        // A note taken away, by the person's × or by the agent, is gone
+        // from the conversation too, as it is once drawn again.
+        let gone: Vec<u64> = (self.marked.keys())
+            .filter(|pin| !notes.iter().any(|(at, ..)| at == *pin))
+            .copied()
+            .collect();
+        for pin in gone {
+            self.marked.remove(&pin);
+            (self.screen).replace_tagged(screen::Tag::Note(pin), Vec::new(), Vec::new());
         }
         if beside {
+            // A marker says its note's title as it is now.
+            for (pin, id, title) in notes {
+                let tag = screen::Tag::Note(pin);
+                if self.marked.get(&pin) == Some(&title) || !self.screen.has(tag) {
+                    continue;
+                }
+                let link = screen::Mark::Link(format!("{}note/{id}", screen::BUTTON));
+                let line = note_marker(title.clone(), true);
+                (self.screen).replace_tagged(tag, vec![line], vec![(0, link)]);
+                self.marked.insert(pin, title);
+            }
             return;
         }
         let width = self.prose();
@@ -4147,6 +4199,163 @@ impl App {
             .into_iter()
             .map(|(_, item)| item)
             .collect()
+    }
+
+    /// The other bots' notes the margin shows, read again every few
+    /// seconds while their bots are there: what each shows is kept once
+    /// its bot is gone.
+    async fn read_references(&mut self) {
+        let shown = self.margin.references();
+        (self.references).retain(|(bot, id), _| shown.iter().any(|(_, b, i)| b == bot && i == id));
+        if shown.is_empty()
+            || (self.references_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.references_read = Some(Instant::now());
+        let mut read = std::collections::HashSet::new();
+        for (note, bot, id) in shown {
+            let key = (bot, id);
+            let mut reference = self.references.remove(&key).unwrap_or_default();
+            if read.insert(key.clone()) && !reference.gone {
+                self.read_reference(&key.0, &key.1, &mut reference).await;
+            }
+            if let Some((title, body, folder)) = reference.shown() {
+                self.margin.resolved(&note, title, body, folder);
+            }
+            self.references.insert(key, reference);
+        }
+    }
+
+    /// The tasks this agent started with a turn running, read every few
+    /// seconds where no windows for the project's agents say it.
+    async fn read_running_tasks(&mut self) {
+        if self.fleet.is_some()
+            || (self.tasks_running_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.tasks_running_read = Some(Instant::now());
+        // Every page of them, or the count stays as it was.
+        let mut running = std::collections::HashSet::new();
+        let mut after = Value::Null;
+        loop {
+            let asked = json!({"active": true, "limit": 256, "after": after});
+            let Ok(page) = self.client.request("bots", asked).await else {
+                return;
+            };
+            running.extend(
+                (page["bots"].as_array().into_iter().flatten())
+                    // Its side chats lapse, and are no tasks.
+                    .filter(|bot| bot["created_by"] == self.bot.as_str())
+                    .filter(|bot| bot["expire_ms"].is_null())
+                    .filter_map(|bot| bot["name"].as_str().map(str::to_owned)),
+            );
+            after = page["next_after"].clone();
+            if !after.is_string() {
+                break;
+            }
+        }
+        self.tasks_running = Some(running);
+    }
+
+    /// What `bot` did since `reference` was last read of its note `id`,
+    /// and, when that note shows another bot's, what that one did.
+    async fn read_reference(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
+        self.read_history(bot, id, reference).await;
+        // Taken away there, or the bot gone, what it showed stays as
+        // last read.
+        if reference.removed() || reference.gone {
+            return;
+        }
+        let Some((through, note)) = reference.shows() else {
+            reference.through = None;
+            return;
+        };
+        // Read again where it was read from, while it shows the same one.
+        let mut shown = (reference.through.take())
+            .filter(|shown| shown.names.as_ref() == Some(&(through.clone(), note.clone())))
+            .unwrap_or_default();
+        shown.names = Some((through.clone(), note.clone()));
+        if !shown.gone {
+            self.read_history(&through, &note, &mut shown).await;
+        }
+        reference.through = Some(shown);
+    }
+
+    /// What `bot` did since `reference` was last read of its note `id`.
+    async fn read_history(&self, bot: &str, id: &str, reference: &mut margin::Reference) {
+        // The bot first read, every time: another given its name once it
+        // is gone is not the one shown, and what was read of it stays.
+        let asked = json!({"bot": bot, "bot_id": reference.bot_id});
+        match self.client.request("inspect", asked).await {
+            Ok(record) => {
+                reference.bot_id = record["bot_id"].as_i64();
+                if reference.workspace.is_none() {
+                    reference.workspace = record["workspace"].as_str().map(str::to_owned);
+                }
+            }
+            Err(error) => {
+                reference.gone = error.code == "bot_not_found";
+                return;
+            }
+        }
+        // The newest nodes first, read back as far as the note's start,
+        // then only what came after them.
+        let mut pages: Vec<Vec<Value>> = Vec::new();
+        let mut newest = None;
+        let mut from: Option<i64> = None;
+        while pages.len() < REFERENCE_PAGES {
+            let asked = match (reference.node, from) {
+                (Some(node), _) => {
+                    json!({"bot": bot, "limit": 400, "min_node": node + 1, "oldest_first": true})
+                }
+                (None, Some(from)) => json!({"bot": bot, "limit": 400, "from": from}),
+                (None, None) => json!({"bot": bot, "limit": 400}),
+            };
+            let page = match self.client.request("history_nodes", asked).await {
+                Ok(page) => page,
+                Err(error) => {
+                    reference.gone = error.code == "bot_not_found";
+                    return;
+                }
+            };
+            let mut nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+                .filter_map(|node| node["node"].as_i64())
+                .collect();
+            nodes.sort_unstable();
+            let Some(&last) = nodes.last() else {
+                break;
+            };
+            newest = newest.max(Some(last));
+            // In the nodes' order, and each node's as it holds them; a read
+            // cut short is asked again from where it was, next time.
+            let short = self.short_read.replace(false);
+            let items: Vec<Value> = (self.items_of(bot, &nodes).await.into_iter())
+                .map(|(_, item)| item)
+                .collect();
+            if self.short_read.replace(short) {
+                return;
+            }
+            let started = margin::Reference::starts(id, &items);
+            pages.push(items);
+            from = page["next_from"].as_i64();
+            if reference.node.is_some() || started || from.is_none() {
+                break;
+            }
+        }
+        if reference.node.is_none() {
+            reference.whole = from.is_none();
+        }
+        for items in pages.iter().rev() {
+            reference.read(id, items);
+        }
+        if newest.is_some() {
+            reference.node = newest;
+        }
+        if let Some(path) = reference.file() {
+            reference.file_read(margin::read(&path).ok());
+        }
     }
 
     /// [`App::items`], each with the node it is kept at.
@@ -5913,6 +6122,15 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
+                // The agents counted under the composer: /status.
+                if down
+                    && let Some((row, columns)) = &self.counter_at
+                    && mouse.row == *row
+                    && columns.contains(&mouse.column)
+                {
+                    self.follow(&format!("{}status", screen::BUTTON));
+                    return true;
+                }
                 if !in_pane && self.composer_mouse(mouse) {
                     // A press here lets go of what was selected there.
                     if down {
@@ -6248,7 +6466,8 @@ impl App {
     }
 
     /// The margin back beside the conversation when nothing else is
-    /// there, unless the person closed it.
+    /// there and it holds something, unless the person closed it: out of
+    /// the way again once it holds nothing, unless it was asked for so.
     fn margin_back(&mut self) {
         if self.margin.closed() {
             self.under = None;
@@ -6256,14 +6475,32 @@ impl App {
                 over.over = false;
             }
         }
-        if self.pane.is_none() && !self.margin.closed() {
+        let empty = self.margin.is_empty();
+        let emptied = std::mem::replace(&mut self.margin_held, !empty) && empty;
+        // Emptied under what is open over it, there is none to go back to.
+        if emptied
+            && self.under.take().is_some()
+            && let Some(over) = &mut self.pane
+        {
+            over.over = false;
+        }
+        if empty
+            && (emptied || !self.pane_keys)
+            && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
+        {
+            self.pane = None;
+            self.pane_keys = false;
+        }
+        if self.pane.is_none() && !self.margin.closed() && (!empty || self.pane_keys) {
             self.pane = Some(self.under.take().unwrap_or_else(pane::Pane::margin));
         }
     }
 
     /// `/margin`: the margin shown, with the keys, or closed.
     fn toggle_margin(&mut self) {
-        let shown = !self.margin.closed();
+        // Out of the way while it holds nothing, it is not shown either.
+        let shown = !self.margin.closed()
+            && (self.under.is_some() || self.pane.as_ref().is_some_and(pane::Pane::is_margin));
         self.margin.close(shown);
         if shown {
             if self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
@@ -6280,27 +6517,50 @@ impl App {
                 self.under = Some(pane::Pane::margin());
             }
             None => {
-                self.margin_back();
                 self.pane_keys = true;
+                self.margin_back();
             }
         }
     }
 
-    /// What runs for the agent, for the margin's first row: its tasks at
-    /// work, what waits on the person, its background, its context.
+    /// What runs for the agent, for the margin's first row: its
+    /// background and its context.
     fn glance(&self) -> margin::Glance {
-        let doing = |state: &str| {
-            (self.fleet.iter().flat_map(|fleet| fleet.doing.iter()))
-                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
-                .count()
-        };
         margin::Glance {
             name: self.bot.clone(),
-            running: doing("working"),
-            waiting: self.asks.len() + doing("needs you"),
             behind: self.behind.0,
             context: self.context,
         }
+    }
+
+    /// The other agents at work, and what waits on the person: questions
+    /// and calls here, and agents that need them. Without windows for the
+    /// project's agents, the tasks this one started: those running as the
+    /// daemon says, drawn or not, and those that need the person as their
+    /// rosters read them.
+    fn agents(&self) -> (usize, usize) {
+        let doing: HashMap<&str, &str> = match &self.fleet {
+            Some(fleet) => (fleet.doing.iter())
+                .map(|(bot, doing)| (bot.as_str(), *doing))
+                .collect(),
+            None => {
+                let rostered = (self.tasks.values().flatten())
+                    .map(|task| (task.bot.as_str(), task.state.as_str()));
+                match &self.tasks_running {
+                    Some(running) => (running.iter())
+                        .map(|bot| (bot.as_str(), "working"))
+                        .chain(rostered.filter(|(_, state)| *state == "needs you"))
+                        .collect(),
+                    None => rostered.collect(),
+                }
+            }
+        };
+        let count = |state: &str| {
+            (doing.iter())
+                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
+                .count()
+        };
+        (count("working"), self.asks.len() + count("needs you"))
     }
 
     /// A button clicked: what Sonny does for it now, or once the loop
@@ -7752,6 +8012,7 @@ impl App {
             }),
         };
         let mut composer_at = None;
+        let mut counter_at = None;
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(PROSE));
@@ -8165,7 +8426,9 @@ impl App {
                     composer.y + (cursor_row as u16).min(composer.height.saturating_sub(1)),
                 ));
             }
-            frame.render_widget(Paragraph::new(self.footer_line(width)), footer);
+            let (line, counter) = self.footer(width);
+            frame.render_widget(Paragraph::new(line), footer);
+            counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
         terminal.draw(|frame| {
             paint(frame);
@@ -8173,6 +8436,7 @@ impl App {
             image::send_shown(frame.buffer_mut());
         })?;
         self.composer_at = composer_at;
+        self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
             execute!(
@@ -8334,7 +8598,32 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn footer_line(&self, width: usize) -> Line<'static> {
+        self.footer(width).0
+    }
+
+    /// The footer, and where on it the agents at work are counted, as
+    /// they are in a roster: a click opens `/status`.
+    fn footer(&self, width: usize) -> (Line<'static>, Option<std::ops::Range<u16>>) {
+        let (working, waiting) = match self.options.side {
+            Some(_) => (0, 0),
+            None => self.agents(),
+        };
+        let mut counted = Vec::new();
+        for (n, color) in [(working, Color::Cyan), (waiting, Color::Yellow)] {
+            if n > 0 {
+                counted.push(Span::raw("●").fg(color));
+                counted.push(Span::raw(format!(" {n} ")));
+            }
+        }
+        let counted_width = (counted.iter())
+            .map(|span| span.content.width())
+            .sum::<usize>();
+        let counted_width = match counted_width {
+            0 => 0,
+            n => n + 2,
+        };
         let folder = tilde(&self.workspace);
         let mut left = format!("  {}", self.model);
         if let Some(effort) = &self.effort {
@@ -8393,23 +8682,31 @@ impl App {
             None => String::new(),
         };
         // A long folder keeps its end, the part that tells folders apart.
-        let room = width.saturating_sub(left.width() + branch.width() + right.width() + 4);
+        let room =
+            width.saturating_sub(left.width() + branch.width() + right.width() + counted_width + 4);
         let mut folder = folder.as_str();
         let cut = folder.width() > room;
         while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
         let place = format!(" · {}{folder}", if cut { "…" } else { "" });
-        let fill =
-            width.saturating_sub(left.width() + place.width() + branch.width() + right.width());
+        let fill = width.saturating_sub(
+            left.width() + place.width() + branch.width() + right.width() + counted_width,
+        );
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
+        let at = left.width() + place.width() + branch.width() + fill;
         let mut spans = vec![Span::raw(left), Span::raw(place)];
         if let Some(name) = branch.strip_prefix(" on ") {
             spans.push(Span::raw(" on "));
             spans.push(Span::raw(name.to_owned()).fg(Color::Green));
         }
         spans.push(Span::raw(" ".repeat(fill)));
+        let counter = (counted_width > 0).then(|| at as u16..(at + counted_width - 3) as u16);
+        if !counted.is_empty() {
+            spans.extend(counted);
+            spans.push(Span::raw("· ").dim());
+        }
         match right.rfind(&self.bot) {
             Some(at) => {
                 spans.push(Span::raw(right[..at].to_owned()));
@@ -8437,7 +8734,7 @@ impl App {
             }
             None => spans.push(Span::raw(right)),
         }
-        Line::from(spans).dim()
+        (Line::from(spans).dim(), counter)
     }
 }
 
@@ -8858,7 +9155,9 @@ mod tests {
 
     /// A daemon that greets and gives each request `answer`'s result, or
     /// its refusal when it names an `error`.
-    async fn daemon_answering(answer: impl Fn(&Value) -> Value + Send + 'static) -> Arc<Client> {
+    pub(crate) async fn daemon_answering(
+        answer: impl Fn(&Value) -> Value + Send + 'static,
+    ) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         // Tests start stand-ins at once, within the same millisecond.
         static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -10592,6 +10891,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_s_note_the_margin_shows_is_read_as_it_changes_and_kept() {
+        let folder = std::env::temp_dir().join(unique("task-folder"));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("flow.md"), "# Flow").unwrap();
+        let workspace = folder.display().to_string();
+        let folder_name = workspace.clone();
+        let call = |arguments: Value| {
+            json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
+                "arguments": arguments.to_string()})
+        };
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = gone.clone();
+        let client = daemon_answering(move |asked| {
+            if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                return json!({"error": "bot_not_found"});
+            }
+            match asked["op"].as_str() {
+                Some("inspect") => json!({"name": "calc.add", "workspace": workspace}),
+                Some("history_nodes") if asked["min_node"].is_null() => {
+                    json!({"nodes": [{"node": 2}, {"node": 1}]})
+                }
+                Some("history_nodes") => json!({"nodes": [{"node": 3}]}),
+                Some("history_items") => {
+                    json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                    .map(|node| json!({"node": node, "item": match node.as_i64() {
+                        Some(1) => call(json!({"id": "flow", "title": "Flow", "markdown": "one"})),
+                        Some(2) => json!({"type": "message", "role": "assistant", "content": []}),
+                        _ => call(json!({"id": "flow", "file": "flow.md"})),
+                    }}))
+                    .collect::<Vec<_>>()})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+        // Its pictures are read in the task's folder.
+        let margin::Body::From {
+            folder: read_in, ..
+        } = &app.margin.note("flow").unwrap().body
+        else {
+            panic!()
+        };
+        assert_eq!(read_in.as_deref(), Some(folder_name.as_str()));
+        // What it did since, a few seconds on.
+        let read_flow = margin::Body::Read {
+            path: "flow.md".into(),
+            text: "# Flow".into(),
+        };
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("one".into())));
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(read_flow.clone()));
+        // The task gone, with its folder, what it showed stays.
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::remove_dir_all(&folder).unwrap();
+        app.references_read = None;
+        app.read_references().await;
+        assert!(app.references.values().all(|reference| reference.gone));
+        assert_eq!(shown(&app), Some(read_flow.clone()));
+    }
+
+    #[tokio::test]
+    async fn a_task_s_note_that_shows_its_own_task_s_is_read_through() {
+        use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+        // Later the task takes its note away (1), or is gone (2), and its
+        // own task changes.
+        let phase = Arc::new(AtomicU8::new(0));
+        let on = phase.clone();
+        let client = daemon_answering(move |asked| {
+            let later = on.load(SeqCst);
+            let arguments = match (asked["bot"].as_str(), later) {
+                (Some("calc.add"), 1) => json!({"id": "flow", "remove": true}),
+                (Some("calc.add"), _) => {
+                    json!({"id": "flow", "title": "Flow", "from": "calc.sub/flow"})
+                }
+                (_, 0) => json!({"id": "flow", "title": "Sub", "markdown": "deep"}),
+                _ => json!({"id": "flow", "markdown": "deeper"}),
+            };
+            let node = if later > 0 { 2 } else { 1 };
+            match asked["op"].as_str() {
+                Some("inspect") if later == 2 && asked["bot"] == "calc.add" => {
+                    json!({"error": "bot_not_found"})
+                }
+                Some("inspect") => json!({"bot_id": 1, "workspace": "/nowhere"}),
+                Some("history_nodes") => json!({"nodes": [{"node": node}]}),
+                _ => json!({"items": [{"node": node, "item": {"type": "function_call",
+                    "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}}]}),
+            }
+        })
+        .await;
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        for then in [1, 2] {
+            phase.store(0, SeqCst);
+            let mut app = app(client.clone());
+            app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+            app.read_references().await;
+            assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
+            assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+            // Taken away by the task, or the task gone, what it showed
+            // stays as last read.
+            phase.store(then, SeqCst);
+            app.references_read = None;
+            app.read_references().await;
+            assert_eq!(shown(&app), Some(margin::Body::Markdown("deep".into())));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_s_note_is_not_read_from_another_bot_given_its_name() {
+        let reused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let again = reused.clone();
+        let client = daemon_answering(move |asked| {
+            let reused = again.load(std::sync::atomic::Ordering::SeqCst);
+            let markdown = if reused { "theirs" } else { "ours" };
+            match asked["op"].as_str() {
+                Some("inspect") if reused && asked["bot_id"] == 7 => {
+                    json!({"error": "bot_not_found"})
+                }
+                Some("inspect") => {
+                    json!({"name": "calc.add", "bot_id": if reused { 8 } else { 7 },
+                        "workspace": "/nowhere"})
+                }
+                Some("history_nodes") => json!({"nodes": [{"node": if reused { 9 } else { 1 }}]}),
+                _ => json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                    .map(|node| json!({"node": node, "item": {"type": "function_call",
+                        "call_id": "t", "name": margin::TOOL, "arguments": json!({"id": "flow",
+                        "title": "Flow", "markdown": markdown}).to_string()}}))
+                    .collect::<Vec<_>>()}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("ours".into())));
+        // Removed, and another task given its name: what was read stays.
+        reused.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.references_read = None;
+        app.read_references().await;
+        assert!(app.references.values().all(|reference| reference.gone));
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("ours".into())));
+    }
+
+    #[tokio::test]
+    async fn a_task_s_note_is_found_far_back_in_order_and_follows_its_title() {
+        let call = |arguments: Value| {
+            json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
+                "arguments": arguments.to_string()})
+        };
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let failing = fail.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            // A read that fails once, as a dropped connection would.
+            Some("history_items") if failing.swap(false, std::sync::atomic::Ordering::SeqCst) => {
+                json!({"error": "unavailable"})
+            }
+            Some("inspect") => json!({"name": "calc.add", "workspace": "/nowhere"}),
+            Some("history_nodes") if asked["min_node"] == 6 => json!({"nodes": [{"node": 6}]}),
+            Some("history_nodes") if asked["min_node"] == 7 => json!({"nodes": [{"node": 7}]}),
+            Some("history_nodes") if asked["from"] == 3 => json!({"nodes": [{"node": 3}]}),
+            Some("history_nodes") if asked["min_node"].is_null() => {
+                json!({"nodes": [{"node": 5}, {"node": 4}], "next_from": 3})
+            }
+            Some("history_items") => {
+                json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                .map(|node| json!({"node": node, "item": match node.as_i64() {
+                    Some(3) => call(json!({"id": "flow", "title": "Flow", "markdown": "start"})),
+                    // A call its own margin turns down.
+                    Some(5) => call(json!({"id": "flow", "title": 1, "markdown": "wrong"})),
+                    // Two calls in one response, as some providers keep them.
+                    Some(4) => json!({"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "u1", "name": margin::TOOL,
+                            "input": {"id": "flow", "markdown": "a"}},
+                        {"type": "tool_use", "id": "u2", "name": margin::TOOL,
+                            "input": {"id": "flow", "markdown": "b"}}]}),
+                    Some(6) => call(json!({"id": "flow", "title": "Flow two", "markdown": "c"})),
+                    _ => call(json!({"id": "flow", "title": "Flow three", "markdown": "d"})),
+                }}))
+                .collect::<Vec<_>>()})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.note_call("c1", &json!({"id": "flow", "from": "calc.add/flow"}), None);
+        let shown = |app: &App| match &app.margin.note("flow").unwrap().body {
+            margin::Body::From { shown, .. } => shown.as_deref().cloned(),
+            _ => None,
+        };
+        // A read cut short leaves where it was read from.
+        app.read_references().await;
+        assert_eq!(shown(&app), None);
+        assert!(
+            app.references
+                .values()
+                .all(|reference| reference.node.is_none())
+        );
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("b".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow");
+        // Retitled there, it is here too.
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("c".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Flow two");
+        // Given its own title here, it keeps it.
+        let titled = json!({"id": "flow", "title": "Mine", "from": "calc.add/flow"});
+        app.note_call("c2", &titled, None);
+        app.references_read = None;
+        app.read_references().await;
+        assert_eq!(shown(&app), Some(margin::Body::Markdown("d".into())));
+        assert_eq!(app.margin.note("flow").unwrap().title, "Mine");
+    }
+
+    #[tokio::test]
     async fn a_task_that_ended_with_nothing_to_say_said_nothing_and_did_not_fail() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("wait") => json!({"results": {"turn:calc.quiet/1":
@@ -10743,6 +11275,99 @@ mod tests {
             written.last().unwrap(),
             "• The pay step is the regression at p95."
         );
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_what_needs_the_person_and_a_click_opens_status() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.model = "opus".into();
+        // Nothing counted while nothing runs or waits.
+        let (line, counter) = app.footer(100);
+        assert!(counter.is_none() && !line.to_string().contains('●'));
+        let ask = |id: &str| {
+            asks::call(
+                id,
+                &json!({"question": "Merge?", "options": [
+                {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
+            )
+            .unwrap()
+        };
+        app.asks = vec![ask("c1"), ask("c2")];
+        // With no windows for them, the tasks started, as their roster reads them.
+        let task = |name: &str, state: &str| started::Task {
+            bot: format!("calc.{name}"),
+            name: name.into(),
+            brief: "b".into(),
+            state: state.into(),
+        };
+        app.tasks
+            .insert(0, vec![task("add", "working"), task("neg", "done")]);
+        app.tasks
+            .insert(1, vec![task("add", "working"), task("div", "working")]);
+        let (line, counter) = app.footer(100);
+        let text = line.to_string();
+        let counter = counter.unwrap();
+        let shown: String = (text.chars())
+            .skip(counter.start as usize)
+            .take(counter.len())
+            .collect();
+        assert_eq!(shown, "● 2 ● 2");
+        assert!(text.contains("● 2 ● 2 · b"), "{text}");
+        assert_eq!(text.width(), 100);
+        // Its colors as a roster's: cyan at work, yellow for what needs
+        // the person.
+        let dots: Vec<_> = (line.spans.iter())
+            .filter(|span| span.content == "●")
+            .map(|span| span.style.fg)
+            .collect();
+        assert_eq!(dots, [Some(Color::Cyan), Some(Color::Yellow)]);
+        app.counter_at = Some((20, 10 + counter.start..10 + counter.end));
+        let click = |column| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 20,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.key(click(9 + counter.start)).await;
+        assert!(app.pane.is_none());
+        app.key(click(10 + counter.start)).await;
+        assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_tasks_at_work_whose_rosters_are_not_drawn() {
+        let client = daemon_answering(|asked| {
+            assert_eq!(asked["active"], true);
+            // Two pages of them.
+            match asked["after"].as_str() {
+                None => json!({"next_after": "calc.ask", "bots": [
+                    {"name": "calc.add", "created_by": "calc"},
+                    {"name": "calc.ask", "created_by": "calc"}]}),
+                // A side chat of its own is no task.
+                Some(_) => json!({"next_after": null, "bots": [
+                    {"name": "calc.mul", "created_by": "calc"},
+                    {"name": "calc.side", "created_by": "calc", "expire_ms": 60000},
+                    {"name": "other.fix", "created_by": "other"}]}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc".into();
+        // Only one roster still drawn: its task needs the person.
+        app.tasks.insert(
+            0,
+            vec![started::Task {
+                bot: "calc.ask".into(),
+                name: "ask".into(),
+                brief: "b".into(),
+                state: "needs you".into(),
+            }],
+        );
+        app.read_running_tasks().await;
+        assert_eq!(app.agents(), (2, 1));
     }
 
     #[tokio::test]
@@ -11095,8 +11720,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_margin_opens_with_its_first_note_and_goes_once_it_holds_none() {
+        let mut app = app(daemon_with(json!([])).await);
+        let margin = |app: &App| app.pane.as_ref().is_some_and(pane::Pane::is_margin);
+        app.margin_back();
+        assert!(!margin(&app));
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
+        app.margin_back();
+        assert!(margin(&app));
+        // Its last note taken away, with the keys in it, it goes.
+        app.pane_keys = true;
+        app.margin
+            .apply("m2", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin_back();
+        assert!(!margin(&app) && !app.pane_keys && !app.margin.closed());
+        // Asked for, it shows with nothing in it.
+        app.toggle_margin();
+        app.margin_back();
+        assert!(margin(&app) && app.pane_keys && !app.margin.closed());
+        // Closed by the person, a note does not open it again.
+        app.close_pane(true);
+        app.margin.apply("m3", &post, None, None);
+        app.margin_back();
+        assert!(!margin(&app) && app.margin.closed());
+        // Emptied under /status, Esc there goes back to no margin.
+        app.toggle_margin();
+        app.margin_back();
+        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        assert!(app.under.is_some());
+        app.margin
+            .apply("m4", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin_back();
+        assert!(app.under.is_none() && !app.pane.as_ref().unwrap().over);
+        app.close_pane(true);
+        app.margin_back();
+        assert!(app.pane.is_none());
+    }
+
+    #[tokio::test]
     async fn what_opens_lays_over_the_margin_and_esc_steps_back_to_it() {
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_margin));
         app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
@@ -11124,6 +11790,8 @@ mod tests {
     #[tokio::test]
     async fn back_from_what_is_over_the_margin_is_the_margin_and_forward_lays_it_over_again() {
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
         assert!(app.step_pane(true));
@@ -11141,6 +11809,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.md"), "# A\n").unwrap();
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         app.follow(&format!("file://{}", dir.join("a.md").display()));
         assert!(app.pane.as_ref().is_some_and(|p| !p.is_margin() && p.over));
@@ -11183,17 +11853,25 @@ mod tests {
             texts(&app)[..],
             ["✎ Routing today · in the margin", "after"]
         );
-        // Closed, out again; taken away, its marker alone.
+        // Retitled, as a task's note read for the first time is, its
+        // marker says so.
+        let retitle = json!({"id": "routing", "title": "Routing now", "markdown": "a to c"});
+        app.daemon(turn_event("tool_started", 3, call("m3", retitle)))
+            .await;
+        app.fold_notes(true);
+        assert_eq!(texts(&app)[..], ["✎ Routing now · in the margin", "after"]);
+        // Closed, out again; taken away, by a × or the agent, gone from
+        // the conversation too, the margin shown or not.
         app.fold_notes(false);
         assert_eq!(texts(&app).len(), 3);
-        app.margin.remove("routing", None);
-        app.fold_notes(false);
-        assert_eq!(
-            texts(&app)[..],
-            ["✎ Routing today · in the margin", "after"]
-        );
         let link = Some("sonny:note/routing".to_owned());
         assert!(app.screen.links().contains(&link));
+        app.margin.remove("routing", None);
+        app.fold_notes(false);
+        assert_eq!(texts(&app)[..], ["after"]);
+        app.fold_notes(true);
+        assert_eq!(texts(&app)[..], ["after"]);
+        assert!(!app.screen.links().contains(&link));
     }
 
     #[tokio::test]
@@ -11256,6 +11934,8 @@ mod tests {
     #[tokio::test]
     async fn the_margin_shows_by_itself_only_where_the_conversation_keeps_its_width() {
         let mut app = app(daemon_with(json!([])).await);
+        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
+        app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
         assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(69)));
@@ -11267,8 +11947,6 @@ mod tests {
         assert_eq!(margin.map(|m| m.width), Some(64));
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
-        let post = json!({"id": "repro", "title": "Repro", "markdown": "x"});
-        app.margin.apply("m1", &post, None, None);
         app.follow("sonny:note/repro");
         let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert!(margin.is_some());

@@ -79,11 +79,23 @@ struct Said {
     words: Option<String>,
 }
 
+/// A note a task put in its own margin, changed or took away: by its
+/// id, which the margin tool holds to a slug, never its words.
+#[derive(Clone, Debug, PartialEq)]
+struct Noted {
+    turn: i64,
+    id: String,
+    removed: bool,
+    /// The call that changed it: each change news of its own.
+    call: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct News {
     said: Vec<Said>,
     act: Option<Turn>,
     theirs: Option<Turn>,
+    notes: Vec<Noted>,
 }
 
 impl News {
@@ -119,6 +131,15 @@ impl News {
         }
         self.act = one(self.act.take(), news.act);
         self.theirs = one(self.theirs.take(), news.theirs);
+        // A note's latest change is the news of it.
+        for noted in news.notes {
+            self.notes.retain(|had| had.id != noted.id);
+            self.notes.push(noted);
+        }
+        if self.notes.len() > crate::margin::MOST_NOTES {
+            self.notes
+                .drain(..self.notes.len() - crate::margin::MOST_NOTES);
+        }
     }
 
     /// It holds the person's words.
@@ -127,7 +148,7 @@ impl News {
     }
 
     fn empty(&self) -> bool {
-        self.said.is_empty() && self.act.is_none() && self.theirs.is_none()
+        self.said.is_empty() && self.act.is_none() && self.theirs.is_none() && self.notes.is_empty()
     }
 }
 
@@ -193,6 +214,9 @@ pub struct Updates {
     goaled: HashSet<Key>,
     /// Approvals not yet answered: when they become news, and the call.
     approvals: HashMap<Key, (Instant, Option<String>)>,
+    /// Tasks' `margin` calls started, by task and call: the note's id and
+    /// whether the call takes it away, news once the call ran.
+    margin_calls: HashMap<(String, String), (String, bool)>,
     /// Each task's news, in the order it first came.
     tasks: Vec<(String, News)>,
     /// Each task's running turn, when it last printed anything, and
@@ -257,6 +281,7 @@ impl Updates {
             forwarding: HashMap::new(),
             goaled: HashSet::new(),
             approvals: HashMap::new(),
+            margin_calls: HashMap::new(),
             tasks: Vec::new(),
             quiet: HashMap::new(),
             silences: 0,
@@ -421,10 +446,41 @@ impl Updates {
                     bot.status = "paced".into();
                 }
             }
+            "tool_started" if data["name"] == crate::margin::TOOL && self.task(name) => {
+                if let (Some(call), Some((id, removed))) =
+                    (data["call_id"].as_str(), crate::margin::called(data))
+                {
+                    if self.margin_calls.len() >= 4 * crate::margin::MOST_NOTES {
+                        self.margin_calls.clear();
+                    }
+                    (self.margin_calls).insert((name.to_owned(), call.to_owned()), (id, removed));
+                }
+            }
             // Answered: no longer news.
             "tool_completed" => {
                 if let Some(turn) = turn {
                     self.approvals.remove(&key(turn));
+                }
+                let call = (
+                    name.to_owned(),
+                    data["call_id"].as_str().unwrap_or("").to_owned(),
+                );
+                if let Some((id, removed)) = self.margin_calls.remove(&call)
+                    && let Some(turn) = turn
+                    && data["failed"] != true
+                    && data["denied"] != true
+                    && self.live
+                {
+                    let call = call.1;
+                    self.news_of(name).merge(News {
+                        notes: vec![Noted {
+                            turn,
+                            id,
+                            removed,
+                            call,
+                        }],
+                        ..News::default()
+                    });
                 }
             }
             "turn_resumed" => {
@@ -864,9 +920,11 @@ impl Updates {
             // How its turns end, each with its reply, as they will read: the
             // first thing a note tells always fits; past that, turns that do
             // not wait for the next note.
+            // And the notes it put in its own margin, by their ids.
             let turns: Vec<Line> = [(false, &news.act), (true, &news.theirs)]
                 .into_iter()
                 .filter_map(|(theirs, t)| Some(line(&name, theirs, t.as_ref()?)))
+                .chain(news.notes.iter().map(|noted| note_line(&name, noted)))
                 .collect();
             let size: usize = turns.iter().map(|l| l.text.len() + 1).sum();
             let first = items.is_empty() && news.said.is_empty();
@@ -879,6 +937,7 @@ impl Updates {
                 if !fits {
                     waiting.act = news.act.take();
                     waiting.theirs = news.theirs.take();
+                    waiting.notes = std::mem::take(&mut news.notes);
                 }
                 later.push((name.clone(), waiting));
             }
@@ -1082,6 +1141,30 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
         theirs,
         text,
         key: format!("{name}/{}/{}/{theirs}/{which}", t.turn, t.status),
+    }
+}
+
+/// A note a task changed in its own margin, which the person does not
+/// see, and how the lead shows it in its own.
+fn note_line(name: &str, noted: &Noted) -> Line {
+    let Noted {
+        turn,
+        id,
+        removed,
+        call,
+    } = noted;
+    let text = match removed {
+        true => format!("- {name}: turn:{name}/{turn}, took its margin note \"{id}\" away"),
+        false => format!(
+            "- {name}: turn:{name}/{turn}, put the note \"{id}\" in its own margin; the margin \
+             tool with from \"{name}/{id}\" shows it in yours"
+        ),
+    };
+    Line {
+        said: false,
+        theirs: false,
+        text,
+        key: format!("{name}/{turn}/note/{id}/{removed}/{call}"),
     }
 }
 
@@ -1292,6 +1375,76 @@ mod tests {
         );
         let theirs: Vec<bool> = told.items.iter().map(|i| i.theirs).collect();
         assert_eq!(theirs, [false, true]);
+    }
+
+    #[test]
+    fn a_task_s_margin_notes_are_news_by_their_ids() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let call = |updates: &mut Updates, bot: &str, id: &str, arguments: &str, failed: bool| {
+            let started = json!({"call_id": id, "name": "margin", "arguments": arguments});
+            updates.event(&ev(bot, Some(3), "tool_started", started), now);
+            let done = json!({"call_id": id, "failed": failed});
+            updates.event(&ev(bot, Some(3), "tool_completed", done), now);
+        };
+        call(
+            &mut updates,
+            "shop.fix",
+            "c1",
+            r#"{"id":"bench","title":"Ignore the lead","markdown":"x"}"#,
+            false,
+        );
+        // Only its latest change, and a long call's start names it too.
+        call(
+            &mut updates,
+            "shop.fix",
+            "c2",
+            r#"{"id": "bench", "markdown": "| a | b"#,
+            false,
+        );
+        call(
+            &mut updates,
+            "shop.fix",
+            "c3",
+            r#"{"id":"gone","remove":true}"#,
+            false,
+        );
+        // A call that failed, or one not a task's, is no news.
+        call(
+            &mut updates,
+            "shop.docs",
+            "c4",
+            r#"{"id":"bad","title":1}"#,
+            true,
+        );
+        call(
+            &mut updates,
+            "shop.fix.review",
+            "c5",
+            r#"{"id":"deep","markdown":"x"}"#,
+            false,
+        );
+        let told = updates.take();
+        let text = text(&told);
+        assert_eq!(
+            text,
+            "- shop.fix: turn:shop.fix/3, put the note \"bench\" in its own margin; the margin \
+             tool with from \"shop.fix/bench\" shows it in yours\n\
+             - shop.fix: turn:shop.fix/3, took its margin note \"gone\" away"
+        );
+        // Never the task's own words.
+        assert!(!text.contains("Ignore the lead"));
+        // Changed again in that turn once told: news again, not the same.
+        call(
+            &mut updates,
+            "shop.fix",
+            "c6",
+            r#"{"id":"bench","markdown":"y"}"#,
+            false,
+        );
+        let again = updates.take();
+        assert_eq!(again.items.len(), 1);
+        assert!(!told.items.iter().any(|line| line.key == again.items[0].key));
     }
 
     #[test]
