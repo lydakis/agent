@@ -290,6 +290,16 @@ off again never shows.
   footer says `↻ 2 in background` while the window's agent has any.
 
   ![/background in the pane](../docs/sonny/pane-background.png)
+- `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
+  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list`), each with
+  its tools or why it did not start. Agents reach them through one `exec`
+  tool: a script that calls many tools at once and returns only what it
+  prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
+  ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)).
+
+  ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
+
+  ![/mcp in the pane](../docs/sonny/pane-mcp.png)
 - Every task works in a git worktree of its own, at the last commit on
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
@@ -369,8 +379,8 @@ text changes, until you edit it: from then on it is yours, and Sonny leaves
 it alone. Sonny notes what it last wrote of each in `~/.agent/sonny/skills`;
 a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
-[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory and
-skills.
+[docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
+skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
 subscribes each lead to its tasks. As soon as the lead rests, it tells it

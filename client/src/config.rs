@@ -15,9 +15,14 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
+//!
+//! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
+//! url = "https://mcp.linear.app/mcp"
+//! bearer_token_env_var = "LINEAR_TOKEN"
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +67,143 @@ pub struct Judge {
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
+    /// The MCP servers Sonny's agents reach, by name.
+    pub mcp_servers: BTreeMap<String, McpServer>,
+}
+
+/// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
+/// command Sonny starts and speaks to on its stdio, or a URL it speaks
+/// streamable HTTP to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct McpServer {
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+    pub url: Option<String>,
+    /// The variable whose value is sent as the bearer token.
+    pub bearer_token_env_var: Option<String>,
+    pub http_headers: BTreeMap<String, String>,
+    pub enabled: bool,
+    /// Only these of its tools, when set.
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Vec<String>,
+    pub startup_timeout_sec: Option<f64>,
+    pub tool_timeout_sec: Option<f64>,
+    /// What it offers, in a sentence, for the agents told of it.
+    pub description: Option<String>,
+}
+
+const MCP_KEYS: [&str; 13] = [
+    "command",
+    "args",
+    "env",
+    "cwd",
+    "url",
+    "bearer_token_env_var",
+    "http_headers",
+    "enabled",
+    "enabled_tools",
+    "disabled_tools",
+    "startup_timeout_sec",
+    "tool_timeout_sec",
+    "description",
+];
+
+/// The server `[sonny.mcp_servers.NAME]` describes.
+fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
+    let at = format!("sonny.mcp_servers.{name}");
+    let named = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !named {
+        return Err(format!("{at}: a name is 1 to 64 letters, digits, _ or -"));
+    }
+    let table = value
+        .as_table()
+        .ok_or_else(|| format!("{at} must be a table"))?;
+    let strings = |key: &str, value: &toml::Value| -> Result<Vec<String>, String> {
+        let list = value
+            .as_array()
+            .ok_or_else(|| format!("{at}.{key} must be a list of strings"))?;
+        list.iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("{at}.{key} must be a list of strings"))
+    };
+    let pairs = |key: &str, value: &toml::Value| -> Result<BTreeMap<String, String>, String> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| format!("{at}.{key} must be a table of strings"))?;
+        table
+            .iter()
+            .map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("{at}.{key} must be a table of strings"))
+    };
+    let seconds = |key: &str, value: &toml::Value| -> Result<f64, String> {
+        match value.as_float().or(value.as_integer().map(|n| n as f64)) {
+            Some(n) if n > 0.0 && n <= 3600.0 => Ok(n),
+            _ => Err(format!("{at}.{key} is a number of seconds, up to 3600")),
+        }
+    };
+    let mut server = McpServer {
+        enabled: true,
+        ..McpServer::default()
+    };
+    for (key, value) in table {
+        let key = key.as_str();
+        if !MCP_KEYS.contains(&key) {
+            return Err(format!("unknown key {at}.{key}"));
+        }
+        match key {
+            "args" => server.args = strings(key, value)?,
+            "enabled_tools" => server.enabled_tools = Some(strings(key, value)?),
+            "disabled_tools" => server.disabled_tools = strings(key, value)?,
+            "env" => server.env = pairs(key, value)?,
+            "http_headers" => server.http_headers = pairs(key, value)?,
+            "enabled" => {
+                server.enabled = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{at}.enabled must be true or false"))?
+            }
+            "startup_timeout_sec" => server.startup_timeout_sec = Some(seconds(key, value)?),
+            "tool_timeout_sec" => server.tool_timeout_sec = Some(seconds(key, value)?),
+            _ => {
+                let text = string(&format!("{at}.{key}"), value)?;
+                match key {
+                    "command" => server.command = Some(text),
+                    "cwd" => server.cwd = Some(PathBuf::from(text)),
+                    "url" => server.url = Some(text),
+                    "bearer_token_env_var" => server.bearer_token_env_var = Some(text),
+                    _ => server.description = Some(text),
+                }
+            }
+        }
+    }
+    match (&server.command, &server.url) {
+        (Some(_), None) => {
+            for key in ["bearer_token_env_var", "http_headers"] {
+                if table.contains_key(key) {
+                    return Err(format!("{at}.{key} goes with url"));
+                }
+            }
+        }
+        (None, Some(url)) => {
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return Err(format!("{at}.url must be http or https"));
+            }
+            for key in ["args", "env", "cwd"] {
+                if table.contains_key(key) {
+                    return Err(format!("{at}.{key} goes with command"));
+                }
+            }
+        }
+        _ => return Err(format!("{at} takes a command or a url")),
+    }
+    Ok(server)
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -131,6 +273,16 @@ fn parse(text: &str) -> Result<Config, String> {
             _ => return Err(format!("unknown table [{name}]")),
         };
         for (key, value) in section {
+            if (name.as_str(), key.as_str()) == ("sonny", "mcp_servers") {
+                let servers = value
+                    .as_table()
+                    .ok_or("sonny.mcp_servers must be a table")?;
+                for (server, value) in servers {
+                    let parsed = mcp_server(server, value)?;
+                    config.sonny.mcp_servers.insert(server.clone(), parsed);
+                }
+                continue;
+            }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
             }
@@ -161,8 +313,6 @@ fn string(key: &str, value: &toml::Value) -> Result<String, String> {
 /// new one goes at the end of its table, or of the top level for a bare
 /// key. The file is written whole, and only if it still reads.
 pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
-    let unwritable =
-        |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
     read(path)?;
     let text = match std::fs::read_to_string(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -221,7 +371,57 @@ pub fn set(path: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
     }
     let mut text = lines.join("\n");
     text.push('\n');
-    parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
+    replace(path, &text)
+}
+
+/// Replaces the table `name`, a dotted path such as
+/// `sonny.mcp_servers.docs`, and its subtables, with `keys` at the end of
+/// the file, each on a line of its own with tables inline; `None` removes
+/// it. The file's other lines stay as they were.
+pub fn set_table(path: &Path, name: &str, keys: Option<&toml::Table>) -> Result<(), String> {
+    read(path)?;
+    let text = match std::fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.map_err(|e| format!("config_unreadable: {}: {e}", path.display()))?,
+    };
+    let header = |line: &str| {
+        let line = line.trim();
+        (line.starts_with('[') && !line.starts_with("[["))
+            .then(|| line.trim_matches(['[', ']']).trim().to_owned())
+    };
+    let ours = |table: &str| table == name || table.starts_with(&format!("{name}."));
+    let mut lines = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if let Some(table) = header(line) {
+            inside = ours(&table);
+        }
+        if !inside {
+            lines.push(line.to_owned());
+        }
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if let Some(keys) = keys {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("[{name}]"));
+        for (key, value) in keys {
+            lines.push(format!("{key} = {value}"));
+        }
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    replace(path, &text)
+}
+
+/// The file at `path` replaced whole by `text`, if `text` reads.
+fn replace(path: &Path, text: &str) -> Result<(), String> {
+    let unwritable =
+        |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
+    parse(text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| unwritable(&e))?;
     }
@@ -271,6 +471,58 @@ mod tests {
     }
 
     #[test]
+    fn mcp_servers_take_codex_s_keys_and_one_transport() {
+        let config = parse(
+            "[sonny.mcp_servers.docs]\nurl = \"https://example.com/mcp\"\nbearer_token_env_var = \"DOCS\"\ndescription = \"The docs\"\n\n[sonny.mcp_servers.files]\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\nenv = { ROOT = \"/tmp\" }\nenabled_tools = [\"read\"]\ntool_timeout_sec = 30\n",
+        )
+        .unwrap();
+        let docs = &config.sonny.mcp_servers["docs"];
+        assert_eq!(docs.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(docs.bearer_token_env_var.as_deref(), Some("DOCS"));
+        assert!(docs.enabled);
+        let files = &config.sonny.mcp_servers["files"];
+        assert_eq!(files.args, ["-y", "server"]);
+        assert_eq!(files.env["ROOT"], "/tmp");
+        assert_eq!(
+            files.enabled_tools.as_deref(),
+            Some(&["read".to_owned()][..])
+        );
+        assert_eq!(files.tool_timeout_sec, Some(30.0));
+        for (text, error) in [
+            (
+                "[sonny.mcp_servers.x]\nenabled = true",
+                "sonny.mcp_servers.x takes a command or a url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\nurl = \"https://b\"",
+                "sonny.mcp_servers.x takes a command or a url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\nbearer_token_env_var = \"T\"",
+                "sonny.mcp_servers.x.bearer_token_env_var goes with url",
+            ),
+            (
+                "[sonny.mcp_servers.x]\nurl = \"ftp://b\"",
+                "sonny.mcp_servers.x.url must be http or https",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\nargs = \"b\"",
+                "sonny.mcp_servers.x.args must be a list of strings",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\ncolour = 1",
+                "unknown key sonny.mcp_servers.x.colour",
+            ),
+            (
+                "[sonny.mcp_servers.\"a b\"]\ncommand = \"a\"",
+                "sonny.mcp_servers.a b: a name is 1 to 64 letters, digits, _ or -",
+            ),
+        ] {
+            assert_eq!(parse(text).unwrap_err(), error, "{text}");
+        }
+    }
+
+    #[test]
     fn setting_keys_keeps_the_rest_of_the_file() {
         let dir = std::env::temp_dir().join(format!("agent-config-set-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -309,6 +561,43 @@ mod tests {
                 .contains("unknown key colour")
         );
         assert_eq!(read(&file).unwrap(), config);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_table_is_replaced_whole_and_the_rest_kept() {
+        let dir = std::env::temp_dir().join(format!("agent-config-table-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &file,
+            "# mine\n[sonny]\nlead_effort = \"low\"\n\n[sonny.mcp_servers.docs]\nurl = \"https://a\"\n\n[sonny.mcp_servers.docs.http_headers]\nX = \"1\"\n\n[judge]\neffort = \"low\"\n",
+        )
+        .unwrap();
+        let mut keys = toml::Table::new();
+        keys.insert("command".into(), "npx".into());
+        keys.insert(
+            "args".into(),
+            toml::Value::Array(vec!["-y".into(), "x".into()]),
+        );
+        keys.insert(
+            "env".into(),
+            toml::Value::Table(toml::Table::from_iter([("K".to_owned(), "v".into())])),
+        );
+        set_table(&file, "sonny.mcp_servers.files", Some(&keys)).unwrap();
+        set_table(&file, "sonny.mcp_servers.docs", None).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("# mine\n[sonny]\nlead_effort = \"low\"\n\n[judge]\neffort = \"low\"\n\n[sonny.mcp_servers.files]\n"), "{text}");
+        let config = read(&file).unwrap();
+        assert!(!config.sonny.mcp_servers.contains_key("docs"));
+        let files = &config.sonny.mcp_servers["files"];
+        assert_eq!(
+            (files.command.as_deref(), &files.args[..]),
+            (Some("npx"), &["-y".to_owned(), "x".to_owned()][..])
+        );
+        assert_eq!(files.env["K"], "v");
+        assert_eq!(config.judge.effort.as_deref(), Some("low"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

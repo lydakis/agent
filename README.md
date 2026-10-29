@@ -195,7 +195,8 @@ protocol directly; [`client/`](client) is a Rust client for it. See the
 [Sonny](sonny/README.md) is a terminal client over the same socket. Opened
 in a folder, it is that project's lead: it starts tasks, each in its own copy
 of the folder, lays them out in Rex, Herdr or cmux, and hears what they did. It
-also gives every agent [triggers, memory and skills](docs/SONNY.md).
+also gives every agent [triggers, memory, skills and your MCP servers](docs/SONNY.md),
+the last through scripts that call many tools and return only what they print.
 
 ```sh
 brew install lydakis/agent/sonny        # or, on Linux, install.sh above
