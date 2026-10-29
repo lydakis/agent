@@ -305,7 +305,8 @@ fn shipped(home: &Path) -> PathBuf {
 }
 
 /// The skills and roles set beside the person's edits that no bot was
-/// told of yet: a line of `KIND NAME` for each.
+/// told of yet: an empty file named `KIND NAME` for each, so Sonnys adding
+/// and claiming at once never write over each other.
 fn pending(home: &Path) -> PathBuf {
     upgrades(home).join("pending")
 }
@@ -370,23 +371,37 @@ fn stage(home: &Path, kind: Kind, name: &str, files: &[(&str, &str)]) {
     queue(home, &format!("{} {name}", kind.word()));
 }
 
-/// Each of `lines` in the pending ones, once.
-fn queue(home: &Path, lines: &str) {
-    let path = pending(home);
-    let mut now = std::fs::read_to_string(&path).unwrap_or_default();
-    let before = now.len();
-    for line in lines.lines().filter(|line| !line.is_empty()) {
-        if !now.lines().any(|have| have == line) {
-            now.push_str(&format!("{line}\n"));
-        }
-    }
-    if now.len() != before {
-        let _ = agent_client::files::replace_mode(&path, now.as_bytes(), 0o644);
-    }
+/// `entry` among the pending ones.
+fn queue(home: &Path, entry: &str) {
+    let _ = std::fs::create_dir_all(pending(home));
+    let _ = std::fs::write(pending(home).join(entry), "");
 }
 
-/// How long a Sonny's claim on the pending ones holds before another
-/// takes them back: it tells its bot within seconds of starting.
+/// Every entry in `from` moved to `to`, each by one rename, so each goes
+/// to one Sonny alone; the names of those moved.
+fn take(from: &Path, to: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Vec::new();
+    };
+    let _ = std::fs::create_dir_all(to);
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .filter(|name| std::fs::rename(from.join(name), to.join(name)).is_ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Where each Sonny moves the entries it tells its bot of, a folder named
+/// by its process.
+fn claims(home: &Path) -> PathBuf {
+    upgrades(home).join("claims")
+}
+
+/// How long a Sonny's claim holds before another takes it back: it tells
+/// its bot within seconds of starting.
 const CLAIM: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Sonny's new text of `name` gone from beside it, as Sonny writes its own
@@ -417,26 +432,32 @@ pub fn upgraded() -> Option<Upgrades> {
 }
 
 fn upgraded_in(home: &Path) -> Option<Upgrades> {
+    let me = std::process::id().to_string();
     // A claim left by a Sonny that stopped before telling goes back.
-    for entry in std::fs::read_dir(upgrades(home)).ok()?.flatten() {
-        let stale = entry.file_name().to_string_lossy().starts_with("pending.")
+    for entry in std::fs::read_dir(claims(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let stale = entry.file_name() != me.as_str()
             && (entry.metadata().and_then(|m| m.modified()).ok())
                 .and_then(|at| at.elapsed().ok())
                 .is_some_and(|age| age > CLAIM);
         if stale {
-            queue(
-                home,
-                &std::fs::read_to_string(entry.path()).unwrap_or_default(),
-            );
-            let _ = std::fs::remove_file(entry.path());
+            take(&entry.path(), &pending(home));
+            let _ = std::fs::remove_dir(entry.path());
         }
     }
-    let claim = upgrades(home).join(format!("pending.{}", std::process::id()));
-    std::fs::rename(pending(home), &claim).ok()?;
-    let text = std::fs::read_to_string(&claim).unwrap_or_default();
+    // A folder made now, so its age is this claim's.
+    let claim = claims(home).join(&me);
+    let taken = take(&pending(home), &claim);
+    if taken.is_empty() {
+        let _ = std::fs::remove_dir(&claim);
+        return None;
+    }
     let mut lines = Vec::new();
     let mut key = String::new();
-    for line in text.lines() {
+    for line in &taken {
         let Some((kind, name)) = line.split_once(' ') else {
             continue;
         };
@@ -523,16 +544,13 @@ impl Upgrades {
     /// Each told of, so the next bot is not told again; one Sonny sets
     /// beside them from now is.
     pub fn told(&self) {
-        let _ = std::fs::remove_file(&self.claim);
+        let _ = std::fs::remove_dir_all(&self.claim);
     }
 
     /// Each back for the next bot, as this one was not told.
     pub fn back(&self) {
-        queue(
-            &self.home,
-            &std::fs::read_to_string(&self.claim).unwrap_or_default(),
-        );
-        let _ = std::fs::remove_file(&self.claim);
+        take(&self.claim, &pending(&self.home));
+        let _ = std::fs::remove_dir(&self.claim);
     }
 }
 
@@ -768,13 +786,11 @@ mod tests {
         assert!(upgraded_in(&home).is_none());
         // A claim a Sonny left as it stopped goes back after a while.
         install_role_in(&home, "lead", "five, offered");
-        let left = home.join(".agent/sonny/upgrades/pending.1");
-        std::fs::rename(pending(&home), &left).unwrap();
+        let left = home.join(".agent/sonny/upgrades/claims/1");
+        take(&pending(&home), &left);
         assert!(upgraded_in(&home).is_none());
         let old = std::time::SystemTime::now() - CLAIM * 2;
-        std::fs::File::options()
-            .write(true)
-            .open(&left)
+        std::fs::File::open(&left)
             .unwrap()
             .set_modified(old)
             .unwrap();
