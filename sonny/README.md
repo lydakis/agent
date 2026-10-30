@@ -568,7 +568,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle.
   Live, a message flies as a spark (yours from the middle, another agent's
-  across, a lookout's or an automation's in from the rim), a commons post
+  across, a follow's or an automation's in from the rim), a commons post
   ripples out, a tool call twinkles, and whoever was lit fades. Faint lines
   join who made whom and who talked to whom; the last messages are listed
   under the sky.

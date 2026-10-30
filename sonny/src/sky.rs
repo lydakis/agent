@@ -414,7 +414,7 @@ impl View {
                         End::Agent(by) => format!("{} → {}", self.short(by), self.short(at)),
                         End::Rim(_) => format!(
                             "{} → {}",
-                            data["origin"].as_str().unwrap_or("outside"),
+                            from_outside(data["origin"].as_str()),
                             self.short(at)
                         ),
                     };
@@ -834,6 +834,19 @@ fn posted(arguments: &Value) -> bool {
         Err(_) => ["\"post\":", "\"reply\":"]
             .iter()
             .any(|key| text.contains(key)),
+    }
+}
+
+/// What sent a prompt from outside, in the words the person reads.
+fn from_outside(origin: Option<&str>) -> &'static str {
+    match origin.unwrap_or("").split('.').next() {
+        Some("lookout") => "a follow",
+        Some("trigger") => "an automation",
+        Some("commons") => "the commons",
+        Some("goal") => "a goal",
+        Some("margin") => "a margin note",
+        Some("tasks") => "a task",
+        _ => "outside",
     }
 }
 
@@ -1301,7 +1314,7 @@ mod tests {
         assert_eq!(view.sparks[0].from, End::Rim(0));
         let shown = text(&view.card(50, 30));
         assert!(shown.contains("a posted to the commons"), "{shown}");
-        assert!(shown.contains("lookout.sources → a"), "{shown}");
+        assert!(shown.contains("a follow → a"), "{shown}");
     }
 
     #[tokio::test]
