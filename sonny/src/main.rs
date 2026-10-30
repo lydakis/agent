@@ -1607,6 +1607,12 @@ struct App {
     live: Option<Live>,
     /// Whether the reply now ending arrived as deltas.
     streamed: bool,
+    /// The item of the turn's output now streaming: a later one is the
+    /// next message, drawn apart.
+    live_item: Option<u64>,
+    /// Items whose words were written when the next began, oldest first,
+    /// until their messages name their nodes.
+    ahead: std::collections::VecDeque<u64>,
     running: Option<Running>,
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
@@ -2493,6 +2499,8 @@ impl App {
             height: 24,
             live: None,
             streamed: false,
+            live_item: None,
+            ahead: std::collections::VecDeque::new(),
             running: record["running_turn"].as_i64().map(|turn| Running {
                 turn,
                 started: Instant::now(),
@@ -3368,6 +3376,8 @@ impl App {
             self.write_words(live, Words::Reply);
         }
         self.streamed = false;
+        self.live_item = None;
+        self.ahead.clear();
         self.said.clear();
         self.replay = None;
         self.notice = Some("reconnecting to the daemon".into());
@@ -5127,6 +5137,35 @@ impl App {
         }
     }
 
+    /// The words streamed as `item` end where the next item begins: written
+    /// as a reply of their own, and found again once their message names
+    /// its node.
+    fn stream_ahead(&mut self, item: u64) {
+        let (drawn, spilled) = (
+            self.rows_drawn,
+            self.live.as_ref().is_some_and(|l| l.spilled),
+        );
+        self.end_live(Words::Reply);
+        if self.rows_drawn > drawn || spilled {
+            self.mark_last(screen::Mark::Tag(screen::Tag::Streamed(item)));
+        }
+        self.ahead.push_back(item);
+        self.said.clear();
+        self.replay = None;
+        self.streamed = false;
+    }
+
+    /// The words streamed as `item` are the message kept at `node`.
+    fn streamed_at(&mut self, item: u64, node: i64) {
+        let (from, to) = (screen::Tag::Streamed(item), screen::Tag::End(node));
+        match (self.marks.iter_mut()).find(|(_, mark)| *mark == screen::Mark::Tag(from)) {
+            Some((_, mark)) => *mark = screen::Mark::Tag(to),
+            None => {
+                self.screen.retag(from, to);
+            }
+        }
+    }
+
     /// The words written into the history as what they turned out to be.
     fn end_live(&mut self, words: Words) {
         self.close_live();
@@ -5249,6 +5288,8 @@ impl App {
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 self.end_live(Words::Reply);
+                self.live_item = None;
+                self.ahead.clear();
                 self.said.clear();
                 self.thought.clear();
                 self.replay = None;
@@ -5308,6 +5349,17 @@ impl App {
             }
             "text_delta" => {
                 self.thought.clear();
+                // Each item the bot streams is a message of its own, as
+                // Codex draws them; one a retried call streams again was
+                // shown already.
+                if let Some(item) = event["item"].as_u64() {
+                    match self.live_item {
+                        Some(live) if item < live => return,
+                        Some(live) if item > live && self.streamed => self.stream_ahead(live),
+                        _ => {}
+                    }
+                    self.live_item = Some(item);
+                }
                 let mut delta = event["text"].as_str().unwrap_or("");
                 // A retried call streams its reply again from the start:
                 // what was already shown is not shown twice.
@@ -5375,6 +5427,14 @@ impl App {
                     if let Some(node) = data["node"].as_i64() {
                         self.saw_reply(node, &text(item));
                     }
+                }
+                // Words written when the next item began are this message.
+                if let (Some(item), Some(node)) = (&item, data["node"].as_i64())
+                    && !text(item).is_empty()
+                    && let Some(streamed) = self.ahead.pop_front()
+                {
+                    self.streamed_at(streamed, node);
+                    return;
                 }
                 let said = std::mem::take(&mut self.said);
                 self.replay = None;
@@ -10309,6 +10369,59 @@ mod tests {
             (1, 1),
             "{drawn:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn each_message_a_call_streams_is_drawn_apart_and_found_by_its_node() {
+        let client = daemon_with(json!({
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Let me check the file."}]},
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "It is fine."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        for (item, text) in [
+            (1, "Let me check"),
+            (1, " the file."),
+            (2, "It is"),
+            // A retried call streams what was shown again.
+            (1, "Let me check"),
+            (2, " fine."),
+        ] {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            app.daemon(delta).await;
+        }
+        let drawn = |app: &mut App| -> Vec<String> {
+            let open = app.open_rows(80);
+            (app.pending.iter().chain(&open))
+                .map(|line| line.to_string())
+                .collect()
+        };
+        let rows = |drawn: &[String], text: &str| drawn.iter().filter(|l| l.contains(text)).count();
+        // Apart while they stream, and as they were kept.
+        for at in [None, Some(2), Some(3)] {
+            if let Some(node) = at {
+                app.daemon(event("message", json!({"node": node}))).await;
+            }
+            let drawn = drawn(&mut app);
+            assert_eq!(
+                [
+                    rows(&drawn, "Let me check the file."),
+                    rows(&drawn, "It is fine."),
+                    rows(&drawn, "Let me check"),
+                ],
+                [1, 1, 1],
+                "{drawn:?}"
+            );
+        }
+        // Reactions find each message by its node.
+        assert!(app.kept(screen::Tag::End(2)));
+        assert!(!app.kept(screen::Tag::Streamed(1)));
     }
 
     #[test]

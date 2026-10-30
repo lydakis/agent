@@ -590,7 +590,8 @@ Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are
 answered.
 
-The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, a tool call is one `• Ran …` line with a
+The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, each message the bot sends its own block, as
+it keeps them (two in one answer no longer run together), a tool call is one `• Ran …` line with a
 short `└` look at its result, edits show as a diff, and a status row says
 `Working (12s • esc to interrupt)`. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
