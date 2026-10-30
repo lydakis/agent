@@ -25,11 +25,13 @@ mod embed;
 mod exec;
 mod herdr;
 mod highlight;
+mod hint;
 mod home;
 mod html;
 mod image;
 mod js;
 mod links;
+mod list;
 mod login;
 mod look;
 mod lookout;
@@ -140,6 +142,10 @@ const REFERENCE_PAGES: usize = 25;
 /// tables too, which most style guides keep within 100 (rustfmt's own
 /// width), so they stay whole at 100 and prose stays near the measure.
 const PROSE: usize = 100;
+
+/// The blank columns between the conversation and the line beside it,
+/// matched on the pane's side, as the conversation's own rows open.
+const GUTTER: u16 = 2;
 /// How long a side chat's copy stays once idle.
 /// What follows a guess at the next message in the composer.
 const TAB: &str = "  tab";
@@ -7087,6 +7093,42 @@ impl App {
 
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
+    /// Every key Sonny takes, beside the conversation.
+    fn shortcuts(&mut self) {
+        let rows = [
+            ("enter", "send, or steer the running turn"),
+            ("tab", "queue for after the running turn"),
+            ("shift+enter", "new line (alt+enter, ctrl+j)"),
+            ("esc", "interrupt, or stop a ! command"),
+            ("/", "commands"),
+            ("!", "run a command of your own"),
+            ("ctrl+o", "open or fold every row that folds"),
+            ("ctrl+f", "find in the conversation"),
+            ("home end", "first turn, newest turn"),
+            ("pgup pgdn", "scroll"),
+            ("tab", "with nothing typed, keys to the pane"),
+            ("ctrl+\\", "keys to the pane and back"),
+            ("ctrl+[ ctrl+]", "hide the pane, show it again"),
+            ("ctrl+v", "paste a picture"),
+            ("ctrl+c", "copy the selection, clear, or quit"),
+            ("ctrl+l", "draw the screen again"),
+        ];
+        let width = rows.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
+        let lines = rows
+            .iter()
+            .map(|(key, does)| {
+                Line::from(vec![
+                    Span::raw(format!(" {key:width$}  ")),
+                    Span::raw(*does).dim(),
+                ])
+            })
+            .collect();
+        self.watch = None;
+        let mut pane = pane::Pane::card("shortcuts", "esc close");
+        pane.set_card(lines, "esc close");
+        self.open_pane(pane);
+    }
+
     fn open_pane(&mut self, mut pane: pane::Pane) {
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
@@ -7406,13 +7448,14 @@ impl App {
         };
         // The margin where the conversation leaves room for it, or while
         // the keys are in it; out of the way otherwise.
-        let margin = pane::margin_width(area.width, PROSE as u16);
+        let prose = PROSE as u16 + GUTTER;
+        let margin = pane::margin_width(area.width, prose);
         if open.is_margin() && margin.is_none() && !self.pane_keys {
             return (area, None);
         }
         let pane = match margin.filter(|_| open.is_margin()) {
             Some(margin) => margin,
-            None => pane::width(area.width, PROSE as u16),
+            None => pane::width(area.width, prose),
         };
         if pane == area.width {
             return match self.pane_keys {
@@ -7420,13 +7463,16 @@ impl App {
                 false => (area, None),
             };
         }
+        // A gutter each side of the line between them: the conversation
+        // stops short of it, and the pane, whose rows open with a space of
+        // their own, starts a column after it.
         let chat = Rect {
-            width: area.width - pane - 1,
+            width: (area.width - pane - 1).saturating_sub(GUTTER),
             ..area
         };
         let pane = Rect {
-            x: area.right() - pane,
-            width: pane,
+            x: area.right() - pane + 1,
+            width: pane - 1,
             ..area
         };
         (chat, Some(pane))
@@ -7846,6 +7892,17 @@ impl App {
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
+                    // With nothing typed, ? shows the keys, as it does in
+                    // Codex and Claude Code.
+                    KeyCode::Char('?')
+                        if !alt
+                            && self.input.is_empty()
+                            && self.asks.is_empty()
+                            && self.approvals.is_empty()
+                            && self.react_to.is_none() =>
+                    {
+                        self.shortcuts()
+                    }
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
@@ -7972,8 +8029,8 @@ impl App {
             let lines = mcp::card();
             // In the place of `/status` or `/background`, if open.
             self.watch = None;
-            let mut pane = pane::Pane::card("/mcp", "esc closes");
-            pane.set_card(lines, "esc closes");
+            let mut pane = pane::Pane::card("/mcp", "esc close");
+            pane.set_card(lines, "esc close");
             self.open_pane(pane);
             return;
         }
@@ -8936,7 +8993,7 @@ impl App {
                 // The line between them, as a split's.
                 if area.width > 0 {
                     let line = Rect {
-                        x: area.right(),
+                        x: area.right() + GUTTER,
                         width: 1,
                         ..at
                     };
@@ -8955,7 +9012,7 @@ impl App {
             let rows = self.screen.height(column as usize).min(room as usize);
             // `/config` lists every setting over the rows above.
             let rows = match &self.config {
-                Some(_) => (rows + config::SETTINGS.len()).min(room as usize),
+                Some(_) => (rows + config::height()).min(room as usize),
                 None => rows,
             };
             let [history, view, _] = Layout::vertical([
@@ -8976,39 +9033,12 @@ impl App {
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
             if !menu.is_empty() {
-                // Up to three, around the pick, in the rows above the input.
                 let pick = self.pick.min(menu.len() - 1);
-                let first = pick.saturating_sub(2).min(menu.len().saturating_sub(3));
-                let wide = menu.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
-                let rows: Vec<Line> = menu
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take(3)
-                    .map(|(i, (name, about))| {
-                        let name = format!("{name:<wide$}");
-                        if i == pick {
-                            Line::from(vec![
-                                Span::raw("  "),
-                                Span::raw(format!(" {name}  {about} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw("   "),
-                                Span::raw(name),
-                                Span::raw(format!("  {about}")).dim(),
-                            ])
-                        }
-                    })
+                let items: Vec<list::Item> = (menu.iter())
+                    .map(|(name, about)| list::Item::new(*name, *about))
                     .collect();
                 let [_, _, _, composer_row, _] = areas(view, live_rows);
-                let area = ratatui::layout::Rect {
-                    y: composer_row.y.saturating_sub(rows.len() as u16),
-                    height: rows.len() as u16,
-                    ..composer_row
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, list::lines(&items, pick, width), composer_row);
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -9020,64 +9050,39 @@ impl App {
                     Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
                     _ => "  ".to_owned(),
                 };
-                let keys = Line::from(vec![
-                    Span::raw(place),
-                    Span::raw("↑ or enter older · ↓ newer · esc").dim(),
-                ]);
+                let mut keys = vec![Span::raw(place)];
+                keys.extend(hint::spans("↑ older · ↓ newer · esc stop"));
+                let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
             if let Some(pick) = self.reacting {
-                // Newest at the bottom, nearest the composer, as they read.
-                let first = pick.saturating_sub(2);
-                let mut rows: Vec<Line> = self
-                    .replies
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .skip(first)
-                    .take(3)
-                    .map(|(i, (node, said))| {
+                // Newest at the bottom, nearest the composer, as they read;
+                // the pick counts from the newest.
+                let items: Vec<list::Item> = (self.replies.iter())
+                    .map(|(node, said)| {
                         let on = self.reactions.on(*node).join(" ");
-                        let room = width.saturating_sub(8 + on.width());
-                        let said = transcript::cut(said, room);
-                        let row = if i == pick {
-                            Span::raw(format!(" {said} ")).reversed()
-                        } else {
-                            Span::raw(format!(" {said}"))
-                        };
-                        Line::from(vec![Span::raw("   "), row, Span::raw(format!("  {on}"))])
+                        let room = width.saturating_sub(10 + on.width());
+                        list::Item::new(transcript::cut(said, room), on)
                     })
                     .collect();
-                rows.reverse();
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(rows.len() as u16),
-                    height: rows.len() as u16,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                let pick = items.len().saturating_sub(pick + 1);
+                over(frame, list::lines(&items, pick, width), composer);
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("which reply to react to").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from("  ↑↓ reply · enter, then send an emoji · esc").dim();
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter react · esc close"));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
             if let Some(pick) = self.approving {
                 // Newest last, as they happened; the reason stays in view
                 // before a retry is approved.
-                let shown = self.denials.len().min(5);
-                let first = pick
-                    .saturating_sub(shown - 1)
-                    .min(self.denials.len() - shown);
-                let room = (composer.width as usize).saturating_sub(6);
-                let rows: Vec<Line> = self.denials[first..first + shown]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, denied)| {
+                let room = (composer.width as usize).saturating_sub(8);
+                let items: Vec<list::Item> = (self.denials.iter())
+                    .map(|denied| {
                         let what =
                             transcript::action(&denied.name, &denied.arguments, &self.workspace);
                         let why = denied
@@ -9088,78 +9093,34 @@ impl App {
                             .unwrap_or("")
                             .trim()
                             .to_owned();
-                        let what = transcript::cut(&what, room / 2);
-                        let why =
-                            transcript::cut(&why, room.saturating_sub(what.chars().count() + 2));
-                        if first + i == pick {
-                            Line::from(vec![
-                                Span::raw("  "),
-                                Span::raw(format!(" {what}  {why} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw(format!("   {what}")),
-                                Span::raw(format!("  {why}")).dim(),
-                            ])
-                        }
+                        list::Item::new(transcript::cut(&what, room / 2), why)
                     })
                     .collect();
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(shown as u16),
-                    height: shown as u16,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, list::lines(&items, pick, width), composer);
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("auto-review denials: approve one retry").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from(
-                    "  ↑↓ denial · enter to read it whole, again to approve one retry · esc",
-                )
-                .dim();
+                let keys = Line::from(hint::spans(
+                    "  ↑↓ pick · enter read, again approve one retry · esc close",
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
             if let Some(pick) = self.choosing {
-                let rows: Vec<Line> = approvals::MODES
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (mode, about))| {
-                        let mark = if Some(*mode) == self.mode {
-                            "• "
-                        } else {
-                            "  "
-                        };
-                        let name = format!("{mode:<4}");
-                        if i == pick {
-                            Line::from(vec![
-                                Span::raw(format!("  {mark}")),
-                                Span::raw(format!(" {name}  {about} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw(format!("  {mark} {name}")),
-                                Span::raw(format!("  {about}")).dim(),
-                            ])
-                        }
+                let items: Vec<list::Item> = (approvals::MODES.iter())
+                    .map(|(mode, about)| {
+                        list::Item::new(*mode, *about).current(Some(*mode) == self.mode)
                     })
                     .collect();
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(3),
-                    height: 3,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, list::lines(&items, pick, width), composer);
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("approvals for this agent and those it makes").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from("  ↑↓ mode · enter to choose · esc").dim();
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9184,35 +9145,17 @@ impl App {
             if let Some(picker) = &self.picker {
                 let shown = picker.shown();
                 let at = picker.at();
-                let first = at.saturating_sub(2).min(shown.len().saturating_sub(3));
-                let mut rows: Vec<Line> = shown
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take(3)
-                    .map(|(i, model)| {
-                        let mark = if *model == self.model { "• " } else { "  " };
-                        if i == at {
-                            Line::from(vec![
-                                Span::raw(format!("  {mark}")),
-                                Span::raw(format!(" {model} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(format!("  {mark} {model}"))
-                        }
-                    })
+                let items: Vec<list::Item> = (shown.iter())
+                    .map(|model| list::Item::new(*model, "").current(*model == self.model))
                     .collect();
+                let mut rows = list::lines(&items, at, width);
                 // Why the list is short, in the rows it leaves.
-                for refused in picker.refused.iter().take(3 - rows.len()) {
-                    rows.push(Line::from(format!("     {refused}")).dim());
+                for refused in
+                    (picker.refused.iter()).take((list::ROWS + 1).saturating_sub(rows.len()))
+                {
+                    rows.push(Line::from(format!("    {refused}")).dim());
                 }
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(3),
-                    height: 3,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, rows, composer);
                 let effort = picker.effort().unwrap_or("default");
                 let line = if picker.filter.is_empty() {
                     Line::from(vec![
@@ -9230,11 +9173,14 @@ impl App {
                     composer.x + 2 + picker.filter.width() as u16,
                     composer.y,
                 ));
-                let keys = Line::from(vec![
+                let mut keys = vec![
                     Span::raw("  effort ").dim(),
                     Span::raw(format!("‹ {effort} ›")).bold(),
-                    Span::raw("  ↑↓ model · ←→ effort · enter to switch · esc").dim(),
-                ]);
+                ];
+                keys.extend(hint::spans(
+                    "  ↑↓ pick · ←→ effort · enter switch · esc close",
+                ));
+                let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9313,8 +9259,8 @@ impl App {
                 _ if let Some(ask) = answering => {
                     asks::hint(ask, self.asks.len() - 1, width.saturating_sub(prompt::LEAD))
                 }
-                _ if self.react_to.is_some() => "An emoji for that reply, or Esc".into(),
-                _ if !self.asks.is_empty() => "A message of your own, or Esc to answer".into(),
+                _ if self.react_to.is_some() => "An emoji for that reply · esc cancel".into(),
+                _ if !self.asks.is_empty() => "A message of your own · esc answer".into(),
                 Some(_) => format!("Steer {name}"),
                 None => format!("Message {name}"),
             };
@@ -9322,10 +9268,17 @@ impl App {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
                 None => Span::raw("› ").bold(),
             };
-            return (
-                vec![Line::from(vec![lead, Span::raw(hint).dim()])],
-                (0, prompt::LEAD),
-            );
+            let mut spans = vec![lead, Span::raw(hint).dim()];
+            // Where the keys are, while nothing else is asked.
+            if answering.is_none()
+                && self.asks.is_empty()
+                && self.react_to.is_none()
+                && self.approvals.is_empty()
+            {
+                spans.push(Span::raw(" · ").dim());
+                spans.extend(hint::spans("? shortcuts"));
+            }
+            return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
         let layout = self.input.layout(width);
         let (row, col) = self.input.cursor(&layout);
@@ -9392,9 +9345,9 @@ impl App {
             return Line::from(vec![
                 Span::raw("⏸ ").fg(Color::Yellow),
                 Span::raw(format!("Allow {name}? ")).bold(),
-                Span::raw("y").bold(),
+                Span::raw("y"),
                 Span::raw(" allow · ").dim(),
-                Span::raw("n").bold(),
+                Span::raw("n"),
                 Span::raw(" deny  ").dim(),
                 Span::raw(what),
             ]);
@@ -9443,10 +9396,18 @@ impl App {
             None => self.agents(),
         };
         let mut counted = Vec::new();
-        for (n, color) in [(working, Color::Cyan), (waiting, Color::Yellow)] {
+        // Marks as the roster and /status draw them, each with its word,
+        // so the counts read without colour; what needs you first.
+        for (n, sign, color, word) in [
+            (waiting, "?", Color::Yellow, "needs you"),
+            (working, "●", Color::Cyan, "working"),
+        ] {
             if n > 0 {
-                counted.push(Span::raw("●").fg(color));
-                counted.push(Span::raw(format!(" {n} ")));
+                if !counted.is_empty() {
+                    counted.push(Span::raw("· ").dim());
+                }
+                counted.push(Span::raw(sign).fg(color));
+                counted.push(Span::raw(format!(" {n} {word} ")));
             }
         }
         let counted_width = (counted.iter())
@@ -9477,7 +9438,7 @@ impl App {
         let right = match (self.options.side, self.context) {
             // Said for as long as the side chat is open.
             (Some(_), _) => format!(
-                "side chat with {} · esc goes back  ",
+                "side chat with {} · esc back  ",
                 self.bot
                     .rsplit_once(".side-")
                     .map_or(self.bot.as_str(), |(s, _)| s)
@@ -9589,8 +9550,19 @@ impl App {
     }
 }
 
+/// `rows` drawn over what is right above `below`, cleared first.
+fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::layout::Rect) {
+    let area = ratatui::layout::Rect {
+        y: below.y.saturating_sub(rows.len() as u16),
+        height: (rows.len() as u16).min(below.y),
+        ..below
+    };
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
 /// What the pane's title row says the keys do on `/status`.
-const STATUS_KEYS: &str = "esc closes";
+const STATUS_KEYS: &str = "esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
@@ -12097,7 +12069,7 @@ mod tests {
         start(&mut app, "add");
         start(&mut app, "neg");
         let rows = drawn(&mut app);
-        assert_eq!(rows[0], "◆ Started 2 tasks · click one to open it");
+        assert_eq!(rows[0], "• Started 2 tasks · click one to open it");
         assert_eq!(rows[1], "  ○ add  starting  Fix add");
         // What each does is read, and drawn where they are.
         app.read_tasks().await;
@@ -12401,7 +12373,7 @@ mod tests {
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", served::START, &arguments, "turn:calc.ask/1", false);
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ● ask  needs you  Fix ask");
+        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks().await;
@@ -12539,16 +12511,16 @@ mod tests {
             .skip(counter.start as usize)
             .take(counter.len())
             .collect();
-        assert_eq!(shown, "● 2 ● 2");
-        assert!(text.contains("● 2 ● 2 · b"), "{text}");
+        assert_eq!(shown, "? 2 needs you · ● 2 working");
+        assert!(text.contains("? 2 needs you · ● 2 working · b"), "{text}");
         assert_eq!(text.width(), 100);
-        // Its colors as a roster's: cyan at work, yellow for what needs
-        // the person.
-        let dots: Vec<_> = (line.spans.iter())
-            .filter(|span| span.content == "●")
+        // Its marks and colors as a roster's: yellow ? for what needs the
+        // person, cyan ● at work.
+        let marks: Vec<_> = (line.spans.iter())
+            .filter(|span| span.content == "●" || span.content == "?")
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(dots, [Some(Color::Cyan), Some(Color::Yellow)]);
+        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
         app.counter_at = Some((20, 10 + counter.start..10 + counter.end));
         let click = |column| {
             Event::Mouse(MouseEvent {
@@ -12803,6 +12775,22 @@ mod tests {
         assert_eq!(pick(&app), Some(1), "the last stays picked");
         app.key(key(KeyCode::Up)).await;
         assert_eq!(pick(&app), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_question_mark_with_nothing_typed_shows_the_keys() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.key(key('?')).await;
+        assert!(app.input.is_empty());
+        assert!(app.pane.as_ref().is_some_and(|pane| pane.is_card()));
+        app.close_pane(false);
+        app.key(key('w')).await;
+        app.key(key('?')).await;
+        assert_eq!(
+            &*app.input, "w?",
+            "typed after a word, it is a question mark"
+        );
     }
 
     #[tokio::test]
@@ -13318,13 +13306,14 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
-        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(69)));
+        // The conversation's 100, a gutter each side of the line, the rest.
+        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, margin), (130, None));
         // Asked for with Tab, it takes its half as anything opened does.
         app.pane_keys = true;
         let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(margin.map(|m| m.width), Some(64));
+        assert_eq!(margin.map(|m| m.width), Some(63));
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
         app.follow("sonny:note/repro");

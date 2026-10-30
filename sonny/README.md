@@ -477,7 +477,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
   tasks), **Ready for review** (finished, its last reply linking a pull
-  request), **Idle** (finished or stopped with nothing open), and
+  request), **Done** (finished or stopped with nothing open), and
   **Resolved**, only counted until `r` shows them. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
@@ -628,12 +628,16 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
+![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Done and the resolved count](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
 the view (`verbose`, off by default), besides the efforts and the side chat
-above.
+above. `/config` lists the keys under their table's name, a value set in
+the file plain and a default muted, so what you changed stands out.
+
+![/config: keys under agent, [judge] and [sonny], set values plain and defaults muted](../docs/sonny/config-grouped.png)
+
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
@@ -813,13 +817,26 @@ every resize and when the terminal regains focus, so a multiplexer that
 reattaches or a display that wakes never leaves stale rows; Ctrl+L
 redraws it by hand, as in a shell.
 
+With nothing typed, `?` lists every key beside the conversation. Every
+hint on screen is written one way, as Codex writes them: the key, then
+what it does muted, `·` between them (`↑↓ pick · enter open · esc
+close`). Every list over the composer (the slash menu, `/model`,
+`/approvals`, `/approve`, a reply to react to) is one list: up to 8 rows
+under a blank one, the pick in reverse video, `•` before what is in
+effect.
+
+![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
+
+![The slash menu: 8 commands under a blank row; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
+
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
 failed in the background and `↻` for its triggers and subscriptions (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
-it shows. Under the composer, the footer counts the other agents at work
-(cyan `●`) and what needs you (yellow `●`), and a click on the count
+it shows. Under the composer, the footer counts what needs you and the
+other agents at work, each with its word (`? 1 needs you · ● 2 working`),
+marked as the roster and `/status` mark them, and a click on the count
 opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each

@@ -679,12 +679,12 @@ impl View {
             return Line::from(format!("  {notice}")).fg(Color::Yellow);
         }
         let keys = match (&self.open, self.threads.len()) {
-            (Some(_), _) => "↑↓ scroll · esc back to the threads",
-            (None, 0) => "esc to close",
-            (None, 1) => "enter reads · esc to close",
-            (None, _) => "↑↓ pick · enter reads · esc to close",
+            (Some(_), _) => "↑↓ scroll · esc back",
+            (None, 0) => "esc close",
+            (None, 1) => "enter read · esc close",
+            (None, _) => "↑↓ pick · enter read · esc close",
         };
-        Line::from(format!("  {keys}")).dim()
+        Line::from(crate::hint::spans(&format!("  {keys}")))
     }
 }
 
@@ -808,10 +808,13 @@ mod tests {
         let listed = text(view.card(60).0);
         let at = |needle: &str| listed.iter().position(|l| l.contains(needle)).unwrap();
         assert!(at("New one") < at("Old one"), "{listed:?}");
-        assert_eq!(
-            view.footer().spans[0].content,
-            "  ↑↓ pick · enter reads · esc to close"
-        );
+        let footer: String = view
+            .footer()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(footer, "  ↑↓ pick · enter read · esc close");
         view.key(KeyEvent::from(KeyCode::Down));
         view.key(KeyEvent::from(KeyCode::Enter));
         let read = text(view.card(60).0);
