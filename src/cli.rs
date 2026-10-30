@@ -617,6 +617,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--unsandboxed"
                     | "--env"
                     | "--shell-exclude"
+                    | "--redact-field"
+                    | "--redact-block"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
