@@ -76,6 +76,10 @@ it keeps these, and says in its PR how:
 
 - A pull request that adds, changes or removes a Sonny feature updates its
   row in sonny/FEATURES.md (status, history, why) in the same pull request.
+- The role files in sonny/agents have byte budgets (`BUDGETS` in
+  sonny/src/project.rs, checked by a test). Text added there cuts as much
+  elsewhere: merge or drop a sentence, or leave to memory what the person
+  can teach. Raise a budget only with George's say.
 - George explicitly selected a custom Rust core as a performance engineering
   project. Keep Pi and Codex as measured baselines, not an adoption gate. Reuse
   standard transport, storage, and profiling components. Record equivalent-workload
