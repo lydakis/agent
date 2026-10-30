@@ -1172,6 +1172,8 @@ pub struct Glance {
     /// What of `/background` failed.
     pub failed: usize,
     pub context: Option<u64>,
+    /// The model's context window, when the daemon said it.
+    pub window: Option<u64>,
 }
 
 impl Glance {
@@ -1212,7 +1214,11 @@ impl Glance {
             );
         }
         if let Some(context) = self.context {
-            let text = crate::transcript::tokens(context);
+            let (amount, _, _) = crate::transcript::fullness(context, self.window);
+            let text = match self.window {
+                Some(_) => format!("{amount} left"),
+                None => amount,
+            };
             fact(&mut spans, text.clone(), Span::raw(text).dim(), None);
         }
         (Line::from(spans), buttons)
@@ -1790,10 +1796,16 @@ mod tests {
             behind: 3,
             failed: 0,
             context: Some(41_000),
+            window: None,
         };
         let (line, buttons) = busy.line();
         let text = line.to_string();
         assert!(text.starts_with(" calc · ↻ 3 · "), "{text}");
+        let windowed = Glance {
+            window: Some(1_000_000),
+            ..busy.clone()
+        };
+        assert!(windowed.line().0.to_string().ends_with(" · 96% left"));
         let urls: Vec<&str> = buttons.iter().map(|b| b.2.as_str()).collect();
         assert_eq!(urls, ["sonny:background"]);
         let (failing, failed_buttons) = Glance {

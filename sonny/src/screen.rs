@@ -917,11 +917,13 @@ impl Screen {
         for row in &self.rows[self.wrapped..] {
             let line = row.line.clone();
             // A picture's row is cut at the edge, not wrapped into pieces:
-            // Kitty's placeholders, or one drawn in half blocks.
+            // Kitty's placeholders, or one drawn in half blocks. So is a
+            // rule, as "Worked for" draws: its line just ends sooner.
             let picture = (line.spans.iter()).any(|span| {
                 span.content.starts_with(crate::image::PLACEHOLDER)
                     || span.content.contains(['▀', '▄'])
-            });
+            }) || (line.spans.last())
+                .is_some_and(|span| span.content.ends_with("──"));
             let link = row.link.clone();
             let buttons = row.buttons.clone();
             let rows = match line.width() <= width || picture {
@@ -1267,6 +1269,11 @@ impl Screen {
         self.top = top;
         self.drawn = bottom - top;
         for (y, shown) in self.shown[top..bottom].iter().enumerate() {
+            // A band behind the line fills the row.
+            if let Some(bg) = shown.line.style.bg {
+                let row = Rect::new(area.x, area.y + y as u16, area.width, 1);
+                buf.set_style(row, Style::new().bg(bg));
+            }
             buf.set_line(area.x, area.y + y as u16, &shown.line, area.width);
         }
         let drawn = Rect {
@@ -2588,6 +2595,10 @@ mod tests {
         let blocks = Line::from("  ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄ ▀▄▀▄");
         let (mut banner, _) = screen(vec![blocks], 20, 5);
         assert_eq!(banner.height(20), 1);
+        // A rule drawn wider than the screen ends at its edge.
+        let rule = crate::transcript::finished("completed", "", Some(48), 80);
+        let (mut worked, _) = screen(vec![rule], 20, 5);
+        assert_eq!(worked.height(20), 1);
     }
 
     #[test]

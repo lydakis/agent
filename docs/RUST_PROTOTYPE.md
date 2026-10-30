@@ -280,7 +280,9 @@ cached for an hour; `sent_ms`, when the request was sent in Unix-epoch
 milliseconds, so a cache miss can be set against the gap since the call before
 it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
-fallback the last attempt's); a prompt-cache refresh's event carries
+fallback the last attempt's); `context_window`, the model's context window
+in tokens on a model round's event, so a client can say how full the
+conversation is; a prompt-cache refresh's event carries
 `purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
