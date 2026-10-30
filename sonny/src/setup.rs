@@ -213,8 +213,9 @@ fn ways(found: &Found) -> (Vec<(Way, Row)>, usize) {
 }
 
 /// Asks which provider the daemon runs and keeps the answer, signing in
-/// to ChatGPT through `agent` at `bin` when that is the one.
-pub fn provider(bin: &Path) -> Result<(), String> {
+/// to ChatGPT through `agent` at `bin` when that is the one. `again`, as
+/// `sonny setup`, a key already set can be replaced.
+pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
     let file = agent_client::env_file::path().ok_or("set HOME")?;
     let config = agent_client::config::path().ok_or("set HOME")?;
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("set HOME")?);
@@ -247,7 +248,19 @@ pub fn provider(bin: &Path) -> Result<(), String> {
             }
             (Some("chatgpt"), Vec::new())
         }
-        Way::Key(index) if found.keys.contains(&KEYS[index].2) => (Some(KEYS[index].1), Vec::new()),
+        Way::Key(index) if found.keys.contains(&KEYS[index].2) => {
+            let (name, spec, var) = KEYS[index];
+            let key = match again {
+                true => secret(&format!(
+                    "Paste a new {name} API key, or press Enter to keep the one set: "
+                ))?,
+                false => String::new(),
+            };
+            match key.is_empty() {
+                true => (Some(spec), Vec::new()),
+                false => (Some(spec), vec![(var, key)]),
+            }
+        }
         Way::Key(index) => {
             let (name, spec, var) = KEYS[index];
             let key = loop {
@@ -259,10 +272,10 @@ pub fn provider(bin: &Path) -> Result<(), String> {
             (Some(spec), vec![(var, key)])
         }
         Way::Bedrock => {
-            let kept = match aws_profile(&found.aws)? {
-                Some(profile) => vec![("AWS_PROFILE", profile)],
-                None => Vec::new(),
-            };
+            // No profile is written as an empty one, which unsets one
+            // the shell or an earlier setup gave.
+            let profile = aws_profile(&found.aws)?.unwrap_or_default();
+            let kept = vec![("AWS_PROFILE", profile)];
             (Some("bedrock"), kept)
         }
     };
@@ -301,6 +314,14 @@ fn aws_profile(found: &[Profile]) -> Result<Option<String>, String> {
 /// Asks for the default model of new projects from what the daemon's
 /// providers list, ranked, and keeps it as the config's `model`.
 pub async fn model(client: &Client) -> Result<String, String> {
+    model_of(client, None)
+        .await?
+        .ok_or_else(|| "no model listed".to_owned())
+}
+
+/// The model asked for, from `only` that provider's models when named; none
+/// when the daemon lists none of them.
+async fn model_of(client: &Client, only: Option<&str>) -> Result<Option<String>, String> {
     let file = agent_client::config::path().ok_or("set HOME")?;
     if !WELCOMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         println!("Welcome to Sonny. One choice and it's set up.\n");
@@ -313,7 +334,15 @@ pub async fn model(client: &Client) -> Result<String, String> {
             .await
             .map_err(|e| e.to_string())?;
         print!("\r\x1b[K");
-        let (models, refused) = listed(&listing);
+        let (mut models, mut refused) = listed(&listing);
+        if let Some(only) = only {
+            let of = |id: &str| id.split_once('/').is_some_and(|(p, _)| p == only);
+            models.retain(|model| of(&model.id));
+            refused.retain(|(provider, _)| provider == only);
+            if models.is_empty() && refused.is_empty() {
+                return Ok(None);
+            }
+        }
         for (provider, error) in &refused {
             println!("Could not list {provider}'s models: {error}");
             if let Some(hint) = hint(provider, error) {
@@ -360,7 +389,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
     };
     save(&file, Some(("model", &model)))?;
     summary(&model, &file);
-    Ok(model)
+    Ok(Some(model))
 }
 
 /// What a refusal to list asks of the person, where Sonny knows.
@@ -481,18 +510,32 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
     }
     let before = agent_client::config::load()?.provider;
     let bin = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-    provider(&bin)?;
+    provider(&bin, true)?;
     let running = Client::connect(socket).await.is_ok();
-    if running && agent_client::config::load()?.provider != before {
-        println!(
-            "{DIM}The running daemon keeps its providers until it restarts: `sonny agent stop` restarts it, ending agents' turns.{RESET}"
-        );
-    }
+    let after = agent_client::config::load()?.provider;
+    // A daemon already running lists the providers it started with, so
+    // only the chosen one's models are offered from it.
+    let only = match (running, &after) {
+        (true, Some(after)) if Some(after) != before.as_ref() => {
+            Some(after.split('=').next().unwrap_or(after).to_owned())
+        }
+        _ => None,
+    };
     if !running {
         crate::start_daemon(store, socket, false).map_err(|e| e.to_string())?;
     }
     let (client, _events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
-    model(&client).await.map(|_| ())
+    if model_of(&client, only.as_deref()).await?.is_none() {
+        // The model chosen before is another provider's; the next new
+        // project asks again once the daemon runs this one.
+        let file = agent_client::config::path().ok_or("set HOME")?;
+        agent_client::config::write(&file, &[("model", None)])?;
+        println!(
+            "The running daemon keeps its providers until it restarts: `sonny agent stop` restarts it, ending agents' turns. The next new project then asks for a {} model.",
+            only.unwrap_or_default()
+        );
+    }
+    Ok(())
 }
 
 /// The first lines of a new `~/.agent/config.toml`, saying what each
@@ -626,8 +669,14 @@ fn ranked(models: Vec<Listed>) -> Vec<Listed> {
     let mut kept: Vec<Listed> = models
         .into_iter()
         .filter(|model| {
+            // A fine-tuned model, `ft:BASE:org:suffix:id`, is its base's
+            // kind, whatever its suffix says, as the daemon judges it.
             let id = model.id.to_lowercase();
-            !NOT_AGENTS.iter().any(|word| id.contains(word))
+            let id = id.split_once('/').map_or(id.as_str(), |(_, id)| id);
+            let base = id
+                .strip_prefix("ft:")
+                .map_or(id, |ft| ft.split(':').next().unwrap_or(ft));
+            !NOT_AGENTS.iter().any(|word| base.contains(word))
         })
         .filter(|model| undated(&model.id).is_none_or(|alias| !ids.contains(alias)))
         .collect();
@@ -730,6 +779,8 @@ mod tests {
             model("openai/gpt-y-2026-04-01"),
             model("openai/text-embedding-3-large"),
             model("openai/gpt-x-realtime"),
+            model("openai/ft:gpt-x:org:image-tags:abc"),
+            model("openai/ft:gpt-image-2:org:mine:abc"),
             model("anthropic/claude-a-20260501"),
             model("anthropic/claude-a"),
             model("bedrock/us.anthropic.claude-a"),
@@ -744,6 +795,8 @@ mod tests {
                 "openai/gpt-x",
                 // No undated twin: kept.
                 "openai/gpt-y-2026-04-01",
+                // Judged by its base, not its suffix.
+                "openai/ft:gpt-x:org:image-tags:abc",
                 "anthropic/claude-a",
                 "bedrock/global.anthropic.claude-a",
                 "bedrock/us.anthropic.claude-a",

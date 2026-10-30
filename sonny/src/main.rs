@@ -498,7 +498,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-            setup::provider(&bin)?;
+            setup::provider(&bin, false)?;
             start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,

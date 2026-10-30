@@ -168,30 +168,48 @@ fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -
         out.push_str(&format!("\x1b[{drawn}F"));
     }
     out.push_str("\x1b[J");
-    let mut lines = vec![format!("{BOLD}{title}{RESET} {}", list.filter)];
+    // A line that wrapped would throw off the count redrawing goes back
+    // by, so every line is cut to the terminal's width.
+    let columns = ratatui::crossterm::terminal::size().map_or(80, |(c, _)| c as usize);
+    let asked = clip(
+        &format!("{title} {}", list.filter),
+        columns.saturating_sub(1),
+    );
+    let at = title.len().min(asked.len());
+    let at = if asked.is_char_boundary(at) {
+        at
+    } else {
+        asked.len()
+    };
+    let (title, filter) = asked.split_at(at);
+    let mut lines = vec![format!("{BOLD}{title}{RESET}{filter}")];
     let width = shown
         .iter()
         .map(|&index| rows[index].label.chars().count())
         .max()
-        .unwrap_or(0);
-    // A line that wrapped would throw off the count redrawing goes back by.
-    let columns = ratatui::crossterm::terminal::size().map_or(80, |(c, _)| c as usize);
+        .unwrap_or(0)
+        .min(columns.saturating_sub(3));
     for (place, &index) in shown.iter().enumerate().skip(list.top).take(SHOWN) {
         let row = &rows[index];
-        let pad = " ".repeat(width - row.label.chars().count());
-        let badge = row.badge.as_deref().unwrap_or("");
-        let room = columns.saturating_sub(5 + width + badge.chars().count() + 2);
-        let detail = clip(&row.detail, room);
-        let badge = match badge.is_empty() {
-            true => String::new(),
-            false => format!("  {ACCENT}{badge}{RESET}"),
+        let label = clip(&row.label, width);
+        let pad = " ".repeat(width - label.chars().count());
+        // What fits after the marker and the label, the last column
+        // left free: the badge, then as much of the detail as is room.
+        let mut room = columns.saturating_sub(3 + width);
+        let badge = match row.badge.as_deref() {
+            Some(badge) if badge.chars().count() + 2 <= room => {
+                room -= badge.chars().count() + 2;
+                format!("  {ACCENT}{badge}{RESET}")
+            }
+            _ => String::new(),
+        };
+        let detail = match room > 2 && !row.detail.is_empty() {
+            true => format!("  {DIM}{}{RESET}", clip(&row.detail, room - 2)),
+            false => String::new(),
         };
         lines.push(match place == list.marked {
-            true => format!(
-                "{ACCENT}›{RESET} {BOLD}{}{RESET}{pad}  {DIM}{detail}{RESET}{badge}",
-                row.label
-            ),
-            false => format!("  {}{pad}  {DIM}{detail}{RESET}{badge}", row.label),
+            true => format!("{ACCENT}›{RESET} {BOLD}{label}{RESET}{pad}{detail}{badge}"),
+            false => format!("  {label}{pad}{detail}{badge}"),
         });
     }
     let hidden = shown.len().saturating_sub(list.top + SHOWN);
@@ -201,7 +219,10 @@ fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -
         _ if hidden > 0 => format!("{hidden} more · ↑↓ move · Enter choose · type to narrow"),
         _ => "↑↓ move · Enter choose · type to narrow".to_owned(),
     };
-    lines.push(format!("{DIM}{hint}{RESET}"));
+    lines.push(format!(
+        "{DIM}{}{RESET}",
+        clip(&hint, columns.saturating_sub(1))
+    ));
     out.push_str(&lines.join("\r\n"));
     out.push_str("\r\n");
     print!("{out}");
@@ -213,6 +234,7 @@ fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -
 fn clip(text: &str, room: usize) -> String {
     match text.chars().count() <= room {
         true => text.to_owned(),
+        false if room == 0 => String::new(),
         false => {
             let kept: String = text.chars().take(room.saturating_sub(1)).collect();
             format!("{kept}…")
@@ -230,6 +252,13 @@ mod tests {
             Row::new("anthropic/claude-b", "Claude Haiku"),
             Row::new("openai/gpt-x", ""),
         ]
+    }
+
+    #[test]
+    fn clipped_text_fits_its_room() {
+        assert_eq!(clip("bedrock/global.anthropic.claude", 10), "bedrock/g…");
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("anything", 0), "");
     }
 
     #[test]
