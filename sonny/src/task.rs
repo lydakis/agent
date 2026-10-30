@@ -680,6 +680,114 @@ pub fn still_there(lead: &str) -> Vec<(String, String)> {
     }
 }
 
+/// The folders Sonny made `lead`'s tasks, from its folder `here`, whose
+/// task is no longer there, removed some other way than `remove_task`,
+/// such as by a prune of finished agents: each by name and the space it
+/// takes. Found without running anything in them: by their records, or
+/// for the worktrees of `here`'s repository, by its list of them. None
+/// when the agents can't be listed, so a task still there is never
+/// counted gone.
+pub fn left_behind(here: &Path, lead: &str) -> Vec<(String, Size)> {
+    let project = crate::project::lead_project(lead).unwrap_or(lead);
+    let (Some(agent), Ok(home)) = (crate::agent_bin(), home_dir()) else {
+        return Vec::new();
+    };
+    let Ok(output) = Command::new(agent)
+        .args(["ls", "--name", &format!("{project}.*")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(bots)) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    let folders = home.join(".agent/worktrees");
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let here = real(here);
+    // The worktrees git lists for the lead's repository, by their real paths.
+    let worktrees: Vec<PathBuf> = git(&here, &["worktree", "list", "--porcelain"])
+        .map(|list| {
+            list.lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .map(|path| real(Path::new(path)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut left = Vec::new();
+    for entry in std::fs::read_dir(&folders).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&format!("{project}."))
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || bots.iter().any(|bot| bot["name"] == name.as_str())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let ours = match recorded(&name) {
+            Some((source, _)) => source == here,
+            None => worktrees.contains(&real(&path)),
+        };
+        if ours {
+            left.push((name, size(&path)));
+        }
+    }
+    left.sort();
+    left
+}
+
+/// The space a folder's files take, and whether all were counted: a
+/// walk stops after [`SIZE_ENTRIES`], so a large build folder never
+/// holds up a start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Size {
+    pub bytes: u64,
+    pub whole: bool,
+}
+
+const SIZE_ENTRIES: usize = 200_000;
+
+/// What `dir` holds, links not followed.
+fn size(dir: &Path) -> Size {
+    let mut size = Size {
+        bytes: 0,
+        whole: true,
+    };
+    let mut folders = vec![dir.to_owned()];
+    let mut seen = 0;
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            seen += 1;
+            if seen > SIZE_ENTRIES {
+                size.whole = false;
+                return size;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                folders.push(entry.path());
+            } else if meta.is_file() {
+                size.bytes += meta.len();
+            }
+        }
+    }
+    size
+}
+
+impl std::fmt::Display for Size {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let over = if self.whole { "" } else { "over " };
+        let bytes = self.bytes as f64;
+        match self.bytes {
+            0..1_000_000 => write!(f, "{over}{:.0} KB", bytes / 1e3),
+            1_000_000..1_000_000_000 => write!(f, "{over}{:.0} MB", bytes / 1e6),
+            _ => write!(f, "{over}{:.1} GB", bytes / 1e9),
+        }
+    }
+}
+
 /// Of `bots`, those `lead` made itself, side chats left out.
 fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
     (bots.iter())
