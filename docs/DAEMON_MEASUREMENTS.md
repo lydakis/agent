@@ -5744,3 +5744,29 @@ Store jobs per turn did not change (7.5 on both), and no change is a cost
 past the gate's 15%; the per-idle-bot drop is the bench's noise, as the
 change adds nothing to an idle bot. The refused path is not measured: it
 runs once per refusal, a second request to the provider.
+
+## The pull cord holds starts while paused (#408)
+
+Admission now asks whether the daemon is held, draining or paused, in
+one check where it asked about draining alone, and a pause is one row
+read once at start. Nothing else runs per turn: the pause's own work
+(ending turns, background commands and terminals) runs only when it is
+pulled. The Perf workflow's matched screen, base main against the PR head
+83252c6, on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.472 | 40.04 | +1.4% |
+| admission | burst submit p99, ms | 6.36 | 6.048 | -4.9% |
+| completion | release to terminal p99, ms | 13.712 | 13.679 | -0.2% |
+| footprint | idle RSS, MiB | 19.057 | 19.174 | +0.6% |
+| footprint | per idle bot, KiB | 1.422 | 1.262 | -11.3% |
+| footprint | RSS after a turn each, MiB | 28.178 | 27.998 | -0.6% |
+| footprint | CPU per turn, ms | 1.257 | 1.265 | +0.6% |
+| lifecycle | CPU, s | 1.16 | 1.16 | +0.0% |
+| lifecycle | p95 turn, ms | 579.236 | 581.178 | +0.3% |
+| lifecycle | peak RSS, MiB | 25.311 | 25.266 | -0.2% |
+
+Store jobs per turn did not change (7.5 on both), and no change is a
+cost past the gate's 15%; the per-idle-bot drop is the bench's noise, as
+the change adds nothing to an idle bot.
