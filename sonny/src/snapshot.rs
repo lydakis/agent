@@ -338,10 +338,10 @@ pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
         // it, where the sealed git folder looks.
         let args = ["rev-parse", "--shared-index-path"];
         let shared = git(&top, &args, Some(&index), None)?;
-        if let Some(name) = Path::new(&shared).file_name() {
-            if !copy_plain(&top.join(&shared), &sealed.dir.join(name))? {
-                return Err(format!("{shared}: no such shared index"));
-            }
+        if let Some(name) = Path::new(&shared).file_name()
+            && !copy_plain(&top.join(&shared), &sealed.dir.join(name))?
+        {
+            return Err(format!("{shared}: no such shared index"));
         }
         // A file marked as not changing would keep its old content.
         let listed = self::sealed(&sealed, &["ls-files", "-v", "-z"], &index, None)?;
