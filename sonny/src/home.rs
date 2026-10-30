@@ -335,6 +335,22 @@ fn git(dir: &Path, args: &[&str], env: Option<&[(OsString, OsString)]>) -> Resul
     let out = command
         .arg("-C")
         .arg(dir)
+        // The person's own git settings must not sign, run hooks, change
+        // line endings or leave files out here, as for memory's history:
+        // the backup holds every file byte for byte. Their credentials
+        // still push.
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+        ])
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -442,16 +458,20 @@ fn same(a: &Path, b: &Path) -> bool {
 }
 
 /// The first key of `config` that holds a secret itself rather than
-/// naming the variable it is in: any MCP server's `http_headers`, or a
-/// string under a key named like a token, key, secret or password.
-/// Config that does not parse is held back too.
+/// naming the variable it is in: any MCP server's `http_headers`, a
+/// string under a key named like a token, key, secret or password, or
+/// such a flag's value in an argument list (`--api-key K`,
+/// `--token=K`, `Bearer K`). Config that does not parse is held back
+/// too.
 fn secret_in(config: &str) -> Option<String> {
     let Ok(value) = toml::from_str::<toml::Table>(config) else {
         return Some("config.toml (it does not parse)".into());
     };
     fn secretish(key: &str) -> bool {
-        let key = key.to_ascii_lowercase();
-        !key.ends_with("_env_var")
+        let key = key.to_ascii_lowercase().replace('-', "_");
+        !["_env_var", "_env", "_file", "_path"]
+            .iter()
+            .any(|end| key.ends_with(end))
             && [
                 "token",
                 "api_key",
@@ -483,7 +503,47 @@ fn secret_in(config: &str) -> Option<String> {
                 toml::Value::String(text) if secretish(key) && !text.is_empty() => {
                     return Some(here);
                 }
+                toml::Value::Array(items) => {
+                    if let Some(found) = in_list(items, &here) {
+                        return Some(found);
+                    }
+                }
                 _ => {}
+            }
+        }
+        None
+    }
+    fn in_list(items: &[toml::Value], path: &str) -> Option<String> {
+        let mut flag = false;
+        for (at, item) in items.iter().enumerate() {
+            let here = format!("{path}[{at}]");
+            match item {
+                toml::Value::String(text) => {
+                    let (name, given) = match text.split_once('=') {
+                        Some((name, given)) if name.starts_with('-') => (name, Some(given)),
+                        _ => (text.as_str(), None),
+                    };
+                    let named = name.starts_with('-') && secretish(name.trim_start_matches('-'));
+                    let bearer = text.to_ascii_lowercase().starts_with("bearer ");
+                    match given {
+                        Some(given) if named && !given.is_empty() => return Some(here),
+                        _ if bearer || (flag && !text.starts_with('-')) => return Some(here),
+                        _ => flag = named && given.is_none(),
+                    }
+                }
+                toml::Value::Table(inner) => {
+                    flag = false;
+                    if let Some(found) = walk(inner, &here) {
+                        return Some(found);
+                    }
+                }
+                toml::Value::Array(inner) => {
+                    flag = false;
+                    if let Some(found) = in_list(inner, &here) {
+                        return Some(found);
+                    }
+                }
+                _ => flag = false,
             }
         }
         None
@@ -686,6 +746,26 @@ mod tests {
             .as_deref(),
             Some("sonny.mcp_servers.z.env.SSH_PRIVATE_KEY")
         );
+        let args = |list: &str| {
+            secret_in(&format!(
+                "[sonny.mcp_servers.a]\ncommand = \"a\"\nargs = {list}\n"
+            ))
+        };
+        assert_eq!(
+            args(r#"["--api-key", "k"]"#).as_deref(),
+            Some("sonny.mcp_servers.a.args[1]")
+        );
+        assert_eq!(
+            args(r#"["serve", "--token=k"]"#).as_deref(),
+            Some("sonny.mcp_servers.a.args[1]")
+        );
+        assert_eq!(
+            args(r#"["--header", "Bearer k"]"#).as_deref(),
+            Some("sonny.mcp_servers.a.args[1]")
+        );
+        assert_eq!(args(r#"["--token-file", "/run/t", "--port", "3"]"#), None);
+        assert_eq!(args(r#"["--api-key", "--verbose"]"#), None);
+        assert_eq!(args(r#"["-y", "@scope/server", "--read-only"]"#), None);
         assert!(secret_in("not = = toml").is_some());
     }
 
@@ -734,6 +814,38 @@ mod tests {
             adopt(&second, &other, None)
                 .unwrap_err()
                 .starts_with("backup_other_repo: ")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_person_s_global_ignores_leave_nothing_out() {
+        let root = scratch("ignores");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        write(&root.join("ignore"), "config.toml\n*.md\n");
+        write(
+            &root.join("gitconfig"),
+            &format!(
+                "[core]\nexcludesFile = {}\n[user]\nname = T\nemail = t@example.com\n",
+                root.join("ignore").display()
+            ),
+        );
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(key, _)| key != "GIT_CONFIG_GLOBAL")
+            .collect();
+        env.push(("GIT_CONFIG_GLOBAL".into(), root.join("gitconfig").into()));
+        let at = places(&root.join("one"));
+        write(&at.agents.join("memory/fact.md"), "fact");
+        write(&at.config, "provider = \"chatgpt\"\n");
+        adopt(&at, &root.join("remote.git").to_string_lossy(), Some(&env)).unwrap();
+        sync(&at, Some(&env)).unwrap();
+        let held = sh(
+            &root.join("remote.git"),
+            &["ls-tree", "-r", "--name-only", "HEAD"],
+        );
+        assert_eq!(
+            held.lines().collect::<Vec<_>>(),
+            ["agents/memory/fact.md", "config.toml"]
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
