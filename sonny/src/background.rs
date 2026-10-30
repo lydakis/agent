@@ -546,9 +546,12 @@ impl View {
 
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
+        // The pick has a column of its own, as the composer's `› ` does,
+        // so it never touches the row's mark; what follows lines up under
+        // the name.
         let pick = match picked {
-            true => Span::raw("›").bold(),
-            false => Span::raw(" "),
+            true => Span::raw("› ").bold(),
+            false => Span::raw("  "),
         };
         // Sonny's one mark for what failed, as `/status` shows a task.
         let mark = match item.kind {
@@ -578,14 +581,14 @@ impl View {
             Line::from(spans),
             width,
             Span::raw(""),
-            Span::raw("   "),
+            Span::raw(INDENT),
         ));
         if let Some(why) = &item.failed {
             out.extend(crate::transcript::wrap(
                 Line::from(why.clone()),
                 width,
-                Span::raw("   "),
-                Span::raw("   "),
+                Span::raw(INDENT),
+                Span::raw(INDENT),
             ));
         }
         let mut facts = item.facts.clone();
@@ -596,15 +599,15 @@ impl View {
             out.extend(crate::transcript::wrap(
                 Line::from(facts.join(" · ")).dim(),
                 width,
-                Span::raw("   "),
-                Span::raw("   "),
+                Span::raw(INDENT),
+                Span::raw(INDENT),
             ));
         }
         if !item.what.is_empty() {
             out.extend(crate::transcript::capped(
                 Line::from(item.what.clone()).dim(),
                 width,
-                Span::raw("   └ ").dim(),
+                Span::raw(format!("{INDENT}└ ")).dim(),
                 1,
             ));
         }
@@ -637,6 +640,10 @@ impl View {
         Line::from(format!("  {}", keys.join(" · "))).dim()
     }
 }
+
+/// Where a row's lines after the first start: under its name, past the
+/// pick and the mark.
+const INDENT: &str = "    ";
 
 fn key_of(item: &Item) -> (Kind, String, String) {
     (item.kind, item.bot.clone(), item.name.clone())
@@ -870,25 +877,25 @@ mod tests {
         let (card, at) = view.card(100);
         let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
         assert_eq!(lines[2], "Failed · 2");
-        assert_eq!(lines[3], " ✗ memory every 1d → memory-cleanup");
+        assert_eq!(lines[3], "  ✗ memory every 1d → memory-cleanup");
         let mark = card[3]
             .spans
             .iter()
             .find(|s| s.content.starts_with('✗'))
             .unwrap();
         assert_eq!(mark.style.fg, Some(Color::Red));
-        assert_eq!(lines[4], "   provider_failed: login expired");
+        assert_eq!(lines[4], "    provider_failed: login expired");
         assert_eq!(
             card[4].style.add_modifier,
             ratatui::style::Modifier::empty()
         );
         assert_eq!(
             lines[7],
-            "›✗ chat could not be read by the nightly memory cleanup"
+            "› ✗ chat could not be read by the nightly memory cleanup"
         );
         assert_eq!(at, 7);
-        assert_eq!(lines[8], "   chat server: auth_expired");
-        assert_eq!(lines[9], "   memory fact unreadable-chat");
+        assert_eq!(lines[8], "    chat server: auth_expired");
+        assert_eq!(lines[9], "    memory fact unreadable-chat");
         assert_eq!(lines[11], "Triggers · 1");
         assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc to close");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -932,11 +939,11 @@ mod tests {
         let lines = text(&view);
         assert_eq!(lines[0], "calc · in the background");
         assert_eq!(lines[3], "Triggers · 1");
-        assert_eq!(lines[4], "›↻ nightly every 1d → lead");
-        assert_eq!(lines[5], "   sent 2");
-        assert_eq!(lines[6], "   └ Read preferences.md");
+        assert_eq!(lines[4], "› ↻ nightly every 1d → lead");
+        assert_eq!(lines[5], "    sent 2");
+        assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Lookout subscriptions · 1");
-        assert_eq!(lines[9], " ◎ tasks for lead");
+        assert_eq!(lines[9], "  ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         // Ctrl+D is not d.
         view.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
