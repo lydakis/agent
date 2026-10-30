@@ -428,10 +428,10 @@ fn a_task_s_own_folder_is_removed_only_with_discard() {
     let (ok, said) = lab.tool(&ws, "start_task", start.clone(), false);
     assert!(ok, "{said}");
     let folder = lab.home.join(".agent/worktrees/demo.fix");
-    // The task makes a repository there, whose settings name a program
-    // git would run: Sonny runs nothing in it, and asks for discard.
-    let repo = folder.join("ws2/src/api");
-    std::fs::create_dir_all(&repo).unwrap();
+    // The task makes a repository there, at its top, whose settings name
+    // a program git would run: Sonny runs nothing in it, and asks for
+    // discard.
+    let repo = folder.clone();
     lab.git(&repo, &["init", "-q", "-b", "main"]);
     let ran = lab.scratch.join("fsmonitor-ran");
     let hook = lab.scratch.join("fsmonitor");
@@ -442,9 +442,17 @@ fn a_task_s_own_folder_is_removed_only_with_discard() {
     let (ok, err) = lab.remove(&ws, false);
     assert!(!ok && err.contains("with discard"), "{err}");
     assert!(folder.exists() && !lab.scratch.join("run.log.rm").exists());
-    // Removed from another folder, it is refused.
+    // Removed from another folder, it is refused, and a task of that name
+    // started there is not given it.
     let (ok, err) = lab.remove(&lab.repo, true);
     assert!(!ok && err.contains("run this there"), "{err}");
+    let (ok, err) = lab.tool(
+        &lab.repo,
+        "start_task",
+        serde_json::json!({"name": "fix", "brief": "x"}),
+        false,
+    );
+    assert!(!ok && err.contains("pick another name"), "{err}");
     let (ok, err) = lab.remove(&ws, true);
     assert!(ok, "{err}");
     assert!(!folder.exists());

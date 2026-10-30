@@ -727,11 +727,18 @@ fn record_of(name: &str) -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".agent/worktrees/.folders").join(name))
 }
 
-/// The folder the task `name` was given an empty folder of its own from,
-/// as Sonny recorded it.
-fn source_of(name: &str) -> Option<PathBuf> {
+/// The lead's folder the task `name` was started from, as Sonny recorded
+/// it, and whether Sonny gave it an empty folder of its own: recorded, as
+/// whatever the task makes there, a repository too, cannot tell.
+fn recorded(name: &str) -> Option<(PathBuf, bool)> {
     let text = std::fs::read_to_string(record_of(name).ok()?).ok()?;
-    Some(PathBuf::from(text.trim_end_matches('\n')))
+    let mut lines = text.lines();
+    let source = PathBuf::from(lines.next()?);
+    Some((source, lines.next() == Some("own")))
+}
+
+fn source_of(name: &str) -> Option<PathBuf> {
+    recorded(name).map(|(source, _)| source)
 }
 
 /// The lead's folder a task's folder at or above `dir` was made from, when
@@ -753,7 +760,7 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
     let undo = if path.exists() {
         // Left by a task of this name before: its own only if it was
         // started from this folder.
-        if source_of(name).as_deref() != Some(here) || path.join(".git").exists() {
+        if recorded(name) != Some((here.to_owned(), true)) {
             return Err(format!(
                 "{} exists and is not the folder of a task of this one; pick another name",
                 path.display()
@@ -763,7 +770,7 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
     } else {
         let made = std::fs::create_dir_all(&path)
             .and_then(|()| std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/"))))
-            .and_then(|()| std::fs::write(&record, format!("{}\n", here.display())));
+            .and_then(|()| std::fs::write(&record, format!("{}\nown\n", here.display())));
         let undo = Undo::Folder {
             path: path.clone(),
             record,
@@ -807,8 +814,9 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     let branch = format!("agent/{name}");
     let undo = if path.exists() {
         // Left by a task of this name before: its own only if it is a
-        // worktree of this repository on the task's branch.
-        if !ours(here, &path, &branch) {
+        // worktree of this repository on the task's branch. A folder of a
+        // task's own is not, and Sonny runs no git in what the task made.
+        if recorded(name).is_some_and(|(_, own)| own) || !ours(here, &path, &branch) {
             return Err(format!(
                 "{} exists and is not this repository's worktree on {branch}; pick another name",
                 path.display()
@@ -962,13 +970,13 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     let branch = format!("agent/{name}");
     let path = home_dir()?.join(".agent/worktrees").join(name);
-    let source = source_of(name);
-    // A worktree has its `.git`; an own folder, whatever the task made in
-    // it, has none at its top.
-    let tree = path.join(".git").symlink_metadata().is_ok();
+    let (source, own) = match recorded(name) {
+        Some((source, own)) => (Some(source), own),
+        None => (None, false),
+    };
     let (worktree, folder) = match path.exists() {
-        true if !tree && source.as_deref() == Some(here) => (None, Some(path)),
-        true if tree
+        true if own && source.as_deref() == Some(here) => (None, Some(path)),
+        true if !own
             && let Some(repo) = repository_of(here, &path)
             && ours(&repo, &path, &branch) =>
         {
