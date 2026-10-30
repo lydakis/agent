@@ -800,15 +800,16 @@ impl Clock {
         out
     }
 
-    /// Stop the clock until the guard is dropped, and give up the place.
+    /// Stop the clock until the guard is dropped, and give up the place,
+    /// even one a call that waited beside this one took back meanwhile.
     fn stop(self: &Arc<Self>) -> Stopped {
         let mut times = self.times.lock().unwrap();
         if times.waiting == 0 {
             times.since = Instant::now();
             times.ran = Duration::ZERO;
             times.checked = None;
-            self.place.lock().unwrap().take();
         }
+        self.place.lock().unwrap().take();
         times.waiting += 1;
         Stopped(Arc::clone(self))
     }
@@ -1625,6 +1626,22 @@ text("done");"#;
             let said = script.await.unwrap().unwrap();
             assert!(said.ends_with("Output:\napproved"), "{said}");
         }
+    }
+
+    #[tokio::test]
+    async fn every_wait_gives_up_the_place_however_the_waits_overlap() {
+        let place = RUNNING.acquire().await.unwrap();
+        let clock = Clock::new(Instant::now() + TIMEOUT, place);
+        let (first, second) = (clock.stop(), clock.stop());
+        assert!(clock.place.lock().unwrap().is_none());
+        // The first's verdict comes: it takes a place back and runs on,
+        // while the second still waits, then waits again.
+        clock.take_place().await.unwrap();
+        drop(first);
+        assert!(clock.place.lock().unwrap().is_some());
+        let again = clock.stop();
+        assert!(clock.place.lock().unwrap().is_none());
+        drop((second, again));
     }
 
     #[tokio::test]
