@@ -786,18 +786,19 @@ fn main() -> std::process::ExitCode {
                 _ => Err(format!("usage: {}", home::USAGE)),
             }
         }
-        Some((verb, rest)) if verb == "setup" && rest.is_empty() => {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())
-                .and_then(|runtime| {
-                    runtime.block_on(async {
-                        let (store, socket) = daemon_paths(None, None)?;
-                        setup::again(&store, &socket).await
-                    })
+        Some((verb, rest)) if verb == "setup" => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .and_then(|runtime| {
+                runtime.block_on(async {
+                    let (store, socket) = daemon_paths(None, None)?;
+                    match rest.is_empty() {
+                        true => setup::again(&store, &socket).await,
+                        false => setup::flags(rest, &socket).await,
+                    }
                 })
-        }
+            }),
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),

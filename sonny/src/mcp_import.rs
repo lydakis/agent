@@ -651,8 +651,30 @@ pub fn here() -> Result<Vec<Found>, String> {
 /// brought in; with `all`, every one without asking. What each did not
 /// bring is said. The names brought.
 pub fn offer(all: bool) -> Result<Vec<String>, String> {
-    let (bringable, refused): (Vec<Found>, Vec<Found>) =
-        here()?.into_iter().partition(|f| !f.keys.is_empty());
+    offer_from(all, &[])
+}
+
+/// [`offer`] of the servers of `agents` alone (`codex`, `claude`,
+/// `opencode`, `kiro`), or of every agent's when it names none.
+pub fn offer_from(all: bool, agents: &[&str]) -> Result<Vec<String>, String> {
+    let unknown: Vec<&&str> = (agents.iter())
+        .filter(|agent| short(agent).is_none())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "no agent {}: name codex, claude, opencode or kiro",
+            unknown
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let wanted =
+        |found: &Found| agents.is_empty() || agents.iter().any(|a| short(a) == Some(found.from));
+    let (bringable, refused): (Vec<Found>, Vec<Found>) = (here()?.into_iter())
+        .filter(wanted)
+        .partition(|f| !f.keys.is_empty());
     let (bringable, unasked): (Vec<Found>, Vec<Found>) = match all {
         true => bringable.into_iter().partition(|f| !f.folder),
         false => (bringable, Vec::new()),
@@ -694,6 +716,17 @@ pub fn offer(all: bool) -> Result<Vec<String>, String> {
         );
     }
     Ok(brought.into_iter().map(|f| f.name).collect())
+}
+
+/// The agent a short name, as `claude`, names.
+fn short(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "codex" => Some("Codex"),
+        "claude" | "claude-code" => Some("Claude Code"),
+        "opencode" => Some("OpenCode"),
+        "kiro" => Some("Kiro"),
+        _ => None,
+    }
 }
 
 /// What `sonny mcp import --json` prints for `found`: never a secret's

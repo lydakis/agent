@@ -58,6 +58,8 @@ struct Found {
     keys: Vec<&'static str>,
     /// The config's `provider`, which setup offers to keep.
     current: Option<String>,
+    /// The other agents on `PATH`, by name.
+    agents: Vec<&'static str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -98,6 +100,7 @@ fn detect(home: &Path, var: &dyn Fn(&str) -> Option<String>) -> Found {
             .filter(|key| var(key).is_some())
             .collect(),
         current: None,
+        agents: Vec::new(),
     }
 }
 
@@ -171,7 +174,22 @@ enum Way {
     Bedrock,
     /// A key's provider, by its index in [`KEYS`].
     Key(usize),
+    /// Another agent on this machine, by its index in [`AGENTS`], set up
+    /// with the person.
+    Agent(usize),
 }
+
+/// The agents setup can hand itself to: their name, their command, and
+/// how it starts a session there with a first message.
+const AGENTS: [(&str, &str, &[&str]); 4] = [
+    ("Claude Code", "claude", &[]),
+    ("Codex", "codex", &[]),
+    ("OpenCode", "opencode", &["--prompt"]),
+    ("Kiro", "kiro-cli", &["chat"]),
+];
+
+/// The skill an agent setting Sonny up reads.
+pub const SKILL: &str = include_str!("../skills/sonny-setup/SKILL.md");
 
 /// The ways to reach a model, what Sonny found for each, and the one to
 /// mark: what is signed in, else what is found, else a ChatGPT plan.
@@ -216,6 +234,24 @@ fn ways(found: &Found) -> (Vec<(Way, Row)>, usize) {
             },
         ));
     }
+    // With nothing ready, an agent this machine has can help, as it
+    // reaches a model already.
+    if !ways
+        .iter()
+        .any(|(_, row)| row.badge.as_deref() == Some("ready"))
+    {
+        for (index, (name, _, _)) in AGENTS.iter().enumerate() {
+            if found.agents.contains(name) {
+                ways.push((
+                    Way::Agent(index),
+                    Row::new(
+                        format!("Let {name} set up Sonny"),
+                        "it runs here with you, asking as it always does",
+                    ),
+                ));
+            }
+        }
+    }
     if let Some(current) = &found.current {
         ways.insert(
             0,
@@ -244,6 +280,10 @@ pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("set HOME")?);
     let mut found = detect(&home, &|name| agent_client::env_file::var(name));
     found.current = agent_client::config::load()?.provider;
+    found.agents = (AGENTS.iter())
+        .filter(|(_, command, _)| on_path(command))
+        .map(|(name, ..)| *name)
+        .collect();
     WELCOMED.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("Welcome to Sonny. Your agents need a model to talk to.");
     println!(
@@ -253,8 +293,17 @@ pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
     );
     let (ways, marked) = ways(&found);
     let rows: Vec<Row> = ways.iter().map(|(_, row)| row.clone()).collect();
-    let Picked::Row(chosen) = picker::pick("Connect with", &rows, marked, false)? else {
-        unreachable!("a pick without typing is a row");
+    let chosen = loop {
+        let Picked::Row(chosen) = picker::pick("Connect with", &rows, marked, false)? else {
+            unreachable!("a pick without typing is a row");
+        };
+        let Way::Agent(index) = ways[chosen].0 else {
+            break chosen;
+        };
+        if hand_off(index)? {
+            println!();
+            return Ok(());
+        }
     };
     // The provider to name in the config, and what goes in the env file.
     let (named, kept): (Option<&str>, Vec<(&str, String)>) = match ways[chosen].0 {
@@ -309,6 +358,7 @@ pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
             };
             (Some(spec), vec![(var, key)])
         }
+        Way::Agent(_) => unreachable!("an agent's setup returned above"),
         Way::Bedrock => {
             // No profile is written as an empty one, which unsets one
             // the shell or an earlier setup gave.
@@ -324,6 +374,236 @@ pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
     save(&config, named.map(|provider| ("provider", provider)))?;
     println!();
     Ok(())
+}
+
+/// Setup handed to the agent at `index` in [`AGENTS`], in a session of its
+/// own in this terminal, with the person; whether a provider is set once
+/// the person leaves it.
+fn hand_off(index: usize) -> Result<bool, String> {
+    let (name, command, args) = AGENTS[index];
+    let skill = crate::skills::install("sonny-setup", SKILL)
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            Some(PathBuf::from(home).join(".agents/skills/sonny-setup/SKILL.md"))
+        })
+        .ok_or("set HOME")?;
+    let sonny = std::env::current_exe().map_err(|e| e.to_string())?;
+    let prompt = format!(
+        "Set up Sonny, the coding-agent client on this machine, so its agents reach a model. \
+         Follow the skill at {}. Sonny is {}; start with `{} setup --json` to see what this \
+         machine has. Ask me before anything that needs my key or a sign-in. Once \
+         `setup --json` shows a provider, tell me to leave this session and Sonny goes on.",
+        skill.display(),
+        sonny.display(),
+        sonny.display()
+    );
+    println!("{DIM}Starting {name}. Leave it when Sonny is set up, and Sonny goes on.{RESET}\n");
+    let status = std::process::Command::new(command)
+        .args(args)
+        .arg(&prompt)
+        .status()
+        .map_err(|e| format!("{command}: {e}"))?;
+    let set = agent_client::config::load()?.provider.is_some();
+    if !set {
+        println!(
+            "\n{name} {} and no provider is set yet. Choose one here.\n",
+            match status.success() {
+                true => "ended",
+                false => "stopped",
+            }
+        );
+    }
+    Ok(set)
+}
+
+pub const USAGE: &str = "\
+usage: sonny setup [--provider chatgpt|anthropic|openai|openrouter|bedrock]
+                   [--profile AWS_PROFILE] [--key-stdin] [--model PROVIDER/MODEL]
+                   [--import-mcp [codex,claude,opencode,kiro]] [--json]
+With no flags, asks in a terminal. With flags, sets what they name and asks
+nothing, for scripts and agents: --key-stdin reads the provider's key from
+stdin into ~/.agent/env; --import-mcp brings the MCP servers of those agents
+(all, when it names none) but those from files in this folder; --json prints
+what this machine has and what is set, after any change.";
+
+/// `sonny setup` with flags: what they name set, nothing asked.
+pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
+    let mut provider = None;
+    let mut profile = None;
+    let mut key_stdin = false;
+    let mut model = None;
+    let mut import = None;
+    let mut json = false;
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let mut value = |flag: &str| {
+            args.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} takes a value\n{USAGE}"))
+        };
+        match arg.as_str() {
+            "--provider" => provider = Some(value("--provider")?),
+            "--profile" => profile = Some(value("--profile")?),
+            "--model" => model = Some(value("--model")?),
+            "--key-stdin" => key_stdin = true,
+            "--json" => json = true,
+            "--import-mcp" => {
+                let named = args.next_if(|next| !next.starts_with("--"));
+                import = Some(named.cloned().unwrap_or_default());
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other => return Err(format!("no flag {other}\n{USAGE}")),
+        }
+    }
+    let config = agent_client::config::path().ok_or("set HOME")?;
+    let env = agent_client::env_file::path().ok_or("set HOME")?;
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("set HOME")?);
+    let found = detect(&home, &|name| agent_client::env_file::var(name));
+    let before = reached()?;
+    if let Some(provider) = &provider {
+        let mut kept: Vec<(&str, String)> = Vec::new();
+        match provider.as_str() {
+            "chatgpt" if !found.chatgpt => {
+                return Err("ChatGPT is not signed in here: run `sonny agent login chatgpt`, then this again".into());
+            }
+            "chatgpt" => {}
+            "bedrock" => match (&profile, found.aws.len()) {
+                (Some(name), _) if !found.aws.iter().any(|p| &p.name == name) => {
+                    return Err(format!(
+                        "no AWS profile {name}; these are: {}",
+                        found
+                            .aws
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                (Some(name), _) => kept.push(("AWS_PROFILE", name.clone())),
+                // None to name: the environment's credentials.
+                (None, 0) => kept.push(("AWS_PROFILE", String::new())),
+                (None, _) => {
+                    return Err(format!(
+                        "name an AWS profile with --profile: {}",
+                        found
+                            .aws
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            },
+            spec => {
+                let Some((name, _, var)) = KEYS.iter().find(|(_, s, _)| *s == spec) else {
+                    return Err(format!("no provider {spec}\n{USAGE}"));
+                };
+                if key_stdin {
+                    let mut key = String::new();
+                    std::io::stdin()
+                        .read_line(&mut key)
+                        .map_err(|e| e.to_string())?;
+                    let key = key.trim();
+                    if key.is_empty() {
+                        return Err(format!("no {name} key on stdin"));
+                    }
+                    kept.push((var, key.to_owned()));
+                } else if !found.keys.contains(var) {
+                    return Err(format!(
+                        "{var} is not set: set it in ~/.agent/env, or pass the key on stdin with --key-stdin"
+                    ));
+                }
+            }
+        }
+        if profile.is_some() && provider != "bedrock" {
+            return Err("--profile is Bedrock's".into());
+        }
+        if !kept.is_empty() {
+            let pairs: Vec<(&str, &str)> = kept.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            agent_client::env_file::set(&env, &pairs)?;
+        }
+        save(&config, Some(("provider", provider)))?;
+    } else if profile.is_some() || key_stdin {
+        return Err(format!(
+            "--profile and --key-stdin go with --provider\n{USAGE}"
+        ));
+    }
+    if let Some(model) = &model {
+        if !whole(model) {
+            return Err(format!(
+                "{model} is not PROVIDER/MODEL, as anthropic/claude-opus-5-5 is"
+            ));
+        }
+        save(&config, Some(("model", model)))?;
+    }
+    let brought = match &import {
+        Some(agents) => {
+            let agents: Vec<&str> = agents.split(',').filter(|a| !a.is_empty()).collect();
+            crate::skills::note_offered("mcp-import");
+            crate::mcp_import::offer_from(true, &agents)?
+        }
+        None => Vec::new(),
+    };
+    if reached()? != before && Client::connect(socket).await.is_ok() {
+        println!(
+            "The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end."
+        );
+    }
+    match json {
+        true => println!("{}", state(&home)?),
+        false => {
+            let changed = [
+                provider.map(|p| format!("provider {p}")),
+                model.map(|m| format!("model {m}")),
+                (!brought.is_empty()).then(|| format!("MCP {}", brought.join(", "))),
+            ];
+            let changed: Vec<String> = changed.into_iter().flatten().collect();
+            match changed.is_empty() {
+                true => println!("{USAGE}"),
+                false => println!(
+                    "Set {}. Settings in {}, keys in {}.",
+                    changed.join(", "),
+                    crate::tilde(&config.display().to_string()),
+                    crate::tilde(&env.display().to_string())
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `sonny setup --json` prints: what this machine has for reaching a
+/// model, what is set, and what setup has left.
+fn state(home: &Path) -> Result<Value, String> {
+    let found = detect(home, &|name| agent_client::env_file::var(name));
+    let config = agent_client::config::load()?;
+    let mut ways = vec![
+        json!({"provider": "chatgpt", "signed_in": found.chatgpt, "codex_signed_in": found.codex_chatgpt}),
+        json!({"provider": "bedrock", "profiles": found.aws.iter()
+            .map(|p| json!({"name": p.name, "detail": p.detail})).collect::<Vec<_>>()}),
+    ];
+    ways.extend(KEYS.iter().map(
+        |(_, spec, var)| json!({"provider": spec, "key": var, "set": found.keys.contains(var)}),
+    ));
+    let mcp = crate::mcp_import::here().unwrap_or_default();
+    Ok(json!({
+        "config": agent_client::config::path(),
+        "env": agent_client::env_file::path(),
+        "provider": config.provider,
+        "model": config.model,
+        "ways": ways,
+        "agents": AGENTS.iter().map(|(name, command, _)| {
+            json!({"name": name, "command": command, "on_path": on_path(command)})
+        }).collect::<Vec<_>>(),
+        "mcp_to_import": crate::mcp_import::json(&mcp),
+        "missing": missing_tools(),
+        "steps": STEPS.iter().map(|step| {
+            json!({"id": step.id, "what": step.what, "how": step.how, "done": (step.done)()})
+        }).collect::<Vec<_>>(),
+    }))
 }
 
 /// The AWS profile Bedrock signs in with, picked from those found; none
@@ -489,12 +769,14 @@ pub fn just_set() -> Option<String> {
     JUST_SET.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
+/// Whether `name` is a file in a `PATH` folder.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
 /// What agents need that this machine lacks, and how to install it.
 fn missing_tools() -> Vec<String> {
-    let on_path = |name: &str| {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
-    };
     let install = |package: &str| {
         let manager = [
             ("apt-get", "sudo apt install"),
@@ -900,6 +1182,27 @@ mod tests {
         let (offered, _) = ways(&found);
         assert!(offered[0].0 == Way::Keep);
         assert!(offered[1].0 == Way::Key(1));
+        assert!(!offered.iter().any(|(way, _)| matches!(way, Way::Agent(_))));
+        // Nothing ready: an agent on this machine can set it up, last.
+        let found = Found {
+            agents: vec!["Codex"],
+            ..Found::default()
+        };
+        let (offered, _) = ways(&found);
+        let (way, row) = offered.last().unwrap();
+        assert!(*way == Way::Agent(1) && row.label == "Let Codex set up Sonny");
+        // Something ready: no agent is offered.
+        let found = Found {
+            agents: vec!["Codex"],
+            keys: vec!["OPENAI_API_KEY"],
+            ..Found::default()
+        };
+        assert!(
+            !ways(&found)
+                .0
+                .iter()
+                .any(|(way, _)| matches!(way, Way::Agent(_)))
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 
