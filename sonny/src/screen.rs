@@ -1228,6 +1228,20 @@ impl Screen {
         }
     }
 
+    /// The agent named lowest in the rows drawn last: the conversation's
+    /// newest mention of one in view.
+    pub fn last_agent(&self) -> Option<String> {
+        (self.links.iter().rev())
+            .find_map(|(.., url)| url.strip_prefix(crate::links::AGENT))
+            .map(str::to_owned)
+    }
+
+    /// The links found again at the next draw: a word read anew may open
+    /// something now, as an agent's name the daemon has just answered for.
+    pub fn relink(&mut self) {
+        self.linked = None;
+    }
+
     /// Draw the rows that fit `area` of `buf`: the newest, or those the
     /// view is scrolled to, the selection reversed and links underlined.
     /// `file` is where a word that may be a path opens, if it is one.
@@ -1285,6 +1299,13 @@ impl Screen {
             self.links = self.find_links(drawn, &file);
         }
         for (y, from, to, url) in &self.links {
+            // An agent's name in the agents' color, as a button is drawn:
+            // never underlined.
+            if url.starts_with(crate::links::AGENT) {
+                for x in *from..(*to).min(area.right()) {
+                    buf[(x, *y)].set_fg(Color::Blue);
+                }
+            }
             if url.starts_with(BUTTON) {
                 continue;
             }
@@ -1449,7 +1470,8 @@ impl Screen {
             }
         }
         // A row its line links opens there across its text, whatever was
-        // read from its words.
+        // read from its words but the agents they name, which open the
+        // agent: found first, they are what a click on them finds.
         for row in top..bottom {
             let Some(url) = &self.shown[row].link else {
                 continue;
@@ -1460,7 +1482,7 @@ impl Screen {
                 .collect();
             let from = text.width() - text.trim_start().width();
             let to = text.trim_end().width().min(drawn.width as usize);
-            links.retain(|link| link.0 != y);
+            links.retain(|link| link.0 != y || link.3.starts_with(crate::links::AGENT));
             if from < to {
                 links.push((y, drawn.x + from as u16, drawn.x + to as u16, url.clone()));
             }
@@ -2721,6 +2743,53 @@ mod tests {
         ));
         assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
         assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn an_agents_name_opens_it_in_its_color_even_on_a_row_that_opens_elsewhere() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("calc.neg's tests pass; ask calc.add.")]);
+        screen.push_marked(
+            vec![Line::from("↳ From calc.neg ▸")],
+            vec![(0, Mark::Link(format!("{BUTTON}said/7")))],
+        );
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::empty(area);
+        let agent = |word: &str| {
+            ["calc.neg", "calc.add"]
+                .contains(&word)
+                .then(|| format!("{}{word}", crate::links::AGENT))
+        };
+        screen.render(area, &mut buf, agent);
+        let click = |screen: &mut Screen, x, y| {
+            screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+            screen.mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y))
+        };
+        // Its own `'s` and the sentence's dot are no part of it.
+        assert_eq!(
+            click(&mut screen, 2, 0),
+            Some(Action::Open("sonny:agent/calc.neg".into()))
+        );
+        assert_eq!(click(&mut screen, 8, 0), None);
+        assert_eq!(
+            click(&mut screen, 30, 0),
+            Some(Action::Open("sonny:agent/calc.add".into()))
+        );
+        assert_eq!(click(&mut screen, 35, 0), None);
+        assert_eq!(buf[(0, 0)].fg, Color::Blue);
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(buf[(9, 0)].fg, Color::Reset);
+        // The name opens the agent; the rest of the row, the message.
+        assert_eq!(
+            click(&mut screen, 9, 1),
+            Some(Action::Open("sonny:agent/calc.neg".into()))
+        );
+        assert_eq!(
+            click(&mut screen, 3, 1),
+            Some(Action::Open("sonny:said/7".into()))
+        );
+        assert_eq!(screen.last_agent().as_deref(), Some("calc.neg"));
+        assert!(screen.link_cells(&buf).is_empty(), "never an OSC 8 link");
     }
 
     #[test]

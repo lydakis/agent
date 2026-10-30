@@ -1928,6 +1928,9 @@ struct App {
     /// Buttons pressed whose work waits for the loop: a note the person
     /// took away, to tell the agent; a view to open.
     pressed: Vec<String>,
+    /// The agents named in what is drawn, as the daemon answered: a
+    /// click on one's name opens it in the pane.
+    names: std::cell::RefCell<links::Names>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2735,6 +2738,7 @@ impl App {
             plan_full: None,
             jump: None,
             pressed: Vec::new(),
+            names: Default::default(),
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -2945,6 +2949,7 @@ impl App {
             self.read_tasks().await;
             self.read_running_tasks().await;
             self.read_references().await;
+            self.read_names().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
@@ -4044,8 +4049,8 @@ impl App {
 
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
-    /// between agents at NODE; `task/BOT` opens the task BOT in the pane;
-    /// `answer/N/ID` answers the question
+    /// between agents at NODE; `task/BOT`, and `agent/BOT` on BOT's name
+    /// in the conversation, opens BOT in the pane; `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
@@ -4060,7 +4065,7 @@ impl App {
                 self.draw_cluster(at);
             }
         }
-        if let Some(bot) = button.strip_prefix("task/") {
+        if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
             self.open_task(bot);
         }
         if let Some(node) = button
@@ -4593,6 +4598,30 @@ impl App {
             .into_iter()
             .map(|(_, item)| item)
             .collect()
+    }
+
+    /// The words drawn that may name agents, asked about: once one does,
+    /// the links on screen are found again, so its name opens it.
+    async fn read_names(&mut self) {
+        let wanted = self.names.borrow_mut().wanted();
+        let mut found = false;
+        for word in wanted {
+            let page = self
+                .client
+                .request("bots", json!({"name": word, "limit": 1}))
+                .await;
+            // Unanswered, it is not taken for a name: never asked each tick.
+            let agent =
+                page.is_ok_and(|page| page["bots"][0]["name"] == word.as_str()) && word != self.bot;
+            found |= agent;
+            self.names.borrow_mut().learn(word, agent);
+        }
+        if found {
+            self.screen.relink();
+            if let Some(pane) = &mut self.pane {
+                pane.screen.relink();
+            }
+        }
     }
 
     /// The other bots' notes the margin shows, read again every few
@@ -6041,6 +6070,15 @@ impl App {
             picked: None,
             pick: None,
         });
+        // Picked already, the agent named last in what shows: Enter opens
+        // the one the conversation just pointed to.
+        if let Some(named) = self.screen.last_agent()
+            && let Some(watch) = &mut self.watch
+        {
+            watch.pick = card_bots(watch, self.width.max(40), &self.bot)
+                .iter()
+                .position(|bot| *bot == named);
+        }
         self.open_pane(pane::Pane::card("/status", PICK_KEYS));
     }
 
@@ -6851,15 +6889,7 @@ impl App {
             && watch.usage.is_none()
             && watch.commons.is_none()
         {
-            let bots: Vec<String> = (watch_card(watch, self.width.max(40), &self.bot).2)
-                .into_iter()
-                .filter_map(|(_, mark)| match mark {
-                    screen::Mark::Link(link) => link
-                        .strip_prefix(&format!("{}task/", screen::BUTTON))
-                        .map(str::to_owned),
-                    _ => None,
-                })
-                .collect();
+            let bots = card_bots(watch, self.width.max(40), &self.bot);
             if !bots.is_empty() {
                 let last = bots.len() - 1;
                 let pick = watch.pick.map(|pick| pick.min(last));
@@ -9021,7 +9051,9 @@ impl App {
                 // Paths in a file are read from its folder first.
                 let base = open.folder().unwrap_or(&workspace).to_owned();
                 let file = |word: &str| {
-                    links::file_line(&base, word).or_else(|| links::file_line(&workspace, word))
+                    (links::file_line(&base, word))
+                        .or_else(|| links::file_line(&workspace, word))
+                        .or_else(|| self.names.borrow_mut().link(word))
                 };
                 pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
@@ -9056,7 +9088,9 @@ impl App {
                 Constraint::Min(0),
             ])
             .areas(area);
-            let file = |word: &str| links::file_line(&workspace, word);
+            let file = |word: &str| {
+                links::file_line(&workspace, word).or_else(|| self.names.borrow_mut().link(word))
+            };
             let history = ratatui::layout::Rect {
                 width: column,
                 ..history
@@ -9606,6 +9640,19 @@ const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 /// running turns counted on from when its rows were read; whether any task in it
 /// is resolved; and the line each agent but `me` starts on, which a click
 /// opens in the pane.
+/// The agents `/status` lists, in its order: what its keys pick from.
+fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
+    (watch_card(watch, width, me).2)
+        .into_iter()
+        .filter_map(|(_, mark)| match mark {
+            screen::Mark::Link(link) => link
+                .strip_prefix(&format!("{}task/", screen::BUTTON))
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 fn watch_card(
     watch: &Watch,
     width: usize,

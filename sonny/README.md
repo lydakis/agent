@@ -504,7 +504,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   shows `↻ 2 triggers` beside its model. A click on an agent's name opens
   it in the pane, as a click on a task in a roster does, and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
-  or Ctrl+[ from the conversation, goes back to `/status`.
+  or Ctrl+[ from the conversation, goes back to `/status`. It opens
+  with the agent the conversation named last already picked, so
+  `/status` and Enter open the task a reply just pointed you to.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
 
@@ -756,6 +758,20 @@ gives them to the pane again; from the conversation Ctrl+[ hides the task
 and Ctrl+] shows it again.
 
 ![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
+
+An agent's name anywhere in the conversation opens that agent in the
+pane, as a GitHub `@name` links to its account: in a reply ("tally.halves
+has a question for you"), in a row of task updates, in a message from
+another agent, and in the pane's own text. Only a name the daemon knows
+is one, so it is drawn in the agents' blue, and a word that only looks
+like one stays plain. In a row a click opens, such as `↳ From calc.neg
+▸`, the name opens the agent and the rest of the row the message. Leads
+and tasks write an agent's whole name when they point you to it, where
+that helps you act.
+
+![A reply naming tally.halves, clicked: the task opened in the pane](../docs/sonny/agent-name-opens.png)
+
+![/status opened with tally.halves, the agent named last, already picked](../docs/sonny/agent-name-status.png)
 
 Sonny keeps to the terminal's own 16 colors, so a theme sets their
 shades, and each means one thing: magenta is you (your `›`), blue the

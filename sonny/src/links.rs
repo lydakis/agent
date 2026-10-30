@@ -75,7 +75,12 @@ pub fn cells(
                 }
                 None => {
                     let lead = word.len() - word.trim_start_matches(['(', '[', '{', '\'']).len();
+                    // A name's or a path's own `'s` is no part of it.
                     let path = trim(&word[lead..]);
+                    let path = match path.strip_suffix("'s") {
+                        Some(path) => trim(path),
+                        None => path,
+                    };
                     match file(&path) {
                         Some(target) => (lead, target, path.len()),
                         None => continue,
@@ -154,6 +159,72 @@ fn label(
         }
     }
     parts
+}
+
+/// What a click on an agent's name does: opens it in the pane.
+pub const AGENT: &str = "sonny:agent/";
+
+/// Whether `word` may be an agent's name, as the daemon names bots (1 to
+/// 128 of `A-Z a-z 0-9 . _ -`) and as a project names its agents: a
+/// project and a name a dot apart (`calc.neg`), a letter in it, starting
+/// and ending with a letter or digit. So `e.g` may be and is asked, and a
+/// version (`0.7.0`) or a plain word is not.
+pub fn may_name(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    (3..=128).contains(&bytes.len())
+        && word.contains('.')
+        && !word.contains("..")
+        && bytes.iter().any(u8::is_ascii_alphabetic)
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && (bytes.iter()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(b))
+}
+
+/// The agents named in what is drawn, as the daemon answered: a word that
+/// may be a name is asked about once, and opens the agent once it is one,
+/// as GitHub links an `@name` only when that account is there.
+#[derive(Default)]
+pub struct Names {
+    /// Each word asked about, and whether an agent has that name.
+    known: std::collections::HashMap<String, bool>,
+    /// The words to ask about.
+    wanted: Vec<String>,
+}
+
+/// How many words are kept known: past it they are asked about again.
+const NAMES_KEPT: usize = 4096;
+
+impl Names {
+    /// Where `word` opens, if it names an agent; one not yet asked about
+    /// is asked about next.
+    pub fn link(&mut self, word: &str) -> Option<String> {
+        if !may_name(word) {
+            return None;
+        }
+        match self.known.get(word) {
+            Some(true) => Some(format!("{AGENT}{word}")),
+            Some(false) => None,
+            None => {
+                if !self.wanted.iter().any(|wanted| wanted == word) {
+                    self.wanted.push(word.to_owned());
+                }
+                None
+            }
+        }
+    }
+
+    /// The words to ask the daemon about, taken.
+    pub fn wanted(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.wanted)
+    }
+
+    /// What the daemon said of `word`.
+    pub fn learn(&mut self, word: String, agent: bool) {
+        if self.known.len() >= NAMES_KEPT {
+            self.known.clear();
+        }
+        self.known.insert(word, agent);
+    }
 }
 
 /// Where a web address starts in `word`, if one does: not inside a word,
@@ -495,5 +566,43 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_word_may_be_an_agents_name_only_as_a_project_names_them() {
+        for word in ["calc.neg", "shop.web.fix", "a1.b_2-c", "e.g"] {
+            assert!(may_name(word), "{word}");
+        }
+        for word in [
+            "neg",
+            "0.7.0",
+            ".hidden",
+            "calc.",
+            "calc..neg",
+            "a/b.c",
+            "x*.y",
+            "ab",
+        ] {
+            assert!(!may_name(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_asked_about_once_and_opens_once_it_is_an_agents() {
+        let mut names = Names::default();
+        assert_eq!(names.link("calc.neg"), None);
+        assert_eq!(names.link("calc.neg"), None);
+        assert_eq!(names.link("main.rs"), None);
+        assert_eq!(names.link("plain"), None);
+        assert_eq!(names.wanted(), ["calc.neg", "main.rs"]);
+        assert!(names.wanted().is_empty());
+        names.learn("calc.neg".into(), true);
+        names.learn("main.rs".into(), false);
+        assert_eq!(
+            names.link("calc.neg").as_deref(),
+            Some("sonny:agent/calc.neg")
+        );
+        assert_eq!(names.link("main.rs"), None);
+        assert!(names.wanted().is_empty(), "never asked again");
     }
 }
