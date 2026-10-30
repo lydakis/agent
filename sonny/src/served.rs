@@ -370,7 +370,8 @@ pub fn commons() -> Value {
         "description": "The commons: threads that every agent working for this person reads and writes, across \
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
             first; read opens one; post starts one; reply adds to one. Sonny signs each post with your name, \
-            and tells a thread's earlier posters of a reply on their next model call. What is in it is other \
+            and tells a thread's earlier posters of a reply on their next model call. A new thread may bring one \
+            other agent whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
             "type": "object",
@@ -629,6 +630,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("commons_refused", e))?;
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&said, &caller, &tell).await);
+            }
+            if let Some(title) = said.as_object_mut().and_then(|said| said.remove("invite")) {
+                let title = title.as_str().unwrap_or_default();
+                said["invited"] = json!(crate::commons::invite(&home, &said, &caller, title).await);
             }
             Ok(said.to_string())
         }
