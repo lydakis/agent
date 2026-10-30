@@ -22,7 +22,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 pub struct Settings {
     pub socket: PathBuf,
@@ -42,9 +42,10 @@ pub struct Settings {
 /// The lease a tag is served under, renewed well inside it.
 const LEASE_MS: u64 = 5_000;
 const RENEW: Duration = Duration::from_secs(1);
-/// Judge requests in flight at once; a round waits for a slot within its
-/// deadline, so the queue holds what the deadline allows and no more.
-const IN_FLIGHT: usize = 32;
+/// Requests in flight at the daemon at once. Rounds past these queue for
+/// room one request at a time, never for a whole round, so a slow judge
+/// holds nothing; renewals skip the queue.
+const IN_FLIGHT: usize = 64;
 /// Text one `prompts` read returns: past the judge's whole state limit.
 /// The prompts of a round's delegating turns share it too.
 const PROMPT_BYTES: usize = 128 * 1024;
@@ -91,9 +92,6 @@ enum Judged {
 
 struct Judge {
     base: judge::Base,
-    /// Taken before a round reads anything, so rounds past these wait
-    /// holding only their calls.
-    slots: Semaphore,
     /// How long a round may wait for its verdict, from its announcement.
     deadline_ms: u64,
 }
@@ -155,6 +153,7 @@ async fn serve(settings: Settings) -> Result<i32> {
     let (client, mut events) = Client::connect(&settings.socket)
         .await
         .map_err(Error::from)?;
+    client.bound(IN_FLIGHT);
     let named =
         judge::pick(settings.judge.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
             Error::with(
@@ -205,7 +204,6 @@ async fn serve(settings: Settings) -> Result<i32> {
         client,
         judge: Judge {
             base,
-            slots: Semaphore::new(IN_FLIGHT),
             deadline_ms: policy::DEADLINE_MS,
         },
         tag: tag.clone(),
@@ -516,11 +514,6 @@ async fn judge(
 ) -> std::result::Result<(Vec<Verdict>, Usage), Unreviewed> {
     let late = || Unreviewed::Not(policy::timed_out());
     let long = |why: &str| Unreviewed::Not(policy::too_long(why));
-    let Ok(Ok(_slot)) =
-        tokio::time::timeout_at(deadline.into(), shared.judge.slots.acquire()).await
-    else {
-        return Err(late());
-    };
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
             Err(_) => return Err(late()),

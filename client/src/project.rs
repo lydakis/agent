@@ -179,7 +179,7 @@ pub fn tasks_rule(in_project: bool) -> String {
     match in_project {
         true => "Every task works in this folder, with no worktree of its own.",
         false => {
-            "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only this folder's leads work in it."
+            "When this folder is a git repository, every task works in its own worktree, so tasks do not collide: only this folder's leads work in it. Elsewhere tasks share this folder, unless one is started in an empty folder of its own."
         }
     }
     .to_owned()
@@ -483,7 +483,7 @@ mod tests {
         let info = json!({"threads_in": "worktree"});
         assert!(
             rule(&info)
-                .ends_with("every task works in its own worktree, so tasks do not collide: only this folder's leads work in it.")
+                .ends_with("Elsewhere tasks share this folder, unless one is started in an empty folder of its own.")
         );
         let shared = json!({"threads_in": "project"});
         assert!(
@@ -729,7 +729,7 @@ mod tests {
             create.get("effort").is_none(),
             "no effort picked sends none"
         );
-        assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only this folder's leads work in it."));
+        assert!(create["instructions"].as_str().unwrap().ends_with("rules\n\nWhen this folder is a git repository, every task works in its own worktree, so tasks do not collide: only this folder's leads work in it. Elsewhere tasks share this folder, unless one is started in an empty folder of its own."));
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
         // A client's gate and settings go with the lead it makes.
         let dir = root("gated");

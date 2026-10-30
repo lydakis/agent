@@ -459,6 +459,8 @@ class Bench:
         calls = decided()
         stats = sampler.done()
         judge_ms = sorted(l['judge_ms'] for l in lines if l.get('event') == 'judged')
+        alive = process.poll() is None
+        (self.out / 'approver.jsonl').write_text(''.join(json.dumps(l) + '\n' for l in lines))
         process.terminate()
         process.wait(10)
         reasons = {}
@@ -468,7 +470,8 @@ class Bench:
         return {'gated': gated, 'judge_ms_model': self.args.judge_ms, 'decided': len(calls),
                 'seconds': round(took, 1), 'decisions': reasons,
                 'round_ms_p50': judge_ms[len(judge_ms) // 2] if judge_ms else None,
-                'round_ms_max': judge_ms[-1] if judge_ms else None, 'approver': stats}
+                'round_ms_max': judge_ms[-1] if judge_ms else None, 'approver': stats,
+                'approver_alive': alive}
 
     def close(self):
         self.stop_lookout()
