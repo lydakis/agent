@@ -362,7 +362,10 @@ fn commons() -> Value {
         "parameters": {
             "type": "object",
             "properties": {
-                "read": {"type": "string", "minLength": 1, "description": "A thread's name: its posts."},
+                "read": {"type": "string", "minLength": 1,
+                    "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                "from": {"type": "integer", "minimum": 0,
+                    "description": "With read: the post to start at, as an earlier read's next says."},
                 "post": {
                     "type": "object",
                     "properties": {
@@ -576,7 +579,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("commons_refused", "no HOME".to_owned()))?;
-            let mut said = crate::commons::call(&home, &caller, arguments)
+            let caller_id = std::env::var("AGENT_BOT_ID")
+                .ok()
+                .and_then(|id| id.parse().ok());
+            let mut said = crate::commons::call(&home, &caller, caller_id, arguments)
                 .map_err(|e| ("commons_refused", e))?;
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&said, &caller, &tell).await);
