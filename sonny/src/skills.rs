@@ -19,6 +19,7 @@ pub fn install_own() {
     );
     install("plan", include_str!("../skills/plan/SKILL.md"));
     install("commons", include_str!("../skills/commons/SKILL.md"));
+    install("sonny-setup", crate::setup::SKILL);
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
@@ -440,6 +441,12 @@ fn offered(home: &Path) -> PathBuf {
 fn offered_in(home: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(offered(home)).unwrap_or_default();
     text.lines().map(str::to_owned).collect()
+}
+
+/// Whether setup or a bot has offered `id` before.
+pub fn was_offered(id: &str) -> bool {
+    std::env::var_os("HOME")
+        .is_some_and(|home| offered_in(&PathBuf::from(home)).iter().any(|o| o == id))
 }
 
 /// `id` offered, by setup or by a bot, so no upgrade offers it again.
