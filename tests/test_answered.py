@@ -307,9 +307,21 @@ class StepTests(ModelFixture):
         decided = self.events(client, turn, 'step_decided')
         self.assertEqual([(d['arguments'], d.get('denied')) for d in decided],
                          [('{"text":"everyone"}', True), ('{"text":"a friend"}', True), ('{"text":"a friend"}', None)])
-        # Allowed later as it was refused, a step's go-ahead is used.
-        [prompt] = client.request('prompts', bot='Lead', turn=turn)['result']['prompts']
-        self.assertEqual(prompt['refused'], [{'name': 'mcp__chat__send', 'arguments': '{"text":"everyone"}'}])
+        def refused():
+            [prompt] = client.request('prompts', bot='Lead', turn=turn)['result']['prompts']
+            return [call['arguments'] for call in prompt['refused']]
+
+        # Allowed later as it was refused, a step's go-ahead is used once it ran.
+        self.assertEqual(refused(), ['{"text":"everyone"}', '{"text":"a friend"}'])
+        ran = dict(bot='Lead', turn=turn, call_id='script-0', step='3')
+        self.assertIn('result', client.request('step_result', failed=True, **ran))
+        self.assertEqual(refused(), ['{"text":"everyone"}', '{"text":"a friend"}'])
+        request = self.ask(client, turn, step='4', arguments={'text': 'a friend'})
+        self.announced(client, turn)
+        self.verdict(client, turn, 'script-0/4')
+        self.reply(client, request)
+        self.assertIn('result', client.request('step_result', **dict(ran, step='4')))
+        self.assertEqual(refused(), ['{"text":"everyone"}'])
         self.answer(client, turn, output='sent')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 

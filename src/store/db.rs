@@ -7470,14 +7470,16 @@ impl Database {
                    AND json_extract(r.data,'$.arguments')=json_extract(e.data,'$.arguments'))
              UNION ALL
              -- A step of a running call its gates refused, unless allowed
-             -- later in the turn as it was.
+             -- later in the turn as it was, and done.
              SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
                 json_extract(e.data,'$.arguments_truncated'),
                 (SELECT json_extract(s.data,'$.steer') FROM events s
                   WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1),
                 e.id
              FROM events e WHERE e.turn=?1 AND e.kind='step_decided' AND json_extract(e.data,'$.denied')
-               AND NOT EXISTS (SELECT 1 FROM events r
+               AND NOT EXISTS (SELECT 1 FROM events r JOIN events d ON d.turn=r.turn
+                   AND d.kind='step_completed' AND json_extract(d.data,'$.call_id')=json_extract(r.data,'$.call_id')
+                   AND json_extract(d.data,'$.failed') IS NOT 1
                  WHERE r.turn=e.turn AND r.kind='step_decided' AND r.id>e.id
                    AND json_extract(r.data,'$.decision')='allow'
                    AND json_extract(r.data,'$.name')=json_extract(e.data,'$.name')
