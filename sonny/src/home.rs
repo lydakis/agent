@@ -97,9 +97,7 @@ pub fn done(places: &Places) -> bool {
 
 /// What the last sync did, with whether backup is set up.
 pub fn status(places: &Places) -> Value {
-    let last = std::fs::read(&places.state)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let last = last(places);
     json!({
         "set_up": done(places),
         "repo": places.repo,
@@ -187,12 +185,16 @@ fn adopt(places: &Places, url: &str, env: Option<&[(OsString, OsString)]>) -> Re
             .to_string_lossy();
         git(parent, &["clone", "--quiet", url, &name], env)?;
     }
-    let held = places.repo.join("agents");
-    if places.state.exists() || !held.is_dir() {
+    // Memory is private to the person, and so is its copy.
+    private(&places.repo).map_err(|e| e.to_string())?;
+    if ever_synced(places) {
         return Ok(false);
     }
-    mirror(&held, &places.agents, false)?;
+    let held = places.repo.join("agents");
     let config = places.repo.join("config.toml");
+    if held.is_dir() {
+        mirror(&held, &places.agents, false)?;
+    }
     if config.is_file() {
         if let Some(dir) = places.config.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -206,8 +208,22 @@ fn adopt(places: &Places, url: &str, env: Option<&[(OsString, OsString)]>) -> Re
             );
         }
         std::fs::copy(&config, &places.config).map_err(|e| e.to_string())?;
+        private(&places.config).map_err(|e| e.to_string())?;
     }
-    Ok(true)
+    Ok(held.is_dir() || config.is_file())
+}
+
+/// Whether a sync from this machine ever went through: a machine that only
+/// tried, before setup or while offline, still restores first, so its
+/// first real sync does not push its fresh home over the one it backs up.
+fn ever_synced(places: &Places) -> bool {
+    last(places).is_some_and(|last| last["ok_ms"].is_u64())
+}
+
+fn last(places: &Places) -> Option<Value> {
+    std::fs::read(&places.state)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
 }
 
 /// Copy the home into the repository, commit and push. Nothing to commit
@@ -218,7 +234,13 @@ pub fn sync(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Val
         Ok(done) => done.clone(),
         Err(error) => error_json(error),
     };
-    record["at_ms"] = json!(now_ms());
+    let now = now_ms();
+    record["at_ms"] = json!(now);
+    record["ok_ms"] = match &result {
+        Ok(_) => json!(now),
+        // A failed sync keeps when the last one went through.
+        Err(_) => last(places).map_or(Value::Null, |last| last["ok_ms"].clone()),
+    };
     if let Some(dir) = places.state.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -333,6 +355,7 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
     let fail =
         |path: &Path, e: std::io::Error| format!("backup_copy_failed: {}: {e}", path.display());
     std::fs::create_dir_all(to).map_err(|e| fail(to, e))?;
+    private(to).map_err(|e| fail(to, e))?;
     let mut kept = std::collections::HashSet::new();
     for entry in std::fs::read_dir(from).map_err(|e| fail(from, e))? {
         let entry = entry.map_err(|e| fail(from, e))?;
@@ -353,11 +376,17 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
                 remove(&target).map_err(|e| fail(&target, e))?;
             }
             mirror(&source, &target, delete)?;
-        } else if !same(&source, &target) {
-            if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir() || m.is_symlink()) {
+        } else {
+            // A link or folder in its place is replaced even when what it
+            // leads to reads the same.
+            let file = std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file());
+            if !file {
                 remove(&target).map_err(|e| fail(&target, e))?;
             }
-            std::fs::copy(&source, &target).map_err(|e| fail(&target, e))?;
+            if !file || !same(&source, &target) {
+                std::fs::copy(&source, &target).map_err(|e| fail(&target, e))?;
+            }
+            private(&target).map_err(|e| fail(&target, e))?;
         }
         kept.insert(name);
     }
@@ -369,6 +398,17 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
                 remove(&entry.path()).map_err(|e| fail(&entry.path(), e))?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Only the person may read it, as memory keeps its files: the owner's own
+/// bits stay, so a skill's script still runs.
+fn private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))?;
     }
     Ok(())
 }
@@ -401,9 +441,18 @@ fn secret_in(config: &str) -> Option<String> {
     fn secretish(key: &str) -> bool {
         let key = key.to_ascii_lowercase();
         !key.ends_with("_env_var")
-            && ["token", "api_key", "apikey", "secret", "password"]
-                .iter()
-                .any(|word| key.contains(word))
+            && [
+                "token",
+                "api_key",
+                "apikey",
+                "secret",
+                "password",
+                "passwd",
+                "private",
+                "credential",
+            ]
+            .iter()
+            .any(|word| key.contains(word))
     }
     fn walk(table: &toml::Table, path: &str) -> Option<String> {
         for (key, value) in table {
@@ -546,6 +595,15 @@ mod tests {
             std::fs::read_link(to.join("skills/link")).unwrap(),
             Path::new("plan")
         );
+        // A link that became a file with the same bytes is a file in the copy.
+        std::fs::remove_file(from.join("skills/link")).unwrap();
+        write(&from.join("skills/link"), "plan");
+        mirror(&from, &to, true).unwrap();
+        assert!(
+            std::fs::symlink_metadata(to.join("skills/link"))
+                .unwrap()
+                .is_file()
+        );
         // A restore adds and overwrites but removes nothing.
         write(&to.join("extra.md"), "x");
         mirror(&from, &to, false).unwrap();
@@ -574,6 +632,13 @@ mod tests {
             secret_in("[sonny.mcp_servers.y]\ncommand = \"y\"\nenv = { Y_API_KEY = \"k\" }\n")
                 .as_deref(),
             Some("sonny.mcp_servers.y.env.Y_API_KEY")
+        );
+        assert_eq!(
+            secret_in(
+                "[sonny.mcp_servers.z]\ncommand = \"z\"\nenv = { SSH_PRIVATE_KEY = \"k\" }\n"
+            )
+            .as_deref(),
+            Some("sonny.mcp_servers.z.env.SSH_PRIVATE_KEY")
         );
         assert!(secret_in("not = = toml").is_some());
     }
@@ -639,6 +704,7 @@ mod tests {
         );
         adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
         sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
         let done = sync(&at, None).unwrap();
         assert!(
             done["config_skipped"]
@@ -648,6 +714,52 @@ mod tests {
         );
         assert!(!at.repo.join("config.toml").exists());
         assert!(at.repo.join("agents/memory/fact.md").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_machine_whose_syncs_never_went_through_restores_first_and_keeps_memory_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("tried");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let url = root.join("remote.git").to_string_lossy().into_owned();
+        let first = places(&root.join("one"));
+        write(&first.agents.join("memory/fact.md"), "fact");
+        adopt(&first, &url, None).unwrap();
+        sh(&first.repo, &["config", "user.email", "t@example.com"]);
+        sh(&first.repo, &["config", "user.name", "T"]);
+        sync(&first, None).unwrap();
+
+        // A new machine tried a sync before setup, and Sonny wrote its skills.
+        let second = places(&root.join("two"));
+        assert!(sync(&second, None).is_err());
+        write(&second.agents.join("skills/plan/SKILL.md"), "plan");
+        assert!(adopt(&second, &url, None).unwrap());
+        let fact = second.agents.join("memory/fact.md");
+        assert_eq!(std::fs::read_to_string(&fact).unwrap(), "fact");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&fact) & 0o077, 0, "{:o}", mode(&fact));
+        assert_eq!(mode(&second.repo) & 0o077, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_backup_of_config_alone_restores_it() {
+        let root = scratch("config");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let url = root.join("remote.git").to_string_lossy().into_owned();
+        let first = places(&root.join("one"));
+        write(&first.config, "provider = \"chatgpt\"\n");
+        adopt(&first, &url, None).unwrap();
+        sh(&first.repo, &["config", "user.email", "t@example.com"]);
+        sh(&first.repo, &["config", "user.name", "T"]);
+        sync(&first, None).unwrap();
+        let second = places(&root.join("two"));
+        assert!(adopt(&second, &url, None).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&second.config).unwrap(),
+            "provider = \"chatgpt\"\n"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
