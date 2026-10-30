@@ -1131,12 +1131,28 @@ fn cache_to_take(bot: &Value) -> Option<&'static str> {
 /// A link, file or page, opened as the system opens it, by the first of
 /// the openers the `open` crate knows that is installed; with none, the
 /// link goes on the clipboard instead, as a login that can't open a
-/// browser prints its URL.
+/// browser prints its URL. Over SSH with no display to open on and no
+/// `BROWSER`, the opener would start on the remote machine's screen, so
+/// the link is copied straight away, as `gh` and other CLIs print it.
 fn open(target: &str) -> Result<(), String> {
+    if remote_without_display(&|key| std::env::var_os(key)) {
+        term::copy(target);
+        return Err(format!("over SSH, nothing opens here; copied {target}"));
+    }
     open::that_detached(target).map_err(|error| {
         term::copy(target);
         format!("couldn't open it ({error}); copied {target}")
     })
+}
+
+/// In an SSH session with no X or Wayland display (forwarded or local)
+/// and no `BROWSER` of the person's to open with.
+fn remote_without_display(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    let set = |key: &str| var(key).is_some_and(|value| !value.is_empty());
+    (set("SSH_CONNECTION") || set("SSH_TTY"))
+        && !["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
+            .iter()
+            .any(|key| set(key))
 }
 
 /// The viewport's rows, top to bottom: the reply's open line, the status,
@@ -9823,6 +9839,34 @@ fn responses(item: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn over_ssh_with_nothing_to_open_on_a_link_is_copied() {
+        let with = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            remote_without_display(&move |key| {
+                vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into())
+            })
+        };
+        assert!(!with(&[]), "a local terminal opens");
+        assert!(with(&[("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22")]));
+        assert!(with(&[("SSH_TTY", "/dev/pts/1"), ("DISPLAY", "")]));
+        assert!(!with(&[
+            ("SSH_CONNECTION", "c"),
+            ("DISPLAY", "localhost:10.0")
+        ]));
+        assert!(!with(&[
+            ("SSH_CONNECTION", "c"),
+            ("WAYLAND_DISPLAY", "wayland-0")
+        ]));
+        assert!(!with(&[
+            ("SSH_CONNECTION", "c"),
+            ("BROWSER", "open-on-client")
+        ]));
+    }
 
     #[test]
     fn a_page_only_read_gives_back_what_drawing_it_would() {
