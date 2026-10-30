@@ -11,7 +11,7 @@ use ratatui::{
 /// words alone.
 pub fn welcome(folder: &str, model: &str, width: usize) -> Vec<Line<'static>> {
     let version = env!("CARGO_PKG_VERSION");
-    let accent = Style::new().fg(Color::Rgb(255, 190, 60));
+    let accent = Style::new().fg(Color::Cyan);
     let art = pixels(&PORTRAIT, &PORTRAIT_COLORS);
     let words = vec![
         Line::from(vec![
@@ -29,7 +29,8 @@ pub fn welcome(folder: &str, model: &str, width: usize) -> Vec<Line<'static>> {
     ];
     let art_width = art.first().map_or(0, Line::width);
     let words_width = words.iter().map(Line::width).max().unwrap_or(0);
-    if width < 2 + art_width + GAP + words_width {
+    // The portrait is its colors; with NO_COLOR it would be a smudge.
+    if width < 2 + art_width + GAP + words_width || crate::look::no_color() {
         return words;
     }
     // The words beside the picture, centred on it.

@@ -34,7 +34,7 @@ impl Mark {
             Mark::Modified => ("M", Color::Yellow),
             Mark::Added => ("A", Color::Green),
             Mark::Deleted => ("D", Color::Red),
-            Mark::Renamed => ("R", Color::Blue),
+            Mark::Renamed => ("R", Color::Reset),
             Mark::Untracked => ("U", Color::Green),
             Mark::Ignored => return None,
         })

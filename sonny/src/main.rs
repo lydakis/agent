@@ -30,6 +30,7 @@ mod image;
 mod js;
 mod links;
 mod login;
+mod look;
 mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -9002,8 +9003,10 @@ impl App {
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
+        let look = look::Look::now();
         terminal.draw(|frame| {
             paint(frame);
+            look.finish(frame.buffer_mut());
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
         })?;
@@ -9011,6 +9014,7 @@ impl App {
         self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
+            linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
             execute!(
                 terminal.backend_mut(),
                 ratatui::crossterm::cursor::SavePosition
@@ -9162,7 +9166,7 @@ impl App {
             return Line::from(spans);
         }
         match &self.notice {
-            Some(notice) => Line::from(Span::raw(notice.clone()).fg(Color::Yellow)),
+            Some(notice) => Line::from(Span::raw(notice.clone())),
             None if self.input.starts_with('!') => Line::from(vec![
                 Span::raw("! ").bold().fg(Color::Magenta),
                 Span::raw(format!(
@@ -9457,10 +9461,7 @@ const INLINE_ROWS: usize = 40;
 /// margin when it is `beside` the conversation, else the note's own head
 /// over its rows.
 fn note_marker(title: String, beside: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw("  ✎ ").fg(Color::Yellow).dim(),
-        Span::raw(title).dim().underlined(),
-    ];
+    let mut spans = vec![Span::raw("  ✎ ").dim(), Span::raw(title).dim().underlined()];
     if beside {
         spans.push(Span::raw(" · in the margin").dim());
     }

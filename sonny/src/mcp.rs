@@ -539,7 +539,7 @@ pub fn card() -> Vec<ratatui::text::Line<'static>> {
             lines.push(Line::from(format!("   {about}")));
         }
         if let Some(error) = server.error {
-            lines.push(Line::from(format!("   {error}")).red());
+            lines.push(Line::from(vec![Span::raw("   ✗ ").red(), Span::raw(error)]));
         }
         if !server.tools.is_empty() {
             lines.push(Line::from(format!("   {}", server.tools.join(", "))).dim());
