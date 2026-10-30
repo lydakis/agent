@@ -200,6 +200,8 @@ pub struct Client {
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
     paused: Value,
+    /// Requests this client keeps in flight at once, when bounded.
+    in_flight: std::sync::OnceLock<Semaphore>,
 }
 
 impl Client {
@@ -328,6 +330,7 @@ impl Client {
                 identity,
                 providers,
                 paused,
+                in_flight: std::sync::OnceLock::new(),
             }),
             Events(receiver),
         ))
@@ -362,7 +365,25 @@ impl Client {
         &self.paused
     }
 
+    /// Keep at most `requests` in flight from now on, as an HTTP/2
+    /// connection caps its streams, so a client with thousands of requests
+    /// to make queues them here and not in the socket. A `wait` holds no
+    /// work at the daemon and a lease renewal is control, like a PING, so
+    /// neither waits for room: a renewal is written behind at most this
+    /// many requests. The first bound set stays.
+    pub fn bound(&self, requests: usize) {
+        let _ = self.in_flight.set(Semaphore::new(requests));
+    }
+
     pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {
+        let _room = match self.in_flight.get() {
+            Some(room) if !matches!(op, "wait" | "renew_approvals") => Some(
+                room.acquire()
+                    .await
+                    .map_err(|_| Error::new("daemon_disconnected"))?,
+            ),
+            _ => None,
+        };
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         params["id"] = json!(id);
         params["op"] = json!(op);
@@ -486,6 +507,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
         for _ in 0..20 {
@@ -506,6 +528,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bounded_client_queues_requests_but_not_a_renewal_or_a_wait() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let (_, write) = stream.into_split();
+        let client = Arc::new(Client {
+            writer: Mutex::new(write),
+            pending: Arc::default(),
+            next: std::sync::atomic::AtomicU64::new(0),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: None,
+            identity: None,
+            providers: Value::Null,
+            paused: Value::Null,
+            in_flight: std::sync::OnceLock::new(),
+        });
+        client.bound(1);
+        let mut lines = BufReader::new(peer).lines();
+        let ask = |op: &'static str| {
+            let client = client.clone();
+            tokio::spawn(async move { client.request(op, json!({"bot":"Bob"})).await })
+        };
+        let op = |line: String| serde_json::from_str::<Value>(&line).unwrap()["op"].clone();
+        let first = ask("inspect");
+        assert_eq!(op(lines.next_line().await.unwrap().unwrap()), "inspect");
+        let second = ask("turns");
+        let early = tokio::time::timeout(Duration::from_millis(100), lines.next_line()).await;
+        assert!(early.is_err(), "a second request went out past the bound");
+        // Control and long polls go out at once.
+        let renewal = ask("renew_approvals");
+        assert_eq!(
+            op(lines.next_line().await.unwrap().unwrap()),
+            "renew_approvals"
+        );
+        let wait = ask("wait");
+        assert_eq!(op(lines.next_line().await.unwrap().unwrap()), "wait");
+        // Room comes back as a request ends, answered or not.
+        first.abort();
+        assert_eq!(op(lines.next_line().await.unwrap().unwrap()), "turns");
+        for task in [second, renewal, wait] {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn a_refusal_keeps_the_facts_sent_beside_its_detail() {
         let (stream, peer) = UnixStream::pair().unwrap();
         let (_, write) = stream.into_split();
@@ -518,6 +583,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
         let request = tokio::spawn({
@@ -558,6 +624,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            in_flight: std::sync::OnceLock::new(),
         });
         let request = tokio::spawn({
             let client = client.clone();

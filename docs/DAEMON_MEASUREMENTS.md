@@ -5856,6 +5856,34 @@ quarter of a KiB. The change pays off in `bench/lookout_scale.py`: with
 the count bound, and at 5,000 gated calls the approver's session stays
 open.
 
+## A lease renewal is answered as it is read (#436)
+
+On the main socket, a session's reader now checks whether each request it
+parses is a `renew_approvals` with a valid id, and answers that one itself from the hub,
+without queueing it for the service loop. Every other request takes the
+path it took before, one enum match later. The Perf workflow's matched
+screen, base main 04fa687 against the PR head 8aac945, on the GitHub
+runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.86 | 29.706 | -0.5% |
+| admission | burst submit p99, ms | 4.283 | 3.978 | -7.1% |
+| completion | release to terminal p99, ms | 9.354 | 9.171 | -2.0% |
+| footprint | idle RSS, MiB | 19.381 | 19.383 | +0.0% |
+| footprint | per idle bot, KiB | 1.468 | 1.43 | -2.6% |
+| footprint | RSS after a turn each, MiB | 30.598 | 29.338 | -4.1% |
+| footprint | CPU per turn, ms | 0.898 | 0.892 | -0.7% |
+| lifecycle | CPU, s | 0.885 | 0.885 | -0.0% |
+| lifecycle | p95 turn, ms | 577.757 | 574.285 | -0.6% |
+| lifecycle | peak RSS, MiB | 25.559 | 25.494 | -0.3% |
+
+Nothing moved past the gate's 15%; none of these benches serves approvals,
+so they measure the extra match on every request. The change pays off in
+`bench/lookout_scale.py --gated 5000 --judge-ms 5000`: with the approver's
+client bound beside it, its longest renewal takes 94 ms, where without
+this change it takes up to 234 ms, and up to 9.7 s with neither.
+
 ## The pull cord holds starts while paused (#408)
 
 Admission now asks whether the daemon is held, draining or paused, in

@@ -415,10 +415,13 @@ finished cleanup started (`finish` keeps that time in `.said`, out of git,
 and `cleanup start` gives it as `since_ms`, null the first night, when it
 looks back a day; a refused cleanup leaves it, so its night is read again): the memory tool's `said` with
 `since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
-daemon: every message in a turn that ran since then that carries no other
-agent's or named client's mark, steers included, newest first and at most
+daemon: every message written since then that carries no other agent's or
+named client's mark, steers included, newest first and at most
 56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
-that turn ran in. It saves what no
+that turn ran in. History keeps no times, so a message is dated by its
+turn: the one that started a turn is as old as the turn's start, and one
+sent into it later came while it ran, so a long turn's opening message
+from before then is left out. It saves what no
 agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
 the day's notes, taking only the person's own words and their scope, as
 Codex's extraction does.

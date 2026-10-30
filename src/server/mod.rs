@@ -1446,6 +1446,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             sender.clone(),
             sessions_next.clone(),
             None,
+            Some(hub.clone()),
         ));
         stdout.send(ready.clone()).await?;
     } else {

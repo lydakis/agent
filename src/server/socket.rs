@@ -67,6 +67,7 @@ pub fn capabilities(
                 sender.clone(),
                 next.clone(),
                 Some(bot),
+                None,
             ));
             opened.insert(bot, (path.clone(), accepting.abort_handle()));
             Ok(path)

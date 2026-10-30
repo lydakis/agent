@@ -88,8 +88,10 @@ fn start() -> Value {
         "name": START,
         "description": "Start a new task. Unless this project's tasks all work in this folder, Sonny makes the \
             task a git worktree of this repository on the branch agent/NAME, from the last commit, so uncommitted \
-            changes here are not in it; outside git, the task works in this folder. With setup, the folder's \
-            .agents/setup runs in the worktree first. The task starts there with this folder's rules, skills and \
+            changes here are not in it; outside git, the task works in this folder itself, shared with you and \
+            its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
+            changes, such as a workspace made with this folder's tooling, as the brief says how, and reads this \
+            folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
             memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
             its branch, here already as it commits. A start that fails leaves no folder behind.",
@@ -104,6 +106,14 @@ fn start() -> Value {
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A role listed under Profiles that fits the task; without one, it \
                         starts in no role."},
+                "folder": {"type": "string", "minLength": 1,
+                    "description": "A folder inside this one to start the task at instead of here, \
+                        relative or absolute, in a git repository, such as one this folder holds: the task \
+                        then gets a worktree of that repository and works at that folder in it."},
+                "own_folder": {"type": "boolean",
+                    "description": "An empty folder of the task's own instead of a worktree or this folder: \
+                        for work that makes its own copy of what it changes, such as a workspace on another \
+                        branch made with this folder's tooling, or that must not touch this folder."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -132,16 +142,18 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it. A worktree is removed, and its branch kept while it has commits not merged here. It refuses, \
-            before removing anything, while the task is working or its worktree has uncommitted changes, and \
-            says what. With discard, that work is dropped: only \
+            it. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
+            own is deleted with all it holds, only with discard, since Sonny cannot check what the task made \
+            there: ask the task first whether its work is pushed. It refuses, before removing anything, while \
+            the task is working or its worktree has uncommitted changes, and says what. With discard, that work is dropped: only \
             when the person says to drop it.",
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {"type": "string", "minLength": 1, "description": "The task's name, as you started it."},
                 "discard": {"type": "boolean",
-                    "description": "Remove it even with work that is not here, which is lost."}
+                    "description": "Remove it even with work that is not here, which is lost; for a \
+                        task in a folder of its own, once it says its work is pushed."}
             },
             "required": ["task"],
             "additionalProperties": false
@@ -505,6 +517,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 setup: arguments["setup"] == true,
                 model: text("model"),
                 effort: text("effort"),
+                own_folder: arguments["own_folder"] == true,
+                folder: text("folder"),
             };
             crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))
         }
@@ -572,6 +586,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("memory_refused", "no HOME".to_owned()))?;
+            // A task in a folder of its own works for its lead's project.
+            let here = crate::task::source_folder(&here).unwrap_or(here);
             if arguments["changed"] == true {
                 return crate::said::changed(&home, &here)
                     .await
