@@ -58,7 +58,7 @@ per feature; group small things into the row they belong to.
 |---|---|---|---|---|
 | Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326 | Room for the pane, folds, buttons and drag-to-copy | ? |
 | Inline mode (Sonny drawn into the terminal's scrollback) | removed | added 10-26 #146; removed 10-29 #326 | The first view; full screen became the experience, and one view is less to keep | ? |
-| Clean view; `/verbose` shows every tool call | shipped | quiet steps 10-27 #188; clean view 10-27 #221; work summed up as one row, Ctrl+O opens every fold 10-30 #PR2 | Show what moves the work on, sum up ordinary calls | ? |
+| Clean view; `/verbose` shows every tool call | shipped | quiet steps 10-27 #188; clean view 10-27 #221; work summed up as one row, Ctrl+O opens every fold 10-30 #421 | Show what moves the work on, sum up ordinary calls | ? |
 | Folds: an agent call is one row, agent messages and task updates are quiet rows, started tasks a live roster | shipped | task updates as one row 10-26 #177; rows, roster 10-29 #326; one row per call 10-29 #369; updates gather into one row 10-30 #384; a failed call says what it tried 10-30 #416 | Less noise between the person's words and the replies | ? |
 | Staged messages, the open line while a reply streams, turn timers | shipped | streaming 10-26 #172; staged 10-27 #175; timers 10-28 #266; each message a call streams drawn apart 10-30 #396 | Show what is in flight | ? |
 | Footer: context size, branch, ↻ background count, agents at work | shipped | context 10-26 #163; branch 10-27 #182; ↻ 10-28 #267; agents at work 10-29 #367 | One line of state under the composer | ? |
@@ -84,7 +84,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384; ↑↓ Enter pick one 10-30 #PR2 | Look at something without losing the conversation | ? |
+| The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384; ↑↓ Enter pick one 10-30 #421 | Look at something without losing the conversation | ? |
 | Pictures, HTML and diagrams in the pane; a folder as a tree | shipped | drawing 10-29 #303; tree 10-29 #319 | Read what agents made, in place | ? |
 | `/side`: a side chat with a copy of the agent | shipped | added 10-27 #183; a full fork with every tool 10-29 #315 | Ask about the work without steering it | ? |
 | Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384; a note opens the agent that asks, ↗ 10-30 #395 | A place for state that outlives one reply | ? |
