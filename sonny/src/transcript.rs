@@ -97,7 +97,7 @@ impl Markdown {
         }
         let mut out = self.finish(width);
         if let Some(styled) = self.line(text) {
-            let lead = if first && out.is_empty() {
+            let lead = if first && out.is_empty() && !heading(text) {
                 "• "
             } else {
                 "  "
@@ -1015,6 +1015,12 @@ pub fn wrap_lines(
         }
     };
     let rest = [vec![goes_on(rest.width(), true)], rest.spans].concat();
+    // A band behind the line, as the person's messages have, fills each
+    // of its rows.
+    let band = match line.style.bg {
+        Some(bg) => Style::new().bg(bg),
+        None => Style::new(),
+    };
     // Each row, and whether it goes on with a word cut in the row above.
     let mut rows: Vec<(Vec<Span<'static>>, bool)> =
         vec![(first.spans, line.alignment == Some(CUT))];
@@ -1065,6 +1071,7 @@ pub fn wrap_lines(
     rows.into_iter()
         .map(|(spans, cut)| Line {
             alignment: cut.then_some(CUT),
+            style: band,
             ..Line::from(spans)
         })
         .collect()
@@ -1153,17 +1160,22 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
     } else {
         lines.len()
     };
+    let band = crate::look::band();
     for (i, line) in lines[..shown].iter().enumerate() {
         let lead = if i == 0 { "› " } else { "  " };
         out.extend(wrap(
-            Line::from(line.to_string()),
+            Line::from(line.to_string()).bg(band),
             width,
             Span::raw(lead).bold().fg(Color::Magenta),
             Span::raw("  "),
         ));
     }
     if lines.len() > shown {
-        out.push(Line::from(format!("  … +{} lines", lines.len() - shown)).dim());
+        out.push(
+            Line::from(format!("  … +{} lines", lines.len() - shown))
+                .dim()
+                .bg(band),
+        );
     }
     out
 }
@@ -1524,10 +1536,21 @@ pub fn reacted(emoji: &str) -> Line<'static> {
     ])
 }
 
+/// Whether a line of Markdown is a heading: a reply that opens with one
+/// takes no `•`, which would be two marks for one thing.
+pub fn heading(line: &str) -> bool {
+    let marks = line.trim_start();
+    marks.starts_with('#') && marks.trim_start_matches('#').starts_with(' ')
+}
+
 /// A whole reply, as replayed history shows it, its pictures' paths
 /// read from `folder`.
 pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'static>> {
-    let leads = (Line::from("• "), Line::from("  "));
+    let opens = text.lines().find(|line| !line.trim().is_empty());
+    let leads = match opens.is_some_and(heading) {
+        true => (Line::from("  "), Line::from("  ")),
+        false => (Line::from("• "), Line::from("  ")),
+    };
     markdown(&mut Markdown::in_folder(folder), text, width, leads)
 }
 
@@ -2540,6 +2563,24 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) 
         Style::new().fg(Color::Red)
     };
     Line::from(Span::styled(format!("{text}{}", "─".repeat(fill)), style))
+}
+
+/// How full a conversation of `size` tokens is, as the footer says it:
+/// with the model's `window` known, what is left of it (`62%`, ` context
+/// left`) and its colour, yellow from half used and red from four fifths;
+/// else its size (`48.5k`, ` context`), uncoloured.
+pub fn fullness(size: u64, window: Option<u64>) -> (String, &'static str, Option<Color>) {
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return (tokens(size), " context", None);
+    };
+    let used = size as f64 / window as f64;
+    let left = ((1.0 - used).max(0.0) * 100.0).round() as u64;
+    let color = match used {
+        used if used < 0.5 => Color::Green,
+        used if used < 0.8 => Color::Yellow,
+        _ => Color::Red,
+    };
+    (format!("{left}%"), " context left", Some(color))
 }
 
 pub fn tokens(n: u64) -> String {

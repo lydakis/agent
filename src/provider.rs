@@ -269,6 +269,10 @@ pub struct Usage {
     /// attempt's; `models` names each. Empty when the provider named none.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub served_model: String,
+    /// The model's context window in tokens, so a client can say how full
+    /// the conversation is. Set by the turn that knows it; zero when unknown.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub context_window: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelTokens {
