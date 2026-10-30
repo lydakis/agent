@@ -39,32 +39,41 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
             // History has no times, so a message is dated by its turn: a
             // turn's first entry is what started it, written when the turn
             // started, and what the person sent into it later came while it
-            // ran. Newest first, a turn's oldest message is held until an
-            // older entry shows it came later.
-            let mut opening: HashMap<i64, (i64, Value)> = HashMap::new();
+            // ran. Newest first, and a turn's entries together, its oldest
+            // message is held until an older entry shows it came later or
+            // the turn ends, when it counts only if the turn started since.
+            let opened = |turn: i64| {
+                (turns.get(&turn).and_then(|t| t.started_ms)).is_none_or(|ms| ms >= since_ms)
+            };
+            let mut held: Option<(i64, i64, Value)> = None;
             walk(client, name, first, |turn, entry| {
+                if held.as_ref().is_some_and(|(at, ..)| *at != turn)
+                    && let Some((at, node, message)) = held.take()
+                    && opened(at)
+                {
+                    said.add(node, message);
+                }
                 let later = match crate::lookout::said_by_person(entry) {
                     Some(node) => {
                         let text = cut(crate::text(&entry["item"]));
                         let project = turns.get(&turn).and_then(|t| t.project.clone());
                         let message =
                             json!({"bot": name, "turn": turn, "text": text, "project": project});
-                        opening.insert(turn, (node, message))
+                        held.replace((turn, node, message))
                     }
-                    None => opening.remove(&turn),
+                    None => held.take(),
                 };
-                if let Some((node, message)) = later {
+                if let Some((_, node, message)) = later {
                     said.add(node, message);
                 }
                 false
             })
             .await
             .map_err(failed)?;
-            for (turn, (node, message)) in opening {
-                let started = turns.get(&turn).and_then(|t| t.started_ms);
-                if started.is_none_or(|ms| ms >= since_ms) {
-                    said.add(node, message);
-                }
+            if let Some((at, node, message)) = held
+                && opened(at)
+            {
+                said.add(node, message);
             }
         }
         after = page["next_after"].clone();
