@@ -1494,7 +1494,7 @@ const COMMANDS: [(&str, &str); 20] = [
     ("/lead", "the folder's leads: open another, or make one"),
     (
         "/goal",
-        "keep the agent working until a command exits 0, or clear it",
+        "ask the agent to work until something is done; show or clear goals",
     ),
     (
         "/margin",
@@ -7746,12 +7746,14 @@ impl App {
             self.lead_command(rest.trim()).await;
             return;
         }
+        // `/goal WHAT` goes to the agent as typed, which sets its goal.
         if let Some(rest) = prompt
             .strip_prefix("/goal")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+            .filter(|rest| matches!(*rest, "" | "clear"))
         {
             self.input.clear();
-            self.notice = Some(self.goal_command(rest.trim()).await);
+            self.notice = Some(self.goal_command(rest == "clear").await);
             return;
         }
         if let Some(question) = prompt
@@ -8203,63 +8205,46 @@ impl App {
         }
     }
 
-    /// `/lead`: the folder's leads; `/lead NAME` opens this window on one,
-    /// and `/lead new [NAME]` makes one and opens it.
-    /// `/goal` shows this agent's goal, `/goal clear` clears it, and
-    /// `/goal CHECK` sets one: the agent works until `CHECK`, run in its
-    /// folder, exits 0. With no turn running, the lookout checks it now.
-    async fn goal_command(&mut self, rest: &str) -> String {
-        let store = &self.options.store;
-        match rest {
-            "" => match lookout::goals::shown(store, &self.bot) {
-                Some(goal) => format!(
-                    "goal: done when {}; /goal clear clears it",
-                    goal["done_when"].as_str().unwrap_or_default()
-                ),
-                None => "no goal; /goal CHECK keeps the agent working until CHECK exits 0".into(),
-            },
-            "clear" => match lookout::goals::clear(store, &self.bot) {
+    /// `/goal` shows the goals of this agent and its tasks, and `/goal
+    /// clear` clears its own, as its goal tool would.
+    async fn goal_command(&mut self, clear: bool) -> String {
+        let arguments = match clear {
+            true => json!({"clear": self.bot}),
+            false => json!({}),
+        };
+        let said =
+            lookout::goals::call(&self.options.store, &self.client, &self.bot, &arguments).await;
+        match said {
+            Err(error) => error,
+            Ok(said) if clear => match said["cleared"] == true {
                 true => "goal cleared".into(),
                 false => "no goal to clear".into(),
             },
-            check => {
-                let record = match self
-                    .client
-                    .request("inspect", json!({"bot": self.bot}))
-                    .await
-                {
-                    Ok(record) => record,
-                    Err(error) => return error.to_string(),
-                };
-                // Its last turn, 0 for an agent with none, when none runs:
-                // the check runs as if it had just completed.
-                let last = match record["running_turn"].is_null() {
-                    true => Some(
-                        (self.client)
-                            .request(
-                                "turns",
-                                json!({"bot": self.bot, "limit": 1, "newest": true}),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|turns| turns["turns"][0]["turn"].as_i64())
-                            .unwrap_or(0),
-                    ),
-                    false => None,
-                };
-                match lookout::goals::set_by_person(store, &record, check, last) {
-                    Ok(_) if last.is_some() => {
-                        format!("goal set: checking `{check}` now, and working until it exits 0")
-                    }
-                    Ok(_) => format!(
-                        "goal set: `{check}` is checked when the agent's turn ends, and it works until it exits 0"
-                    ),
-                    Err(error) => error,
+            Ok(said) => {
+                let goals = said["goals"].as_array().cloned().unwrap_or_default();
+                if goals.is_empty() {
+                    return "no goal; /goal WHAT asks the agent to work until WHAT is done".into();
                 }
+                let shown: Vec<String> = goals
+                    .iter()
+                    .map(|goal| {
+                        format!(
+                            "{}: done when {}",
+                            goal["bot"].as_str().unwrap_or_default(),
+                            goal["done_when"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "goals: {}; /goal clear clears this agent's",
+                    shown.join("; ")
+                )
             }
         }
     }
 
+    /// `/lead`: the folder's leads; `/lead NAME` opens this window on one,
+    /// and `/lead new [NAME]` makes one and opens it.
     async fn lead_command(&mut self, rest: &str) {
         let Some(project) = self.project.clone().filter(|_| self.options.side.is_none()) else {
             self.notice = Some("/lead is for a folder's lead, not this agent".into());
@@ -9766,6 +9751,58 @@ mod tests {
             2,
             "the person's and the copy's"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_words_go_to_the_agent_as_typed_and_goal_alone_shows_or_clears() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |asked| {
+            seen.lock().unwrap().push(asked.clone());
+            match asked["op"].as_str() {
+                Some("inspect") => json!({"bot_id": 1, "workspace": "/"}),
+                Some("submit") => json!({"turn": 1}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        let store = std::env::temp_dir().join(format!("goal-window-{}", std::process::id()));
+        app.options.store = store.clone();
+        app.input.set("/goal");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("no goal; /goal WHAT asks the agent to work until WHAT is done")
+        );
+        // The words reach the agent as the person typed them.
+        app.input.set("/goal the tests pass");
+        app.submit().await;
+        let ops = asked.lock().unwrap().clone();
+        let submits: Vec<_> = ops.iter().filter(|op| op["op"] == "submit").collect();
+        assert_eq!(submits.len(), 1);
+        assert!(submits[0].to_string().contains("/goal the tests pass"));
+        // The agent sets one with its tool; /goal shows it and clears it.
+        let set = json!({"set": {"done_when": "the tests pass", "check": "true"}});
+        lookout::goals::call(&store, &app.client, "b", &set)
+            .await
+            .unwrap();
+        app.input.set("/goal");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("goals: b: done when the tests pass; /goal clear clears this agent's")
+        );
+        app.input.set("/goal clear");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("goal cleared"));
+        assert!(lookout::goals::read(&store, "b").is_none());
+        app.input.set("/goal clear");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no goal to clear"));
+        let ops = asked.lock().unwrap().clone();
+        assert_eq!(ops.iter().filter(|op| op["op"] == "submit").count(), 1);
+        std::fs::remove_dir_all(lookout::subs::dir(&store)).unwrap();
     }
 
     #[tokio::test]

@@ -52,10 +52,6 @@ pub struct Goal {
     pub timeout_s: u64,
     /// Why the agent gave up, told once its turn ends.
     pub blocked: Option<String>,
-    /// Set by the person on an agent with no turn running: the lookout
-    /// checks it at once, as if this turn, the agent's last (0 when it has
-    /// none), had just completed, rather than waiting for the next one.
-    pub check_after: Option<i64>,
 }
 
 impl Goal {
@@ -63,7 +59,7 @@ impl Goal {
         json!({"bot": self.bot, "bot_id": self.bot_id, "done_when": self.done_when, "check": self.check,
             "workspace": self.workspace, "set_by": self.set_by, "set_ms": self.set_ms,
             "budget_tokens": self.budget_tokens, "tokens_at_set": self.tokens_at_set,
-            "timeout_s": self.timeout_s, "blocked": self.blocked, "check_after": self.check_after})
+            "timeout_s": self.timeout_s, "blocked": self.blocked})
     }
 
     fn from_json(value: &Value) -> Option<Goal> {
@@ -80,7 +76,6 @@ impl Goal {
             tokens_at_set: value["tokens_at_set"].as_u64().unwrap_or(0),
             timeout_s: value["timeout_s"].as_u64().unwrap_or(TIMEOUT_S),
             blocked: text("blocked"),
-            check_after: value["check_after"].as_i64(),
         })
     }
 
@@ -172,58 +167,6 @@ fn end(store: &Path, goal: &Goal) {
     }
 }
 
-/// The person's goal for `bot`, from Sonny's `/goal CHECK`: done once
-/// `check` exits 0 in its folder. `record` is the agent's as `inspect`
-/// gives it; `last` its last turn when none is running, so the lookout
-/// checks at once.
-pub fn set_by_person(
-    store: &Path,
-    record: &Value,
-    check: &str,
-    last: Option<i64>,
-) -> Result<Value, String> {
-    let bot = record["name"].as_str().ok_or("the agent has no name")?;
-    let goal = Goal {
-        bot: bot.to_owned(),
-        bot_id: record["bot_id"].as_i64().unwrap_or_default(),
-        done_when: format!("`{check}` exits 0"),
-        check: check.to_owned(),
-        workspace: PathBuf::from(record["workspace"].as_str().unwrap_or("/")),
-        set_by: "the person".to_owned(),
-        set_ms: now_ms(),
-        budget_tokens: None,
-        tokens_at_set: record["tokens_used"].as_u64().unwrap_or(0),
-        timeout_s: TIMEOUT_S,
-        blocked: None,
-        check_after: last,
-    };
-    write(store, &goal)?;
-    Ok(goal.shown())
-}
-
-/// Clear `bot`'s goal: whether it had one.
-pub fn clear(store: &Path, bot: &str) -> bool {
-    let had = read(store, bot);
-    if let Some(goal) = &had {
-        end(store, goal);
-    }
-    had.is_some()
-}
-
-/// What `bot`'s goal is, as its agent is shown it.
-pub fn shown(store: &Path, bot: &str) -> Option<Value> {
-    read(store, bot).map(|goal| goal.shown())
-}
-
-/// A goal checked without waiting for a turn no longer asks to be, unless
-/// it was set again since.
-fn checked_now(store: &Path, goal: &Goal) {
-    if let Some(mut now) = read(store, &goal.bot).filter(|now| now.set_ms == goal.set_ms) {
-        now.check_after = None;
-        let _ = write(store, &now);
-    }
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -282,7 +225,6 @@ pub async fn call(
             tokens_at_set: record["tokens_used"].as_u64().unwrap_or(0),
             timeout_s,
             blocked: None,
-            check_after: None,
         };
         // The same goal again changes nothing, its budget still counted
         // from when it was first set.
@@ -353,7 +295,8 @@ pub fn tool(name: &str, tag: &str) -> Value {
             again, and its lead hears nothing of those turns. The goal ends once the check passes, the \
             budget is spent, two turns it started call no tool, or the agent gives up with blocked and why, \
             and its lead hears that turn with how it ended. Setting the same goal again changes nothing; \
-            with nothing given, the result lists your goals and your tasks'.",
+            with nothing given, the result lists your goals and your tasks'. A person's message that \
+            starts with /goal asks you to set one on yourself for what it says.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -392,8 +335,6 @@ pub fn tool(name: &str, tag: &str) -> Value {
 pub struct Settled {
     pub bot: String,
     pub turn: i64,
-    /// The goal checked, by when it was set.
-    pub set_ms: u64,
     pub outcome: Option<String>,
 }
 
@@ -442,21 +383,14 @@ impl Goals {
         }
     }
 
-    /// The check of `bot`'s `turn`, for the goal set at `set_ms`, said how
-    /// it stands; one of a goal since replaced touches nothing of its own.
-    pub fn settled(&mut self, bot: &str, turn: i64, set_ms: u64) {
+    /// The check of `bot`'s `turn` said how its goal stands.
+    pub fn settled(&mut self, bot: &str, turn: i64) {
         if self
             .checking
             .get(bot)
-            .is_some_and(|check| (check.turn, check.set_ms) == (turn, set_ms))
+            .is_some_and(|check| check.turn == turn)
         {
             self.checking.remove(bot);
-        }
-        // A goal checked at once was: what follows is the agent's turns.
-        if let Some(goal) = read(&self.store, bot)
-            .filter(|goal| goal.set_ms == set_ms && goal.check_after == Some(turn))
-        {
-            checked_now(&self.store, &goal);
         }
     }
 
@@ -564,7 +498,6 @@ impl Goals {
                         let _ = done.try_send(Settled {
                             bot: bot.to_owned(),
                             turn: check.turn,
-                            set_ms: check.set_ms,
                             outcome: Some(String::new()),
                         });
                     }
@@ -585,89 +518,31 @@ impl Goals {
                     false => 0,
                 };
                 self.idle.insert(bot.to_owned(), (goal.set_ms, turn, idle));
-                // This turn's end checks it: no other check is due.
-                if goal.check_after.is_some() {
-                    checked_now(&self.store, &goal);
-                }
-                self.pursue(goal, turn, idle, event["cursor"].as_i64(), client, done);
-                Some((bot.to_owned(), turn))
+                let (client, done, store, socket) = (
+                    client.clone(),
+                    done.clone(),
+                    self.store.clone(),
+                    self.socket.clone(),
+                );
+                let held = (bot.to_owned(), turn);
+                let set_ms = goal.set_ms;
+                let bot = bot.to_owned();
+                let checking = bot.clone();
+                let pursuit = tokio::spawn(async move {
+                    let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
+                    let _ = done.send(Settled { bot, turn, outcome }).await;
+                });
+                let check = Check {
+                    pursuit: pursuit.abort_handle(),
+                    at: event["cursor"].as_i64(),
+                    turn,
+                    set_ms,
+                };
+                self.checking.insert(checking, check);
+                Some(held)
             }
             _ => None,
         }
-    }
-
-    /// The goals the person set on an agent with no turn running: each is
-    /// checked now, as after the agent's last turn, whose news was told
-    /// already, so nothing is held for it.
-    pub fn check_now(
-        &mut self,
-        client: &std::sync::Arc<Client>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
-    ) {
-        for (bot, goal) in all(&self.store) {
-            let Some(turn) = goal.check_after else {
-                continue;
-            };
-            // The mark stays until the check says, so a lookout that
-            // reconnects or restarts meanwhile runs it again.
-            match self.checking.get(&bot) {
-                Some(check) if check.set_ms == goal.set_ms => continue,
-                // A check of the goal it replaces: its turn is plain news.
-                Some(_) => {
-                    if let Some(check) = self.checking.remove(&bot) {
-                        check.pursuit.abort();
-                        let _ = done.try_send(Settled {
-                            bot: bot.clone(),
-                            turn: check.turn,
-                            set_ms: check.set_ms,
-                            outcome: Some(String::new()),
-                        });
-                    }
-                }
-                None => {}
-            }
-            self.goals.insert(bot.clone(), goal.clone());
-            self.idle.insert(bot, (goal.set_ms, turn, 0));
-            self.pursue(goal, turn, 0, None, client, done);
-        }
-    }
-
-    fn pursue(
-        &mut self,
-        goal: Goal,
-        turn: i64,
-        idle: u32,
-        at: Option<i64>,
-        client: &std::sync::Arc<Client>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
-    ) {
-        let (client, done, store, socket) = (
-            client.clone(),
-            done.clone(),
-            self.store.clone(),
-            self.socket.clone(),
-        );
-        let set_ms = goal.set_ms;
-        let bot = goal.bot.clone();
-        let checking = bot.clone();
-        let pursuit = tokio::spawn(async move {
-            let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
-            let _ = done
-                .send(Settled {
-                    bot,
-                    turn,
-                    set_ms,
-                    outcome,
-                })
-                .await;
-        });
-        let check = Check {
-            pursuit: pursuit.abort_handle(),
-            at,
-            turn,
-            set_ms,
-        };
-        self.checking.insert(checking, check);
     }
 }
 
@@ -896,7 +771,6 @@ mod tests {
             tokens_at_set: 3,
             timeout_s: 5,
             blocked: None,
-            check_after: Some(4),
         }
     }
 

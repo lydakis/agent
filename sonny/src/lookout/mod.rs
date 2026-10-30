@@ -766,8 +766,8 @@ impl Service {
                         continue;
                     }
                 }
-                Some(goals::Settled { bot, turn, set_ms, outcome }) = settled.recv() => {
-                    self.goals.settled(&bot, turn, set_ms);
+                Some(goals::Settled { bot, turn, outcome }) = settled.recv() => {
+                    self.goals.settled(&bot, turn);
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
                     }
@@ -791,11 +791,6 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
-                    // A goal the person just set, on an agent with no turn
-                    // running, is checked at once.
-                    if live {
-                        self.goals.check_now(&client, &checked);
-                    }
                     // What `subscriptions` calls wrote since: at once for
                     // one this lookout answered, else now and then.
                     if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
