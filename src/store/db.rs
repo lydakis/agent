@@ -1387,6 +1387,9 @@ pub struct Database {
     /// Waiting steps the current group stepped, published after its
     /// events.
     stepped: Vec<i64>,
+    /// The `steps` the current group removed, put back if it does not
+    /// commit, as the rows they name are.
+    steps_gone: Vec<(i64, i64)>,
 }
 
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
@@ -1644,6 +1647,7 @@ impl Database {
             served: Vec::new(),
             steps: HashMap::new(),
             stepped: Vec::new(),
+            steps_gone: Vec::new(),
         })
     }
 
@@ -1867,6 +1871,7 @@ impl Database {
             served: Vec::new(),
             steps: HashMap::new(),
             stepped: Vec::new(),
+            steps_gone: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -1946,7 +1951,8 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let (served, stepped) = (self.served.len(), self.stepped.len());
+        let (served, stepped, gone) =
+            (self.served.len(), self.stepped.len(), self.steps_gone.len());
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -1956,6 +1962,7 @@ impl Database {
                 .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
             self.served.truncate(served);
             self.stepped.truncate(stepped);
+            self.restore_steps(gone);
             self.recount_pending()?;
         }
         done
@@ -1972,7 +1979,24 @@ impl Database {
         }
         self.conn.prepare_cached("COMMIT")?.execute([])?;
         self.live_before.clear();
+        self.steps_gone.clear();
         Ok(())
+    }
+    /// Put back the steps removed since the group had `kept` removals.
+    fn restore_steps(&mut self, kept: usize) {
+        for (approval, turn) in self.steps_gone.drain(kept..) {
+            self.steps.insert(approval, turn);
+        }
+    }
+    /// A waiting step is decided or gone: no longer registered, and told of
+    /// once the group commits, if it was registered.
+    fn unstep(&mut self, approval: i64, tell: bool) {
+        if let Some(turn) = self.steps.remove(&approval) {
+            self.steps_gone.push((approval, turn));
+            if tell {
+                self.stepped.push(approval);
+            }
+        }
     }
     /// Forget a group that did not commit: roll back whatever is still
     /// open, drop the outcomes its jobs announced, and recount the waiting
@@ -1981,6 +2005,7 @@ impl Database {
         self.outcomes.clear();
         self.served.clear();
         self.stepped.clear();
+        self.restore_steps(0);
         self.pending_stale = true;
         for (turn, before) in self.live_before.drain() {
             match before {
@@ -6747,7 +6772,7 @@ impl Database {
         decided: Value,
     ) -> Stepped {
         self.approvals -= 1;
-        self.steps.remove(&request.id);
+        self.unstep(request.id, false);
         let status = bot.status.as_str();
         Stepped {
             step: Step::Decided(decided),
@@ -6780,9 +6805,7 @@ impl Database {
         tx.commit()?;
         self.approvals -= ids.len() as i64;
         for (approval, _) in ids {
-            if self.steps.remove(&approval).is_some() {
-                self.stepped.push(approval);
-            }
+            self.unstep(approval, true);
         }
         Ok(())
     }
@@ -7677,8 +7700,10 @@ impl Database {
             .filter(|(_, of)| **of == turn)
             .map(|(id, _)| *id)
             .collect();
+        // As `unstep` does, with the turn's savepoint open.
         for id in ended {
             self.steps.remove(&id);
+            self.steps_gone.push((id, turn));
             self.stepped.push(id);
         }
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {

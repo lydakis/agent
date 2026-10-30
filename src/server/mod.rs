@@ -799,6 +799,12 @@ struct Stepping {
     bot: String,
     turn: i64,
     id: String,
+    /// Its client's session closed: it is dropped, and no one answered.
+    gone: bool,
+    /// A check of it is with the store, and whether to check it again
+    /// once that one is back.
+    checking: bool,
+    again: bool,
 }
 /// Tell the turn waiting on a step's call that the call's time runs again,
 /// and give the step's reply once it is decided.
@@ -956,6 +962,8 @@ struct Service {
     /// run loop once the step is decided: a step goes with the client
     /// that put it.
     stepping: HashMap<i64, Stepping>,
+    /// Checks of waiting steps with the store.
+    step_checks: JoinSet<Vec<(i64, Result<Stepped>)>>,
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
@@ -1460,6 +1468,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut service = Service {
         store,
         stepping: HashMap::new(),
+        step_checks: JoinSet::new(),
         companions,
         identity,
         transport,
@@ -1569,9 +1578,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // A wait's deadline, or a step answered, ended or lapsing:
                 // the one schedule that waiting requests keep.
                 () = service.handles.due() => {
-                    for approval in service.handles.take_due(handles::now_ms()) {
-                        service.check_step(approval, false).await;
-                    }
+                    let due = service.handles.take_due(handles::now_ms());
+                    service.check_steps(due, false);
+                }
+                Some(checked) = service.step_checks.join_next(), if !service.step_checks.is_empty() => {
+                    service.steps_checked(checked.map_err(|_| Error::new("step_check_failed"))?);
                 }
                 // Queued admissions are answered as their commits land, in order.
                 _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
@@ -1603,7 +1614,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
-                            service.abandon_steps(id).await;
+                            service.abandon_steps(id);
                             if id == 0 && stdio_owner { break; }
                         }
                         Inbound::Request(id, request) => {
@@ -2297,59 +2308,111 @@ impl Service {
         self.plan_expiry(overdue).await
     }
 
-    /// How long until the earliest parked turn is due.
-    /// See where a waiting step stands, and answer its `approve_step` once
-    /// it is decided. `gone` when its client's session closed: the step is
-    /// dropped, and no one is left to answer.
-    async fn check_step(&mut self, approval: i64, gone: bool) {
-        let Some(stepping) = self.stepping.get(&approval) else {
-            return;
-        };
-        let (bot, turn, id) = (stepping.bot.clone(), stepping.turn, stepping.id.clone());
-        let stepped = self
-            .store
-            .op("step_check", move |db| match gone {
-                true => db.step_abandon(&bot, turn, &id, now_ms()),
-                false => db.step_check(&bot, turn, &id, now_ms()),
-            })
-            .await;
-        let result = match stepped {
-            Ok(stepped) => {
-                if let Step::Pending {
-                    expires_ms,
-                    approval: still,
-                } = stepped.step
-                {
-                    self.handles.step_lapses(still, expires_ms);
-                    return;
-                }
-                let stepping = &self.stepping[&approval];
-                Ok(settle_step(&self.handles, &stepping.bot, turn, stepped)
-                    .expect("a decided step"))
+    /// Check where waiting steps stand, in one storage job, so they
+    /// commit together and the loop goes on meanwhile: `gone` for the steps
+    /// whose client's session closed, which are dropped. A step already
+    /// being checked is checked again once that check is back.
+    fn check_steps(&mut self, approvals: Vec<i64>, gone: bool) {
+        let mut asked = Vec::new();
+        for approval in approvals {
+            let Some(stepping) = self.stepping.get_mut(&approval) else {
+                continue;
+            };
+            stepping.gone |= gone;
+            if stepping.checking {
+                stepping.again = true;
+                continue;
             }
-            Err(error) => Err(error),
-        };
-        self.handles.step_lapses(approval, None);
-        let stepping = self.stepping.remove(&approval).expect("a waiting step");
-        if !gone
-            && stepping
-                .output
-                .try_respond(stepping.request, result)
-                .is_err()
-        {
-            stepping.output.close();
+            stepping.checking = true;
+            asked.push((
+                approval,
+                stepping.bot.clone(),
+                stepping.turn,
+                stepping.id.clone(),
+                stepping.gone,
+            ));
         }
+        if asked.is_empty() {
+            return;
+        }
+        let approvals: Vec<i64> = asked.iter().map(|asked| asked.0).collect();
+        let store = self.store.clone();
+        let check = move |db: &mut agent_runtime::store::Database| {
+            let now = now_ms();
+            Ok(asked
+                .into_iter()
+                .map(|(approval, bot, turn, id, gone)| {
+                    let stepped = match gone {
+                        true => db.step_abandon(&bot, turn, &id, now),
+                        false => db.step_check(&bot, turn, &id, now),
+                    };
+                    (approval, stepped)
+                })
+                .collect::<Vec<_>>())
+        };
+        self.step_checks.spawn(async move {
+            store.op("step_check", check).await.unwrap_or_else(|error| {
+                approvals
+                    .into_iter()
+                    .map(|approval| (approval, Err(error.clone())))
+                    .collect()
+            })
+        });
+    }
+    /// What a check of waiting steps found: a step still waiting keeps its
+    /// lapse on the schedule, and a decided one has its `approve_step`
+    /// answered, unless its client left.
+    fn steps_checked(&mut self, checked: Vec<(i64, Result<Stepped>)>) {
+        let mut again = Vec::new();
+        for (approval, stepped) in checked {
+            let Some(stepping) = self.stepping.get_mut(&approval) else {
+                continue;
+            };
+            if !stepping.checking {
+                continue;
+            }
+            stepping.checking = false;
+            let result = match stepped {
+                Ok(Stepped {
+                    step: Step::Pending { expires_ms, .. },
+                    ..
+                }) => {
+                    self.handles.step_lapses(approval, expires_ms);
+                    if std::mem::take(&mut stepping.again) {
+                        again.push(approval);
+                    }
+                    continue;
+                }
+                Ok(stepped) => {
+                    Ok(
+                        settle_step(&self.handles, &stepping.bot, stepping.turn, stepped)
+                            .expect("a decided step"),
+                    )
+                }
+                Err(error) => Err(error),
+            };
+            self.handles.step_lapses(approval, None);
+            let stepping = self.stepping.remove(&approval).expect("a waiting step");
+            if !stepping.gone
+                && stepping
+                    .output
+                    .try_respond(stepping.request, result)
+                    .is_err()
+            {
+                stepping.output.close();
+            }
+        }
+        self.check_steps(again, false);
     }
     /// Drop the steps a closed session's client put.
-    async fn abandon_steps(&mut self, session: u64) {
+    fn abandon_steps(&mut self, session: u64) {
         let gone: Vec<i64> = (self.stepping.iter())
             .filter(|(_, stepping)| stepping.session == session)
             .map(|(approval, _)| *approval)
             .collect();
-        for approval in gone {
-            self.check_step(approval, true).await;
-        }
+        self.check_steps(gone, true);
     }
+    /// How long until the earliest parked turn is due.
     fn wake_delay(&self) -> Duration {
         self.wakes
             .next()
@@ -3381,6 +3444,9 @@ impl Service {
                     bot: bot.clone(),
                     turn,
                     id: format!("{call_id}/{step}"),
+                    gone: false,
+                    checking: false,
+                    again: false,
                 };
                 let name = bot;
                 let stepped = store
@@ -4478,6 +4544,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4649,6 +4716,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4863,6 +4931,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -5101,6 +5170,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),

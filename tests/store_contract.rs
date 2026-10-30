@@ -13075,3 +13075,87 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
     drop(raw);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
+    let mut db = db();
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: true,
+        inherit: true,
+    };
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["run".into()],
+        expire_ms: None,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&run)),
+            gate: Some(&gate),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    use agent_runtime::store::{Publication, Step};
+    let Step::Pending { approval, .. } = db
+        .step_announce("Lead", turn, "c1", "1", "send", json!({}), 0)
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    let mut watermark = db.last_event_id().unwrap();
+    let mut stepped = |db: &mut Database| {
+        let mut told = Vec::new();
+        db.publish_since(&mut watermark, |p| {
+            if let Publication::Stepped(approval) = p {
+                told.push(approval);
+            }
+            true
+        })
+        .unwrap();
+        told
+    };
+    // The call's answer ends the step, but its group fails to commit:
+    // the step still waits, and nothing is told.
+    db.begin_group().unwrap();
+    db.answer_call("Lead", turn, "c1", result("done"), 0)
+        .unwrap();
+    db.abandon_group().unwrap();
+    assert!(stepped(&mut db).is_empty());
+    // Answered again and committed, the step is told of.
+    db.begin_group().unwrap();
+    db.answer_call("Lead", turn, "c1", result("done"), 0)
+        .unwrap();
+    db.commit_group().unwrap();
+    assert_eq!(stepped(&mut db), [approval]);
+}
