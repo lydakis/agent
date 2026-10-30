@@ -1307,7 +1307,9 @@ default 64) that spent most input plus output first and `other_bots` summing
 the rest with how many (`null` when none), and `models`, the turn's model as
 `turns` reports it: a different compaction model's or an Anthropic fallback's
 tokens count under the turn's model, since only the usage events keep that
-split and events are pruned. With `bucket_ms` it adds `series`, one row for each bucket
+split and events are pruned, and `origins`, by the `origin` a client gave
+the turn at `submit` (`null` for none), so a client can tell what its own
+features cost. With `bucket_ms` it adds `series`, one row for each bucket
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a
 `since_ms` and fewer than 1024 buckets to now (`invalid_usage_window`). Usage
 is read from `turns`, so a deleted bot's turns, and the judge's own copies once
