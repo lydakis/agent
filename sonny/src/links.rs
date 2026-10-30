@@ -75,14 +75,16 @@ pub fn cells(
                 }
                 None => {
                     let lead = word.len() - word.trim_start_matches(['(', '[', '{', '\'']).len();
-                    // A name's or a path's own `'s` is no part of it.
                     let path = trim(&word[lead..]);
-                    let path = match path.strip_suffix("'s") {
-                        Some(path) => trim(path),
-                        None => path,
-                    };
-                    match file(&path) {
-                        Some(target) => (lead, target, path.len()),
+                    // A name's or a path's own `'s` is no part of it, unless
+                    // a file's name ends so.
+                    let opens = |path: String| file(&path).map(|target| (target, path.len()));
+                    let found = opens(path.clone()).or_else(|| {
+                        let short = path.strip_suffix("'s")?;
+                        opens(trim(short))
+                    });
+                    match found {
+                        Some((target, kept)) => (lead, target, kept),
                         None => continue,
                     }
                 }
@@ -185,14 +187,18 @@ pub fn may_name(word: &str) -> bool {
 /// as GitHub links an `@name` only when that account is there.
 #[derive(Default)]
 pub struct Names {
-    /// Each word asked about, and whether an agent has that name.
-    known: std::collections::HashMap<String, bool>,
+    /// Each word asked about: an agent's name, or when it was found not
+    /// to be one.
+    known: std::collections::HashMap<String, Option<std::time::Instant>>,
     /// The words to ask about.
     wanted: Vec<String>,
 }
 
 /// How many words are kept known: past it they are asked about again.
 const NAMES_KEPT: usize = 4096;
+/// How long a word is taken for no agent's name: an agent may be made
+/// with it later, or the daemon may not have answered.
+const NOT_NAMES_KEPT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Names {
     /// Where `word` opens, if it names an agent; one not yet asked about
@@ -202,9 +208,9 @@ impl Names {
             return None;
         }
         match self.known.get(word) {
-            Some(true) => Some(format!("{AGENT}{word}")),
-            Some(false) => None,
-            None => {
+            Some(None) => Some(format!("{AGENT}{word}")),
+            Some(Some(at)) if at.elapsed() < NOT_NAMES_KEPT => None,
+            _ => {
                 if !self.wanted.iter().any(|wanted| wanted == word) {
                     self.wanted.push(word.to_owned());
                 }
@@ -223,7 +229,8 @@ impl Names {
         if self.known.len() >= NAMES_KEPT {
             self.known.clear();
         }
-        self.known.insert(word, agent);
+        let not = (!agent).then(std::time::Instant::now);
+        self.known.insert(word, not);
     }
 }
 
@@ -552,7 +559,12 @@ mod tests {
             file_line(&dir, "src/main.rs#L40-L44"),
             Some(format!("{main}#L40"))
         );
-        assert_eq!(file_line(&dir, "src/main.rs"), Some(main));
+        assert_eq!(file_line(&dir, "src/main.rs"), Some(main.clone()));
+        // A file's `'s` is no part of it, unless its name ends so.
+        assert_eq!(opens("src/main.rs's tests", 80), [(2, main.clone())]);
+        std::fs::write(dir.join("src/owner's"), "").unwrap();
+        let owners = format!("file://{}/src/owner%27s", dir.display());
+        assert_eq!(opens("see src/owner's", 80), [(6, owners)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -603,6 +615,14 @@ mod tests {
             Some("sonny:agent/calc.neg")
         );
         assert_eq!(names.link("main.rs"), None);
-        assert!(names.wanted().is_empty(), "never asked again");
+        assert!(names.wanted().is_empty(), "not asked again at once");
+        let long_ago = std::time::Instant::now() - NOT_NAMES_KEPT;
+        names.known.insert("main.rs".into(), Some(long_ago));
+        assert_eq!(names.link("main.rs"), None);
+        assert_eq!(
+            names.wanted(),
+            ["main.rs"],
+            "asked again once it was a while"
+        );
     }
 }

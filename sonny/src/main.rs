@@ -3784,6 +3784,9 @@ impl App {
             brief: started::first(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
+        // Its name opens it at once, where it was drawn before it was made.
+        self.names.get_mut().learn(task.bot.clone(), true);
+        self.screen.relink();
         self.tasks_read = None;
         if let Some((at, drawn)) = self.starting
             && drawn == self.rows_drawn
@@ -4610,7 +4613,7 @@ impl App {
                 .client
                 .request("bots", json!({"name": word, "limit": 1}))
                 .await;
-            // Unanswered, it is not taken for a name: never asked each tick.
+            // Unanswered, it is not taken for a name for a while, not asked each tick.
             let agent =
                 page.is_ok_and(|page| page["bots"][0]["name"] == word.as_str()) && word != self.bot;
             found |= agent;
