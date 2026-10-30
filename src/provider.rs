@@ -3,7 +3,7 @@
 use crate::{Error, Result, codec::Family, fail, fail_with, sse::Decoder};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,9 +110,34 @@ impl Refresh {
 /// priced as if it had run there all along; and server-side fallbacks, whose
 /// blocks a history from before the daemon retried on its own may still
 /// hold. No request asks for a server-side fallback: it sticks to the
-/// fallback model for later requests. Bedrock takes only the first.
-const ANTHROPIC_BETAS: &str = "thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,server-side-fallback-2026-07-01";
+/// fallback model for later requests. Fast mode, which only a request
+/// naming `speed` uses. Bedrock takes only the first.
+const ANTHROPIC_BETAS: &str = "thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,server-side-fallback-2026-07-01,fast-mode-2026-02-01";
 const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
+
+/// How fast a bot's calls are served, each faster tier at a higher price.
+/// The Claude API serves `fast` (fast mode, Opus 4.8 and later at twice the
+/// price) and Bedrock serves Claude at standard speed only; OpenAI serves
+/// `fast` (its priority tier) and `ultrafast`, and Bedrock serves GPT
+/// models `ultrafast` alone (OpenAI's fast-mode guide and Bedrock's GPT-6.1
+/// Sol and GPT-6 Astra cards, read 2026-10-30). Which models take a tier is
+/// the provider's to say: a call on one that does not is refused there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speed {
+    Standard,
+    Fast,
+    Ultrafast,
+}
+impl Speed {
+    pub fn name(self) -> &'static str {
+        match self {
+            Speed::Standard => "standard",
+            Speed::Fast => "fast",
+            Speed::Ultrafast => "ultrafast",
+        }
+    }
+}
 
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
@@ -209,6 +234,8 @@ pub struct Provider {
     keep_warm: Option<Duration>,
     /// Ask Anthropic to cache for an hour instead of five minutes.
     cache_hour: bool,
+    /// A faster tier than standard, one this provider serves.
+    speed: Option<Speed>,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
     /// Bedrock signs every request with SigV4 instead of sending a key.
@@ -478,6 +505,7 @@ impl Provider {
             stall_timeout: STALL_TIMEOUT,
             keep_warm: Some(KEEP_WARM),
             cache_hour: false,
+            speed: None,
             sockets: None,
             aws: None,
             bedrock,
@@ -545,7 +573,52 @@ impl Provider {
     }
     /// How much longer this model's pool is closed by a rate limit, if it is.
     pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
-        self.pools.get(&self.family.pool_key(model)).blocked_for()
+        self.pools.get(&self.pool_key(model)).blocked_for()
+    }
+
+    /// The quota calls to `model` draw on: Claude's fast mode has a rate
+    /// limit of its own, and OpenAI counts every tier against the model's.
+    fn pool_key(&self, model: &str) -> String {
+        let key = self.family.pool_key(model);
+        match (self.family, self.speed) {
+            (Family::Anthropic, Some(speed)) => format!("{key} {}", speed.name()),
+            _ => key,
+        }
+    }
+
+    /// The tiers faster than standard this provider serves, by name.
+    pub fn speeds(&self) -> &'static [&'static str] {
+        match (self.family, self.bedrock) {
+            (Family::Anthropic, false) => &["fast"],
+            (Family::Anthropic, true) => &[],
+            (Family::Responses, false) => &["fast", "ultrafast"],
+            (Family::Responses, true) => &["ultrafast"],
+        }
+    }
+
+    /// Serve every call at `speed`, refused where this provider has no such
+    /// tier; standard sends none.
+    pub fn with_speed(mut self, speed: Option<Speed>) -> Result<Self> {
+        let speed = speed.filter(|speed| *speed != Speed::Standard);
+        if let Some(speed) = speed
+            && !self.speeds().contains(&speed.name())
+        {
+            let speeds = self.speeds();
+            let detail = match speeds {
+                [] => format!(
+                    "this provider serves {} at standard speed only",
+                    self.family.name()
+                ),
+                _ => format!(
+                    "{} is not one of standard, {}",
+                    speed.name(),
+                    speeds.join(", ")
+                ),
+            };
+            return Err(Error::with("invalid_speed", detail).facts(json!({"speeds":speeds})));
+        }
+        self.speed = speed;
+        Ok(self)
     }
 
     /// Bound generated tokens, reasoning included. Anthropic calls send it
@@ -647,24 +720,32 @@ impl Provider {
         self.family == Family::Anthropic && !(self.bedrock && five_minute_cache(model))
     }
 
-    /// This provider with one bot's output bound, cache lifetime and
-    /// keep-warm; borrowed, with no copy, when they are its own.
+    /// This provider with one bot's output bound, cache lifetime, keep-warm
+    /// and speed; borrowed, with no copy, when they are its own.
     pub fn shaped(
         &self,
         max_output_tokens: Option<u32>,
         keep_warm: Option<Duration>,
         cache_hour: bool,
+        speed: Option<Speed>,
     ) -> Result<std::borrow::Cow<'_, Self>> {
         let cache_hour = cache_hour && self.family == Family::Anthropic;
-        if (max_output_tokens, keep_warm, cache_hour)
-            == (self.max_output_tokens, self.keep_warm, self.cache_hour)
+        let speed = speed.filter(|speed| *speed != Speed::Standard);
+        if (max_output_tokens, keep_warm, cache_hour, speed)
+            == (
+                self.max_output_tokens,
+                self.keep_warm,
+                self.cache_hour,
+                self.speed,
+            )
         {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
         let mut shaped = self
             .clone()
             .with_keep_warm(keep_warm)?
-            .with_cache_hour(cache_hour);
+            .with_cache_hour(cache_hour)
+            .with_speed(speed)?;
         shaped.max_output_tokens = None;
         if let Some(limit) = max_output_tokens {
             shaped = shaped.with_max_output_tokens(limit)?;
@@ -714,6 +795,8 @@ impl Provider {
             reasoning: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_key: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            service_tier: Option<&'static str>,
         }
         #[derive(Serialize)]
         struct ToolChoice {
@@ -739,6 +822,8 @@ impl Provider {
             output_config: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             fallback_credit_token: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            speed: Option<&'static str>,
         }
         let search = request
             .web_search
@@ -795,6 +880,12 @@ impl Provider {
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
                     prompt_cache_key: request.cache_key,
+                    // Fast is OpenAI's priority tier, by the name every
+                    // model that has one takes.
+                    service_tier: self.speed.map(|speed| match speed {
+                        Speed::Ultrafast => "ultrafast",
+                        _ => "priority",
+                    }),
                 })?,
                 &b",\"input\":["[..],
             ),
@@ -835,6 +926,7 @@ impl Provider {
                         .filter(|_| !legacy_thinking(request.model))
                         .map(|level| json!({"effort":level})),
                     fallback_credit_token: request.fallback_credit.filter(|_| !self.bedrock),
+                    speed: self.speed.map(Speed::name),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -882,7 +974,7 @@ impl Provider {
         {
             return fail("keep_warm_unsupported");
         }
-        let pace = self.pools.get(&self.family.pool_key(request.model));
+        let pace = self.pools.get(&self.pool_key(request.model));
         let prefix = Bytes::from(self.prefix_for(&request, true)?);
         let estimate = pace::Cost {
             input: self.input_estimate(&pace, prefix.len() + request.items.weight, 0),
@@ -1060,7 +1152,7 @@ impl Provider {
         if let Some(aws) = &self.aws {
             aws.current().await?;
         }
-        let pace = self.pools.get(&self.family.pool_key(request.model));
+        let pace = self.pools.get(&self.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
         // Anthropic counts output as it is written, not the cap a request
         // asks for: reserve what this model's calls have been writing.
@@ -2583,9 +2675,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let same = anthropic.shaped(None, Some(KEEP_WARM), false).unwrap();
+        let same = anthropic
+            .shaped(None, Some(KEEP_WARM), false, None)
+            .unwrap();
         assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
-        let own = anthropic.shaped(Some(4096), None, true).unwrap();
+        let own = anthropic.shaped(Some(4096), None, true, None).unwrap();
         assert_eq!(
             (own.max_output_tokens, own.keep_warm, own.cache_hour),
             (Some(4096), None, true)
@@ -2595,7 +2689,7 @@ mod tests {
         // Its family's own rules still hold.
         assert_eq!(
             anthropic
-                .shaped(Some(1024), None, false)
+                .shaped(Some(1024), None, false, None)
                 .err()
                 .unwrap()
                 .code,
@@ -2603,7 +2697,7 @@ mod tests {
         );
         // Responses keeps no cache lifetime, so an hour asks for nothing.
         let responses = Provider::new(transport, Family::Responses, "https://h/v1", None).unwrap();
-        let hour = responses.shaped(None, Some(KEEP_WARM), true).unwrap();
+        let hour = responses.shaped(None, Some(KEEP_WARM), true, None).unwrap();
         assert!(matches!(hour, std::borrow::Cow::Borrowed(_)));
     }
 
@@ -3785,5 +3879,79 @@ mod tests {
             .collect()
             .await;
         assert_eq!(chunks, [Bytes::from_static(b"]}")]);
+    }
+
+    /// A bot's speed is sent in its family's field, at the tiers its
+    /// provider serves; Bedrock serves Claude at standard speed only, and
+    /// GPT models ultrafast alone. Claude's fast mode draws on its own pool.
+    #[test]
+    fn speed_is_sent_where_the_provider_serves_it() {
+        let transport = Transport::new(64, 1).unwrap();
+        let encoded = |provider: &Provider| {
+            let mut prefix = provider
+                .prefix(&Request {
+                    model: "m",
+                    instructions: "i",
+                    reasoning: None,
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    web_search: false,
+                    fallback_credit: None,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                    route: None,
+                    sent: None,
+                })
+                .unwrap();
+            prefix.extend_from_slice(b"]}");
+            serde_json::from_slice::<Value>(&prefix).unwrap()
+        };
+        let at = |family, url: &str, speed| {
+            Provider::new(transport.clone(), family, url, None)
+                .unwrap()
+                .shaped(None, Some(KEEP_WARM), false, speed)
+                .map(std::borrow::Cow::into_owned)
+        };
+        let claude = "https://api.example.test";
+        let fast = at(Family::Anthropic, claude, Some(Speed::Fast)).unwrap();
+        assert_eq!(encoded(&fast)["speed"], "fast");
+        assert!(
+            ANTHROPIC_BETAS
+                .split(',')
+                .any(|beta| beta == "fast-mode-2026-02-01")
+        );
+        assert_ne!(fast.pool_key("m"), Family::Anthropic.pool_key("m"));
+        let standard = at(Family::Anthropic, claude, Some(Speed::Standard)).unwrap();
+        assert!(encoded(&standard).get("speed").is_none());
+        assert_eq!(standard.pool_key("m"), Family::Anthropic.pool_key("m"));
+        let refused = at(Family::Anthropic, claude, Some(Speed::Ultrafast))
+            .err()
+            .unwrap();
+        assert_eq!(refused.code, "invalid_speed");
+        assert_eq!(refused.facts.unwrap()["speeds"], json!(["fast"]));
+        let bedrock = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1";
+        let refused = at(Family::Anthropic, bedrock, Some(Speed::Fast))
+            .err()
+            .unwrap();
+        assert_eq!(refused.code, "invalid_speed");
+        assert!(at(Family::Anthropic, bedrock, None).is_ok());
+
+        let openai = "https://api.openai.example.test/v1";
+        let fast = at(Family::Responses, openai, Some(Speed::Fast)).unwrap();
+        assert_eq!(encoded(&fast)["service_tier"], "priority");
+        // Every tier counts against the model's own limit.
+        assert_eq!(fast.pool_key("m"), Family::Responses.pool_key("m"));
+        let ultra = at(Family::Responses, openai, Some(Speed::Ultrafast)).unwrap();
+        assert_eq!(encoded(&ultra)["service_tier"], "ultrafast");
+        let standard = at(Family::Responses, openai, None).unwrap();
+        assert!(encoded(&standard).get("service_tier").is_none());
+        let bedrock = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+        let refused = at(Family::Responses, bedrock, Some(Speed::Fast))
+            .err()
+            .unwrap();
+        assert_eq!(refused.facts.unwrap()["speeds"], json!(["ultrafast"]));
+        let ultra = at(Family::Responses, bedrock, Some(Speed::Ultrafast)).unwrap();
+        assert_eq!(encoded(&ultra)["service_tier"], "ultrafast");
     }
 }

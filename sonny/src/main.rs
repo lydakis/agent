@@ -1599,6 +1599,13 @@ struct Running {
     note: bool,
 }
 
+/// The tier faster than standard a bot's record says it is served at.
+fn speed(record: &Value) -> Option<String> {
+    (record["settings"]["speed"].as_str())
+        .filter(|speed| *speed != "standard")
+        .map(str::to_owned)
+}
+
 /// Whether the lookout sent the turn: its note, by its request ID.
 fn from_lookout(data: &Value) -> bool {
     (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
@@ -1627,9 +1634,13 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 24] = [
+const COMMANDS: [(&str, &str); 25] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
+    (
+        "/fast",
+        "Serve this agent faster at a higher price; again for standard",
+    ),
     (
         "/compact",
         "Summarize the lead's conversation before its next call",
@@ -1752,6 +1763,8 @@ struct App {
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
+    /// The tier faster than standard its calls are served at, if any.
+    speed: Option<String>,
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
@@ -2008,6 +2021,8 @@ struct App {
     /// The prompt-cache lifetime a bot made before Sonny gave its model
     /// one takes, set once no turn runs.
     cache: Option<&'static str>,
+    /// `/fast`: the speed picked, set once no turn runs.
+    pace: Option<&'static str>,
     /// The bot's tools, which an approval mode gates.
     tools: Vec<String>,
     /// The tools its client declared, of which a mode gates Sonny's that
@@ -2682,6 +2697,7 @@ impl App {
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
+            speed: speed(record),
             context: None,
             window: None,
             input: prompt::Prompt::default(),
@@ -2809,6 +2825,7 @@ impl App {
             listing: None,
             switch: None,
             cache: None,
+            pace: None,
             tools: record["tools"]
                 .as_array()
                 .into_iter()
@@ -3161,6 +3178,7 @@ impl App {
             && self.gating.is_none()
             && self.declare.is_none()
             && self.cache.is_none()
+            && self.pace.is_none()
         {
             return true;
         }
@@ -3169,6 +3187,7 @@ impl App {
         }
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let cache = self.cache.take();
+        let pace = self.pace.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
@@ -3195,6 +3214,9 @@ impl App {
         }
         if let Some(ttl) = cache {
             asked["cache_ttl"] = json!(ttl);
+        }
+        if let Some(speed) = pace {
+            asked["speed"] = json!(speed);
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
@@ -3233,6 +3255,11 @@ impl App {
                     // The bot's own model now, for this window's turns too.
                     self.turn_model = None;
                 }
+                if let Some(speed) = pace {
+                    self.speed = Some(speed)
+                        .filter(|speed| *speed != "standard")
+                        .map(str::to_owned);
+                }
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
                     if mode == "auto"
@@ -3248,6 +3275,7 @@ impl App {
                 self.gating = gating;
                 self.declare = declare;
                 self.cache = cache;
+                self.pace = pace;
                 return false;
             }
             Err(error) => {
@@ -3317,6 +3345,19 @@ impl App {
         }
     }
 
+    /// The tiers faster than standard the bot's provider serves.
+    fn speeds(&self) -> Vec<String> {
+        let provider = self
+            .model
+            .split_once('/')
+            .map_or("", |(provider, _)| provider);
+        (self.client.providers()[provider]["speeds"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|speed| speed.as_str().map(str::to_owned))
+            .collect()
+    }
+
     /// What the footer and pickers show of the bot, from its record.
     /// A changed model replaces the one this window's turns run on.
     fn refresh(&mut self, record: &Value, model: bool) {
@@ -3331,6 +3372,7 @@ impl App {
         if let Some(workspace) = record["workspace"].as_str() {
             self.workspace = workspace.to_owned();
         }
+        self.speed = speed(record);
         self.mode = approvals::mode(record);
     }
 
@@ -5608,6 +5650,9 @@ impl App {
                 }
                 if changed("instructions") && self.instruct.take().is_some() {
                     dropped.push("instructions");
+                }
+                if changed("speed") && self.pace.take().is_some() {
+                    dropped.push("speed");
                 }
                 if !dropped.is_empty() {
                     self.notice = Some(format!(
@@ -8317,6 +8362,47 @@ impl App {
             }
             return;
         }
+        if prompt == "/fast" || prompt.starts_with("/fast ") {
+            self.input.clear();
+            let asked = prompt["/fast".len()..].trim();
+            let serves = self.speeds();
+            // A pick still waiting for the turn to end is what it toggles.
+            let current = match self.pace {
+                Some(pace) => pace != "standard",
+                None => self.speed.is_some(),
+            };
+            let speed = match asked {
+                "" if current => "standard",
+                "" => "fast",
+                "ultra" | "ultrafast" => "ultrafast",
+                "off" | "standard" => "standard",
+                _ => {
+                    self.notice = Some("/fast, /fast ultra or /fast off".into());
+                    return;
+                }
+            };
+            if speed != "standard" && !serves.iter().any(|s| s == speed) {
+                let provider = self.model.split_once('/').map_or("", |(p, _)| p);
+                self.notice = Some(match serves.as_slice() {
+                    [] => format!("{provider} serves its models at standard speed only"),
+                    [one] if one == "ultrafast" => {
+                        format!("{provider} serves ultrafast alone; /fast ultra picks it")
+                    }
+                    [one] => format!("{provider} serves {one} alone; /fast picks it"),
+                    _ => format!("{provider} serves {}", serves.join(" and ")),
+                });
+                return;
+            }
+            self.pace = Some(speed);
+            self.notice = Some(match (self.configure().await, self.pace.is_some()) {
+                (true, _) if speed == "standard" => "standard speed".into(),
+                (true, _) => format!("{speed}, at a higher price per token"),
+                (false, true) => "applies when idle".into(),
+                // Refused: the notice already says why.
+                (false, false) => return,
+            });
+            return;
+        }
         if prompt == "/model" {
             self.input.clear();
             let (send, receive) = tokio::sync::oneshot::channel();
@@ -9779,6 +9865,9 @@ impl App {
         if let Some(effort) = &self.effort {
             left.push_str(&format!(" {effort}"));
         }
+        if let Some(speed) = &self.speed {
+            left.push_str(&format!(" {speed}"));
+        }
         // What waits for the turn to end, so a pick is not taken as lost.
         if let Some((model, effort)) = &self.switch {
             left.push_str(&format!(" → {model}"));
@@ -9789,6 +9878,9 @@ impl App {
         }
         if let Some(mode) = self.gating {
             left.push_str(&format!(" · {mode} approvals when idle"));
+        }
+        if let Some(speed) = self.pace {
+            left.push_str(&format!(" · {speed} speed when idle"));
         }
         // The context, not what the bot ever spent: how full the next
         // round is.
@@ -10396,6 +10488,14 @@ mod tests {
     pub(crate) async fn daemon_answering(
         answer: impl Fn(&Value) -> Value + Send + 'static,
     ) -> Arc<Client> {
+        daemon_serving(json!({}), answer).await
+    }
+
+    /// A stand-in daemon whose ready event lists `providers`.
+    async fn daemon_serving(
+        providers: Value,
+        answer: impl Fn(&Value) -> Value + Send + 'static,
+    ) -> Arc<Client> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         // Tests start stand-ins at once, within the same millisecond.
         static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -10410,7 +10510,8 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
-            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL,
+                "providers": providers});
             write
                 .write_all(format!("{ready}\n").as_bytes())
                 .await
@@ -12355,6 +12456,62 @@ mod tests {
             (&json!("configure"), &json!("1h"))
         );
         assert!(app.cache.is_none());
+    }
+
+    #[tokio::test]
+    async fn fast_toggles_the_speed_its_provider_serves_and_names_what_it_does_not() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let providers = json!({"anthropic": {"speeds": ["fast"]}, "bedrock": {"speeds": []},
+            "openai": {"speeds": ["fast", "ultrafast"]}});
+        let client = daemon_serving(providers, move |request| {
+            seen.lock().unwrap().push(request.clone());
+            json!({"bot": "b", "changed": ["speed"]})
+        })
+        .await;
+        let mut app = app(client);
+        app.model = "anthropic/claude-opus-5-5".into();
+        app.input.set("/fast");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("fast, at a higher price per token")
+        );
+        assert_eq!(app.speed.as_deref(), Some("fast"));
+        assert!(
+            app.footer_line(200)
+                .spans
+                .iter()
+                .any(|s| s.content.contains("claude-opus-5-5 fast"))
+        );
+        // Again, it goes back to standard.
+        app.input.set("/fast");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("standard speed"));
+        assert_eq!(app.speed, None);
+        let speeds: Vec<_> = (asked.lock().unwrap().iter())
+            .map(|sent| sent["speed"].clone())
+            .collect();
+        assert_eq!(speeds, [json!("fast"), json!("standard")]);
+        // A tier the provider does not serve is not asked for.
+        app.input.set("/fast ultra");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("anthropic serves fast alone; /fast picks it")
+        );
+        app.model = "bedrock/anthropic.claude-opus-5-5".into();
+        app.input.set("/fast");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("bedrock serves its models at standard speed only")
+        );
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        app.model = "openai/gpt-6.1-sol".into();
+        app.input.set("/fast ultra");
+        app.submit().await;
+        assert_eq!(app.speed.as_deref(), Some("ultrafast"));
     }
 
     #[tokio::test]
