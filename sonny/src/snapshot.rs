@@ -478,7 +478,16 @@ pub fn restore(
         self::sealed(&sealed, &["reset", "-q"], &sealed.index, None)
     });
     let _ = std::fs::remove_dir_all(&at);
-    checked_out.map(|_| ())
+    if let Err(error) = checked_out {
+        // Nothing is left half made, for a later task of the name to take
+        // as its own: the worktree goes, with whatever it was given, and
+        // its branch.
+        let remove = ["worktree", "remove", "--force", "--force", &target];
+        let _ = git(here, &remove, None, None);
+        let _ = git(here, &["branch", "-D", branch], None, None);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Drop bot `bot_id`'s snapshots in the repository `dir` is in; git's own
@@ -1010,6 +1019,27 @@ mod tests {
             None,
         );
         assert_eq!(kept.unwrap(), "changed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_restore_that_fails_leaves_no_worktree_or_branch() {
+        let (dir, top) = repo("rollback");
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let copy = dir.join("copy");
+        // A file where its sealed git folder would go.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        assert!(restore(&top, &snapshot, &copy, "agent/copy", &blocked).is_err());
+        assert!(!copy.exists());
+        let branches = git(&top, &["branch", "--list", "agent/copy"], None, None).unwrap();
+        assert_eq!(branches, "");
+        let listed = git(&top, &["worktree", "list", "--porcelain"], None, None).unwrap();
+        assert!(!listed.contains("copy"), "{listed}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
