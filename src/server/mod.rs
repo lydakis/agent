@@ -68,6 +68,12 @@ struct Sends {
     bytes: usize,
     packets: usize,
 }
+impl Sends {
+    /// What they take from the session's queue budget.
+    fn cost(self) -> usize {
+        self.bytes + self.packets * output::PACKET_BYTES
+    }
+}
 impl std::ops::Add for Sends {
     type Output = Sends;
     fn add(self, other: Sends) -> Sends {
@@ -2002,7 +2008,7 @@ impl Service {
             if self.admissions.len() >= ADMISSION_WINDOW {
                 return true;
             }
-            let (bytes, packets) = output.room();
+            let room = output.room();
             let queued = self
                 .admissions
                 .iter()
@@ -2012,7 +2018,7 @@ impl Service {
             let promised = queued
                 .chain(answered)
                 .fold(bound.total(), |sum, sends| sum + sends);
-            promised.bytes > bytes || promised.packets > packets
+            promised.cost() > room
         };
         match command {
             Some(Command::Create { .. }) => full(),
@@ -2057,8 +2063,7 @@ impl Service {
                 (sum + events.events, Some(events.cursor))
             });
         let newest = newest?;
-        let (bytes, packets) = output.room();
-        (promised.bytes > bytes || promised.packets > packets).then_some(newest)
+        (promised.cost() > output.room()).then_some(newest)
     }
 
     /// Answer the oldest queued admission once its commit is known.
@@ -4034,13 +4039,15 @@ mod tests {
     async fn retention_replies_backpressure_stdio_but_evict_lagged_sockets() {
         use tokio::io::AsyncBufReadExt;
         for session in [0, 1] {
-            let (writer, reader) = tokio::io::duplex(1);
+            let (writer, reader) = tokio::io::duplex(4096);
             let output = Output::writer(writer);
             let closed = output.subscribe_closed();
-            output.send(json!({"first":true})).await.unwrap();
+            output.send(json!({"first":"x".repeat(8192)})).await.unwrap();
             // Block the writer on its first packet, then fill the queue.
             tokio::task::yield_now().await;
-            while output.try_send(json!({"filler":true})).is_ok() {}
+            for filler in [json!({"filler":"x".repeat(64 * 1024)}), json!({"filler":true})] {
+                while output.try_send(filler.clone()).is_ok() {}
+            }
             let response = output.clone();
             let mut task = tokio::spawn(async move {
                 retention_reply(
@@ -6010,7 +6017,10 @@ mod tests {
             None,
             "the window's events and the next admission fit"
         );
-        while output.room().1 > window {
+        let need = (service.pending_events(1))
+            .fold(bound.total(), |sum, events| sum + events.events)
+            .cost();
+        while output.room() >= need {
             output.try_send(json!({"filler": true})).unwrap();
         }
         let newest = service.awaits_publication(Some(&next), 1, &output, bound);
