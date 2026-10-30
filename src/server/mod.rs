@@ -750,6 +750,10 @@ pub struct Configuration {
     /// from the daemon's environment, as Codex's shell environment
     /// excludes; none by default.
     pub shell_excludes: Vec<String>,
+    /// Field names whose values are redacted from tool output.
+    pub redact_fields: Vec<String>,
+    /// What the headers of PEM blocks redacted from tool output name.
+    pub redact_blocks: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1217,6 +1221,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut providers = HashMap::new();
     let aws_start = agent_runtime::provider::aws::Start::new();
     let credentials = agent_runtime::tools::Credentials::default();
+    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
     // Every tool shell inherits the environment the daemon started with,
     // so the excludes are matched against it once.
     for (name, _) in std::env::vars_os() {

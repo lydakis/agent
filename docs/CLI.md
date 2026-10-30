@@ -33,6 +33,11 @@ terminal it was started in (`TMUX`, `TMUX_PANE`, Rex's, Herdr's and cmux's
 places, `agent_client::TERMINAL_PLACES`), so a bot's command never lands in
 that terminal. A running daemon keeps the excludes it started with, and
 a variable a bot or caller sets with `--env` is still set.
+`serve --redact-field NAME` has the value printed after a field named like
+NAME (its end, any case, `_` and `-` ignored) redacted from tool output, and
+`serve --redact-block LABEL` the body of each PEM block whose header names
+LABEL. A client that starts a daemon passes `agent_client::SECRET_FIELDS`
+(`password`, `api_key`, `secret_access_key` and the like) and `PRIVATE KEY`.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 

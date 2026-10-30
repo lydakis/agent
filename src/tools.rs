@@ -484,6 +484,12 @@ struct CredentialSet {
     /// of a new token. Refreshes pay for insertion; tool output stays sorted.
     values: Vec<Credential>,
     names: Vec<String>,
+    /// Field names, lowercased without `_` or `-`, whose values a client
+    /// had redacted wherever they are printed (`--redact-field`).
+    fields: Vec<String>,
+    /// What the header of a PEM block a client had redacted names
+    /// (`--redact-block`), such as `PRIVATE KEY`.
+    blocks: Vec<String>,
 }
 
 /// Whether a variable's `name` matches `pattern`: `*` any run of
@@ -558,12 +564,25 @@ impl Credentials {
             .names
             .clone()
     }
+    /// Also redact the values after these field names, matched as a name's
+    /// end, and the bodies of PEM blocks whose header names one of `blocks`.
+    pub fn redact_also(&self, fields: &[String], blocks: &[String]) {
+        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        set.fields = fields.iter().map(|field| field_key(field)).collect();
+        set.blocks = blocks.to_vec();
+    }
     pub fn redact(&self, mut text: String) -> String {
         let set = self.0.read().unwrap_or_else(|e| e.into_inner());
         for credential in &set.values {
             if text.contains(&credential.value) {
                 text = text.replace(&credential.value, REDACTED);
             }
+        }
+        if !set.blocks.is_empty() {
+            text = redact_blocks(text, &set.blocks);
+        }
+        if !set.fields.is_empty() {
+            text = redact_fields(text, &set.fields);
         }
         text
     }
@@ -605,6 +624,142 @@ impl Credentials {
 }
 
 const REDACTED: &str = "[REDACTED]";
+/// Shorter values are flags, placeholders and counts, not secrets; so are
+/// values without both letters and digits.
+const SECRET_MIN: usize = 8;
+
+/// A field name as it is matched: lowercased, without `_` or `-`.
+fn field_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Replace the value after each of `fields` in `text`, printed as
+/// `NAME=VALUE`, `NAME: VALUE` or `"NAME": "VALUE"`. A name matches when it
+/// ends with a field, so `aws_secret_access_key` matches `secretaccesskey`.
+fn redact_fields(text: String, fields: &[String]) -> String {
+    let shortest = fields.iter().map(String::len).min().unwrap_or(0);
+    let bytes = text.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !word(bytes[i]) || (i > 0 && word(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && word(bytes[i]) {
+            i += 1;
+        }
+        // A word shorter than every field cannot end with one.
+        if i - start < shortest {
+            continue;
+        }
+        let name = field_key(&text[start..i]);
+        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+            continue;
+        }
+        // The name's closing quote, the separator, and the value's quote.
+        let mut j = i;
+        if j < bytes.len() && matches!(bytes[j], b'"' | b'\'') {
+            j += 1;
+        }
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j >= bytes.len() || !matches!(bytes[j], b'=' | b':') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let quote = bytes.get(j).copied().filter(|b| matches!(b, b'"' | b'\''));
+        if quote.is_some() {
+            j += 1;
+        }
+        let from = j;
+        while j < bytes.len() {
+            let b = bytes[j];
+            let ends = match quote {
+                Some(q) => b == q || b == b'\n',
+                None => {
+                    b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                }
+            };
+            if ends {
+                break;
+            }
+            // An escaped quote is part of a quoted value.
+            j = match (quote, b) {
+                (Some(_), b'\\') => (j + 2).min(bytes.len()),
+                _ => j + 1,
+            };
+        }
+        let value = &text[from..j];
+        // Code names a type or a variable there; a key mixes in digits.
+        let keylike = value.bytes().any(|b| b.is_ascii_digit())
+            && value.bytes().any(|b| b.is_ascii_alphabetic());
+        if value.len() >= SECRET_MIN && keylike && !value.starts_with(['{', '[', '$']) {
+            spans.push(from..j);
+        }
+        i = j;
+    }
+    if spans.is_empty() {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for span in spans {
+        out.push_str(&text[at..span.start]);
+        out.push_str(REDACTED);
+        at = span.end;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// Replace the body of each PEM block in `text` whose header names one of
+/// `blocks`.
+fn redact_blocks(mut text: String, blocks: &[String]) -> String {
+    const BEGIN: &str = "-----BEGIN ";
+    const END: &str = "-----END ";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(BEGIN) {
+        let begin = from + found;
+        // The header line ends in five dashes, then LF or CRLF.
+        let Some(dashes) = text[begin + BEGIN.len()..]
+            .find("-----")
+            .map(|n| begin + BEGIN.len() + n + 5)
+        else {
+            break;
+        };
+        let header = match &text.as_bytes()[dashes..] {
+            [b'\r', b'\n', ..] => dashes + 2,
+            [b'\n', ..] => dashes + 1,
+            _ => dashes,
+        };
+        if !blocks
+            .iter()
+            .any(|block| text[begin..header].contains(block.as_str()))
+        {
+            from = header;
+            continue;
+        }
+        let Some(end) = text[header..].find(END).map(|n| header + n) else {
+            // A key cut off by truncation is still a key.
+            text.replace_range(header.., REDACTED);
+            break;
+        };
+        text.replace_range(header..end, &format!("{REDACTED}\n"));
+        from = header + REDACTED.len() + 1 + END.len();
+    }
+    text
+}
+
 pub enum Prepared {
     Echo(String),
     Shell {
@@ -2290,6 +2445,61 @@ mod tests {
         assert!(Registry::new("echo,echo").is_err());
         assert!(Registry::new("mcp").is_err());
         assert_eq!(Registry::new("read").unwrap().names(), ["read"]);
+    }
+    #[test]
+    fn the_fields_and_blocks_a_client_names_are_redacted() {
+        let credentials = Credentials::default();
+        let unnamed = "password: fake8fake8fake8\n-----BEGIN RSA PRIVATE KEY-----\nMIIE";
+        assert_eq!(credentials.redact(unnamed.to_owned()), unnamed);
+        let fields = ["secret_access_key", "SessionToken", "api-key", "password"];
+        credentials.redact_also(&fields.map(String::from), &["PRIVATE KEY".to_owned()]);
+        let redact = |text: &str| credentials.redact(text.to_owned());
+        assert_eq!(
+            redact(
+                r#"{"AccessKeyId": "example1example1", "SecretAccessKey": "fake2fake2fake2", "SessionToken": "fake3fake3fake3", "Expiration": "2026-01-01T00:00:00Z"}"#
+            ),
+            r#"{"AccessKeyId": "example1example1", "SecretAccessKey": "[REDACTED]", "SessionToken": "[REDACTED]", "Expiration": "2026-01-01T00:00:00Z"}"#
+        );
+        assert_eq!(
+            redact("aws_secret_access_key = fake4fake4fake4\nregion = us-east-1\n"),
+            "aws_secret_access_key = [REDACTED]\nregion = us-east-1\n"
+        );
+        assert_eq!(
+            redact("export OPENAI_API_KEY=fake-5fake-5fake; echo ok"),
+            "export OPENAI_API_KEY=[REDACTED]; echo ok"
+        );
+        // An escaped quote is inside the value, not its end.
+        assert_eq!(
+            redact(r#"{"password":"a\"fake7fake7fake7","user":"me"}"#),
+            r#"{"password":"[REDACTED]","user":"me"}"#
+        );
+        assert_eq!(redact(r#"password: "x\"#), r#"password: "x\"#);
+        // Names that only resemble one, short values, and code keep theirs.
+        for kept in [
+            "NextToken: page6page6page6",
+            "max_tokens: 4096",
+            "password: hunter2",
+            "    api_key: Option<String>,",
+            "token: ${{ secrets.TOKEN }}",
+        ] {
+            assert_eq!(redact(kept), kept);
+        }
+        assert_eq!(
+            redact(
+                "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nz"
+            ),
+            "a\n-----BEGIN OPENSSH PRIVATE KEY-----\n[REDACTED]\n-----END OPENSSH PRIVATE KEY-----\nz"
+        );
+        let certificate = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        assert_eq!(redact(certificate), certificate);
+        assert_eq!(
+            redact("-----BEGIN RSA PRIVATE KEY-----\nMIIE"),
+            "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]"
+        );
+        assert_eq!(
+            redact("-----BEGIN PRIVATE KEY-----\r\nMIIE\r\n-----END PRIVATE KEY-----\r\n"),
+            "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
+        );
     }
     #[cfg(unix)]
     #[test]

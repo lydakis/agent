@@ -867,6 +867,12 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     for name in agent_client::TERMINAL_PLACES {
         command.arg("--shell-exclude").arg(name);
     }
+    for field in agent_client::SECRET_FIELDS {
+        command.arg("--redact-field").arg(field);
+    }
+    for label in agent_client::SECRET_BLOCKS {
+        command.arg("--redact-block").arg(label);
+    }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
     }

@@ -2193,8 +2193,12 @@ retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
-holds, wherever it appears. What else counts as a secret is the client's
-judgement, not the daemon's: nothing else is rewritten. Results include separate output, exit code, and
+holds, wherever it appears; the value printed after a field name ending in
+one the daemon was started with (`--redact-field`, any case, with or without
+`_` or `-`, as `NAME=`, `NAME:` or `"NAME":`), when it is at least 8 bytes and
+mixes letters and digits; and the body of a PEM block whose header names a
+`--redact-block` label. Which names count as secrets is the client's
+judgement: the CLI passes `agent_client::SECRET_FIELDS` and `PRIVATE KEY`. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. A command's return,
 timeout, or overflow kills its owned process group, so a process it started
 with `&` does not outlive it; the tool description tells the model so. A

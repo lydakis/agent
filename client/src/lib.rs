@@ -128,6 +128,28 @@ pub const TERMINAL_PLACES: [&str; 12] = [
     "CMUX_PANEL_ID",
 ];
 
+/// Field names whose printed values are secrets: a client starting the
+/// daemon has their values redacted from tool output (`--redact-field`). A
+/// name matches a field's end, so `aws_secret_access_key` matches
+/// `secret_access_key` and `AccessKeyId` or `NextToken` match nothing.
+pub const SECRET_FIELDS: [&str; 12] = [
+    "secret",
+    "secret_key",
+    "secret_access_key",
+    "session_token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "api_key",
+    "password",
+    "passwd",
+    "private_key",
+];
+
+/// PEM blocks whose bodies are secrets (`--redact-block`).
+pub const SECRET_BLOCKS: [&str; 1] = ["PRIVATE KEY"];
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

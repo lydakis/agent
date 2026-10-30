@@ -204,7 +204,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude",
+        flags: "--shell-exclude --redact-field --redact-block",
         settings: "",
         startup: true,
     },
@@ -367,6 +367,14 @@ fn print_flags(flags: &str) {
             "--shell-exclude" => (
                 "PATTERN",
                 "Leave variables named like this (* and ? wildcards, any case) out of tool shells; repeatable; clients pass [shell_environment_policy] from ~/.agent/config.toml",
+            ),
+            "--redact-field" => (
+                "NAME",
+                "Redact the value printed after a field named like this (its end, any case, _ and - ignored) from tool output; repeatable",
+            ),
+            "--redact-block" => (
+                "LABEL",
+                "Redact the body of each PEM block whose header names LABEL, such as PRIVATE KEY, from tool output; repeatable",
             ),
             "--port" => (
                 "N",
