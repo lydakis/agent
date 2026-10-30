@@ -34,7 +34,10 @@ per feature; group small things into the row they belong to.
   clean view shows what they say and what they do that reaches you: an
   agent you should look at, a note in the margin, a lookout or task update
   that changed what an agent does, a question for you. Commands, reads,
-  edits and the like stay in `/verbose`. (George, 10-30)
+  edits and the like stay in `/verbose`. What an agent does that has not
+  earned trust yet, such as a memory it saved about you, stays in view so
+  it can be checked, and leaves the clean view as trust builds. (George,
+  10-30)
 
 ## Leads and tasks
 
