@@ -71,8 +71,6 @@ pub enum Tag {
     Picked(i64),
     /// A group of calls, by the client's number for it.
     Group(u64),
-    /// The rows of the message at this node that one bot sent another.
-    Relayed(i64),
     /// Tasks the lead started together, by the client's number for them.
     Tasks(u64),
     /// Where a note was put in the margin, by [`crate::margin::anchor`].
@@ -470,12 +468,7 @@ impl Screen {
     }
 
     /// Its lines replaced by `lines`, the view kept as far down from the
-    /// first row as it was.
-    pub fn replace(&mut self, lines: Vec<Line<'static>>) {
-        self.replace_marked(lines, Vec::new());
-    }
-
-    /// [`Screen::replace`], with `marks` as [`Screen::push_marked`] puts them.
+    /// first row as it was, with `marks` as [`Screen::push_marked`] puts them.
     pub fn replace_marked(&mut self, lines: Vec<Line<'static>>, marks: Vec<(usize, Mark)>) {
         let top = self.top;
         *self = Self {
@@ -2487,7 +2480,7 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         let before = row(&buf, 0);
         for _ in 0..3 {
-            screen.replace(lines.clone());
+            screen.replace_marked(lines.clone(), Vec::new());
             screen.render(area, &mut buf, |_| None);
             assert_eq!(row(&buf, 0), before);
         }

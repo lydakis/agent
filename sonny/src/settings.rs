@@ -9,6 +9,8 @@ pub struct Settings {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// When a note opens the margin; `/config` changes it.
+    pub margin_opens: agent_client::config::MarginOpens,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Settings {
         Settings {
             chime: sonny.chime,
             verbose: sonny.verbose,
+            margin_opens: sonny.margin_opens,
         }
     }
 
