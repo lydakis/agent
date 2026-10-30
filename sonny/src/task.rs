@@ -150,9 +150,12 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         }
         Err(error)
     };
-    // The folder's setup script, run in the task's own folder, as for a
-    // worktree; a task in the lead's folder has nothing to set up.
-    let script = at.join(".agents/setup");
+    // The lead's folder's setup script, run in the task's own folder, as
+    // for a worktree; a task in the lead's folder has nothing to set up.
+    // Never a repository's inside it: its `.agents`, unlike the lead's, is
+    // no more kept from the lead's sandbox than the rest of it, and the
+    // script runs outside any.
+    let script = here.join(".agents/setup");
     if start.setup && place.dir != at && script.exists() {
         // Its output is not kept, however long a build runs: only the last
         // lines of its errors, which a failure shows.

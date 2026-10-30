@@ -468,12 +468,37 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     std::fs::write(ws.join("AGENTS.md"), "Build with the workspace tool.\n").unwrap();
     let api = ws.join("src/api");
     std::fs::rename(&lab.repo, &api).unwrap();
+    // Setup is the lead's folder's, never one the repository holds, which
+    // the lead's sandbox does not keep it from writing.
+    let planted = lab.scratch.join("planted");
+    for (dir, script) in [
+        (
+            ws.clone(),
+            "#!/bin/sh\necho \"$AGENT_SOURCE\" > from\n".to_owned(),
+        ),
+        (
+            api.clone(),
+            format!("#!/bin/sh\ntouch {}\n", planted.display()),
+        ),
+    ] {
+        let setup = dir.join(".agents/setup");
+        std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
+        std::fs::write(&setup, script).unwrap();
+        std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let start = serde_json::json!({"name": "fix", "brief": format!("fix {}/src/lib.rs", api.display()),
-        "folder": "src/api"});
+        "folder": "src/api", "setup": true});
     let (ok, said) = lab.tool(&ws, "start_task", start, false);
     assert!(ok, "{said}");
     let worktree = lab.home.join(".agent/worktrees/demo.fix");
     assert!(said.contains("a worktree at"), "{said}");
+    let from = std::fs::read_to_string(worktree.join("from")).unwrap();
+    assert_eq!(
+        from.trim(),
+        std::fs::canonicalize(&api).unwrap().to_string_lossy()
+    );
+    assert!(!planted.exists());
+    std::fs::remove_file(worktree.join("from")).unwrap();
     let ran = lab.ran();
     assert_eq!(ran[6], worktree.to_string_lossy());
     assert_eq!(
