@@ -2403,7 +2403,9 @@ toward the 64 KiB. A client's code-running tool is one.
 
 Protocol version 24 adds `item` to `text_delta` and `thinking_delta`, so a
 client draws each message a call streams apart, as it is kept (see
-`follow` above).
+`follow` above). It also reports an unset `cache_ttl` in `inspect`'s
+`settings` as `null` rather than `"5m"`, so a client tells a lifetime
+nobody set from five minutes someone chose.
 
 ### Tool approval
 
