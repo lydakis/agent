@@ -12,7 +12,7 @@ the automatic approver's own cost, at `81458d2` for the judges
 compared, at `7a66687` for the finish cost of per-bot settings, by
 the change that keyed creation for its cost, and at `3ad9e2f`, the change
 that runs summaries beside the turn's call and adds the Pi Durable
-baseline, on `b026767`.
+baseline, on `b026767`, and at `2182b4a` for the five-harness rescreen.
 This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
@@ -133,11 +133,14 @@ more turns is not here, because its work changes with its speed; it is under
   Because every call should run, this says nothing about false allows.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
-  64 KiB: Agent 28.7 MiB peak and 0.69 s CPU, Pi 159 MiB and 1.9 s, Codex
-  246 MiB and 40.1 s, opencode 958 MiB and 24.7 s, Claude Code 6,490 MiB and
-  42.4 s. Exploratory, not a ranking: the harnesses do unequal work, and
+  64 KiB: Agent 28.9 MiB peak and 0.65 s CPU, Pi 172 MiB and 1.8 s, Codex
+  301 MiB and 35.5 s, opencode 991 MiB and 19.8 s, Claude Code 7,348 MiB and
+  32.7 s. Exploratory, not a ranking: the harnesses do unequal work, and
   Codex and Claude Code did not reach 32 concurrent streams on this host.
-  Linux VM, Agent 0.4.1 (main `3a9f7df`), 2026-10-28.
+  Agent is unchanged within host drift from the 2026-10-28 screen (28.7 MiB,
+  0.69 s at `3a9f7df`); the other engines, with unchanged binaries, moved by
+  up to about 20% between screens. Linux VM, main `2182b4a` (the 0.7.0
+  code), 2026-10-30.
   [Record](HARNESS_MEASUREMENTS.md).
 - **Pi Durable on the durable lifecycle.** 32 named conversations, three
   turns each, both engines syncing every commit (`synchronous=FULL`, which
