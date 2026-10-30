@@ -35,10 +35,12 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import zlib
 import time
 from pathlib import Path
 
@@ -328,6 +330,25 @@ def until_subscribed(home, cap=10 * 60):
     return False
 
 
+def allow_waiting(env, agent):
+    """Allow every call a task waits on the person for. Only the lead's
+    session runs through `sonny acp`, which answers the lead's own; a
+    task's would otherwise park and stall the day."""
+    out = subprocess.run([str(agent), 'approvals'], env=env, capture_output=True, text=True).stdout
+    try:
+        calls = json.loads(out or '[]')
+    except json.JSONDecodeError:
+        return
+    for call in calls:
+        gates = call.get('gates') or []
+        if call.get('bot') == 'shop.lead' or (call.get('asked') is None and 'manual' not in gates):
+            continue
+        tag = ['--tag', 'manual'] if 'manual' in gates else []
+        subprocess.run([str(agent), 'answer', '--bot', call['bot'], '--turn', str(call['turn']),
+                        '--call', call['call_id'], '--request', str(call['request']), *tag, 'allow'],
+                       env=env, capture_output=True)
+
+
 def settle(env, agent, acp, quiet=60, cap=40 * 60):
     """Wait until no agent has a turn running and `sonny acp` has said
     nothing for `quiet` seconds: the lookout's notes have landed and been
@@ -335,6 +356,7 @@ def settle(env, agent, acp, quiet=60, cap=40 * 60):
     start = time.monotonic()
     calm = None
     while time.monotonic() - start < cap:
+        allow_waiting(env, agent)
         busy = active(env, agent)
         idle = not busy and time.monotonic() - acp.last > 10
         if idle:
@@ -350,7 +372,9 @@ def settle(env, agent, acp, quiet=60, cap=40 * 60):
 def run(arm, n, bins, model, spec=None):
     bin_dir = Path(bins[arm])
     agent, sonny = bin_dir / 'agent', bin_dir / 'sonny'
-    root = ROOT / f'{arm}{n}'
+    # Short (macOS socket paths), and apart per model, so runs of two
+    # models at once never share a root.
+    root = ROOT / f'{zlib.crc32(model.encode()):08x}-{arm}{n}'
     home, repo, env = setup(root, bin_dir, model, spec)
     out = RUNS / f'{arm}{n}'
     if out.exists():
@@ -455,7 +479,7 @@ def blind():
     for run_name, name in zip(runs, names):
         # Paths in calls name the arm (the run's root, the build): hide them.
         text = (RUNS / run_name / 'transcript.md').read_text()
-        text = text.replace(str(ROOT / run_name), str(ROOT / 'RUN'))
+        text = re.sub(re.escape(str(ROOT)) + r'/[0-9a-f]{8}-' + re.escape(run_name), str(ROOT / 'RUN'), text)
         for arm in 'AB':
             text = text.replace(f'/src-{arm}/', '/src-ARM/')
         (dest / f'{name}.md').write_text(text)
@@ -487,11 +511,15 @@ def main():
         jobs = [(arm, n) for n in range(1, a.runs + 1) for arm in sorted(bins)]
         with concurrent.futures.ThreadPoolExecutor(a.parallel) as pool:
             futures = {pool.submit(run, arm, n, bins, a.model, a.provider): (arm, n) for arm, n in jobs}
+            failed = 0
             for f in concurrent.futures.as_completed(futures):
                 try:
                     print(futures[f], f.result(), flush=True)
                 except Exception as e:  # one run failing leaves the others
+                    failed += 1
                     print(futures[f], 'FAILED', e, flush=True)
+        if failed:
+            sys.exit(f'{failed} of {len(jobs)} runs failed')
     elif a.cmd == 'blind':
         blind()
     else:

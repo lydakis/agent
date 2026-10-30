@@ -10,9 +10,9 @@ This eval is how a cut proves that shorter text works as well.
 ## What it runs
 
 Each run gets its own HOME, daemon, socket and git repository (`shop`, with
-a bare `origin`) under `/tmp/role/<arm><n>`. A lead is driven through
+a bare `origin`) under `/tmp/role/<model hash>-<arm><n>`. A lead is driven through
 `sonny acp` the way T3 Code drives one, so the lookout, Sonny's tools and
-the tasks are all real. Every permission asked is allowed. Two sources, `chat`
+the tasks are all real. Every permission asked is allowed, the lead's through ACP and a task's through `agent answer`. Two sources, `chat`
 and `mail`, release fixed events at each step. They include news that bears
 on the work and news that doesn't. The person's words at each step are in
 `STEPS`. A step settles once no agent has a turn running and the lead has
