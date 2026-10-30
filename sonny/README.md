@@ -770,7 +770,9 @@ with its next call. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
-its own, and stays once the task is gone. A file, `/status`, `/background` or a side
+its own, and stays once the task is gone. A note with `opens: "AGENT"`,
+such as the lead's to-do for a task's question, gets a `↗` that opens that
+agent in the pane, where you answer it. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
 opens by itself when the agent puts up or changes a note, once the window
