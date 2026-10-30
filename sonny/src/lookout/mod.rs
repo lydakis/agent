@@ -681,6 +681,7 @@ impl Service {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
             lookout.reading = 0;
+            lookout.updates.replies_dropped();
         }
         self.goals.reconnected();
         let (done, mut results) = tokio::sync::mpsc::channel(64);
@@ -810,6 +811,9 @@ impl Service {
                     let (client, done) = (client.clone(), done.clone());
                     let (lead, id) = (lookout.lead.clone(), lookout.id);
                     lookout.reading += 1;
+                    if seen.reply {
+                        lookout.updates.reading_reply(&seen.task, seen.turn);
+                    }
                     tokio::spawn(async move {
                         let seen = read_event(&client, seen).await;
                         let _ = done.send((lead, id, seen)).await;
@@ -1610,6 +1614,11 @@ impl Lookout {
             return;
         };
         let told = self.updates.take();
+        // All there is waits on replies being read.
+        if told.items.is_empty() && told.memory.is_none() {
+            self.updates.unsent(told);
+            return;
+        }
         let prompt = note(&told, steer);
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
@@ -2013,6 +2022,50 @@ mod tests {
              Lines marked > are a task's own reply, not the person's words.\n"
         ), "{note}");
         assert!(!note.contains("early"));
+    }
+
+    #[test]
+    fn a_steer_leaves_a_turn_whose_reply_is_being_read_for_the_next_note() {
+        let mut lookout = seated("running");
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 4, "turn_finished", done));
+        let read = lookout.due.pop().unwrap();
+        lookout.updates.reading_reply(&read.task, read.turn);
+        // The person writes in a task while the reply is read: the steer
+        // carries their words, not the turn's end without its reply.
+        lookout.heard(&said(5, PERSON, "use tabs"));
+        let told = lookout.updates.take();
+        let steered = note(&told, true);
+        assert!(steered.contains("use tabs"), "{steered}");
+        assert!(!steered.contains("turn:calc.fix/4"), "{steered}");
+        lookout.updates.sent(told);
+        assert!(lookout.updates.news());
+        // Nothing else to tell: no note until the read is in.
+        let told = lookout.updates.take();
+        assert!(told.items.is_empty());
+        lookout.updates.unsent(told);
+        lookout.heard(&Seen {
+            text: "Fixed avg.".into(),
+            ..read
+        });
+        let told = lookout.updates.take();
+        let next = note(&told, false);
+        assert!(
+            next.contains("turn:calc.fix/4 completed") && next.contains("  > Fixed avg."),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn a_reply_read_with_no_words_holds_its_turn_no_more() {
+        let mut lookout = seated("idle");
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 4, "turn_finished", done));
+        let read = lookout.due.pop().unwrap();
+        lookout.updates.reading_reply(&read.task, read.turn);
+        lookout.heard(&read);
+        let told = lookout.updates.take();
+        assert!(note(&told, false).contains("turn:calc.fix/4 completed"));
     }
 
     #[test]
