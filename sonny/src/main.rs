@@ -1658,6 +1658,9 @@ struct Watch {
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
+    /// The agent `/status` has picked from the keys, by its place among
+    /// the agents it lists: ↑ and ↓ move it, Enter opens it.
+    pick: Option<usize>,
 }
 
 struct App {
@@ -4394,6 +4397,35 @@ impl App {
         (lines, marks)
     }
 
+    /// Opens every fold and gathered row still in the conversation, or
+    /// folds them all again when none is left shut.
+    fn open_all(&mut self) {
+        let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
+        let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
+            || self.clusters.values().any(|cluster| !cluster.open);
+        let folds: Vec<usize> = (self.folds.iter())
+            .filter(|(_, fold)| opens(fold))
+            .map(|(at, _)| *at)
+            .collect();
+        for at in folds {
+            if let Some(fold) = self.folds.get_mut(&at)
+                && fold.open != open
+            {
+                fold.open = open;
+                self.draw_fold(at);
+            }
+        }
+        let clusters: Vec<usize> = self.clusters.keys().copied().collect();
+        for at in clusters {
+            if let Some(cluster) = self.clusters.get_mut(&at)
+                && cluster.open != open
+            {
+                cluster.open = open;
+                self.draw_cluster(at);
+            }
+        }
+    }
+
     /// The cluster `at` drawn again where it is; whether it is still in
     /// the conversation.
     fn draw_cluster(&mut self, at: usize) -> bool {
@@ -5963,8 +5995,9 @@ impl App {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         });
-        self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("/status", PICK_KEYS));
     }
 
     /// What runs for the project's agents with no one typing:
@@ -5989,6 +6022,7 @@ impl App {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
     }
@@ -6010,6 +6044,7 @@ impl App {
             usage: Some(view),
             commons: None,
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
     }
@@ -6031,6 +6066,7 @@ impl App {
             usage: None,
             commons: Some(commons::View::open(&home)),
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
     }
@@ -6760,6 +6796,46 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        // `/status` picks an agent from the keys and opens it, as a click
+        // on it does.
+        if self.finding.is_none()
+            && self.pane_keys
+            && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+            && self.pane.as_ref().is_some_and(|pane| pane.is_card())
+            && let Some(watch) = &self.watch
+            && watch.background.is_none()
+            && watch.usage.is_none()
+            && watch.commons.is_none()
+        {
+            let bots: Vec<String> = (watch_card(watch, self.width.max(40), &self.bot).2)
+                .into_iter()
+                .filter_map(|(_, mark)| match mark {
+                    screen::Mark::Link(link) => link
+                        .strip_prefix(&format!("{}task/", screen::BUTTON))
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            if !bots.is_empty() {
+                let last = bots.len() - 1;
+                let pick = watch.pick.map(|pick| pick.min(last));
+                let pick = match (key.code, pick) {
+                    (KeyCode::Up, Some(at)) => Some(at.saturating_sub(1)),
+                    (KeyCode::Up, None) => Some(last),
+                    (KeyCode::Down, Some(at)) => Some((at + 1).min(last)),
+                    (KeyCode::Down, None) => Some(0),
+                    (_, pick) => pick,
+                };
+                if key.code == KeyCode::Enter {
+                    if let Some(at) = pick {
+                        self.open_task(&bots[at]);
+                    }
+                } else if let Some(watch) = &mut self.watch {
+                    watch.pick = pick;
+                }
+                return true;
+            }
+        }
         if self.finding.is_none()
             && let Some(pane) = &mut self.pane
         {
@@ -6958,6 +7034,9 @@ impl App {
                 self.finding = Some(String::new());
                 self.screen.find("");
             }
+            // Every row a click opens, opened or folded from the keys, as
+            // Claude Code's Ctrl+O shows a turn's calls.
+            KeyCode::Char('o') if ctrl => self.open_all(),
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
@@ -8808,10 +8887,18 @@ impl App {
                 pane.set_card(lines, STATUS_KEYS);
                 pane.foot = Some(view.footer());
             } else {
-                let (lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                // The agent picked from the keys leads with `›`, as a
+                // pick in Codex's lists does.
+                if let Some(&(row, _)) = watch.pick.and_then(|pick| marks.get(pick))
+                    && let Some(first) = lines.get_mut(row).and_then(|line| line.spans.first_mut())
+                {
+                    *first = Span::raw("›").bold();
+                    pane.screen.keep_in_view(row, 2);
+                }
                 let keys = match any_resolved && watch.resolved {
-                    true => "r hides resolved · esc closes",
-                    false => STATUS_KEYS,
+                    true => "↑↓ pick · enter open · r hide resolved · esc close",
+                    false => PICK_KEYS,
                 };
                 pane.set_card_marked(lines, marks, keys);
             }
@@ -9496,6 +9583,9 @@ impl App {
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc closes";
+
+/// What the title row says the keys do on `/status` itself.
+const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; whether any task in it
@@ -12489,6 +12579,7 @@ mod tests {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         };
         // A named lead's window: its own row opens nothing, and the
         // folder's other lead opens by its own name, not its label.
@@ -12650,6 +12741,60 @@ mod tests {
         assert!(app.composer_mouse(&mouse(drag, prompt::LEAD + 6, 13)));
         let line = |n: usize| lines[..n].iter().map(|l| l.len() + 1).sum::<usize>();
         assert_eq!(app.input.selection(), Some(line(2)..line(3) + 6));
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_opens_every_fold_and_folds_them_again() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.width = 80;
+        let start = |app: &mut App, name: &str| {
+            let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
+            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+        };
+        start(&mut app, "calc.add");
+        start(&mut app, "calc.neg");
+        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+        let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_o)).await;
+        let open = drawn(&mut app);
+        assert_eq!(open[0], "• Messaged calc.add and calc.neg ▾");
+        assert!(open.len() > 1, "{open:?}");
+        app.key(Event::Key(ctrl_o)).await;
+        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+    }
+
+    #[tokio::test]
+    async fn status_picks_an_agent_from_the_keys() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |name: &str| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "working".into(),
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![row("add"), row("neg")],
+            read: Instant::now(),
+            lookout: String::new(),
+            resolved: false,
+            background: None,
+            usage: None,
+            commons: None,
+            picked: None,
+            pick: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let pick = |app: &App| app.watch.as_ref().unwrap().pick;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(0));
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(1), "the last stays picked");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(pick(&app), Some(0));
     }
 
     #[tokio::test]
