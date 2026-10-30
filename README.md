@@ -208,7 +208,10 @@ Anthropic, OpenAI or OpenRouter key, or Bedrock with your AWS profile) and
 which model new projects use. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
 which Sonny applies to the daemon and everything else it starts, so nothing
-goes in your shell profile. Bots search the web where their provider offers
+goes in your shell profile. Tool shells never get the keys the daemon's
+providers use; as in Codex, `[shell_environment_policy]` with
+`ignore_default_excludes = false` also leaves out every variable named like
+`*KEY*`, `*SECRET*` or `*TOKEN*`, and `exclude` lists more. Bots search the web where their provider offers
 it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Every
 bot can also read a page with `web_fetch`, which the daemon runs itself. Put
 `web_search = "disabled"` in `config.toml` to leave both out of new bots.

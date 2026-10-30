@@ -16,6 +16,10 @@
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
 //!
+//! [shell_environment_policy]    # what tool shells leave out, as in Codex
+//! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
+//! exclude = ["AWS_*"]           # names to leave out, * and ? wildcards, any case
+//!
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
@@ -63,7 +67,43 @@ pub struct Config {
     /// classifier declined to it, that request alone.
     pub fallbacks: BTreeMap<String, String>,
     pub judge: Judge,
+    pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
+}
+
+/// What Codex's default excludes leave out when they apply.
+pub const DEFAULT_EXCLUDES: [&str; 3] = ["*KEY*", "*SECRET*", "*TOKEN*"];
+
+/// Codex's `[shell_environment_policy]` excludes: variables of the daemon's
+/// environment that no tool shell gets, past the provider keys it always
+/// withholds. A daemon takes them when it starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShellEnvironmentPolicy {
+    /// False also leaves out `DEFAULT_EXCLUDES`; true, Codex's default,
+    /// keeps them.
+    pub ignore_default_excludes: bool,
+    /// Names to leave out, with `*` and `?` wildcards, in any case.
+    pub exclude: Vec<String>,
+}
+
+impl Default for ShellEnvironmentPolicy {
+    fn default() -> Self {
+        ShellEnvironmentPolicy {
+            ignore_default_excludes: true,
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl ShellEnvironmentPolicy {
+    /// Every pattern a daemon leaves out of tool shells.
+    pub fn excludes(&self) -> Vec<String> {
+        let defaults = DEFAULT_EXCLUDES
+            .iter()
+            .filter(|_| !self.ignore_default_excludes)
+            .map(|pattern| (*pattern).to_owned());
+        defaults.chain(self.exclude.iter().cloned()).collect()
+    }
 }
 
 /// Codex's `web_search` modes this runtime serves. Codex's `cached`, an
@@ -383,6 +423,7 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
+            "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
@@ -414,6 +455,25 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
+            }
+            if name == "shell_environment_policy" {
+                let policy = &mut config.shell_environment_policy;
+                if key == "ignore_default_excludes" {
+                    policy.ignore_default_excludes = value
+                        .as_bool()
+                        .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                    continue;
+                }
+                let invalid = || format!("{name}.{key} must be a list of names");
+                let patterns = value.as_array().ok_or_else(invalid)?;
+                policy.exclude = patterns
+                    .iter()
+                    .map(|pattern| match pattern.as_str() {
+                        Some(pattern) if !pattern.trim().is_empty() => Ok(pattern.to_owned()),
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
+                continue;
             }
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
@@ -827,6 +887,46 @@ mod tests {
             (
                 "[sonny.mcp_servers.\"a b\"]\ncommand = \"a\"",
                 "sonny.mcp_servers.a b: a name is 1 to 64 letters, digits, _ or -",
+            ),
+        ] {
+            assert_eq!(parse(text).unwrap_err(), error, "{text}");
+        }
+    }
+
+    #[test]
+    fn shell_excludes_are_codex_s_and_off_by_default() {
+        assert!(
+            Config::default()
+                .shell_environment_policy
+                .excludes()
+                .is_empty()
+        );
+        let config = parse("[shell_environment_policy]\nexclude = [\"AWS_*\"]\n").unwrap();
+        assert_eq!(config.shell_environment_policy.excludes(), ["AWS_*"]);
+        let config = parse(
+            "[shell_environment_policy]\nignore_default_excludes = false\nexclude = [\"AWS_*\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.shell_environment_policy.excludes(),
+            ["*KEY*", "*SECRET*", "*TOKEN*", "AWS_*"]
+        );
+        for (text, error) in [
+            (
+                "[shell_environment_policy]\nexclude = \"AWS_*\"",
+                "shell_environment_policy.exclude must be a list of names",
+            ),
+            (
+                "[shell_environment_policy]\nexclude = [\" \"]",
+                "shell_environment_policy.exclude must be a list of names",
+            ),
+            (
+                "[shell_environment_policy]\nignore_default_excludes = \"no\"",
+                "shell_environment_policy.ignore_default_excludes must be true or false",
+            ),
+            (
+                "[shell_environment_policy]\ninherit = \"core\"",
+                "unknown key shell_environment_policy.inherit",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
