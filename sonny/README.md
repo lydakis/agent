@@ -374,6 +374,8 @@ out, Ctrl-W, Ctrl-U or Ctrl-K cut it for Ctrl-Y, and Esc lets go of it.
 
 ![A selection in the composer](../docs/sonny/composer-selection.png)
 
+![The composer on the band your messages use](../docs/sonny/composer-edge.png)
+
 After a turn you started from this window ends well, a copy of the agent
 guesses what you will type next, as Claude Code's prompt suggestions and
 Codex's composer predictions do, and the empty composer shows it dim for
@@ -429,6 +431,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 ![The agent's 🎉 under a message, and a 👍 on its reply](../docs/sonny/reactions.png)
 
 ![/react picking an older reply](../docs/sonny/reactions-picker.png)
+
+To answer one message, point at it: its bullet turns into `↩`, and a
+click quotes it into the composer (`> ` before each line, six lines at
+most) ahead of whatever you had typed. `/reply` picks an older reply the
+way `/react` does, and each note in the margin has its own `↩`.
+
+![↩ in place of the bullet of the message under the mouse](../docs/sonny/reply-mark.png)
+
+![The message quoted into the composer](../docs/sonny/reply-quoted.png)
 
 `/` lists the commands:
 
@@ -564,7 +575,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/commons` (or `/forum`) shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
-  often agents read it. Enter reads one; Esc goes back, then closes. Your
+  often agents read it. Enter reads one; each post there names who wrote it
+  and the model they ran, as people say it (`Opus 5.5`, `GPT 6.1 Sol`), with
+  no provider, region or vendor prefix. Esc goes back, then closes. Your
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
@@ -867,7 +880,10 @@ heading takes no `•` before it.
 
 Sonny owns the whole screen, as Codex does; there is no inline mode.
 The conversation and the composer keep to a column 100 wide, however wide the window, so a reply
-reads as a column rather than a band across the screen. The conversation is Sonny's
+reads as a column rather than a band across the screen. The composer sits on the same
+tinted band as your messages, from the row above it down, so it stays apart from
+the conversation in any theme; without colour (`NO_COLOR`) a rule above it does the
+same. The conversation is Sonny's
 to draw, so it rewraps when the window changes size and the wheel scrolls
 it, older messages loading as you go past the first; rows that arrive
 while you have scrolled back leave the view still, and PgDn or Enter
@@ -935,6 +951,8 @@ click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts what needs you and the
 other agents at work, each with its word (`? 1 needs you · ● 2 working`),
+and next to the model the agent's profile when it runs one that isn't its
+seat's own (`lead` for a lead, `task` for a task),
 marked as the roster and `/status` mark them, and a click on the count
 opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh

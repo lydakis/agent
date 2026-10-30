@@ -607,6 +607,18 @@ impl Margin {
         self.kept.notes.iter().find(|note| note.id == id)
     }
 
+    /// A note as a reply quotes it: its title, then what it says when the
+    /// agent wrote it out, or the file it shows.
+    pub fn quoted(&self, id: &str) -> Option<String> {
+        let note = self.note(id)?;
+        let said = match &note.body {
+            Body::Markdown(text) | Body::Read { text, .. } => text.clone(),
+            Body::File(path) => path.clone(),
+            _ => String::new(),
+        };
+        Some(format!("✎ {}\n{said}", note.title).trim_end().to_owned())
+    }
+
     /// Whether it holds no note and no plan.
     pub fn is_empty(&self) -> bool {
         self.kept.notes.is_empty() && self.plan.is_empty()
@@ -1033,8 +1045,8 @@ fn cut(text: &str, most: usize) -> &str {
 /// it, and its buttons on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
     let right = match note.opens {
-        Some(_) => "↗  ↑  × ",
-        None => "↑  × ",
+        Some(_) => "↗  ↩  ↑  × ",
+        None => "↩  ↑  × ",
     };
     let tail = match live {
         true => " live",
@@ -1059,12 +1071,22 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
         spans.extend([Span::raw("↗").fg(Color::Cyan), Span::raw("  ")]);
         buttons.push((opens, opens + 1, format!("{BUTTON}task/{agent}")));
     }
-    let up = opens + 3 * u16::from(note.opens.is_some());
-    spans.extend([Span::raw("↑").dim(), Span::raw("  "), Span::raw("×").dim()]);
+    // ↩ answers it, quoted where the person writes, as a message's own
+    // mark does.
+    let reply = opens + 3 * u16::from(note.opens.is_some());
+    let up = reply + 3;
+    spans.extend([
+        Span::raw(crate::screen::REPLY).dim(),
+        Span::raw("  "),
+        Span::raw("↑").dim(),
+        Span::raw("  "),
+        Span::raw("×").dim(),
+    ]);
     buttons.extend([
         (0, opens.saturating_sub(1), format!("{BUTTON}jump/{id}")),
         (up, up + 1, format!("{BUTTON}jump/{id}")),
         (up + 3, up + 4, format!("{BUTTON}close/{id}")),
+        (reply, reply + 1, format!("{BUTTON}reply-note/{id}")),
     ]);
     (Line::from(spans), buttons)
 }
@@ -1653,6 +1675,8 @@ mod tests {
         assert_eq!(at(buttons[1].0), Some('↑'));
         assert_eq!(at(buttons[2].0), Some('×'));
         assert!(buttons[2].2.ends_with("close/repro"));
+        assert_eq!(at(buttons[3].0), Some('↩'));
+        assert!(buttons[3].2.ends_with("reply-note/repro"));
         assert!(lines.iter().any(|line| line.to_string().contains("one")));
     }
 
@@ -1671,7 +1695,7 @@ mod tests {
             (lines[1].to_string(), buttons.unwrap())
         };
         let (head, opened) = buttons(&mut margin);
-        assert!(head.ends_with("↗  ↑  ×"), "{head}");
+        assert!(head.ends_with("↗  ↩  ↑  ×"), "{head}");
         let cols: Vec<char> = head.chars().collect();
         assert_eq!(cols[opened[0].0 as usize], '↗');
         assert_eq!(opened[0].2, format!("{BUTTON}task/shop.wire"));
