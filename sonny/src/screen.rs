@@ -2487,6 +2487,22 @@ mod tests {
     }
 
     #[test]
+    fn another_card_shown_from_its_top_drops_the_kept_scroll() {
+        let lines: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 10, 5);
+        let area = Rect::new(0, 0, 10, 5);
+        let mut buf = Buffer::empty(area);
+        screen.show_row(10, 0);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "row 10");
+        let other: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("post {i}"))).collect();
+        screen.replace_marked(other, Vec::new());
+        screen.show_row(0, 0);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "post 0");
+    }
+
+    #[test]
     fn a_pictures_rows_are_cut_at_the_edge_not_wrapped() {
         let cells: String = std::iter::repeat_n(crate::image::PLACEHOLDER, 30).collect();
         let picture = Line::from(vec![Span::raw("  "), Span::raw(cells)]);

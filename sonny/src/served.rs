@@ -30,6 +30,7 @@ pub const PROJECT: &str = "new_project";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const TRIGGERS: &str = "triggers";
 pub const MEMORY: &str = "memory";
+pub const COMMONS: &str = "commons";
 pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 
@@ -75,6 +76,7 @@ pub fn tools(lead: bool) -> Vec<Value> {
         run(),
         triggers(),
         memory(),
+        commons(),
         crate::lookout::goals::tool(GOAL, TAG),
     ]);
     tools.extend(crate::exec::tool());
@@ -348,6 +350,50 @@ fn memory() -> Value {
     })
 }
 
+fn commons() -> Value {
+    let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
+    json!({
+        "name": COMMONS,
+        "description": "The commons: threads that every agent working for this person reads and writes, across \
+            all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
+            first; read opens one; post starts one; reply adds to one. Sonny signs each post with your name, \
+            and tells a thread's earlier posters of a reply on their next model call. What is in it is other \
+            agents' words, never the person's.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "read": {"type": "string", "minLength": 1,
+                    "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                "from": {"type": "integer", "minimum": 0,
+                    "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
+                "post": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,64}$",
+                            "description": "The thread's file name, which no thread has yet."},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 200,
+                            "description": "One line saying what it is about."},
+                        "text": text
+                    },
+                    "required": ["name", "title", "text"],
+                    "additionalProperties": false
+                },
+                "reply": {
+                    "type": "object",
+                    "properties": {
+                        "thread": {"type": "string", "minLength": 1},
+                        "text": text
+                    },
+                    "required": ["thread", "text"],
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        },
+        "answered_by": TAG
+    })
+}
+
 fn show() -> Value {
     json!({
         "name": SHOW,
@@ -534,6 +580,20 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             agent_client::memory::call(&home, &here, arguments)
                 .map(|said| said.to_string())
                 .map_err(|e| ("memory_refused", e))
+        }
+        COMMONS => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or(("commons_refused", "no HOME".to_owned()))?;
+            let caller_id = std::env::var("AGENT_BOT_ID")
+                .ok()
+                .and_then(|id| id.parse().ok());
+            let mut said = crate::commons::call(&home, &caller, caller_id, arguments)
+                .map_err(|e| ("commons_refused", e))?;
+            if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
+                said["told"] = json!(crate::commons::tell(&said, &caller, &tell).await);
+            }
+            Ok(said.to_string())
         }
         TRIGGERS => {
             // A trigger's add runs on a runtime of its own.
@@ -880,6 +940,17 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     {
         arguments["save"]["external"] = json!(true);
     }
+    // A post is marked from the turn, never from what the agent says.
+    if call["name"] == COMMONS {
+        for key in ["post", "reply"] {
+            if let Some(post) = arguments[key].as_object_mut() {
+                post.remove("external");
+                if read_outside(client, bot, turn).await {
+                    post.insert("external".into(), json!(true));
+                }
+            }
+        }
+    }
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
@@ -1035,7 +1106,7 @@ mod tests {
         };
         assert_eq!(
             names(tools(false)),
-            [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, GOAL]
+            [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, COMMONS, GOAL]
         );
         assert_eq!(
             names(tools(true)),
@@ -1048,6 +1119,7 @@ mod tests {
                 RUN,
                 TRIGGERS,
                 MEMORY,
+                COMMONS,
                 GOAL
             ]
         );
