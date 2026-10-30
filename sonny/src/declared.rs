@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 /// The most tools a bot may have declared, and the most bytes they take,
 /// as the daemon counts them.
-const MAX_DECLARED: usize = 16;
+const MAX_DECLARED: usize = 32;
 const DECLARED_BYTES: usize = 64 * 1024;
 
 /// Sonny's tools, as it declares them on a lead, or on another bot.
@@ -156,7 +156,7 @@ mod tests {
         let auto = json!({"gates": [{"tag": "auto", "tools": ["shell"]}]});
         assert!(names(declare(&auto, true).unwrap()).contains(&"run_in_pane".to_owned()));
         // A bot whose own tools leave no room keeps them as they are.
-        let full: Vec<Value> = (0..14)
+        let full: Vec<Value> = (0..30)
             .map(|n| {
                 json!({"name": format!("t{n}"), "description": "d",
                 "parameters": {"type": "object"}, "result": "ok"})
