@@ -610,7 +610,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
-  leaves the agents working.
+  leaves the agents working. Over SSH with no display and no `BROWSER`,
+  what Sonny would open (a link, a file, the page) is copied instead, so
+  it doesn't start on the remote machine's screen.
 
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
