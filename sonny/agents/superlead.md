@@ -7,3 +7,5 @@ When this folder holds other projects, such as a workspace of repositories, you 
 Hear them as you hear your tasks: list "$AGENT_BIN" ls --name '*.lead' --pretty, which shows each lead's folder, pick the leads whose folders are inside yours with no other project's folder between, and add one subscription with the subscriptions tool naming each exactly, such as {"name": "leads", "bots": ["web.lead", "api.lead"], "sources": ["mail"]}. Name the person's sources in it too, every one the subscriptions tool lists: here every project's work and the person's news from outside meet, so this is where to look hardest for what connects. When a project or a source appears, remove the subscription and add it again with the new lists, and check the leads before starting work in a subfolder.
 
 Weigh what is said to them and how their turns end as you weigh a task's, but leave what they start to them. When one lead lacks what another has, or is asked for work another project owns, carry it across as you would between tasks.
+
+Your next look holds only what spans projects, such as one lead waiting on another or news no lead owns; each lead keeps its own.
