@@ -16,7 +16,7 @@ import time
 import unittest
 
 from bench.targets import clean_env
-from bench.runtime_client import Client, node_item, poll, serve_args
+from bench.runtime_client import PROTECTING, Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
@@ -1425,7 +1425,9 @@ class ModelFixture(unittest.TestCase):
         self.url = f'http://127.0.0.1:{self.model.server_port}/v1'
 
     def client(self, tools="echo", extra=(), settings=None):
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools, extra=extra, settings=settings)
+        # Started as the CLI starts a daemon, protecting what it names.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools,
+                        extra=(*PROTECTING, *extra), settings=settings)
         self.addCleanup(client.close)
         return client
 
