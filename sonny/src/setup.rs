@@ -754,7 +754,22 @@ fn backup() -> Result<bool, String> {
     if url.is_empty() {
         return Ok(false);
     }
-    crate::home::set_up(&places, Some(&url)).map(|()| true)
+    let file = agent_client::config::path().ok_or("set HOME")?;
+    let chosen = agent_client::config::read(&file)?;
+    let done = crate::home::set_up(&places, Some(&url));
+    // A backup restored over this config brings its MCP servers and
+    // efforts; the provider and model just chosen, whose keys are here, stay.
+    let now = agent_client::config::read(&file)?;
+    for (key, was, is) in [
+        ("provider", chosen.provider, now.provider),
+        ("model", chosen.model, now.model),
+    ] {
+        if let Some(was) = was.filter(|was| Some(was) != is.as_ref()) {
+            save(&file, Some((key, &was)))?;
+            println!("{DIM}Kept {key} {was}, chosen here.{RESET}");
+        }
+    }
+    done.map(|()| true)
 }
 
 /// What a refusal to list asks of the person, where Sonny knows.
