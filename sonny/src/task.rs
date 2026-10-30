@@ -109,6 +109,23 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         }
         Err(error)
     };
+    // A worktree's files come from commits a task can write, which may
+    // make the lead's subfolder a link out of it: the task would then work
+    // wherever it leads, with the sandbox's leave to write there.
+    if let Undo::Worktree { path, .. } = &place.undo
+        && let (Ok(dir), Ok(top)) = (
+            std::fs::canonicalize(&place.dir),
+            std::fs::canonicalize(path),
+        )
+        && !dir.starts_with(&top)
+    {
+        let error = format!(
+            "{} leads out of the task's worktree, to {}",
+            place.dir.display(),
+            dir.display()
+        );
+        return failed(&place, false, error);
+    }
     // The folder's setup script, run in the task's own folder, as for a
     // worktree; a task in the lead's folder has nothing to set up. A fork's
     // files are what a task wrote, so setup, which runs outside any

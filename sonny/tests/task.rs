@@ -420,6 +420,34 @@ fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
 }
 
 #[test]
+fn a_fork_whose_files_lead_out_of_its_worktree_starts_nothing() {
+    let lab = Lab::new("fork-out");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    // A task's commit, as any task can write one, makes the lead's
+    // subfolder a link to the home.
+    let source = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::remove_dir_all(source.join("src")).unwrap();
+    std::os::unix::fs::symlink(&lab.home, source.join("src")).unwrap();
+    snapshot(&lab, &source, 12, 77);
+    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
+        "workspace": source}]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    let (ok, err) = lab.tool(
+        &lab.repo.join("src"),
+        "start_task",
+        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
+        false,
+    );
+    assert!(
+        !ok && err.contains("leads out of the task's worktree"),
+        "{err}"
+    );
+    assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
+    assert!(!lab.scratch.join("run.log.fork").exists());
+}
+
+#[test]
 fn a_task_forked_from_another_s_turn_gets_its_files_then_in_a_worktree_of_its_own() {
     let lab = Lab::new("fork");
     let (ok, said) = lab.task(false, false);
