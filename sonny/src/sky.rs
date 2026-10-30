@@ -236,6 +236,8 @@ pub struct View {
     order: Vec<(usize, usize)>,
     live: bool,
     paused: bool,
+    /// What each mark, colour and shape means, in the ticker's place.
+    pub legend: bool,
     down: Option<String>,
 }
 
@@ -272,6 +274,7 @@ impl View {
             order: Vec::new(),
             live: false,
             paused: false,
+            legend: false,
             down: None,
         }
     }
@@ -819,8 +822,12 @@ impl View {
         }
         // The list's rows say what the ticker would, agent by agent.
         if cols < SKY_COLS || rows < SKY_ROWS {
-            lines.extend(self.list(now, cols, rows.saturating_sub(2).max(3)));
-            lines.extend(self.ticked(now, cols, false));
+            let under = if self.legend { LEGEND } else { 2 };
+            lines.extend(self.list(now, cols, rows.saturating_sub(under).max(3)));
+            lines.extend(match self.legend {
+                true => legend(true),
+                false => self.ticked(now, cols, false),
+            });
             return lines;
         }
         let sky_rows = rows.saturating_sub(TICKER + 3).clamp(8, cols / 2 + 1);
@@ -943,7 +950,10 @@ impl View {
         }
         lines.extend(sky.lines());
         lines.push(Line::default());
-        lines.extend(self.ticked(now, cols, true));
+        lines.extend(match self.legend {
+            true => legend(false),
+            false => self.ticked(now, cols, true),
+        });
         lines
     }
 
@@ -1092,6 +1102,67 @@ impl View {
         }
         Line::from(spans)
     }
+}
+
+/// The legend's rows, the ticker's room.
+const LEGEND: usize = TICKER;
+
+/// What the sky's marks mean, each drawn as the sky draws it: the states,
+/// the sparks, a tool's twinkle by kind, a commons post and the lines; in
+/// the list, the firefly in the sparks' place.
+fn legend(list: bool) -> Vec<Line<'static>> {
+    let mark = |text: &str, color: Color| Span::raw(text.to_owned()).fg(color);
+    let says = |text: &str| Span::raw(text.to_owned()).dim();
+    let mut lines = vec![Line::from(vec![
+        mark("●", WORKING),
+        says(" working  "),
+        mark("?", NEEDS),
+        says(" needs you  "),
+        mark("✗", FAILED),
+        says(" failed  "),
+        Span::raw("name").bold(),
+        says(" works, "),
+        says("name"),
+        says(" idle"),
+    ])];
+    if list {
+        lines.push(Line::from(vec![
+            mark("✦", TALK).bold(),
+            says(" just talked  "),
+            Span::raw("•"),
+            says(" a while ago  "),
+            says("· quiet"),
+        ]));
+        return lines;
+    }
+    lines.extend([
+        Line::from(vec![
+            Span::raw("•").bold(),
+            says(" a message: yours, or from outside  "),
+            mark("•", TALK),
+            says(" agent to agent"),
+        ]),
+        Line::from(vec![
+            mark("⠤⠤", TOOL),
+            says(" shell  "),
+            mark("⡇", TOOL),
+            says(" files  "),
+            mark("⡁⢈", TOOL),
+            says(" web  "),
+            mark("✳", TOOL),
+            says(" another tool  "),
+            mark("✳", FAILED),
+            says(" a call failed"),
+        ]),
+        Line::from(vec![
+            mark("◯", BOARD),
+            says(" a commons post  "),
+            Span::raw("⠁⠈⠁"),
+            says(" who made whom, who talked"),
+        ]),
+        Line::from(says("A star glows as its agent talks, then fades.")),
+    ]);
+    lines
 }
 
 /// How long ago, as the ticker says it.
@@ -1407,7 +1478,7 @@ const FRAME: Duration = Duration::from_millis(60);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
-const KEYS: &str = "q quit";
+const KEYS: &str = "? legend · q quit";
 
 /// `sonny sky`: the same sky, the whole terminal, on its own, to keep
 /// beside the work as btop is kept: its title and the keys over it, the
@@ -1447,9 +1518,13 @@ pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), S
                 }
                 if let event::Event::Key(key) = event::read().map_err(|e| e.to_string())?
                     && key.kind != event::KeyEventKind::Release
-                    && quits(&key)
                 {
-                    return Ok(());
+                    if quits(&key) {
+                        return Ok(());
+                    }
+                    if key.code == event::KeyCode::Char('?') {
+                        view.legend = !view.legend;
+                    }
                 }
             }
         });
@@ -1492,7 +1567,11 @@ impl ratatui::widgets::Widget for &mut View {
         {
             buf.set_line(area.x + 1, area.y + 2 + at as u16, &line, area.width - 1);
         }
-        let foot = Line::from(format!(" {}", self.footer())).dim();
+        // The footer's own margin, one column less, as the title's.
+        let mut foot = self.footer(width + 1);
+        if let Some(first) = foot.spans.first_mut() {
+            first.content = first.content.replacen(' ', "", 1).into();
+        }
         buf.set_line(area.x, area.bottom() - 1, &foot, area.width);
     }
 }
@@ -1690,7 +1769,7 @@ mod tests {
         assert!((2..29).any(|y| row(y).contains("shop lead")));
         assert_eq!(
             row(29),
-            " 1 agent · 1 working · 0 messages in the last minute"
+            " 1 agent · ● 1 working · 0 messages in the last minute"
         );
         // q, Esc and Ctrl+C leave it; other keys do not.
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2247,6 +2326,26 @@ mod tests {
         assert_eq!(state(&view, "shop.lead"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
+    }
+
+    #[tokio::test]
+    async fn the_legend_takes_the_tickers_place() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
+            .unwrap();
+        view.drain();
+        view.legend = true;
+        let shown = text(&view.card(80, 30));
+        assert!(
+            shown.contains("● working  ? needs you  ✗ failed"),
+            "{shown}"
+        );
+        assert!(shown.contains("⠤⠤ shell  ⡇ files  ⡁⢈ web"), "{shown}");
+        assert!(!shown.contains("Catching up"), "{shown}");
+        let listed = text(&view.card(40, 12));
+        assert!(listed.contains("✦ just talked"), "{listed}");
+        view.legend = false;
+        assert!(text(&view.card(80, 30)).contains("Catching up"));
     }
 
     #[tokio::test]

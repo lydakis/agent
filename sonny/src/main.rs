@@ -7236,6 +7236,14 @@ impl App {
                 match key.code {
                     // Back to the margin from what is over it; the margin closed.
                     KeyCode::Esc => self.close_pane(true),
+                    // `/sky` shows what its marks mean, or the ticker again.
+                    KeyCode::Char('?')
+                        if pane.is_card()
+                            && let Some(view) =
+                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    {
+                        view.legend = !view.legend
+                    }
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -9328,7 +9336,7 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, STATUS_KEYS);
+                pane.set_card(lines, SKY_KEYS);
                 pane.foot = Some(view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
@@ -10041,6 +10049,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
+const SKY_KEYS: &str = "? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";

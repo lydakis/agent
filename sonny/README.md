@@ -579,7 +579,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   shows the state table's mark and colour: working cyan `●`, needs you
   yellow `?` (an ask, or an approval waiting), failed red `✗`; the footer
   counts them the same way. Under 60 columns or 24 rows the sky becomes a
-  list, a firefly per agent and the last it said or was told.
+  list, a firefly per agent and the last it said or was told. `?` swaps the
+  ticker for a legend of every mark, colour and shape.
   `sonny sky` draws the same sky on its own, in the whole terminal, to keep
   in another one beside the work; `q` leaves it, and a daemon that goes is
   followed again once it is back.
@@ -589,6 +590,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   ![/sky with states](../docs/sonny/sky-states.png)
 
   ![/sky in a small pane](../docs/sonny/sky-list.png)
+
+  ![/sky with its legend](../docs/sonny/sky-legend.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns end and what arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with
