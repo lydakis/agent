@@ -23,7 +23,7 @@ Over a Unix socket instead of stdio, with the approver a process of its own:
 
 - `socket`: the `held` arm with this client answering over the socket, the
   baseline for the one below.
-- `judge`: `agent approver` answers with the synthetic model as a general
+- `judge`: `sonny approver` answers with the synthetic model as a general
   judge through the daemon (a fork, a turn, and a deletion per round),
   judging every call low at once.
 
@@ -241,7 +241,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
 
 def run_socket(binary, arm, *, bots, turns):
     """The `held` workload over a Unix socket, answered by this client
-    (`socket`) or by `agent approver` (`judge`)."""
+    (`socket`) or by `sonny approver` (`judge`)."""
     server, url = start()
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / '.local') as temp, \
             tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp') as short:

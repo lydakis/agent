@@ -2,7 +2,7 @@
 
 One socket daemon on a streaming synthetic model, P projects of T tasks
 each (every project's lead subscribed to its tasks, as Sonny does), and the
-companions in a bot's path: `sonny lookout` and `agent approver`. Phases:
+companions in a bot's path: `sonny lookout` and `sonny approver`. Phases:
 
 - idle: the lookout's start (until every lead is seated), RSS and CPU idle;
 - load: every task runs back-to-back turns that stream K deltas MS apart;
