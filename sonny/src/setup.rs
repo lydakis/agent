@@ -35,7 +35,10 @@ pub const STEPS: [Step; 1] = [Step {
     id: "mcp-import",
     what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
     how: "sonny mcp import",
-    done: || crate::mcp_import::here().map_or(true, |found| found.is_empty()),
+    // Done when none is left to bring; one Sonny cannot bring never counts.
+    done: || {
+        crate::mcp_import::here().map_or(true, |found| found.iter().all(|f| f.keys.is_empty()))
+    },
 }];
 
 /// Someone is there to answer.
