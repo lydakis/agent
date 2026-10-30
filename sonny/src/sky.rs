@@ -35,7 +35,6 @@ const LIVE: &[&str] = &[
     "queued",
     "accepted",
     "steered",
-    "message",
     "tool_started",
     "tool_completed",
     "turn_finished",
@@ -90,7 +89,8 @@ struct Spark {
 struct Agent {
     name: String,
     made_by: Option<String>,
-    working: bool,
+    /// The turn it runs, when it runs one.
+    running: Option<i64>,
     /// When it was last lit, and in what colour (none: the person's).
     lit: Option<(Instant, Option<Color>)>,
     twinkle: Option<(Instant, Color)>,
@@ -246,7 +246,7 @@ impl View {
         agent.made_by = (bot["created_by"].as_str())
             .filter(|by| !by.is_empty())
             .map(str::to_owned);
-        agent.working = bot["running_turn"].as_i64().is_some();
+        agent.running = bot["running_turn"].as_i64();
         Some(at)
     }
 
@@ -257,13 +257,18 @@ impl View {
             .filter(|&at| !self.agents[at].gone)
     }
 
+    /// One of the daemon's events: `{cursor, bot, turn, event, data}`,
+    /// what is particular to its kind in `data`.
     fn event(&mut self, event: &Value, now: Instant, live: bool) {
         let Some(name) = event["bot"].as_str() else {
             return;
         };
+        let data = &event["data"];
         match event["event"].as_str().unwrap_or("") {
             "created" | "forked" => {
-                if let Some(at) = self.seat(event) {
+                let record = json!({"name": name, "created_by": data["created_by"],
+                    "running_turn": data["running_turn"]});
+                if let Some(at) = self.seat(&record) {
                     self.agents[at].lit = Some((now, None));
                 }
                 return;
@@ -284,12 +289,14 @@ impl View {
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
                 let sent_turn = match kind {
-                    "steered" => event["steer"].as_i64().unwrap_or(turn),
+                    "steered" => data["steer"].as_i64().unwrap_or(turn),
                     _ => turn,
                 };
-                let from = self.sender(event, at);
-                if kind == "accepted" {
-                    self.agents[at].working = true;
+                let from = self.sender(data, at);
+                // Past turns say who talked to whom; whether an agent works
+                // now is the listing's, and live events' after it.
+                if kind == "accepted" && live {
+                    self.agents[at].running = Some(turn);
                     self.agents[at].sender = Some(from);
                 }
                 if !self.sent.insert((name.to_owned(), sent_turn)) {
@@ -311,18 +318,38 @@ impl View {
                         End::Agent(by) => format!("{} → {}", self.short(by), self.short(at)),
                         End::Rim(_) => format!(
                             "{} → {}",
-                            event["origin"].as_str().unwrap_or("outside"),
+                            data["origin"].as_str().unwrap_or("outside"),
                             self.short(at)
                         ),
                     };
                     self.say(now, said);
                 }
             }
-            "message" if live => {
+            "tool_started" if live => {
+                self.agents[at].twinkle = Some((now, TOOL));
+                if data["name"] == "commons" && posted(&data["arguments"]) {
+                    self.agents[at].ripple = Some(now);
+                    let said = format!("{} posted to the commons", self.short(at));
+                    self.say(now, said);
+                }
+            }
+            "tool_completed" if live => {
+                if data["failed"] == true || data["denied"] == true {
+                    self.agents[at].twinkle = Some((now, FAILED));
+                }
+            }
+            // A steer the running turn absorbed finishes as a turn of its
+            // own: only the running turn's end means the agent stopped.
+            "turn_finished"
+                if self.agents[at]
+                    .running
+                    .is_none_or(|running| running == turn) =>
+            {
                 let agent = &mut self.agents[at];
-                agent.lit = Some((now, agent.lit.and_then(|(_, color)| color)));
-                // Words for the person fly back to the middle.
-                if agent.sender == Some(End::Person) && event["role"] != "user" {
+                agent.running = None;
+                // The answer to the person flies back to the middle.
+                if live && agent.sender == Some(End::Person) && data["status"] == "completed" {
+                    agent.lit = Some((now, None));
                     self.sparks.push(Spark {
                         from: End::Agent(at),
                         to: End::Person,
@@ -330,27 +357,6 @@ impl View {
                         color: None,
                     });
                 }
-            }
-            "tool_started" if live => {
-                self.agents[at].twinkle = Some((now, TOOL));
-                if event["name"] == "commons"
-                    && matches!(
-                        event["arguments"]["action"].as_str(),
-                        Some("post" | "reply")
-                    )
-                {
-                    self.agents[at].ripple = Some(now);
-                    let said = format!("{} posted to the commons", self.short(at));
-                    self.say(now, said);
-                }
-            }
-            "tool_completed" if live => {
-                if event["failed"] == true || event["denied"] == true {
-                    self.agents[at].twinkle = Some((now, FAILED));
-                }
-            }
-            "turn_finished" => {
-                self.agents[at].working = false;
                 self.agents[at].sender = None;
             }
             _ => {}
@@ -359,11 +365,11 @@ impl View {
 
     /// Who sent a prompt: another agent, a client named by its origin
     /// (in from the rim), or the person.
-    fn sender(&self, event: &Value, at: usize) -> End {
-        if let Some(by) = event["from"]["bot"].as_str() {
+    fn sender(&self, data: &Value, at: usize) -> End {
+        if let Some(by) = data["from"]["bot"].as_str() {
             return self.agent(by).map_or(End::Rim(at), End::Agent);
         }
-        match event["origin"].as_str() {
+        match data["origin"].as_str() {
             Some(_) => End::Rim(at),
             None => End::Person,
         }
@@ -601,10 +607,10 @@ impl View {
             {
                 sky.twinkle(agent.at, Ink::Color(color, true));
             }
-            match agent.working || glow > 0.4 {
+            match agent.running.is_some() || glow > 0.4 {
                 true => sky.blob(
                     agent.at,
-                    if agent.working {
+                    if agent.running.is_some() {
                         Ink::Bright
                     } else {
                         Ink::Plain
@@ -620,7 +626,7 @@ impl View {
                 let agent = &self.agents[at];
                 !agent.gone
                     && (agent.root
-                        || agent.working
+                        || agent.running.is_some()
                         || agent.lit.is_some_and(|(lit, _)| {
                             now.duration_since(lit) < Duration::from_secs(4)
                         }))
@@ -634,7 +640,7 @@ impl View {
         });
         for at in named {
             let agent = &self.agents[at];
-            let style = match agent.working {
+            let style = match agent.running.is_some() {
                 true => Style::default().bold(),
                 false => Style::default().add_modifier(Modifier::DIM),
             };
@@ -688,7 +694,7 @@ impl View {
     /// Counts in words: everyone, who works, how many messages a minute.
     pub fn footer(&self) -> String {
         let shown = self.agents.iter().filter(|a| !a.gone);
-        let working = shown.clone().filter(|a| a.working).count();
+        let working = shown.clone().filter(|a| a.running.is_some()).count();
         let count = shown.count();
         format!(
             "{count} {} · {working} working · {} {} in the last minute",
@@ -714,6 +720,18 @@ fn weight(at: usize, children: &[Vec<usize>]) -> usize {
         below.max(1)
     }
     go(at, children, 0)
+}
+
+/// Whether a `commons` call's arguments, a JSON preview that may be cut
+/// short, post or reply.
+fn posted(arguments: &Value) -> bool {
+    let text = arguments.as_str().unwrap_or("");
+    match serde_json::from_str::<Value>(text) {
+        Ok(call) => matches!(call["action"].as_str(), Some("post" | "reply")),
+        Err(_) => ["\"post\"", "\"reply\""]
+            .iter()
+            .any(|action| text.contains(action)),
+    }
 }
 
 /// An agent's label: `shop lead`, `shop lead billing`, or the name after
@@ -1096,12 +1114,12 @@ mod tests {
         let from = json!({"bot": "shop.lead", "turn": 3});
         for kind in ["queued", "accepted"] {
             send.send(Feed::Live(
-                json!({"event": kind, "bot": "shop.login", "turn": 2, "from": from}),
+                json!({"cursor": 1, "event": kind, "bot": "shop.login", "turn": 2, "data": {"from": from}}),
             ))
             .unwrap();
         }
         send.send(Feed::Live(
-            json!({"event": "accepted", "bot": "shop.lead", "turn": 4}),
+            json!({"cursor": 3, "event": "accepted", "bot": "shop.lead", "turn": 4, "data": {}}),
         ))
         .unwrap();
         view.drain();
@@ -1124,13 +1142,14 @@ mod tests {
         send.send(Feed::Bots(vec![json!({"name": "a"}), json!({"name": "b"})]))
             .unwrap();
         send.send(Feed::Past(
-            json!({"event": "accepted", "bot": "b", "turn": 1, "from": {"bot": "a"}}),
+            json!({"event": "accepted", "bot": "b", "turn": 1, "data": {"from": {"bot": "a"}}}),
         ))
         .unwrap();
         view.drain();
         assert!(view.sparks.is_empty());
         assert_eq!(view.talks.len(), 1);
         assert!(view.ticker.is_empty());
+        assert!(view.agents.iter().all(|a| a.running.is_none()));
     }
 
     #[tokio::test]
@@ -1138,12 +1157,12 @@ mod tests {
         let (mut view, send) = view();
         send.send(Feed::Bots(vec![json!({"name": "a"})])).unwrap();
         send.send(Feed::Live(
-            json!({"event": "tool_started", "bot": "a", "turn": 1,
-            "name": "commons", "arguments": {"action": "post"}}),
+            json!({"event": "tool_started", "bot": "a", "turn": 1, "data": {
+            "name": "commons", "arguments": r#"{"action":"post","title":"Flaky tests"}"#}}),
         ))
         .unwrap();
         send.send(Feed::Live(
-            json!({"event": "accepted", "bot": "a", "turn": 2, "origin": "lookout.sources"}),
+            json!({"event": "accepted", "bot": "a", "turn": 2, "data": {"origin": "lookout.sources"}}),
         ))
         .unwrap();
         view.drain();
@@ -1152,6 +1171,61 @@ mod tests {
         let shown = text(&view.card(50, 30));
         assert!(shown.contains("a posted to the commons"), "{shown}");
         assert!(shown.contains("lookout.sources → a"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_steer_finishing_leaves_the_agent_working() {
+        let (mut view, send) = view();
+        send.send(Feed::Bots(vec![json!({"name": "a", "running_turn": 5})]))
+            .unwrap();
+        // The daemon finishes the steer's own turn, then reports it steered.
+        send.send(Feed::Live(
+            json!({"event": "turn_finished", "bot": "a", "turn": 6,
+            "data": {"status": "steered", "into": 5}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.agents[0].running, Some(5));
+        send.send(Feed::Live(
+            json!({"event": "turn_finished", "bot": "a", "turn": 5,
+            "data": {"status": "completed"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.agents[0].running, None);
+    }
+
+    #[tokio::test]
+    async fn a_made_agent_is_seated_from_its_event_and_answers_fly_home() {
+        let (mut view, send) = view();
+        send.send(Feed::Bots(vec![json!({"name": "shop.lead"})]))
+            .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "created", "bot": "shop.cart", "turn": null,
+            "data": {"id": 9, "created_by": "shop.lead", "running_turn": null}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.lead", "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "turn_finished", "bot": "shop.lead", "turn": 1,
+            "data": {"status": "completed"}}),
+        ))
+        .unwrap();
+        view.drain();
+        let cart = view.index["shop.cart"];
+        assert_eq!(view.agents[cart].made_by.as_deref(), Some("shop.lead"));
+        assert_eq!(view.sparks.last().map(|s| s.to), Some(End::Person));
+    }
+
+    #[test]
+    fn a_cut_commons_preview_still_reads_as_a_post() {
+        assert!(posted(&json!(
+            r#"{"action":"reply","thread":"x","text":"lo"#
+        )));
+        assert!(!posted(&json!(r#"{"action":"read","thread":"x"}"#)));
     }
 
     #[test]
