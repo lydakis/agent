@@ -710,6 +710,16 @@ pub fn in_worktree(dir: &Path) -> bool {
     home_dir().is_ok_and(|home| real(dir).starts_with(real(&home.join(".agent/worktrees"))))
 }
 
+/// Whether `top` is the top of one of Sonny's task worktrees itself, whose
+/// git config no task can write, and not a repository made inside one.
+pub fn is_worktree(top: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    home_dir().is_ok_and(|home| {
+        real(top).parent() == Some(&real(&home.join(".agent/worktrees")))
+            && top.join(".git").is_file()
+    })
+}
+
 /// The bot `name` as the daemon lists it.
 fn record(agent: &Path, name: &str) -> Option<Value> {
     let output = Command::new(agent)

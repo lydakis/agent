@@ -64,7 +64,12 @@ fn git(
     let mut command = Command::new("git");
     // The folder's own code never runs here, where the daemon's keys are:
     // no hook, no fsmonitor, no filter, and none of the keys in its
-    // environment.
+    // environment. Its own attributes, which a task writes, pick nothing:
+    // they are read from an empty tree (git 2.40 on; older git reads them
+    // still, but every filter they could pick is off).
+    if let Some(empty) = empty_tree(dir) {
+        command.env("GIT_ATTR_SOURCE", empty);
+    }
     command
         .arg("-C")
         .arg(dir)
@@ -147,6 +152,20 @@ fn unfiltered(dir: &Path) -> Vec<String> {
         })
         .flatten()
         .collect()
+}
+
+/// The empty tree's ID in the repository `dir` is in, by its hash.
+fn empty_tree(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["hash-object", "-t", "tree", "--stdin"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let id = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !id.is_empty()).then_some(id)
 }
 
 /// The top of the git checkout `dir` is in, if it is in one.
@@ -385,11 +404,15 @@ fn gone(bot_id: i64) -> bool {
     (GONE.lock().unwrap_or_else(|e| e.into_inner())).contains(&bot_id)
 }
 
-/// The checkout `dir` is in, and its lock.
+/// The checkout `dir` is in, and its lock: only a task worktree's own,
+/// as a repository a task made inside one has config the task wrote.
 async fn checkout(dir: PathBuf) -> Option<(PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>)> {
     let top = tokio::task::spawn_blocking(move || top(&dir))
         .await
         .ok()??;
+    if !crate::task::is_worktree(&top) {
+        return None;
+    }
     let lock = (CHECKOUTS.lock().unwrap_or_else(|e| e.into_inner()))
         .entry(top.clone())
         .or_default()
@@ -683,6 +706,26 @@ mod tests {
         restore(&top, &snapshot, &copy, "agent/copy").unwrap();
         assert!(!ran.exists());
         assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_folder_s_own_attributes_pick_nothing() {
+        let (dir, top) = repo("attributes");
+        std::fs::write(top.join(".gitattributes"), "*.a text eol=crlf\n").unwrap();
+        std::fs::write(top.join("x.a"), "one\r\ntwo\r\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let kept = Command::new("git")
+            .arg("-C")
+            .arg(&top)
+            .args(["cat-file", "blob", &format!("{}:x.a", snapshot.commit)])
+            .output()
+            .unwrap();
+        assert_eq!(kept.stdout, b"one\r\ntwo\r\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 
