@@ -1356,6 +1356,9 @@ class AnthropicRuntimeTests(unittest.TestCase):
         deltas = [m for m in client.saved if m.get('event') in ('text_delta', 'thinking_delta')]
         self.assertEqual([d['event'] for d in deltas][:2], ['thinking_delta', 'thinking_delta'])
         self.assertEqual(''.join(d['text'] for d in deltas if d['event'] == 'text_delta'), 'echo:shared')
+        # Each call's message is an item of its own, numbered on through the turn.
+        items = [d['item'] for d in deltas]
+        self.assertEqual((items, len(set(items))), (sorted(items), 2))
         usage = [m for m in client.saved if m.get('event') == 'usage']
         self.assertEqual(len(usage), 2)
         # Each call records when it was sent, in epoch milliseconds.
@@ -2201,6 +2204,34 @@ class RuntimeTests(ModelFixture):
                 self.assertFalse(sentinel in json.dumps(item))
         self.assertEqual(len(self.model.auth_checks), 4)
         self.assertTrue(all(self.model.auth_checks))
+
+    def test_config_shell_excludes_leave_variables_out_of_tool_shells(self):
+        store = self.path / 'state.sqlite'
+        common = ['--store', str(store), '--provider', f'openai=responses,{self.url}',
+                  '--model', 'openai/synthetic-model', '--tools', 'shell']
+        env = {**clean_env(), 'HOME': str(self.path), 'SYNTHETIC_API_KEY': 'synthetic-a',
+               'GITHUB_TOKEN': 'synthetic-b', 'AWS_PROFILE': 'synthetic-c', 'KEEP_ME': 'kept'}
+        shown = 'shell:printf "%s:%s:%s:%s" "${SYNTHETIC_API_KEY-unset}" "${GITHUB_TOKEN-unset}" ' \
+                '"${AWS_PROFILE-unset}" "$KEEP_ME" > seen'
+
+        def seen(bot):
+            run = subprocess.run([str(self.binary), 'run', *common, '--new', '--bot', bot, shown],
+                                 env=env, capture_output=True, text=True, timeout=30, cwd=self.path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return (self.path / 'seen').read_text()
+
+        def shutdown():
+            subprocess.run([str(self.binary), 'shutdown', '--store', str(store)],
+                           env=env, capture_output=True, timeout=10)
+        self.addCleanup(shutdown)
+        # As in Codex, nothing past the providers' keys is left out by default.
+        self.assertEqual(seen('Bob'), 'synthetic-a:synthetic-b:synthetic-c:kept')
+        shutdown()
+        (self.path / '.agent').mkdir()
+        (self.path / '.agent/config.toml').write_text(
+            '[shell_environment_policy]\nignore_default_excludes = false\nexclude = ["aws_*"]\n')
+        # A daemon started after takes the defaults and the listed names.
+        self.assertEqual(seen('Ann'), 'unset:unset:unset:kept')
 
     def test_history_pages_recover_an_omitted_long_message(self):
         client = self.client(tools='echo,history', settings={'context_items': 6})

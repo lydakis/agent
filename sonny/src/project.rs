@@ -772,6 +772,13 @@ async fn find(client: &Client, bot: &str) -> Result<Option<Value>, String> {
 /// The model of the agent made last, from any client: what the person
 /// chose most recently when Sonny has not run before.
 async fn newest(client: &Client) -> Result<Option<String>, String> {
+    // Only a provider the daemon runs: after a switch, an older bot's
+    // model would fail to open.
+    let stats = client
+        .request("stats", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let runs = |provider: &str| stats["providers"].get(provider).is_some();
     let mut after = Value::Null;
     let mut best: Option<(i64, String)> = None;
     loop {
@@ -784,6 +791,7 @@ async fn newest(client: &Client) -> Result<Option<String>, String> {
             if best.as_ref().is_none_or(|(b, _)| id > *b)
                 && let (Some(provider), Some(model)) =
                     (bot["provider"].as_str(), bot["model"].as_str())
+                && runs(provider)
             {
                 best = Some((id, format!("{provider}/{model}")));
             }

@@ -91,7 +91,7 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'the lead was not woken')
         self.assertIn('- calc.fix: turn:calc.fix/', woke)
         self.assertIn(' completed, asked by tasks, and replied:\n  > ', woke)
-        self.assertIn("Lines marked > are a task's own reply", woke)
+        self.assertIn("Lines marked > are a task's own words", woke)
         self.assertIn('If nothing, end your turn with an empty reply', woke)
         # The other project's lead heard nothing of calc's task, nor of its
         # own, since nothing subscribed it.

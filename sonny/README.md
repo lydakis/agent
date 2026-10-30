@@ -3,6 +3,8 @@
 A terminal client for the daemon that lays its work out in Rex, Herdr or
 cmux. It speaks the daemon's socket protocol through `agent-client`; nothing
 in the daemon or CLI knows it exists.
+[FEATURES.md](FEATURES.md) lists every feature Sonny has had, what became of
+it and why.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
@@ -73,12 +75,26 @@ or not a window is open. Settings go in
 `--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
 agent's when none is named) and the efforts below. When no provider is named
 and no key is set, the first `sonny` in a terminal asks for one, as Codex and
-Claude Code ask for a sign-in: a ChatGPT plan (signed in with `agent login
-chatgpt`), an Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS
-profile. A new project's model is `--model`, else the project file's or the
-role's, else `AGENT_MODEL`, else the config's `model`, else the newest
-agent's; with none, Sonny lists what the providers offer and keeps the pick
-as `model`. Either step also suggests efforts, `[sonny] lead_effort =
+Claude Code ask for a sign-in, in a list picked with the arrow keys: a
+ChatGPT plan (signed in with `agent login chatgpt`), Bedrock, or an
+Anthropic, OpenAI or OpenRouter key. It first looks at what the machine has
+and offers that first: a ChatGPT sign-in of its own or Codex's (only that
+there is one), and the AWS profiles in `~/.aws/config` and
+`~/.aws/credentials`, which Bedrock then offers by name with their regions.
+A new project's model is `--model`, else the project file's or the role's,
+else `AGENT_MODEL`, else the config's `model`, else the newest agent's; with
+none, Sonny lists what the providers offer, ranked, the first marked
+recommended so Enter takes it: models no agent runs on (embeddings, speech,
+images, realtime) and dated snapshots of a listed name are left out, and
+Bedrock's global inference profiles come first. A provider that will not
+list says how to fix it (`aws sso login --profile NAME` for an expired AWS
+session), and Enter lists again. The pick is kept as `model`, and a new
+`config.toml` starts with comments saying what each setting does. Setup
+ends with what it chose and with any tool agents need that is missing
+(bubblewrap for the sandbox on Linux, ripgrep), with the command that
+installs it. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
+up (in your home or this folder), setup offers them too, all ticked, as
+`sonny mcp import` does. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
@@ -288,7 +304,8 @@ the lead's from its next turn. A thread offers only its bot's provider family,
 since a bot changes model only within it, and a task's thread keeps the model
 its lead gave the task.
 
-Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
+Enter sends (and steers a running turn), Tab while a turn runs queues what
+you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
 keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
@@ -299,6 +316,8 @@ last of those took. Shift-Enter needs a terminal that speaks the kitty
 keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
 WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
 or Ctrl-J still start a line.
+
+![A message queued with Tab waits under the running turn](../docs/sonny/tab-queues.png)
 
 On the full screen the mouse edits the composer too, as in Codex: a click
 puts the cursor there, a drag selects (and copies), two clicks select a word
@@ -463,6 +482,18 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
   removes it; the subscription Sonny keeps for a lead's tasks stays. The
   footer says `↻ 2 in background` while the window's agent has any.
+  What failed is listed first, with a red `✗` and the error: a trigger
+  whose fire failed (one that ended on it stays listed until `d` removes
+  it), or whose fire went out and whose turn then failed (as
+  when the machine was offline or a login expired), and a server the
+  nightly memory cleanup could not read. Your own agents' failures, such as
+  the memory cleanup's, show in every window. The footer then says
+  `✗ 1 failed` in red, left of the `↻`, and a click on either opens
+  `/background`. An agent sees the same in its triggers tool, whose rows
+  say how the turn their last fire sent ended.
+
+  ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
+  ![The footer: ✗ 2 failed in red, left of ↻ 1 in background](../docs/sonny/footer-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/usage` shows, in the pane beside the conversation,
@@ -475,8 +506,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   A turn counts where it started. It reads again every minute.
 
   ![/usage in the pane](../docs/sonny/usage.gif)
+- `/commons` (or `/forum`) shows, in the pane beside the conversation, the
+  threads the agents of every project share in the commons, newest first,
+  each with who started it, how many posts it has, who wrote last and how
+  often agents read it. Enter reads one; Esc goes back, then closes. Your
+  reading there is not counted as an agent's.
+
+  ![/commons in the pane](../docs/sonny/commons.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
-  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
+  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
@@ -520,7 +558,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   lead does not wait: it goes on with the option it recommends when that
   can be undone, or ends its turn. Open questions are read from the
   history Sonny replays (its `ask` calls not yet answered), so one asked
-  while Sonny was closed is answered the same way when it opens.
+  while Sonny was closed is answered the same way when it opens. A yellow
+  `?` starts it and a muted bar runs down its left side, setting it apart
+  from the replies around it with or without color. A task
+  asks the same way: its lead hears the question in its task updates
+  (`shop.wire asks you`), the task's row reads `needs you`, and a click on
+  it opens the task in the pane, where an option's click answers the task
+  itself.
+
+  ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
@@ -546,7 +592,7 @@ that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
-and a call answered with an error says why under it. A task's own
+and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
 `resolve_task` is read from its history: its last turn resolved it. The
 lead's Sonny keeps each task the lead resolved beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a
@@ -598,9 +644,11 @@ Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are
 answered.
 
-The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, a tool call is one `• Ran …` line with a
+The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, each message the bot sends its own block, as
+it keeps them (two in one answer no longer run together), a tool call is one `• Ran …` line with a
 short `└` look at its result, edits show as a diff, and a status row says
-`Working (12s • esc to interrupt)`. The steps on the way, calls and what
+`Working (12s • esc to interrupt)`, with `• tab to queue` once you start
+writing. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
 
@@ -661,11 +709,26 @@ and Ctrl+] shows it again.
 
 Sonny keeps to the terminal's own 16 colors, so a theme sets their
 shades, and each means one thing: magenta is you (your `›`), blue the
-agents (task names, who sent a message, the lead in the footer, the
-headings of a reply), green what worked (a call's dot, the git branch),
-yellow what needs you, red what failed, and cyan code and work under
-way. The context in the footer turns from green to yellow at 100k
-tokens and to red at 200k.
+agents (task names, who sent a message, the lead in the footer), green
+what worked (a call's dot, `+` lines, the git branch), yellow what needs
+you (a question's `?`, an approval's `⏸`), red what failed (`✗`, `-`
+lines), and cyan code and work under way. Color only repeats what a
+mark already says: each state has its own shape (`✓ ✗ ● ◌ ?`) and a
+diff its `-` and `+`, so the screen reads with `NO_COLOR` set, which
+Sonny honors (no color, bold and dim kept), and to an eye that does
+not tell red from green. Text is the theme's own color; hues go on
+marks and names. Markdown is prose: headings bold, with their `#` marks
+dim to show the level, code in cyan, links underlined, and the marks
+of lists, quotes and rules dim. Dim text is a gray Sonny works out from
+the theme's own foreground and background, as the terminal reports them
+at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
+the theme allows; a terminal that does not say keeps its own dim. Diffs
+tint from the same background and the theme's own red and green. The
+context in the footer turns from green to yellow at 100k tokens and to
+red at 200k.
+
+![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
+![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
 
 ![The task calc.neg opened in the pane beside the lead's conversation](../docs/sonny/task-in-pane.png)
 
@@ -718,8 +781,9 @@ the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are.
 
 The pane's place, when nothing else is open there, is the margin. Its
-first row is a glance at what runs for the agent: `↻` for its triggers
-and subscriptions (a click opens `/background`), and its context, each
+first row is a glance at what runs for the agent: a red `✗` for what
+failed in the background and `↻` for its triggers and subscriptions (a
+click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts the other agents at work
 (cyan `●`) and what needs you (yellow `●`), and a click on the count
@@ -734,7 +798,9 @@ with its next call. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
-its own, and stays once the task is gone. A file, `/status`, `/background` or a side
+its own, and stays once the task is gone. A note with `opens: "AGENT"`,
+such as the lead's to-do for a task's question, gets a `↗` that opens that
+agent in the pane, where you answer it. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
 opens by itself when the agent puts up or changes a note, once the window
@@ -778,6 +844,8 @@ pictures, and code in syntax colors.
 ![The lead took its only note away: the margin stays open, empty, until Esc or /margin](../docs/sonny/margin-stays-once-empty.png)
 
 ![Closed with /margin, then the lead put up a new note: the margin opened again with it](../docs/sonny/margin-opens-again.png)
+
+![The lead heard that wire asks you and keeps it on your list in the margin, its ↗ ready to open wire](../docs/sonny/margin-opens-task.png)
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 

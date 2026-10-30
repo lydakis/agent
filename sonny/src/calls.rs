@@ -23,6 +23,51 @@ pub struct Said {
     pub output: Option<String>,
 }
 
+/// What a call that failed tried to do: its past-tense verb turned to
+/// `Couldn't` and the verb's base, `Started fix` read as `Couldn't start
+/// fix`, so a refused call never reads as done.
+pub fn attempted(verb: &str) -> String {
+    let (first, rest) = verb.split_once(' ').unwrap_or((verb, ""));
+    let base = match first {
+        "Added" => "add",
+        "Answered" => "answer",
+        "Asked" => "ask",
+        "Checked" => "check",
+        "Cleaned" => "clean",
+        "Cleared" => "clear",
+        "Discarded" => "discard",
+        "Fired" => "fire",
+        "Followed" => "follow",
+        "Forked" => "fork",
+        "Indexed" => "index",
+        "Interrupted" => "interrupt",
+        "Listed" => "list",
+        "Looked" => "look",
+        "Messaged" => "message",
+        "Moved" => "move",
+        "Opened" => "open",
+        "Pruned" => "prune",
+        "Queued" => "queue",
+        "Read" => "read",
+        "Removed" => "remove",
+        "Resolved" => "resolve",
+        "Saved" => "save",
+        "Scheduled" => "schedule",
+        "Started" => "start",
+        "Steered" => "steer",
+        "Subscribed" => "subscribe",
+        "Typed" => "type",
+        "Unsubscribed" => "unsubscribe",
+        "Updated" => "update",
+        "Waited" => "wait",
+        _ => return format!("Failed: {}", verb.to_lowercase()),
+    };
+    match rest {
+        "" => format!("Couldn't {base}"),
+        rest => format!("Couldn't {base} {rest}"),
+    }
+}
+
 pub fn said(command: &str, output: &str, failed: bool) -> Option<Said> {
     let simple = crate::shell::simple(command)?;
     let mut words = simple.words.as_slice();
@@ -233,10 +278,7 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
     Said {
         verb,
         what,
-        under: refusal
-            .map(|refusal| Line::from(refusal).fg(Color::Red))
-            .into_iter()
-            .collect(),
+        under: refusal.map(Line::from).into_iter().collect(),
         failed: failed || reply.get("error").is_some(),
         output: None,
     }
@@ -290,7 +332,7 @@ fn trigger(words: &[String], output: &str, failed: bool) -> Option<Said> {
         _ => return None,
     }
     if let Some(refusal) = refusal {
-        said.under.push(Line::from(refusal).fg(Color::Red));
+        said.under.push(Line::from(refusal));
     }
     Some(said)
 }
@@ -470,7 +512,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         _ => return None,
     }
     if let Some(refusal) = refusal {
-        said.under.push(Line::from(refusal).fg(Color::Red));
+        said.under.push(Line::from(refusal));
     }
     Some(said)
 }
@@ -892,6 +934,17 @@ pub fn plan(items: &[String]) -> Said {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_call_reads_as_what_it_tried() {
+        assert_eq!(attempted("Started"), "Couldn't start");
+        assert_eq!(
+            attempted("Removed the trigger"),
+            "Couldn't remove the trigger"
+        );
+        assert_eq!(attempted("Queued for"), "Couldn't queue for");
+        assert_eq!(attempted("Saved to memory"), "Couldn't save to memory");
+    }
 
     fn text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

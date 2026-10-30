@@ -68,7 +68,8 @@ const DESCRIPTION: &str = "Keep something beside the conversation, in the margin
          markdown instead, since that copy goes away with the task), or from (a task's note as \
          \"task/id\", as your task updates name it, shown here as the task keeps it and kept once \
          the task is gone, rather than copied). Never ask a question or for a decision only in a \
-         note: ask it where the person answers, and the note may point to it.";
+         note: ask it where the person answers, and the note may point to it, with opens naming \
+         the agent that asked it when that is not you.";
 
 /// The `margin` tool as Sonny declares it on a bot.
 pub fn tool() -> Value {
@@ -88,6 +89,8 @@ pub fn tool() -> Value {
                     "description": "Or a file to show, absolute or from your folder."},
                 "from": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}/[a-z0-9][a-z0-9-]{0,39}$",
                     "description": "Or a task's note to show, as \"task/id\"."},
+                "opens": {"type": "string", "pattern": "^[A-Za-z0-9._-]{0,128}$",
+                    "description": "An agent the note is about, by its name, such as a task whose question waits on the person: the note gets a button that opens it beside the conversation. Empty takes the button away."},
                 "remove": {"type": "boolean", "description": "true takes the note away."}
             },
             "required": ["id"],
@@ -133,6 +136,8 @@ pub struct Note {
     pub after: Option<i64>,
     /// The turn that last changed it after it was put there.
     pub turn: Option<i64>,
+    /// The agent its button opens beside the conversation.
+    pub opens: Option<String>,
 }
 
 /// What a call did to the margin.
@@ -162,7 +167,7 @@ impl Kept {
         let notes: Vec<Value> = (self.notes.iter())
             .map(|note| {
                 let mut json = json!({"id": note.id, "title": note.title, "call": note.call,
-                    "after": note.after, "turn": note.turn});
+                    "after": note.after, "turn": note.turn, "opens": note.opens});
                 body_json(&note.body, &mut json);
                 json
             })
@@ -183,6 +188,7 @@ impl Kept {
                     call: text(note, "call")?,
                     after: note["after"].as_i64(),
                     turn: note["turn"].as_i64(),
+                    opens: text(note, "opens"),
                 })
             })
             .collect();
@@ -278,9 +284,13 @@ fn changed(item: &Value) -> Option<(String, Value)> {
 /// The bot and the note a `from` names, as `bot/id`.
 pub fn from(text: &str) -> Option<(String, String)> {
     let (bot, id) = text.trim().rsplit_once('/')?;
+    (is_agent(bot) && is_id(id)).then(|| (bot.to_owned(), id.to_owned()))
+}
+
+/// Whether `name` reads as an agent's name.
+fn is_agent(name: &str) -> bool {
     let named = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
-    (!bot.is_empty() && bot.len() <= 128 && bot.chars().all(named) && is_id(id))
-        .then(|| (bot.to_owned(), id.to_owned()))
+    !name.is_empty() && name.len() <= 128 && name.chars().all(named)
 }
 
 /// Another bot's note, as read from its history: the newest node read,
@@ -697,6 +707,11 @@ impl Margin {
             .as_str()
             .map(str::trim)
             .filter(|t| !t.is_empty());
+        // An agent's name, or none for an empty one; unsaid, as it was.
+        let opens = arguments["opens"]
+            .as_str()
+            .map(str::trim)
+            .map(|name| Some(name.to_owned()).filter(|name| is_agent(name)));
         let had = at.map(|at| &self.kept.notes[at].body);
         let body = match (
             arguments["from"].as_str().and_then(from),
@@ -741,6 +756,9 @@ impl Margin {
                 if let Some(body) = body {
                     note.body = body;
                 }
+                if let Some(opens) = opens {
+                    note.opens = opens;
+                }
                 note.turn = turn;
                 Some(Change::Updated(id.to_owned()))
             }
@@ -752,6 +770,7 @@ impl Margin {
                     call: call.to_owned(),
                     after,
                     turn: None,
+                    opens: opens.flatten(),
                 });
                 if self.kept.notes.len() > MOST_NOTES {
                     self.kept.notes.remove(0);
@@ -1013,7 +1032,10 @@ fn cut(text: &str, most: usize) -> &str {
 /// A note's first row: its title, `live` while the running turn changes
 /// it, and its buttons on the right; and where those buttons are.
 fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen::Buttons) {
-    let right = "↑  × ";
+    let right = match note.opens {
+        Some(_) => "↗  ↑  × ",
+        None => "↑  × ",
+    };
     let tail = match live {
         true => " live",
         false => "",
@@ -1022,23 +1044,29 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
     let title = crate::transcript::cut(&note.title, room);
     let used = 3 + title.width() + tail.width();
     let gap = width.saturating_sub(used + right.width()).max(1);
-    let up = (used + gap) as u16;
-    let line = Line::from(vec![
-        Span::raw(" ✎ ").fg(Color::Yellow),
+    let opens = (used + gap) as u16;
+    let mut spans = vec![
+        Span::raw(" ✎ ").dim(),
         Span::raw(title).bold(),
-        Span::raw(tail).fg(Color::Green),
+        Span::raw(tail).fg(Color::Cyan),
         Span::raw(" ".repeat(gap)),
-        Span::raw("↑").dim(),
-        Span::raw("  "),
-        Span::raw("×").dim(),
-    ]);
+    ];
     let id = &note.id;
-    let buttons = vec![
-        (0, up.saturating_sub(1), format!("{BUTTON}jump/{id}")),
+    let mut buttons = Vec::new();
+    // The agent it is about opens beside the conversation, as a click on
+    // that agent's row does.
+    if let Some(agent) = &note.opens {
+        spans.extend([Span::raw("↗").fg(Color::Cyan), Span::raw("  ")]);
+        buttons.push((opens, opens + 1, format!("{BUTTON}task/{agent}")));
+    }
+    let up = opens + 3 * u16::from(note.opens.is_some());
+    spans.extend([Span::raw("↑").dim(), Span::raw("  "), Span::raw("×").dim()]);
+    buttons.extend([
+        (0, opens.saturating_sub(1), format!("{BUTTON}jump/{id}")),
         (up, up + 1, format!("{BUTTON}jump/{id}")),
         (up + 3, up + 4, format!("{BUTTON}close/{id}")),
-    ];
-    (line, buttons)
+    ]);
+    (Line::from(spans), buttons)
 }
 
 /// A file's `text` as a note shows the file at `path`: Markdown as
@@ -1136,11 +1164,13 @@ fn is_id(id: &str) -> bool {
 }
 
 /// What runs for the agent, as the margin's first row says it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Glance {
     pub name: String,
     /// Triggers and subscriptions.
     pub behind: usize,
+    /// What of `/background` failed.
+    pub failed: usize,
     pub context: Option<u64>,
 }
 
@@ -1163,6 +1193,15 @@ impl Glance {
             spans.push(span);
             at += width;
         };
+        if self.failed > 0 {
+            let text = format!("✗ {}", self.failed);
+            fact(
+                &mut spans,
+                text.clone(),
+                Span::raw(text).fg(Color::Red),
+                Some("background"),
+            );
+        }
         if self.behind > 0 {
             let text = format!("↻ {}", self.behind);
             fact(
@@ -1612,6 +1651,51 @@ mod tests {
     }
 
     #[test]
+    fn a_note_about_an_agent_opens_it() {
+        let mut margin = margin();
+        let post = json!({"id": "wire", "title": "wire asks you", "markdown": "Keep 0.3?",
+            "opens": "shop.wire"});
+        margin.apply("c1", &post, None, None);
+        let buttons = |margin: &mut Margin| {
+            let (lines, marks) = margin.lines(40, Path::new("/"), None);
+            let buttons = marks.into_iter().find_map(|(_, m)| match m {
+                Mark::Buttons(buttons) => Some(buttons),
+                _ => None,
+            });
+            (lines[1].to_string(), buttons.unwrap())
+        };
+        let (head, opened) = buttons(&mut margin);
+        assert!(head.ends_with("↗  ↑  ×"), "{head}");
+        let cols: Vec<char> = head.chars().collect();
+        assert_eq!(cols[opened[0].0 as usize], '↗');
+        assert_eq!(opened[0].2, format!("{BUTTON}task/shop.wire"));
+        assert_eq!(cols[opened[2].0 as usize], '↑');
+        assert_eq!(cols[opened[3].0 as usize], '×');
+        // Kept as it was when unsaid, and kept across a read again.
+        margin.apply(
+            "c2",
+            &json!({"id": "wire", "markdown": "Still?"}),
+            None,
+            None,
+        );
+        assert_eq!(
+            Kept::read(&margin.kept.json()).notes[0].opens.as_deref(),
+            Some("shop.wire")
+        );
+        // Empty, or not an agent's name, takes the button away.
+        margin.apply("c3", &json!({"id": "wire", "opens": "a b"}), None, None);
+        assert!(buttons(&mut margin).0.ends_with(" ↑  ×"));
+        margin.apply(
+            "c4",
+            &json!({"id": "wire", "opens": "shop.wire"}),
+            None,
+            None,
+        );
+        margin.apply("c5", &json!({"id": "wire", "opens": ""}), None, None);
+        assert_eq!(margin.note("wire").unwrap().opens, None);
+    }
+
+    #[test]
     fn a_file_note_shows_the_file_and_follows_it() {
         let dir = std::env::temp_dir().join(format!("sonny-margin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1704,6 +1788,7 @@ mod tests {
         let busy = Glance {
             name: "calc".into(),
             behind: 3,
+            failed: 0,
             context: Some(41_000),
         };
         let (line, buttons) = busy.line();
@@ -1711,6 +1796,18 @@ mod tests {
         assert!(text.starts_with(" calc · ↻ 3 · "), "{text}");
         let urls: Vec<&str> = buttons.iter().map(|b| b.2.as_str()).collect();
         assert_eq!(urls, ["sonny:background"]);
+        let (failing, failed_buttons) = Glance {
+            failed: 2,
+            ..busy.clone()
+        }
+        .line();
+        assert!(
+            failing.to_string().starts_with(" calc · ✗ 2 · ↻ 3 · "),
+            "{failing}"
+        );
+        assert_eq!(failing.spans[3].style.fg, Some(Color::Red));
+        assert_eq!(failed_buttons.len(), 2);
+        assert!(failed_buttons.iter().all(|b| b.2 == "sonny:background"));
         let slice = |(from, to): (u16, u16)| -> String {
             text.chars()
                 .skip(from as usize)

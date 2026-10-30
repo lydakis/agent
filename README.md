@@ -203,12 +203,17 @@ brew install lydakis/agent/sonny        # or, on Linux, install.sh above
 sonny                                   # in your project's folder
 ```
 
-The first run asks how your agents reach a model (a ChatGPT plan, an
-Anthropic, OpenAI or OpenRouter key, or Bedrock with your AWS profile) and
-which model new projects use. As Codex does, it keeps the settings in
+The first run looks at what your machine already has (a provider key, a
+ChatGPT sign-in, your AWS profiles), asks how your agents reach a model only
+when nothing does, and offers the providers' models ranked, the first marked
+so Enter takes it, then offers the MCP servers Claude Code, Codex, OpenCode
+or Kiro already have. `sonny setup` asks again. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
 which Sonny applies to the daemon and everything else it starts, so nothing
-goes in your shell profile. Bots search the web where their provider offers
+goes in your shell profile. Tool shells never get the keys the daemon's
+providers use; as in Codex, `[shell_environment_policy]` with
+`ignore_default_excludes = false` also leaves out every variable named like
+`*KEY*`, `*SECRET*` or `*TOKEN*`, and `exclude` lists more. Bots search the web where their provider offers
 it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Every
 bot can also read a page with `web_fetch`, which the daemon runs itself. Put
 `web_search = "disabled"` in `config.toml` to leave both out of new bots.

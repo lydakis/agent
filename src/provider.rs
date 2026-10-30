@@ -220,10 +220,13 @@ pub struct Provider {
     listing: Arc<models::Listing>,
 }
 
+/// Streamed text or thinking, with the index of the response's output item
+/// it belongs to: deltas of one item are one message, or one block of
+/// thinking, as the response keeps them.
 #[derive(Debug)]
 pub enum Delta {
-    Text(String),
-    Thinking(String),
+    Text(usize, String),
+    Thinking(usize, String),
 }
 /// What one decoded SSE frame carried.
 #[derive(Debug)]
@@ -2863,7 +2866,7 @@ mod tests {
                 sent: None,
             },
             |delta| {
-                if let Delta::Text(part) = delta {
+                if let Delta::Text(_, part) = delta {
                     text.push_str(&part);
                 }
                 async { Ok(()) }
