@@ -759,7 +759,7 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_folder_swapped_for_a_link_is_not_followed() {
-    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    use agent_runtime::sandbox::{Mode, Policy};
     if !sandboxes() {
         return;
     }
@@ -790,7 +790,7 @@ async fn a_folder_swapped_for_a_link_is_not_followed() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_read_only_sandbox_writes_nothing() {
-    use agent_runtime::sandbox::{Daemon, Mode, Policy};
+    use agent_runtime::sandbox::{Mode, Policy};
     if !sandboxes() {
         return;
     }
