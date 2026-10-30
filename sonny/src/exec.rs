@@ -447,6 +447,9 @@ struct Nested {
     asks: bool,
 }
 
+/// Calls answered in this process, so two answerings of one call differ.
+static ANSWERINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The `exec` call a script answers, whose steps its calls are: where a
 /// call that asks first is put to the agent's gate.
 pub struct Steps {
@@ -454,6 +457,10 @@ pub struct Steps {
     pub bot: String,
     pub turn: i64,
     pub call_id: String,
+    /// This answering of the call, so its steps' ids are its own: a
+    /// lookout that restarts and answers the same call again never repeats
+    /// one, which the agent's judge would take as reviewed already.
+    run: String,
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -464,6 +471,15 @@ impl Steps {
             bot,
             turn,
             call_id,
+            run: format!(
+                "{:x}{:x}{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                std::process::id(),
+                ANSWERINGS.fetch_add(1, Ordering::Relaxed)
+            ),
             next: Default::default(),
         }
     }
@@ -472,7 +488,11 @@ impl Steps {
     /// it may not run. An allow a gate gave names the step, to say how it
     /// ended once it ran.
     async fn ask(&self, tool: &str, arguments: Value) -> Result<Option<String>, String> {
-        let step = (self.next.fetch_add(1, Ordering::SeqCst) + 1).to_string();
+        let step = format!(
+            "{}.{}",
+            self.run,
+            self.next.fetch_add(1, Ordering::SeqCst) + 1
+        );
         let asked = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
             "step": step, "name": tool, "arguments": arguments});
         match self.client.request("approve_step", asked).await {
@@ -1468,6 +1488,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_answered_again_names_its_steps_afresh() {
+        let dir = scratch("again");
+        let (client, _steps) = gate(&dir, Duration::ZERO, None).await;
+        let first = Steps::new(client.clone(), "shop.lead".into(), 7, "c1".into());
+        let again = Steps::new(client, "shop.lead".into(), 7, "c1".into());
+        assert_ne!(first.run, again.run);
+    }
+
+    #[tokio::test]
     async fn each_call_that_asks_first_waits_for_the_gate_with_the_script_s_time_stopped() {
         let dir = scratch("steps");
         let hub = hub(&dir).await;
@@ -1480,6 +1509,7 @@ mod tests {
         hub.configure(&servers).await;
         let (client, mut steps) = gate(&dir, Duration::from_millis(600), None).await;
         let asker = Steps::new(client, "shop.lead".into(), 7, "c1".into());
+        let answering = asker.run.clone();
         // A script with 300 ms whose `slow` waits 600 ms for its verdict.
         let script = r#"// @exec: {"timeout_ms": 300}
 text(await tools.mcp__test__echo({text: "hi"}).then(r => r.content[0].text));
@@ -1513,15 +1543,15 @@ text("done");"#;
         assert_eq!(ran.len(), 1, "{asked:?}");
         assert_eq!(
             (ran[0]["step"].as_str(), ran[0]["failed"].as_bool()),
-            (Some("2"), Some(false))
+            (Some(&*format!("{answering}.2")), Some(false))
         );
         asked.retain(|s| s["op"] == "approve_step");
-        let seen: Vec<(&str, &str, &str, i64, &str)> = asked
+        let seen: Vec<(&str, String, &str, i64, &str)> = asked
             .iter()
             .map(|s| {
                 (
                     s["op"].as_str().unwrap(),
-                    s["step"].as_str().unwrap(),
+                    s["step"].as_str().unwrap().replace(&answering, "RUN"),
                     s["name"].as_str().unwrap(),
                     s["turn"].as_i64().unwrap(),
                     s["call_id"].as_str().unwrap(),
@@ -1531,8 +1561,8 @@ text("done");"#;
         assert_eq!(
             seen,
             [
-                ("approve_step", "1", "mcp__test__add", 7, "c1"),
-                ("approve_step", "2", "mcp__test__slow", 7, "c1")
+                ("approve_step", "RUN.1".into(), "mcp__test__add", 7, "c1"),
+                ("approve_step", "RUN.2".into(), "mcp__test__slow", 7, "c1")
             ]
         );
         assert_eq!(asked[1]["arguments"], json!({"ms": 10}));
