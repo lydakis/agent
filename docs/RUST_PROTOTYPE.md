@@ -1015,7 +1015,9 @@ stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
 interrupted}`, where `pause` is `{reason, by, at_ms}`. While a pause holds,
 another changes nothing and answers the first with `changed: false`.
 `{"op":"resume"}` lifts it and answers `{pause, changed}` with the pause it
-lifted, or null when none held; what waited starts as capacity allows. Each
+lifted, or null when none held; what waited starts as capacity allows. A
+sandboxed bot's own socket refuses it with `not_permitted`, so a command
+left running in a sandbox cannot let the line go on. Each
 change is told to every session as a `paused` or `resumed` event, `{event,
 pause, durable: false}`. `ready` and `stats` carry `paused`, the pause or null.
 `agent pause --reason TEXT` sends it as `AGENT_BOT` when run in a bot's shell,

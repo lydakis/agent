@@ -1791,6 +1791,9 @@ impl Service {
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // Any agent may pull the cord; letting the line go on is the
+            // person's, from outside any sandbox.
+            Command::Resume => return refuse("resume a pause"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
