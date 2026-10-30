@@ -2344,16 +2344,21 @@ impl Service {
         let store = self.store.clone();
         let check = move |db: &mut agent_runtime::store::Database| {
             let now = now_ms();
-            Ok(asked
-                .into_iter()
-                .map(|(approval, bot, turn, id, gone)| {
-                    let stepped = match gone {
-                        true => db.step_abandon(&bot, turn, &id, now),
-                        false => db.step_check(&bot, turn, &id, now),
-                    };
-                    (approval, stepped)
-                })
-                .collect::<Vec<_>>())
+            let mut checked = Vec::with_capacity(asked.len());
+            for (approval, bot, turn, id, gone) in asked {
+                let stepped = match gone {
+                    true => db.step_abandon(&bot, turn, &id, now),
+                    false => db.step_check(&bot, turn, &id, now),
+                };
+                // A check that lost the group's transaction lost what the
+                // checks before it wrote too: the whole batch fails, as
+                // the group does, rather than the rest committing alone.
+                if !db.in_group() {
+                    return fail("storage_group_rolled_back");
+                }
+                checked.push((approval, stepped));
+            }
+            Ok(checked)
         };
         self.step_checks.spawn(async move {
             store.op("step_check", check).await.unwrap_or_else(|error| {
