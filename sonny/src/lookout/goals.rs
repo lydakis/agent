@@ -295,7 +295,8 @@ pub fn tool(name: &str, tag: &str) -> Value {
             again, and its lead hears nothing of those turns. The goal ends once the check passes, the \
             budget is spent, two turns it started call no tool, or the agent gives up with blocked and why, \
             and its lead hears that turn with how it ended. Setting the same goal again changes nothing; \
-            with nothing given, the result lists your goals and your tasks'.",
+            with nothing given, the result lists your goals and your tasks'. A person's message that \
+            starts with /goal asks you to set one on yourself for what it says.",
         "parameters": {
             "type": "object",
             "properties": {
