@@ -2,9 +2,11 @@
 //! answers makes the task a git worktree, then starts it there with the
 //! daemon's `agent run`. A worktree starts at the last commit on a branch
 //! of its own, with clones of the lead's build folders where the disk makes
-//! them copy-on-write (seed.rs); outside git, the task works in the lead's
-//! folder. A task that could not start leaves no folder behind, and the
-//! `remove_task` tool takes away one that is done.
+//! them copy-on-write (seed.rs). Outside git, the task gets an empty folder
+//! of its own and makes there what it works in, as the person's tooling
+//! makes a workspace, reading the lead's folder where it is. A task that
+//! could not start leaves no folder behind, and the `remove_task` tool
+//! takes away one that is done.
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,6 +14,9 @@ use std::process::{Command, Stdio};
 /// The task's folder, how its work comes back, and what undoes it.
 struct Place {
     dir: PathBuf,
+    /// The folder whose rules, roles and memory the task is told: the
+    /// lead's, or its copy.
+    told: PathBuf,
     note: Option<String>,
     undo: Undo,
     /// The lead's folder the task's is a copy of, and the copy's top: a
@@ -26,6 +31,11 @@ enum Undo {
         here: PathBuf,
         path: PathBuf,
         branch: String,
+    },
+    /// An empty folder of the task's own, and Sonny's record of it.
+    Folder {
+        path: PathBuf,
+        record: PathBuf,
     },
 }
 
@@ -81,7 +91,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         flags.extend(["--effort".to_owned(), effort]);
     }
     let mut place = if info["threads_in"] == "project" {
-        in_place(here)
+        in_place(here, name)
     } else {
         worktree(here, name)?
     };
@@ -146,7 +156,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    let mut flags = match told(&place.dir, &info, &flags) {
+    let mut flags = match told(&place.told, &info, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
@@ -598,14 +608,21 @@ fn undo(undo: &Undo) {
             let _ = git(here, &["worktree", "remove", "--force", &path]);
             let _ = git(here, &["branch", "-D", branch]);
         }
+        Undo::Folder { path, record } => {
+            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_file(record);
+        }
     }
 }
 
 /// Every task works in the lead's folder.
-fn in_place(here: &Path) -> Place {
+fn in_place(here: &Path, name: &str) -> Place {
     Place {
         dir: here.to_owned(),
-        note: None,
+        told: here.to_owned(),
+        note: Some(format!(
+            "{name}: works in this folder itself, as every task of this project does"
+        )),
         undo: Undo::Nothing,
         copy: None,
     }
@@ -617,11 +634,78 @@ fn home_dir() -> Result<PathBuf, String> {
     ))
 }
 
+/// Where Sonny records the folder each task with an empty folder of its
+/// own was started from, by the task's name: under a name no task's
+/// folder can have, as a branch's part never starts with a dot.
+fn record_of(name: &str) -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".agent/worktrees/.folders").join(name))
+}
+
+/// The folder the task `name` was given an empty folder of its own from,
+/// as Sonny recorded it.
+fn source_of(name: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(record_of(name).ok()?).ok()?;
+    Some(PathBuf::from(text.trim_end_matches('\n')))
+}
+
+/// The lead's folder a task's own folder at or above `dir` was made from,
+/// whose project the task works for.
+pub fn source_folder(dir: &Path) -> Option<PathBuf> {
+    let tasks = home_dir().ok()?.join(".agent/worktrees");
+    let tasks = std::fs::canonicalize(&tasks).unwrap_or(tasks);
+    let name = dir.strip_prefix(&tasks).ok()?.components().next()?;
+    source_of(name.as_os_str().to_str()?)
+}
+
+/// Outside git, an empty folder of the task's own, beside the worktrees:
+/// what it works in, such as a workspace the person's tooling makes, it
+/// makes there, and it reads `here` where it is.
+fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
+    let path = home_dir()?.join(".agent/worktrees").join(name);
+    let record = record_of(name)?;
+    let undo = if path.exists() {
+        // Left by a task of this name before: its own only if it was
+        // started from this folder.
+        if source_of(name).as_deref() != Some(here) {
+            return Err(format!(
+                "{} exists and is not the folder of a task of this one; pick another name",
+                path.display()
+            ));
+        }
+        Undo::Nothing
+    } else {
+        let made = std::fs::create_dir_all(&path)
+            .and_then(|()| std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/"))))
+            .and_then(|()| std::fs::write(&record, format!("{}\n", here.display())));
+        let undo = Undo::Folder {
+            path: path.clone(),
+            record,
+        };
+        if let Err(e) = made {
+            self::undo(&undo);
+            return Err(format!("{}: {e}", path.display()));
+        }
+        undo
+    };
+    Ok(Place {
+        dir: path.clone(),
+        told: here.to_owned(),
+        note: Some(format!(
+            "{name}: works in {}, an empty folder of its own, since this folder is not a git \
+             repository; it reads this folder where it is, and makes in its own what it \
+             changes, as its brief says how",
+            shell_quote(&path)
+        )),
+        undo,
+        copy: None,
+    })
+}
+
 /// A git worktree on branch agent/NAME at the last commit, in the lead's
-/// subfolder of it. Outside git the task works in the lead's folder.
+/// subfolder of it. Outside git, an empty folder of the task's own.
 fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     if git(here, &["rev-parse", "--show-toplevel"]).is_err() {
-        return Ok(in_place(here));
+        return own_folder(here, name);
     }
     let top = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"])?);
     let prefix = git(here, &["rev-parse", "--show-prefix"])?;
@@ -649,8 +733,10 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
             branch: branch.clone(),
         }
     };
+    let dir = within(&path, Path::new(prefix.trim_end_matches('/')));
     Ok(Place {
-        dir: within(&path, Path::new(prefix.trim_end_matches('/'))),
+        told: dir.clone(),
+        dir,
         note: Some(format!(
             "{name}: a worktree at {} on branch {branch}, from the last commit (uncommitted \
              changes here are not in it); its commits are on {branch} here as it makes \
@@ -773,24 +859,34 @@ fn shell_quote(path: &Path) -> String {
 }
 
 /// A `remove_task` call: remove the task and the worktree Sonny made it,
-/// once its changes are committed, its branch kept unless merged.
-/// `discard` removes them anyway. An agent still working is not removed,
+/// once its changes are committed, its branch kept unless merged; or the
+/// folder of its own, once every repository in it has its changes
+/// committed and pushed. `discard` removes them anyway. An agent still working is not removed,
 /// and then neither is anything else. Says what was removed and what was
 /// kept.
 pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> {
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     let branch = format!("agent/{name}");
-    let worktree = home_dir()?.join(".agent/worktrees").join(name);
-    let worktree = match worktree.exists() {
-        true if ours(here, &worktree, &branch) => Some(worktree),
+    let path = home_dir()?.join(".agent/worktrees").join(name);
+    let source = source_of(name);
+    let (worktree, folder) = match path.exists() {
+        true if source.as_deref() == Some(here) => (None, Some(path)),
+        true if source.is_none() && ours(here, &path, &branch) => (Some(path), None),
         true => {
-            return Err(format!(
-                "{} is not this repository's worktree on {branch}; run this in the repository \
-                 the task was started from",
-                worktree.display()
-            ));
+            return Err(match source {
+                Some(source) => format!(
+                    "{} is the folder of a task of {}; run this there",
+                    path.display(),
+                    source.display()
+                ),
+                None => format!(
+                    "{} is not this repository's worktree on {branch}; run this in the \
+                     repository the task was started from",
+                    path.display()
+                ),
+            });
         }
-        false => None,
+        false => (None, None),
     };
     // What would be lost, checked while the task can still be kept, and again
     // once it is gone and can write no more.
@@ -803,6 +899,16 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
                 "{name}'s worktree has uncommitted changes; commit them, or with discard, it is \
                  removed anyway"
             ));
+        }
+        if !discard && let Some(path) = &folder {
+            let unsaved = unsaved(path)?;
+            if !unsaved.is_empty() {
+                return Err(format!(
+                    "{name}'s folder has work not committed or not pushed in {}; commit and push \
+                     it, or with discard, it is removed anyway",
+                    unsaved.join(", ")
+                ));
+            }
         }
         Ok(())
     };
@@ -835,7 +941,83 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             ));
         }
     }
+    if let Some(path) = &folder {
+        std::fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Ok(record) = record_of(name) {
+            let _ = std::fs::remove_file(record);
+        }
+    }
     Ok(format!("Removed {name}."))
+}
+
+/// The repositories in the task's folder `dir` with work that would be
+/// lost with it, by their paths in it: changes not committed, or commits
+/// on a branch that no remote has.
+fn unsaved(dir: &Path) -> Result<Vec<String>, String> {
+    let repos = repositories(dir);
+    let mut unsaved = Vec::new();
+    for repo in &repos {
+        // A repository inside this one is its own.
+        let inner: Vec<String> = (repos.iter())
+            .filter_map(|other| other.strip_prefix(repo).ok())
+            .filter(|inner| !inner.as_os_str().is_empty())
+            .map(|inner| format!(":(exclude){}", inner.display()))
+            .collect();
+        let path = within(dir, repo);
+        let mut status = vec!["status", "--porcelain", "--untracked-files=all", "--", "."];
+        status.extend(inner.iter().map(String::as_str));
+        let changed = !git(&path, &status)?.is_empty();
+        let unpushed = !git(
+            &path,
+            &[
+                "log",
+                "--branches",
+                "--not",
+                "--remotes",
+                "--format=%h",
+                "-n",
+                "1",
+            ],
+        )?
+        .is_empty();
+        if changed || unpushed {
+            unsaved.push(match repo.as_os_str().is_empty() {
+                true => ".".to_owned(),
+                false => repo.display().to_string(),
+            });
+        }
+    }
+    Ok(unsaved)
+}
+
+/// The git repositories in `dir`, by their paths in it, as a task's tooling
+/// lays them out: no deeper than a workspace keeps them, past no link, and
+/// never into a git folder, a node_modules or a folder a cache tags.
+fn repositories(dir: &Path) -> Vec<PathBuf> {
+    const DEPTH: usize = 8;
+    let mut found = Vec::new();
+    let mut folders = vec![PathBuf::new()];
+    while let Some(at) = folders.pop() {
+        let path = within(dir, &at);
+        if path.join(".git").symlink_metadata().is_ok() {
+            found.push(at.clone());
+        }
+        if at.components().count() >= DEPTH || path.join("CACHEDIR.TAG").is_file() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if name == ".git"
+                || name == "node_modules"
+                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                continue;
+            }
+            folders.push(at.join(name));
+        }
+    }
+    found.sort();
+    found
 }
 
 #[cfg(test)]

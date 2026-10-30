@@ -86,8 +86,9 @@ fn start() -> Value {
         "name": START,
         "description": "Start a new task. Unless this project's tasks all work in this folder, Sonny makes the \
             task a git worktree of this repository on the branch agent/NAME, from the last commit, so uncommitted \
-            changes here are not in it; outside git, the task works in this folder. With setup, the folder's \
-            .agents/setup runs in the worktree first. The task starts there with this folder's rules, skills and \
+            changes here are not in it; outside git, an empty folder of its own, where the task makes what it \
+            changes, such as a workspace made with this folder's tooling, as the brief says how, and reads this \
+            folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
             memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
             its branch, here already as it commits. A start that fails leaves no folder behind.",
@@ -130,9 +131,10 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it. A worktree is removed, and its branch kept while it has commits not merged here. It refuses, \
-            before removing anything, while the task is working or its worktree has uncommitted changes, and \
-            says what. With discard, that work is dropped: only \
+            it. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
+            own is deleted with all it holds. It refuses, before removing anything, while the task is working, \
+            its worktree has uncommitted changes, or a repository in its own folder has changes not committed \
+            or commits not pushed, and says what. With discard, that work is dropped: only \
             when the person says to drop it.",
         "parameters": {
             "type": "object",
@@ -525,6 +527,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("memory_refused", "no HOME".to_owned()))?;
+            // A task in a folder of its own works for its lead's project.
+            let here = crate::task::source_folder(&here).unwrap_or(here);
             agent_client::memory::call(&home, &here, arguments)
                 .map(|said| said.to_string())
                 .map_err(|e| ("memory_refused", e))

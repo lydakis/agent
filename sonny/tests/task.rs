@@ -371,3 +371,103 @@ fn a_done_worktree_task_is_removed_with_its_merged_branch() {
         ""
     );
 }
+
+#[test]
+fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
+    let lab = Lab::new("own-folder");
+    // A workspace that is no repository, holding one.
+    let ws = lab.scratch.join("ws");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "Build with the workspace tool.\n").unwrap();
+    std::fs::rename(&lab.repo, ws.join("src/api")).unwrap();
+    let start = serde_json::json!({"name": "fix", "brief": "fix it"});
+    let (ok, said) = lab.tool(&ws, "start_task", start.clone(), false);
+    assert!(ok, "{said}");
+    assert!(said.contains("an empty folder of its own"), "{said}");
+    let folder = lab.home.join(".agent/worktrees/demo.fix");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+    let ran = lab.ran();
+    let after = |flag: &str| {
+        let at = ran.iter().position(|arg| arg == flag).unwrap();
+        ran[at + 1].clone()
+    };
+    assert_eq!(after("--workspace"), folder.to_string_lossy());
+    // Told the rules of the lead's folder, not of its empty one.
+    assert!(ran.join("\n").contains("Build with the workspace tool."));
+    assert!(!ran.iter().any(|arg| arg == "--writable"), "{ran:?}");
+    // The lead's folder is as it was.
+    assert!(!ws.join(".git").exists());
+    // Another folder's task of this name does not take it over.
+    let other = lab.scratch.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let (ok, said) = lab.tool(&other, "start_task", start.clone(), false);
+    assert!(!ok && said.contains("pick another name"), "{said}");
+    // One started again from this folder keeps it.
+    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    assert!(ok, "{said}");
+}
+
+#[test]
+fn a_task_s_own_folder_is_removed_once_its_repositories_hold_nothing_unsaved() {
+    let lab = Lab::new("rm-folder");
+    let ws = lab.scratch.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let start = serde_json::json!({"name": "fix", "brief": "fix it"});
+    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    assert!(ok, "{said}");
+    let folder = lab.home.join(".agent/worktrees/demo.fix");
+    // The task makes a workspace: a clone of the repository, as a
+    // workspace's tooling would, and one nested in it with no remote.
+    let api = folder.join("ws2/src/api");
+    let (ok, _, err) = lab.run(
+        &lab.scratch,
+        "git",
+        &[
+            "clone",
+            "-q",
+            lab.repo.to_str().unwrap(),
+            api.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert!(ok, "{err}");
+    std::fs::write(api.join(".git/info/exclude"), "/deps/\n").unwrap();
+    let deps = api.join("deps/lib");
+    std::fs::create_dir_all(&deps).unwrap();
+    lab.git(&deps, &["init", "-q", "-b", "main"]);
+    std::fs::write(folder.join("ws2/build.log"), "x\n").unwrap();
+    // Uncommitted work in the nested repository keeps it.
+    std::fs::write(deps.join("new.txt"), "x\n").unwrap();
+    let (ok, err) = lab.remove(&ws, false);
+    assert!(!ok && err.contains("ws2/src/api/deps/lib"), "{err}");
+    assert!(!err.contains("ws2/src/api,"), "{err}");
+    // So do commits no remote has.
+    lab.git(&deps, &["add", "."]);
+    lab.git(&deps, &["commit", "-qm", "dep"]);
+    lab.git(&api, &["commit", "-q", "--allow-empty", "-m", "api"]);
+    let (ok, err) = lab.remove(&ws, false);
+    assert!(
+        !ok && err.contains("not committed or not pushed in ws2/src/api, ws2/src/api/deps/lib"),
+        "{err}"
+    );
+    assert!(folder.exists());
+    // Pushed, the folder goes with all it holds.
+    lab.git(&api, &["push", "-q", "origin", "HEAD:refs/heads/done"]);
+    std::fs::remove_dir_all(&deps).unwrap();
+    let (ok, err) = lab.remove(&ws, false);
+    assert!(ok, "{err}");
+    assert!(!folder.exists());
+    assert!(!lab.home.join(".agent/worktrees/.folders/demo.fix").exists());
+    // Removed from another folder, a task's own folder is refused.
+    let (ok, said) = lab.tool(
+        &ws,
+        "start_task",
+        serde_json::json!({"name": "fix", "brief": "b"}),
+        false,
+    );
+    assert!(ok, "{said}");
+    let (ok, err) = lab.remove(&lab.repo, false);
+    assert!(!ok && err.contains("run this there"), "{err}");
+    let (ok, err) = lab.remove(&ws, true);
+    assert!(ok, "{err}");
+}
