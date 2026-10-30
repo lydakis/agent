@@ -31,15 +31,23 @@ pub struct Step {
 }
 
 /// Each step an upgrade can offer; first-run setup offers them itself.
-pub const STEPS: [Step; 1] = [Step {
-    id: "mcp-import",
-    what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
-    how: "sonny mcp import",
-    // Done when none is left to bring; one Sonny cannot bring never counts.
-    done: || {
-        crate::mcp_import::here().map_or(true, |found| found.iter().all(|f| f.keys.is_empty()))
+pub const STEPS: [Step; 2] = [
+    Step {
+        id: "mcp-import",
+        what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
+        how: "sonny mcp import",
+        // Done when none is left to bring; one Sonny cannot bring never counts.
+        done: || {
+            crate::mcp_import::here().map_or(true, |found| found.iter().all(|f| f.keys.is_empty()))
+        },
     },
-}];
+    Step {
+        id: "backup",
+        what: "memory, skills, profiles and config.toml backed up to a private git repository every 10 minutes, so a new machine starts where this one left off",
+        how: "sonny setup backup",
+        done: || crate::home::Places::home().is_ok_and(|places| crate::home::done(&places)),
+    },
+];
 
 /// Someone is there to answer.
 pub fn interactive() -> bool {
@@ -697,8 +705,31 @@ pub async fn model(client: &Client) -> Result<String, String> {
         println!("{DIM}MCP servers not brought in: {error}{RESET}");
         Vec::new()
     });
-    summary(&model, &file, &brought);
+    let backed = backup().unwrap_or_else(|error| {
+        if error != "setup cancelled" {
+            println!("{DIM}Backup not set up: {error}{RESET}");
+        }
+        false
+    });
+    summary(&model, &file, &brought, backed);
     Ok(model)
+}
+
+/// Backup, offered once and last; an empty answer skips it.
+fn backup() -> Result<bool, String> {
+    let places = crate::home::Places::home()?;
+    if crate::home::done(&places) || crate::skills::was_offered("backup") {
+        return Ok(false);
+    }
+    crate::skills::note_offered("backup");
+    println!(
+        "\nBack up memory, skills, profiles and config.toml to a private git repository,\nso a new machine starts where this one left off. Keys in ~/.agent/env, logins\nand chat history stay on this machine."
+    );
+    let url = line("Repository URL, or Enter to skip (`sonny setup backup` later): ")?;
+    if url.is_empty() {
+        return Ok(false);
+    }
+    crate::home::set_up(&places, Some(&url)).map(|()| true)
 }
 
 /// What a refusal to list asks of the person, where Sonny knows.
@@ -729,7 +760,7 @@ fn whole(text: &str) -> bool {
 }
 
 /// What setup chose, and where to change it.
-fn summary(model: &str, file: &Path, brought: &[String]) {
+fn summary(model: &str, file: &Path, brought: &[String], backed: bool) {
     let sonny = agent_client::config::read(file).map(|c| c.sonny).ok();
     let effort = |effort: Option<String>| effort.unwrap_or_else(|| "the model's own".into());
     let (lead, task) = sonny.map_or((None, None), |s| (s.lead_effort, s.task_effort));
@@ -748,6 +779,12 @@ fn summary(model: &str, file: &Path, brought: &[String]) {
     );
     if !brought.is_empty() {
         println!("  MCP         {}", brought.join(", "));
+    }
+    if backed {
+        println!(
+            "  Backup      ~/agent-home, every {} minutes",
+            crate::home::EVERY_SECONDS / 60
+        );
     }
     println!("  Settings    {file}");
     for missing in missing_tools() {

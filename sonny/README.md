@@ -124,7 +124,9 @@ cleanup find nothing to do. On a machine that never synced, setup first
 restores what the repository holds, keeping a `config.toml` it replaces as
 `config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
 backup URL`. `sonny home status` says how the last sync went. Pushing uses
-the person's own git credentials, read from the login shell.
+the person's own git credentials, read from the login shell. First-run
+setup offers it last, once, and an empty answer skips it; an upgrade offers
+it once to a person who has neither set it up nor been offered it.
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,

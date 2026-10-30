@@ -443,6 +443,12 @@ fn offered_in(home: &Path) -> Vec<String> {
     text.lines().map(str::to_owned).collect()
 }
 
+/// Whether setup or a bot has offered `id` before.
+pub fn was_offered(id: &str) -> bool {
+    std::env::var_os("HOME")
+        .is_some_and(|home| offered_in(&PathBuf::from(home)).iter().any(|o| o == id))
+}
+
 /// `id` offered, by setup or by a bot, so no upgrade offers it again.
 pub fn note_offered(id: &str) {
     if let Some(home) = std::env::var_os("HOME") {

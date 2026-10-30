@@ -576,8 +576,9 @@ the bot to tell the person what of them matters, and once it is sent the
 new register is the heard one. No version is compared, so a skipped release
 is told with the next. The first register a person has is heard of without
 a word. The note also offers each setup step an upgrade brings that the
-person has neither done nor been offered (`setup::STEPS`, now bringing in
-MCP servers with `sonny mcp import`): each is offered once, then noted in
+person has neither done nor been offered (`setup::STEPS`: bringing in
+MCP servers with `sonny mcp import`, and a git backup with `sonny setup
+backup`): each is offered once, then noted in
 `~/.agent/sonny/offered`, as is one setup itself offers. The row reads
 `↳ Sonny upgraded · what's new · set up mcp-import`.
 
