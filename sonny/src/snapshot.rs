@@ -735,7 +735,12 @@ mod tests {
         .unwrap();
         // Committed by the person's own git, which converts it.
         for args in [&["add", "-A"][..], &["commit", "-q", "-m", "converted"]] {
-            let done = Command::new("git").arg("-C").arg(&top).args(args).status();
+            let done = (Command::new("git").arg("-C").arg(&top).args(args))
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status();
             assert!(done.unwrap().success());
         }
         std::fs::write(top.join("y.a"), "three\r\n").unwrap();
