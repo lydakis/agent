@@ -817,6 +817,10 @@ pictures, and code in syntax colors.
 
 ![Closed with /margin, then the lead put up a new note: the margin opened again with it](../docs/sonny/margin-opens-again.png)
 
+![The lead heard that wire asks you and keeps it on your list in the margin, its ↗ ready to open wire](../docs/sonny/margin-opens-task.png)
+
+![The ↗ clicked: wire opened over the margin with its question, ← going back to the margin](../docs/sonny/margin-opens-task-opened.png)
+
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
 ![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)
