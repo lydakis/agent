@@ -234,6 +234,74 @@ fn a_task_starts_in_a_worktree_of_its_own_by_default() {
 }
 
 #[test]
+fn a_start_lists_the_folders_the_lead_s_gone_tasks_left() {
+    let lab = Lab::new("left");
+    let src = lab.repo.join("src");
+    let listed = |names: &[&str]| {
+        let bots: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({"name": name}))
+            .collect();
+        std::fs::write(
+            lab.scratch.join("run.log.ls"),
+            serde_json::to_string(&bots).unwrap(),
+        )
+        .unwrap();
+    };
+    let start = |name: &str, own: bool| {
+        let call = serde_json::json!({"name": name, "brief": "b", "own_folder": own});
+        let (ok, said) = lab.tool(&src, "start_task", call, false);
+        assert!(ok, "{said}");
+        said
+    };
+    listed(&["demo.old"]);
+    start("old", false);
+    std::fs::write(
+        lab.home.join(".agent/worktrees/demo.old/big"),
+        vec![0; 2_000_000],
+    )
+    .unwrap();
+    listed(&["demo.old", "demo.mine"]);
+    let said = start("mine", true);
+    assert!(!said.contains("no longer there"), "{said}");
+    // Pruned, its agents leave their folders, which the next start lists,
+    // the one started now not among them.
+    listed(&["demo.new"]);
+    let said = start("new", false);
+    assert!(
+        said.contains(
+            "Folders left by your tasks no longer there: demo.mine (0 KB), demo.old (2 MB)"
+        ),
+        "{said}"
+    );
+    // Another repository's tasks are its lead's to list.
+    let other = lab.scratch.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    lab.git(&other, &["init", "-q"]);
+    lab.git(&other, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    listed(&["demo.new", "demo.else"]);
+    let call = serde_json::json!({"name": "else", "brief": "b"});
+    let (ok, said) = lab.tool(&other, "start_task", call, false);
+    assert!(ok && !said.contains("no longer there"), "{said}");
+    // remove_task clears them, with its checks.
+    let (ok, said) = lab.tool(
+        &src,
+        "remove_task",
+        serde_json::json!({"task": "old"}),
+        false,
+    );
+    assert!(!ok && said.contains("uncommitted changes"), "{said}");
+    for (task, discard) in [("old", true), ("mine", true)] {
+        let call = serde_json::json!({"task": task, "discard": discard});
+        let (ok, said) = lab.tool(&src, "remove_task", call, false);
+        assert!(ok, "{said}");
+    }
+    listed(&["demo.new", "demo.last"]);
+    let said = start("last", false);
+    assert!(!said.contains("no longer there"), "{said}");
+}
+
+#[test]
 fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
     let lab = Lab::new("brief");
     // A link in the home to the repository, as `~/workplace` is to

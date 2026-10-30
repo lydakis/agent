@@ -183,6 +183,41 @@ class ApprovalTests(ModelFixture):
         self.assertFalse((repo / '.git/commondir').exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_repository_inside_a_bot_s_folder_given_as_writable_keeps_what_git_runs(self):
+        # Sonny gives each repository inside an agent's folder as a writable
+        # git folder, which keeps its hooks and config as a root's own.
+        git = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com']
+        repo = self.path / 'src/api'
+        repo.mkdir(parents=True)
+        for args in (['init', '-q', '-b', 'main'], ['commit', '-q', '--allow-empty', '-m', 'one']):
+            subprocess.run(git + args, cwd=repo, check=True, capture_output=True)
+        config = (repo / '.git/config').read_text()
+        client = self.client('shell', settings={
+            'sandbox': 'workspace-write', 'writable': [os.path.realpath(repo / '.git')]})
+        client.request('create', bot='Bob', workspace=str(self.path))
+        made = self.path / 'made'
+        calls = [['shell', {'command': f'cd {repo} && ' + ' '.join(git) + ' commit -q --allow-empty -m two'}],
+                 ['shell', {'command': f'echo exit 1 > {repo}/.git/hooks/pre-commit'}],
+                 ['shell', {'command': f'echo "[core] hooksPath = /tmp" >> {repo}/.git/config'}],
+                 # Nor is the folder put aside for one of its own.
+                 ['shell', {'command': f'mv {repo}/.git {repo}/.git.x'}],
+                 # A repository it makes is its own.
+                 ['shell', {'command': f'git init -q {made} && echo exit 0 > {made}/.git/hooks/pre-commit'}]]
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='calls:' + json.dumps(calls))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
+        log = subprocess.run(['git', 'log', '--format=%s'], cwd=repo, capture_output=True, text=True)
+        self.assertEqual(log.stdout.split(), ['two', 'one'])
+        for call in ('shell-2', 'shell-3', 'shell-4'):
+            self.assertNotEqual(self.tool_output(client, call)[1]['exit_code'], 0, call)
+        self.assertFalse((repo / '.git/hooks/pre-commit').exists())
+        self.assertEqual((repo / '.git/config').read_text(), config)
+        self.assertTrue((repo / '.git/HEAD').exists())
+        self.assertEqual(self.tool_output(client, 'shell-5')[1]['exit_code'], 0)
+        self.assertTrue((made / '.git/hooks/pre-commit').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_a_sandboxed_bot_without_a_gate_cannot_leave_its_sandbox(self):
         (ROOT / '.local').mkdir(exist_ok=True)
         outside = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
@@ -245,6 +280,7 @@ class ApprovalTests(ModelFixture):
             dict(op='fork', source='Src', bot='Twin', request_id='twin'),
             dict(child, bot='Runner', workspace=str(self.path / 'kid'), declare=[run]),
             dict(child, bot='Stepper', workspace=str(self.path / 'kid'), declare=[dict(run, steps=True)]),
+            dict(op='resume'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
@@ -280,11 +316,11 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, stepper) = probed['answers']
+         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, stepper, resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
         # Passed on as it has it, not as a tool whose steps alone are gated.
         self.assertIn('result', runner)
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, stepper):
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, stepper, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),

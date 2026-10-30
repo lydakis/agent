@@ -46,7 +46,9 @@ it keeps these, and says in its PR how:
 - A waiting bot holds nothing live. A wait of a second or more (a closed
   pool, an allowance refill, a retry backoff, `wait`, an approval, an answered
   tool) parks durably: no task, no active slot, no timer of its own. The run
-  loop owns the one wake-up schedule.
+  loop owns the one wake-up schedule. So does a client's request that waits
+  (`wait`, `approve_step`): its deadline is an entry in the handles'
+  schedule, which the run loop sleeps on.
 - Bots never block each other. Shared bounds (active slots, the process
   budget, a provider pool, a session's output queue) are taken in fair order
   and never held while waiting on something else; one bot's wide round does

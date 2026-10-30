@@ -348,7 +348,10 @@ the person's preferences, what they corrected and what they confirmed
 worked, traps, pointers. Each fact is one
 Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
-`verified`, and `external` when it is so). The person's facts are in `~/.agents/memory`, a project's in
+`verified`, `external` when it is so, and `confirmed` and `pushed_back`,
+how many times the person confirmed or pushed back on it, when not zero, as
+ExpeL's insights and ACE's playbook bullets keep helpful and harmful
+counts; a save that leaves a count out keeps it). The person's facts are in `~/.agents/memory`, a project's in
 `~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
 task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
@@ -421,7 +424,13 @@ named client's mark, steers included, newest first and at most
 that turn ran in. History keeps no times, so a message is dated by its
 turn: the one that started a turn is as old as the turn's start, and one
 sent into it later came while it ran, so a long turn's opening message
-from before then is left out. It saves what no
+from before then is left out. The person's reactions to a bot's replies
+are in it too, each with `reacted_to`, the first line of the reply it
+answers (the bot is told only the emoji when it was its last reply). A
+reaction counts once, and not at all once the person took it off, as the
+window's reactions file says. An answer to an ask comes with
+`recommended`, the label of the option the ask recommended, as ChatGPT
+Pulse keeps feedback with the card it was on. It saves what no
 agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
 the day's notes, taking only the person's own words and their scope, as
 Codex's extraction does.
@@ -434,7 +443,12 @@ in their chat, mail and the like when they connected servers for those. It
 saves each as a `user` fact with the dates it was seen and how many times,
 so a later lead names the pattern rather than the instance, and removes it
 when their words show it stopped. It also saves how they took what an
-agent did unasked, which is how far leads go on their own. It reads only
+agent did unasked, which is how far leads go on their own, and what
+worked: an approach they welcomed, in words or with a reaction, or picked
+when it was recommended, raising its fact's `confirmed` count, or
+`pushed_back` when they pushed back on it. A fact pushed back on more than
+it was confirmed is removed, as ExpeL drops an insight whose count reaches
+zero; it reinforces approaches, never agreement. It reads only
 what the person sent, sends nothing, and a fact saved after an MCP read is
 marked `external` as any is. A server it cannot read, as one whose sign-in
 expired, gets an `unreadable-SERVER` fact, and that night is left
@@ -538,6 +552,17 @@ is in it, and the task and lead roles each name it once, as a place to look
 for what another agent may have found and, for a task, to post what agents
 in other projects could use. There are no votes, roles or moderators: what
 agents make of it is theirs.
+
+## Pause
+
+`/pause REASON` stops every agent of every project at once, through the
+daemon's `pause` ([protocol](RUST_PROTOTYPE.md)): running turns end, nothing
+new starts, and what arrives meanwhile, triggers and lookout notes too, waits
+in the store, also across restarts. `/resume` lets it all go on. While it
+holds, every window says above the footer who paused and why. Agents pull the
+same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
+tool for it: `task.md` and `lead.md` say to, when they see agents doing harm
+someone needs to look at, and that resuming is the person's call.
 
 ## Skills
 

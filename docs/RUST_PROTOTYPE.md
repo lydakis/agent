@@ -1006,6 +1006,28 @@ closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
 cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
 
+Protocol 24 also adds the pull cord: `pause` stops every agent until
+`resume`, and holds across restarts, since the store keeps it (schema 64, a
+one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
+reason of 1 to 4096 bytes. `by` is who pulled it; on a bot's own socket it is
+that bot, whatever the request says. It ends every running turn as
+`interrupted` with `daemon_paused`, ends every background command (whose
+handle then answers `daemon_paused`) and terminal, though not a detached
+command, which no one tracks, and from then no turn starts: a `reject`
+submission answers `daemon_paused`, `queue` and `steer` submissions are
+recorded and wait, triggers and notes with them, and parked and paced turns
+stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
+interrupted}`, where `pause` is `{reason, by, at_ms}`. While a pause holds,
+another changes nothing and answers the first with `changed: false`.
+`{"op":"resume"}` lifts it and answers `{pause, changed}` with the pause it
+lifted, or null when none held; what waited starts as capacity allows. A
+sandboxed bot's own socket refuses it with `not_permitted`, so a command
+left running in a sandbox cannot let the line go on. Each
+change is told to every session as a `paused` or `resumed` event, `{event,
+pause, durable: false}`. `ready` and `stats` carry `paused`, the pause or null.
+`agent pause --reason TEXT` sends it as `AGENT_BOT` when run in a bot's shell,
+and `agent resume` lifts it.
+
 On shutdown, committed turn events get up to five seconds to drain through
 the publisher. Background commands can keep the storage stream open; when
 that deadline expires, the service cancels and awaits the publisher before
@@ -2438,8 +2460,9 @@ Under no gate the reply comes at once:
 step is announced in its own `approval_requested`, listed, served and
 answered exactly as a gated call is, under the call id `CALL/STEP`, with
 `step_of` naming its call, `node` 0 (a step has no item of its own) and
-its arguments whole. The reply waits for the decision, off the service's
-loop: `{call_id, decision, approvals}`, with the deny's `reason`, and
+its arguments whole. The reply waits for the decision, holding no task or
+timer, only the step's lapse in the daemon's one schedule:
+`{call_id, decision, approvals}`, with the deny's `reason`, and
 `expired` when a gate lapsed without a verdict, which denies the step
 (`not reviewed: no verdict`) and nothing more: the turn never waits on a
 step. Each decided step is recorded in a `step_decided` event with

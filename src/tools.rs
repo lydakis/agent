@@ -420,6 +420,9 @@ pub struct Registry {
     /// Set once as the daemon stops: background commands still running
     /// end then rather than outlive it.
     stopping: Arc<watch::Sender<bool>>,
+    /// Counts pulls of the cord: background commands running or waiting
+    /// for a slot at one end then.
+    pulls: Arc<watch::Sender<u64>>,
     credentials: Credentials,
     environment: Arc<Vec<(String, String)>>,
     /// What the daemon keeps that a sandbox leaves alone or lets through.
@@ -937,6 +940,7 @@ impl Registry {
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
+            pulls: Arc::new(watch::Sender::new(0)),
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             daemon: Arc::default(),
@@ -1766,6 +1770,7 @@ impl Registry {
         let registry = self.clone();
         let mut queued = queued;
         let mut stopping = self.stopping.subscribe();
+        let mut pulls = self.pulls.subscribe();
         tokio::spawn(async move {
             let result = async {
                 let slot = match queued.permit.take() {
@@ -1794,8 +1799,35 @@ impl Registry {
                     let _ = done.send(result);
                 }
                 _ = stopping.wait_for(|stopping| *stopping) => {}
+                // The cord pulled: dropped the same way, its handle saying
+                // why.
+                Ok(()) = pulls.changed() => {
+                    let _ = done.send(Err(Error::new("daemon_paused")));
+                }
             }
         });
+    }
+
+    /// `run`, a command a steer moved to the background, ended as the pull
+    /// cord is pulled, as one started there is.
+    pub fn until_pulled<F>(&self, run: F) -> impl Future<Output = Result<Outcome>> + use<F>
+    where
+        F: Future<Output = Result<Outcome>>,
+    {
+        let mut pulls = self.pulls.subscribe();
+        async move {
+            tokio::select! {
+                result = run => result,
+                Ok(()) = pulls.changed() => Err(Error::new("daemon_paused")),
+            }
+        }
+    }
+
+    /// End every background command and terminal now, as the pull cord
+    /// stops the line. A detached command is no one's to stop.
+    pub fn end_running(&self) {
+        self.pulls.send_modify(|pulls| *pulls += 1);
+        self.end_terminals();
     }
 
     /// End every background command still running, as the daemon stops.

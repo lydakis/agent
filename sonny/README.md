@@ -130,6 +130,17 @@ empty answer skips it; until backup is set up, the first lead after an
 upgrade offers it once, and makes the private repository wherever this
 machine keeps its own.
 
+`[sonny] start_at_boot = true` (in `/config`) starts the daemon when the
+machine does, for a box whose agents should keep working after a restart
+with nobody opening Sonny. Sonny keeps a job that runs `sonny boot`, which
+starts the daemon as a trigger's fire does, with the login shell's
+environment: a LaunchAgent run at login on a Mac, or a systemd user
+service wanted by `default.target` elsewhere, which starts at boot once
+the user lingers (Sonny runs `loginctl enable-linger`, and says when that
+needs `sudo`). The daemon brings back the companions it keeps, the lookout
+among them. Turning it off removes the job and leaves a running daemon
+running.
+
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
 beside the folder, the lead's model and a few commands. A new lead opens
@@ -214,6 +225,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
+| The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
@@ -433,7 +445,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `suggest`) through them
+  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `suggest`,
+  `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
@@ -504,7 +517,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   shows `↻ 2 triggers` beside its model. A click on an agent's name opens
   it in the pane, as a click on a task in a roster does, and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
-  or Ctrl+[ from the conversation, goes back to `/status`.
+  or Ctrl+[ from the conversation, goes back to `/status`. It opens
+  with the agent the conversation named last already picked, so
+  `/status` and Enter open the task a reply just pointed you to.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
 
@@ -548,6 +563,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
+- `/pause REASON` stops every agent, in every project, until `/resume`:
+  running turns end and what arrives meanwhile waits, across restarts too.
+  Every window says who paused and why. Agents pull the same cord with
+  `agent pause --reason` from their shell
+  ([docs/SONNY.md](../docs/SONNY.md#pause)).
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
@@ -768,6 +788,20 @@ gives them to the pane again; from the conversation Ctrl+[ hides the task
 and Ctrl+] shows it again.
 
 ![Three tasks started together, each with what it does now](../docs/sonny/tasks-roster.png)
+
+An agent's name anywhere in the conversation opens that agent in the
+pane, as a GitHub `@name` links to its account: in a reply ("tally.halves
+has a question for you"), in a row of task updates, in a message from
+another agent, and in the pane's own text. Only a name the daemon knows
+is one, so it is drawn in the agents' blue, and a word that only looks
+like one stays plain. In a row a click opens, such as `↳ From calc.neg
+▸`, the name opens the agent and the rest of the row the message. Leads
+and tasks write an agent's whole name when they point you to it, where
+that helps you act.
+
+![A reply naming tally.halves, clicked: the task opened in the pane](../docs/sonny/agent-name-opens.png)
+
+![/status opened with tally.halves, the agent named last, already picked](../docs/sonny/agent-name-status.png)
 
 Sonny keeps to the terminal's own 16 colors, so a theme sets their
 shades, and each means one thing: magenta is you (your `›`), blue the

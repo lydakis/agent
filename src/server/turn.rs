@@ -43,6 +43,8 @@ pub const MAX_ROUNDS: usize = 200;
 /// client's interrupt, or the daemon shutting down around it.
 pub const INTERRUPTED: &str = "cancelled";
 pub const SHUTDOWN: &str = "daemon_shutdown";
+/// A running turn's end when the daemon is paused.
+pub const PAUSED: &str = "daemon_paused";
 /// Attempts per model call before its failure is the turn's failure, and the
 /// wall-clock budget those attempts may span. A model call has no side
 /// effects, so retrying one is always safe; a tool is never rerun.
@@ -4562,6 +4564,7 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
+        let run = self.registry.until_pulled(run);
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });

@@ -151,7 +151,7 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
+            it; for a task no longer there, the folder it left, which a start lists. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
             own is deleted with all it holds, only with discard, since Sonny cannot check what the task made \
             there: ask the task first whether its work is pushed. It refuses, before removing anything, while \
             the task is working or its worktree has uncommitted changes, and says what. With discard, that work is dropped: only \
@@ -335,7 +335,11 @@ fn memory() -> Value {
                 "text": {"type": "string", "minLength": 1,
                     "description": "The fact, then Why: and, where it helps, How to apply:."},
                 "external": {"type": "boolean",
-                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."}
+                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."},
+                "confirmed": {"type": "integer", "minimum": 0,
+                    "description": "How many times the person confirmed what a feedback fact says; left out, the fact keeps the count it had."},
+                "pushed_back": {"type": "integer", "minimum": 0,
+                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false
@@ -534,7 +538,24 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
             };
-            crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))
+            let started =
+                crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))?;
+            // What the lead's gone tasks left, which only it can clear.
+            let left = crate::task::left_behind(&here, &caller);
+            Ok(match left.is_empty() {
+                true => started,
+                false => {
+                    let listed: Vec<String> = (left.iter())
+                        .map(|(name, size)| format!("{name} ({size})"))
+                        .collect();
+                    format!(
+                        "{started}\n\nFolders left by your tasks no longer there: {}. \
+                         remove_task with a name removes its folder, with the same checks as \
+                         for a task still there.",
+                        listed.join(", ")
+                    )
+                }
+            })
         }
         REMOVE => {
             let task = text("task").unwrap_or_default();

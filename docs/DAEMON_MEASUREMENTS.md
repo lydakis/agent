@@ -5883,3 +5883,56 @@ so they measure the extra match on every request. The change pays off in
 `bench/lookout_scale.py --gated 5000 --judge-ms 5000`: with the approver's
 client bound beside it, its longest renewal takes 94 ms, where without
 this change it takes up to 234 ms, and up to 9.7 s with neither.
+
+## The pull cord holds starts while paused (#408)
+
+Admission now asks whether the daemon is held, draining or paused, in
+one check where it asked about draining alone, and a pause is one row
+read once at start. Nothing else runs per turn: the pause's own work
+(ending turns, background commands and terminals) runs only when it is
+pulled. The Perf workflow's matched screen, base main against the PR head
+83252c6, on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.472 | 40.04 | +1.4% |
+| admission | burst submit p99, ms | 6.36 | 6.048 | -4.9% |
+| completion | release to terminal p99, ms | 13.712 | 13.679 | -0.2% |
+| footprint | idle RSS, MiB | 19.057 | 19.174 | +0.6% |
+| footprint | per idle bot, KiB | 1.422 | 1.262 | -11.3% |
+| footprint | RSS after a turn each, MiB | 28.178 | 27.998 | -0.6% |
+| footprint | CPU per turn, ms | 1.257 | 1.265 | +0.6% |
+| lifecycle | CPU, s | 1.16 | 1.16 | +0.0% |
+| lifecycle | p95 turn, ms | 579.236 | 581.178 | +0.3% |
+| lifecycle | peak RSS, MiB | 25.311 | 25.266 | -0.2% |
+
+Store jobs per turn did not change (7.5 on both), and no change is a
+cost past the gate's 15%; the per-idle-bot drop is the bench's noise, as
+the change adds nothing to an idle bot.
+
+## Waiting requests keep no task or timer (#434)
+
+A client's `wait` with a timeout, a parked turn's wait deadline, and an
+`approve_step` waiting for its step no longer spawn a task or timer each:
+every deadline is one entry in the handles' schedule, which the run loop
+sleeps on, and steps that come due together are checked in one storage
+job. An ordinary turn gains one more arm in the run loop's select. The Perf
+workflow's matched screen, base main 04fa687 against the PR head 93b93e1,
+on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.804 | 29.595 | -0.7% |
+| admission | burst submit p99, ms | 4.086 | 3.954 | -3.2% |
+| completion | release to terminal p99, ms | 9.299 | 8.836 | -5.0% |
+| footprint | idle RSS, MiB | 19.369 | 19.467 | +0.5% |
+| footprint | per idle bot, KiB | 1.508 | 1.356 | -10.1% |
+| footprint | RSS after a turn each, MiB | 30.625 | 29.203 | -4.6% |
+| footprint | CPU per turn, ms | 0.874 | 0.868 | -0.7% |
+| lifecycle | CPU, s | 0.875 | 0.885 | +1.1% |
+| lifecycle | p95 turn, ms | 665.672 | 585.85 | -12.0% |
+| lifecycle | peak RSS, MiB | 25.648 | 25.561 | -0.3% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The p95 turn and per-idle-bot drops are the bench's spread
+between runs, as the change adds nothing to an idle bot or a turn's work.

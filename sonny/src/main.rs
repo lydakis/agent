@@ -14,6 +14,7 @@ mod asks;
 mod attach;
 mod background;
 mod banner;
+mod boot;
 mod cache;
 mod calls;
 mod cmux;
@@ -482,6 +483,9 @@ async fn start_lookout(client: &Client) -> Result<(), String> {
     .await
 }
 
+/// How long a word waits on the daemon to say whether it names an agent.
+const NAME_LOOKUP: Duration = Duration::from_secs(2);
+
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
 const APPROVER: &str = "approver-auto";
@@ -784,6 +788,10 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "home" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
+        // Unlisted: the job `sonny.start_at_boot` keeps.
+        Some((verb, [])) if verb == "boot" => {
+            return std::process::ExitCode::from(boot::run() as u8);
+        }
         Some((verb, rest))
             if verb == "setup" && rest.first().is_some_and(|step| step == "backup") =>
         {
@@ -836,6 +844,7 @@ async fn run() -> Result<(), String> {
     skills::install_own();
     trigger::at_start();
     home::at_start();
+    boot::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
@@ -901,7 +910,7 @@ async fn run() -> Result<(), String> {
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
-    let context = caught_up(&mut events).await;
+    let caught = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
         .await
@@ -917,7 +926,9 @@ async fn run() -> Result<(), String> {
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = terminal.clear();
     let mut app = App::new(client, &name, &bot, options.clone());
-    (app.context, app.window) = context;
+    app.context = caught.context;
+    app.window = caught.window;
+    app.paused = caught.paused(&app.client);
     app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
@@ -1273,21 +1284,46 @@ fn status_report(state: &str, bot: &str) {
 /// the client's queue and cut the stream before it goes live.
 /// Skip the replay of a follow up to its live events; returns how big the
 /// context was after the last model round it held, when it held one.
-async fn caught_up(events: &mut Events) -> (Option<u64>, Option<u64>) {
-    let (mut context, mut window) = (None, None);
+async fn caught_up(events: &mut Events) -> Caught {
+    let mut caught = Caught::default();
     let replay = async {
         while let Some(event) = events.recv().await {
             if event["event"] == "follow_live" {
                 return;
             }
             if let Some(size) = context_after(&event) {
-                context = Some(size);
-                window = window_of(&event).or(window);
+                caught.context = Some(size);
+                caught.window = window_of(&event).or(caught.window);
+            }
+            // A pause or resume since the greeting, which no replay brings
+            // again.
+            match event["event"].as_str() {
+                Some("paused") => caught.pause = Some(event["pause"].clone()),
+                Some("resumed") => caught.pause = Some(Value::Null),
+                _ => {}
             }
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(30), replay).await;
-    (context, window)
+    caught
+}
+
+/// What a follow's replay brought before it went live: the context after
+/// its last round and the model's window, and the pause as a pause or
+/// resume meanwhile left it.
+#[derive(Default)]
+struct Caught {
+    context: Option<u64>,
+    window: Option<u64>,
+    pause: Option<Value>,
+}
+
+impl Caught {
+    /// The pause now: as the greeting said, unless one came since.
+    fn paused(&self, client: &Client) -> Option<Value> {
+        let pause = self.pause.as_ref().unwrap_or(client.paused());
+        Some(pause.clone()).filter(|pause| pause.is_object())
+    }
 }
 
 /// The model's context window a `usage` event says, when the daemon knew
@@ -1585,7 +1621,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 21] = [
+const COMMANDS: [(&str, &str); 23] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1617,6 +1653,8 @@ const COMMANDS: [(&str, &str); 21] = [
     ),
     ("/commons", "what the agents of every project share"),
     ("/usage", "the tokens the agents spent, over time"),
+    ("/pause", "stop every agent until /resume, saying why"),
+    ("/resume", "let the agents go on after a pause"),
     ("/mcp", "the MCP servers agents' scripts call"),
     ("/config", "the settings in ~/.agent/config.toml"),
     ("/sound", "the chime when work ends, on or off"),
@@ -1755,6 +1793,8 @@ struct App {
     asked: Option<Value>,
     following: bool,
     notice: Option<String>,
+    /// The pause that holds every agent, if one does, as the daemon told.
+    paused: Option<Value>,
     quit: bool,
     /// Another lead of the folder, which this window opens on instead once
     /// it quits: `/lead NAME`.
@@ -1929,6 +1969,11 @@ struct App {
     /// Buttons pressed whose work waits for the loop: a note the person
     /// took away, to tell the agent; a view to open.
     pressed: Vec<String>,
+    /// The agents named in what is drawn, as the daemon answered: a
+    /// click on one's name opens it in the pane.
+    names: std::cell::RefCell<links::Names>,
+    /// The words being asked about, and what the daemon said of each.
+    naming: Option<tokio::task::JoinHandle<Vec<(String, bool)>>>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2611,6 +2656,7 @@ impl Fleet {
 
 impl App {
     fn new(client: Arc<Client>, bot: &str, record: &Value, options: Options) -> Self {
+        let paused = Some(client.paused().clone()).filter(|pause| pause.is_object());
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or("?"),
@@ -2658,6 +2704,7 @@ impl App {
             asked: None,
             following: true,
             notice: None,
+            paused,
             quit: false,
             switch_to: None,
             started: Instant::now(),
@@ -2736,6 +2783,8 @@ impl App {
             plan_full: None,
             jump: None,
             pressed: Vec::new(),
+            names: Default::default(),
+            naming: None,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -2946,6 +2995,7 @@ impl App {
             self.read_tasks().await;
             self.read_running_tasks().await;
             self.read_references().await;
+            self.read_names().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
@@ -3545,26 +3595,27 @@ impl App {
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
                 .map_err(|e| e.to_string())?;
-            let context = caught_up(&mut fresh).await;
+            let caught = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
             let record = client
                 .request("inspect", json!({"bot": self.bot}))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((client, fresh, record, context))
+            Ok::<_, String>((client, fresh, record, caught))
         };
         if self.down {
-            let Ok((client, fresh, record, context)) = lead.await else {
+            let Ok((client, fresh, record, caught)) = lead.await else {
                 self.retry = Some(Instant::now() + Duration::from_secs(2));
                 return;
             };
+            self.paused = caught.paused(&client);
             self.client = client;
             *events = fresh;
             self.down = false;
             self.notice = None;
-            self.context = context.0.or(self.context);
-            self.window = context.1.or(self.window);
+            self.context = caught.context.or(self.context);
+            self.window = caught.window.or(self.window);
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
             self.unstage_landed().await;
@@ -3780,6 +3831,9 @@ impl App {
             brief: started::first(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
+        // Its name opens it at once, where it was drawn before it was made.
+        self.names.get_mut().learn(task.bot.clone(), true);
+        self.screen.relink();
         self.tasks_read = None;
         if let Some((at, drawn)) = self.starting
             && drawn == self.rows_drawn
@@ -4045,8 +4099,8 @@ impl App {
 
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
-    /// between agents at NODE; `task/BOT` opens the task BOT in the pane;
-    /// `answer/N/ID` answers the question
+    /// between agents at NODE; `task/BOT`, and `agent/BOT` on BOT's name
+    /// in the conversation, opens BOT in the pane; `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
@@ -4061,7 +4115,7 @@ impl App {
                 self.draw_cluster(at);
             }
         }
-        if let Some(bot) = button.strip_prefix("task/") {
+        if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
             self.open_task(bot);
         }
         if let Some(node) = button
@@ -4594,6 +4648,49 @@ impl App {
             .into_iter()
             .map(|(_, item)| item)
             .collect()
+    }
+
+    /// The words drawn that may name agents, asked about off the loop
+    /// that draws and reads keys, a batch at a time: once one does, the
+    /// links on screen are found again, so its name opens it.
+    async fn read_names(&mut self) {
+        if self.naming.as_ref().is_some_and(|job| job.is_finished()) {
+            let job = self.naming.take().expect("a lookup");
+            let mut found = false;
+            for (word, agent) in job.await.unwrap_or_default() {
+                let agent = agent && word != self.bot;
+                found |= agent;
+                self.names.get_mut().learn(word, agent);
+            }
+            if found {
+                self.screen.relink();
+                if let Some(pane) = &mut self.pane {
+                    pane.screen.relink();
+                }
+            }
+        }
+        if self.naming.is_some() {
+            return;
+        }
+        let wanted = self.names.get_mut().wanted();
+        if wanted.is_empty() {
+            return;
+        }
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        self.naming = Some(tokio::spawn(async move {
+            let mut known = Vec::new();
+            for word in wanted {
+                let asked = client.request("bots", json!({"name": word, "limit": 1}));
+                // Unanswered, it is not taken for a name for a while.
+                let agent = match tokio::time::timeout(NAME_LOOKUP, asked).await {
+                    Ok(Ok(page)) => page["bots"][0]["name"] == word.as_str(),
+                    _ => false,
+                };
+                known.push((word, agent));
+            }
+            woken.notify_one();
+            known
+        }));
     }
 
     /// The other bots' notes the margin shows, read again every few
@@ -5409,6 +5506,11 @@ impl App {
 
     async fn daemon(&mut self, event: Value) {
         let kind = event["event"].as_str().unwrap_or("");
+        // Every agent's, not this one's: told to every client.
+        if matches!(kind, "paused" | "resumed") {
+            self.paused = (kind == "paused").then(|| event["pause"].clone());
+            return;
+        }
         if !self.following {
             if kind == "follow_live" {
                 self.following = true;
@@ -6042,6 +6144,15 @@ impl App {
             picked: None,
             pick: None,
         });
+        // Picked already, the agent named last in what shows: Enter opens
+        // the one the conversation just pointed to.
+        if let Some(named) = self.screen.last_agent()
+            && let Some(watch) = &mut self.watch
+        {
+            watch.pick = card_bots(watch, self.width.max(40), &self.bot)
+                .iter()
+                .position(|bot| *bot == named);
+        }
         self.open_pane(pane::Pane::card("/status", PICK_KEYS));
     }
 
@@ -6852,15 +6963,7 @@ impl App {
             && watch.usage.is_none()
             && watch.commons.is_none()
         {
-            let bots: Vec<String> = (watch_card(watch, self.width.max(40), &self.bot).2)
-                .into_iter()
-                .filter_map(|(_, mark)| match mark {
-                    screen::Mark::Link(link) => link
-                        .strip_prefix(&format!("{}task/", screen::BUTTON))
-                        .map(str::to_owned),
-                    _ => None,
-                })
-                .collect();
+            let bots = card_bots(watch, self.width.max(40), &self.bot);
             if !bots.is_empty() {
                 let last = bots.len() - 1;
                 let pick = watch.pick.map(|pick| pick.min(last));
@@ -7897,7 +8000,11 @@ impl App {
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
-                        if !ctrl && !alt && !self.approvals.is_empty() && self.input.is_empty() =>
+                        if !ctrl
+                            && !alt
+                            && !self.approvals.is_empty()
+                            && self.paused.is_none()
+                            && self.input.is_empty() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -8119,6 +8226,34 @@ impl App {
                 }
                 Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
             }
+            return;
+        }
+        if prompt == "/resume" {
+            self.input.clear();
+            self.notice = Some(match self.client.request("resume", json!({})).await {
+                Ok(said) if said["changed"] == true => "the agents go on".into(),
+                Ok(_) => "nothing was paused".into(),
+                Err(error) => format!("resume: {error}"),
+            });
+            return;
+        }
+        if prompt == "/pause" || prompt.starts_with("/pause ") {
+            self.input.clear();
+            let reason = prompt["/pause".len()..].trim();
+            self.notice = Some(match reason {
+                "" => "/pause takes why: /pause REASON".into(),
+                reason => match (self.client)
+                    .request("pause", json!({"reason": reason}))
+                    .await
+                {
+                    Ok(said) if said["changed"] == true => format!(
+                        "every agent is paused; {} running stopped",
+                        said["interrupted"]
+                    ),
+                    Ok(_) => "already paused".into(),
+                    Err(error) => format!("pause: {error}"),
+                },
+            });
             return;
         }
         if prompt == "/compact" {
@@ -9022,7 +9157,9 @@ impl App {
                 // Paths in a file are read from its folder first.
                 let base = open.folder().unwrap_or(&workspace).to_owned();
                 let file = |word: &str| {
-                    links::file_line(&base, word).or_else(|| links::file_line(&workspace, word))
+                    (links::file_line(&base, word))
+                        .or_else(|| links::file_line(&workspace, word))
+                        .or_else(|| self.names.borrow_mut().link(word))
                 };
                 pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
@@ -9057,7 +9194,9 @@ impl App {
                 Constraint::Min(0),
             ])
             .areas(area);
-            let file = |word: &str| links::file_line(&workspace, word);
+            let file = |word: &str| {
+                links::file_line(&workspace, word).or_else(|| self.names.borrow_mut().link(word))
+            };
             let history = ratatui::layout::Rect {
                 width: column,
                 ..history
@@ -9370,6 +9509,22 @@ impl App {
     }
 
     fn status_line(&self) -> Line<'static> {
+        // A pause holds every approved call too, so it is shown first, and
+        // the approval keys wait for the resume.
+        if let Some(pause) = &self.paused {
+            let by = pause["by"].as_str().unwrap_or("you");
+            let mut line = vec![
+                Span::raw("⏸ ").fg(Color::Red),
+                Span::raw("Every agent is paused").bold(),
+                Span::raw(format!(" by {by}: ")).dim(),
+                Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
+                Span::raw(" · /resume").dim(),
+            ];
+            if !self.approvals.is_empty() {
+                line.push(Span::raw(" · an approval waits").dim());
+            }
+            return Line::from(line);
+        }
         if let Some(call) = self.approvals.first() {
             let name = call["name"].as_str().unwrap_or("tool");
             let what = call["arguments"]["command"]
@@ -9602,6 +9757,19 @@ const STATUS_KEYS: &str = "esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
+
+/// The agents `/status` lists, in its order: what its keys pick from.
+fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
+    (watch_card(watch, width, me).2)
+        .into_iter()
+        .filter_map(|(_, mark)| match mark {
+            screen::Mark::Link(link) => link
+                .strip_prefix(&format!("{}task/", screen::BUTTON))
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; whether any task in it
@@ -10128,6 +10296,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pause_shows_who_pulled_it_until_resume() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("pause") => json!({"pause": {"reason": asked["reason"], "by": null, "at_ms": 1},
+                "changed": true, "interrupted": 2}),
+            Some("resume") => json!({"pause": {"reason": "rows", "by": null}, "changed": true}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        let shown = |app: &App| -> String {
+            (app.status_line().spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        app.input.set("/pause");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("/pause takes why: /pause REASON")
+        );
+        app.input.set("/pause the migration deletes rows");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("every agent is paused; 2 running stopped")
+        );
+        // Every window hears of it, whoever pulled it.
+        let pause = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1});
+        app.daemon(json!({"event": "paused", "pause": pause, "durable": false}))
+            .await;
+        assert_eq!(
+            shown(&app),
+            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume"
+        );
+        app.input.set("/resume");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("the agents go on"));
+        // It holds the line over an approval, whose keys wait for it.
+        app.approvals
+            .push(json!({"name": "shell", "arguments": {"command": "rm -rf rows"}}));
+        assert_eq!(
+            shown(&app),
+            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume · an approval waits"
+        );
+        app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
+            .await;
+        assert!(app.paused.is_none());
+        assert!(shown(&app).starts_with("⏸ Allow shell? "));
+    }
+
+    #[tokio::test]
     async fn the_cleanup_reads_only_what_the_person_wrote_since_the_last_one() {
         let said_ = |text: &str| {
             json!({"type": "message", "role": "user",
@@ -10193,7 +10412,7 @@ mod tests {
             }
         })
         .await;
-        let read = said::said(&client, 1000).await.unwrap();
+        let read = said::said(&client, None, 1000).await.unwrap();
         assert_eq!(
             read,
             json!({"since_ms": 1000, "cut": false, "said": [
@@ -10203,6 +10422,151 @@ mod tests {
                     "project": null}]})
         );
         std::fs::remove_dir_all(shop).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_reads_the_persons_reactions_and_picks_with_what_each_answers() {
+        let message = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
+        };
+        let ask = json!({"question": "Ship it now?", "why": "w", "reason": "r",
+            "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
+        let items = json!([
+            // An answer to an ask, with what the ask recommended.
+            {"node": 17, "item": message("user", "You asked: Ship it now?\n\nLater")},
+            {"node": 16, "item": {"type": "function_call", "name": "ask", "call_id": "c1",
+                "arguments": ask.to_string()}},
+            // One to an older reply names it; one to the last reply is the
+            // emoji alone, and answers the reply before it.
+            {"node": 15, "item": message("user", "> Tagged 0.6.0.\n\n🎉")},
+            {"node": 14, "item": message("user", "👍")},
+            {"node": 13, "item": message("user", "👀"), "from": {"bot": "shop.fix", "turn": 1}},
+            {"node": 12, "item": message("assistant",
+                "\nSplit the review into a task of its own.\nIt runs now.")},
+            {"node": 11, "item": message("user", "Review the cart change.")}]);
+        let nodes: Vec<Value> = (items.as_array().unwrap().iter())
+            .map(|entry| json!({"node": entry["node"], "turn": if entry["node"] == 11 || entry["node"] == 12 { 3 } else { 4 }}))
+            .collect();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "turns" => json!({"turns": [
+                {"turn": 4, "started_ms": 2500, "finished_ms": 2600},
+                {"turn": 3, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
+                    "history_nodes" => json!({"nodes": nodes, "next_from": null}),
+                    "history_items" => json!({"items": items}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let read = said::said(&client, None, 1000).await.unwrap();
+        let entry = |turn: i64, text: &str| json!({"bot": "shop.lead", "turn": turn, "text": text, "project": null});
+        let mut answer = entry(4, "You asked: Ship it now?\n\nLater");
+        answer["recommended"] = json!("Now");
+        let mut older = entry(4, "🎉");
+        older["reacted_to"] = json!("Tagged 0.6.0.");
+        let mut last = entry(4, "👍");
+        last["reacted_to"] = json!("Split the review into a task of its own.");
+        assert_eq!(
+            read["said"],
+            json!([answer, older, last, entry(3, "Review the cart change.")])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_counts_only_reactions_still_on_and_reads_anthropic_asks() {
+        let message = |role: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": "text", "text": text}]});
+        let ask = json!({"question": "Ship it now?", "why": "w", "reason": "r",
+            "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
+        let tag = json!({"question": "Tag it too?", "options": [{"label": "Yes"}, {"label": "No"}],
+            "recommended": 1});
+        let items = json!([
+            // An answer against what the ask recommended.
+            {"node": 13, "item": message("user", "You asked: Tag it too?\n\nNo")},
+            // A 🙌 on the last finished reply, which waited for its call
+            // while another reply was written.
+            {"node": 12, "item": message("user", "🙌")},
+            {"node": 11, "item": message("assistant", "Still working.")},
+            // A 🚀 on the older of two replies that begin alike.
+            {"node": 10, "item": message("user", "> Done.\n\n🚀")},
+            {"node": 9, "item": message("user", "You asked: Ship it now?\n\nNow")},
+            // A 👍 on the ask's reply, taken off and put on again: once.
+            {"node": 8, "item": message("user", "👍")},
+            {"node": 7, "item": message("user", "👍")},
+            // An Anthropic reply holds its ask as a `tool_use` block.
+            {"node": 6, "item": {"role": "assistant", "content": [
+                {"type": "text", "text": "Ready to ship."},
+                {"type": "tool_use", "id": "t1", "name": "ask", "input": ask},
+                {"type": "tool_use", "id": "t2", "name": "ask", "input": tag}]}},
+            // A 🎉 on an older reply, taken off since.
+            {"node": 5, "item": message("user", "> Split the review.\n\n🎉")},
+            {"node": 4, "item": message("assistant", "Split the review.")},
+            {"node": 3, "item": message("assistant", "Done.")},
+            {"node": 2, "item": message("assistant", "Done.")}]);
+        let nodes: Vec<Value> = (items.as_array().unwrap().iter())
+            .map(|entry| json!({"node": entry["node"], "turn": 2}))
+            .collect();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => {
+                        json!({"bots": [{"name": "shop.lead", "bot_id": 3}], "next_after": null})
+                    }
+                    "turns" => {
+                        json!({"turns": [{"turn": 2, "started_ms": 1500, "finished_ms": 1800}],
+                    "next_before": null})
+                    }
+                    "history_nodes" => json!({"nodes": nodes, "next_from": null}),
+                    "history_items" => json!({"items": items}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let home = std::env::temp_dir().join(format!("said-reactions-{}", std::process::id()));
+        let store = home.join("state.sqlite");
+        let dir = home.join(".agent/sonny/reactions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = reactions::key(&store, 3);
+        std::fs::write(
+            dir.join(format!("{key}.json")),
+            r#"{"6": ["👍", "🙌"], "2": ["🚀"]}"#,
+        )
+        .unwrap();
+        let read = said::said(&client, Some((&home, &store)), 1000)
+            .await
+            .unwrap();
+        let entry =
+            |text: &str| json!({"bot": "shop.lead", "turn": 2, "text": text, "project": null});
+        let mut answer = entry("You asked: Ship it now?\n\nNow");
+        answer["recommended"] = json!("Now");
+        let mut liked = entry("👍");
+        liked["reacted_to"] = json!("Ready to ship.");
+        let mut launched = entry("🚀");
+        launched["reacted_to"] = json!("Done.");
+        let mut cheered = entry("🙌");
+        cheered["reacted_to"] = json!("Ready to ship.");
+        let mut against = entry("You asked: Tag it too?\n\nNo");
+        against["recommended"] = json!("Yes");
+        assert_eq!(
+            read["said"],
+            json!([against, cheered, launched, answer, liked])
+        );
+        // Without the windows' file, nothing says which were taken off.
+        let read = said::said(&client, None, 1000).await.unwrap();
+        let mut older = entry("🎉");
+        older["reacted_to"] = json!("Split the review.");
+        cheered["reacted_to"] = json!("Still working.");
+        assert_eq!(
+            read["said"],
+            json!([against, cheered, launched, answer, liked, older])
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]

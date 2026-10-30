@@ -33,7 +33,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Notify, mpsc, watch},
+    sync::{mpsc, watch},
     task::JoinSet,
 };
 use turn::Turn;
@@ -549,6 +549,16 @@ enum Command {
         #[serde(default)]
         grace_ms: u64,
     },
+    /// Stop every agent until `resume`, across restarts: each running turn
+    /// ends with `daemon_paused`, no turn starts, and queued work waits.
+    /// `by` names who pulled it; a bot's own socket is that bot. While a
+    /// pause holds, another changes nothing.
+    Pause {
+        reason: String,
+        by: Option<String>,
+    },
+    /// Lift the pause; what waited starts as capacity allows.
+    Resume,
 }
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
@@ -794,74 +804,36 @@ fn name(field: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
-/// An `approve_step` waiting for its step's decision, off the service's
-/// loop: woken by an answer, at the gate's lapse, or when the turn ends. A
-/// client whose session closes takes its step with it.
-struct StepWait {
-    store: Store,
-    handles: Handles,
+/// An `approve_step` waiting for its step's decision, which holds no task
+/// or timer: an answer, the turn's or call's end, and the gate's lapse
+/// each bring it to the run loop through the handles' schedule. A client
+/// whose session closes takes its step with it.
+struct Stepping {
+    session: u64,
+    output: Output,
+    request: Value,
     bot: String,
     turn: i64,
     id: String,
+    /// Its client's session closed: it is dropped, and no one answered.
+    gone: bool,
+    /// A check of it is with the store, and whether to check it again
+    /// once that one is back.
+    checking: bool,
+    again: bool,
 }
-impl StepWait {
-    /// Tell the turn waiting on the step's call that the call's time runs
-    /// again, and give the reply once the step is decided.
-    fn settle(&self, stepped: Stepped) -> std::result::Result<Value, (Arc<Notify>, Option<u64>)> {
-        if let Some(notify) = stepped.notify {
-            notify.notify_one();
-        }
-        if stepped.wake {
-            self.handles.wake(self.bot.clone(), self.turn);
-        }
-        match stepped.step {
-            Step::Decided(reply) => Ok(reply),
-            Step::Pending { notify, expires_ms } => Err((notify, expires_ms)),
-        }
+/// Tell the turn waiting on a step's call that the call's time runs again,
+/// and give the step's reply once it is decided.
+fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Option<Value> {
+    if let Some(notify) = stepped.notify {
+        notify.notify_one();
     }
-    async fn wait(
-        self,
-        mut notify: Arc<Notify>,
-        mut expires_ms: Option<u64>,
-        output: Output,
-        mut closed: watch::Receiver<bool>,
-        request: Value,
-    ) {
-        loop {
-            let lapse = expires_ms.map(|at| {
-                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
-            });
-            let gone = tokio::select! {
-                () = notify.notified() => false,
-                () = async {
-                    match lapse {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = closed.wait_for(|closed| *closed) => true,
-            };
-            let (bot, turn, id) = (self.bot.clone(), self.turn, self.id.clone());
-            let stepped = self
-                .store
-                .op("step_check", move |db| match gone {
-                    true => db.step_abandon(&bot, turn, &id, now_ms()),
-                    false => db.step_check(&bot, turn, &id, now_ms()),
-                })
-                .await;
-            let result = match stepped.map(|stepped| self.settle(stepped)) {
-                Ok(Err((next, at))) => {
-                    (notify, expires_ms) = (next, at);
-                    continue;
-                }
-                Ok(Ok(reply)) => Ok(reply),
-                Err(error) => Err(error),
-            };
-            if !gone && output.try_respond(request, result).is_err() {
-                output.close();
-            }
-            return;
-        }
+    if stepped.wake {
+        handles.wake(bot.to_owned(), turn);
+    }
+    match stepped.step {
+        Step::Decided(reply) => Some(reply),
+        Step::Pending { .. } => None,
     }
 }
 /// The most bytes a prompt's pictures may have together, decoded: what
@@ -1002,9 +974,12 @@ fn gate(
 }
 struct Service {
     store: Store,
-    /// For each session with a step waiting, what tells its waits that the
-    /// session closed: a step goes with the client that put it.
-    stepping: HashMap<u64, watch::Sender<bool>>,
+    /// Each waiting step's `approve_step`, by approval, answered from the
+    /// run loop once the step is decided: a step goes with the client
+    /// that put it.
+    stepping: HashMap<i64, Stepping>,
+    /// Checks of waiting steps with the store.
+    step_checks: JoinSet<Vec<(i64, Result<Stepped>)>>,
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
@@ -1042,6 +1017,12 @@ struct Service {
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
+    /// The pause that holds, as the store keeps it: no turn starts and
+    /// accepted submissions wait for `resume`.
+    paused: Option<Value>,
+    /// Events for every session, sent once the request that made them is
+    /// answered.
+    notices: Vec<Value>,
     /// Admissions queued with the storage worker and not yet answered,
     /// oldest first: the worker answers in queue order.
     admissions: std::collections::VecDeque<Admission>,
@@ -1129,7 +1110,8 @@ enum Pending {
         delivery: Delivery,
         /// Holds one of `reserved`.
         reserved: bool,
-        draining: bool,
+        /// Why no turn may start, as the refusal names it.
+        held: Option<&'static str>,
         answer: Answer<(i64, Started)>,
         answered: Option<Result<(i64, Started)>>,
     },
@@ -1220,6 +1202,7 @@ pub(crate) async fn publish(
             Publication::Finished { bot, turn, outcome } => {
                 handles.turn_finished(&bot, turn, outcome);
             }
+            Publication::Stepped(approval) => handles.stepped(approval),
         }
     }
 }
@@ -1399,7 +1382,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     let hub = Hub::default();
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
+    // A pause outlives the daemon that took it.
+    let paused = store.op("pause", |db| db.pause()).await?;
     let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
+        "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
@@ -1509,6 +1495,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut service = Service {
         store,
         stepping: HashMap::new(),
+        step_checks: JoinSet::new(),
         companions,
         identity,
         transport,
@@ -1531,6 +1518,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         wakes,
         steer_wakes,
         draining: false,
+        paused,
+        notices: Vec::new(),
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
         storage_backoff: Duration::ZERO,
@@ -1615,6 +1604,15 @@ pub async fn run(config: Configuration) -> Result<()> {
                         service.resume(bot, turn, due).await?;
                     }
                 }
+                // A wait's deadline, or a step answered, ended or lapsing:
+                // the one schedule that waiting requests keep.
+                () = service.handles.due() => {
+                    let due = service.handles.take_due(handles::now_ms());
+                    service.check_steps(due, false);
+                }
+                Some(checked) = service.step_checks.join_next(), if !service.step_checks.is_empty() => {
+                    service.steps_checked(checked.map_err(|_| Error::new("step_check_failed"))?);
+                }
                 // Queued admissions are answered as their commits land, in order.
                 _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
                     let (session, output, id, result) = service.settled();
@@ -1632,7 +1630,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     match message {
                         Inbound::Open(id, output, caller, _) => {
-                            let _ = output.try_send(ready.clone());
+                            // With the pause as it holds now: one taken or
+                            // lifted since start was told only to sessions then.
+                            let mut ready = ready.clone();
+                            ready["paused"] = json!(service.paused);
+                            let _ = output.try_send(ready);
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
@@ -1645,9 +1647,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
-                            if let Some(stepping) = service.stepping.remove(&id) {
-                                stepping.send_replace(true);
-                            }
+                            service.abandon_steps(id);
                             if id == 0 && stdio_owner { break; }
                         }
                         Inbound::Request(id, request) => {
@@ -1723,6 +1723,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                            // What every session hears of it, such as a pause. One
+                            // too far behind to hear it is closed, as a lagging
+                            // follower is, and hears it in its next greeting.
+                            for notice in std::mem::take(&mut service.notices) {
+                                for (session, output) in &sessions {
+                                    if output.try_send(notice.clone()).is_err() {
+                                        service.hub.close_session(*session);
+                                        output.close();
+                                    }
+                                }
+                            }
                             // Start serving, or release an answer's hold, after its reply.
                             if let Some((tag, lease)) = serving {
                                 service.hub.start(&tag, id, lease);
@@ -1878,6 +1889,9 @@ impl Service {
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // Any agent may pull the cord; letting the line go on is the
+            // person's, from outside any sandbox.
+            Command::Resume => return refuse("resume a pause"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
@@ -1886,6 +1900,10 @@ impl Service {
             .store
             .op("inspect", move |db| db.inspect_id(caller))
             .await?;
+        // Any agent may pull the cord, as itself.
+        if let Command::Pause { by, .. } = command {
+            *by = Some(me.name.clone());
+        }
         // A request may name only the caller as the creator of what it makes.
         let claim = |created_by: &mut Option<String>, created_by_id: &mut Option<i64>| {
             if created_by.as_ref().is_some_and(|name| *name != me.name)
@@ -2076,8 +2094,20 @@ impl Service {
         }
     }
     fn has_capacity(&self) -> bool {
-        !self.draining
+        self.held().is_none()
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
+    }
+
+    /// Why no turn may start, if none may: the daemon is shutting down or
+    /// paused.
+    fn held(&self) -> Option<&'static str> {
+        if self.draining {
+            Some("daemon_draining")
+        } else if self.paused.is_some() {
+            Some(turn::PAUSED)
+        } else {
+            None
+        }
     }
 
     /// What an admission will send `session`: its reply, and its event once
@@ -2129,7 +2159,7 @@ impl Service {
             Some(Command::Create { .. }) => full(),
             Some(Command::Submit { .. }) => {
                 full()
-                    || (!self.draining
+                    || (self.held().is_none()
                         && self.limit_active != 0
                         && self.reserved > 0
                         && self.active.len() + self.reserved >= self.limit_active)
@@ -2195,14 +2225,14 @@ impl Service {
                 request_id,
                 delivery,
                 reserved,
-                draining,
+                held,
                 answered,
                 ..
             } => {
                 self.reserved -= usize::from(reserved);
                 let answered = answered.expect("the submission was answered");
                 let name = followed.then(|| bot.clone());
-                let result = self.admitted(bot, request_id, delivery, draining, answered);
+                let result = self.admitted(bot, request_id, delivery, held, answered);
                 let cursor = result.as_ref().ok().and_then(|r| r["cursor"].as_i64());
                 (result, cursor, name)
             }
@@ -2237,13 +2267,13 @@ impl Service {
         bot: String,
         request_id: String,
         delivery: Delivery,
-        draining: bool,
+        held: Option<&'static str>,
         result: Result<(i64, Started)>,
     ) -> Result<Value> {
-        // While draining no turn starts: `reject` work is refused for the
-        // next daemon, and queued work waits durably for it.
-        let (identity, started) = result.map_err(|error| match error.code.as_str() {
-            "active_agent_limit" if draining => Error::new("daemon_draining"),
+        // While draining or paused no turn starts: `reject` work is refused,
+        // and queued work waits durably for the next daemon or `resume`.
+        let (identity, started) = result.map_err(|error| match (error.code.as_str(), held) {
+            ("active_agent_limit", Some(held)) => Error::new(held),
             _ => error,
         })?;
         let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -2340,6 +2370,115 @@ impl Service {
         self.plan_expiry(overdue).await
     }
 
+    /// Check where waiting steps stand, in one storage job, so they
+    /// commit together and the loop goes on meanwhile: `gone` for the steps
+    /// whose client's session closed, which are dropped. A step already
+    /// being checked is checked again once that check is back.
+    fn check_steps(&mut self, approvals: Vec<i64>, gone: bool) {
+        let mut asked = Vec::new();
+        for approval in approvals {
+            let Some(stepping) = self.stepping.get_mut(&approval) else {
+                continue;
+            };
+            stepping.gone |= gone;
+            if stepping.checking {
+                stepping.again = true;
+                continue;
+            }
+            stepping.checking = true;
+            asked.push((
+                approval,
+                stepping.bot.clone(),
+                stepping.turn,
+                stepping.id.clone(),
+                stepping.gone,
+            ));
+        }
+        if asked.is_empty() {
+            return;
+        }
+        let approvals: Vec<i64> = asked.iter().map(|asked| asked.0).collect();
+        let store = self.store.clone();
+        let check = move |db: &mut agent_runtime::store::Database| {
+            let now = now_ms();
+            let mut checked = Vec::with_capacity(asked.len());
+            for (approval, bot, turn, id, gone) in asked {
+                let stepped = match gone {
+                    true => db.step_abandon(&bot, turn, &id, now),
+                    false => db.step_check(&bot, turn, &id, now),
+                };
+                // A check that lost the group's transaction lost what the
+                // checks before it wrote too: the whole batch fails, as
+                // the group does, rather than the rest committing alone.
+                if !db.in_group() {
+                    return fail("storage_group_rolled_back");
+                }
+                checked.push((approval, stepped));
+            }
+            Ok(checked)
+        };
+        self.step_checks.spawn(async move {
+            store.op("step_check", check).await.unwrap_or_else(|error| {
+                approvals
+                    .into_iter()
+                    .map(|approval| (approval, Err(error.clone())))
+                    .collect()
+            })
+        });
+    }
+    /// What a check of waiting steps found: a step still waiting keeps its
+    /// lapse on the schedule, and a decided one has its `approve_step`
+    /// answered, unless its client left.
+    fn steps_checked(&mut self, checked: Vec<(i64, Result<Stepped>)>) {
+        let mut again = Vec::new();
+        for (approval, stepped) in checked {
+            let Some(stepping) = self.stepping.get_mut(&approval) else {
+                continue;
+            };
+            if !stepping.checking {
+                continue;
+            }
+            stepping.checking = false;
+            let result = match stepped {
+                Ok(Stepped {
+                    step: Step::Pending { expires_ms, .. },
+                    ..
+                }) => {
+                    self.handles.step_lapses(approval, expires_ms);
+                    if std::mem::take(&mut stepping.again) {
+                        again.push(approval);
+                    }
+                    continue;
+                }
+                Ok(stepped) => {
+                    Ok(
+                        settle_step(&self.handles, &stepping.bot, stepping.turn, stepped)
+                            .expect("a decided step"),
+                    )
+                }
+                Err(error) => Err(error),
+            };
+            self.handles.step_lapses(approval, None);
+            let stepping = self.stepping.remove(&approval).expect("a waiting step");
+            if !stepping.gone
+                && stepping
+                    .output
+                    .try_respond(stepping.request, result)
+                    .is_err()
+            {
+                stepping.output.close();
+            }
+        }
+        self.check_steps(again, false);
+    }
+    /// Drop the steps a closed session's client put.
+    fn abandon_steps(&mut self, session: u64) {
+        let gone: Vec<i64> = (self.stepping.iter())
+            .filter(|(_, stepping)| stepping.session == session)
+            .map(|(approval, _)| *approval)
+            .collect();
+        self.check_steps(gone, true);
+    }
     /// How long until the earliest parked turn is due.
     fn wake_delay(&self) -> Duration {
         self.wakes
@@ -3123,6 +3262,46 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
+            Command::Pause { reason, by } => {
+                let reason = reason.trim().to_owned();
+                if reason.is_empty() || reason.len() > 4096 {
+                    return fail_with("usage", "a pause's reason is 1 to 4096 bytes");
+                }
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let (pause, new) = store
+                    .op("put_pause", move |db| {
+                        db.put_pause(&reason, by.as_deref(), at)
+                    })
+                    .await?;
+                self.paused = Some(pause.clone());
+                // The line stops: every running turn ends now. Parked and
+                // queued turns hold no slot and wait.
+                let mut interrupted = 0;
+                if new {
+                    interrupted = (self.active.values())
+                        .filter(|active| active.cancel(turn::PAUSED))
+                        .count();
+                    // And what they started that runs on without them.
+                    self.registry.end_running();
+                    self.notices
+                        .push(json!({"event": "paused", "pause": pause, "durable": false}));
+                }
+                Ok(json!({"pause": pause, "changed": new, "interrupted": interrupted}))
+            }
+            Command::Resume => {
+                let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
+                self.paused = None;
+                let changed = lifted.is_some();
+                if changed {
+                    // What waited starts as capacity allows.
+                    self.ready_hint = true;
+                    self.notices
+                        .push(json!({"event": "resumed", "pause": lifted, "durable": false}));
+                }
+                Ok(json!({"pause": lifted, "changed": changed}))
+            }
             Command::Companions { add, remove } => match (add, remove) {
                 (Some(_), Some(_)) => {
                     fail_with("usage", "companions takes add or remove, not both")
@@ -3191,6 +3370,7 @@ impl Service {
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
                     "draining": self.draining,
+                    "paused": self.paused,
                 }))
             }
             Command::Answer {
@@ -3365,12 +3545,16 @@ impl Service {
                         format!("arguments may be up to {ANSWER_BYTES} bytes"),
                     );
                 }
-                let wait = StepWait {
-                    store: store.clone(),
-                    handles: self.handles.clone(),
+                let stepping = Stepping {
+                    session,
+                    output: output.clone(),
+                    request: id,
                     bot: bot.clone(),
                     turn,
                     id: format!("{call_id}/{step}"),
+                    gone: false,
+                    checking: false,
+                    again: false,
                 };
                 let name = bot;
                 let stepped = store
@@ -3378,19 +3562,19 @@ impl Service {
                         db.step_announce(&name, turn, &call_id, &step, &tool, arguments, now_ms())
                     })
                     .await?;
-                match wait.settle(stepped) {
-                    Ok(reply) => Ok(reply),
-                    Err((notify, expires_ms)) => {
-                        let closed = self
-                            .stepping
-                            .entry(session)
-                            .or_insert_with(|| watch::channel(false).0)
-                            .subscribe();
-                        tokio::spawn(wait.wait(notify, expires_ms, output.clone(), closed, id));
-                        // The response is sent by the wait, not by this dispatch.
-                        Err(Error::new("deferred"))
-                    }
+                if let Step::Pending {
+                    approval,
+                    expires_ms,
+                } = stepped.step
+                {
+                    self.handles.step_lapses(approval, expires_ms);
+                    self.stepping.insert(approval, stepping);
+                    // The response is sent from the run loop once the step
+                    // is decided, not by this dispatch.
+                    return Err(Error::new("deferred"));
                 }
+                Ok(settle_step(&self.handles, &stepping.bot, turn, stepped)
+                    .expect("a decided step"))
             }
             Command::StepResult {
                 bot,
@@ -3821,7 +4005,7 @@ impl Service {
                         request_id,
                         delivery,
                         reserved,
-                        draining: self.draining,
+                        held: self.held(),
                         answer,
                         answered: None,
                     },
@@ -4476,6 +4660,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4520,6 +4705,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
@@ -4647,6 +4834,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4691,6 +4879,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
@@ -4861,6 +5051,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4908,6 +5099,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
@@ -5099,6 +5292,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -5131,6 +5325,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,

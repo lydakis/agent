@@ -40,20 +40,38 @@ impl Reactions {
     /// The reactions kept under `key`, the bot's [`key`];
     /// none kept, or no key, is none.
     pub fn load(key: Option<&str>) -> Self {
-        let file = key.and_then(|key| {
-            let home = std::env::var_os("HOME")?;
-            Some(PathBuf::from(home).join(format!(".agent/sonny/reactions/{key}.json")))
-        });
-        let on = file
-            .as_ref()
-            .and_then(|file| std::fs::read(file).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        Reactions { file, on }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match key.zip(home) {
+            Some((key, home)) => {
+                let file = file(&home, key);
+                let on = read(&file).unwrap_or_default();
+                Reactions {
+                    file: Some(file),
+                    on,
+                }
+            }
+            None => Reactions::default(),
+        }
+    }
+
+    /// The reactions a window kept under `key` in `home`, or none when no
+    /// window kept a file there, as when the key is not the window's.
+    pub fn kept(home: &Path, key: &str) -> Option<Self> {
+        let file = file(home, key);
+        let on = read(&file)?;
+        Some(Reactions {
+            file: Some(file),
+            on,
+        })
     }
 
     pub fn on(&self, node: i64) -> &[String] {
         self.on.get(&node).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether a reply older than `node` has `emoji` on it.
+    pub fn before(&self, node: i64, emoji: &str) -> bool {
+        (self.on.range(..node)).any(|(_, on)| on.iter().any(|e| e == emoji))
     }
 
     /// Adds `emoji` to the reply at `node`, or takes it off when it was
@@ -92,6 +110,14 @@ impl Reactions {
     }
 }
 
+fn file(home: &Path, key: &str) -> PathBuf {
+    home.join(format!(".agent/sonny/reactions/{key}.json"))
+}
+
+fn read(file: &Path) -> Option<BTreeMap<i64, Vec<String>>> {
+    serde_json::from_slice(&std::fs::read(file).ok()?).ok()
+}
+
 /// What the bot is told: the emoji, after the first line of the reply it
 /// answers when that is not the bot's last.
 pub fn message(emoji: &str, older: Option<&str>) -> String {
@@ -104,14 +130,22 @@ pub fn message(emoji: &str, older: Option<&str>) -> String {
 /// Whether a message of the person's is a reaction [`message`] made,
 /// which the reply's own row shows instead.
 pub fn is_reaction(text: &str) -> bool {
-    let reaction = match text.strip_prefix("> ") {
+    parse(text).is_some()
+}
+
+/// A reaction [`message`] made: the first line of the reply it answers
+/// when that was not the bot's last, and the emoji.
+pub fn parse(text: &str) -> Option<(Option<&str>, &str)> {
+    let (first, reaction) = match text.strip_prefix("> ") {
         Some(quoted) => match quoted.split_once("\n\n") {
-            Some((first, rest)) if !first.contains('\n') => rest,
-            _ => return false,
+            Some((first, rest)) if !first.contains('\n') => (Some(first), rest),
+            _ => return None,
         },
-        None => text,
+        None => (None, text),
     };
-    crate::transcript::reaction(reaction).is_some()
+    crate::transcript::reaction(reaction)
+        .is_some()
+        .then_some((first, reaction))
 }
 
 /// The name of the tool a bot reacts with.
