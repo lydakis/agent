@@ -204,8 +204,10 @@ class TriggerFireTests(ModelFixture):
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
         fired = self.fire('p.task', 'Look again.', at=int(time.time()))
-        # Delivered, it leaves no row behind.
-        self.assertIsNone(fired)
+        # Delivered, it ends, keeping its row until its turn is known to
+        # have ended well.
+        self.assertEqual(fired['last']['outcome'], 'sent', fired)
+        self.assertFalse(job(self.home, 'p.task').exists())
         self.model.release_headers.set()
         self.settle('p.task')
         previews = [t['prompt_preview'] for t in self.turns('p.task')][1:]
@@ -421,8 +423,9 @@ class TriggerFireTests(ModelFixture):
         first = self.fire('p.task', 'once', extra=['--runs', '1'], generation='g1')
         self.settle('p.task')
         self.assertEqual(len(self.turns('p.task')), 2)
-        # Delivered to its limit, it ends leaving nothing.
-        self.assertIsNone(first)
+        # Delivered to its limit, it ends, its row kept until its turn is
+        # known to have ended well.
+        self.assertEqual(first['last']['outcome'], 'sent', first)
         self.assertFalse(job(self.home, 'p.task').exists())
 
     def test_a_fire_caps_the_turn_it_starts(self):

@@ -142,7 +142,7 @@ fn remove() -> Value {
     json!({
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
+            it; for a task no longer there, the folder it left, which a start lists. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
             own is deleted with all it holds, only with discard, since Sonny cannot check what the task made \
             there: ask the task first whether its work is pushed. It refuses, before removing anything, while \
             the task is working or its worktree has uncommitted changes, and says what. With discard, that work is dropped: only \
@@ -524,7 +524,24 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 own_folder: arguments["own_folder"] == true,
                 folder: text("folder"),
             };
-            crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))
+            let started =
+                crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))?;
+            // What the lead's gone tasks left, which only it can clear.
+            let left = crate::task::left_behind(&here, &caller);
+            Ok(match left.is_empty() {
+                true => started,
+                false => {
+                    let listed: Vec<String> = (left.iter())
+                        .map(|(name, size)| format!("{name} ({size})"))
+                        .collect();
+                    format!(
+                        "{started}\n\nFolders left by your tasks no longer there: {}. \
+                         remove_task with a name removes its folder, with the same checks as \
+                         for a task still there.",
+                        listed.join(", ")
+                    )
+                }
+            })
         }
         REMOVE => {
             let task = text("task").unwrap_or_default();
@@ -652,6 +669,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 let ended = crate::trigger::ended(&client, handles).await;
                 for row in rows {
                     crate::trigger::with_turn(row, &ended);
+                }
+                if let (Some(store), Ok(places)) = (client.store(), crate::trigger::Places::home())
+                {
+                    crate::trigger::forget_done(&places, store, &ended);
                 }
                 client.close().await;
             }

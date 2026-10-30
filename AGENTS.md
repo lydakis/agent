@@ -46,7 +46,9 @@ it keeps these, and says in its PR how:
 - A waiting bot holds nothing live. A wait of a second or more (a closed
   pool, an allowance refill, a retry backoff, `wait`, an approval, an answered
   tool) parks durably: no task, no active slot, no timer of its own. The run
-  loop owns the one wake-up schedule.
+  loop owns the one wake-up schedule. So does a client's request that waits
+  (`wait`, `approve_step`): its deadline is an entry in the handles'
+  schedule, which the run loop sleeps on.
 - Bots never block each other. Shared bounds (active slots, the process
   budget, a provider pool, a session's output queue) are taken in fair order
   and never held while waiting on something else; one bot's wide round does
@@ -76,6 +78,10 @@ it keeps these, and says in its PR how:
 
 - A pull request that adds, changes or removes a Sonny feature updates its
   row in sonny/FEATURES.md (status, history, why) in the same pull request.
+- The role files in sonny/agents have byte budgets (`BUDGETS` in
+  sonny/src/project.rs, checked by a test). Text added there cuts as much
+  elsewhere: merge or drop a sentence, or leave to memory what the person
+  can teach. Raise a budget only with George's say.
 - George explicitly selected a custom Rust core as a performance engineering
   project. Keep Pi and Codex as measured baselines, not an adoption gate. Reuse
   standard transport, storage, and profiling components. Record equivalent-workload

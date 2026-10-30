@@ -2461,8 +2461,9 @@ Under no gate the reply comes at once:
 step is announced in its own `approval_requested`, listed, served and
 answered exactly as a gated call is, under the call id `CALL/STEP`, with
 `step_of` naming its call, `node` 0 (a step has no item of its own) and
-its arguments whole. The reply waits for the decision, off the service's
-loop: `{call_id, decision, approvals}`, with the deny's `reason`, and
+its arguments whole. The reply waits for the decision, holding no task or
+timer, only the step's lapse in the daemon's one schedule:
+`{call_id, decision, approvals}`, with the deny's `reason`, and
 `expired` when a gate lapsed without a verdict, which denies the step
 (`not reviewed: no verdict`) and nothing more: the turn never waits on a
 step. Each decided step is recorded in a `step_decided` event with

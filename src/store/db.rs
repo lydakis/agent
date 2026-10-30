@@ -702,6 +702,9 @@ pub enum Publication {
         turn: i64,
         outcome: Value,
     },
+    /// A waiting step, by approval, that may be decided now: answered, or
+    /// gone with its turn or its call.
+    Stepped(i64),
 }
 /// Steers a running turn absorbed at a round boundary: their user items are
 /// on the lineage and their rows are finished as `steered`.
@@ -1017,10 +1020,11 @@ pub enum Gated {
 pub enum Step {
     /// Decided, or under no gate: the reply for the client that put it.
     Decided(Value),
-    /// Still waiting. `notify` fires when an answer for it is
-    /// acknowledged; `expires_ms` is when its earliest gate lapses.
+    /// Still waiting, as `approval`: [`Publication::Stepped`] names it once
+    /// an answer for it, or its turn's or call's end, is committed;
+    /// `expires_ms` is when its earliest gate lapses.
     Pending {
-        notify: Arc<Notify>,
+        approval: i64,
         expires_ms: Option<u64>,
     },
 }
@@ -1377,9 +1381,15 @@ pub struct Database {
     /// Announcements the group's jobs committed, for serving approvers,
     /// published after the group's events.
     served: Vec<Served>,
-    /// What wakes each waiting step's `approve_step`, by approval, with
-    /// the step's turn, so the turn's end wakes every one of them.
-    steps: HashMap<i64, (i64, Arc<Notify>)>,
+    /// Each waiting step's turn, by approval, so the turn's end tells of
+    /// every one of them.
+    steps: HashMap<i64, i64>,
+    /// Waiting steps the current group stepped, published after its
+    /// events.
+    stepped: Vec<i64>,
+    /// The `steps` the current group removed, put back if it does not
+    /// commit, as the rows they name are.
+    steps_gone: Vec<(i64, i64)>,
 }
 
 /// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
@@ -1636,6 +1646,8 @@ impl Database {
             live_before: HashMap::new(),
             served: Vec::new(),
             steps: HashMap::new(),
+            stepped: Vec::new(),
+            steps_gone: Vec::new(),
         })
     }
 
@@ -1860,6 +1872,8 @@ impl Database {
             live_before: HashMap::new(),
             served: Vec::new(),
             steps: HashMap::new(),
+            stepped: Vec::new(),
+            steps_gone: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -1939,7 +1953,8 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
-        let served = self.served.len();
+        let (served, stepped, gone) =
+            (self.served.len(), self.stepped.len(), self.steps_gone.len());
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -1948,6 +1963,8 @@ impl Database {
             self.conn
                 .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
             self.served.truncate(served);
+            self.stepped.truncate(stepped);
+            self.restore_steps(gone);
             self.recount_pending()?;
         }
         done
@@ -1964,7 +1981,24 @@ impl Database {
         }
         self.conn.prepare_cached("COMMIT")?.execute([])?;
         self.live_before.clear();
+        self.steps_gone.clear();
         Ok(())
+    }
+    /// Put back the steps removed since the group had `kept` removals.
+    fn restore_steps(&mut self, kept: usize) {
+        for (approval, turn) in self.steps_gone.drain(kept..) {
+            self.steps.insert(approval, turn);
+        }
+    }
+    /// A waiting step is decided or gone: no longer registered, and told of
+    /// once the group commits, if it was registered.
+    fn unstep(&mut self, approval: i64, tell: bool) {
+        if let Some(turn) = self.steps.remove(&approval) {
+            self.steps_gone.push((approval, turn));
+            if tell {
+                self.stepped.push(approval);
+            }
+        }
     }
     /// Forget a group that did not commit: roll back whatever is still
     /// open, drop the outcomes its jobs announced, and recount the waiting
@@ -1972,6 +2006,8 @@ impl Database {
     pub fn abandon_group(&mut self) -> Result<()> {
         self.outcomes.clear();
         self.served.clear();
+        self.stepped.clear();
+        self.restore_steps(0);
         self.pending_stale = true;
         for (turn, before) in self.live_before.drain() {
             match before {
@@ -2026,6 +2062,7 @@ impl Database {
                 if !sink(Publication::Event(event)) {
                     self.outcomes.clear();
                     self.served.clear();
+                    self.stepped.clear();
                     return Ok(());
                 }
             }
@@ -2044,11 +2081,19 @@ impl Database {
             if !sink(Publication::Through(assigned)) {
                 self.outcomes.clear();
                 self.served.clear();
+                self.stepped.clear();
                 return Ok(());
             }
         }
         for served in std::mem::take(&mut self.served) {
             if !sink(Publication::Approval(served)) {
+                self.outcomes.clear();
+                self.stepped.clear();
+                return Ok(());
+            }
+        }
+        for approval in std::mem::take(&mut self.stepped) {
+            if !sink(Publication::Stepped(approval)) {
                 self.outcomes.clear();
                 return Ok(());
             }
@@ -6585,10 +6630,12 @@ impl Database {
         self.served
             .push(Served::new(&bot.name, turn, cursor, vec![judged], None));
         self.approvals += 1;
-        let notify = Arc::new(Notify::new());
-        self.steps.insert(approval, (turn, notify.clone()));
+        self.steps.insert(approval, turn);
         Ok(Stepped {
-            step: Step::Pending { notify, expires_ms },
+            step: Step::Pending {
+                approval,
+                expires_ms,
+            },
             notify: None,
             wake: false,
         })
@@ -6638,15 +6685,10 @@ impl Database {
             let reason = Some("not reviewed: no verdict".to_owned());
             (false, reason, lapsed, None, true)
         } else {
-            let notify = self
-                .steps
-                .entry(request.id)
-                .or_insert_with(|| (turn, Arc::new(Notify::new())))
-                .1
-                .clone();
+            self.steps.insert(request.id, turn);
             return Ok(Stepped {
                 step: Step::Pending {
-                    notify,
+                    approval: request.id,
                     expires_ms: lapse,
                 },
                 notify: None,
@@ -6768,7 +6810,7 @@ impl Database {
         decided: Value,
     ) -> Stepped {
         self.approvals -= 1;
-        self.steps.remove(&request.id);
+        self.unstep(request.id, false);
         let status = bot.status.as_str();
         Stepped {
             step: Step::Decided(decided),
@@ -6801,9 +6843,7 @@ impl Database {
         tx.commit()?;
         self.approvals -= ids.len() as i64;
         for (approval, _) in ids {
-            if let Some((_, notify)) = self.steps.remove(&approval) {
-                notify.notify_one();
-            }
+            self.unstep(approval, true);
         }
         Ok(())
     }
@@ -6994,7 +7034,7 @@ impl Database {
         let reply = json!({"bot":answer.bot,"turn":answer.turn,"call_id":answer.call_id,
             "request":request.request,"tag":tag,
             "decision":if answer.allow { "allow" } else { "deny" },"pending":pending});
-        // A step's verdict is written now and wakes its `approve_step`,
+        // A step's verdict is written now and tells its `approve_step`,
         // whatever the turn is doing: the turn never waits on it.
         if request.step_of.is_some() {
             let tx = self.conn.savepoint()?;
@@ -7005,12 +7045,12 @@ impl Database {
                 ])?;
             untag_answered(&tx, request.id, std::slice::from_ref(&verdict))?;
             tx.commit()?;
+            if self.steps.contains_key(&request.id) {
+                self.stepped.push(request.id);
+            }
             return Ok(Answered {
                 reply,
-                notify: self
-                    .steps
-                    .get(&request.id)
-                    .map(|(_, notify)| notify.clone()),
+                notify: None,
                 resume: false,
             });
         }
@@ -7691,17 +7731,18 @@ impl Database {
             false => tx.execute("DELETE FROM approvals WHERE turn=?", [turn])? as i64,
         };
         // Each step still waiting is gone with its turn: its `approve_step`
-        // wakes to find so.
+        // is told to find so.
         let ended: Vec<i64> = self
             .steps
             .iter()
-            .filter(|(_, (of, _))| *of == turn)
+            .filter(|(_, of)| **of == turn)
             .map(|(id, _)| *id)
             .collect();
+        // As `unstep` does, with the turn's savepoint open.
         for id in ended {
-            if let Some((_, notify)) = self.steps.remove(&id) {
-                notify.notify_one();
-            }
+            self.steps.remove(&id);
+            self.steps_gone.push((id, turn));
+            self.stepped.push(id);
         }
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
             tx.execute("DELETE FROM answers WHERE turn=?", [turn])?;
