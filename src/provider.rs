@@ -586,6 +586,14 @@ impl Provider {
         }
     }
 
+    /// The rate-limit headers its calls' pool learns from.
+    fn limits(&self) -> pace::Limits {
+        match (self.family, self.speed) {
+            (Family::Anthropic, Some(_)) => pace::Limits::AnthropicFast,
+            (family, _) => family.into(),
+        }
+    }
+
     /// The tiers faster than standard this provider serves, by name.
     pub fn speeds(&self) -> &'static [&'static str] {
         match (self.family, self.bedrock) {
@@ -1023,7 +1031,7 @@ impl Provider {
             let body = error_body(response).await.unwrap_or_default();
             let quota = status == 429 && body.quota;
             if !quota {
-                reservation.learn(&headers, self.family);
+                reservation.learn(&headers, self.limits());
             }
             if matches!(status, 429 | 529) && !quota {
                 refused(&pace, status == 529, retry_after(&headers));
@@ -1042,7 +1050,7 @@ impl Provider {
                 &headers,
             ));
         }
-        reservation.learn(response.headers(), self.family);
+        reservation.learn(response.headers(), self.limits());
         // The answer is a message with no content; only its usage matters.
         let mut stream = response.bytes_stream();
         let mut body = Vec::new();
@@ -1293,7 +1301,7 @@ impl Provider {
             }
             let quota = status == 429 && body.quota;
             if !quota {
-                reservation.learn(&headers, self.family);
+                reservation.learn(&headers, self.limits());
             }
             if matches!(status, 429 | 529) && !quota {
                 refused(&pace, status == 529, retry_after(&headers));
@@ -1313,7 +1321,7 @@ impl Provider {
                 &headers,
             ));
         }
-        reservation.learn(response.headers(), self.family);
+        reservation.learn(response.headers(), self.limits());
         if self.family == Family::Responses
             && let Some(route) = route
             && let Some(state) = response.headers().get(TURN_STATE)
@@ -1537,7 +1545,7 @@ impl Provider {
                     // The upgrade's headers predate this call, so they
                     // teach the pool without settling its reservation.
                     Ok((mut session, response)) => {
-                        pace.seed(&response, self.family);
+                        pace.seed(&response, self.limits());
                         session.auth = auth;
                         session
                     }
@@ -1553,7 +1561,7 @@ impl Provider {
                                 sent.mark();
                             }
                             if let Some(headers) = &failure.headers {
-                                reservation.learn(headers, self.family);
+                                reservation.learn(headers, self.limits());
                             }
                             limit(pace, &failure);
                             reservation.settle(0);
@@ -1635,7 +1643,7 @@ impl Provider {
             }
             Err(failure) => {
                 if let Some(headers) = failure.headers.as_deref() {
-                    reservation.learn(headers, self.family);
+                    reservation.learn(headers, self.limits());
                 }
                 limit(pace, &failure);
                 session.failed(&failure);
@@ -3922,6 +3930,7 @@ mod tests {
                 .any(|beta| beta == "fast-mode-2026-02-01")
         );
         assert_ne!(fast.pool_key("m"), Family::Anthropic.pool_key("m"));
+        assert_eq!(fast.limits(), pace::Limits::AnthropicFast);
         let standard = at(Family::Anthropic, claude, Some(Speed::Standard)).unwrap();
         assert!(encoded(&standard).get("speed").is_none());
         assert_eq!(standard.pool_key("m"), Family::Anthropic.pool_key("m"));
