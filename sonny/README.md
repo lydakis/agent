@@ -693,6 +693,9 @@ tint from the same background and the theme's own red and green. The
 context in the footer turns from green to yellow at 100k tokens and to
 red at 200k.
 
+![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
+![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
+
 ![The task calc.neg opened in the pane beside the lead's conversation](../docs/sonny/task-in-pane.png)
 
 Sonny owns the whole screen, as Codex does; there is no inline mode.
