@@ -37,6 +37,7 @@ mod mac;
 mod margin;
 mod math;
 mod mcp;
+mod mcp_import;
 mod mermaid;
 mod models;
 mod mux;

@@ -60,7 +60,7 @@ pub fn pick(title: &str, rows: &[Row], marked: usize, typed: bool) -> Result<Pic
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut drawn = 0;
     let picked = loop {
-        drawn = draw(title, rows, &mut list, typed, drawn);
+        drawn = draw(title, rows, &mut list, Hint::Pick { typed }, drawn);
         match event::read() {
             Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                 if let Some(done) = list.key(key.code, key.modifiers, rows, typed) {
@@ -84,6 +84,72 @@ pub fn pick(title: &str, rows: &[Row], marked: usize, typed: bool) -> Result<Pic
     }
     let _ = std::io::stdout().flush();
     picked
+}
+
+/// Asks `title` over `rows`, each ticked or not as `ticked` says, Space
+/// ticking the marked one; the rows ticked when Enter is pressed.
+pub fn pick_many(title: &str, rows: &[Row], mut ticked: Vec<bool>) -> Result<Vec<usize>, String> {
+    let mut list = List {
+        filter: String::new(),
+        marked: 0,
+        top: 0,
+    };
+    let shown = |ticked: &[bool]| -> Vec<Row> {
+        (rows.iter().zip(ticked))
+            .map(|(row, on)| Row {
+                label: format!("{} {}", if *on { "[x]" } else { "[ ]" }, row.label),
+                ..row.clone()
+            })
+            .collect()
+    };
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let mut drawn = 0;
+    let picked = loop {
+        drawn = draw(title, &shown(&ticked), &mut list, Hint::Tick, drawn);
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err("setup cancelled".to_owned());
+                }
+                KeyCode::Esc => break Ok(Vec::new()),
+                KeyCode::Up => list.marked = list.marked.saturating_sub(1),
+                KeyCode::Down if list.marked + 1 < rows.len() => list.marked += 1,
+                KeyCode::Char(' ') => ticked[list.marked] = !ticked[list.marked],
+                KeyCode::Char('a') => {
+                    let all = !ticked.iter().all(|on| *on);
+                    ticked.iter_mut().for_each(|on| *on = all);
+                }
+                KeyCode::Enter => {
+                    break Ok((0..rows.len()).filter(|&index| ticked[index]).collect());
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(error) => break Err(error.to_string()),
+        }
+    };
+    let _ = disable_raw_mode();
+    print!("\x1b[{drawn}F\x1b[J");
+    if let Ok(picked) = &picked {
+        let names: Vec<&str> = picked
+            .iter()
+            .map(|&index| rows[index].label.as_str())
+            .collect();
+        let answer = match names.is_empty() {
+            true => "none".to_owned(),
+            false => names.join(", "),
+        };
+        println!("{BOLD}{title}{RESET} {ACCENT}{answer}{RESET}");
+    }
+    let _ = std::io::stdout().flush();
+    picked
+}
+
+/// The keys a list's last line names.
+#[derive(Clone, Copy)]
+enum Hint {
+    Pick { typed: bool },
+    Tick,
 }
 
 struct List {
@@ -158,7 +224,7 @@ impl List {
 }
 
 /// Draws the list over the `drawn` lines it drew before; how many it drew.
-fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -> usize {
+fn draw(title: &str, rows: &[Row], list: &mut List, hint: Hint, drawn: usize) -> usize {
     let shown = list.shown(rows);
     // Lines that wrapped or scrolled off the top would throw off the
     // count redrawing goes back by, so the list fits the terminal: every
@@ -219,11 +285,17 @@ fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -
         });
     }
     let hidden = shown.len().saturating_sub(list.top + fit);
-    let hint = match (shown.is_empty(), typed) {
-        (true, true) => "nothing listed matches; Enter takes what you typed".to_owned(),
-        (true, false) => "nothing matches; Backspace to widen".to_owned(),
-        _ if hidden > 0 => format!("{hidden} more · ↑↓ move · Enter choose · type to narrow"),
-        _ => "↑↓ move · Enter choose · type to narrow".to_owned(),
+    let more = match hidden {
+        0 => String::new(),
+        n => format!("{n} more · "),
+    };
+    let hint = match (hint, shown.is_empty()) {
+        (Hint::Tick, _) => format!("{more}↑↓ move · Space tick · a all · Enter done · Esc none"),
+        (Hint::Pick { typed: true }, true) => {
+            "nothing listed matches; Enter takes what you typed".to_owned()
+        }
+        (Hint::Pick { .. }, true) => "nothing matches; Backspace to widen".to_owned(),
+        (Hint::Pick { .. }, false) => format!("{more}↑↓ move · Enter choose · type to narrow"),
     };
     lines.push(format!(
         "{DIM}{}{RESET}",
