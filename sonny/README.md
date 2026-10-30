@@ -628,7 +628,11 @@ turn of the task numbered after that one reopens it.
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
 the view (`verbose`, off by default), besides the efforts and the side chat
-above.
+above. `/config` lists the keys under their table's name, a value set in
+the file plain and a default muted, so what you changed stands out.
+
+![/config: keys under agent, [judge] and [sonny], set values plain and defaults muted](../docs/sonny/config-grouped.png)
+
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
@@ -807,6 +811,18 @@ newer, and Esc stops where you are. Sonny draws the whole screen again on
 every resize and when the terminal regains focus, so a multiplexer that
 reattaches or a display that wakes never leaves stale rows; Ctrl+L
 redraws it by hand, as in a shell.
+
+With nothing typed, `?` lists every key beside the conversation. Every
+hint on screen is written one way, as Codex writes them: the key, then
+what it does muted, `·` between them (`↑↓ pick · enter open · esc
+close`). Every list over the composer (the slash menu, `/model`,
+`/approvals`, `/approve`, a reply to react to) is one list: up to 8 rows
+under a blank one, the pick in reverse video, `•` before what is in
+effect.
+
+![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
+
+![The slash menu: 8 commands under a blank row; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
 
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
