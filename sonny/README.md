@@ -470,8 +470,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
   shows `↻ 2 triggers` beside its model. A click on an agent's name opens
-  it in the pane, as a click on a task in a roster does; ‹ in its title,
+  it in the pane, as a click on a task in a roster does, and so does
+  Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`.
+
+  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/work-status.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
@@ -643,9 +646,17 @@ turn's `Worked for …` line.
 The view is clean by default: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, messaged or
 waited for, a question to you, the plan, memory, a trigger, a window
-opened). Commands, reads and edits are left out. `/verbose` draws every
-call, the conversation so far included, and is kept with the other
-settings; `/verbose` again goes back to clean.
+opened). Commands, reads, edits and lookups between them are one row
+that sums them up, as Codex's `Ran` and Claude Code's `Read 3 files` do
+(`• Ran 2 commands, edited calc.py  -1 +1 ▸`), with `✗` and how many
+failed when one did; a click opens it to every call in it. Ctrl+O opens
+every row that folds, and folds them all again once all are open.
+`/verbose` draws every call, the conversation so far included, and is
+kept with the other settings; `/verbose` again goes back to clean.
+
+![A stretch of work as one row each, a failed command marked ✗](../docs/sonny/work-top.png)
+
+![Ctrl+O opening both rows to the commands and the edit](../docs/sonny/work-opened.png)
 
 Some rows are buttons. A call that starts, messages, steers, queues for,
 waits for or changes agents is one row that says what it did and to whom
