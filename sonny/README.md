@@ -565,6 +565,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
+- `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
+  ring, the agents each one made fanned out behind it, you in the middle.
+  Live, a message flies as a spark (yours from the middle, another agent's
+  across, a lookout's or an automation's in from the rim), a commons post
+  ripples out, a tool call twinkles, and whoever was lit fades. Faint lines
+  join who made whom and who talked to whom; the last messages are listed
+  under the sky.
+
+  ![/sky in the pane](../docs/sonny/sky.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns end and what arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with

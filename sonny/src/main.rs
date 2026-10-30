@@ -63,6 +63,7 @@ mod settings;
 mod setup;
 mod shell;
 mod skills;
+mod sky;
 mod snapshot;
 mod sound;
 mod started;
@@ -1626,7 +1627,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 23] = [
+const COMMANDS: [(&str, &str); 24] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -1651,6 +1652,7 @@ const COMMANDS: [(&str, &str); 23] = [
     ),
     ("/background", "Run or remove automations and follows"),
     ("/commons", "Read what the agents of every project share"),
+    ("/sky", "Watch every agent light up as they talk"),
     ("/usage", "Show the tokens the agents spent, over time"),
     ("/pause", "Stop every agent until /resume, saying why"),
     ("/resume", "Let the agents go on after a pause"),
@@ -1725,6 +1727,8 @@ struct Watch {
     usage: Option<usage::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
+    /// `/sky` holds it instead.
+    sky: Option<sky::View>,
     /// The row of the picked item (`/background`'s, `/commons`'s or
     /// `/status`'s) as the pane last drew it, so a new pick scrolls to it
     /// and scrolling otherwise stays put.
@@ -6181,6 +6185,7 @@ impl App {
             background: None,
             usage: None,
             commons: None,
+            sky: None,
             picked: None,
             pick: None,
         });
@@ -6217,6 +6222,7 @@ impl App {
             background: Some(view),
             usage: None,
             commons: None,
+            sky: None,
             picked: None,
             pick: None,
         });
@@ -6239,6 +6245,7 @@ impl App {
             background: None,
             usage: Some(view),
             commons: None,
+            sky: None,
             picked: None,
             pick: None,
         });
@@ -6261,10 +6268,30 @@ impl App {
             background: None,
             usage: None,
             commons: Some(commons::View::open(&home)),
+            sky: None,
             picked: None,
             pick: None,
         });
         self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
+    }
+
+    /// Every agent the daemon keeps, lit up live as they talk: `/sky` in
+    /// the pane, as `/status` is, until Esc. Its connection is its own.
+    fn sky(&mut self) {
+        self.watch = Some(Watch {
+            project: self.scope().project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            lookout: String::new(),
+            resolved: false,
+            background: None,
+            usage: None,
+            commons: None,
+            sky: Some(sky::View::open(self.options.socket.clone())),
+            picked: None,
+            pick: None,
+        });
+        self.open_pane(pane::Pane::card("/sky", STATUS_KEYS));
     }
 
     /// `view` read from the daemon again.
@@ -6279,6 +6306,10 @@ impl App {
     }
 
     async fn reread(&mut self) {
+        // `/sky` follows the daemon live and reads nothing again.
+        if self.watch.as_ref().is_some_and(|w| w.sky.is_some()) {
+            return;
+        }
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.background
         {
@@ -8203,6 +8234,11 @@ impl App {
             self.commons();
             return;
         }
+        if prompt == "/sky" {
+            self.input.clear();
+            self.sky();
+            return;
+        }
         if prompt == "/usage" {
             self.input.clear();
             if self.options.side.is_some() {
@@ -9130,7 +9166,20 @@ impl App {
                 _ => pane::width(size.width, PROSE as u16),
             };
             let width = wide.saturating_sub(2) as usize;
-            if let Some(view) = &watch.background {
+            if let Some(view) = &mut watch.sky {
+                view.drain();
+                let rows = size.height.saturating_sub(4) as usize;
+                let lines: Vec<Line<'static>> = (view.card(width.saturating_sub(1), rows))
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, STATUS_KEYS);
+                pane.foot = Some(Line::from(format!("  {}", view.footer())).dim());
+            } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
                 let (card, at) = view.card(width);
@@ -13092,6 +13141,7 @@ mod tests {
             background: None,
             usage: None,
             commons: None,
+            sky: None,
             picked: None,
             pick: None,
         };
@@ -13297,6 +13347,7 @@ mod tests {
             background: None,
             usage: None,
             commons: None,
+            sky: None,
             picked: None,
             pick: None,
         });
