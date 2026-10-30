@@ -94,7 +94,17 @@ ends with what it chose and with any tool agents need that is missing
 (bubblewrap for the sandbox on Linux, ripgrep), with the command that
 installs it. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
 up (in your home or this folder), setup offers them too, all ticked, as
-`sonny mcp import` does. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
+`sonny mcp import` does. When no way to reach a model is ready, setup also
+offers each of those agents found on `PATH` ("Let Claude Code set up
+Sonny"): it starts that agent in this terminal (`claude`, `codex`,
+`opencode --prompt`, `kiro-cli chat`) with a first message pointing at the
+`sonny-setup` skill, in the agent's own permission mode, and goes on once
+the person leaves it with a provider set. `sonny setup` asks both again.
+With flags it asks nothing: `--provider chatgpt|anthropic|openai|openrouter|bedrock`
+(a key already set, or one on stdin with `--key-stdin`; `--profile NAME`
+for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
+(never a folder's own servers), and `--json`, which prints what the machine
+has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
@@ -114,7 +124,11 @@ cleanup find nothing to do. On a machine that never synced, setup first
 restores what the repository holds, keeping a `config.toml` it replaces as
 `config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
 backup URL`. `sonny home status` says how the last sync went. Pushing uses
-the person's own git credentials, read from the login shell.
+the person's own git credentials, read from the login shell. Sonny names
+no host for the repository. First-run setup offers it last, once, and an
+empty answer skips it; until backup is set up, the first lead after an
+upgrade offers it once, and makes the private repository wherever this
+machine keeps its own.
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
@@ -477,7 +491,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
   tasks), **Ready for review** (finished, its last reply linking a pull
-  request), **Idle** (finished or stopped with nothing open), and
+  request), **Done** (finished or stopped with nothing open), and
   **Resolved**, only counted until `r` shows them. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
@@ -562,7 +576,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   they missed, a better way of working or a mistake, coaching a habit
   once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
   also starts, or sets up with a trigger, what the person said they will
-  do when nothing owns it, as far as their memory says they want; so
+  do when nothing owns it, as far as their memory says they want. Both
+  files say to save what the person corrected and what they welcomed, and
+  that their memory overrides the files' defaults; so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
@@ -594,7 +610,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
-  leaves the agents working.
+  leaves the agents working. Over SSH with no display and no `BROWSER`,
+  what Sonny would open (a link, a file, the page) is copied instead, so
+  it doesn't start on the remote machine's screen.
 
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
@@ -626,12 +644,16 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
+![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Done and the resolved count](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
 the view (`verbose`, off by default), besides the efforts and the side chat
-above.
+above. `/config` lists the keys under their table's name, a value set in
+the file plain and a default muted, so what you changed stands out.
+
+![/config: keys under agent, [judge] and [sonny], set values plain and defaults muted](../docs/sonny/config-grouped.png)
+
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
@@ -752,8 +774,16 @@ the theme's own foreground and background, as the terminal reports them
 at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
 the theme allows; a terminal that does not say keeps its own dim. Diffs
 tint from the same background and the theme's own red and green. The
-context in the footer turns from green to yellow at 100k tokens and to
-red at 200k.
+footer says how much of the model's context window is left (`62% context
+left`, as Codex says it), from the window the daemon sends with each
+round: green, yellow from half used, red from four fifths. Before the
+daemon has said it, the footer gives the conversation's size uncoloured.
+Your own messages sit on a band tinted from the theme's foreground over
+its background, as Codex and Claude Code tint the user's cell, so your
+turns are easy to find when you scroll back; a reply that opens with a
+heading takes no `•` before it.
+
+![Your message on its band, and the footer saying 76% context left](../docs/sonny/message-band.png)
 
 ![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
 ![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
@@ -811,13 +841,26 @@ every resize and when the terminal regains focus, so a multiplexer that
 reattaches or a display that wakes never leaves stale rows; Ctrl+L
 redraws it by hand, as in a shell.
 
+With nothing typed, `?` lists every key beside the conversation. Every
+hint on screen is written one way, as Codex writes them: the key, then
+what it does muted, `·` between them (`↑↓ pick · enter open · esc
+close`). Every list over the composer (the slash menu, `/model`,
+`/approvals`, `/approve`, a reply to react to) is one list: up to 8 rows
+under a blank one, the pick in reverse video, `•` before what is in
+effect.
+
+![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
+
+![The slash menu: 8 commands under a blank row; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
+
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
 failed in the background and `↻` for its triggers and subscriptions (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
-it shows. Under the composer, the footer counts the other agents at work
-(cyan `●`) and what needs you (yellow `●`), and a click on the count
+it shows. Under the composer, the footer counts what needs you and the
+other agents at work, each with its word (`? 1 needs you · ● 2 working`),
+marked as the roster and `/status` mark them, and a click on the count
 opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each

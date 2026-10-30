@@ -423,6 +423,7 @@ mod tests {
                 sent_ms: 0,
                 models: Vec::new(),
                 served_model: "gpt-test-2026-09-26".to_owned(),
+                context_window: 0,
             })
         );
         // A response that failed after billing still names what ran.

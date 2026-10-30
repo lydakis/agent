@@ -280,7 +280,9 @@ cached for an hour; `sent_ms`, when the request was sent in Unix-epoch
 milliseconds, so a cache miss can be set against the gap since the call before
 it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
-fallback the last attempt's); a prompt-cache refresh's event carries
+fallback the last attempt's); `context_window`, the model's context window
+in tokens on a model round's event, so a client can say how full the
+conversation is; a prompt-cache refresh's event carries
 `purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
@@ -950,8 +952,10 @@ limits as text and tool history; reasoning-heavy conversations can reach the
 limits sooner. They are not discarded to make history appear smaller. Indexed
 history and bounded context selection remain the next storage work.
 
-Each session's output channel allows at most 64 queued packets and 2 MiB of
-queued/writing bytes; each packet is capped at 1 MiB. The stdio owner session
+Each session's output channel is bounded by bytes, as NATS and Redis bound a
+slow consumer: at most 2 MiB queued or being written, each packet counting
+64 bytes besides its own, and each packet capped at 1 MiB. A burst of many
+small events fits as well as a few large ones. The stdio owner session
 applies backpressure to producers. Socket followers never block a turn: a
 follower whose queue is full has its entire session closed, including blocked
 writes. This is deliberate: one session multiplexes replies and events, so

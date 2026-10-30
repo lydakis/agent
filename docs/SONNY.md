@@ -344,7 +344,8 @@ when the goal ends, and the note goes with the agent.
 ## Memory
 
 Memory is what earlier agents learned that a later one needs: decisions,
-the person's preferences and corrections, traps, pointers. Each fact is one
+the person's preferences, what they corrected and what they confirmed
+worked, traps, pointers. Each fact is one
 Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
 `verified`, and `external` when it is so). The person's facts are in `~/.agents/memory`, a project's in
@@ -414,10 +415,13 @@ finished cleanup started (`finish` keeps that time in `.said`, out of git,
 and `cleanup start` gives it as `since_ms`, null the first night, when it
 looks back a day; a refused cleanup leaves it, so its night is read again): the memory tool's `said` with
 `since_ms`, or `~/.agent/memory said [SINCE_MS]`. Sonny reads it from the
-daemon: every message in a turn that ran since then that carries no other
-agent's or named client's mark, steers included, newest first and at most
+daemon: every message written since then that carries no other agent's or
+named client's mark, steers included, newest first and at most
 56 KiB, within what a served tool may answer, each with its agent, turn, and the memory project of the folder
-that turn ran in. It saves what no
+that turn ran in. History keeps no times, so a message is dated by its
+turn: the one that started a turn is as old as the turn's start, and one
+sent into it later came while it ran, so a long turn's opening message
+from before then is left out. It saves what no
 agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
 the day's notes, taking only the person's own words and their scope, as
 Codex's extraction does.
@@ -542,7 +546,9 @@ every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
 as a file; `memory`, what to save for later agents; `commons`, the threads
 agents share (see Commons); `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
-Triggers); and, depending on where it runs, `pictures`, `rex-windows`,
+Triggers); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
+flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md)); and,
+depending on where it runs, `pictures`, `rex-windows`,
 `herdr-panes` or `cmux-tabs`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
@@ -574,8 +580,9 @@ the bot to tell the person what of them matters, and once it is sent the
 new register is the heard one. No version is compared, so a skipped release
 is told with the next. The first register a person has is heard of without
 a word. The note also offers each setup step an upgrade brings that the
-person has neither done nor been offered (`setup::STEPS`, now bringing in
-MCP servers with `sonny mcp import`): each is offered once, then noted in
+person has neither done nor been offered (`setup::STEPS`: bringing in
+MCP servers with `sonny mcp import`, and a git backup with `sonny setup
+backup`): each is offered once, then noted in
 `~/.agent/sonny/offered`, as is one setup itself offers. The row reads
 `↳ Sonny upgraded · what's new · set up mcp-import`.
 

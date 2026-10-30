@@ -59,10 +59,10 @@ pub fn settled(state: &str) -> bool {
 fn sign(state: &str) -> Span<'static> {
     match state {
         "done" => Span::raw("✓").fg(Color::Green),
-        CHECKED => Span::raw("✔").fg(Color::Green).bold(),
+        CHECKED => Span::raw("✓").fg(Color::Green),
         QUIET => Span::raw("✓").dim(),
         "failed" => Span::raw("✗").fg(Color::Red),
-        "needs you" => Span::raw("●").fg(Color::Yellow),
+        "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
         "stopped" | "removed" => Span::raw("■").dim(),
         "starting" => Span::raw("○").dim(),
         _ => Span::raw("●").fg(Color::Cyan),
@@ -79,7 +79,7 @@ pub fn first(brief: &str) -> String {
 }
 
 /// The rows of `tasks` started together, `width` wide, each with the
-/// task a click on it opens, if any: `◆ Started 3 tasks`, then a row for
+/// task a click on it opens, if any: `• Started 3 tasks`, then a row for
 /// each with its state's mark, its name, what it is doing, and its brief
 /// cut to fit.
 pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)> {
@@ -89,7 +89,7 @@ pub fn draw(tasks: &[Task], width: usize) -> Vec<(Line<'static>, Option<usize>)>
     };
     let mut out = vec![(
         Line::from(vec![
-            Span::raw("◆ ").fg(Color::Blue),
+            Span::raw("• ").fg(Color::Green),
             Span::raw(format!("Started {count}")).bold(),
             Span::raw(" · click one to open it").dim(),
         ]),
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(
             texts(draw(&tasks, 60)),
             [
-                "◆ Started 2 tasks · click one to open it",
+                "• Started 2 tasks · click one to open it",
                 "  ● add     working  Fix the add bug: 2+2 returns 5",
                 "  ✓ divide  done     Fix division by zero",
             ]

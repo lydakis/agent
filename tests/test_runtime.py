@@ -545,7 +545,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             if user == 'burst':
                 text = 'reply:burst'
-                deltas = [{'type': 'response.output_text.delta', 'delta': ''}] * 2000
+                deltas = [{'type': 'response.output_text.delta', 'delta': ''}] * 20000
                 frames = deltas + events
                 body = b''.join(('data: ' + json.dumps(e) + '\n\n').encode() for e in frames)
                 self.wfile.write(f'{len(body):x}\r\n'.encode() + body + b'\r\n0\r\n\r\n')
@@ -1144,6 +1144,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         # Cache writes are recorded with the attempt that made them.
         usage[0].pop('sent_ms')
+        usage[0].pop('context_window')
         self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2,
                                     'cache_write_tokens': 1, 'served_model': 'synthetic-fallback', 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
@@ -1364,9 +1365,11 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # Each call records when it was sent, in epoch milliseconds.
         sent = [u['data'].pop('sent_ms') for u in usage]
         self.assertTrue(before - 1 <= sent[0] <= sent[1] <= after + 1, (before, sent, after))
-        # The call names the dated model that answered, not only the one asked.
+        # The call names the dated model that answered, not only the one asked,
+        # and the model's context window, for a client to say how full it is.
         self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2,
-                                            'served_model': 'synthetic-claude-20260926'})
+                                            'served_model': 'synthetic-claude-20260926',
+                                            'context_window': 200000})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
         self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
                                              'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})

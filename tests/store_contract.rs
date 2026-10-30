@@ -4391,6 +4391,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         sent_ms: 0,
         models: Vec::new(),
         served_model: String::new(),
+        context_window: 0,
     };
     db.append(turn, vec![assistant("one")], &[], Some(&usage))
         .unwrap();
@@ -7609,6 +7610,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         sent_ms: 0,
         models: Vec::new(),
         served_model: String::new(),
+        context_window: 0,
     };
     let warm = Usage {
         input_tokens: 300,
@@ -7619,6 +7621,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         sent_ms: 0,
         models: Vec::new(),
         served_model: String::new(),
+        context_window: 0,
     };
     db.append(turn, vec![assistant("one")], &[], Some(&cold))
         .unwrap();
@@ -7683,6 +7686,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                         output_tokens: 10,
                         models: Vec::new(),
                         served_model: String::new(),
+                        context_window: 0,
                     }),
                 )
                 .unwrap();
@@ -7719,6 +7723,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     output_tokens: 10,
                     models: Vec::new(),
                     served_model: String::new(),
+                    context_window: 0,
                 },
             )
             .unwrap();
@@ -7903,6 +7908,7 @@ fn schema_47_turns_take_their_own_token_cap() {
         sent_ms: 0,
         models: Vec::new(),
         served_model: String::new(),
+        context_window: 0,
     };
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -12961,6 +12967,7 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
         sent_ms: 0,
         models: Vec::new(),
         served_model: String::new(),
+        context_window: 0,
     };
     let hour = 3_600_000;
     let now = std::time::SystemTime::now()
