@@ -1352,9 +1352,11 @@ Built on 2026-09-27, the automatic approver:
   delegating turns, or more prompt text across them than one 128 KiB read
   holds, the words are cut and consent is not counted), redacts, and asks one judge request per
   round to a model through the daemon ([Which model
-  judges](#which-model-judges)). A round takes one of 32 judge slots
-  before it reads anything, so rounds past those wait holding only their
-  calls. It answers under its lease, denies as not reviewed past the round's deadline, and trips
+  judges](#which-model-judges)). Rounds are not capped (a round
+  waiting on its judge holds nothing); the approver keeps at most 64
+  requests in flight at the daemon and queues the rest, so its lease
+  renewals and long waits, which skip that queue, are never stuck behind
+  thousands of reads (an HTTP/2 connection's stream limit and PING). It answers under its lease, denies as not reviewed past the round's deadline, and trips
   the breaker. Each round prints one JSON line with the verdicts, the
   judge's time, and its tokens.
 - `from` on `submit`, `AGENT_TURN` in tool shells, and the `prompts` read
