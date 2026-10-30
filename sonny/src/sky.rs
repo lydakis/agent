@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 /// Past turns' events read for who talked to whom.
-const PAST: &[&str] = &["accepted", "steered"];
+const PAST: &[&str] = &["accepted", "steered", "turn_finished"];
 /// Live events: who is made, who talks, works, calls and posts.
 const LIVE: &[&str] = &[
     "created",
@@ -81,6 +81,9 @@ enum Feed {
     /// Every agent there is now: who is listed is here, who isn't is gone.
     Roll(Vec<Value>),
     Past(Value),
+    /// The calls waiting for the person when the past was read, each with
+    /// its agent: what is answered after, live events let go.
+    Held(Vec<(String, String)>),
     Live(Value),
     /// Caught up: from here on, what happens.
     Ready,
@@ -177,8 +180,8 @@ struct Agent {
     ripple: Option<Instant>,
     /// It asked the person something, not yet answered.
     asking: bool,
-    /// A call of its waits for the person's approval.
-    held: bool,
+    /// Its calls that wait for the person's approval.
+    held: HashSet<String>,
     /// Its last turn failed.
     failed: bool,
     /// The last it said or was told, for the list.
@@ -194,7 +197,7 @@ struct Agent {
 
 impl Agent {
     fn state(&self) -> Option<State> {
-        if self.asking || self.held {
+        if self.asking || !self.held.is_empty() {
             Some(State::NeedsYou)
         } else if self.running.is_some() {
             Some(State::Working)
@@ -323,6 +326,13 @@ impl View {
                     }
                 }
                 Feed::Past(event) => self.event(&event, now, false),
+                Feed::Held(calls) => {
+                    for (bot, call) in calls {
+                        if let Some(at) = self.agent(&bot) {
+                            self.agents[at].held.insert(call);
+                        }
+                    }
+                }
                 Feed::Live(event) => {
                     self.live = true;
                     self.event(&event, now, true);
@@ -492,10 +502,19 @@ impl View {
                     let agent = &mut self.agents[at];
                     agent.running = Some(turn);
                     agent.sender = Some(from);
-                    // A new turn: what it asked is answered, what failed
-                    // is tried again.
-                    agent.asking = false;
+                    // A new turn tries again what failed.
                     agent.failed = false;
+                }
+                // What it asked is answered by the one it asked: the person,
+                // or the agent that made it.
+                if kind != "queued" && live {
+                    let maker = self.agents[at]
+                        .made_by
+                        .as_deref()
+                        .and_then(|by| self.agent(by));
+                    if from == End::Person || matches!(from, End::Agent(by) if Some(by) == maker) {
+                        self.agents[at].asking = false;
+                    }
                 }
                 // A queued prompt sparks when sent; its start, or the steer
                 // taking it, is the same message and ends the watch for it.
@@ -541,6 +560,10 @@ impl View {
             }
             "tool_started" if live => {
                 let tool = data["name"].as_str().unwrap_or("");
+                // A call approved starts.
+                if let Some(call) = data["call_id"].as_str() {
+                    self.agents[at].held.remove(call);
+                }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
                 if tool == crate::asks::TOOL {
                     self.agents[at].asking = true;
@@ -555,18 +578,29 @@ impl View {
             // A call waits for the person: one gated for them, or one the
             // reviewer handed them.
             "approval_requested" if live => {
-                let manual = (data["calls"].as_array().into_iter().flatten()).any(|call| {
-                    (call["gates"].as_array())
-                        .is_some_and(|gates| gates.iter().any(|g| g == "manual"))
-                });
-                if manual {
-                    self.agents[at].held = true;
+                for call in data["calls"].as_array().into_iter().flatten() {
+                    let manual = (call["gates"].as_array())
+                        .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
+                    if let (true, Some(id)) = (manual, call["call_id"].as_str()) {
+                        self.agents[at].held.insert(id.to_owned());
+                    }
                 }
             }
-            "approval_asked" if live => self.agents[at].held = true,
-            "step_decided" | "turn_resumed" if live => self.agents[at].held = false,
+            "approval_asked" if live => {
+                if let Some(id) = data["call_id"].as_str() {
+                    self.agents[at].held.insert(id.to_owned());
+                }
+            }
+            // Each answer lets go of its call alone.
+            "step_decided" | "turn_resumed" if live => {
+                if let Some(id) = data["call_id"].as_str() {
+                    self.agents[at].held.remove(id);
+                }
+            }
             "tool_completed" if live => {
-                self.agents[at].held = false;
+                if let Some(id) = data["call_id"].as_str() {
+                    self.agents[at].held.remove(id);
+                }
                 if data["failed"] == true || data["denied"] == true {
                     let work = Work::of(data["name"].as_str().unwrap_or(""));
                     self.agents[at].twinkle = Some((now, FAILED, work));
@@ -581,11 +615,11 @@ impl View {
             {
                 let agent = &mut self.agents[at];
                 agent.running = None;
-                agent.held = false;
-                // A turn that ended with nothing to say ended as it should.
-                agent.failed =
-                    live && data["status"] == "failed" && data["error"] != "empty_completion";
-                if agent.failed {
+                agent.held.clear();
+                // Its last turn's end, past or live, says whether it failed;
+                // one that ended with nothing to say ended as it should.
+                agent.failed = data["status"] == "failed" && data["error"] != "empty_completion";
+                if live && agent.failed {
                     agent.last = Some((now, "failed".into()));
                 }
                 // The answer to the person flies back to the middle.
@@ -1493,6 +1527,19 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     }
+    // What waits for the person now; the live replay from the past's end
+    // brings what changed since.
+    match held(&client).await {
+        Ok(calls) => {
+            if send.send(Feed::Held(calls)).is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = send.send(Feed::Down(error.to_string()));
+            return;
+        }
+    }
     // Asking again replaces the follow: from where the past ended, what
     // animates the sky. Its own replay repeats nothing already sent.
     if let Err(error) = client
@@ -1565,6 +1612,37 @@ async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
             None => return send.send(Feed::Roll(bots)).is_ok(),
         }
     }
+}
+
+/// The calls a person must answer, as the conversation reads them: every
+/// one gated `manual`, and those the approver serving `auto` handed over.
+/// Each tag's listing reads only the calls still waiting on it.
+async fn held(client: &Client) -> agent_client::Result<Vec<(String, String)>> {
+    let mut calls = Vec::new();
+    for tag in ["manual", "auto"] {
+        let mut after = 0;
+        loop {
+            let page = client
+                .request(
+                    "approvals",
+                    json!({"tag": tag, "after": after, "limit": 256}),
+                )
+                .await?;
+            for call in page["approvals"].as_array().into_iter().flatten() {
+                if tag == "auto" && call["asked"].is_null() {
+                    continue;
+                }
+                if let (Some(bot), Some(id)) = (call["bot"].as_str(), call["call_id"].as_str()) {
+                    calls.push((bot.to_owned(), id.to_owned()));
+                }
+            }
+            match page["next_after"].as_i64() {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+    }
+    Ok(calls)
 }
 
 #[cfg(test)]
@@ -1870,6 +1948,8 @@ mod tests {
                         }
                         return;
                     }
+                } else if asked["op"] == "approvals" {
+                    out.push(json!({"id": id, "result": {"approvals": []}}));
                 } else {
                     follows += 1;
                     if follows == 2 {
@@ -1895,7 +1975,7 @@ mod tests {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
-                Feed::Past(_) | Feed::Down(_) => continue,
+                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) => continue,
             });
         }
         // Made, then started, once each in the store's order; then the roll
@@ -2026,7 +2106,7 @@ mod tests {
                 "shop.login",
                 "approval_requested",
                 2,
-                json!({"calls": [{"gates": ["manual"]}]}),
+                json!({"calls": [{"call_id": "c1", "gates": ["manual"]}]}),
             ),
             live(
                 "shop.cart",
@@ -2059,7 +2139,7 @@ mod tests {
         // The call allowed, the agent works again; a new turn for what
         // failed and what asked starts afresh.
         for feed in [
-            live("shop.login", "tool_completed", 2, json!({})),
+            live("shop.login", "tool_completed", 2, json!({"call_id": "c1"})),
             live("shop.cart", "accepted", 4, json!({})),
             live("shop.lead", "accepted", 5, json!({})),
             live(
@@ -2075,6 +2155,98 @@ mod tests {
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
         assert_eq!(state(&view, "shop.lead"), None);
+    }
+
+    #[tokio::test]
+    async fn what_needs_the_person_stays_until_they_answer_it() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead", "running_turn": 7}),
+            json!({"name": "shop.ops"}),
+        ]))
+        .unwrap();
+        // Read when the view opened: a failed last turn, and a call that
+        // already waited.
+        send.send(Feed::Past(
+            json!({"event": "turn_finished", "bot": "shop.ops",
+            "turn": 1, "data": {"status": "failed", "error": "provider_error"}}),
+        ))
+        .unwrap();
+        send.send(Feed::Held(vec![("shop.cart".into(), "c0".into())]))
+            .unwrap();
+        let live = |bot: &str, kind: &str, turn: i64, data: Value| {
+            Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
+        };
+        for feed in [
+            live(
+                "shop.login",
+                "accepted",
+                2,
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+            live("shop.login", "tool_started", 2, json!({"name": "ask"})),
+            live(
+                "shop.login",
+                "turn_finished",
+                2,
+                json!({"status": "completed"}),
+            ),
+            live(
+                "shop.lead",
+                "accepted",
+                3,
+                json!({"from": {"bot": "shop.ops"}}),
+            ),
+            live(
+                "shop.lead",
+                "approval_requested",
+                3,
+                json!({"calls": [{"call_id": "a", "gates": ["manual"]},
+                    {"call_id": "b", "gates": ["manual"]}]}),
+            ),
+            live("shop.lead", "tool_completed", 3, json!({"call_id": "a"})),
+            // A message from someone else is no answer to what it asked.
+            live(
+                "shop.login",
+                "accepted",
+                4,
+                json!({"from": {"bot": "shop.ops"}}),
+            ),
+        ] {
+            send.send(feed).unwrap();
+        }
+        view.drain();
+        let state = |view: &View, name: &str| view.agents[view.index[name]].state();
+        assert_eq!(state(&view, "shop.ops"), Some(State::Failed));
+        assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+
+        // The last call answered, the waiting one started, and the lead
+        // that made it answers what it asked.
+        for feed in [
+            live("shop.lead", "step_decided", 3, json!({"call_id": "b"})),
+            live(
+                "shop.cart",
+                "tool_started",
+                7,
+                json!({"call_id": "c0", "name": "shell"}),
+            ),
+            live(
+                "shop.login",
+                "steered",
+                4,
+                json!({"from": {"bot": "shop.lead"}}),
+            ),
+        ] {
+            send.send(feed).unwrap();
+        }
+        view.drain();
+        assert_eq!(state(&view, "shop.lead"), Some(State::Working));
+        assert_eq!(state(&view, "shop.cart"), Some(State::Working));
+        assert_eq!(state(&view, "shop.login"), Some(State::Working));
     }
 
     #[tokio::test]
