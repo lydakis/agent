@@ -500,7 +500,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   to care whether they succeed: take work off their plate, do or offer
   what they will need next, and say plainly, as soon as they see it, what
   they missed, a better way of working or a mistake, coaching a habit
-  once it repeats (in `lead.md`, and in `task.md` for the rest); so
+  once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
+  also starts, or sets up with a trigger, what the person said they will
+  do when nothing owns it, as far as their memory says they want; so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
