@@ -1099,9 +1099,21 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         let _ = send.send(Feed::Down(error.to_string()));
         return;
     }
+    // Until the new follow is live, the old one's last events may still be
+    // waiting here, and its replay brings them again: each cursor once.
+    let mut handoff = Some(HashSet::new());
     while let Some(event) = events.recv().await {
+        if let (Some(seen), Some(at)) = (&mut handoff, event["cursor"].as_i64())
+            && !seen.insert(at)
+        {
+            continue;
+        }
         match event["event"].as_str() {
-            Some("follow_live" | "pruned") => continue,
+            Some("follow_live") => {
+                handoff = None;
+                continue;
+            }
+            Some("pruned") => continue,
             Some("lagged" | "follow_lagged") => {
                 let _ = send.send(Feed::Down("fell behind the daemon".into()));
                 return;
@@ -1363,6 +1375,72 @@ mod tests {
         assert_eq!(view.talks.back(), Some(&(b, c)));
         assert_eq!(view.agents[c].sender, Some(End::Agent(b)));
         assert!(view.sparks.iter().all(|spark| spark.to == End::Agent(c)));
+    }
+
+    #[tokio::test]
+    async fn an_event_across_the_handoff_comes_once() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sky-handoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut out = vec![json!({"event": "ready", "protocol": agent_client::PROTOCOL})];
+            let mut lines = BufReader::new(read).lines();
+            let (mut rolls, mut follows) = (0, 0);
+            let started = json!({"cursor": 11, "bot": "a", "turn": 2, "event": "accepted",
+                "data": {"from": {"bot": "b", "turn": 1}}});
+            loop {
+                for line in out.drain(..) {
+                    write
+                        .write_all(format!("{line}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                let Ok(Some(line)) = lines.next_line().await else {
+                    return;
+                };
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                let id = asked["id"].clone();
+                if asked["op"] == "bots" {
+                    rolls += 1;
+                    if rolls == 2 {
+                        // The old follow, still live while the roll is read.
+                        out.push(started.clone());
+                    }
+                    out.push(json!({"id": id, "result": {"bots": [{"name": "a"},
+                        {"name": "b"}]}}));
+                } else {
+                    follows += 1;
+                    out.push(json!({"id": id, "result": {}}));
+                    if follows == 1 {
+                        out.push(json!({"event": "follow_live", "cursor": 10}));
+                    } else {
+                        out.push(started.clone());
+                        out.push(json!({"event": "follow_live", "cursor": 11}));
+                        for line in out.drain(..) {
+                            write
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        let (send, mut feed) = mpsc::unbounded_channel();
+        follow(socket, send).await;
+        let mut started = 0;
+        while let Ok(item) = feed.try_recv() {
+            if let Feed::Live(event) = item {
+                started += usize::from(event["event"] == "accepted");
+            }
+        }
+        assert_eq!(started, 1);
     }
 
     #[tokio::test]
