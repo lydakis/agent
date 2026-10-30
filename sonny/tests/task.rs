@@ -516,6 +516,16 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     let away = serde_json::json!({"name": "away", "brief": "b", "folder": "../"});
     let (ok, said) = lab.tool(&ws, "start_task", away, false);
     assert!(!ok && said.contains("not a folder inside"), "{said}");
+    // As is one in no repository, or in what git keeps.
+    for folder in ["src", "src/api/.git/hooks"] {
+        let away = serde_json::json!({"name": "away", "brief": "b", "folder": folder});
+        let (ok, said) = lab.tool(&ws, "start_task", away, false);
+        assert!(
+            !ok && said.contains("not in a git repository"),
+            "{folder}: {said}"
+        );
+    }
+    assert!(!lab.home.join(".agent/worktrees/demo.away").exists());
     // Recorded as the lead's, for its project's memory.
     let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
     assert_eq!(

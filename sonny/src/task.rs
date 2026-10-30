@@ -108,7 +108,19 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     // Where in the lead's folder the task works: the lead's own place, or
     // the folder inside it named.
     let at = match folder {
-        Some(folder) => inside(here, folder)?,
+        Some(folder) => {
+            let at = inside(here, folder)?;
+            // A repository's, which the task gets a worktree of: never
+            // the lead's folder by another name, nor a folder git keeps,
+            // which a task working in would write past what keeps it.
+            if git(&at, &["rev-parse", "--show-toplevel"]).is_err() {
+                return Err(format!(
+                    "{folder} is not in a git repository; give folder only for one, whose \
+                     worktree the task gets"
+                ));
+            }
+            at
+        }
         None => here.to_owned(),
     };
     let mut place = if info["threads_in"] == "project" {

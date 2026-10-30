@@ -106,8 +106,8 @@ fn start() -> Value {
                         starts in no role."},
                 "folder": {"type": "string", "minLength": 1,
                     "description": "A folder inside this one to start the task at instead of here, \
-                        relative or absolute, such as a repository this folder holds: the task then gets \
-                        a worktree of that repository and works at that folder in it."},
+                        relative or absolute, in a git repository, such as one this folder holds: the task \
+                        then gets a worktree of that repository and works at that folder in it."},
                 "own_folder": {"type": "boolean",
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
                         for work that makes its own copy of what it changes, such as a workspace on another \
