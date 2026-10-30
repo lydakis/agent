@@ -17,9 +17,10 @@ const MESSAGE_BYTES: usize = 4 * 1024;
 /// How far back the cleanup looks when no earlier one finished.
 pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Every message the person wrote to an agent in a turn that ran at or
-/// after `since_ms`, newest first, each with its agent, turn, and the
-/// project whose memory the turn's folder reads (null for none).
+/// Every message the person wrote to an agent at or after `since_ms`,
+/// newest first, each with its agent, turn, and the project whose memory
+/// the turn's folder reads (null for none). The one that started a turn
+/// before `since_ms` is older, though the turn still ran after.
 pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
     let failed = |e: agent_client::Error| format!("said_unread: {e}");
     let mut said = Newest::default();
@@ -31,23 +32,40 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
             .map_err(failed)?;
         for bot in page["bots"].as_array().into_iter().flatten() {
             let name = bot["name"].as_str().unwrap_or_default();
-            let projects = turns_since(client, name, since_ms).await.map_err(failed)?;
-            let Some(first) = projects.keys().min().copied() else {
+            let turns = turns_since(client, name, since_ms).await.map_err(failed)?;
+            let Some(first) = turns.keys().min().copied() else {
                 continue;
             };
+            // History has no times, so a message is dated by its turn: a
+            // turn's first entry is what started it, written when the turn
+            // started, and what the person sent into it later came while it
+            // ran. Newest first, a turn's oldest message is held until an
+            // older entry shows it came later.
+            let mut opening: HashMap<i64, (i64, Value)> = HashMap::new();
             walk(client, name, first, |turn, entry| {
-                if let Some(node) = crate::lookout::said_by_person(entry) {
-                    let text = cut(crate::text(&entry["item"]));
-                    let project = projects.get(&turn).cloned().flatten();
-                    said.add(
-                        node,
-                        json!({"bot": name, "turn": turn, "text": text, "project": project}),
-                    );
+                let later = match crate::lookout::said_by_person(entry) {
+                    Some(node) => {
+                        let text = cut(crate::text(&entry["item"]));
+                        let project = turns.get(&turn).and_then(|t| t.project.clone());
+                        let message =
+                            json!({"bot": name, "turn": turn, "text": text, "project": project});
+                        opening.insert(turn, (node, message))
+                    }
+                    None => opening.remove(&turn),
+                };
+                if let Some((node, message)) = later {
+                    said.add(node, message);
                 }
                 false
             })
             .await
             .map_err(failed)?;
+            for (turn, (node, message)) in opening {
+                let started = turns.get(&turn).and_then(|t| t.started_ms);
+                if started.is_none_or(|ms| ms >= since_ms) {
+                    said.add(node, message);
+                }
+            }
         }
         after = page["next_after"].clone();
         if after.is_null() {
@@ -99,14 +117,20 @@ impl Newest {
     }
 }
 
-/// The turns of `bot` that were running at or after `since_ms`, each with
-/// the project whose memory its folder reads, as memory finds it: a bot
-/// that moved between projects keeps each turn's own.
+/// A turn that ran at or after `since_ms`: the project whose memory its
+/// folder reads, as memory finds it, so a bot that moved between projects
+/// keeps each turn's own, and when it started (none while queued).
+struct Ran {
+    project: Option<String>,
+    started_ms: Option<i64>,
+}
+
+/// The turns of `bot` that were running at or after `since_ms`.
 async fn turns_since(
     client: &Client,
     bot: &str,
     since_ms: i64,
-) -> Result<HashMap<i64, Option<String>>, agent_client::Error> {
+) -> Result<HashMap<i64, Ran>, agent_client::Error> {
     let mut found = HashMap::new();
     let mut folders: HashMap<String, Option<String>> = HashMap::new();
     let mut before = Value::Null;
@@ -140,7 +164,14 @@ async fn turns_since(
                     .clone(),
                 None => None,
             };
-            found.insert(id, project);
+            let started_ms = turn["started_ms"].as_i64();
+            found.insert(
+                id,
+                Ran {
+                    project,
+                    started_ms,
+                },
+            );
         }
         before = page["next_before"].clone();
         if ended || before.is_null() {
