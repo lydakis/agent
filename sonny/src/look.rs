@@ -22,6 +22,11 @@ pub fn no_color() -> bool {
     *NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()))
 }
 
+/// The blocks that fill part of a cell from its bottom or its left.
+const PARTS: [&str; 14] = [
+    "▁", "▂", "▃", "▄", "▅", "▆", "▇", "▏", "▎", "▍", "▌", "▋", "▊", "▉",
+];
+
 /// What a frame's cells become before they are written.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Look {
@@ -60,9 +65,16 @@ impl Look {
                     cell.modifier.remove(Modifier::DIM);
                 }
             }
-            // A picture's placeholder cells name it by their color.
-            Look::Plain if cell.symbol().starts_with(crate::image::PLACEHOLDER) => {}
+            // A picture's placeholder cells name it by their color, a
+            // linked one behind its link's escape.
+            Look::Plain if cell.symbol().contains(crate::image::PLACEHOLDER) => {}
             Look::Plain => {
+                // A part block on a colored background (a stacked bar's
+                // step) fills its cell: without the background it would
+                // read as a gap.
+                if cell.bg != Color::Reset && PARTS.contains(&cell.symbol()) {
+                    cell.set_symbol("█");
+                }
                 cell.fg = Color::Reset;
                 cell.bg = Color::Reset;
             }
@@ -145,7 +157,26 @@ mod tests {
 
         Look::Plain.finish(&mut buffer);
         assert_eq!(buffer[(1, 0)].fg, Color::Reset);
+        assert_eq!(buffer[(2, 0)].symbol(), "c");
         assert!(buffer[(1, 0)].modifier.contains(Modifier::DIM));
         assert_eq!(buffer[(2, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn without_color_a_stacked_step_fills_its_cell_and_a_picture_keeps_its_id() {
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 3, 1));
+        buffer[(0, 0)]
+            .set_symbol("▃")
+            .set_fg(Color::Magenta)
+            .set_bg(Color::Cyan);
+        buffer[(1, 0)].set_symbol("▃").set_fg(Color::Magenta);
+        let linked = format!("\x1b]8;;file:///a.png\x1b\\{}", crate::image::PLACEHOLDER);
+        buffer[(2, 0)]
+            .set_symbol(&linked)
+            .set_fg(Color::Rgb(0, 0, 7));
+        Look::Plain.finish(&mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "█");
+        assert_eq!(buffer[(1, 0)].symbol(), "▃");
+        assert_eq!(buffer[(2, 0)].fg, Color::Rgb(0, 0, 7));
     }
 }
