@@ -74,6 +74,8 @@ it keeps these, and says in its PR how:
 
 ## Working rules
 
+- A pull request that adds, changes or removes a Sonny feature updates its
+  row in sonny/FEATURES.md (status, history, why) in the same pull request.
 - George explicitly selected a custom Rust core as a performance engineering
   project. Keep Pi and Codex as measured baselines, not an adoption gate. Reuse
   standard transport, storage, and profiling components. Record equivalent-workload

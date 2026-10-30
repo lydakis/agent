@@ -17,6 +17,7 @@ mod banner;
 mod cache;
 mod calls;
 mod cmux;
+mod commons;
 mod config;
 mod declared;
 mod diff;
@@ -1475,7 +1476,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 20] = [
+const COMMANDS: [(&str, &str); 21] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1505,6 +1506,7 @@ const COMMANDS: [(&str, &str); 20] = [
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
     ),
+    ("/commons", "what the agents of every project share"),
     ("/usage", "the tokens the agents spent, over time"),
     ("/mcp", "the MCP servers agents' scripts call"),
     ("/config", "the settings in ~/.agent/config.toml"),
@@ -1575,6 +1577,8 @@ struct Watch {
     background: Option<background::View>,
     /// `/usage` holds it instead.
     usage: Option<usage::View>,
+    /// `/commons` holds it instead.
+    commons: Option<commons::View>,
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
@@ -5785,6 +5789,7 @@ impl App {
             resolved: false,
             background: None,
             usage: None,
+            commons: None,
             picked: None,
         });
         self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
@@ -5809,6 +5814,7 @@ impl App {
             resolved: false,
             background: Some(view),
             usage: None,
+            commons: None,
             picked: None,
         });
         self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
@@ -5829,9 +5835,31 @@ impl App {
             resolved: false,
             background: None,
             usage: Some(view),
+            commons: None,
             picked: None,
         });
         self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
+    }
+
+    /// What the agents of every project share: `/commons` in the pane,
+    /// as `/status` is, until Esc.
+    fn commons(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.notice = Some("no HOME, so no commons".into());
+            return;
+        };
+        self.watch = Some(Watch {
+            project: self.scope().project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            lookout: String::new(),
+            resolved: false,
+            background: None,
+            usage: None,
+            commons: Some(commons::View::open(&home)),
+            picked: None,
+        });
+        self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
     }
 
     /// `view` read from the daemon again.
@@ -5848,6 +5876,13 @@ impl App {
     async fn reread(&mut self) {
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.background
+        {
+            view.reload();
+            watch.read = Instant::now();
+            return;
+        }
+        if let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.commons
         {
             view.reload();
             watch.read = Instant::now();
@@ -6574,6 +6609,39 @@ impl App {
                     _ => {
                         if view.key(*key) == background::Key::Close {
                             self.close_pane(true);
+                        }
+                    }
+                }
+                return true;
+            }
+            // `/commons` takes its own keys: picking a thread, reading it.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
+            {
+                let reading = view.reading();
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Up if reading => pane.screen.scroll(1),
+                    KeyCode::Down if reading => pane.screen.scroll(-1),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown => pane.screen.page(false),
+                    KeyCode::Char(' ') if reading => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => {
+                        if view.key(*key) == commons::Key::Close {
+                            self.close_pane(true);
+                        } else if view.reading() != reading {
+                            // A thread opened or left starts at its top.
+                            pane.screen.hold(usize::MAX);
+                            if let Some(watch) = &mut self.watch {
+                                watch.picked = None;
+                            }
                         }
                     }
                 }
@@ -7565,6 +7633,11 @@ impl App {
             }
             return;
         }
+        if matches!(prompt.as_str(), "/commons" | "/forum") {
+            self.input.clear();
+            self.commons();
+            return;
+        }
         if prompt == "/usage" {
             self.input.clear();
             if self.options.side.is_some() {
@@ -8440,6 +8513,29 @@ impl App {
                 pane.foot = Some(view.footer());
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    pane.screen.keep_in_view(at, 2);
+                }
+            } else if let Some(view) = &watch.commons {
+                let (card, at) = view.card(width);
+                let lines: Vec<Line<'static>> = card
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, STATUS_KEYS);
+                pane.foot = Some(view.footer());
+                if view.reading() {
+                    // A thread just opened starts at its top, after the
+                    // card's swap kept the list's scroll.
+                    if watch.picked != Some(usize::MAX) {
+                        watch.picked = Some(usize::MAX);
+                        pane.screen.show_row(0, 0);
+                    }
+                } else if watch.picked != Some(at) {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -11867,6 +11963,7 @@ mod tests {
             resolved: false,
             background: None,
             usage: None,
+            commons: None,
             picked: None,
         };
         // A named lead's window: its own row opens nothing, and the

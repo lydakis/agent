@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// What every agent of Sonny's leans on: the lead's and tasks' roles (and
 /// the superlead's, which a project opts into), the
-/// memory, plan and automation skills, the nightly cleanup's, and
+/// memory, plan, commons and automation skills, the nightly cleanup's, and
 /// `~/.agent/memory` and `~/.agent/trigger`, which run this Sonny. Written
 /// at each start, so they lead to this copy.
 pub fn install_own() {
@@ -18,6 +18,7 @@ pub fn install_own() {
         include_str!("../skills/memory-cleanup/SKILL.md"),
     );
     install("plan", include_str!("../skills/plan/SKILL.md"));
+    install("commons", include_str!("../skills/commons/SKILL.md"));
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
