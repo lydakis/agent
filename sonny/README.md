@@ -121,7 +121,9 @@ edited, it sets that text beside yours in `~/.agent/sonny/upgrades`, with
 what you started from in `~/.agent/sonny/shipped` when it kept it, and
 the first bot you open after the upgrade tells you and offers to bring
 Sonny's changes into your copy. A copy left the same as Sonny's new text
-is Sonny's again from the next start. A folder's own
+is Sonny's again from the next start. That bot also tells you what is new
+since the Sonny you last heard of, from [FEATURES.md](FEATURES.md), and
+offers once each new setup step you have not done. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 

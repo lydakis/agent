@@ -1331,10 +1331,17 @@ fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return Some(sourced(rest));
     }
-    // "- the lead role: theirs at …" is the lead role.
+    // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
+    // the backup, and a register's rows are what's new.
     if let Some(rest) = text.strip_prefix(crate::skills::UPGRADED) {
         let mut parts = vec!["Sonny upgraded".to_owned()];
+        if rest.lines().any(|line| line.starts_with("| ")) {
+            parts.push("what's new".to_owned());
+        }
         parts.extend(rest.lines().filter_map(|line| {
+            if let Some(step) = line.strip_prefix("- set up ") {
+                return Some(format!("set up {}", step.split_once(": ")?.0));
+            }
             let what = line.strip_prefix("- the ")?.split_once(": ")?.0;
             Some(format!("{what} edited"))
         }));
@@ -2859,6 +2866,19 @@ mod tests {
         assert_eq!(
             text(&super::prompt(&note, None, 90)),
             ["↳ Sonny upgraded · lead role edited · plan skill edited"]
+        );
+        let note = format!(
+            "{}Sonny's features changed since the person last heard of them. The rows:\n\
+             | Tasks | shipped | added 10-26 #142 | Why | ? |\n\
+             The whole register is at /h/FEATURES.md.\n\n\
+             Sonny offers setup the person has not done:\n\
+             - set up backup: a git backup of ~/.agents, with `sonny setup backup`\n\
+             Offer each once.",
+            crate::skills::UPGRADED
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 90)),
+            ["↳ Sonny upgraded · what's new · set up backup"]
         );
     }
 
