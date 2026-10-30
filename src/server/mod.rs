@@ -762,6 +762,11 @@ pub struct Configuration {
     pub redact_fields: Vec<String>,
     /// What the headers of PEM blocks redacted from tool output name.
     pub redact_blocks: Vec<String>,
+    /// Names kept read-only at the top of every writable root, and kept from
+    /// being made.
+    pub protected: Vec<String>,
+    /// Names kept read-only at the top of every writable root that has them.
+    pub protected_existing: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1371,6 +1376,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         // Read once at start: what runs a confined write is this binary.
         helper: std::env::current_exe().ok(),
         capabilities: None,
+        protected: config.protected.clone(),
+        protected_existing: config.protected_existing.clone(),
     };
     daemon.capabilities = daemon
         .socket

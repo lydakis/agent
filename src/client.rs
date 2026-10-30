@@ -866,6 +866,12 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     for label in agent_client::SECRET_BLOCKS {
         command.arg("--redact-block").arg(label);
     }
+    for name in agent_client::PROTECTED {
+        command.arg("--protect").arg(name);
+    }
+    for name in agent_client::PROTECTED_EXISTING {
+        command.arg("--protect-existing").arg(name);
+    }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
     }

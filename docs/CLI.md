@@ -38,6 +38,10 @@ NAME (its end, any case, `_` and `-` ignored) redacted from tool output, and
 `serve --redact-block LABEL` the body of each PEM block whose header names
 LABEL. A client that starts a daemon passes `agent_client::SECRET_FIELDS`
 (`password`, `api_key`, `secret_access_key` and the like) and `PRIVATE KEY`.
+Likewise `serve --protect NAME` keeps NAME at the top of a sandboxed bot's
+writable folders read-only and from being made, and `--protect-existing NAME`
+keeps it read-only where it exists; a client passes `.git`, `.agents` and
+`.codex`, and `.aws` where it exists.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 

@@ -139,6 +139,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
     let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
+    let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -157,6 +158,13 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             }
             "--redact-field" => redact_fields.push(value.clone()),
             "--redact-block" => redact_blocks.push(value.clone()),
+            "--protect" | "--protect-existing"
+                if value.is_empty() || value.contains('/') || value == "." || value == ".." =>
+            {
+                return fail_with("usage", format!("{flag} needs a name in a folder"));
+            }
+            "--protect" => protected.push(value.clone()),
+            "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-detached"
             | "--max-active"
@@ -202,5 +210,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         shell_excludes,
         redact_fields,
         redact_blocks,
+        protected,
+        protected_existing,
     })
 }

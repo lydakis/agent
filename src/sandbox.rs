@@ -26,15 +26,6 @@ pub enum Mode {
     DangerFullAccess,
 }
 
-/// Folders at the top of a writable root that stay read-only, as Codex keeps
-/// them: what git runs (hooks, config), what agents trust, and AWS profiles,
-/// which can name a program to run for credentials. A missing one is kept
-/// from being made, as Codex does for its own metadata.
-const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
-/// Of those, the ones kept from being made when missing: a new `.git`
-/// would be run by git outside the sandbox, and a new `.agents` read as
-/// the project's own settings.
-const PROTECTED_MISSING: [&str; 3] = [".git", ".agents", ".codex"];
 /// In a git folder given as a root, so a bot may commit, what git runs
 /// stays read-only as it does under `.git`: its hooks, the config that can
 /// name other hooks or programs, its submodules' git folders, which hold
@@ -425,6 +416,13 @@ pub struct Daemon {
     /// Where each sandboxed bot's own socket is opened, when the daemon
     /// listens on one.
     pub capabilities: Option<Capabilities>,
+    /// Names at the top of every writable root that stay read-only and,
+    /// when missing, may not be made (`--protect`), as Codex keeps its own
+    /// metadata. The client starting the daemon names them.
+    pub protected: Vec<String>,
+    /// Names at the top of every writable root that stay read-only when
+    /// they exist (`--protect-existing`).
+    pub protected_existing: Vec<String>,
 }
 
 impl Daemon {
@@ -482,7 +480,9 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     let mut read_only = Vec::new();
     let mut missing = Vec::new();
     let mut left = Vec::new();
-    for name in PROTECTED {
+    let names = (daemon.protected.iter().map(|name| (name, true)))
+        .chain(daemon.protected_existing.iter().map(|name| (name, false)));
+    for (name, kept_missing) in names {
         let kept = path.join(name);
         if held(&kept) {
             missing.push(kept);
@@ -502,7 +502,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
                 }
                 read_only.push(kept);
             }
-            Err(_) if PROTECTED_MISSING.contains(&name) => missing.push(kept),
+            Err(_) if kept_missing => missing.push(kept),
             Err(_) => {}
         }
     }
@@ -1161,6 +1161,15 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
 mod tests {
     use super::*;
 
+    /// The daemon as the CLI starts it, protecting what its client names.
+    fn protecting() -> Daemon {
+        Daemon {
+            protected: agent_client::PROTECTED.map(String::from).to_vec(),
+            protected_existing: agent_client::PROTECTED_EXISTING.map(String::from).to_vec(),
+            ..Daemon::default()
+        }
+    }
+
     #[test]
     fn only_a_plain_script_of_allowed_commands_leaves_the_sandbox() {
         let allowed = ["mcpx".to_owned(), "docker  compose".to_owned()];
@@ -1284,7 +1293,7 @@ mod tests {
             Some(&base),
             &[git.to_str().unwrap().to_owned()],
             false,
-            &Daemon::default(),
+            &protecting(),
         )
         .unwrap()
         .unwrap();
@@ -1311,7 +1320,7 @@ mod tests {
             Some(&base),
             &[git.to_str().unwrap().to_owned()],
             false,
-            &Daemon::default(),
+            &protecting(),
         )
         .unwrap()
         .unwrap();
@@ -1324,7 +1333,7 @@ mod tests {
             Some(&base),
             &[git.to_str().unwrap().to_owned()],
             false,
-            &Daemon::default(),
+            &protecting(),
         )
         .unwrap()
         .unwrap();
@@ -1345,7 +1354,7 @@ mod tests {
             Some(&base),
             &[inner.to_str().unwrap().to_owned()],
             false,
-            &Daemon::default(),
+            &protecting(),
         )
         .unwrap()
         .unwrap();
@@ -1399,7 +1408,7 @@ mod tests {
         let daemon = Daemon {
             socket: Some(socket.clone()),
             store: Some(store),
-            ..Daemon::default()
+            ..protecting()
         };
         for network in [false, true] {
             let policy = Policy::new(
@@ -1498,7 +1507,10 @@ mod tests {
             .map(|index| {
                 path.push(format!("{index:0>12}"));
                 Root {
-                    read_only: PROTECTED.iter().map(|name| path.join(name)).collect(),
+                    read_only: [".git", ".agents", ".codex", ".aws"]
+                        .iter()
+                        .map(|name| path.join(name))
+                        .collect(),
                     missing: Vec::new(),
                     left: Vec::new(),
                     path: path.clone(),
@@ -1532,7 +1544,7 @@ mod tests {
             Some(&base),
             &[],
             false,
-            &Daemon::default(),
+            &protecting(),
         )
         .unwrap_err();
         assert_eq!(error.code, "sandbox_unavailable");

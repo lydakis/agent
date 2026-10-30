@@ -196,7 +196,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing",
         settings: "",
         startup: true,
     },
@@ -367,6 +367,14 @@ fn print_flags(flags: &str) {
             "--redact-block" => (
                 "LABEL",
                 "Redact the body of each PEM block whose header names LABEL, such as PRIVATE KEY, from tool output; repeatable",
+            ),
+            "--protect" => (
+                "NAME",
+                "Keep NAME at the top of each sandboxed bot's writable folders read-only, and from being made when missing; repeatable",
+            ),
+            "--protect-existing" => (
+                "NAME",
+                "Keep NAME at the top of each sandboxed bot's writable folders read-only where it exists; repeatable",
             ),
             "--port" => (
                 "N",
@@ -603,6 +611,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--shell-exclude"
                     | "--redact-field"
                     | "--redact-block"
+                    | "--protect"
+                    | "--protect-existing"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
