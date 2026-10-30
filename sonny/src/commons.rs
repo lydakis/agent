@@ -55,8 +55,8 @@ const CUTS: [(&str, &str); 3] = [
         "the project's memory, and the person",
     ),
     (
-        "look in the other agents' turns or the commons, or",
-        "look in the other agents' turns, or",
+        "Agent's store, or look in the commons, or ask your lead",
+        "Agent's store, or ask your lead",
     ),
     (
         " When you find something agents in other projects could use, post it to the commons.",
