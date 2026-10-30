@@ -120,14 +120,31 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     };
     // A task in a folder inside the lead's is told the rules of the
     // folders above it too, which its worktree is not inside.
+    // Recorded as the lead's, like an own folder, so its memory is the
+    // lead's project's, whatever project the repository's folder is in.
+    let mut recorded = None;
     if at != here {
         place.told = at.clone();
+        if let (Some(_), Ok(record)) = (&place.copy, record_of(name))
+            && !record.exists()
+        {
+            let wrote = std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/")))
+                .and_then(|()| std::fs::write(&record, format!("{}\n", here.display())));
+            if let Err(e) = wrote {
+                undo(&place.undo);
+                return Err(format!("{}: {e}", record.display()));
+            }
+            recorded = Some(record);
+        }
     }
     // Only a run that started can have made the task, which then keeps
     // its folder; anything that failed before leaves nothing behind.
     let failed = |place: &Place, ran: bool, error: String| {
         if !ran || !listed(&agent, name) {
             undo(&place.undo);
+            if let Some(record) = &recorded {
+                let _ = std::fs::remove_file(record);
+            }
         }
         Err(error)
     };
@@ -184,7 +201,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    let mut flags = match told(&place.told, &info, &flags) {
+    let mut flags = match told(&place.told, here, &info, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
@@ -340,7 +357,7 @@ fn with_cache(flags: &mut Vec<String>) {
 /// told (`task.md`, or the task profile the project `info` or the config
 /// names) after it, and the role's model and tools unless the flags name
 /// their own. Other flags pass as they are.
-fn told(dir: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, String> {
+fn told(dir: &Path, lead: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, String> {
     let mut kept = Vec::new();
     let (mut agents, mut profile) = (false, None);
     let mut flags = flags.iter().map(|flag| flag.as_str());
@@ -380,7 +397,8 @@ fn told(dir: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, Stri
             task.path.is_some_and(|other| real(&other) == real(path))
         }),
     };
-    let memory = agent_client::policy::memory_indexes(dir).map_err(|e| e.to_string())?;
+    // The memory of the lead's project, wherever the task works.
+    let memory = agent_client::policy::memory_indexes(lead).map_err(|e| e.to_string())?;
     let composed =
         agent_client::policy::instructions(dir, role.as_ref().filter(|r| !told_after(r)), &memory)
             .map_err(|e| format!("{}: {e}", e.code()))?;
@@ -676,30 +694,35 @@ fn inside(here: &Path, folder: &str) -> Result<PathBuf, String> {
     Ok(real)
 }
 
-/// The main checkout of the repository the worktree `path` belongs to,
-/// when that is `here`'s or one inside it.
+/// The checkout to run git in for the worktree `path`: `here`'s own, when
+/// `path` is a worktree of its repository, else the main checkout git
+/// lists for it, when that is inside `here`.
 fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
-    let common = git(
-        path,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()?;
-    let common = std::fs::canonicalize(common).ok()?;
-    let main = common.parent()?.to_owned();
+    let common = |dir: &Path| {
+        git(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .ok()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+    };
+    if let Some(mine) = common(here)
+        && common(path) == Some(mine)
+    {
+        let top = git(here, &["rev-parse", "--show-toplevel"]).ok()?;
+        return std::fs::canonicalize(top).ok();
+    }
+    let listed = git(path, &["worktree", "list", "--porcelain"]).ok()?;
+    let main = listed.lines().next()?.strip_prefix("worktree ")?;
+    let main = std::fs::canonicalize(main).ok()?;
     let base = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_owned());
-    let mine = git(
-        here,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()
-    .and_then(|dir| std::fs::canonicalize(dir).ok());
-    (common.file_name()? == ".git" && (mine == Some(common.clone()) || main.starts_with(&base)))
-        .then_some(main)
+    main.starts_with(&base).then_some(main)
 }
 
-/// Where Sonny records the folder each task with an empty folder of its
-/// own was started from, by the task's name: under a name no task's
-/// folder can have, as a branch's part never starts with a dot.
+/// Where Sonny records the lead's folder each task with a folder of its
+/// own, or a worktree of a repository inside the lead's, was started
+/// from, by the task's name: under a name no task's folder can have, as a
+/// branch's part never starts with a dot.
 fn record_of(name: &str) -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".agent/worktrees/.folders").join(name))
 }
@@ -711,8 +734,8 @@ fn source_of(name: &str) -> Option<PathBuf> {
     Some(PathBuf::from(text.trim_end_matches('\n')))
 }
 
-/// The lead's folder a task's own folder at or above `dir` was made from,
-/// whose project the task works for.
+/// The lead's folder a task's folder at or above `dir` was made from, when
+/// Sonny recorded it, whose project the task works for.
 pub fn source_folder(dir: &Path) -> Option<PathBuf> {
     let tasks = home_dir().ok()?.join(".agent/worktrees");
     let tasks = std::fs::canonicalize(&tasks).unwrap_or(tasks);
@@ -730,7 +753,7 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
     let undo = if path.exists() {
         // Left by a task of this name before: its own only if it was
         // started from this folder.
-        if source_of(name).as_deref() != Some(here) {
+        if source_of(name).as_deref() != Some(here) || path.join(".git").exists() {
             return Err(format!(
                 "{} exists and is not the folder of a task of this one; pick another name",
                 path.display()
@@ -940,9 +963,12 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     let branch = format!("agent/{name}");
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let source = source_of(name);
+    // A worktree has its `.git`; an own folder, whatever the task made in
+    // it, has none at its top.
+    let tree = path.join(".git").symlink_metadata().is_ok();
     let (worktree, folder) = match path.exists() {
-        true if source.as_deref() == Some(here) => (None, Some(path)),
-        true if source.is_none()
+        true if !tree && source.as_deref() == Some(here) => (None, Some(path)),
+        true if tree
             && let Some(repo) = repository_of(here, &path)
             && ours(&repo, &path, &branch) =>
         {
@@ -1009,6 +1035,9 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         }
         args.push(&path);
         git(repo, &args)?;
+        if let Ok(record) = record_of(name) {
+            let _ = std::fs::remove_file(record);
+        }
         let delete = if discard { "-D" } else { "-d" };
         let ours = git(here, &["rev-parse", "--show-toplevel"])
             .ok()
@@ -1225,7 +1254,12 @@ mod tests {
         let project = std::cell::RefCell::new(serde_json::json!({"threads_profile": "task"}));
         let told = |flags: &[&str]| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
-            told(&dir, &project.borrow(), &flags.iter().collect::<Vec<_>>())
+            told(
+                &dir,
+                &dir,
+                &project.borrow(),
+                &flags.iter().collect::<Vec<_>>(),
+            )
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();

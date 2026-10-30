@@ -483,9 +483,45 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     let away = serde_json::json!({"name": "away", "brief": "b", "folder": "../"});
     let (ok, said) = lab.tool(&ws, "start_task", away, false);
     assert!(!ok && said.contains("not a folder inside"), "{said}");
+    // Recorded as the lead's, for its project's memory.
+    let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
+    assert_eq!(
+        std::fs::read_to_string(&record).unwrap().trim(),
+        std::fs::canonicalize(&ws).unwrap().to_string_lossy()
+    );
     // Removed from the lead's folder, with its merged branch.
     let (ok, err) = lab.remove(&ws, false);
     assert!(ok, "{err}");
-    assert!(!worktree.exists());
+    assert!(!worktree.exists() && !record.exists());
     assert_eq!(lab.git(&api, &["branch", "--list", "agent/demo.fix"]), "");
+}
+
+#[test]
+fn a_task_of_a_lead_in_a_submodule_is_removed_with_its_worktree() {
+    let lab = Lab::new("submodule");
+    let main = lab.scratch.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    lab.git(&main, &["init", "-q", "-b", "main"]);
+    let repo = lab.repo.to_string_lossy().into_owned();
+    lab.git(
+        &main,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &repo,
+            "sub",
+        ],
+    );
+    let sub = main.join("sub");
+    let start = serde_json::json!({"name": "fix", "brief": "fix it"});
+    let (ok, said) = lab.tool(&sub, "start_task", start, false);
+    assert!(ok, "{said}");
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    assert!(worktree.join(".git").exists());
+    let (ok, err) = lab.remove(&sub, false);
+    assert!(ok, "{err}");
+    assert!(!worktree.exists());
 }
