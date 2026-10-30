@@ -69,6 +69,8 @@ enum Feed {
     Roll(Vec<Value>),
     Past(Value),
     Live(Value),
+    /// Caught up: from here on, what happens.
+    Ready,
     Down(String),
 }
 
@@ -215,6 +217,7 @@ impl View {
                     self.live = true;
                     self.event(&event, now, true);
                 }
+                Feed::Ready => self.live = true,
                 Feed::Down(why) => self.down = Some(why),
             }
         }
@@ -1113,11 +1116,6 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     }
-    // Who is here and who works may have changed while the past was read:
-    // the roll again says so, and the live follow takes it from the cursor.
-    if !roll(&client, &send).await {
-        return;
-    }
     // Asking again replaces the follow: from where the past ended, what
     // animates the sky. Its own replay repeats nothing already sent.
     if let Err(error) = client
@@ -1141,6 +1139,12 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
                     if send.send(Feed::Live(event)).is_err() {
                         return;
                     }
+                }
+                // Who is here and who works may have changed while the past
+                // was read, removals among it, which no replay brings: the
+                // roll again says so, now that what follows it is kept.
+                if !roll(&client, &send).await || send.send(Feed::Ready).is_err() {
+                    return;
                 }
                 continue;
             }
@@ -1444,21 +1448,9 @@ mod tests {
                 let id = asked["id"].clone();
                 if asked["op"] == "bots" {
                     rolls += 1;
-                    if rolls == 2 {
-                        // The old follow, still live while the roll is read.
-                        out.push(started.clone());
-                    }
                     out.push(json!({"id": id, "result": {"bots": [{"name": "a"},
-                        {"name": "b"}]}}));
-                } else {
-                    follows += 1;
-                    out.push(json!({"id": id, "result": {}}));
-                    if follows == 1 {
-                        out.push(json!({"event": "follow_live", "cursor": 10}));
-                    } else {
-                        out.push(made.clone());
-                        out.push(started.clone());
-                        out.push(json!({"event": "follow_live", "cursor": 12}));
+                        {"name": "b"}, {"name": "c"}]}}));
+                    if rolls == 2 {
                         for line in out.drain(..) {
                             write
                                 .write_all(format!("{line}\n").as_bytes())
@@ -1467,19 +1459,37 @@ mod tests {
                         }
                         return;
                     }
+                } else {
+                    follows += 1;
+                    if follows == 2 {
+                        // The old follow, still live until it is replaced.
+                        out.push(started.clone());
+                    }
+                    out.push(json!({"id": id, "result": {}}));
+                    if follows == 1 {
+                        out.push(json!({"event": "follow_live", "cursor": 10}));
+                    } else {
+                        out.push(made.clone());
+                        out.push(started.clone());
+                        out.push(json!({"event": "follow_live", "cursor": 12}));
+                    }
                 }
             }
         });
         let (send, mut feed) = mpsc::unbounded_channel();
         follow(socket, send).await;
-        let mut live = Vec::new();
+        let mut seen = Vec::new();
         while let Ok(item) = feed.try_recv() {
-            if let Feed::Live(event) = item {
-                live.push(event["cursor"].as_i64().unwrap());
-            }
+            seen.push(match item {
+                Feed::Live(event) => event["cursor"].to_string(),
+                Feed::Roll(_) => "roll".into(),
+                Feed::Ready => "ready".into(),
+                Feed::Past(_) | Feed::Down(_) => continue,
+            });
         }
-        // Made, then started: once each, in the store's order.
-        assert_eq!(live, [11, 12]);
+        // Made, then started, once each in the store's order; then the roll
+        // again, then caught up.
+        assert_eq!(seen, ["roll", "11", "12", "roll", "ready"]);
     }
 
     #[tokio::test]
@@ -1538,6 +1548,18 @@ mod tests {
                 .iter()
                 .all(|spark| spark.from != End::Agent(view.index["a"]))
         );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_fleet_once_caught_up_says_so() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let text: Vec<String> = (view.card(60, 30).iter())
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|line| line.starts_with("Quiet.")));
     }
 
     #[tokio::test]
