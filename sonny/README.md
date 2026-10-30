@@ -290,7 +290,8 @@ the lead's from its next turn. A thread offers only its bot's provider family,
 since a bot changes model only within it, and a task's thread keeps the model
 its lead gave the task.
 
-Enter sends (and steers a running turn), Esc interrupts, `y`/`n` answer a
+Enter sends (and steers a running turn), Tab while a turn runs queues what
+you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
 keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
@@ -301,6 +302,8 @@ last of those took. Shift-Enter needs a terminal that speaks the kitty
 keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
 WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
 or Ctrl-J still start a line.
+
+![A message queued with Tab waits under the running turn](../docs/sonny/tab-queues.png)
 
 On the full screen the mouse edits the composer too, as in Codex: a click
 puts the cursor there, a drag selects (and copies), two clicks select a word
@@ -612,9 +615,11 @@ Sonny's tools. A Sonny that finds another build's lookout running, as one
 an upgrade left, stops it and starts its own, so its agents' new tools are
 answered.
 
-The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, a tool call is one `• Ran …` line with a
+The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, each message the bot sends its own block, as
+it keeps them (two in one answer no longer run together), a tool call is one `• Ran …` line with a
 short `└` look at its result, edits show as a diff, and a status row says
-`Working (12s • esc to interrupt)`. The steps on the way, calls and what
+`Working (12s • esc to interrupt)`, with `• tab to queue` once you start
+writing. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
 
@@ -675,11 +680,26 @@ and Ctrl+] shows it again.
 
 Sonny keeps to the terminal's own 16 colors, so a theme sets their
 shades, and each means one thing: magenta is you (your `›`), blue the
-agents (task names, who sent a message, the lead in the footer, the
-headings of a reply), green what worked (a call's dot, the git branch),
-yellow what needs you, red what failed, and cyan code and work under
-way. The context in the footer turns from green to yellow at 100k
-tokens and to red at 200k.
+agents (task names, who sent a message, the lead in the footer), green
+what worked (a call's dot, `+` lines, the git branch), yellow what needs
+you (a question's `?`, an approval's `⏸`), red what failed (`✗`, `-`
+lines), and cyan code and work under way. Color only repeats what a
+mark already says: each state has its own shape (`✓ ✗ ● ◌ ?`) and a
+diff its `-` and `+`, so the screen reads with `NO_COLOR` set, which
+Sonny honors (no color, bold and dim kept), and to an eye that does
+not tell red from green. Text is the theme's own color; hues go on
+marks and names. Markdown is prose: headings bold, with their `#` marks
+dim to show the level, code in cyan, links underlined, and the marks
+of lists, quotes and rules dim. Dim text is a gray Sonny works out from
+the theme's own foreground and background, as the terminal reports them
+at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
+the theme allows; a terminal that does not say keeps its own dim. Diffs
+tint from the same background and the theme's own red and green. The
+context in the footer turns from green to yellow at 100k tokens and to
+red at 200k.
+
+![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
+![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
 
 ![The task calc.neg opened in the pane beside the lead's conversation](../docs/sonny/task-in-pane.png)
 

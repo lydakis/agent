@@ -1356,6 +1356,9 @@ class AnthropicRuntimeTests(unittest.TestCase):
         deltas = [m for m in client.saved if m.get('event') in ('text_delta', 'thinking_delta')]
         self.assertEqual([d['event'] for d in deltas][:2], ['thinking_delta', 'thinking_delta'])
         self.assertEqual(''.join(d['text'] for d in deltas if d['event'] == 'text_delta'), 'echo:shared')
+        # Each call's message is an item of its own, numbered on through the turn.
+        items = [d['item'] for d in deltas]
+        self.assertEqual((items, len(set(items))), (sorted(items), 2))
         usage = [m for m in client.saved if m.get('event') == 'usage']
         self.assertEqual(len(usage), 2)
         # Each call records when it was sent, in epoch milliseconds.

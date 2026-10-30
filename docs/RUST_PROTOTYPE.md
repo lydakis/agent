@@ -1312,8 +1312,13 @@ service created. Do not replace ownership-lock files while a service runs.
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
-delivered only to live followers and carry `durable:false`, as do the `pruned`
-and `deleted` retention notices. Durable event kinds
+delivered only to live followers and carry `durable:false`, and an `item`
+naming the output item they stream, a number that grows through the turn:
+deltas with the same `item` are one message (or one block of thinking) as
+its `message` event keeps it, and a larger `item` starts the next, as Codex
+streams a response's items apart. A call retried or resumed after a park
+streams its items again under the same numbers. The `pruned`
+and `deleted` retention notices carry `durable:false` too. Durable event kinds
 are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview, and `approvals` and the planning `node`
@@ -2414,6 +2419,10 @@ must take `input` as a required string (`invalid_declare` otherwise).
 Either way the call's `arguments` are `{"input": TEXT}` and its answer is
 the provider's custom tool output where it has one. The grammar counts
 toward the 64 KiB. A client's code-running tool is one.
+
+Protocol version 24 adds `item` to `text_delta` and `thinking_delta`, so a
+client draws each message a call streams apart, as it is kept (see
+`follow` above).
 
 ### Tool approval
 

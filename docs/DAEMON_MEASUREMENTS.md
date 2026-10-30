@@ -5745,6 +5745,33 @@ past the gate's 15%; the per-idle-bot drop is the bench's noise, as the
 change adds nothing to an idle bot. The refused path is not measured: it
 runs once per refusal, a second request to the provider.
 
+## Text deltas name their item (#396)
+
+Each `text_delta` and `thinking_delta` notification carries one more
+integer, `item`: the call's last node plus the output index the provider
+names, worked out per delta with no store work and nothing kept per bot.
+The Responses parser reads one more field of the delta frame. The Perf
+workflow's matched screen, base main 96ae19a against the PR head 9e9034b, on
+the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 25.835 | 25.585 | -1.0% |
+| admission | burst submit p99, ms | 3.271 | 3.085 | -5.7% |
+| completion | release to terminal p99, ms | 7.458 | 7.152 | -4.1% |
+| footprint | idle RSS, MiB | 19.211 | 19.146 | -0.3% |
+| footprint | per idle bot, KiB | 1.494 | 1.486 | -0.5% |
+| footprint | RSS after a turn each, MiB | 28.596 | 30.133 | +5.4% |
+| footprint | CPU per turn, ms | 0.718 | 0.701 | -2.3% |
+| lifecycle | CPU, s | 0.7 | 0.675 | -3.6% |
+| lifecycle | p95 turn, ms | 575.754 | 575.038 | -0.1% |
+| lifecycle | peak RSS, MiB | 25.477 | 25.488 | +0.0% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The RSS after a turn each moves by about this much between runs
+of one build (27.7 to 30.3 MiB across the head's own runs); the change keeps
+nothing between deltas.
+
 ## The pull cord holds starts while paused (#408)
 
 Admission now asks whether the daemon is held, draining or paused, in

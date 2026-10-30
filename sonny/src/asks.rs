@@ -227,15 +227,12 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         options.push(rows.len());
         let mut label = vec![Span::raw(choice.label.clone()).bold()];
         if ask.recommended == Some(at) {
-            label.push(Span::raw(" · recommended").fg(Color::Green));
+            label.push(Span::raw(" · recommended").dim());
         }
         rows.extend(crate::transcript::wrap_lines(
             Line::from(label),
             width,
-            Line::from(vec![
-                indent(),
-                Span::raw(format!("{:<3}", at + 1)).fg(Color::Yellow),
-            ]),
+            Line::from(vec![indent(), Span::raw(format!("{:<3}", at + 1))]),
             Line::from(under()),
         ));
         rows.extend(markdown(
@@ -251,10 +248,7 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
         rows.push(Line::default());
         rows.extend(markdown(
             &ask.reason,
-            Line::from(vec![
-                indent(),
-                Span::raw(format!("Why {}: ", at + 1)).fg(Color::Green),
-            ]),
+            Line::from(vec![indent(), Span::raw(format!("Why {}: ", at + 1))]),
             Line::from(indent()),
             Style::new().dim(),
         ));
