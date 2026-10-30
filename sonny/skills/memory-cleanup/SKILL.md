@@ -14,8 +14,9 @@ doing that costs them, so a later agent can name the pattern.
 
 ## Steps
 
-Each step names the memory tool's field; without the tool, run the same
-command with `"$HOME/.agent/memory"`.
+Each step names the memory tool's field; without the tool, or when a call
+of it ends `tool_unserved`, run the same command with
+`"$HOME/.agent/memory"`.
 
 1. Call the memory tool with `cleanup` `start`. It commits what agents saved
    since the last cleanup. If it says `"duplicate": true`, an earlier
