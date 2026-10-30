@@ -323,6 +323,12 @@ line is the lookout's own words only: the agent's reason for giving up,
 and a check it set itself, are its text, which the lead reads in the turn
 or with `goal`.
 
+The roster and `/status` keep "it stopped" apart from "it did what was
+asked": a task whose turn completed while it has a goal reads `checking`,
+and the turn whose check passed reads `checked`, not `done`, until the
+task's next turn. That turn is noted in `STORE.lookout/goals/met/BOT.json`
+when the goal ends, and the note goes with the agent.
+
 ## Memory
 
 Memory is what earlier agents learned that a later one needs: decisions,
