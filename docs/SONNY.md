@@ -595,8 +595,12 @@ and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
 `~/.codex/config.toml`, Claude Code's `~/.claude.json` (the user's and this
 folder's) and `.mcp.json`, OpenCode's `opencode.json` and Kiro's
 `.kiro/settings/mcp.json`, at home and in the folder it runs in. It lists
-them all ticked; Space unticks one and Enter brings the rest, `--yes` takes
-them all, and `--json` only prints what it found. First-run setup offers the
+them ticked, but for those from a file in the folder: whoever wrote the
+folder wrote those, and one can send a key the person has to its own URL,
+so, as Claude Code asks before it starts a project's `.mcp.json` servers,
+they start unticked and each row says what variables it reads. Space ticks
+or unticks one and Enter brings the ticked ones; `--yes` takes all but the
+folder's, and `--json` only prints what it found. First-run setup offers the
 same. A name Sonny has already, or that an agent earlier in that list has,
 is skipped, and the other agents' files are left as they were. A secret
 written into a server's entry (an `env` value named like a key or token, or

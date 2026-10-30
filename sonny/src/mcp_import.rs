@@ -25,6 +25,10 @@ pub struct Found {
     pub needs: Vec<String>,
     /// What did not come across and why, for the person to set by hand.
     pub notes: Vec<String>,
+    /// From a file in the folder, which whoever wrote the folder wrote: as
+    /// Claude Code asks before it starts a project's servers, Sonny brings
+    /// one only when the person ticks it.
+    pub folder: bool,
 }
 
 /// A server as another agent's file describes it, before translating.
@@ -43,6 +47,7 @@ struct Raw {
     kept: toml::Table,
     /// Why it cannot come across at all.
     refused: Option<String>,
+    folder: bool,
 }
 
 /// The agents whose servers are offered, in the order a name two of them
@@ -100,17 +105,16 @@ fn read(agent: &str, home: &Path, folder: &Path, var: &dyn Fn(&str) -> Option<St
             let user = json(home.join(".claude.json")).unwrap_or_default();
             let here = folder.to_string_lossy();
             let shared = json(folder.join(".mcp.json")).unwrap_or_default();
-            for servers in [
-                &user["mcpServers"],
-                &user["projects"][here.as_ref()]["mcpServers"],
-                &shared["mcpServers"],
+            for (servers, folder) in [
+                (&user["mcpServers"], false),
+                (&user["projects"][here.as_ref()]["mcpServers"], false),
+                (&shared["mcpServers"], true),
             ] {
                 raws.extend(
-                    servers
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .map(|(n, s)| claude(n, s)),
+                    (servers.as_object().into_iter().flatten()).map(|(n, s)| Raw {
+                        folder,
+                        ..claude(n, s)
+                    }),
                 );
             }
         }
@@ -119,29 +123,35 @@ fn read(agent: &str, home: &Path, folder: &Path, var: &dyn Fn(&str) -> Option<St
                 .map_or_else(|| home.join(".config"), PathBuf::from)
                 .join("opencode");
             let files = [
-                var("OPENCODE_CONFIG").map(PathBuf::from),
-                Some(global.join("opencode.json")),
-                Some(global.join("opencode.jsonc")),
-                Some(folder.join("opencode.json")),
-                Some(folder.join("opencode.jsonc")),
+                (var("OPENCODE_CONFIG").map(PathBuf::from), false),
+                (Some(global.join("opencode.json")), false),
+                (Some(global.join("opencode.jsonc")), false),
+                (Some(folder.join("opencode.json")), true),
+                (Some(folder.join("opencode.jsonc")), true),
             ];
-            for config in files.into_iter().flatten().filter_map(json) {
+            for (file, folder) in files {
+                let Some(config) = file.and_then(json) else {
+                    continue;
+                };
                 raws.extend(
-                    config["mcp"]
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .map(|(n, s)| opencode(n, s)),
+                    (config["mcp"].as_object().into_iter().flatten()).map(|(n, s)| Raw {
+                        folder,
+                        ..opencode(n, s)
+                    }),
                 );
             }
         }
         _ => {
             let global = var("KIRO_HOME").map_or_else(|| home.join(".kiro"), PathBuf::from);
-            for file in [global, folder.join(".kiro")] {
+            for (file, folder) in [(global, false), (folder.join(".kiro"), true)] {
                 if let Some(config) = json(file.join("settings/mcp.json")) {
                     raws.extend(
-                        (config["mcpServers"].as_object().into_iter().flatten())
-                            .map(|(n, s)| claude(n, s)),
+                        (config["mcpServers"].as_object().into_iter().flatten()).map(|(n, s)| {
+                            Raw {
+                                folder,
+                                ..claude(n, s)
+                            }
+                        }),
                     );
                 }
             }
@@ -396,6 +406,7 @@ fn translate(from: &'static str, raw: Raw) -> Found {
         secrets: Vec::new(),
         needs: Vec::new(),
         notes: Vec::new(),
+        folder: raw.folder,
     };
     if let Some(why) = raw.refused {
         found.notes.push(format!("not brought in: {why}"));
@@ -604,6 +615,10 @@ fn row(found: &Found) -> Row {
         (_, Some(url)) => url.as_str().unwrap_or("").to_owned(),
         _ => String::new(),
     };
+    let reads = match found.needs.is_empty() {
+        true => String::new(),
+        false => format!(" · reads {}", found.needs.join(", ")),
+    };
     let secrets = match found.secrets.len() {
         0 => String::new(),
         n => format!(
@@ -613,7 +628,11 @@ fn row(found: &Found) -> Row {
     };
     let row = Row::new(
         &found.name,
-        format!("from {}{secrets} · {what}", found.from),
+        format!(
+            "from {}{}{secrets}{reads} · {what}",
+            found.from,
+            if found.folder { " in this folder" } else { "" }
+        ),
     );
     match found.keys.get("enabled").and_then(toml::Value::as_bool) {
         Some(false) => row.badge("off"),
@@ -634,11 +653,15 @@ pub fn here() -> Result<Vec<Found>, String> {
 pub fn offer(all: bool) -> Result<Vec<String>, String> {
     let (bringable, refused): (Vec<Found>, Vec<Found>) =
         here()?.into_iter().partition(|f| !f.keys.is_empty());
+    let (bringable, unasked): (Vec<Found>, Vec<Found>) = match all {
+        true => bringable.into_iter().partition(|f| !f.folder),
+        false => (bringable, Vec::new()),
+    };
     let chosen: Vec<Found> = match all || bringable.is_empty() {
         true => bringable,
         false => {
             let rows: Vec<Row> = bringable.iter().map(row).collect();
-            let ticked = vec![true; rows.len()];
+            let ticked = bringable.iter().map(|f| !f.folder).collect();
             let picked =
                 picker::pick_many("Bring MCP servers from your other agents", &rows, ticked)?;
             (bringable.into_iter().enumerate())
@@ -655,6 +678,12 @@ pub fn offer(all: bool) -> Result<Vec<String>, String> {
         for note in server.notes.iter().cloned().chain(unset) {
             println!("  {}: {note}", server.name);
         }
+    }
+    for server in &unasked {
+        println!(
+            "\x1b[2mNot bringing {} from {} in this folder without asking: `sonny mcp import` offers it\x1b[0m",
+            server.name, server.from
+        );
     }
     for server in &refused {
         let why = server.notes.join("; ");
@@ -681,6 +710,7 @@ pub fn json(found: &[Found]) -> Value {
                     "secrets": f.secrets.iter().map(|(var, _)| var).collect::<Vec<_>>(),
                     "needs": f.needs,
                     "notes": f.notes,
+                    "folder": f.folder,
                 })
             })
             .collect(),
@@ -820,6 +850,8 @@ mod tests {
         let mut names: Vec<(String, &str)> = Vec::new();
         for agent in AGENTS {
             for raw in read(agent, &home, &folder, &|_| None) {
+                // Only the folder's own file is the folder's.
+                assert_eq!(raw.folder, raw.name == "shared", "{}", raw.name);
                 names.push((raw.name, agent));
             }
         }
