@@ -31,6 +31,8 @@
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! suggest = false               # no guess at the next message, on by default
 //! commons = false               # agents go without the commons, on by default
+//! commons_invites = 3           # invites a day a new thread can send, 0 none; answers add up to as many again
+//! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
@@ -158,6 +160,11 @@ pub struct Sonny {
     /// Whether agents have the commons: its tool, skill and the roles'
     /// lines about it.
     pub commons: bool,
+    /// The invites a day new commons threads send before answers earn
+    /// more: each answered one adds one, up to as many again.
+    pub commons_invites: u64,
+    /// The tokens an invite pays for in its thread.
+    pub commons_invite_tokens: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
 }
@@ -174,6 +181,8 @@ impl Default for Sonny {
             side_chat: SideChat::default(),
             suggest: true,
             commons: true,
+            commons_invites: 3,
+            commons_invite_tokens: 1_000_000,
             chime: true,
             verbose: false,
             start_at_boot: false,
@@ -521,6 +530,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest",
                 "start_at_boot",
                 "commons",
+                "commons_invites",
+                "commons_invite_tokens",
                 "unsandboxed",
             ],
             _ => return Err(format!("unknown table [{name}]")),
@@ -573,6 +584,16 @@ fn parse(text: &str) -> Result<Config, String> {
                 *switch = value
                     .as_bool()
                     .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                continue;
+            }
+            if let Some(count) = match key.as_str() {
+                "commons_invites" => Some(&mut config.sonny.commons_invites),
+                "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
+                _ => None,
+            } {
+                *count = (value.as_integer())
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| format!("{name}.{key} must be a whole number, 0 or more"))?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
@@ -867,6 +888,15 @@ mod tests {
         assert!(!parse("[sonny]\nsuggest = false").unwrap().sonny.suggest);
         assert!(config.sonny.commons);
         assert!(!parse("[sonny]\ncommons = false").unwrap().sonny.commons);
+        let sonny = parse("[sonny]\ncommons_invites = 0\ncommons_invite_tokens = 500")
+            .unwrap()
+            .sonny;
+        assert_eq!(
+            (sonny.commons_invites, sonny.commons_invite_tokens),
+            (0, 500)
+        );
+        assert!(parse("[sonny]\ncommons_invites = -1").is_err());
+        assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
         assert_eq!(
             parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
             "sonny.suggest must be true or false"
