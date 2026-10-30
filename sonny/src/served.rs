@@ -86,7 +86,8 @@ fn start() -> Value {
         "name": START,
         "description": "Start a new task. Unless this project's tasks all work in this folder, Sonny makes the \
             task a git worktree of this repository on the branch agent/NAME, from the last commit, so uncommitted \
-            changes here are not in it; outside git, an empty folder of its own, where the task makes what it \
+            changes here are not in it; outside git, the task works in this folder itself, shared with you and \
+            its other tasks. With own_folder, it gets an empty folder of its own instead, where it makes what it \
             changes, such as a workspace made with this folder's tooling, as the brief says how, and reads this \
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
             memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
@@ -103,6 +104,14 @@ fn start() -> Value {
                 "profile": {"type": "string", "minLength": 1,
                     "description": "A role listed under Profiles that fits the task; without one, it \
                         starts in no role."},
+                "folder": {"type": "string", "minLength": 1,
+                    "description": "A folder inside this one to start the task at instead of here, \
+                        relative or absolute, such as a repository this folder holds: the task then gets \
+                        a worktree of that repository and works at that folder in it."},
+                "own_folder": {"type": "boolean",
+                    "description": "An empty folder of the task's own instead of a worktree or this folder: \
+                        for work that makes its own copy of what it changes, such as a workspace on another \
+                        branch made with this folder's tooling, or that must not touch this folder."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -460,6 +469,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 setup: arguments["setup"] == true,
                 model: text("model"),
                 effort: text("effort"),
+                own_folder: arguments["own_folder"] == true,
+                folder: text("folder"),
             };
             crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))
         }

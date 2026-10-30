@@ -6,7 +6,7 @@
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The most of the person's words one call returns, the answer whole; the
 /// newest are kept. Within the 60 KiB a served tool's answer may take.
@@ -135,7 +135,13 @@ async fn turns_since(
             let project = match turn["workspace"].as_str() {
                 Some(dir) => folders
                     .entry(dir.to_owned())
-                    .or_insert_with(|| agent_client::policy::project(Path::new(dir)).ok().flatten())
+                    .or_insert_with(|| {
+                        // A task in a folder of its own works for its
+                        // lead's project.
+                        let dir = crate::task::source_folder(Path::new(dir))
+                            .unwrap_or_else(|| PathBuf::from(dir));
+                        agent_client::policy::project(&dir).ok().flatten()
+                    })
                     .clone(),
                 None => None,
             };

@@ -2,11 +2,12 @@
 //! answers makes the task a git worktree, then starts it there with the
 //! daemon's `agent run`. A worktree starts at the last commit on a branch
 //! of its own, with clones of the lead's build folders where the disk makes
-//! them copy-on-write (seed.rs). Outside git, the task gets an empty folder
-//! of its own and makes there what it works in, as the person's tooling
-//! makes a workspace, reading the lead's folder where it is. A task that
-//! could not start leaves no folder behind, and the `remove_task` tool
-//! takes away one that is done.
+//! them copy-on-write (seed.rs); outside git, the task shares the lead's
+//! folder. With `own_folder`, the task gets an empty folder of its own
+//! instead and makes there what it works in, as the person's tooling makes
+//! a workspace, reading the lead's folder where it is. A task that could
+//! not start leaves no folder behind, and the `remove_task` tool takes away
+//! one that is done.
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,6 +48,13 @@ pub struct Start {
     pub setup: bool,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// An empty folder of the task's own, rather than a worktree or, outside
+    /// git, the lead's folder itself.
+    pub own_folder: bool,
+    /// A folder inside the lead's that the task works at instead of the
+    /// lead's own, such as a repository it holds, of which the task then
+    /// gets a worktree.
+    pub folder: Option<String>,
 }
 
 /// Start the task `start` asks for of the lead `lead`, whose folder is
@@ -90,11 +98,31 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
         flags.extend(["--effort".to_owned(), effort]);
     }
+    let folder = start.folder.as_deref().filter(|f| !f.trim().is_empty());
+    if folder.is_some() && (start.own_folder || info["threads_in"] == "project") {
+        return Err(match start.own_folder {
+            true => "folder and own_folder each give the task its folder; give one".into(),
+            false => "this project's tasks all work in this folder; start it without folder".into(),
+        });
+    }
+    // Where in the lead's folder the task works: the lead's own place, or
+    // the folder inside it named.
+    let at = match folder {
+        Some(folder) => inside(here, folder)?,
+        None => here.to_owned(),
+    };
     let mut place = if info["threads_in"] == "project" {
         in_place(here, name)
+    } else if start.own_folder {
+        own_folder(here, name)?
     } else {
-        worktree(here, name)?
+        worktree(&at, name)?
     };
+    // A task in a folder inside the lead's is told the rules of the
+    // folders above it too, which its worktree is not inside.
+    if at != here {
+        place.told = at.clone();
+    }
     // Only a run that started can have made the task, which then keeps
     // its folder; anything that failed before leaves nothing behind.
     let failed = |place: &Place, ran: bool, error: String| {
@@ -105,8 +133,8 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     };
     // The folder's setup script, run in the task's own folder, as for a
     // worktree; a task in the lead's folder has nothing to set up.
-    let script = here.join(".agents/setup");
-    if start.setup && place.dir != here && script.exists() {
+    let script = at.join(".agents/setup");
+    if start.setup && place.dir != at && script.exists() {
         // Its output is not kept, however long a build runs: only the last
         // lines of its errors, which a failure shows.
         let mut setup = Command::new(&script);
@@ -117,7 +145,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         }
         let ran = setup
             .current_dir(&place.dir)
-            .env("AGENT_SOURCE", here)
+            .env("AGENT_SOURCE", &at)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -634,6 +662,41 @@ fn home_dir() -> Result<PathBuf, String> {
     ))
 }
 
+/// The folder `folder` names inside `here`, by its real path: relative to
+/// `here`, or absolute.
+fn inside(here: &Path, folder: &str) -> Result<PathBuf, String> {
+    let real = std::fs::canonicalize(here.join(folder)).map_err(|e| format!("{folder}: {e}"))?;
+    let base = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_owned());
+    if !real.is_dir() || !real.starts_with(&base) {
+        return Err(format!(
+            "{folder} is not a folder inside {}",
+            base.display()
+        ));
+    }
+    Ok(real)
+}
+
+/// The main checkout of the repository the worktree `path` belongs to,
+/// when that is `here`'s or one inside it.
+fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
+    let common = git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let common = std::fs::canonicalize(common).ok()?;
+    let main = common.parent()?.to_owned();
+    let base = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_owned());
+    let mine = git(
+        here,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .and_then(|dir| std::fs::canonicalize(dir).ok());
+    (common.file_name()? == ".git" && (mine == Some(common.clone()) || main.starts_with(&base)))
+        .then_some(main)
+}
+
 /// Where Sonny records the folder each task with an empty folder of its
 /// own was started from, by the task's name: under a name no task's
 /// folder can have, as a branch's part never starts with a dot.
@@ -653,13 +716,14 @@ fn source_of(name: &str) -> Option<PathBuf> {
 pub fn source_folder(dir: &Path) -> Option<PathBuf> {
     let tasks = home_dir().ok()?.join(".agent/worktrees");
     let tasks = std::fs::canonicalize(&tasks).unwrap_or(tasks);
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
     let name = dir.strip_prefix(&tasks).ok()?.components().next()?;
     source_of(name.as_os_str().to_str()?)
 }
 
-/// Outside git, an empty folder of the task's own, beside the worktrees:
-/// what it works in, such as a workspace the person's tooling makes, it
-/// makes there, and it reads `here` where it is.
+/// An empty folder of the task's own, beside the worktrees: what it works
+/// in, such as a workspace the person's tooling makes, it makes there, and
+/// it reads `here` where it is.
 fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let record = record_of(name)?;
@@ -691,10 +755,10 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
         dir: path.clone(),
         told: here.to_owned(),
         note: Some(format!(
-            "{name}: works in {}, an empty folder of its own, since this folder is not a git \
-             repository; it reads this folder where it is, and makes in its own what it \
-             changes, as its brief says how",
-            shell_quote(&path)
+            "{name}: works in {}, an empty folder of its own; it reads this folder, {}, where \
+             it is, and makes in its own what it changes, as its brief says how",
+            shell_quote(&path),
+            shell_quote(here)
         )),
         undo,
         copy: None,
@@ -702,10 +766,17 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
 }
 
 /// A git worktree on branch agent/NAME at the last commit, in the lead's
-/// subfolder of it. Outside git, an empty folder of the task's own.
+/// subfolder of it. Outside git, the lead's folder, which the task shares.
 fn worktree(here: &Path, name: &str) -> Result<Place, String> {
     if git(here, &["rev-parse", "--show-toplevel"]).is_err() {
-        return own_folder(here, name);
+        return Ok(Place {
+            note: Some(format!(
+                "{name}: works in this folder itself, shared with you and its other tasks, since \
+                 it is not a git repository; a task that needs a copy of its own, such as a \
+                 workspace its tooling makes, takes own_folder"
+            )),
+            ..in_place(here, name)
+        });
     }
     let top = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"])?);
     let prefix = git(here, &["rev-parse", "--show-prefix"])?;
@@ -871,7 +942,12 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     let source = source_of(name);
     let (worktree, folder) = match path.exists() {
         true if source.as_deref() == Some(here) => (None, Some(path)),
-        true if source.is_none() && ours(here, &path, &branch) => (Some(path), None),
+        true if source.is_none()
+            && let Some(repo) = repository_of(here, &path)
+            && ours(&repo, &path, &branch) =>
+        {
+            (Some((repo, path)), None)
+        }
         true => {
             return Err(match source {
                 Some(source) => format!(
@@ -892,7 +968,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     // once it is gone and can write no more.
     let kept = || -> Result<(), String> {
         if !discard
-            && let Some(path) = &worktree
+            && let Some((_, path)) = &worktree
             && !git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()
         {
             return Err(format!(
@@ -925,20 +1001,32 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         }
         kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
     }
-    if let Some(path) = &worktree {
+    if let Some((repo, path)) = &worktree {
         let path = path.to_string_lossy();
         let mut args = vec!["worktree", "remove"];
         if discard {
             args.push("--force");
         }
         args.push(&path);
-        git(here, &args)?;
+        git(repo, &args)?;
         let delete = if discard { "-D" } else { "-d" };
-        if git(here, &["branch", delete, &branch]).is_err() {
-            return Ok(format!(
-                "Removed {name}. {branch} is kept, since it has commits not merged here; \
-                 `git branch -D {branch}` deletes it."
-            ));
+        let ours = git(here, &["rev-parse", "--show-toplevel"])
+            .ok()
+            .and_then(|top| std::fs::canonicalize(top).ok())
+            .is_some_and(|top| &top == repo);
+        if git(repo, &["branch", delete, &branch]).is_err() {
+            return Ok(match ours {
+                true => format!(
+                    "Removed {name}. {branch} is kept, since it has commits not merged here; \
+                     `git branch -D {branch}` deletes it."
+                ),
+                false => format!(
+                    "Removed {name}. {branch} is kept in {}, since it has commits not merged \
+                     there; `git -C {} branch -D {branch}` deletes it.",
+                    repo.display(),
+                    shell_quote(repo)
+                ),
+            });
         }
     }
     if let Some(path) = &folder {
@@ -967,19 +1055,20 @@ fn unsaved(dir: &Path) -> Result<Vec<String>, String> {
         let mut status = vec!["status", "--porcelain", "--untracked-files=all", "--", "."];
         status.extend(inner.iter().map(String::as_str));
         let changed = !git(&path, &status)?.is_empty();
-        let unpushed = !git(
-            &path,
-            &[
-                "log",
-                "--branches",
-                "--not",
-                "--remotes",
-                "--format=%h",
-                "-n",
-                "1",
-            ],
-        )?
-        .is_empty();
+        // A detached checkout's commits are on no branch.
+        let mut log = vec![
+            "log",
+            "--branches",
+            "--not",
+            "--remotes",
+            "--format=%h",
+            "-n",
+            "1",
+        ];
+        if git(&path, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok() {
+            log.insert(2, "HEAD");
+        }
+        let unpushed = !git(&path, &log)?.is_empty();
         if changed || unpushed {
             unsaved.push(match repo.as_os_str().is_empty() {
                 true => ".".to_owned(),
