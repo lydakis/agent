@@ -69,6 +69,7 @@ per feature; group small things into the row they belong to.
 | Pictures: SVG, Mermaid, math and HTML drawn in the terminal | shipped | added 10-26 #147; `\[ \]` math 10-29 #313; sent once 10-29 #338 | Agents can show, not only tell | ? |
 | Reactions, on the message they answer (`/react`) | shipped | added 10-27 #224; under the message 10-29 #326 | A light acknowledgement without a reply | ? |
 | Welcome and first run: sets itself up and says hello | shipped | added 10-28 #253; heads every lead's history 10-29 #320; finds keys, ChatGPT and AWS profiles, ranks the models, `sonny setup` 10-30 #402 | A new person gets going without docs | ? |
+| After an upgrade: the first lead tells what's new from this register and offers new setup once | experimental | added 10-30 #420 | The person hears of what changed and sets up what is new without reading release notes | ? |
 | `sonny view`: long writing beside the lead | removed | added 10-27 #197; reverted 10-27 #198 | Viewers are skills, not Sonny; long writing stays in a file | ? |
 
 ## Composer

@@ -565,6 +565,20 @@ not changed since; a copy left the same as it is Sonny's
 again from the next start. A file of the person's own that Sonny never
 wrote, or a link, is not offered.
 
+The same note carries what changed in Sonny, from its feature register
+([FEATURES.md](../sonny/FEATURES.md)), which Sonny writes to
+`~/.agent/sonny/FEATURES.md` at each start. Sonny keeps the register as the
+person last heard of it in `~/.agent/sonny/shipped/FEATURES.md`; when this
+Sonny's differs, the note lists the rows that are new or changed and asks
+the bot to tell the person what of them matters, and once it is sent the
+new register is the heard one. No version is compared, so a skipped release
+is told with the next. The first register a person has is heard of without
+a word. The note also offers each setup step an upgrade brings that the
+person has neither done nor been offered (`setup::STEPS`, now bringing in
+MCP servers with `sonny mcp import`): each is offered once, then noted in
+`~/.agent/sonny/offered`, as is one setup itself offers. The row reads
+`↳ Sonny upgraded · what's new · set up mcp-import`.
+
 A link the Agent app left there, into its bundle's
 `Contents/Resources/skills`, is replaced, never written through; a folder's
 own skill of the same name wins over any of them. Agents already running
