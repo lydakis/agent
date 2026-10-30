@@ -33,7 +33,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Notify, mpsc, watch},
+    sync::{mpsc, watch},
     task::JoinSet,
 };
 use turn::Turn;
@@ -788,74 +788,30 @@ fn name(field: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
-/// An `approve_step` waiting for its step's decision, off the service's
-/// loop: woken by an answer, at the gate's lapse, or when the turn ends. A
-/// client whose session closes takes its step with it.
-struct StepWait {
-    store: Store,
-    handles: Handles,
+/// An `approve_step` waiting for its step's decision, which holds no task
+/// or timer: an answer, the turn's or call's end, and the gate's lapse
+/// each bring it to the run loop through the handles' schedule. A client
+/// whose session closes takes its step with it.
+struct Stepping {
+    session: u64,
+    output: Output,
+    request: Value,
     bot: String,
     turn: i64,
     id: String,
 }
-impl StepWait {
-    /// Tell the turn waiting on the step's call that the call's time runs
-    /// again, and give the reply once the step is decided.
-    fn settle(&self, stepped: Stepped) -> std::result::Result<Value, (Arc<Notify>, Option<u64>)> {
-        if let Some(notify) = stepped.notify {
-            notify.notify_one();
-        }
-        if stepped.wake {
-            self.handles.wake(self.bot.clone(), self.turn);
-        }
-        match stepped.step {
-            Step::Decided(reply) => Ok(reply),
-            Step::Pending { notify, expires_ms } => Err((notify, expires_ms)),
-        }
+/// Tell the turn waiting on a step's call that the call's time runs again,
+/// and give the step's reply once it is decided.
+fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Option<Value> {
+    if let Some(notify) = stepped.notify {
+        notify.notify_one();
     }
-    async fn wait(
-        self,
-        mut notify: Arc<Notify>,
-        mut expires_ms: Option<u64>,
-        output: Output,
-        mut closed: watch::Receiver<bool>,
-        request: Value,
-    ) {
-        loop {
-            let lapse = expires_ms.map(|at| {
-                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
-            });
-            let gone = tokio::select! {
-                () = notify.notified() => false,
-                () = async {
-                    match lapse {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending().await,
-                    }
-                } => false,
-                _ = closed.wait_for(|closed| *closed) => true,
-            };
-            let (bot, turn, id) = (self.bot.clone(), self.turn, self.id.clone());
-            let stepped = self
-                .store
-                .op("step_check", move |db| match gone {
-                    true => db.step_abandon(&bot, turn, &id, now_ms()),
-                    false => db.step_check(&bot, turn, &id, now_ms()),
-                })
-                .await;
-            let result = match stepped.map(|stepped| self.settle(stepped)) {
-                Ok(Err((next, at))) => {
-                    (notify, expires_ms) = (next, at);
-                    continue;
-                }
-                Ok(Ok(reply)) => Ok(reply),
-                Err(error) => Err(error),
-            };
-            if !gone && output.try_respond(request, result).is_err() {
-                output.close();
-            }
-            return;
-        }
+    if stepped.wake {
+        handles.wake(bot.to_owned(), turn);
+    }
+    match stepped.step {
+        Step::Decided(reply) => Some(reply),
+        Step::Pending { .. } => None,
     }
 }
 /// The most bytes a prompt's pictures may have together, decoded: what
@@ -996,9 +952,10 @@ fn gate(
 }
 struct Service {
     store: Store,
-    /// For each session with a step waiting, what tells its waits that the
-    /// session closed: a step goes with the client that put it.
-    stepping: HashMap<u64, watch::Sender<bool>>,
+    /// Each waiting step's `approve_step`, by approval, answered from the
+    /// run loop once the step is decided: a step goes with the client
+    /// that put it.
+    stepping: HashMap<i64, Stepping>,
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
@@ -1214,6 +1171,7 @@ pub(crate) async fn publish(
             Publication::Finished { bot, turn, outcome } => {
                 handles.turn_finished(&bot, turn, outcome);
             }
+            Publication::Stepped(approval) => handles.stepped(approval),
         }
     }
 }
@@ -1608,6 +1566,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                         service.resume(bot, turn, due).await?;
                     }
                 }
+                // A wait's deadline, or a step answered, ended or lapsing:
+                // the one schedule that waiting requests keep.
+                () = service.handles.due() => {
+                    for approval in service.handles.take_due(handles::now_ms()) {
+                        service.check_step(approval, false).await;
+                    }
+                }
                 // Queued admissions are answered as their commits land, in order.
                 _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
                     let (session, output, id, result) = service.settled();
@@ -1638,9 +1603,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
-                            if let Some(stepping) = service.stepping.remove(&id) {
-                                stepping.send_replace(true);
-                            }
+                            service.abandon_steps(id).await;
                             if id == 0 && stdio_owner { break; }
                         }
                         Inbound::Request(id, request) => {
@@ -2335,6 +2298,58 @@ impl Service {
     }
 
     /// How long until the earliest parked turn is due.
+    /// See where a waiting step stands, and answer its `approve_step` once
+    /// it is decided. `gone` when its client's session closed: the step is
+    /// dropped, and no one is left to answer.
+    async fn check_step(&mut self, approval: i64, gone: bool) {
+        let Some(stepping) = self.stepping.get(&approval) else {
+            return;
+        };
+        let (bot, turn, id) = (stepping.bot.clone(), stepping.turn, stepping.id.clone());
+        let stepped = self
+            .store
+            .op("step_check", move |db| match gone {
+                true => db.step_abandon(&bot, turn, &id, now_ms()),
+                false => db.step_check(&bot, turn, &id, now_ms()),
+            })
+            .await;
+        let result = match stepped {
+            Ok(stepped) => {
+                if let Step::Pending {
+                    expires_ms,
+                    approval: still,
+                } = stepped.step
+                {
+                    self.handles.step_lapses(still, expires_ms);
+                    return;
+                }
+                let stepping = &self.stepping[&approval];
+                Ok(settle_step(&self.handles, &stepping.bot, turn, stepped)
+                    .expect("a decided step"))
+            }
+            Err(error) => Err(error),
+        };
+        self.handles.step_lapses(approval, None);
+        let stepping = self.stepping.remove(&approval).expect("a waiting step");
+        if !gone
+            && stepping
+                .output
+                .try_respond(stepping.request, result)
+                .is_err()
+        {
+            stepping.output.close();
+        }
+    }
+    /// Drop the steps a closed session's client put.
+    async fn abandon_steps(&mut self, session: u64) {
+        let gone: Vec<i64> = (self.stepping.iter())
+            .filter(|(_, stepping)| stepping.session == session)
+            .map(|(approval, _)| *approval)
+            .collect();
+        for approval in gone {
+            self.check_step(approval, true).await;
+        }
+    }
     fn wake_delay(&self) -> Duration {
         self.wakes
             .next()
@@ -3359,9 +3374,10 @@ impl Service {
                         format!("arguments may be up to {ANSWER_BYTES} bytes"),
                     );
                 }
-                let wait = StepWait {
-                    store: store.clone(),
-                    handles: self.handles.clone(),
+                let stepping = Stepping {
+                    session,
+                    output: output.clone(),
+                    request: id,
                     bot: bot.clone(),
                     turn,
                     id: format!("{call_id}/{step}"),
@@ -3372,19 +3388,19 @@ impl Service {
                         db.step_announce(&name, turn, &call_id, &step, &tool, arguments, now_ms())
                     })
                     .await?;
-                match wait.settle(stepped) {
-                    Ok(reply) => Ok(reply),
-                    Err((notify, expires_ms)) => {
-                        let closed = self
-                            .stepping
-                            .entry(session)
-                            .or_insert_with(|| watch::channel(false).0)
-                            .subscribe();
-                        tokio::spawn(wait.wait(notify, expires_ms, output.clone(), closed, id));
-                        // The response is sent by the wait, not by this dispatch.
-                        Err(Error::new("deferred"))
-                    }
+                if let Step::Pending {
+                    approval,
+                    expires_ms,
+                } = stepped.step
+                {
+                    self.handles.step_lapses(approval, expires_ms);
+                    self.stepping.insert(approval, stepping);
+                    // The response is sent from the run loop once the step
+                    // is decided, not by this dispatch.
+                    return Err(Error::new("deferred"));
                 }
+                Ok(settle_step(&self.handles, &stepping.bot, turn, stepped)
+                    .expect("a decided step"))
             }
             Command::StepResult {
                 bot,

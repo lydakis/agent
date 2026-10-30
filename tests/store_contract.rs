@@ -7372,6 +7372,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
             Publication::Through(_) => "through",
             Publication::Approval(_) => "approval",
             Publication::Finished { .. } => "finished",
+            Publication::Stepped(_) => "stepped",
         })
         .collect();
     assert_eq!(kinds, ["created", "created"]);
@@ -7433,6 +7434,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
             Publication::Through(through) => format!("through:{through}"),
             Publication::Approval(a) => format!("approval:{}", a.cursor),
             Publication::Finished { turn, .. } => format!("finished:{turn}"),
+            Publication::Stepped(approval) => format!("stepped:{approval}"),
         });
         true
     })

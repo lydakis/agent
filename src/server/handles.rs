@@ -2,6 +2,10 @@
 //! turns, resolved from the daemon's own completions, and background commands
 //! recorded in the store. A waiter is either a parked turn (a store row plus a
 //! registry entry, no task) or a client request awaiting its response.
+//!
+//! What waits here has no task or timer of its own: every deadline, a
+//! wait's and a waiting step's, is one entry in this registry's schedule,
+//! which the service's run loop sleeps on.
 use agent_runtime::{
     Result, fail_with,
     output::Output,
@@ -78,7 +82,7 @@ pub enum Completion {
 }
 
 /// Who is waiting: parked turns are keyed by turn id, requests by a counter.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Waiter {
     Turn(i64),
     Request(u64),
@@ -92,14 +96,15 @@ struct Waiting {
     remaining: BTreeSet<String>,
     results: BTreeMap<String, Arc<Value>>,
     completion: Completion,
-    timer: Option<tokio::task::AbortHandle>,
+    /// When the wait gives up on what is still pending, as scheduled.
+    deadline: Option<u64>,
 }
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        if let Some(timer) = self.timer.take() {
-            timer.abort();
-        }
-    }
+/// What comes due on the schedule: a wait's deadline, by its generation, or
+/// a waiting step's lapse, by its approval.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Due {
+    Wait(Waiter, u64),
+    Step(i64),
 }
 struct Retained {
     value: Arc<Value>,
@@ -117,12 +122,21 @@ struct Inner {
     // Answers still reading their pending turns, each holding its session's
     // output; shutdown ends them before the outputs close.
     reads: tokio::task::JoinSet<()>,
+    schedule: BTreeSet<(u64, Due)>,
+    /// Each waiting step's lapse on the schedule.
+    lapses: HashMap<i64, u64>,
+    /// Steps an answer or their turn's end may have decided, by approval,
+    /// for the run loop to check.
+    stepped: Vec<i64>,
 }
 
 #[derive(Clone)]
 pub struct Handles {
     inner: Arc<Mutex<Inner>>,
     resume: mpsc::UnboundedSender<(String, i64)>,
+    /// Told when the schedule's first entry comes sooner, or a step is
+    /// stepped: the run loop's sleep is out of date.
+    sooner: Arc<tokio::sync::Notify>,
 }
 
 impl Handles {
@@ -130,7 +144,101 @@ impl Handles {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
             resume,
+            sooner: Default::default(),
         }
+    }
+
+    fn schedule_locked(inner: &mut Inner, sooner: &tokio::sync::Notify, at: u64, due: Due) {
+        if inner.schedule.first().is_none_or(|&(first, _)| at < first) {
+            sooner.notify_one();
+        }
+        inner.schedule.insert((at, due));
+    }
+
+    /// Remove a waiter, and its deadline from the schedule.
+    fn remove_locked(inner: &mut Inner, waiter: Waiter) -> Option<Waiting> {
+        let waiting = inner.waiters.remove(&waiter)?;
+        if let Some(at) = waiting.deadline {
+            inner
+                .schedule
+                .remove(&(at, Due::Wait(waiter, waiting.generation)));
+        }
+        Some(waiting)
+    }
+
+    /// Put a waiting step's lapse on the schedule, in place of any it had:
+    /// none when no gate of it lapses, or once it is decided.
+    pub fn step_lapses(&self, approval: i64, at: Option<u64>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(old) = inner.lapses.remove(&approval) {
+            inner.schedule.remove(&(old, Due::Step(approval)));
+        }
+        if let Some(at) = at {
+            inner.lapses.insert(approval, at);
+            Self::schedule_locked(&mut inner, &self.sooner, at, Due::Step(approval));
+        }
+    }
+
+    /// A waiting step was answered, or its turn or call ended: the run
+    /// loop checks it. Told after the store committed.
+    pub fn stepped(&self, approval: i64) {
+        self.inner.lock().unwrap().stepped.push(approval);
+        self.sooner.notify_one();
+    }
+
+    /// Until something on the schedule comes due or a step was stepped:
+    /// the run loop's one sleep for every deadline here.
+    pub async fn due(&self) {
+        loop {
+            let next = {
+                let inner = self.inner.lock().unwrap();
+                if !inner.stepped.is_empty() {
+                    return;
+                }
+                inner.schedule.first().map(|&(at, _)| at)
+            };
+            let sooner = self.sooner.notified();
+            match next {
+                Some(at) if at <= now_ms() => return,
+                Some(at) => {
+                    let delay = Duration::from_millis(at - now_ms().min(at));
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = sooner => {}
+                    }
+                }
+                None => sooner.await,
+            }
+        }
+    }
+
+    /// Give up the waits whose deadlines came by `now`, and hand back the
+    /// steps to check: those stepped, and those whose lapse came.
+    pub fn take_due(&self, now: u64) -> Vec<i64> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut steps = std::mem::take(&mut inner.stepped);
+        while let Some(&(at, due)) = inner.schedule.first()
+            && at <= now
+        {
+            inner.schedule.pop_first();
+            match due {
+                Due::Wait(waiter, generation) => {
+                    if let Some(waiting) = inner.waiters.get_mut(&waiter)
+                        && waiting.generation == generation
+                    {
+                        waiting.deadline = None;
+                        Self::expire_locked(&mut inner, &self.resume, waiter);
+                    }
+                }
+                Due::Step(approval) => {
+                    inner.lapses.remove(&approval);
+                    steps.push(approval);
+                }
+            }
+        }
+        steps.sort_unstable();
+        steps.dedup();
+        steps
     }
 
     /// Wake anyone parked on a background command whose result is recorded.
@@ -236,9 +344,7 @@ impl Handles {
             } => {
                 // A request waiter is consumed by its response.
                 Self::detach_locked(inner, waiter);
-                let results = inner
-                    .waiters
-                    .remove(&waiter)
+                let results = Self::remove_locked(inner, waiter)
                     .map(|mut w| std::mem::take(&mut w.results))
                     .unwrap_or_default();
                 let pending: Vec<(String, String, i64)> = results
@@ -320,6 +426,7 @@ impl Handles {
                     Handle::Process(id) => inner.by_process.entry(*id).or_default().push(waiter),
                 }
             }
+            Self::remove_locked(&mut inner, waiter);
             inner.waiters.insert(
                 waiter,
                 Waiting {
@@ -328,7 +435,7 @@ impl Handles {
                     remaining,
                     results: BTreeMap::new(),
                     completion,
-                    timer: None,
+                    deadline: None,
                 },
             );
             generation
@@ -352,13 +459,6 @@ impl Handles {
             }
         }
         if let Some(deadline) = deadline_ms {
-            let delay = Duration::from_millis(deadline.saturating_sub(now_ms()));
-            if delay.is_zero() {
-                // Polls inspect every handle above, then return pending results
-                // without allocating a timer task or waiting for a timer tick.
-                self.expire(waiter, generation);
-                return;
-            }
             let mut inner = self.inner.lock().unwrap();
             let Some(waiting) = inner.waiters.get_mut(&waiter) else {
                 return;
@@ -366,13 +466,18 @@ impl Handles {
             if waiting.generation != generation || waiting.remaining.is_empty() {
                 return;
             }
-            let handles = self.clone();
-            waiting.timer = Some(
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    handles.expire(waiter, generation);
-                })
-                .abort_handle(),
+            if deadline <= now_ms() {
+                // Polls inspect every handle above, then return pending results
+                // without waiting for the schedule.
+                Self::expire_locked(&mut inner, &self.resume, waiter);
+                return;
+            }
+            waiting.deadline = Some(deadline);
+            Self::schedule_locked(
+                &mut inner,
+                &self.sooner,
+                deadline,
+                Due::Wait(waiter, generation),
             );
         }
     }
@@ -457,16 +562,19 @@ impl Handles {
     }
 
     /// Report unresolved handles as pending and complete the waiter.
-    fn expire(&self, waiter: Waiter, generation: u64) {
-        let mut inner = self.inner.lock().unwrap();
+    fn expire_locked(
+        inner: &mut Inner,
+        resume: &mpsc::UnboundedSender<(String, i64)>,
+        waiter: Waiter,
+    ) {
         let Some(waiting) = inner.waiters.get_mut(&waiter) else {
             return;
         };
-        if waiting.generation != generation || waiting.remaining.is_empty() {
+        if waiting.remaining.is_empty() {
             return;
         }
         Self::pend_remaining(waiting);
-        Self::complete_locked(&mut inner, &self.resume, waiter);
+        Self::complete_locked(inner, resume, waiter);
     }
 
     /// Registry size for `stats`: live waiters and retained outcomes.
@@ -484,9 +592,7 @@ impl Handles {
     pub fn take(&self, turn: i64) -> BTreeMap<String, Arc<Value>> {
         let mut inner = self.inner.lock().unwrap();
         Self::detach_locked(&mut inner, Waiter::Turn(turn));
-        inner
-            .waiters
-            .remove(&Waiter::Turn(turn))
+        Self::remove_locked(&mut inner, Waiter::Turn(turn))
             .map(|mut w| std::mem::take(&mut w.results))
             .unwrap_or_default()
     }
@@ -495,7 +601,7 @@ impl Handles {
     pub fn forget(&self, waiter: Waiter) {
         let mut inner = self.inner.lock().unwrap();
         Self::detach_locked(&mut inner, waiter);
-        inner.waiters.remove(&waiter);
+        Self::remove_locked(&mut inner, waiter);
     }
 
     /// Sessions own only their still-pending requests, not a history of waits.
@@ -507,7 +613,7 @@ impl Handles {
         }).collect();
         for waiter in waiters {
             Self::detach_locked(&mut inner, waiter);
-            inner.waiters.remove(&waiter);
+            Self::remove_locked(&mut inner, waiter);
         }
     }
 
@@ -518,6 +624,9 @@ impl Handles {
     pub fn shutdown(&self) -> tokio::task::JoinSet<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.waiters.clear();
+        inner.schedule.clear();
+        inner.lapses.clear();
+        inner.stepped.clear();
         inner.by_turn.clear();
         inner.by_process.clear();
         inner.retained.clear();
@@ -608,7 +717,7 @@ mod tests {
                         request: json!(1),
                         reader: store.reader(),
                     },
-                    timer: None,
+                    deadline: None,
                 },
             );
             inner.by_process.insert(2, vec![Waiter::Request(1)]);
@@ -650,7 +759,7 @@ mod tests {
                         request: json!(1),
                         reader: store.reader(),
                     },
-                    timer: None,
+                    deadline: None,
                 },
             );
             inner.by_process.insert(2, vec![Waiter::Request(1)]);
@@ -691,6 +800,49 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn every_deadline_is_one_entry_on_the_schedule_and_none_outlives_its_waiter() {
+        let (resume, mut resumed) = mpsc::unbounded_channel();
+        let handles = Handles::new(resume);
+        let waiting = |turn: i64, at: u64| Waiting {
+            generation: turn as u64,
+            any: false,
+            remaining: ["proc:1".into()].into(),
+            results: BTreeMap::new(),
+            completion: Completion::Resume {
+                bot: "Bob".into(),
+                turn,
+            },
+            deadline: Some(at),
+        };
+        {
+            let mut inner = handles.inner.lock().unwrap();
+            for turn in [1, 2] {
+                inner.waiters.insert(Waiter::Turn(turn), waiting(turn, 100));
+                let due = Due::Wait(Waiter::Turn(turn), turn as u64);
+                Handles::schedule_locked(&mut inner, &handles.sooner, 100, due);
+            }
+        }
+        // A waiter that leaves takes its deadline with it.
+        handles.forget(Waiter::Turn(2));
+        assert_eq!(handles.inner.lock().unwrap().schedule.len(), 1);
+        // A step's lapse moves rather than adds, and goes once it is due.
+        handles.step_lapses(5, Some(50));
+        handles.step_lapses(5, Some(90));
+        handles.step_lapses(6, Some(70));
+        handles.step_lapses(6, None);
+        handles.stepped(7);
+        // Something stepped: the run loop's sleep ends at once.
+        handles.due().await;
+        assert_eq!(handles.take_due(99), [5, 7]);
+        assert_eq!(handles.inner.lock().unwrap().schedule.len(), 1);
+        // The wait's deadline gives up on what is pending, and resumes it.
+        assert!(handles.take_due(100).is_empty());
+        assert_eq!(resumed.try_recv().unwrap(), ("Bob".into(), 1));
+        let inner = handles.inner.lock().unwrap();
+        assert!(inner.schedule.is_empty() && inner.lapses.is_empty());
+    }
+
     #[test]
     fn shared_results_are_released_when_waiters_leave() {
         let handles = Handles::new(mpsc::unbounded_channel().0);
@@ -709,7 +861,7 @@ mod tests {
                             bot: turn.to_string(),
                             turn,
                         },
-                        timer: None,
+                        deadline: None,
                     },
                 );
                 for process in [1, 2] {
