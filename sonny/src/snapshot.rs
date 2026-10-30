@@ -790,10 +790,11 @@ static WORKED: std::sync::LazyLock<
 static RUNNING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The folder of every bot the lookout knows of, working or not: one a
-/// turn has ended in may still run what that turn left going.
-static HOUSED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
-    std::sync::LazyLock::new(Default::default);
+/// The folders every bot the lookout knows of may write, working or not:
+/// one a turn has ended in may still run what that turn left going.
+static HOUSED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<PathBuf>>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Note that `bot` works in `workspace` now, or, with `None`, no longer.
 pub fn running(bot: &str, workspace: Option<&Path>) {
@@ -801,7 +802,11 @@ pub fn running(bot: &str, workspace: Option<&Path>) {
     match workspace {
         Some(workspace) => {
             let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
-            housed(bot, Some(&real));
+            let mut housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
+            let folders = housed.entry(bot.to_owned()).or_default();
+            if !folders.contains(&real) {
+                folders.push(real.clone());
+            }
             running.insert(bot.to_owned(), real);
         }
         None => {
@@ -810,13 +815,13 @@ pub fn running(bot: &str, workspace: Option<&Path>) {
     }
 }
 
-/// Note that `bot` has its folder at `workspace`, or, with `None`, is gone.
-pub fn housed(bot: &str, workspace: Option<&Path>) {
+/// Note that `bot` may write `folders`, or, with `None`, is gone.
+pub fn housed(bot: &str, folders: Option<&[PathBuf]>) {
     let mut housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
-    match workspace {
-        Some(workspace) => {
-            let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
-            housed.insert(bot.to_owned(), real);
+    match folders {
+        Some(folders) => {
+            let real = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            housed.insert(bot.to_owned(), folders.iter().map(real).collect());
         }
         None => {
             housed.remove(bot);
@@ -824,12 +829,29 @@ pub fn housed(bot: &str, workspace: Option<&Path>) {
     }
 }
 
+/// The folders a sandbox lets the bot the daemon lists as `record` write:
+/// its own, and those its settings add, such as its repository's git
+/// folder.
+pub fn writable(record: &serde_json::Value) -> Vec<PathBuf> {
+    let added = record["settings"]["writable"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    (record["workspace"].as_str().into_iter())
+        .chain(added.filter_map(serde_json::Value::as_str))
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// The folder of a bot that holds `path`, which a sandbox would let it
 /// write: none of Sonny's own may be in one.
 fn housing(path: &Path) -> Option<PathBuf> {
     let housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
     let shared = shared();
-    holder(path, (housed.values().chain(&shared)).map(PathBuf::as_path))
+    holder(
+        path,
+        (housed.values().flatten().chain(&shared)).map(PathBuf::as_path),
+    )
 }
 
 /// The folders every sandbox lets its bot write, whatever its folder:
@@ -1601,7 +1623,7 @@ mod tests {
         let temporary = |path: Option<PathBuf>| {
             path.is_some_and(|path| shared().iter().any(|tmp| real(tmp) == path))
         };
-        housed("housed.task", Some(&task));
+        housed("housed.task", Some(std::slice::from_ref(&task)));
         assert!(temporary(housing(&indexes)));
         running("housed.lead", Some(&lead));
         running("housed.lead", None);

@@ -1156,7 +1156,7 @@ fn forked(agent: &Path, name: &str, source: &Source) -> Result<Place, String> {
     let bots: Vec<Value> = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("{} ls: {e}", agent.display()))?;
     let folders: Vec<PathBuf> = (bots.iter())
-        .filter_map(|bot| bot["workspace"].as_str().map(PathBuf::from))
+        .flat_map(crate::snapshot::writable)
         .chain(crate::snapshot::shared())
         .collect();
     if let Some(folder) = crate::snapshot::holder(&indexes, folders.iter().map(PathBuf::as_path)) {

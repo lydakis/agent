@@ -674,9 +674,8 @@ impl Service {
                 .filter_map(|b| Some((b["name"].as_str()?, Path::new(b["workspace"].as_str()?)))),
         );
         for bot in &bots {
-            if let (Some(name), Some(workspace)) = (bot["name"].as_str(), bot["workspace"].as_str())
-            {
-                crate::snapshot::housed(name, Some(Path::new(workspace)));
+            if let Some(name) = bot["name"].as_str() {
+                crate::snapshot::housed(name, Some(&crate::snapshot::writable(bot)));
             }
         }
         self.subscribers = subs::all(&self.store).into_iter().collect();
@@ -970,6 +969,9 @@ impl Service {
                 if let Some(workspace) = data["workspace"].as_str() {
                     let workspace = PathBuf::from(workspace);
                     crate::snapshot::worked(&workspace);
+                    if let Some(record) = record {
+                        crate::snapshot::housed(bot, Some(&crate::snapshot::writable(record)));
+                    }
                     crate::snapshot::running(bot, Some(&workspace));
                     self.working.insert((bot.to_owned(), turn), workspace);
                 }
