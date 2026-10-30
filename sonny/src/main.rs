@@ -30,6 +30,7 @@ mod image;
 mod js;
 mod links;
 mod login;
+mod look;
 mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -724,8 +725,16 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "memory" => {
             // The person's words are read from the daemon, which only
             // Sonny reaches; the rest is memory's own.
-            if let Some(("said", since)) = rest.split_first().map(|(v, r)| (v.as_str(), r)) {
-                return std::process::ExitCode::from(said::cli(since) as u8);
+            match rest.split_first().map(|(v, r)| (v.as_str(), r)) {
+                Some(("said", since)) => {
+                    return std::process::ExitCode::from(said::cli(since) as u8);
+                }
+                // The person's words count as a change, so a night they
+                // wrote is cleaned up whether or not an agent saved.
+                Some(("changed", [])) => {
+                    return std::process::ExitCode::from(said::changed_cli() as u8);
+                }
+                _ => {}
             }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
@@ -1615,6 +1624,12 @@ struct App {
     live: Option<Live>,
     /// Whether the reply now ending arrived as deltas.
     streamed: bool,
+    /// The item of the turn's output now streaming: a later one is the
+    /// next message, drawn apart.
+    live_item: Option<u64>,
+    /// Items whose words were written when the next began, oldest first,
+    /// until their messages name their nodes.
+    ahead: std::collections::VecDeque<u64>,
     running: Option<Running>,
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
@@ -1659,6 +1674,9 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// The staged turns sent with Tab to run after the running one, which
+    /// they do not join.
+    queued: Vec<i64>,
     /// Pictures given with the message being written, each behind its
     /// placeholder in the composer: [`attach::placeholder`] of its place
     /// here, from 1.
@@ -2501,6 +2519,8 @@ impl App {
             height: 24,
             live: None,
             streamed: false,
+            live_item: None,
+            ahead: std::collections::VecDeque::new(),
             running: record["running_turn"].as_i64().map(|turn| Running {
                 turn,
                 started: Instant::now(),
@@ -2537,6 +2557,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            queued: Vec::new(),
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
@@ -2864,7 +2885,10 @@ impl App {
             self.shown.extend(user_shell::lines(&ran, self.prose()));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
-            match self.send(record.clone(), Some(SHELL), false, &[]).await {
+            match self
+                .send(record.clone(), Some(SHELL), false, false, &[])
+                .await
+            {
                 Ok(()) => self.ran_here.extend(user_shell::read(&record)),
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
@@ -3376,6 +3400,8 @@ impl App {
             self.write_words(live, Words::Reply);
         }
         self.streamed = false;
+        self.live_item = None;
+        self.ahead.clear();
         self.said.clear();
         self.replay = None;
         self.notice = Some("reconnecting to the daemon".into());
@@ -3943,7 +3969,7 @@ impl App {
                 return;
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
-            match self.send(answer, None, false, &[]).await {
+            match self.send(answer, None, false, false, &[]).await {
                 Ok(()) => {
                     self.notice = None;
                     self.asks.retain(|open| open.id != ask.id);
@@ -5013,8 +5039,8 @@ impl App {
         let mut rows: Vec<Line<'static>> = self
             .staged
             .iter()
-            .flat_map(|(_, prompt)| {
-                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
+            .flat_map(|(turn, prompt)| {
+                let mut shown: Vec<Line<'static>> = match user_shell::read(prompt) {
                     Some(ran) => user_shell::header(&ran.command, width, true),
                     None => {
                         // An answer shows as itself, under the question it answers.
@@ -5038,6 +5064,9 @@ impl App {
                             .collect()
                     }
                 };
+                if self.queued.contains(turn) {
+                    shown.push(Line::from("  queued for after this turn").dim().italic());
+                }
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -5132,6 +5161,35 @@ impl App {
                 live.closed = true;
             }
             self.live = Some(live);
+        }
+    }
+
+    /// The words streamed as `item` end where the next item begins: written
+    /// as a reply of their own, and found again once their message names
+    /// its node.
+    fn stream_ahead(&mut self, item: u64) {
+        let (drawn, spilled) = (
+            self.rows_drawn,
+            self.live.as_ref().is_some_and(|l| l.spilled),
+        );
+        self.end_live(Words::Reply);
+        if self.rows_drawn > drawn || spilled {
+            self.mark_last(screen::Mark::Tag(screen::Tag::Streamed(item)));
+        }
+        self.ahead.push_back(item);
+        self.said.clear();
+        self.replay = None;
+        self.streamed = false;
+    }
+
+    /// The words streamed as `item` are the message kept at `node`.
+    fn streamed_at(&mut self, item: u64, node: i64) {
+        let (from, to) = (screen::Tag::Streamed(item), screen::Tag::End(node));
+        match (self.marks.iter_mut()).find(|(_, mark)| *mark == screen::Mark::Tag(from)) {
+            Some((_, mark)) => *mark = screen::Mark::Tag(to),
+            None => {
+                self.screen.retag(from, to);
+            }
         }
     }
 
@@ -5257,6 +5315,8 @@ impl App {
             "accepted" => {
                 self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 self.end_live(Words::Reply);
+                self.live_item = None;
+                self.ahead.clear();
                 self.said.clear();
                 self.thought.clear();
                 self.replay = None;
@@ -5316,6 +5376,14 @@ impl App {
             }
             "text_delta" => {
                 self.thought.clear();
+                // Each item the bot streams is a message of its own, as
+                // Codex draws them.
+                if let Some(item) = event["item"].as_u64() {
+                    if self.live_item.is_some_and(|live| live != item) && self.streamed {
+                        self.stream_ahead(self.live_item.unwrap_or(item));
+                    }
+                    self.live_item = Some(item);
+                }
                 let mut delta = event["text"].as_str().unwrap_or("");
                 // A retried call streams its reply again from the start:
                 // what was already shown is not shown twice.
@@ -5384,6 +5452,14 @@ impl App {
                         self.saw_reply(node, &text(item));
                     }
                 }
+                // Words written when the next item began are this message.
+                if let (Some(item), Some(node)) = (&item, data["node"].as_i64())
+                    && !text(item).is_empty()
+                    && let Some(streamed) = self.ahead.pop_front()
+                {
+                    self.streamed_at(streamed, node);
+                    return;
+                }
                 let said = std::mem::take(&mut self.said);
                 self.replay = None;
                 if self.streamed {
@@ -5441,6 +5517,18 @@ impl App {
                 self.notice = Some("at the round limit: this reply ends the turn".into())
             }
             "retry" => {
+                // Messages written as the next began may come again, or
+                // not: what was shown stays, and the call's own is drawn.
+                // The retry numbers its items afresh, so its first is still
+                // the message being streamed.
+                self.live_item = None;
+                if !self.ahead.is_empty() {
+                    self.end_live(Words::Reply);
+                    self.ahead.clear();
+                    self.streamed = false;
+                    self.said.clear();
+                    self.notice = Some("the model retried; its reply may repeat".into());
+                }
                 if !self.said.is_empty() {
                     self.replay = Some(std::mem::take(&mut self.said));
                 }
@@ -7335,8 +7423,8 @@ impl App {
                         self.approve_shown = None;
                         if at < self.denials.len() {
                             let denied = self.denials.remove(at);
-                            self.notice =
-                                Some(match self.send(approval(&denied), None, false, &[]).await {
+                            self.notice = Some(
+                                match self.send(approval(&denied), None, false, false, &[]).await {
                                     Ok(()) => {
                                         "approved one retry; the retry is still reviewed".into()
                                     }
@@ -7344,7 +7432,8 @@ impl App {
                                         self.denials.insert(at, denied);
                                         error
                                     }
-                                });
+                                },
+                            );
                         }
                     }
                     KeyCode::Esc => {
@@ -7566,6 +7655,9 @@ impl App {
                         self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
+                    // Tab sends it to run once the running turn ends, as
+                    // Codex queues; Enter steers.
+                    KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
                     KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
                     KeyCode::Esc => {
                         if let Some(shell) = &self.shell {
@@ -7595,6 +7687,12 @@ impl App {
     }
 
     async fn submit(&mut self) {
+        self.submit_as(false).await
+    }
+
+    /// Send what is written: a message to a busy bot joins its running
+    /// turn, or with `queue` runs after it.
+    async fn submit_as(&mut self, queue: bool) {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
             return;
@@ -7858,10 +7956,13 @@ impl App {
         // Words are a message, whatever reply `/react` picked.
         self.react_to = None;
         // What the person ran and the agent could not be given yet goes
-        // first, each on its own, and this message joins the turn they start.
+        // first, each on its own, and this message joins the turn they start;
+        // queued, each waits its turn too.
         let mut join = false;
         while let Some(record) = self.unsent.first().cloned() {
-            if let Err(error) = self.send(record.clone(), Some(SHELL), join, &[]).await {
+            if let Err(error) =
+                (self.send(record.clone(), Some(SHELL), join && !queue, queue, &[])).await
+            {
                 self.notice = Some(error);
                 return;
             }
@@ -7870,7 +7971,10 @@ impl App {
             join = true;
         }
         let pictures = self.placed(&prompt);
-        match self.send(prompt, None, join, &pictures).await {
+        match self
+            .send(prompt, None, join && !queue, queue, &pictures)
+            .await
+        {
             Ok(()) => {
                 self.input.clear();
                 self.notice = None;
@@ -7903,24 +8007,27 @@ impl App {
     }
 
     /// Send `prompt`: a turn of its own, or a steer of the running one (or
-    /// of the one just started, `join`); staged until it lands. `origin`
-    /// names what sent it when the person's words did not.
+    /// of the one just started, `join`), or with `queue` a turn after
+    /// whatever runs; staged until it lands. `origin` names what sent it
+    /// when the person's words did not.
     async fn send(
         &mut self,
         prompt: String,
         origin: Option<&str>,
         join: bool,
+        queue: bool,
         pictures: &[attach::Picture],
     ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
-        let delivery = (join || self.running.is_some()).then_some("steer");
-        let model = delivery
-            .is_none()
-            .then(|| self.turn_model.clone())
-            .flatten();
+        let delivery = match queue {
+            true => Some("queue"),
+            false => (join || self.running.is_some()).then_some("steer"),
+        };
+        let steer = delivery == Some("steer");
+        let model = (!steer).then(|| self.turn_model.clone()).flatten();
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
-        let workspace = delivery.is_none().then(|| self.move_to.clone()).flatten();
+        let workspace = (!steer).then(|| self.move_to.clone()).flatten();
         let reply = self
             .client
             .request(
@@ -7940,13 +8047,19 @@ impl App {
             // person's is the turn it joins: the running one, or the one the
             // message before it started.
             if origin.is_none() {
-                self.yours = match delivery {
-                    None => Some(turn),
-                    Some(_) => (self.running.as_ref().map(|r| r.turn))
+                self.yours = match steer {
+                    false => Some(turn),
+                    true => (self.running.as_ref().map(|r| r.turn))
                         .or_else(|| self.staged.last().map(|(started, _)| *started)),
                 };
             }
             self.staged.push((turn, prompt));
+            let staged = &self.staged;
+            self.queued
+                .retain(|queued| staged.iter().any(|(turn, _)| turn == queued));
+            if queue {
+                self.queued.push(turn);
+            }
         }
         if workspace.is_some() {
             self.move_to = None;
@@ -8898,8 +9011,10 @@ impl App {
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
+        let look = look::Look::now();
         terminal.draw(|frame| {
             paint(frame);
+            look.finish(frame.buffer_mut());
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
         })?;
@@ -8907,6 +9022,7 @@ impl App {
         self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
+            linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
             execute!(
                 terminal.backend_mut(),
                 ratatui::crossterm::cursor::SavePosition
@@ -9043,9 +9159,14 @@ impl App {
         if let Some(running) = &self.running {
             let mut spans = vec![Span::raw("• ").dim()];
             spans.extend(shimmer(&running.phase, self.started.elapsed()));
+            // What is written steers it on Enter; Tab keeps it for after.
+            let queues = match self.input.trim().is_empty() {
+                true => "",
+                false => " • tab to queue",
+            };
             spans.push(
                 Span::raw(format!(
-                    " ({} • esc to interrupt)",
+                    " ({} • esc to interrupt{queues})",
                     transcript::elapsed(running.started.elapsed().as_secs())
                 ))
                 .dim(),
@@ -9053,7 +9174,7 @@ impl App {
             return Line::from(spans);
         }
         match &self.notice {
-            Some(notice) => Line::from(Span::raw(notice.clone()).fg(Color::Yellow)),
+            Some(notice) => Line::from(Span::raw(notice.clone())),
             None if self.input.starts_with('!') => Line::from(vec![
                 Span::raw("! ").bold().fg(Color::Magenta),
                 Span::raw(format!(
@@ -9348,10 +9469,7 @@ const INLINE_ROWS: usize = 40;
 /// margin when it is `beside` the conversation, else the note's own head
 /// over its rows.
 fn note_marker(title: String, beside: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw("  ✎ ").fg(Color::Yellow).dim(),
-        Span::raw(title).dim().underlined(),
-    ];
+    let mut spans = vec![Span::raw("  ✎ ").dim(), Span::raw(title).dim().underlined()];
     if beside {
         spans.push(Span::raw(" · in the margin").dim());
     }
@@ -9780,6 +9898,39 @@ mod tests {
                     "project": null}]})
         );
         std::fs::remove_dir_all(shop).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_night_the_person_wrote_is_cleaned_up_though_no_agent_saved() {
+        let home = std::env::temp_dir().join(format!("said-changed-{}", std::process::id()));
+        let root = home.join(".agents/memory");
+        std::fs::create_dir_all(&root).unwrap();
+        // The last cleanup started at 1000; nothing was saved since.
+        std::fs::write(root.join(".said"), "1000").unwrap();
+        let answering = |text: &'static str| {
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "turns" => json!({"turns": [
+                    {"turn": 2, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
+                    "history_nodes" => {
+                        json!({"nodes": [{"node": 5, "turn": 2}], "next_from": null})
+                    }
+                    "history_items" => json!({"items": [{"node": 5, "item": {"type": "message",
+                    "role": "user", "content": [{"type": "input_text", "text": text}]},
+                    "origin": if text.is_empty() { json!("trigger") } else { Value::Null }}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+        };
+        let wrote = answering("I keep forgetting to rebase.").await;
+        let done = said::changed_on(&home, &home, async { Ok::<_, String>(wrote) }).await;
+        assert_eq!(done, Ok(json!({"changed": true, "said": true})));
+        // Only a trigger's words since: nothing to clean up.
+        let quiet = answering("").await;
+        let done = said::changed_on(&home, &home, async { Ok::<_, String>(quiet) }).await;
+        assert!(done.unwrap_err().starts_with("unchanged: "));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
@@ -10511,6 +10662,128 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn each_message_a_call_streams_is_drawn_apart_and_found_by_its_node() {
+        let client = daemon_with(json!({
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Let me check the file."}]},
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "It is fine."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        for (item, text) in [
+            (1, "Let me check"),
+            (1, " the file."),
+            (2, "It is"),
+            (2, " fine."),
+        ] {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            app.daemon(delta).await;
+        }
+        let drawn = |app: &mut App| -> Vec<String> {
+            let open = app.open_rows(80);
+            (app.pending.iter().chain(&open))
+                .map(|line| line.to_string())
+                .collect()
+        };
+        let rows = |drawn: &[String], text: &str| drawn.iter().filter(|l| l.contains(text)).count();
+        // Apart while they stream, and as they were kept.
+        for at in [None, Some(2), Some(3)] {
+            if let Some(node) = at {
+                app.daemon(event("message", json!({"node": node}))).await;
+            }
+            let drawn = drawn(&mut app);
+            assert_eq!(
+                [
+                    rows(&drawn, "Let me check the file."),
+                    rows(&drawn, "It is fine."),
+                    rows(&drawn, "Let me check"),
+                ],
+                [1, 1, 1],
+                "{drawn:?}"
+            );
+        }
+        // Reactions find each message by its node.
+        assert!(app.kept(screen::Tag::End(2)));
+        assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_call_retried_after_two_messages_draws_what_it_kept() {
+        let client = daemon_with(json!({
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "All good."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        app.daemon(said(1, "Let me check the file.")).await;
+        app.daemon(said(2, "It is")).await;
+        // The call failed; its retry keeps one message, unlike the first.
+        app.daemon(event("retry", json!({"error": "provider_http_529"})))
+            .await;
+        app.daemon(said(1, "All good.")).await;
+        app.daemon(event("message", json!({"node": 2}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("All good.")).count(),
+            1,
+            "{drawn:?}"
+        );
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("retried")));
+        assert!(app.ahead.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_message_streams_under_another_item_draws_it_once() {
+        let client = daemon_with(json!({
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "All good."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        app.daemon(said(1, "All good.")).await;
+        // The retry thinks first, so its message is the call's second item.
+        app.daemon(event("retry", json!({"error": "provider_http_529"})))
+            .await;
+        app.daemon(said(2, "All good.")).await;
+        app.daemon(event("message", json!({"node": 3}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("All good.")).count(),
+            1,
+            "{drawn:?}"
+        );
+        assert!(app.ahead.is_empty());
+        assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
     #[test]
     fn the_status_row_names_what_the_model_is_thinking_about() {
         assert_eq!(heading(""), None);
@@ -11085,6 +11358,64 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn tab_queues_a_message_for_after_the_running_turn() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            let mut sent = seen.lock().unwrap();
+            sent.push(asked.clone());
+            json!({"turn": 1 + sent.len()})
+        })
+        .await;
+        let mut app = app(client);
+        app.move_to = Some("/moved".into());
+        let tab = || Event::Key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Idle, Tab sends nothing: Enter starts a turn.
+        app.input.set("first");
+        app.key(tab()).await;
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.input.trim(), "first");
+        app.input.clear();
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+        });
+        app.yours = Some(1);
+        assert!(!app.status_line().to_string().contains("tab to queue"));
+        app.input.set("after this");
+        assert!(app.status_line().to_string().contains("tab to queue"));
+        app.key(tab()).await;
+        assert!(app.input.is_empty());
+        // A turn of its own, once the running one ends: it may move the
+        // lead, and it is the person's.
+        let queued = sent.lock().unwrap()[0].clone();
+        assert_eq!(queued["delivery"], "queue");
+        assert_eq!(queued["prompt"], "after this");
+        assert_eq!(queued["workspace"], "/moved");
+        assert!(app.move_to.is_none());
+        assert_eq!(app.yours, Some(2));
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            staged,
+            ["", "› after this", "  queued for after this turn", ""]
+        );
+        // Enter still steers.
+        app.input.set("now");
+        app.key(enter()).await;
+        let steer = sent.lock().unwrap()[1].clone();
+        assert_eq!(steer["delivery"], "steer");
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(staged[3..], ["", "› now", ""]);
+        // Once its turn starts it is no longer waiting.
+        app.daemon(turn_event("turn_finished", 3, json!({}))).await;
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        assert!(app.staged.is_empty());
     }
 
     #[tokio::test]

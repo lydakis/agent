@@ -1024,9 +1024,9 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
     let gap = width.saturating_sub(used + right.width()).max(1);
     let up = (used + gap) as u16;
     let line = Line::from(vec![
-        Span::raw(" ✎ ").fg(Color::Yellow),
+        Span::raw(" ✎ ").dim(),
         Span::raw(title).bold(),
-        Span::raw(tail).fg(Color::Green),
+        Span::raw(tail).fg(Color::Cyan),
         Span::raw(" ".repeat(gap)),
         Span::raw("↑").dim(),
         Span::raw("  "),

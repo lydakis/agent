@@ -8,7 +8,7 @@
 use crate::{lookout, trigger};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    style::{Color, Stylize},
+    style::Stylize,
     text::{Line, Span},
 };
 use serde_json::Value;
@@ -366,12 +366,12 @@ impl View {
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         let pick = match picked {
-            true => Span::raw("›").fg(Color::Cyan).bold(),
+            true => Span::raw("›").bold(),
             false => Span::raw(" "),
         };
         let mark = match item.kind {
-            Kind::Trigger => Span::raw("↻ ").fg(Color::Cyan),
-            Kind::Subscription => Span::raw("◎ ").fg(Color::Magenta),
+            Kind::Trigger => Span::raw("↻ ").dim(),
+            Kind::Subscription => Span::raw("◎ ").dim(),
         };
         let name = match picked {
             true => Span::raw(item.name.clone()).bold().reversed(),
@@ -420,12 +420,12 @@ impl View {
     /// the keys the picked row takes.
     pub fn footer(&self) -> Line<'static> {
         if let Some(notice) = &self.notice {
-            return Line::from(format!("  {notice}")).fg(Color::Yellow);
+            return Line::from(format!("  {notice}"));
         }
         if let Some((_, _, name)) = &self.confirm {
             return Line::from(vec![
-                Span::raw("  d again removes ").fg(Color::Yellow),
-                Span::raw(name.clone()).bold().fg(Color::Yellow),
+                Span::raw("  d again removes "),
+                Span::raw(name.clone()).bold(),
                 Span::raw(" · any other key keeps it").dim(),
             ]);
         }

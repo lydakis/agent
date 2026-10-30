@@ -1,7 +1,8 @@
 //! What the terminal can do, asked at start: its background (OSC 11, or
 //! the colour scheme it reports, mode 2031), so tints read on light and
-//! dark; whether it draws Kitty graphics; and its cell size in pixels, so
-//! an image fills whole cells. A terminal that follows the Mac's light and
+//! dark; its theme's foreground, red and green (OSC 10 and 4), which
+//! Sonny's own grays and tints start from; whether it draws Kitty
+//! graphics; and its cell size in pixels, so an image fills whole cells. A terminal that follows the Mac's light and
 //! dark appearance (Rex does) is followed as it switches.
 use std::{
     io::Write,
@@ -22,6 +23,28 @@ static PROBE: OnceLock<Probe> = OnceLock::new();
 static LIGHT: AtomicBool = AtomicBool::new(true);
 /// The background changed since [`switched`] was last asked.
 static SWITCHED: AtomicBool = AtomicBool::new(false);
+static THEME: OnceLock<Theme> = OnceLock::new();
+/// The theme changed since it was asked, so its colors are not known.
+static STALE: AtomicBool = AtomicBool::new(false);
+
+pub type Rgb = (u8, u8, u8);
+
+/// The theme's own colors, each as the terminal answered at start; none
+/// it did not answer, and none at all once the theme has switched.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Theme {
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub red: Option<Rgb>,
+    pub green: Option<Rgb>,
+}
+
+pub fn theme() -> Theme {
+    match STALE.load(Ordering::Relaxed) {
+        true => Theme::default(),
+        false => THEME.get().copied().unwrap_or_default(),
+    }
+}
 
 pub fn light() -> bool {
     LIGHT.load(Ordering::Relaxed)
@@ -77,6 +100,7 @@ pub async fn laid_out() {
 pub fn detect() {
     let reply = query().unwrap_or_default();
     let mac = appearance();
+    let _ = THEME.set(answered(&reply));
     let light = parse(&reply)
         .map(|rgb| luminance(rgb) > 0.5)
         .or_else(|| scheme(&reply))
@@ -97,6 +121,7 @@ pub fn detect() {
                 if let Some(now) = appearance()
                     && LIGHT.swap(now, Ordering::Relaxed) != now
                 {
+                    STALE.store(true, Ordering::Relaxed);
                     SWITCHED.store(true, Ordering::Relaxed);
                 }
             }
@@ -133,13 +158,15 @@ fn colorfgbg() -> Option<bool> {
     Some(matches!(background, 7 | 15))
 }
 
-/// OSC 11, a Kitty graphics query and the cell size, then DA1, which every
-/// terminal answers, so the wait ends as soon as the rest is in.
+/// OSC 11 and 10, red and green (OSC 4), a Kitty graphics query and the
+/// cell size, then DA1, which every terminal answers, so the wait ends as
+/// soon as the rest is in.
 fn query() -> Option<String> {
     let mut stdout = std::io::stdout();
     write!(
         stdout,
-        "\x1b]11;?\x1b\\\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?996n\x1b[c"
+        "\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\
+         \x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[?996n\x1b[c"
     )
     .ok()?;
     stdout.flush().ok()?;
@@ -192,7 +219,28 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` (each 1 to 4 hex digits) as 0..1.
 fn parse(reply: &str) -> Option<(f32, f32, f32)> {
-    let rgb = reply.split("]11;rgb:").nth(1)?;
+    color(reply, "]11;")
+}
+
+/// The colors the reply names.
+fn answered(reply: &str) -> Theme {
+    let rgb = |answer: &str| {
+        color(reply, answer).map(|(r, g, b)| {
+            let byte = |v: f32| (v * 255.0).round() as u8;
+            (byte(r), byte(g), byte(b))
+        })
+    };
+    Theme {
+        foreground: rgb("]10;"),
+        background: rgb("]11;"),
+        red: rgb("]4;1;"),
+        green: rgb("]4;2;"),
+    }
+}
+
+/// The color an OSC answer starting `answer` names, as 0..1.
+fn color(reply: &str, answer: &str) -> Option<(f32, f32, f32)> {
+    let rgb = reply.split(answer).nth(1)?.strip_prefix("rgb:")?;
     let mut parts = rgb.split('/').map(|part| {
         let hex: String = part.chars().take_while(char::is_ascii_hexdigit).collect();
         let max = (16u32.pow(hex.len() as u32) - 1) as f32;
@@ -238,6 +286,17 @@ mod tests {
         let dark = parse("\x1b]11;rgb:1e/1e/2e\x07").unwrap();
         assert!(luminance(dark) < 0.5);
         assert!(parse("\x1b[?62;22c").is_none());
+        let reply = "\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\x1b]10;rgb:cd/d6/f4\x07\
+                     \x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\\x1b[?62;22c";
+        assert_eq!(
+            answered(reply),
+            Theme {
+                foreground: Some((0xcd, 0xd6, 0xf4)),
+                background: Some((0x1e, 0x1e, 0x2e)),
+                red: Some((0xf3, 0x8b, 0xa8)),
+                green: None,
+            }
+        );
         assert_eq!(
             cell_size("\x1b_Gi=31;OK\x1b\\\x1b[6;18;9t\x1b[?62;22c"),
             Some((9, 18))
