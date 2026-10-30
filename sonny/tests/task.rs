@@ -594,6 +594,21 @@ fn a_fork_whose_snapshot_names_a_folder_above_its_worktree_starts_nothing() {
     let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
         "workspace": source.join("src")}]);
     std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    // Hooks of a folder a task could write, which making the fork's branch
+    // and taking it back would run.
+    let (hooks, ran) = (lab.scratch.join("hooks"), lab.scratch.join("hooked"));
+    std::fs::create_dir(&hooks).unwrap();
+    for hook in ["reference-transaction", "post-checkout"] {
+        let hook = hooks.join(hook);
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let set = (std::process::Command::new("git").arg("-C").arg(&lab.repo))
+        .args(["config", "core.hooksPath"])
+        .arg(&hooks)
+        .status();
+    assert!(set.unwrap().success());
     let (ok, err) = lab.tool(
         &lab.repo.join("src"),
         "start_task",
@@ -603,6 +618,7 @@ fn a_fork_whose_snapshot_names_a_folder_above_its_worktree_starts_nothing() {
     assert!(!ok && err.contains("not a folder inside it"), "{err}");
     assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
     assert!(!lab.scratch.join("run.log.fork").exists());
+    assert!(!ran.exists());
 }
 
 #[test]

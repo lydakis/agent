@@ -702,12 +702,24 @@ pub fn restore(
         // Nothing is left half made, for a later task of the name to take
         // as its own: the worktree goes, with whatever it was given, and
         // its branch.
-        let remove = ["worktree", "remove", "--force", "--force", &target];
-        let _ = git(here, &remove, None, None);
-        let _ = git(here, &["branch", "-D", branch], None, None);
+        unwind(here, path, branch);
         return Err(error);
     }
     Ok(())
+}
+
+/// Take away the worktree at `path` of the repository `here` is in, and
+/// its branch, as git's run here does: so no hook or program of the
+/// folder's config runs, as it would where a task wrote it.
+pub(crate) fn unwind(here: &Path, path: &Path, branch: &str) {
+    let path = path.to_string_lossy();
+    let _ = git(
+        here,
+        &["worktree", "remove", "--force", "--force", &path],
+        None,
+        None,
+    );
+    let _ = git(here, &["branch", "-D", branch], None, None);
 }
 
 /// Drop bot `bot_id`'s snapshots in the repository `dir` is in; git's own

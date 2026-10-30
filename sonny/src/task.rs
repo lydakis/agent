@@ -956,11 +956,7 @@ fn listed(agent: &Path, name: &str) -> bool {
 fn undo(undo: &Undo) {
     match undo {
         Undo::Nothing => {}
-        Undo::Worktree { here, path, branch } => {
-            let path = path.to_string_lossy();
-            let _ = git(here, &["worktree", "remove", "--force", &path]);
-            let _ = git(here, &["branch", "-D", branch]);
-        }
+        Undo::Worktree { here, path, branch } => crate::snapshot::unwind(here, path, branch),
         Undo::Folder { path, record } => {
             let _ = std::fs::remove_dir_all(path);
             let _ = std::fs::remove_file(record);
