@@ -274,6 +274,35 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'memory', {'save': dict(fact, name='x', type='mood')}))
         self.assertEqual(refused['error'], 'memory_refused')
 
+    def test_agents_share_a_thread_in_the_commons_and_hear_of_replies(self):
+        for bot in ('calc.a', 'shop.b'):
+            self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
+                                instructions='Agent.', declare=[declared('commons')])
+        self.lookout()
+        scripts = {}
+
+        def turn(bot, arguments):
+            # The script runs on from the calls this bot's earlier turns made.
+            self.script = scripts.setdefault(bot, [])
+            return json.loads(self.call(bot, 'commons', arguments))
+
+        post = {'name': 'fake-home', 'title': 'Live tests want a fake HOME', 'text': 'For both binaries.'}
+        self.assertEqual(turn('calc.a', {'post': post})['posts'], 1)
+        replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
+        self.assertEqual((replied['posts'], replied['told']), (2, ['calc.a']), replied)
+        thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
+        self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
+        # The reply joins calc.a's next model call, and starts no turn.
+        turns = self.daemon.request('turns', bot='calc.a')['result']['turns']
+        self.assertEqual([t['status'] for t in turns], ['completed', 'attached'], turns)
+        self.model.bodies = []
+        turn_id = self.daemon.request('submit', bot='calc.a', request_id='next', prompt='hello')['result']['turn']
+        self.assertEqual(self.daemon.finished(turn_id)['data']['status'], 'completed')
+        sent = b''.join(self.model.bodies)
+        self.assertIn(b'shop.b replied in the commons thread fake-home', sent)
+        listed = turn('shop.b', {})
+        self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
+
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'
         (ws / '.agents').mkdir(parents=True)
