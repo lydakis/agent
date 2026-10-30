@@ -9271,7 +9271,9 @@ impl App {
                     Span::raw("  effort ").dim(),
                     Span::raw(format!("‹ {effort} ›")).bold(),
                 ];
-                keys.extend(hint::spans("  ↑↓ pick · ←→ effort · enter switch · esc close"));
+                keys.extend(hint::spans(
+                    "  ↑↓ pick · ←→ effort · enter switch · esc close",
+                ));
                 let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
@@ -9488,10 +9490,18 @@ impl App {
             None => self.agents(),
         };
         let mut counted = Vec::new();
-        for (n, color) in [(working, Color::Cyan), (waiting, Color::Yellow)] {
+        // Marks as the roster and /status draw them, each with its word,
+        // so the counts read without colour; what needs you first.
+        for (n, sign, color, word) in [
+            (waiting, "?", Color::Yellow, "needs you"),
+            (working, "●", Color::Cyan, "working"),
+        ] {
             if n > 0 {
-                counted.push(Span::raw("●").fg(color));
-                counted.push(Span::raw(format!(" {n} ")));
+                if !counted.is_empty() {
+                    counted.push(Span::raw("· ").dim());
+                }
+                counted.push(Span::raw(sign).fg(color));
+                counted.push(Span::raw(format!(" {n} {word} ")));
             }
         }
         let counted_width = (counted.iter())
@@ -12142,7 +12152,7 @@ mod tests {
         start(&mut app, "add");
         start(&mut app, "neg");
         let rows = drawn(&mut app);
-        assert_eq!(rows[0], "◆ Started 2 tasks · click one to open it");
+        assert_eq!(rows[0], "• Started 2 tasks · click one to open it");
         assert_eq!(rows[1], "  ○ add  starting  Fix add");
         // What each does is read, and drawn where they are.
         app.read_tasks().await;
@@ -12446,7 +12456,7 @@ mod tests {
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
         app.commit_call("c", served::START, &arguments, "turn:calc.ask/1", false);
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ● ask  needs you  Fix ask");
+        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks().await;
@@ -12584,16 +12594,16 @@ mod tests {
             .skip(counter.start as usize)
             .take(counter.len())
             .collect();
-        assert_eq!(shown, "● 2 ● 2");
-        assert!(text.contains("● 2 ● 2 · b"), "{text}");
+        assert_eq!(shown, "? 2 needs you · ● 2 working");
+        assert!(text.contains("? 2 needs you · ● 2 working · b"), "{text}");
         assert_eq!(text.width(), 100);
-        // Its colors as a roster's: cyan at work, yellow for what needs
-        // the person.
-        let dots: Vec<_> = (line.spans.iter())
-            .filter(|span| span.content == "●")
+        // Its marks and colors as a roster's: yellow ? for what needs the
+        // person, cyan ● at work.
+        let marks: Vec<_> = (line.spans.iter())
+            .filter(|span| span.content == "●" || span.content == "?")
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(dots, [Some(Color::Cyan), Some(Color::Yellow)]);
+        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
         app.counter_at = Some((20, 10 + counter.start..10 + counter.end));
         let click = |column| {
             Event::Mouse(MouseEvent {
@@ -12860,7 +12870,10 @@ mod tests {
         app.close_pane(false);
         app.key(key('w')).await;
         app.key(key('?')).await;
-        assert_eq!(&*app.input, "w?", "typed after a word, it is a question mark");
+        assert_eq!(
+            &*app.input, "w?",
+            "typed after a word, it is a question mark"
+        );
     }
 
     #[tokio::test]

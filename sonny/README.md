@@ -477,7 +477,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   approval, asking you a question, or failed),
   **Working** (a turn running, queued, rate limited or waiting on other
   tasks), **Ready for review** (finished, its last reply linking a pull
-  request), **Idle** (finished or stopped with nothing open), and
+  request), **Done** (finished or stopped with nothing open), and
   **Resolved**, only counted until `r` shows them. As threads in a
   claude.ai project do, a task resolves itself with the `resolve_task`
   tool once nothing is left to do in it, such as when its pull request
@@ -623,7 +623,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Idle and the resolved count](../docs/sonny/status-groups.png)
+![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Done and the resolved count](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
@@ -813,8 +813,9 @@ first row is a glance at what runs for the agent: a red `✗` for what
 failed in the background and `↻` for its triggers and subscriptions (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
-it shows. Under the composer, the footer counts the other agents at work
-(cyan `●`) and what needs you (yellow `●`), and a click on the count
+it shows. Under the composer, the footer counts what needs you and the
+other agents at work, each with its word (`? 1 needs you · ● 2 working`),
+marked as the roster and `/status` mark them, and a click on the count
 opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
