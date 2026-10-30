@@ -91,12 +91,20 @@ of it ends `tool_unserved`, run the same command with
      sent, not what others sent them, and save nothing about other
      people. Read only: send, reply, mark or move nothing there. A fact
      saved after reading them is marked `external`, as any is; keep it.
+   - When a server you meant to read fails, as when its sign-in expired,
+     save or update a `reference` fact named `unreadable-SERVER` with the
+     error and since when, and remove it the night that server reads
+     again. Then skip step 6 tonight, unless `since_ms` is more than three
+     days old: memory stays as you leave it, and the next night starts
+     from the same `since_ms` and reads what was missed. Habits keep their
+     dates, so a night read twice counts nothing twice.
 6. Call it with `cleanup` `finish`. It commits the cleanup, or
    refuses with `loss_guard` and puts memory back when the cleanup removed
    more than a quarter of the facts (two at least). A refusal means you
    removed too much: do not try again tonight.
 7. Reply with one line per change: what you saved, merged, removed or
-   re-dated, and why. Reply `No changes.` when there were none.
+   re-dated, and why, and a line for each server you could not read.
+   Reply `No changes.` when there were none.
 
 ## Do not
 

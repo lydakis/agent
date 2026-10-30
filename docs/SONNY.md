@@ -429,7 +429,10 @@ so a later lead names the pattern rather than the instance, and removes it
 when their words show it stopped. It also saves how they took what an
 agent did unasked, which is how far leads go on their own. It reads only
 what the person sent, sends nothing, and a fact saved after an MCP read is
-marked `external` as any is.
+marked `external` as any is. A server it cannot read, as one whose sign-in
+expired, gets an `unreadable-SERVER` fact, and that night is left
+unfinished, so the next one reads from the same time and catches up; after
+three days it finishes without it.
 
 `read` gives one fact's whole file as `text` and records the read in the
 folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
