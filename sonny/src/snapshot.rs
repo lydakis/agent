@@ -97,19 +97,19 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
         "--path-format=absolute",
         "--git-path",
         "objects",
-        "--git-path",
-        "index",
-        "--git-path",
-        "info/exclude",
-        "--git-path",
-        "info/attributes",
+        "--git-dir",
+        "--git-common-dir",
         "--show-object-format",
     ];
     let listed = git(work, &args, None, None)?;
-    let [objects, index, exclude, attributes, format] = listed.lines().collect::<Vec<_>>()[..]
-    else {
+    let [objects, gitdir, common, format] = listed.lines().collect::<Vec<_>>()[..] else {
         return Err("git rev-parse: an answer of another shape".into());
     };
+    // Named here, not by git, which would give where a link leads.
+    let (gitdir, common) = (Path::new(gitdir), Path::new(common));
+    let index = gitdir.join("index");
+    let exclude = common.join("info/exclude");
+    let attributes = common.join("info/attributes");
     let repository = match format {
         "sha1" => "[core]\n\trepositoryformatversion = 0\n",
         "sha256" => {
@@ -170,26 +170,52 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
         std::fs::create_dir(at.join("info"))?;
         let head = head.map_or("ref: refs/heads/none".to_owned(), str::to_owned);
         std::fs::write(at.join("HEAD"), format!("{head}\n"))?;
-        std::fs::write(at.join("config"), repository)?;
-        // The repository's own ignores and attributes: what to leave out,
-        // and how to convert what is kept. An attribute naming a filter
-        // names none the sealed folder has.
-        for (from, to) in [(exclude, "info/exclude"), (attributes, "info/attributes")] {
-            match std::fs::copy(from, at.join(to)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-        }
-        Ok(())
+        std::fs::write(at.join("config"), repository)
     })();
     made.map_err(|e| format!("{}: {e}", at.display()))?;
+    // The repository's own ignores and attributes: what to leave out, and
+    // how to convert what is kept. An attribute naming a filter names none
+    // the sealed folder has.
+    for (from, to) in [(exclude, "info/exclude"), (attributes, "info/attributes")] {
+        copy_plain(&from, &at.join(to))?;
+    }
     Ok(Sealed {
         dir: at.to_owned(),
         work: work.to_owned(),
         objects: PathBuf::from(objects),
-        index: PathBuf::from(index),
+        index,
         settings,
     })
+}
+
+/// Copy the file `from`, in a git folder a task may write, to `to`, made
+/// anew; whether there was one. Only a plain file, opened without following
+/// a link, in a folder that is no link: a link to a file of the lookout's
+/// own, its environment say, would put it where a task could read it.
+fn copy_plain(from: &Path, to: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let failed = |e: std::io::Error| format!("{}: {e}", from.display());
+    let parent = from.parent().map(std::fs::symlink_metadata);
+    if parent
+        .as_ref()
+        .is_some_and(|found| found.as_ref().is_ok_and(|up| !up.is_dir()))
+    {
+        return Err(format!("{}: not a folder", from.display()));
+    }
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(from);
+    let mut theirs = match opened {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        opened => opened.map_err(failed)?,
+    };
+    if !theirs.metadata().map_err(failed)?.is_file() {
+        return Err(format!("{}: not a plain file", from.display()));
+    }
+    let mut ours = std::fs::File::create_new(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    std::io::copy(&mut theirs, &mut ours).map_err(failed)?;
+    Ok(true)
 }
 
 /// git on the files of the checkout `sealed` is for, reading no config
@@ -307,15 +333,15 @@ pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
         _ => {}
     }
-    if let Ok(mut theirs) = std::fs::File::open(&sealed.index) {
-        let mut ours = std::fs::File::create_new(&index).map_err(|e| e.to_string())?;
-        std::io::copy(&mut theirs, &mut ours).map_err(|e| e.to_string())?;
+    if copy_plain(&sealed.index, &index)? {
         // A split index keeps most of its entries in a shared index beside
         // it, where the sealed git folder looks.
         let args = ["rev-parse", "--shared-index-path"];
         let shared = git(&top, &args, Some(&index), None)?;
         if let Some(name) = Path::new(&shared).file_name() {
-            std::fs::copy(top.join(&shared), sealed.dir.join(name)).map_err(|e| e.to_string())?;
+            if !copy_plain(&top.join(&shared), &sealed.dir.join(name))? {
+                return Err(format!("{shared}: no such shared index"));
+            }
         }
         // A file marked as not changing would keep its old content.
         let listed = self::sealed(&sealed, &["ls-files", "-v", "-z"], &index, None)?;
@@ -955,6 +981,28 @@ mod tests {
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_link_in_the_git_folder_is_never_followed() {
+        for name in ["info/exclude", "info/attributes", "index"] {
+            let (dir, top) = repo("linked");
+            let secret = dir.join("secret");
+            std::fs::write(&secret, "KEY=hidden\n").unwrap();
+            let link = top.join(".git").join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let indexes = top.with_extension("indexes");
+            assert!(stage(&top, &indexes).is_err(), "{name}");
+            let found = Command::new("grep")
+                .args(["-rq", "hidden"])
+                .arg(&indexes)
+                .status()
+                .unwrap();
+            assert!(!found.success(), "{name}");
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_dir_all(indexes);
+        }
     }
 
     #[test]
