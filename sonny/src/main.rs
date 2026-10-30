@@ -6297,6 +6297,15 @@ impl App {
                 items = read(&self.turns);
             }
         }
+        // A trigger that ended goes once its last turn did well, also one
+        // that ended after its turn did, as a `--reply-to` fire passing on
+        // the answer.
+        if !self.turns.is_empty()
+            && let (Some(store), Ok(places)) = (self.client.store(), trigger::Places::home())
+            && trigger::forget_done(&places, store, &self.turns) > 0
+        {
+            items = read(&self.turns);
+        }
         let fired: std::collections::HashSet<&String> =
             items.iter().filter_map(|i| i.handle.as_ref()).collect();
         self.turns.retain(|handle, _| fired.contains(handle));

@@ -670,6 +670,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 for row in rows {
                     crate::trigger::with_turn(row, &ended);
                 }
+                if let (Some(store), Ok(places)) = (client.store(), crate::trigger::Places::home())
+                {
+                    crate::trigger::forget_done(&places, store, &ended);
+                }
                 client.close().await;
             }
             Ok(said.to_string())
