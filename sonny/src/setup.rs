@@ -515,7 +515,8 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
                 if key_stdin {
                     // Typed or pasted at a terminal, the key is not shown.
                     let key = match std::io::stdin().is_terminal() {
-                        true => secret(&format!("{name} key: "))?,
+                        // On stderr, so stdout keeps `--json`'s one value.
+                        true => masked(&format!("{name} key: "), &mut std::io::stderr())?,
                         false => {
                             let mut key = String::new();
                             std::io::stdin()
@@ -1117,8 +1118,13 @@ pub(crate) fn line(prompt: &str) -> Result<String, String> {
 
 /// A line typed after `prompt` without showing it, as a key is.
 fn secret(prompt: &str) -> Result<String, String> {
-    print!("{prompt}");
-    let _ = std::io::stdout().flush();
+    masked(prompt, &mut std::io::stdout())
+}
+
+/// [`secret`], with the prompt and its line's end written to `out`.
+fn masked(prompt: &str, out: &mut dyn Write) -> Result<String, String> {
+    let _ = write!(out, "{prompt}");
+    let _ = out.flush();
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut typed = String::new();
     let read = loop {
@@ -1140,7 +1146,7 @@ fn secret(prompt: &str) -> Result<String, String> {
         }
     };
     let _ = disable_raw_mode();
-    println!();
+    let _ = writeln!(out);
     read.map(|()| typed.trim().to_owned())
 }
 
