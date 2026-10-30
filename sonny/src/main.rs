@@ -5350,13 +5350,10 @@ impl App {
             "text_delta" => {
                 self.thought.clear();
                 // Each item the bot streams is a message of its own, as
-                // Codex draws them; one a retried call streams again was
-                // shown already.
+                // Codex draws them.
                 if let Some(item) = event["item"].as_u64() {
-                    match self.live_item {
-                        Some(live) if item < live => return,
-                        Some(live) if item > live && self.streamed => self.stream_ahead(live),
-                        _ => {}
+                    if self.live_item.is_some_and(|live| live != item) && self.streamed {
+                        self.stream_ahead(self.live_item.unwrap_or(item));
                     }
                     self.live_item = Some(item);
                 }
@@ -5493,6 +5490,16 @@ impl App {
                 self.notice = Some("at the round limit: this reply ends the turn".into())
             }
             "retry" => {
+                // Messages written as the next began may come again, or
+                // not: what was shown stays, and the call's own is drawn.
+                if !self.ahead.is_empty() {
+                    self.end_live(Words::Reply);
+                    self.ahead.clear();
+                    self.live_item = None;
+                    self.streamed = false;
+                    self.said.clear();
+                    self.notice = Some("the model retried; its reply may repeat".into());
+                }
                 if !self.said.is_empty() {
                     self.replay = Some(std::mem::take(&mut self.said));
                 }
@@ -10388,8 +10395,6 @@ mod tests {
             (1, "Let me check"),
             (1, " the file."),
             (2, "It is"),
-            // A retried call streams what was shown again.
-            (1, "Let me check"),
             (2, " fine."),
         ] {
             let mut delta = event("text_delta", json!({}));
@@ -10422,6 +10427,42 @@ mod tests {
         // Reactions find each message by its node.
         assert!(app.kept(screen::Tag::End(2)));
         assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_call_retried_after_two_messages_draws_what_it_kept() {
+        let client = daemon_with(json!({
+            "2": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "All good."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        app.daemon(said(1, "Let me check the file.")).await;
+        app.daemon(said(2, "It is")).await;
+        // The call failed; its retry keeps one message, unlike the first.
+        app.daemon(event("retry", json!({"error": "provider_http_529"})))
+            .await;
+        app.daemon(said(1, "All good.")).await;
+        app.daemon(event("message", json!({"node": 2}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("All good.")).count(),
+            1,
+            "{drawn:?}"
+        );
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("retried")));
+        assert!(app.ahead.is_empty());
     }
 
     #[test]
