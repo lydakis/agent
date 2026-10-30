@@ -127,7 +127,7 @@ per feature; group small things into the row they belong to.
 | `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315 | One settings file, editable in Sonny | ? |
 | `/usage`: tokens spent over time, by agent and model | shipped | added 10-29 #302 | See where the tokens go | ? |
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
-| `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #PR | A disposable box loses at most ten minutes of what agents learned | ? |
+| `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #417 | A disposable box loses at most ten minutes of what agents learned | ? |
 
 ## Other clients
 
