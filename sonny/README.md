@@ -100,6 +100,22 @@ Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
 
+`sonny setup backup URL` keeps the person's home off the machine, for one
+that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
+`~/.agent/config.toml` are copied into a clone of URL, a private git
+repository, at `~/agent-home`, committed and pushed every ten minutes by a
+LaunchAgent or a systemd user timer (`me.lydakis.agent.backup`), which runs
+`sonny home sync`. Keys in `~/.agent/env`, logins and the daemon's store
+stay out, and so does a `config.toml` that holds a secret itself (an MCP
+server's `http_headers`, or a key named like a token), which the sync names
+and leaves behind while memory still goes. Memory's own git history stays
+out too, since a commit inside `~/.agents/memory` would make the nightly
+cleanup find nothing to do. On a machine that never synced, setup first
+restores what the repository holds, keeping a `config.toml` it replaces as
+`config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
+backup URL`. `sonny home status` says how the last sync went. Pushing uses
+the person's own git credentials, read from the login shell.
+
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
 beside the folder, the lead's model and a few commands. A new lead opens

@@ -1011,7 +1011,7 @@ pub fn cron(expression: &str) -> Result<When, String> {
     })
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1261,7 +1261,7 @@ fn runs_with(text: &str, environment: &[(&str, String)]) -> bool {
 }
 
 /// The environment a fire runs with, as its plist says it.
-fn environment_section(environment: &[(&str, String)]) -> String {
+pub(crate) fn environment_section(environment: &[(&str, String)]) -> String {
     if environment.is_empty() {
         return String::new();
     }
@@ -1405,7 +1405,7 @@ pub fn unit(
 }
 
 /// The environment a fire runs with, as its unit says it.
-fn unit_environment(environment: &[(&str, String)]) -> String {
+pub(crate) fn unit_environment(environment: &[(&str, String)]) -> String {
     environment
         .iter()
         .map(|(key, value)| format!("Environment={}\n", quoted(&format!("{key}={value}"), false)))
@@ -1433,7 +1433,7 @@ fn on_calendar(entry: &Entry) -> String {
 /// One word of a unit's command or environment, as systemd reads it back:
 /// C escapes inside double quotes, `%` doubled for its specifiers and, in a
 /// command, `$` doubled for its variables.
-fn quoted(text: &str, command: bool) -> String {
+pub(crate) fn quoted(text: &str, command: bool) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
@@ -2578,7 +2578,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
 
 /// What a trigger's job starts with besides launchd's own: the shell whose
 /// login environment starts a daemon with your keys, as Sonny starts one.
-fn environment(scheduler: Scheduler) -> Vec<(&'static str, String)> {
+pub(crate) fn environment(scheduler: Scheduler) -> Vec<(&'static str, String)> {
     // PATH too: an `--if` command runs with the adder's, as typed there.
     let mut keys = vec!["HOME", "SHELL", "PATH"];
     // Where systemd's units and timer stamps are, which the fire finds as
