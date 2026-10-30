@@ -117,6 +117,7 @@ per feature; group small things into the row they belong to.
 |---|---|---|---|---|
 | `/approvals`, auto-review shown in progress, `/approve` retries a denial | shipped | added 10-28 #261 | Approvals stay visible and easy to override | ? |
 | Auto approver (a model judges gated calls) | shipped | added 09-27 #47; permissive 10-27 #176; Codex's guardian policy 10-28 #237; sees history 10-28 #243; sandbox escapes only 10-28 #275 | Few prompts, stop only likely unasked danger | ? |
+| Pull cord: `/pause REASON` and `agent pause --reason` stop every agent until `/resume`, across restarts | experimental | added 10-30 #408 | One stop for the whole line when agents do harm someone needs to look at; agents pull it from the CLI, with no tool | ? |
 | OpenAI Decisions judge for the approver | removed | added 10-25 #141; removed 10-30 #389 | Removed as unused, with no clear gain over the other judges; may come back when the API matures | no |
 
 ## Settings and install
