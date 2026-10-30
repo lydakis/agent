@@ -447,6 +447,10 @@ fn run(
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Nor any transport: an object missing from a partial clone is not
+        // fetched, through a program a remote of its config names.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -1260,6 +1264,35 @@ mod tests {
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert!(!ran.exists());
         assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_remote_is_fetched_from_for_a_commit_the_folder_lacks() {
+        let (dir, top) = repo("promisor");
+        let ran = dir.join("ran");
+        let script = dir.join("script");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A partial clone whose remote is a program, and a branch on a
+        // commit it lacks, as a task could make them.
+        let url = format!("ext::{}", script.display());
+        for (key, value) in [
+            ("extensions.partialClone", "late"),
+            ("remote.late.url", url.as_str()),
+            ("remote.late.promisor", "true"),
+            ("protocol.ext.allow", "always"),
+        ] {
+            git(&top, &["config", key, value], None, None).unwrap();
+        }
+        let missing = "1234567890123456789012345678901234567890\n";
+        std::fs::write(top.join(".git/refs/heads/main"), missing).unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        assert!(staged.head.is_none());
+        assert!(!ran.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
