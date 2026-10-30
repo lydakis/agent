@@ -1475,7 +1475,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 20] = [
+const COMMANDS: [(&str, &str); 21] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
