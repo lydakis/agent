@@ -151,6 +151,9 @@ pub struct Sonny {
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// Whether the daemon starts when the machine does, for a box whose
+    /// agents keep working after a restart. Sonny keeps the job.
+    pub start_at_boot: bool,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
 }
@@ -168,6 +171,7 @@ impl Default for Sonny {
             suggest: true,
             chime: true,
             verbose: false,
+            start_at_boot: false,
             margin_opens: MarginOpens::default(),
             sources: Vec::new(),
         }
@@ -510,6 +514,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "verbose",
                 "margin_opens",
                 "suggest",
+                "start_at_boot",
                 "unsandboxed",
             ],
             _ => return Err(format!("unknown table [{name}]")),
@@ -555,6 +560,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
                 "verbose" => Some(&mut config.sonny.verbose),
+                "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 _ => None,
             } {
                 *switch = value
