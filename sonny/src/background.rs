@@ -251,6 +251,14 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         if outcome == "failed" && failed.is_none() {
             failed = Some("failed".into());
         }
+        // Its turn went well and its answer did not reach `--reply-to`.
+        if last["reply"]["outcome"] == "failed" && failed.is_none() {
+            facts.push("its answer was not passed on".into());
+            failed = Some(match last["reply"]["detail"].as_str() {
+                Some(detail) if !detail.is_empty() => first_line(detail),
+                _ => "its answer was not passed on".into(),
+            });
+        }
     }
     if row["missed"] == true {
         facts.push("missed its time".into());
@@ -775,6 +783,14 @@ mod tests {
         assert_eq!(stopped.failed, None);
         assert_eq!(stopped.facts[2], "its turn interrupted");
         assert_eq!(ended("h3").failed, None);
+        // Its answer did not reach the agent it was for.
+        let mut lost = row("h3");
+        lost["reply_to"] = json!("calc.lead");
+        lost["last"]["reply"] = json!({"outcome": "failed", "detail": "bot_not_found: calc.lead"});
+        trigger::with_turn(&mut lost, &turns);
+        let lost = trigger_item(&lost, vec!["memory-cleanup".into()]);
+        assert_eq!(lost.failed.as_deref(), Some("bot_not_found: calc.lead"));
+        assert_eq!(lost.facts[2], "its answer was not passed on");
         // Not asked yet: the window asks the daemon for it.
         let running = ended("h4");
         assert_eq!(running.failed, None);

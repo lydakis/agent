@@ -1623,8 +1623,10 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
             continue;
         };
         row["ended"] = json!(true);
-        let mut bots: Vec<String> = row["bot"].as_str().map(str::to_owned).into_iter().collect();
-        bots.extend(row["reply_to"].as_str().map(str::to_owned));
+        let bots: Vec<String> = ["bot", "by", "reply_to"]
+            .iter()
+            .filter_map(|key| row[*key].as_str().map(str::to_owned))
+            .collect();
         found.push((row, bots));
     }
     found.sort_by(|a, b| a.0["name"].as_str().cmp(&b.0["name"].as_str()));
@@ -3017,8 +3019,15 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
         "started_id": kept.started_id}));
     row["started_id"] = json!(kept.started_id);
     // Whose it is once its job is gone: a failure it retired with is
-    // shown on that daemon's windows only.
+    // shown on that daemon's windows only, and on the windows of the
+    // agent that added it to start its own.
     row["store_id"] = json!(trigger.store_id);
+    if let Target::Start {
+        by: Some((by, _)), ..
+    } = &trigger.target
+    {
+        row["by"] = json!(by);
+    }
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
     row["checked"] = kept.checked.clone();
@@ -5235,6 +5244,27 @@ mod tests {
         assert_eq!(kept[0].0["last"]["outcome"], "failed");
         assert_eq!(kept[0].1, [s.bot().to_owned()]);
         assert!(on_store(&w.places, "another-store").is_empty());
+        // One that starts its agent stays the adder's too.
+        let started = Trigger {
+            name: "digest".into(),
+            target: Target::Start {
+                name: "digest".into(),
+                model: "openai/gpt".into(),
+                effort: None,
+                by: Some(("p.lead".into(), 7)),
+            },
+            ..trigger()
+        };
+        w.install(&started).unwrap();
+        stops(&w.places, &started, "start_failed: no".into(), &|x| {
+            w.fake.call(x)
+        });
+        let kept = on_store(&w.places, &s.store_id);
+        let digest = kept
+            .iter()
+            .find(|(row, _)| row["name"] == "digest")
+            .unwrap();
+        assert_eq!(digest.1, ["digest".to_owned(), "p.lead".to_owned()]);
     }
 
     #[test]
