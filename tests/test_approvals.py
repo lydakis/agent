@@ -245,6 +245,7 @@ class ApprovalTests(ModelFixture):
             dict(op='fork', source='Src', bot='Twin', request_id='twin'),
             dict(child, bot='Runner', workspace=str(self.path / 'kid'), declare=[run]),
             dict(child, bot='Stepper', workspace=str(self.path / 'kid'), declare=[dict(run, steps=True)]),
+            dict(op='resume'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
@@ -280,11 +281,11 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, stepper) = probed['answers']
+         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, stepper, resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
         # Passed on as it has it, not as a tool whose steps alone are gated.
         self.assertIn('result', runner)
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, stepper):
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, stepper, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),

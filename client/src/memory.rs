@@ -39,7 +39,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory save NAME --type user|feedback|project|reference --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -90,6 +90,14 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
         }
         if save["external"] == true {
             args.push("--external".to_owned());
+        }
+        for (key, flag) in [
+            ("confirmed", "--confirmed"),
+            ("pushed_back", "--pushed-back"),
+        ] {
+            if let Some(n) = save[key].as_u64() {
+                args.extend([flag.to_owned(), n.to_string()]);
+            }
         }
         args
     } else if let Some(name) = arguments["read"].as_str() {
@@ -163,11 +171,21 @@ fn run(
     let mut fields = [None, None, None];
     let mut scope = None;
     let mut external = false;
+    let mut counts = [None, None];
     let mut it = flags.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
             "--external" if verb == "save" && !external => {
                 external = true;
+                continue;
+            }
+            count @ ("--confirmed" | "--pushed-back") if verb == "save" => {
+                let at = usize::from(count == "--pushed-back");
+                let n = it.next().and_then(|n| n.parse::<u32>().ok());
+                if counts[at].is_some() || n.is_none() {
+                    return Err(usage());
+                }
+                counts[at] = n;
                 continue;
             }
             "--type" => &mut fields[0],
@@ -246,8 +264,10 @@ fn run(
                 source,
                 verified: today(),
                 external,
+                confirmed: counts[0].unwrap_or_default(),
+                pushed_back: counts[1].unwrap_or_default(),
             };
-            save(&scope()?, &fact, &text)
+            save(&scope()?, fact, counts, &text)
         }
         ("read", Some(name), [None, None, None], None) => read(&scope()?, &name),
         ("rm", Some(name), [None, None, None], None) => remove(&scope()?, &name),
@@ -331,12 +351,17 @@ struct Fact {
     /// Saved in a turn that read outside content, a web page, a search or
     /// an MCP server, so it may carry words no person wrote.
     external: bool,
+    /// How many times the person confirmed what the fact says, and pushed
+    /// back on it, as ExpeL's insights and ACE's playbook bullets keep
+    /// helpful and harmful counts, so a later agent sees its weight.
+    confirmed: u32,
+    pushed_back: u32,
 }
 
 impl Fact {
     fn render(&self, body: &str) -> String {
         format!(
-            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n{}---\n\n{}\n",
+            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n{}{}---\n\n{}\n",
             self.name,
             self.description,
             self.kind,
@@ -347,17 +372,31 @@ impl Fact {
             } else {
                 ""
             },
+            self.counts(|key, n| format!("{key}: {n}\n")),
             body.trim()
         )
     }
 
+    /// The counts that are not zero, each as `each` writes it.
+    fn counts(&self, each: impl Fn(&str, u32) -> String) -> String {
+        [
+            ("confirmed", self.confirmed),
+            ("pushed_back", self.pushed_back),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(key, n)| each(key, n))
+        .collect()
+    }
+
     fn line(&self) -> String {
         format!(
-            "- {} ({}, verified {}{}): {}\n",
+            "- {} ({}, verified {}{}{}): {}\n",
             self.name,
             self.kind,
             self.verified,
             if self.external { ", external" } else { "" },
+            self.counts(|key, n| format!(", {} {n}", key.replace('_', " "))),
             self.description
         )
     }
@@ -394,6 +433,8 @@ impl Fact {
                 Some(&"true") => true,
                 Some(other) => return Err(format!("external is true or absent, not {other}")),
             },
+            confirmed: count(&fields, "confirmed")?,
+            pushed_back: count(&fields, "pushed_back")?,
         };
         if format!("{}.md", fact.name) != file {
             return Err(format!("its name is {}, not its file's", fact.name));
@@ -420,6 +461,15 @@ impl Fact {
         }
         Ok(())
     }
+}
+
+/// A count in a fact's front matter: absent is none.
+fn count(fields: &std::collections::HashMap<&str, &str>, key: &str) -> Result<u32, String> {
+    fields.get(key).map_or(Ok(0), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("{key} is a whole number or absent, not {value}"))
+    })
 }
 
 /// A fact's name, which is also its file's. `memory` would be the index's
@@ -507,10 +557,21 @@ fn render_index(dir: &Path, facts: &[Fact]) -> String {
     text
 }
 
-fn save(dir: &Path, fact: &Fact, body: &str) -> Result<Value, String> {
+/// Save `fact`; a count left out (`None` in `counts`) keeps the one the
+/// fact had, so an agent rewording a fact does not reset its weight.
+fn save(dir: &Path, mut fact: Fact, counts: [Option<u32>; 2], body: &str) -> Result<Value, String> {
     fact.valid()?;
     if body.trim().is_empty() {
         return Err("invalid_text: a fact needs a body".into());
+    }
+    let _lock = lock(dir)?;
+    let path = dir.join(format!("{}.md", fact.name));
+    let before = std::fs::read_to_string(&path).ok();
+    if let Some(had) =
+        (before.as_deref()).and_then(|text| Fact::parse(&format!("{}.md", fact.name), text).ok())
+    {
+        fact.confirmed = counts[0].unwrap_or(had.confirmed);
+        fact.pushed_back = counts[1].unwrap_or(had.pushed_back);
     }
     let text = fact.render(body);
     if text.len() > LIMIT {
@@ -519,9 +580,6 @@ fn save(dir: &Path, fact: &Fact, body: &str) -> Result<Value, String> {
             text.len()
         ));
     }
-    let _lock = lock(dir)?;
-    let path = dir.join(format!("{}.md", fact.name));
-    let before = std::fs::read_to_string(&path).ok();
     // Index the folder as it will be before writing anything, so a save
     // that does not fit changes nothing.
     let mut all = facts(dir)?;
@@ -1605,6 +1663,8 @@ mod tests {
                 source: "the person, 2020-01-01".into(),
                 verified: verified.into(),
                 external: false,
+                confirmed: 0,
+                pushed_back: 0,
             };
             std::fs::write(root.join(format!("{name}.md")), fact.render("old")).unwrap();
         };
@@ -1715,6 +1775,91 @@ mod tests {
         std::fs::write(
             root.join("y.md"),
             "---\nname: y\ndescription: d\ntype: project\nsource: s\nverified: 2026-10-29\nexternal: yes\n---\n\nt\n",
+        )
+        .unwrap();
+        assert_eq!(code(run_(&["index", "--user"])), "memory_invalid");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_facts_counts_show_in_the_index_and_outlast_a_save_without_them() {
+        let home = temp("counts");
+        let root = home.join(".agents/memory");
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        let save = json!({"save": {"name": "split-reviews", "type": "feedback",
+            "description": "Reviews go to a task of their own", "source": "the person, 2026-10-30",
+            "text": "Start a task for each review.", "confirmed": 3, "pushed_back": 1}, "user": true});
+        call(&home, &home, &save).unwrap();
+        let file = || std::fs::read_to_string(root.join("split-reviews.md")).unwrap();
+        assert!(
+            file().contains("\nconfirmed: 3\npushed_back: 1\n---\n"),
+            "{}",
+            file()
+        );
+        let index = || std::fs::read_to_string(root.join(INDEX)).unwrap();
+        assert!(
+            index().contains(", confirmed 3, pushed back 1): Reviews go to a task of their own"),
+            "{}",
+            index()
+        );
+        // Reworded without counts, the fact keeps its weight.
+        let mut reworded = save.clone();
+        reworded["save"]
+            .as_object_mut()
+            .unwrap()
+            .remove("confirmed");
+        reworded["save"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pushed_back");
+        reworded["save"]["text"] = json!("Each review is a task.");
+        call(&home, &home, &reworded).unwrap();
+        assert!(file().contains("confirmed: 3") && file().contains("pushed_back: 1"));
+        // A count given is the count; zero leaves it out of file and index.
+        reworded["save"]["confirmed"] = json!(4);
+        reworded["save"]["pushed_back"] = json!(0);
+        call(&home, &home, &reworded).unwrap();
+        assert!(file().contains("confirmed: 4") && !file().contains("pushed_back"));
+        assert!(index().contains(", confirmed 4): "), "{}", index());
+        // The script takes them as flags, once each, as whole numbers.
+        let run_ = |line: &[&str]| run(&root, &home, &args(line), &no_stdin);
+        let base = [
+            "save",
+            "x",
+            "--type",
+            "project",
+            "--description",
+            "d",
+            "--source",
+            "s",
+            "--user",
+        ];
+        let line = |extra: &[&str]| {
+            let mut line: Vec<&str> = base.to_vec();
+            line.extend_from_slice(extra);
+            line.extend_from_slice(&["--", "t"]);
+            run_(&line)
+        };
+        line(&["--pushed-back", "2"]).unwrap();
+        assert!(
+            std::fs::read_to_string(root.join("x.md"))
+                .unwrap()
+                .contains("pushed_back: 2")
+        );
+        assert_eq!(
+            code(line(&["--confirmed", "1", "--confirmed", "2"])),
+            "usage"
+        );
+        assert_eq!(code(line(&["--confirmed", "many"])), "usage");
+        assert_eq!(
+            code(run_(&["rm", "x", "--confirmed", "1", "--user"])),
+            "usage"
+        );
+        assert_eq!(check(&root)["problems"], json!([]));
+        // Any other value is not a fact.
+        std::fs::write(
+            root.join("y.md"),
+            "---\nname: y\ndescription: d\ntype: project\nsource: s\nverified: 2026-10-29\nconfirmed: lots\n---\n\nt\n",
         )
         .unwrap();
         assert_eq!(code(run_(&["index", "--user"])), "memory_invalid");

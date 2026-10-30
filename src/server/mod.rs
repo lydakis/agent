@@ -549,6 +549,16 @@ enum Command {
         #[serde(default)]
         grace_ms: u64,
     },
+    /// Stop every agent until `resume`, across restarts: each running turn
+    /// ends with `daemon_paused`, no turn starts, and queued work waits.
+    /// `by` names who pulled it; a bot's own socket is that bot. While a
+    /// pause holds, another changes nothing.
+    Pause {
+        reason: String,
+        by: Option<String>,
+    },
+    /// Lift the pause; what waited starts as capacity allows.
+    Resume,
 }
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
@@ -1007,6 +1017,12 @@ struct Service {
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
+    /// The pause that holds, as the store keeps it: no turn starts and
+    /// accepted submissions wait for `resume`.
+    paused: Option<Value>,
+    /// Events for every session, sent once the request that made them is
+    /// answered.
+    notices: Vec<Value>,
     /// Admissions queued with the storage worker and not yet answered,
     /// oldest first: the worker answers in queue order.
     admissions: std::collections::VecDeque<Admission>,
@@ -1094,7 +1110,8 @@ enum Pending {
         delivery: Delivery,
         /// Holds one of `reserved`.
         reserved: bool,
-        draining: bool,
+        /// Why no turn may start, as the refusal names it.
+        held: Option<&'static str>,
         answer: Answer<(i64, Started)>,
         answered: Option<Result<(i64, Started)>>,
     },
@@ -1365,7 +1382,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     let hub = Hub::default();
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
+    // A pause outlives the daemon that took it.
+    let paused = store.op("pause", |db| db.pause()).await?;
     let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
+        "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
@@ -1498,6 +1518,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         wakes,
         steer_wakes,
         draining: false,
+        paused,
+        notices: Vec::new(),
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
         storage_backoff: Duration::ZERO,
@@ -1608,7 +1630,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     match message {
                         Inbound::Open(id, output, caller, _) => {
-                            let _ = output.try_send(ready.clone());
+                            // With the pause as it holds now: one taken or
+                            // lifted since start was told only to sessions then.
+                            let mut ready = ready.clone();
+                            ready["paused"] = json!(service.paused);
+                            let _ = output.try_send(ready);
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
@@ -1697,6 +1723,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                            // What every session hears of it, such as a pause. One
+                            // too far behind to hear it is closed, as a lagging
+                            // follower is, and hears it in its next greeting.
+                            for notice in std::mem::take(&mut service.notices) {
+                                for (session, output) in &sessions {
+                                    if output.try_send(notice.clone()).is_err() {
+                                        service.hub.close_session(*session);
+                                        output.close();
+                                    }
+                                }
+                            }
                             // Start serving, or release an answer's hold, after its reply.
                             if let Some((tag, lease)) = serving {
                                 service.hub.start(&tag, id, lease);
@@ -1852,6 +1889,9 @@ impl Service {
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // Any agent may pull the cord; letting the line go on is the
+            // person's, from outside any sandbox.
+            Command::Resume => return refuse("resume a pause"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
             _ => {}
@@ -1860,6 +1900,10 @@ impl Service {
             .store
             .op("inspect", move |db| db.inspect_id(caller))
             .await?;
+        // Any agent may pull the cord, as itself.
+        if let Command::Pause { by, .. } = command {
+            *by = Some(me.name.clone());
+        }
         // A request may name only the caller as the creator of what it makes.
         let claim = |created_by: &mut Option<String>, created_by_id: &mut Option<i64>| {
             if created_by.as_ref().is_some_and(|name| *name != me.name)
@@ -2050,8 +2094,20 @@ impl Service {
         }
     }
     fn has_capacity(&self) -> bool {
-        !self.draining
+        self.held().is_none()
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
+    }
+
+    /// Why no turn may start, if none may: the daemon is shutting down or
+    /// paused.
+    fn held(&self) -> Option<&'static str> {
+        if self.draining {
+            Some("daemon_draining")
+        } else if self.paused.is_some() {
+            Some(turn::PAUSED)
+        } else {
+            None
+        }
     }
 
     /// What an admission will send `session`: its reply, and its event once
@@ -2103,7 +2159,7 @@ impl Service {
             Some(Command::Create { .. }) => full(),
             Some(Command::Submit { .. }) => {
                 full()
-                    || (!self.draining
+                    || (self.held().is_none()
                         && self.limit_active != 0
                         && self.reserved > 0
                         && self.active.len() + self.reserved >= self.limit_active)
@@ -2169,14 +2225,14 @@ impl Service {
                 request_id,
                 delivery,
                 reserved,
-                draining,
+                held,
                 answered,
                 ..
             } => {
                 self.reserved -= usize::from(reserved);
                 let answered = answered.expect("the submission was answered");
                 let name = followed.then(|| bot.clone());
-                let result = self.admitted(bot, request_id, delivery, draining, answered);
+                let result = self.admitted(bot, request_id, delivery, held, answered);
                 let cursor = result.as_ref().ok().and_then(|r| r["cursor"].as_i64());
                 (result, cursor, name)
             }
@@ -2211,13 +2267,13 @@ impl Service {
         bot: String,
         request_id: String,
         delivery: Delivery,
-        draining: bool,
+        held: Option<&'static str>,
         result: Result<(i64, Started)>,
     ) -> Result<Value> {
-        // While draining no turn starts: `reject` work is refused for the
-        // next daemon, and queued work waits durably for it.
-        let (identity, started) = result.map_err(|error| match error.code.as_str() {
-            "active_agent_limit" if draining => Error::new("daemon_draining"),
+        // While draining or paused no turn starts: `reject` work is refused,
+        // and queued work waits durably for the next daemon or `resume`.
+        let (identity, started) = result.map_err(|error| match (error.code.as_str(), held) {
+            ("active_agent_limit", Some(held)) => Error::new(held),
             _ => error,
         })?;
         let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -3206,6 +3262,46 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
+            Command::Pause { reason, by } => {
+                let reason = reason.trim().to_owned();
+                if reason.is_empty() || reason.len() > 4096 {
+                    return fail_with("usage", "a pause's reason is 1 to 4096 bytes");
+                }
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let (pause, new) = store
+                    .op("put_pause", move |db| {
+                        db.put_pause(&reason, by.as_deref(), at)
+                    })
+                    .await?;
+                self.paused = Some(pause.clone());
+                // The line stops: every running turn ends now. Parked and
+                // queued turns hold no slot and wait.
+                let mut interrupted = 0;
+                if new {
+                    interrupted = (self.active.values())
+                        .filter(|active| active.cancel(turn::PAUSED))
+                        .count();
+                    // And what they started that runs on without them.
+                    self.registry.end_running();
+                    self.notices
+                        .push(json!({"event": "paused", "pause": pause, "durable": false}));
+                }
+                Ok(json!({"pause": pause, "changed": new, "interrupted": interrupted}))
+            }
+            Command::Resume => {
+                let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
+                self.paused = None;
+                let changed = lifted.is_some();
+                if changed {
+                    // What waited starts as capacity allows.
+                    self.ready_hint = true;
+                    self.notices
+                        .push(json!({"event": "resumed", "pause": lifted, "durable": false}));
+                }
+                Ok(json!({"pause": lifted, "changed": changed}))
+            }
             Command::Companions { add, remove } => match (add, remove) {
                 (Some(_), Some(_)) => {
                     fail_with("usage", "companions takes add or remove, not both")
@@ -3274,6 +3370,7 @@ impl Service {
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
                     "draining": self.draining,
+                    "paused": self.paused,
                 }))
             }
             Command::Answer {
@@ -3908,7 +4005,7 @@ impl Service {
                         request_id,
                         delivery,
                         reserved,
-                        draining: self.draining,
+                        held: self.held(),
                         answer,
                         answered: None,
                     },
@@ -4608,6 +4705,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
@@ -4780,6 +4879,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
@@ -4998,6 +5099,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,
@@ -5222,6 +5325,8 @@ mod tests {
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: false,
+            paused: None,
+            notices: Vec::new(),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             expiry: None,

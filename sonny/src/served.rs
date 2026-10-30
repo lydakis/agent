@@ -326,7 +326,11 @@ fn memory() -> Value {
                 "text": {"type": "string", "minLength": 1,
                     "description": "The fact, then Why: and, where it helps, How to apply:."},
                 "external": {"type": "boolean",
-                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."}
+                    "description": "True keeps the mark of a fact read from outside content, when merging or rewriting one whose index line says external. A save in a turn that read a web page, a search or an MCP server is marked without it."},
+                "confirmed": {"type": "integer", "minimum": 0,
+                    "description": "How many times the person confirmed what a feedback fact says; left out, the fact keeps the count it had."},
+                "pushed_back": {"type": "integer", "minimum": 0,
+                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false

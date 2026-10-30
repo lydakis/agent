@@ -76,7 +76,7 @@ per feature; group small things into the row they belong to.
 | Staged messages, the open line while a reply streams, turn timers | shipped | streaming 10-26 #172; staged 10-27 #175; timers 10-28 #266; each message a call streams drawn apart 10-30 #396 | Show what is in flight | ? |
 | Footer: context size, branch, ↻ background count, agents at work | shipped | context 10-26 #163; branch 10-27 #182; ↻ 10-28 #267; agents at work 10-29 #367; context as % left of the window the daemon sends 10-30 #432 | One line of state under the composer | ? |
 | Colour: 16 terminal colours, one meaning each; marks say it first, muted gray and diff tints from the theme's own colours, `NO_COLOR` honoured | shipped | added 10-29 #326; one visual system 10-30 #405 | Colour that carries meaning, in any theme, and reads with low contrast, colour blindness or no colour | ? |
-| Links and file paths clickable | shipped | a path opens from the folder that named it 10-10 #98; web addresses 10-27 #179; link text, paths 10-27 #230; never drawn over a list 10-30 #416; copied, not opened, over SSH with no display 10-30 #437 | Open what an agent names | ? |
+| Links, file paths and agents' names clickable | shipped | a path opens from the folder that named it 10-10 #98; web addresses 10-27 #179; link text, paths 10-27 #230; never drawn over a list 10-30 #416; copied, not opened, over SSH with no display 10-30 #437; an agent's name opens it in the pane 10-30 #435 | Open what an agent names | ? |
 | Find (Ctrl+F) and long histories (older pages on scroll, Home to the first turn) | shipped | Ctrl+F 10-28 #258, 10-29 #343; pages 10-29 #331; lay out near the view 10-29 #353; Home 10-29 #364 | Long conversations stay fast and searchable | ? |
 | One Markdown renderer for every surface; code coloured with Oniguruma; headings bold with dim `#` marks, no hue | shipped | renderer 10-29 #325; Oniguruma 10-29 #336; Markdown as prose 10-30 #405 | Same rendering everywhere, three times faster colouring | ? |
 | Pictures: SVG, Mermaid, math and HTML drawn in the terminal | shipped | added 10-26 #147; `\[ \]` math 10-29 #313; sent once 10-29 #338 | Agents can show, not only tell | ? |
@@ -100,7 +100,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384; ↑↓ Enter pick one 10-30 #421; a two-column gutter each side of its line 10-30 #427 | Look at something without losing the conversation | ? |
+| The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384; ↑↓ Enter pick one 10-30 #421; a two-column gutter each side of its line 10-30 #427; `/status` opens on the agent named last 10-30 #435 | Look at something without losing the conversation | ? |
 | Pictures, HTML and diagrams in the pane; a folder as a tree | shipped | drawing 10-29 #303; tree 10-29 #319 | Read what agents made, in place | ? |
 | `/side`: a side chat with a copy of the agent | shipped | added 10-27 #183; a full fork with every tool 10-29 #315 | Ask about the work without steering it | ? |
 | Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384; a note opens the agent that asks, ↗ 10-30 #395 | A place for state that outlives one reply | ? |
@@ -111,7 +111,7 @@ per feature; group small things into the row they belong to.
 |---|---|---|---|---|
 | `ask`: a question for the person, as a decision card with reasons | shipped | pinned questions above the composer 10-27 #192; declared tool 10-27 #225; decision card where it was asked 10-28 #245; options are buttons 10-29 #326; a task's question reaches its lead, a yellow ? and a muted bar, decisions and sends go through it 10-30 #395 | Agents ask instead of guessing; the person answers in one click | ? |
 | `plan`: the agent's plan, drawn in the conversation | shipped | added 10-27 #225 | See the steps an agent intends | ? |
-| Memory (`sonny memory`, the memory skills, nightly cleanup) | shipped | app memory 10-09 #82, 10-10 #104, #120; moved into Sonny 10-27 #189; a tool 10-28 #278; 16 KiB 10-28 #241; read tracking, 30-day unread check 10-29 #354; outside-content marks 10-29 #356; the cleanup reflects on habits, from the person's words and what they sent through their servers 10-30 #403; a server it cannot read holds the night open 10-30 #411; confirmed approaches saved, not only corrections 10-30 #410 | Later agents start knowing what earlier ones learned | ? |
+| Memory (`sonny memory`, the memory skills, nightly cleanup) | shipped | app memory 10-09 #82, 10-10 #104, #120; moved into Sonny 10-27 #189; a tool 10-28 #278; 16 KiB 10-28 #241; read tracking, 30-day unread check 10-29 #354; outside-content marks 10-29 #356; the cleanup reflects on habits, from the person's words and what they sent through their servers 10-30 #403; a server it cannot read holds the night open 10-30 #411; confirmed approaches saved, not only corrections 10-30 #410; confirm and push-back counts per fact in the index, the person's reactions and ask picks reach the cleanup 10-30 #431 | Later agents start knowing what earlier ones learned | ? |
 | Triggers (`sonny trigger`): wake an agent at a time, on a file, a commit, or by name | shipped | app triggers 10-10 #89-#92; moved into Sonny 10-27 #189; skipped checks, `--replace` 10-28 #241; a tool 10-28 #278; Linux via systemd 10-29 #344; `--start` agents get Sonny's tools 10-30 #403 | Work that starts while nobody is at the terminal | ? |
 | Turn-end triggers | removed | added 10-10 #89-#92; removed 10-27 #189 | Leads hear of task turns from task updates and the lookout | ? |
 | Goals: keep an agent working until a check command passes | experimental | added 10-29 #341; `/goal WHAT` asks the agent to set one, `/goal` shows, `/goal clear` clears 10-30 #397 | Autonomy with a check, not a model's say-so | ? |
@@ -134,6 +134,7 @@ per feature; group small things into the row they belong to.
 |---|---|---|---|---|
 | `/approvals`, auto-review shown in progress, `/approve` retries a denial | shipped | added 10-28 #261 | Approvals stay visible and easy to override | ? |
 | Auto approver (a model judges gated calls) | shipped | added 09-27 #47; permissive 10-27 #176; Codex's guardian policy 10-28 #237; sees history 10-28 #243; sandbox escapes only 10-28 #275 | Few prompts, stop only likely unasked danger | ? |
+| Pull cord: `/pause REASON` and `agent pause --reason` stop every agent until `/resume`, across restarts | experimental | added 10-30 #408 | One stop for the whole line when agents do harm someone needs to look at; agents pull it from the CLI, with no tool | ? |
 | OpenAI Decisions judge for the approver | removed | added 10-25 #141; removed 10-30 #389 | Removed as unused, with no clear gain over the other judges; may come back when the API matures | no |
 
 ## Settings and install
@@ -146,6 +147,7 @@ per feature; group small things into the row they belong to.
 | Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |
 | Opening Sonny after an upgrade replaces the older running daemon once its turns end, and says so | shipped | added 10-30 #413 | An upgrade left the old daemon running, and every command failed until it was restarted by hand | ? |
 | `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #417; offered last in first-run setup and once after an upgrade, the lead picks where the repo lives 10-30 #428 | A disposable box loses at most ten minutes of what agents learned | ? |
+| `[sonny] start_at_boot`: the daemon started with the machine (LaunchAgent at login, systemd user service at boot with linger); off by default | experimental | added 10-30 #441 | A box's agents keep working after it restarts, with nobody opening Sonny | ? |
 
 ## Other clients
 

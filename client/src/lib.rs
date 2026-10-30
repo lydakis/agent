@@ -199,6 +199,7 @@ pub struct Client {
     identity: Option<String>,
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
+    paused: Value,
     /// Requests this client keeps in flight at once, when bounded.
     in_flight: std::sync::OnceLock<Semaphore>,
 }
@@ -259,6 +260,7 @@ impl Client {
         let store = ready["store"]["lineage"].as_str().map(str::to_owned);
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
+        let paused = ready["paused"].clone();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
@@ -327,6 +329,7 @@ impl Client {
                 store,
                 identity,
                 providers,
+                paused,
                 in_flight: std::sync::OnceLock::new(),
             }),
             Events(receiver),
@@ -354,6 +357,12 @@ impl Client {
     /// The daemon's provider bindings as `ready` announced them.
     pub fn providers(&self) -> &Value {
         &self.providers
+    }
+
+    /// The pause that held the daemon as this client connected, or null;
+    /// `paused` and `resumed` events tell of later ones.
+    pub fn paused(&self) -> &Value {
+        &self.paused
     }
 
     /// Keep at most `requests` in flight from now on, as an HTTP/2
@@ -497,6 +506,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
@@ -529,6 +539,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
             in_flight: std::sync::OnceLock::new(),
         });
         client.bound(1);
@@ -571,6 +582,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
@@ -611,6 +623,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
             in_flight: std::sync::OnceLock::new(),
         });
         let request = tokio::spawn({

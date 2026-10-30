@@ -338,12 +338,12 @@ fn running_as(label: &str) -> bool {
 
 /// The logged-in user's systemd manager, found by its runtime folder as
 /// `systemctl --user` finds it.
-struct UserManager {
+pub(crate) struct UserManager {
     runtime: PathBuf,
 }
 
 impl UserManager {
-    fn find() -> Result<Self, String> {
+    pub(crate) fn find() -> Result<Self, String> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -358,7 +358,7 @@ impl UserManager {
             )),
         }
     }
-    fn run(&self, args: &[&str]) -> Result<(), String> {
+    pub(crate) fn run(&self, args: &[&str]) -> Result<(), String> {
         self.run_allowing(args, &[])
     }
     /// `systemctl --user ARGS`, also fine when it exits with one of `fine`.
@@ -382,7 +382,7 @@ impl UserManager {
 }
 
 /// How a loader says the label it was asked to unload is not loaded.
-const NOT_LOADED: &str = "not_loaded: ";
+pub(crate) const NOT_LOADED: &str = "not_loaded: ";
 
 /// Unload a label; one launchd does not have is already unloaded.
 fn unload(label: &str, jobs: Loader) -> Result<(), String> {
