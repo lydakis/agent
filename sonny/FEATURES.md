@@ -143,7 +143,7 @@ per feature; group small things into the row they belong to.
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
 | `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315; grouped by table, changed values plain and defaults muted 10-30 #427 | One settings file, editable in Sonny | ? |
-| `/usage`: tokens spent over time, by agent and model | shipped | added 10-29 #302 | See where the tokens go | ? |
+| `/usage`: tokens spent over time, by agent, model and what started the turns (commons, triggers, margin) | shipped | added 10-29 #302; by origin 10-30 | See where the tokens go | ? |
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
 | Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |
 | Opening Sonny after an upgrade replaces the older running daemon once its turns end, and says so | shipped | added 10-30 #413 | An upgrade left the old daemon running, and every command failed until it was restarted by hand | ? |

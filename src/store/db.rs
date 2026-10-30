@@ -9412,7 +9412,8 @@ impl Database {
     /// What the turns of the bots whose names match `name` (every bot
     /// when absent) spent, from those started at `since_ms` or later: in
     /// all, by bot (the `limit` that spent most, the rest summed as one),
-    /// by model, and, with `bucket_ms`, in buckets of that width from
+    /// by model, by the origin its client gave the turn, and, with
+    /// `bucket_ms`, in buckets of that width from
     /// `since_ms`. A turn counts wholly where it started. One statement,
     /// so one snapshot.
     pub fn usage(
@@ -9452,9 +9453,9 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT t.bot,b.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
                     (t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
-                    SUM(t.cached_input_tokens),SUM(t.output_tokens)
+                    SUM(t.cached_input_tokens),SUM(t.output_tokens),t.origin
              FROM turns t JOIN bots b ON b.name=t.bot
-             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,4"
+             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,4,9"
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
         let mut rows = match name {
@@ -9464,6 +9465,7 @@ impl Database {
         let mut total = Spent::default();
         let mut bots: HashMap<String, (i64, Spent)> = HashMap::new();
         let mut models: HashMap<String, Spent> = HashMap::new();
+        let mut origins: HashMap<Option<String>, Spent> = HashMap::new();
         let mut series: BTreeMap<i64, Spent> = BTreeMap::new();
         while let Some(r) = rows.next()? {
             let spent = Spent {
@@ -9477,6 +9479,7 @@ impl Database {
             bot.0 = r.get(1)?;
             bot.1.add(&spent);
             models.entry(r.get(2)?).or_default().add(&spent);
+            origins.entry(r.get(8)?).or_default().add(&spent);
             if bucket_ms.is_some() {
                 series.entry(r.get(3)?).or_default().add(&spent);
             }
@@ -9493,6 +9496,8 @@ impl Database {
         }
         let mut models: Vec<(String, Spent)> = models.into_iter().collect();
         models.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
+        let mut origins: Vec<(Option<String>, Spent)> = origins.into_iter().collect();
+        origins.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
         let mut out = total.json();
         out["since_ms"] = json!(since_ms);
         out["bucket_ms"] = json!(bucket_ms);
@@ -9518,6 +9523,14 @@ impl Database {
             .map(|(model, spent)| {
                 let mut row = spent.json();
                 row["model"] = json!(model);
+                row
+            })
+            .collect();
+        out["origins"] = origins
+            .iter()
+            .map(|(origin, spent)| {
+                let mut row = spent.json();
+                row["origin"] = json!(origin);
                 row
             })
             .collect();

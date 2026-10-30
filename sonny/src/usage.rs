@@ -1,6 +1,7 @@
 //! `/usage`: the tokens the project's agents spent, or every agent's, in
 //! the last day, week or month: in all, over time as stacked bars, by
-//! agent (or project) and by model. One daemon read, `usage`, each time
+//! agent (or project), by model, and by what started the turns: the
+//! commons, a trigger, the margin, or a prompt. One daemon read, `usage`, each time
 //! the view changes and every minute while it is open: it reads every
 //! matching turn, so it is not asked for often.
 use crate::background::Scope;
@@ -360,6 +361,23 @@ impl View {
         }
         out.push(Line::default());
         out.extend(self.bars("By model", &models, &total, width));
+        // What Sonny's own features started, by the origin it gave their
+        // turns; one with none was a prompt, a person's or an agent's.
+        let origins: Vec<(String, Spent)> = usage["origins"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| {
+                (
+                    o["origin"].as_str().unwrap_or("prompts").to_owned(),
+                    Spent::of(o),
+                )
+            })
+            .collect();
+        if origins.iter().any(|(origin, _)| origin != "prompts") {
+            out.push(Line::default());
+            out.extend(self.bars("By what started it", &origins, &total, width));
+        }
         out
     }
 
@@ -723,6 +741,10 @@ mod tests {
                 ],
                 "other_bots": null,
                 "models": [{"model": "openai/gpt-6-sol", "turns": 3, "input_tokens": 3000, "cached_input_tokens": 2000, "output_tokens": 300}],
+                "origins": [
+                    {"origin": null, "turns": 2, "input_tokens": 2000, "cached_input_tokens": 1500, "output_tokens": 200},
+                    {"origin": "commons", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                ],
                 "series": [
                     {"at_ms": since, "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
                     {"at_ms": since + 23 * bucket, "turns": 2, "input_tokens": 2000, "cached_input_tokens": 1500, "output_tokens": 200},
@@ -739,6 +761,10 @@ mod tests {
         assert!(card.contains("lead "), "{card}");
         assert!(card.contains("fix "), "{card}");
         assert!(card.contains("openai/gpt-6-sol"), "{card}");
+        // What the commons started, beside the prompts.
+        assert!(card.contains("By what started it"), "{card}");
+        assert!(card.contains("commons "), "{card}");
+        assert!(card.contains("prompts "), "{card}");
         // The busiest bar reaches the top row.
         let top = view.card(60)[4].clone();
         assert!(text(&[top]).ends_with('█'), "{card}");

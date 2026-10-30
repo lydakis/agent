@@ -12989,15 +12989,13 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
     }
     let mut started = Vec::new();
     for (bot, request, usage, at) in &turns {
+        // The task's turn is one a client started for the commons.
+        let options = TurnOptions {
+            origin: (*bot == "p.task").then(|| "commons".to_owned()),
+            ..TurnOptions::default()
+        };
         let turn = db
-            .begin(
-                bot,
-                request,
-                "work",
-                true,
-                &TurnOptions::default(),
-                allow_provider,
-            )
+            .begin(bot, request, "work", true, &options, allow_provider)
             .unwrap()
             .turn;
         db.append(turn, vec![assistant("done")], &[], Some(usage))
@@ -13044,6 +13042,17 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
     assert_eq!(usage["other_bots"], Value::Null);
     assert_eq!(usage["models"].as_array().unwrap().len(), 1);
     assert_eq!(usage["models"][0]["turns"], 3);
+    let origins: Vec<_> = usage["origins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["origin"].clone(), o["input_tokens"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(
+        origins,
+        [(Value::Null, 1200), (json!("commons"), 400)],
+        "by the origin each turn was given, most spent first"
+    );
     let series: Vec<_> = usage["series"]
         .as_array()
         .unwrap()
