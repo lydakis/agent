@@ -46,7 +46,7 @@ per feature; group small things into the row they belong to.
 | A lead per folder: `sonny` in a folder opens that folder's own lasting agent | shipped | added 10-26 #146; every folder outside git gets its own 10-28 #259; a project keeps its subfolders 10-28 #263; a subfolder's lead reads its own project's memory 10-28 #298 | One coordinator per project that the person talks to and that starts the work | ? |
 | Several leads in one folder (`/lead`) | experimental | added 10-29 #365; each store notes its last lead 10-29 #376 | Parallel conversations in one project without a second folder | ? |
 | Tasks: the lead starts agents, each in its own git worktree (`sonny task`) | shipped | added 10-26 #142, #162; brief names its copy 10-28 #234; copies isolated, done tasks removed 10-28 #227; worktree starts with the lead's build folders 10-28 #286 | Only the lead works in its folder, so tasks never step on it or each other | ? |
-| Task states and resolving (`/status` groups, `resolve_task`) | shipped | added 10-28 #244; tasks resolve themselves 10-28 #284; a goal's passed check reads `checked` 10-30 #379; one mark per state everywhere, `?` needs you, footer counts say their words, Idle is Done 10-30 #PR3 | See at a glance what needs you, is working, or is done | ? |
+| Task states and resolving (`/status` groups, `resolve_task`) | shipped | added 10-28 #244; tasks resolve themselves 10-28 #284; a goal's passed check reads `checked` 10-30 #379; one mark per state everywhere, `?` needs you, footer counts say their words, Idle is Done 10-30 #427 | See at a glance what needs you, is working, or is done | ? |
 | Lead and task roles as editable files (`~/.agents/agents/lead.md`, `task.md`) | shipped | added 10-28 #240; leads and tasks run as any profile, profiles extend others 10-29 #296; an upgrade offers a merge with an edited role 10-29 #357 | The person owns the roles; Sonny never overwrites their edits | ? |
 | How leads work: act across tasks, care about the person, carry what one task lacks to whoever has it, react to the person's words in a task, pick task models | shipped | added 10-27 #229; routing 10-29 #295; reaction 10-29 #330, #340; models from the list 10-30 #385; asked why it starts another task 10-30 #386 | Leads that coordinate instead of only relaying | ? |
 | Proactive leads: straight feedback, coaching repeated habits, weighing what sources report, starting what the person said they will do | experimental | added 10-30 #394; commitments 10-30 #399; nightly habit reflection 10-30 #403 | Agents that flag what the person missed, say what they see unsugared, and follow through without being asked | ? |
@@ -91,8 +91,8 @@ per feature; group small things into the row they belong to.
 | Editing: wrap, arrow keys, shell keys, Shift-Enter, mouse selection | shipped | wrap 10-26 #157; arrows 10-27 #174; shell keys and pictures in messages 10-28 #242; Shift-Enter, selection 10-29 #297 | A composer that edits like a shell | ? |
 | `!COMMAND`: run your own shell command and tell the agent | shipped | added 10-27 #209 | Do it yourself without leaving the conversation | ? |
 | A guess at your next message, Tab takes it (`[sonny] suggest`) | experimental | added 10-29 #329 | As Claude Code and Codex do; cost per guess not yet measured | ? |
-| Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #PR3 |
-| One list over the composer (slash menu, `/model`, `/approvals`, `/approve`, `/react`): up to 8 rows, the pick reversed, `•` what is in effect | shipped | added 10-30 #PR3 | As Codex's one popup: every list reads and moves the same | ? | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
+| Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #427 |
+| One list over the composer (slash menu, `/model`, `/approvals`, `/approve`, `/react`): up to 8 rows, the pick reversed, `•` what is in effect | shipped | added 10-30 #427 | As Codex's one popup: every list reads and moves the same | ? | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
 | Messages to a busy agent: Enter steers, Tab queues for after the turn | shipped | Tab queues 10-30 #400 | As Codex does: the person knows whether it should wait, so no judge guesses | ? |
 
 ## Side pane
@@ -139,7 +139,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315; grouped by table, changed values plain and defaults muted 10-30 #PR3 | One settings file, editable in Sonny | ? |
+| `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315; grouped by table, changed values plain and defaults muted 10-30 #427 | One settings file, editable in Sonny | ? |
 | `/usage`: tokens spent over time, by agent and model | shipped | added 10-29 #302 | See where the tokens go | ? |
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
 | Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |
