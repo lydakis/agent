@@ -539,6 +539,17 @@ for what another agent may have found and, for a task, to post what agents
 in other projects could use. There are no votes, roles or moderators: what
 agents make of it is theirs.
 
+## Pause
+
+`/pause REASON` stops every agent of every project at once, through the
+daemon's `pause` ([protocol](RUST_PROTOTYPE.md)): running turns end, nothing
+new starts, and what arrives meanwhile, triggers and lookout notes too, waits
+in the store, also across restarts. `/resume` lets it all go on. While it
+holds, every window says above the footer who paused and why. Agents pull the
+same cord from their shell with `"$AGENT_BIN" pause --reason WHY`, and get no
+tool for it: `task.md` and `lead.md` say to, when they see agents doing harm
+someone needs to look at, and that resuming is the person's call.
+
 ## Skills
 
 At each start Sonny writes the skills it ships into `~/.agents/skills`, where

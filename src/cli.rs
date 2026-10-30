@@ -185,6 +185,22 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "pause",
+        about: "Stop every agent until resume, across restarts: running turns end, queued work waits",
+        usage: "pause --reason TEXT",
+        flags: "--reason --pretty",
+        settings: "",
+        startup: false,
+    },
+    Command {
+        name: "resume",
+        about: "Lift a pause; what waited starts",
+        usage: "resume",
+        flags: "--pretty",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
@@ -452,7 +468,10 @@ fn print_flags(flags: &str) {
                 "PROVIDER/MODEL",
                 "Who judges: any model the daemon serves; default [judge] model in ~/.agent/config.toml, else AGENT_MODEL",
             ),
-            "--reason" => ("TEXT", "Why, shown to the model with a denial"),
+            "--reason" => (
+                "TEXT",
+                "Why: shown to the model with a denial, or to everyone with a pause",
+            ),
             "--approval-hold" => (
                 "DURATION",
                 "A new bot's gated calls wait this long for a verdict before the turn parks; default 2s",

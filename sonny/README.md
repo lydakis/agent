@@ -563,6 +563,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   reading there is not counted as an agent's.
 
   ![/commons in the pane](../docs/sonny/commons.png)
+- `/pause REASON` stops every agent, in every project, until `/resume`:
+  running turns end and what arrives meanwhile waits, across restarts too.
+  Every window says who paused and why. Agents pull the same cord with
+  `agent pause --reason` from their shell
+  ([docs/SONNY.md](../docs/SONNY.md#pause)).
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
