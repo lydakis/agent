@@ -7103,6 +7103,7 @@ impl App {
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
+            ("ctrl+l", "draw the screen again"),
         ];
         let width = rows.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
         let lines = rows
