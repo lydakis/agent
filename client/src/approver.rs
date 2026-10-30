@@ -167,26 +167,6 @@ pub const JUDGE_INSTRUCTIONS: &str = concat!(
 You get a JSON object: `state` describes the turn and its planned calls, and `assess` lists the ids of the planned calls to judge. Reply with one JSON object mapping every id in `assess` to its assessment, and nothing else. For a low-risk call give just {"outcome":"allow"}. For anything else give {"risk_level":"low"|"medium"|"high"|"critical","user_authorization":"unknown"|"low"|"medium"|"high","outcome":"allow"|"deny","rationale":"..."}."#
 );
 
-/// What OpenAI's Decisions API is told, as a developer message: the same
-/// policy, without the reply format, which one predicate a call replaces.
-pub const DECISIONS_INSTRUCTIONS: &str = concat!(
-    "The user message is the state: a JSON object describing a turn of an AI agent and the tool calls it has planned, before they run.\n\n",
-    policy!()
-);
-
-/// The Decisions API's one question a call: whether the policy denies it.
-pub fn questions(calls: &[&str]) -> Vec<(String, String)> {
-    calls
-        .iter()
-        .map(|call| {
-            (
-                (*call).to_owned(),
-                format!("Following the policy, is the outcome for planned call {call} deny?"),
-            )
-        })
-        .collect()
-}
-
 /// The state's fields in the order the judge reads them: what holds for the
 /// whole turn first and the calls being judged last, so consecutive rounds
 /// share the longest prefix the provider can cache.
@@ -303,17 +283,6 @@ pub fn verdict(assessment: &Value) -> Option<Verdict> {
             )))
         }
         _ => None,
-    }
-}
-
-/// A Decisions API answer as an assessment: the probability that the
-/// policy denies the call, read at even odds.
-pub fn decided(probability: f64) -> Value {
-    match probability >= 0.5 {
-        true => {
-            json!({"outcome":"deny","rationale":"The judge found the call's risk unacceptable under the policy."})
-        }
-        false => json!({"outcome":"allow"}),
     }
 }
 
@@ -1292,7 +1261,6 @@ mod tests {
         assert!(JUDGE_INSTRUCTIONS.contains("# Outcome policy"));
         assert!(JUDGE_INSTRUCTIONS.contains("The approval channel"));
         assert!(JUDGE_INSTRUCTIONS.ends_with(r#""rationale":"..."}."#));
-        assert!(!DECISIONS_INSTRUCTIONS.contains("# Reply"));
         let reply = "Here you go:\n```json\n{\"c1\":{\"outcome\":\"allow\"},\"c2\":{\"risk_level\":\"critical\",\"user_authorization\":\"unknown\",\"outcome\":\"deny\",\"rationale\":\"It answers its own approvals.\"}}\n```";
         let assessed = assessments(reply, &["c1", "c2"]).unwrap();
         assert_eq!(verdict(&assessed["c1"]), Some(Verdict::Allow));
@@ -1303,28 +1271,6 @@ mod tests {
         assert!(assessments(reply, &["c1", "c3"]).is_none());
         assert!(assessments(r#"{"c1":{"risk_level":"low"}}"#, &["c1"]).is_none());
         assert!(assessments("They look fine.", &["c1"]).is_none());
-    }
-
-    #[test]
-    fn openai_decisions_answers_one_predicate_a_call() {
-        let asked = questions(&["c1", "c2"]);
-        assert_eq!(asked.len(), 2);
-        assert!(asked[1].1.contains("planned call c2 deny"));
-        let state = json!({"request":[{"by":"person","text":"push it"}]});
-        let body = crate::judge::decisions_body(
-            "gpt-6-luna",
-            DECISIONS_INSTRUCTIONS,
-            &state_text(&state),
-            &asked,
-        );
-        assert_eq!(body["input"][1]["content"][0]["text"], state_text(&state));
-        let every = json!({"answers":[
-            {"type":"predicate","name":"c1","probability":0.1},
-            {"type":"predicate","name":"c2","probability":0.8}]});
-        let answers = crate::judge::decisions_answers(&every, &asked).unwrap();
-        let assessed = |id: &str| verdict(&decided(answers[id].as_f64().unwrap()));
-        assert_eq!(assessed("c1"), Some(Verdict::Allow));
-        assert!(matches!(assessed("c2"), Some(Verdict::Deny(_))));
     }
 
     #[test]

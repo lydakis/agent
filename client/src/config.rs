@@ -24,6 +24,7 @@
 //! side_chat = "fork"            # "answer", the default, calls no tool
 //! chime = false                 # rings when work ends or waits, the default
 //! verbose = true                # every tool call drawn, not the clean view
+//! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! suggest = false               # no guess at the next message, on by default
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //!
@@ -78,8 +79,7 @@ pub enum WebSearch {
 /// The judge `agent approver` and Sonny's lookout ask.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Judge {
-    /// `provider/model` or `openai-decisions/MODEL`; unset, the judged
-    /// bot's own model.
+    /// `provider/model`; unset, the judged bot's own model.
     pub model: Option<String>,
     pub effort: Option<String>,
 }
@@ -106,6 +106,8 @@ pub struct Sonny {
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
+    /// When a note the agent puts up or changes opens the margin.
+    pub margin_opens: MarginOpens,
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
@@ -126,6 +128,7 @@ impl Default for Sonny {
             suggest: true,
             chime: true,
             verbose: false,
+            margin_opens: MarginOpens::default(),
             sources: Vec::new(),
         }
     }
@@ -139,6 +142,19 @@ pub enum SideChat {
     #[default]
     Answer,
     Fork,
+}
+
+/// When a note opens the margin beside the conversation, as VS Code's
+/// `reveal` opens a task's terminal: `"always"`, the default, even when
+/// the person closed it; `"unless-closed"`, not once they closed it with
+/// Esc, until `/margin`; or `"never"`, the margin opening only with
+/// `/margin`. It never closes by itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarginOpens {
+    #[default]
+    Always,
+    UnlessClosed,
+    Never,
 }
 
 /// A command Sonny's lookout runs, whose every printed line is news for
@@ -375,6 +391,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "side_chat",
                 "chime",
                 "verbose",
+                "margin_opens",
                 "suggest",
                 "unsandboxed",
             ],
@@ -427,6 +444,19 @@ fn parse(text: &str) -> Result<Config, String> {
                     "answer" => SideChat::Answer,
                     "fork" => SideChat::Fork,
                     other => return Err(format!("sonny.side_chat is answer or fork, not {other}")),
+                };
+                continue;
+            }
+            if key == "margin_opens" {
+                config.sonny.margin_opens = match value.as_str() {
+                    "always" => MarginOpens::Always,
+                    "unless-closed" => MarginOpens::UnlessClosed,
+                    "never" => MarginOpens::Never,
+                    other => {
+                        return Err(format!(
+                            "sonny.margin_opens is always, unless-closed or never, not {other}"
+                        ));
+                    }
                 };
                 continue;
             }
@@ -696,6 +726,11 @@ mod tests {
         assert_eq!(config.sonny.side_chat, SideChat::Answer);
         let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
         assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
+        let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
+        assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
+        let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
+        assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(config.sonny.chime && !config.sonny.verbose);
         let quiet = parse("[sonny]\nchime = false\nverbose = true").unwrap();
         assert!(!quiet.sonny.chime && quiet.sonny.verbose);
@@ -721,6 +756,10 @@ mod tests {
             (
                 "[sonny]\nside_chat = \"all\"",
                 "sonny.side_chat is answer or fork, not all",
+            ),
+            (
+                "[sonny]\nmargin_opens = \"sometimes\"",
+                "sonny.margin_opens is always, unless-closed or never, not sometimes",
             ),
             ("colour = \"red\"", "unknown key colour"),
             ("model = 3", "model must be a string"),

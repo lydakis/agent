@@ -131,8 +131,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "approver",
         about: "Judge a gate's calls with a model, until stopped",
-        usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]",
-        flags: "--tag --judge --effort --note --judge-url",
+        usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE]",
+        flags: "--tag --judge --effort --note",
         settings: "",
         startup: false,
     },
@@ -446,11 +446,7 @@ fn print_flags(flags: &str) {
             ),
             "--judge" => (
                 "PROVIDER/MODEL",
-                "Who judges: openai-decisions/MODEL or any model the daemon serves; default [judge] model in ~/.agent/config.toml, else AGENT_MODEL",
-            ),
-            "--judge-url" => (
-                "URL",
-                "The Decisions API's base URL; default https://api.openai.com",
+                "Who judges: any model the daemon serves; default [judge] model in ~/.agent/config.toml, else AGENT_MODEL",
             ),
             "--reason" => ("TEXT", "Why, shown to the model with a denial"),
             "--approval-hold" => (

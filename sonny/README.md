@@ -56,7 +56,9 @@ of the first rather than above it. `sonny` opens the one last written to in
 that folder, else the first. `--lead NAME` opens another (`--lead lead` the
 first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
-and `/lead new [NAME]` makes one. A lead hears of, shows and lists in
+and `/lead new [NAME]` makes one. `/goal WHAT` asks the agent to set a goal
+on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
+clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
 to that lead, to leave changes it did not make alone and never to switch the
 folder's branch, since the leads share one checkout; the instructions,
@@ -133,7 +135,8 @@ Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlea
 written to `~/.agents/agents` beside the others and used by no lead
 unless a project sets `profile = "superlead"`. It builds on the lead's:
 the folder holds other projects, so the lead subscribes to their leads
-and routes work and answers between them as it does between tasks. Sonny
+and to every source you set up, and routes work and answers between
+them as it does between tasks. Sonny
 itself knows only leads and tasks.
 
 The project's wins, then the config's, then `lead` and `task`. A name that
@@ -162,6 +165,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
@@ -273,7 +277,9 @@ wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
 same bot. T3 Code's model picker lists what the providers list, as `/model`
-does, with `~/.agent/models`' notes and the models only it names, after
+does, each by the name its provider lists (else its id) beside the provider,
+as "Global Claude Opus 5.5 · bedrock", with the full id and
+`~/.agent/models`' notes, and the models only that file names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
 for a lead Sonny makes: a lead the thread binds to with `/lead NAME` keeps its
@@ -376,7 +382,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `suggest`) through them
+  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `suggest`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
@@ -444,7 +450,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
-  shows `↻ 2 triggers` beside its model.
+  shows `↻ 2 triggers` beside its model. A click on an agent's name opens
+  it in the pane, as a click on a task in a roster does; ‹ in its title,
+  or Ctrl+[ from the conversation, goes back to `/status`.
+
+  ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the triggers that wake them, with
@@ -479,13 +489,18 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   the branch `agent/NAME`, so only the lead works in the folder; outside
   git, tasks work in the lead's folder. The lead starts each task with its
   `start_task` tool (`name`, `brief`, `setup`, `profile`, `model`,
-  `effort`), which makes its worktree, runs `.agents/setup` there with
-  `setup`, starts the task with `agent run`, and leaves no folder behind
-  when that fails. Every agent Sonny starts, leads and tasks
+  `effort`, `reason`), which makes its worktree, runs `.agents/setup`
+  there with `setup`, starts the task with `agent run`, and leaves no
+  folder behind when that fails. While the lead has tasks still there, a
+  start without a `reason` saying why the work is separate is refused
+  with those tasks listed, so work one of them holds goes to it. Every agent Sonny starts, leads and tasks
   alike, is told that the person it works for may be under pressure, and
   to care whether they succeed: take work off their plate, do or offer
-  what they will need next, and say once when a better way of working
-  would help them (in `lead.md`, and in `task.md` for the rest); so
+  what they will need next, and say plainly, as soon as they see it, what
+  they missed, a better way of working or a mistake, coaching a habit
+  once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
+  also starts, or sets up with a trigger, what the person said they will
+  do when nothing owns it, as far as their memory says they want; so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
@@ -618,7 +633,13 @@ agent asks you lists its options, and a click on one answers with it.
 What agents tell each other stays quiet too: a message from another agent
 is one dim row naming who sent it (`↳ From calc.neg ▸`), the lead's task
 updates one row with what happened in them, and a click opens the whole
-message. A turn that ends
+message. Such messages that come one after another, with nothing the agent
+said between them, gather into one row that counts them (`↳ 3 task
+updates ▸`): a click lists them, a click on one opens it, and what the
+agent did about it while saying nothing, such as a task steered or a
+memory saved, is under it there rather than a row of its own. Quiet rows
+one after another (calls folded, notes put in the margin, messages
+between agents) sit together, with no blank row between. A turn that ends
 with the model saying nothing (`empty_completion`) ends quietly, not as a
 failure.
 
@@ -627,6 +648,12 @@ failure.
 ![A message from calc.neg, the task updates and a steer, each one row](../docs/sonny/agent-calls-folded.png)
 
 ![The steer opened to what it told calc.neg](../docs/sonny/agent-call-opened.png)
+
+![Three task updates in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
+
+![That row opened: each update one row of its own](../docs/sonny/task-updates-listed.png)
+
+![One update opened: what it said, and the steer the lead sent about it](../docs/sonny/task-update-opened.png)
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
@@ -722,9 +749,13 @@ shows as the task keeps it, follows the task's title until the lead gives
 its own, and stays once the task is gone. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
-opens by itself with its first note, once the window leaves the
-conversation its 100 columns and the margin 40 more, and goes once it
-holds nothing; closed with Esc, it stays closed as notes come; in a narrower one the footer counts the notes
+opens by itself when the agent puts up or changes a note, once the window
+leaves the conversation its 100 columns and the margin 40 more, even
+after Esc closed it, under whatever is open over it, as VS Code's
+`reveal` shows a task's output; `[sonny] margin_opens = "unless-closed"`
+leaves it closed after Esc until `/margin`, and `"never"` opens it only
+with `/margin`. It never closes by itself: emptied, or opened to look at
+with nothing in it, it stays until Esc. In a narrower window the footer counts the notes
 (`✎ 3`), and Tab with nothing typed shows the margin. Where the margin
 cannot show, because the window is narrower or it is closed, each note is
 drawn in the conversation where it was put instead of its marker, up to
@@ -756,7 +787,9 @@ pictures, and code in syntax colors.
 
 ![The margin opened by itself with the lead's first notes, two tasks' tables shown as the tasks keep them](../docs/sonny/margin-opens-with-a-note.png)
 
-![Both notes taken away with ×: the margin goes and the conversation has the window back](../docs/sonny/margin-gone-once-empty.png)
+![The lead took its only note away: the margin stays open, empty, until Esc or /margin](../docs/sonny/margin-stays-once-empty.png)
+
+![Closed with /margin, then the lead put up a new note: the margin opened again with it](../docs/sonny/margin-opens-again.png)
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 

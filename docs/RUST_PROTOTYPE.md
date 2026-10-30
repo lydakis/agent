@@ -2569,7 +2569,7 @@ starts `agent approver` detached if no session serves `auto`, logging to
 `STORE.approver.log`; its judge is `[judge] model` in `~/.agent/config.toml`, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
-PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves
+PROVIDER/MODEL] [--effort LEVEL] [--note FILE]` serves
 a tag and has a judge decide every call waiting on it, printing one JSON
 line per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny

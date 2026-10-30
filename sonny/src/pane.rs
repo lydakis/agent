@@ -305,6 +305,12 @@ impl Pane {
         self.card.is_some() && !self.margin
     }
 
+    /// Whether this is a card, or one is back or forward from here: what
+    /// keeps `/status` read for going back to it.
+    pub fn keeps_card(&self) -> bool {
+        self.is_card() || (self.back.iter().chain(&self.forward)).any(Pane::is_card)
+    }
+
     pub fn is_margin(&self) -> bool {
         self.margin
     }
@@ -342,10 +348,22 @@ impl Pane {
     /// A card's lines, put in only when they changed, so a selection in
     /// them lasts while they do not, and the view stays where it was.
     pub fn set_card(&mut self, lines: Vec<Line<'static>>, keys: &'static str) {
+        self.set_card_marked(lines, Vec::new(), keys);
+    }
+
+    /// [`Pane::set_card`], with links on its rows, such as `/status`'s
+    /// agents, each of which a click opens.
+    pub fn set_card_marked(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        marks: Vec<(usize, crate::screen::Mark)>,
+        keys: &'static str,
+    ) {
         self.keys = keys;
-        if self.card.as_ref() != Some(&lines) {
-            self.screen.replace(lines.clone());
+        if self.card.as_ref() != Some(&lines) || self.marks != marks {
+            self.screen.replace_marked(lines.clone(), marks.clone());
             self.card = Some(lines);
+            self.marks = marks;
         }
     }
 
