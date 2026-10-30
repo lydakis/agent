@@ -150,6 +150,16 @@ pub const SECRET_FIELDS: [&str; 12] = [
 /// PEM blocks whose bodies are secrets (`--redact-block`).
 pub const SECRET_BLOCKS: [&str; 1] = ["PRIVATE KEY"];
 
+/// Folders at the top of a bot's writable folders that stay read-only and,
+/// when missing, may not be made, as Codex keeps its own metadata: what git
+/// runs (hooks, config), and what agents trust as the project's settings.
+/// A client starting the daemon passes them (`--protect`).
+pub const PROTECTED: [&str; 3] = [".git", ".agents", ".codex"];
+
+/// Folders kept read-only where they exist (`--protect-existing`): AWS
+/// profiles, which can name a program to run for credentials.
+pub const PROTECTED_EXISTING: [&str; 1] = [".aws"];
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

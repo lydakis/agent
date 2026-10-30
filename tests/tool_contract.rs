@@ -538,7 +538,7 @@ async fn a_sandboxed_command_writes_only_its_roots() {
     let daemon = Daemon {
         store: Some(dir.join("store")),
         helper: Some(env!("CARGO_BIN_EXE_agent").into()),
-        ..Daemon::default()
+        ..protecting()
     };
     let writable = [
         repo.to_str().unwrap().to_owned(),
@@ -724,7 +724,7 @@ async fn a_sandboxed_command_cannot_reach_the_daemon_socket() {
     for network in [false, true] {
         let daemon = Daemon {
             socket: Some(socket.clone()),
-            ..Daemon::default()
+            ..protecting()
         };
         let policy = Policy::new(
             Some(Mode::WorkspaceWrite),
@@ -775,7 +775,7 @@ async fn a_folder_swapped_for_a_link_is_not_followed() {
             Some(workspace),
             &[],
             false,
-            &Daemon::default(),
+            &protecting(),
         )
     };
     assert!(policy(&given).is_ok());
@@ -795,15 +795,9 @@ async fn a_read_only_sandbox_writes_nothing() {
         return;
     }
     let dir = std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let policy = Policy::new(
-        Some(Mode::ReadOnly),
-        Some(&dir),
-        &[],
-        true,
-        &Daemon::default(),
-    )
-    .unwrap()
-    .unwrap();
+    let policy = Policy::new(Some(Mode::ReadOnly), Some(&dir), &[], true, &protecting())
+        .unwrap()
+        .unwrap();
     assert!(!policy.network);
     let tools = Registry::new("shell").unwrap();
     let marker = format!("agent-read-only-{}", std::process::id());
@@ -1085,4 +1079,14 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     let killed = tools.write_stdin(1, 4, "", None, true, None).await.unwrap();
     let killed: Value = serde_json::from_str(&killed.output).unwrap();
     assert_eq!(killed["signal"], libc::SIGKILL);
+}
+
+/// The daemon as the CLI starts it, protecting what its client names.
+#[cfg(target_os = "linux")]
+fn protecting() -> agent_runtime::sandbox::Daemon {
+    agent_runtime::sandbox::Daemon {
+        protected: agent_client::PROTECTED.map(String::from).to_vec(),
+        protected_existing: agent_client::PROTECTED_EXISTING.map(String::from).to_vec(),
+        ..Default::default()
+    }
 }

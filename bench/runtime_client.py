@@ -6,10 +6,15 @@ import threading
 import time
 from .targets import clean_env
 
+# What the CLI has a daemon it starts protect in sandboxed bots' folders
+# (agent_client::PROTECTED and PROTECTED_EXISTING).
+PROTECTING = ['--protect', '.git', '--protect', '.agents', '--protect', '.codex',
+              '--protect-existing', '.aws']
+
 def serve_args(path, url, key_env=None, provider="openai", family="responses", extra=()):
     """Arguments for a stdio service bound to one synthetic provider endpoint."""
     spec = f'{provider}={family},{url}' + (f',{key_env}' if key_env else '')
-    return ['serve', '--store', str(path), '--provider', spec, *extra]
+    return ['serve', '--store', str(path), '--provider', spec, *PROTECTING, *extra]
 
 
 def node_item(client, bot, node):

@@ -2266,11 +2266,15 @@ the folders kept read-only inside them, the bubblewrap arguments on Linux and
 the Seatbelt profile on macOS are Codex's, ported (see NOTICE). Reading stays
 open. `read-only` writes nothing; `workspace-write` writes the bot's folder
 (its stored workspace, else the turn's), each `writable` folder, `$TMPDIR`
-and `/tmp`. Inside each writable folder, `.git` (and a linked worktree's own
-git folder when the folder holds it), `.agents`, `.codex` and `.aws` stay
-read-only, and a missing `.git`, `.agents` or `.codex` may not be made: git
-runs hooks and config from there outside the sandbox, and agents trust what
-is there. The daemon's store and the files beside it stay read-only too. A
+and `/tmp`. Inside each writable folder, each name the daemon was started
+with as `serve --protect NAME` stays read-only and, when missing, may not be
+made, and each `--protect-existing NAME` stays read-only where it exists. A
+`.git` among them keeps a linked worktree's own git folder read-only too
+when the folder holds it. Which names is the client's judgement: the CLI
+passes `agent_client::PROTECTED` (`.git`, `.agents`, `.codex`, since git runs
+hooks and config from there outside the sandbox and agents trust what is
+there) and `PROTECTED_EXISTING` (`.aws`, whose profiles can name a program
+to run). The daemon's store and the files beside it stay read-only too. A
 protected folder that is a symlink refuses the call with
 `sandbox_unavailable`, since the link could be swapped from inside. A git
 folder given as a `writable` folder, so a bot may commit, keeps what git
