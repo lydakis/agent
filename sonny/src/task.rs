@@ -172,8 +172,10 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     }
     // A new worktree takes clones of the lead's build folders only once
     // setup has run: setup runs outside any sandbox and must not run what
-    // the lead's folders hold.
-    if let (Undo::Worktree { path, .. }, Some((top, _))) = (&place.undo, &place.copy) {
+    // the lead's folders hold. A fork takes none: Sonny writes nothing of
+    // its own among files a task wrote, whose links could lead it out.
+    if let (Undo::Worktree { path, .. }, Some((top, _)), None) = (&place.undo, &place.copy, &source)
+    {
         let seeded = crate::seed::seed(top, path);
         // Named so the person knows why the first build is quicker.
         if let (false, Some(note)) = (seeded.is_empty(), place.note.as_mut()) {
