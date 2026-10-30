@@ -725,8 +725,16 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "memory" => {
             // The person's words are read from the daemon, which only
             // Sonny reaches; the rest is memory's own.
-            if let Some(("said", since)) = rest.split_first().map(|(v, r)| (v.as_str(), r)) {
-                return std::process::ExitCode::from(said::cli(since) as u8);
+            match rest.split_first().map(|(v, r)| (v.as_str(), r)) {
+                Some(("said", since)) => {
+                    return std::process::ExitCode::from(said::cli(since) as u8);
+                }
+                // The person's words count as a change, so a night they
+                // wrote is cleaned up whether or not an agent saved.
+                Some(("changed", [])) => {
+                    return std::process::ExitCode::from(said::changed_cli() as u8);
+                }
+                _ => {}
             }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
@@ -9890,6 +9898,39 @@ mod tests {
                     "project": null}]})
         );
         std::fs::remove_dir_all(shop).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_night_the_person_wrote_is_cleaned_up_though_no_agent_saved() {
+        let home = std::env::temp_dir().join(format!("said-changed-{}", std::process::id()));
+        let root = home.join(".agents/memory");
+        std::fs::create_dir_all(&root).unwrap();
+        // The last cleanup started at 1000; nothing was saved since.
+        std::fs::write(root.join(".said"), "1000").unwrap();
+        let answering = |text: &'static str| {
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "turns" => json!({"turns": [
+                    {"turn": 2, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
+                    "history_nodes" => {
+                        json!({"nodes": [{"node": 5, "turn": 2}], "next_from": null})
+                    }
+                    "history_items" => json!({"items": [{"node": 5, "item": {"type": "message",
+                    "role": "user", "content": [{"type": "input_text", "text": text}]},
+                    "origin": if text.is_empty() { json!("trigger") } else { Value::Null }}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+        };
+        let wrote = answering("I keep forgetting to rebase.").await;
+        let done = said::changed_on(&home, &home, async { Ok::<_, String>(wrote) }).await;
+        assert_eq!(done, Ok(json!({"changed": true, "said": true})));
+        // Only a trigger's words since: nothing to clean up.
+        let quiet = answering("").await;
+        let done = said::changed_on(&home, &home, async { Ok::<_, String>(quiet) }).await;
+        assert!(done.unwrap_err().starts_with("unchanged: "));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
