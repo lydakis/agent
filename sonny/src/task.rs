@@ -121,15 +121,17 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     // A task in a folder inside the lead's is told the rules of the
     // folders above it too, which its worktree is not inside.
     // Recorded as the lead's, like an own folder, so its memory is the
-    // lead's project's, whatever project the repository's folder is in.
+    // lead's project's, whatever project the repository's folder is in,
+    // with the checkout it was made from, which removes it.
     let mut recorded = None;
     if at != here {
         place.told = at.clone();
-        if let (Some(_), Ok(record)) = (&place.copy, record_of(name))
+        if let (Some((top, _)), Ok(record)) = (&place.copy, record_of(name))
             && !record.exists()
         {
+            let text = format!("{}\n{}\n", here.display(), top.display());
             let wrote = std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/")))
-                .and_then(|()| std::fs::write(&record, format!("{}\n", here.display())));
+                .and_then(|()| std::fs::write(&record, text));
             if let Err(e) = wrote {
                 undo(&place.undo);
                 return Err(format!("{}: {e}", record.display()));
@@ -695,8 +697,7 @@ fn inside(here: &Path, folder: &str) -> Result<PathBuf, String> {
 }
 
 /// The checkout to run git in for the worktree `path`: `here`'s own, when
-/// `path` is a worktree of its repository, else the main checkout git
-/// lists for it, when that is inside `here`.
+/// `path` is a worktree of its repository.
 fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
     let common = |dir: &Path| {
         git(
@@ -712,11 +713,7 @@ fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
         let top = git(here, &["rev-parse", "--show-toplevel"]).ok()?;
         return std::fs::canonicalize(top).ok();
     }
-    let listed = git(path, &["worktree", "list", "--porcelain"]).ok()?;
-    let main = listed.lines().next()?.strip_prefix("worktree ")?;
-    let main = std::fs::canonicalize(main).ok()?;
-    let base = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_owned());
-    main.starts_with(&base).then_some(main)
+    None
 }
 
 /// Where Sonny records the lead's folder each task with a folder of its
@@ -727,14 +724,28 @@ fn record_of(name: &str) -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".agent/worktrees/.folders").join(name))
 }
 
+/// What Sonny made a task it keeps a record of: recorded, as whatever the
+/// task makes in its folder, a repository too, cannot tell.
+#[derive(PartialEq)]
+enum Made {
+    /// An empty folder of its own.
+    Own,
+    /// A worktree of the repository checked out at this folder inside the
+    /// lead's.
+    Worktree(PathBuf),
+}
+
 /// The lead's folder the task `name` was started from, as Sonny recorded
-/// it, and whether Sonny gave it an empty folder of its own: recorded, as
-/// whatever the task makes there, a repository too, cannot tell.
-fn recorded(name: &str) -> Option<(PathBuf, bool)> {
+/// it, and what Sonny made it.
+fn recorded(name: &str) -> Option<(PathBuf, Made)> {
     let text = std::fs::read_to_string(record_of(name).ok()?).ok()?;
     let mut lines = text.lines();
     let source = PathBuf::from(lines.next()?);
-    Some((source, lines.next() == Some("own")))
+    let made = match lines.next()? {
+        "own" => Made::Own,
+        repo => Made::Worktree(PathBuf::from(repo)),
+    };
+    Some((source, made))
 }
 
 fn source_of(name: &str) -> Option<PathBuf> {
@@ -760,7 +771,7 @@ fn own_folder(here: &Path, name: &str) -> Result<Place, String> {
     let undo = if path.exists() {
         // Left by a task of this name before: its own only if it was
         // started from this folder.
-        if recorded(name) != Some((here.to_owned(), true)) {
+        if recorded(name) != Some((here.to_owned(), Made::Own)) {
             return Err(format!(
                 "{} exists and is not the folder of a task of this one; pick another name",
                 path.display()
@@ -816,7 +827,8 @@ fn worktree(here: &Path, name: &str) -> Result<Place, String> {
         // Left by a task of this name before: its own only if it is a
         // worktree of this repository on the task's branch. A folder of a
         // task's own is not, and Sonny runs no git in what the task made.
-        if recorded(name).is_some_and(|(_, own)| own) || !ours(here, &path, &branch) {
+        if recorded(name).is_some_and(|(_, made)| made == Made::Own) || !ours(here, &path, &branch)
+        {
             return Err(format!(
                 "{} exists and is not this repository's worktree on {branch}; pick another name",
                 path.display()
@@ -970,33 +982,32 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     let branch = format!("agent/{name}");
     let path = home_dir()?.join(".agent/worktrees").join(name);
-    let (source, own) = match recorded(name) {
-        Some((source, own)) => (Some(source), own),
-        None => (None, false),
-    };
-    let (worktree, folder) = match path.exists() {
-        true if own && source.as_deref() == Some(here) => (None, Some(path)),
-        true if !own
-            && let Some(repo) = repository_of(here, &path)
-            && ours(&repo, &path, &branch) =>
+    let (worktree, folder) = match (path.exists(), recorded(name)) {
+        (false, _) => (None, None),
+        (true, Some((source, _))) if source != here => {
+            return Err(format!(
+                "{} is the folder of a task of {}; run this there",
+                path.display(),
+                source.display()
+            ));
+        }
+        (true, Some((_, Made::Own))) => (None, Some(path)),
+        (true, Some((_, Made::Worktree(repo)))) if ours(&repo, &path, &branch) => {
+            (Some((repo, path)), None)
+        }
+        (true, None)
+            if let Some(repo) = repository_of(here, &path)
+                && ours(&repo, &path, &branch) =>
         {
             (Some((repo, path)), None)
         }
-        true => {
-            return Err(match source {
-                Some(source) => format!(
-                    "{} is the folder of a task of {}; run this there",
-                    path.display(),
-                    source.display()
-                ),
-                None => format!(
-                    "{} is not this repository's worktree on {branch}; run this in the \
-                     repository the task was started from",
-                    path.display()
-                ),
-            });
+        (true, _) => {
+            return Err(format!(
+                "{} is not this repository's worktree on {branch}; run this in the repository \
+                 the task was started from",
+                path.display()
+            ));
         }
-        false => (None, None),
     };
     // What would be lost, checked while the task can still be kept, and again
     // once it is gone and can write no more.

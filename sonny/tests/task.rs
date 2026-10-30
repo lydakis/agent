@@ -494,14 +494,34 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
     // Recorded as the lead's, for its project's memory.
     let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
     assert_eq!(
-        std::fs::read_to_string(&record).unwrap().trim(),
-        std::fs::canonicalize(&ws).unwrap().to_string_lossy()
+        std::fs::read_to_string(&record).unwrap().lines().next(),
+        Some(&*std::fs::canonicalize(&ws).unwrap().to_string_lossy())
     );
     // Removed from the lead's folder, with its merged branch.
     let (ok, err) = lab.remove(&ws, false);
     assert!(ok, "{err}");
     assert!(!worktree.exists() && !record.exists());
     assert_eq!(lab.git(&api, &["branch", "--list", "agent/demo.fix"]), "");
+}
+
+#[test]
+fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
+    let lab = Lab::new("linked");
+    let ws = lab.scratch.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    // The repository's main checkout is outside the lead's folder.
+    let web = ws.join("web");
+    let target = web.to_string_lossy().into_owned();
+    lab.git(&lab.repo, &["worktree", "add", "-q", "-b", "web", &target]);
+    let start = serde_json::json!({"name": "fix", "brief": "fix it", "folder": "web"});
+    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    assert!(ok, "{said}");
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    assert!(worktree.join(".git").exists());
+    let (ok, err) = lab.remove(&ws, false);
+    assert!(ok, "{err}");
+    assert!(!worktree.exists());
+    assert_eq!(lab.git(&web, &["branch", "--list", "agent/demo.fix"]), "");
 }
 
 #[test]
