@@ -18,7 +18,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::f32::consts::{PI, TAU};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -91,7 +91,10 @@ struct Spark {
 #[derive(Default)]
 struct Agent {
     name: String,
+    /// The daemon's id for it, so a name used again is someone else.
+    id: Option<i64>,
     made_by: Option<String>,
+    made_by_id: Option<i64>,
     /// The turn it runs, when it runs one.
     running: Option<i64>,
     /// When it was last lit, and in what colour (none: the person's).
@@ -297,11 +300,24 @@ impl View {
         };
         let agent = &mut self.agents[at];
         agent.gone = false;
+        agent.id = bot["bot_id"].as_i64();
         agent.made_by = (bot["created_by"].as_str())
             .filter(|by| !by.is_empty())
             .map(str::to_owned);
+        agent.made_by_id = bot["created_by_id"].as_i64();
         agent.running = bot["running_turn"].as_i64();
         Some(at)
+    }
+
+    /// Who made the agent at `at`, when that one is still here: by name,
+    /// and by id when both are known, as a name used again is a stranger.
+    fn maker(&self, at: usize) -> Option<usize> {
+        let agent = &self.agents[at];
+        let by = self.agent(agent.made_by.as_deref()?)?;
+        match (agent.made_by_id, self.agents[by].id) {
+            (Some(made_by), Some(id)) if made_by != id => None,
+            _ => Some(by),
+        }
     }
 
     fn agent(&self, name: &str) -> Option<usize> {
@@ -320,7 +336,8 @@ impl View {
         let data = &event["data"];
         match event["event"].as_str().unwrap_or("") {
             "created" | "forked" => {
-                let record = json!({"name": name, "created_by": data["created_by"],
+                let record = json!({"name": name, "bot_id": data["bot_id"],
+                    "created_by": data["created_by"], "created_by_id": data["created_by_id"],
                     "running_turn": data["running_turn"]});
                 if let Some(at) = self.seat(&record) {
                     self.agents[at].lit = Some((now, None));
@@ -488,9 +505,8 @@ impl View {
             if self.agents[at].gone {
                 continue;
             }
-            let parent = (self.agents[at].made_by.as_deref())
-                .and_then(|by| self.agent(by))
-                .filter(|&by| by != at && !project::is_lead(&self.agents[at].name));
+            let parent =
+                (self.maker(at)).filter(|&by| by != at && !project::is_lead(&self.agents[at].name));
             match parent {
                 Some(by) => children[by].push(at),
                 None => roots.push(at),
@@ -607,8 +623,8 @@ impl View {
         // The person in the middle.
         sky.text_at((0.0, 0.0), "you", Style::default().bold());
         // Who made whom: faint lines; who talked: faint curves.
-        for agent in self.agents.iter().filter(|a| !a.gone) {
-            if let Some(by) = agent.made_by.as_deref().and_then(|by| self.agent(by))
+        for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
+            if let Some(by) = self.maker(at)
                 && !agent.root
             {
                 sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
@@ -1100,17 +1116,17 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         return;
     }
     // Until the new follow is live, the old one's last events may still be
-    // waiting here, and its replay brings them again: each cursor once.
-    let mut handoff = Some(HashSet::new());
+    // arriving, ahead of the replay that brings them again in order: wait
+    // for it, and pass each cursor once, in the store's order.
+    let mut handoff = Some(BTreeMap::new());
     while let Some(event) = events.recv().await {
-        if let (Some(seen), Some(at)) = (&mut handoff, event["cursor"].as_i64())
-            && !seen.insert(at)
-        {
-            continue;
-        }
         match event["event"].as_str() {
             Some("follow_live") => {
-                handoff = None;
+                for (_, event) in handoff.take().into_iter().flatten() {
+                    if send.send(Feed::Live(event)).is_err() {
+                        return;
+                    }
+                }
                 continue;
             }
             Some("pruned") => continue,
@@ -1119,6 +1135,10 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
                 return;
             }
             _ => {}
+        }
+        if let (Some(waiting), Some(at)) = (&mut handoff, event["cursor"].as_i64()) {
+            waiting.insert(at, event);
+            continue;
         }
         if send.send(Feed::Live(event)).is_err() {
             return;
@@ -1378,7 +1398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_event_across_the_handoff_comes_once() {
+    async fn events_across_the_handoff_come_once_and_in_order() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = std::env::temp_dir().join(format!("sky-handoff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1391,8 +1411,10 @@ mod tests {
             let mut out = vec![json!({"event": "ready", "protocol": agent_client::PROTOCOL})];
             let mut lines = BufReader::new(read).lines();
             let (mut rolls, mut follows) = (0, 0);
-            let started = json!({"cursor": 11, "bot": "a", "turn": 2, "event": "accepted",
-                "data": {"from": {"bot": "b", "turn": 1}}});
+            let made = json!({"cursor": 11, "bot": "c", "event": "created",
+                "data": {"created_by": "a"}});
+            let started = json!({"cursor": 12, "bot": "c", "turn": 2, "event": "accepted",
+                "data": {"from": {"bot": "a", "turn": 1}}});
             loop {
                 for line in out.drain(..) {
                     write
@@ -1419,8 +1441,9 @@ mod tests {
                     if follows == 1 {
                         out.push(json!({"event": "follow_live", "cursor": 10}));
                     } else {
+                        out.push(made.clone());
                         out.push(started.clone());
-                        out.push(json!({"event": "follow_live", "cursor": 11}));
+                        out.push(json!({"event": "follow_live", "cursor": 12}));
                         for line in out.drain(..) {
                             write
                                 .write_all(format!("{line}\n").as_bytes())
@@ -1434,13 +1457,28 @@ mod tests {
         });
         let (send, mut feed) = mpsc::unbounded_channel();
         follow(socket, send).await;
-        let mut started = 0;
+        let mut live = Vec::new();
         while let Ok(item) = feed.try_recv() {
             if let Feed::Live(event) = item {
-                started += usize::from(event["event"] == "accepted");
+                live.push(event["cursor"].as_i64().unwrap());
             }
         }
-        assert_eq!(started, 1);
+        // Made, then started: once each, in the store's order.
+        assert_eq!(live, [11, 12]);
+    }
+
+    #[tokio::test]
+    async fn a_name_used_again_is_not_the_maker() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a", "bot_id": 7}),
+            json!({"name": "b", "bot_id": 2, "created_by": "a", "created_by_id": 1}),
+            json!({"name": "c", "bot_id": 3, "created_by": "a", "created_by_id": 7}),
+        ]))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.maker(view.index["b"]), None);
+        assert_eq!(view.maker(view.index["c"]), Some(view.index["a"]));
     }
 
     #[tokio::test]
