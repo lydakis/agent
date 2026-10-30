@@ -946,3 +946,27 @@ fn a_fork_of_a_task_in_a_repository_inside_the_lead_s_folder_is_removed_from_the
     assert!(!copy.exists());
     assert_eq!(lab.git(&api, &["branch", "--list", "agent/demo.try"]), "");
 }
+
+#[test]
+fn no_fork_comes_back_through_a_sealed_folder_a_bot_s_folder_holds() {
+    let lab = Lab::new("fork-housed");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let source = lab.home.join(".agent/worktrees/demo.fix");
+    snapshot(&lab, &source, 12, 77);
+    // A bot works in the folder that holds the store and its sealed one.
+    let listed = serde_json::json!([
+        {"name": "demo.fix", "bot_id": 5, "workspace": source.join("src")},
+        {"name": "demo.wide", "bot_id": 6, "workspace": lab.scratch},
+    ]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    let (ok, err) = lab.tool(
+        &lab.repo.join("src"),
+        "start_task",
+        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
+        false,
+    );
+    assert!(!ok && err.contains("where a bot works"), "{err}");
+    assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
+    assert!(!lab.scratch.join("run.log.fork").exists());
+}

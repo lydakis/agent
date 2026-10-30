@@ -147,7 +147,7 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         None => None,
     };
     let mut place = match &source {
-        Some(source) => forked(name, source)?,
+        Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
         None if start.own_folder => own_folder(here, name)?,
         None => worktree(&at, name)?,
@@ -1130,7 +1130,7 @@ fn source(agent: &Path, project: &str, from: &str, start: &Start) -> Result<Sour
 /// A git worktree of `source`'s repository on branch agent/NAME holding
 /// the files it had after its turn, on the commit it was on, in the folder
 /// of it `source` worked in.
-fn forked(name: &str, source: &Source) -> Result<Place, String> {
+fn forked(agent: &Path, name: &str, source: &Source) -> Result<Place, String> {
     // The repository's own checkout, whose paths a brief names; a bare
     // one has none, and the source's worktree stands in.
     let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
@@ -1145,6 +1145,26 @@ fn forked(name: &str, source: &Source) -> Result<Place, String> {
         return Err(format!("{} exists; pick another name", path.display()));
     }
     let indexes = crate::snapshot::indexes(&crate::daemon_paths(None, None)?.0);
+    // A bot that can write the sealed folder the files come back through
+    // could change it between its making and git's reading of it.
+    let output = Command::new(agent)
+        .arg("ls")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    let bots: Vec<Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("{} ls: {e}", agent.display()))?;
+    let folders: Vec<PathBuf> = (bots.iter())
+        .filter_map(|bot| bot["workspace"].as_str().map(PathBuf::from))
+        .collect();
+    if let Some(folder) = crate::snapshot::holder(&indexes, folders.iter().map(PathBuf::as_path)) {
+        return Err(format!(
+            "{} is inside {}, where a bot works, so no fork's files come back through it",
+            indexes.display(),
+            folder.display()
+        ));
+    }
     crate::snapshot::restore(&here, &source.snapshot, &path, &branch, &indexes)?;
     let mut note = format!(
         "{name}: a worktree at {} on branch {branch}, with {}'s files as they were after its \

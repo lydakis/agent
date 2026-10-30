@@ -827,15 +827,36 @@ pub fn housed(bot: &str, workspace: Option<&Path>) {
 /// The folder of a bot that holds `path`, which a sandbox would let it
 /// write: none of Sonny's own may be in one.
 fn housing(path: &Path) -> Option<PathBuf> {
-    let real = (path.parent())
-        .and_then(|up| std::fs::canonicalize(up).ok())
-        .zip(path.file_name())
-        .map_or_else(|| path.to_owned(), |(up, name)| up.join(name));
     let housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
-    housed
-        .values()
-        .find(|folder| real.starts_with(folder))
-        .cloned()
+    holder(path, housed.values().map(PathBuf::as_path))
+}
+
+/// The first of `folders` that holds `path`, both by their real paths:
+/// `path`'s as far as it is there.
+pub(crate) fn holder<'a>(
+    path: &Path,
+    folders: impl IntoIterator<Item = &'a Path>,
+) -> Option<PathBuf> {
+    let real = |path: &Path| {
+        let mut rest = Vec::new();
+        let mut at = path;
+        loop {
+            if let Ok(real) = std::fs::canonicalize(at) {
+                return rest.iter().rev().fold(real, |real, name| real.join(name));
+            }
+            match (at.parent(), at.file_name()) {
+                (Some(up), Some(name)) => {
+                    rest.push(name.to_owned());
+                    at = up;
+                }
+                _ => return path.to_owned(),
+            }
+        }
+    };
+    let path = real(path);
+    (folders.into_iter())
+        .map(real)
+        .find(|folder| path.starts_with(folder))
 }
 
 /// Start over from the bots `listed` as running, each in its folder.
