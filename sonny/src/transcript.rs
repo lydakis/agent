@@ -1788,6 +1788,144 @@ pub fn folds(
     (FOLDS.contains(&said.verb.as_str()) && !what.is_empty()).then_some((said.verb, what))
 }
 
+/// The verb of a fold of ordinary work: commands, reads and edits the
+/// clean view says in one row instead of each, as Codex's "Explored" and
+/// Claude Code's "Read 3 files" rows do; a click opens each call drawn
+/// as the verbose view draws it.
+pub const WORK: &str = "Worked";
+
+/// One call of ordinary work, as the row that folds it counts it:
+/// `kind`, what it was done to, the lines it took out and put in, and
+/// whether it failed, kept in a fold's `whats`.
+pub fn work_item(name: &str, arguments: &Value, failed: bool, workspace: &str) -> String {
+    let field = |key: &str| arguments[key].as_str().unwrap_or("").to_owned();
+    let (kind, what, (removed, added)) = match name {
+        "shell" => (
+            "ran",
+            field("command").lines().next().unwrap_or("").to_owned(),
+            (0, 0),
+        ),
+        "exec" => ("ran", "a script".to_owned(), (0, 0)),
+        "read" => ("read", shown(&field("path"), workspace), (0, 0)),
+        "edit" => (
+            "edited",
+            shown(&field("path"), workspace),
+            diff(arguments, workspace).counts(),
+        ),
+        "write" => (
+            "edited",
+            shown(&field("path"), workspace),
+            (0, field("content").lines().count()),
+        ),
+        "apply_patch" => {
+            let patch = field("input");
+            let counted = patch.lines().fold((0, 0), |(removed, added), line| {
+                match (line.starts_with("***"), line.chars().next()) {
+                    (false, Some('-')) => (removed + 1, added),
+                    (false, Some('+')) => (removed, added + 1),
+                    _ => (removed, added),
+                }
+            });
+            let files = patch_files(&patch)
+                .iter()
+                .map(|path| shown(path, workspace))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ("edited", files, counted)
+        }
+        "web_search" | "web_fetch" => ("looked up", String::new(), (0, 0)),
+        _ => ("called", name.to_owned(), (0, 0)),
+    };
+    format!("{kind}\t{what}\t{removed}\t{added}\t{failed}")
+}
+
+/// The row a fold of ordinary work is drawn as: what kinds of work it
+/// did and how much, the files it edited and their lines, and how many
+/// failed, as `Ran 2 commands, edited tally.py -1 +1`.
+fn work_row(items: &[String]) -> (Vec<Span<'static>>, usize) {
+    let mut ran = Vec::new();
+    let (mut read, mut looked, mut called, mut failed) = (0, 0, 0, 0);
+    let mut edited: Vec<String> = Vec::new();
+    let (mut removed, mut added) = (0, 0);
+    for item in items {
+        let mut field = item.split('\t');
+        let (kind, what) = (field.next().unwrap_or(""), field.next().unwrap_or(""));
+        let number = |n: Option<&str>| n.and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+        removed += number(field.next());
+        added += number(field.next());
+        failed += usize::from(field.next() == Some("true"));
+        match kind {
+            "ran" => ran.push(what.to_owned()),
+            "read" => read += 1,
+            "edited" => {
+                for file in what.split(", ").filter(|f| !f.is_empty()) {
+                    if !edited.iter().any(|seen| seen == file) {
+                        edited.push(file.to_owned());
+                    }
+                }
+            }
+            "looked up" => looked += 1,
+            _ => called += 1,
+        }
+    }
+    let plural = |n: usize, one: &str, many: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    };
+    let mut parts = Vec::new();
+    match ran.as_slice() {
+        [] => {}
+        [one] => parts.push(format!("ran {}", cut(one, 48))),
+        many => parts.push(format!("ran {}", plural(many.len(), "command", "commands"))),
+    }
+    if read > 0 {
+        parts.push(format!("read {}", plural(read, "file", "files")));
+    }
+    if looked > 0 {
+        parts.push(format!(
+            "searched the web {}",
+            plural(looked, "time", "times")
+        ));
+    }
+    if called > 0 {
+        parts.push(format!(
+            "made {}",
+            plural(called, "other call", "other calls")
+        ));
+    }
+    let editing = match edited.as_slice() {
+        [] => None,
+        [one] => Some(format!("edited {one}")),
+        [one, two] => Some(format!("edited {one} and {two}")),
+        many => Some(format!("edited {}", plural(many.len(), "file", "files"))),
+    };
+    let mut said = parts.join(", ");
+    let mut spans = Vec::new();
+    if let Some(editing) = editing {
+        if !said.is_empty() {
+            said.push_str(", ");
+        }
+        said.push_str(&editing);
+        let mut first = said.chars();
+        let said = first
+            .next()
+            .map_or(String::new(), |c| c.to_uppercase().chain(first).collect());
+        spans.push(Span::raw(said).bold());
+        spans.push(Span::raw("  "));
+        spans.extend(crate::diff::counts(removed, added));
+    } else {
+        let mut first = said.chars();
+        let said = first
+            .next()
+            .map_or(String::new(), |c| c.to_uppercase().chain(first).collect());
+        spans.push(Span::raw(said).bold());
+    }
+    if failed > 0 {
+        spans.push(Span::raw(format!(" · {failed} failed")));
+    }
+    (spans, failed)
+}
+
 /// Calls folded into one: what they did, said once with whom each did
 /// it to, `▸` to open them; open, the same row with `▾`, and each call's
 /// own rows under it.
@@ -1805,6 +1943,19 @@ pub fn folded(
         let mut first = first.clone();
         first.spans.push(Span::raw(" ▾").dim());
         return [vec![first], rest.to_vec()].concat();
+    }
+    if verb == WORK {
+        let (mut spans, failed) = work_row(whats);
+        spans.push(Span::raw(if open { " ▾" } else { " ▸" }).dim());
+        let bullet = match failed {
+            0 => Span::raw("• ").fg(Color::Green),
+            _ => Span::raw("✗ ").fg(Color::Red),
+        };
+        let mut out = wrap(Line::from(spans), width, bullet, Span::raw("    "));
+        if open {
+            out.extend(calls.iter().flatten().cloned());
+        }
+        return out;
     }
     let mut names = crate::calls::once(whats.iter().cloned()).join(", ");
     if let Some(at) = names.rfind(", ") {

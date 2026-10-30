@@ -1629,6 +1629,9 @@ struct Watch {
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
+    /// The agent `/status` has picked from the keys, by its place among
+    /// the agents it lists: ↑ and ↓ move it, Enter opens it.
+    pick: Option<usize>,
 }
 
 struct App {
@@ -3601,10 +3604,32 @@ impl App {
             &self.workspace,
             self.prose(),
         ));
+        // Ordinary work the clean view leaves out (commands, reads,
+        // edits) is said in one row for each stretch of it, which opens
+        // to every call as the verbose view draws it.
+        let (lines, work) = match lines.is_empty() && !self.verbose {
+            true => (
+                transcript::quiet(transcript::tool(
+                    name,
+                    arguments,
+                    Some(output),
+                    failed,
+                    &self.workspace,
+                    self.prose(),
+                )),
+                Some((
+                    transcript::WORK.to_owned(),
+                    transcript::work_item(name, arguments, failed, &self.workspace),
+                )),
+            ),
+            false => (lines, None),
+        };
         if lines.is_empty() {
             return;
         }
-        let Some((verb, what)) = transcript::folds(name, arguments, Some(output), failed) else {
+        let Some((verb, what)) =
+            work.or_else(|| transcript::folds(name, arguments, Some(output), failed))
+        else {
             self.commit(lines);
             return;
         };
@@ -4350,6 +4375,35 @@ impl App {
 
     /// The cluster `at` drawn again where it is; whether it is still in
     /// the conversation.
+    /// Opens every fold and gathered row still in the conversation, or
+    /// folds them all again when none is left shut.
+    fn open_all(&mut self) {
+        let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
+        let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
+            || self.clusters.values().any(|cluster| !cluster.open);
+        let folds: Vec<usize> = (self.folds.iter())
+            .filter(|(_, fold)| opens(fold))
+            .map(|(at, _)| *at)
+            .collect();
+        for at in folds {
+            if let Some(fold) = self.folds.get_mut(&at)
+                && fold.open != open
+            {
+                fold.open = open;
+                self.draw_fold(at);
+            }
+        }
+        let clusters: Vec<usize> = self.clusters.keys().copied().collect();
+        for at in clusters {
+            if let Some(cluster) = self.clusters.get_mut(&at)
+                && cluster.open != open
+            {
+                cluster.open = open;
+                self.draw_cluster(at);
+            }
+        }
+    }
+
     fn draw_cluster(&mut self, at: usize) -> bool {
         let (lines, marks) = self.cluster_lines(at);
         self.flush();
@@ -5917,8 +5971,9 @@ impl App {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         });
-        self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("/status", PICK_KEYS));
     }
 
     /// What runs for the project's agents with no one typing:
@@ -5942,6 +5997,7 @@ impl App {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
     }
@@ -5963,6 +6019,7 @@ impl App {
             usage: Some(view),
             commons: None,
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
     }
@@ -5984,6 +6041,7 @@ impl App {
             usage: None,
             commons: Some(commons::View::open(&home)),
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
     }
@@ -6691,6 +6749,46 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        // `/status` picks an agent from the keys and opens it, as a click
+        // on it does.
+        if self.finding.is_none()
+            && self.pane_keys
+            && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+            && self.pane.as_ref().is_some_and(|pane| pane.is_card())
+            && let Some(watch) = &self.watch
+            && watch.background.is_none()
+            && watch.usage.is_none()
+            && watch.commons.is_none()
+        {
+            let bots: Vec<String> = (watch_card(watch, self.width.max(40), &self.bot).2)
+                .into_iter()
+                .filter_map(|(_, mark)| match mark {
+                    screen::Mark::Link(link) => link
+                        .strip_prefix(&format!("{}task/", screen::BUTTON))
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            if !bots.is_empty() {
+                let last = bots.len() - 1;
+                let pick = watch.pick.map(|pick| pick.min(last));
+                let pick = match (key.code, pick) {
+                    (KeyCode::Up, Some(at)) => Some(at.saturating_sub(1)),
+                    (KeyCode::Up, None) => Some(last),
+                    (KeyCode::Down, Some(at)) => Some((at + 1).min(last)),
+                    (KeyCode::Down, None) => Some(0),
+                    (_, pick) => pick,
+                };
+                if key.code == KeyCode::Enter {
+                    if let Some(at) = pick {
+                        self.open_task(&bots[at]);
+                    }
+                } else if let Some(watch) = &mut self.watch {
+                    watch.pick = pick;
+                }
+                return true;
+            }
+        }
         if self.finding.is_none()
             && let Some(pane) = &mut self.pane
         {
@@ -6889,6 +6987,9 @@ impl App {
                 self.finding = Some(String::new());
                 self.screen.find("");
             }
+            // Every row a click opens, opened or folded from the keys, as
+            // Claude Code's Ctrl+O shows a turn's calls.
+            KeyCode::Char('o') if ctrl => self.open_all(),
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
@@ -8703,10 +8804,18 @@ impl App {
                 pane.set_card(lines, STATUS_KEYS);
                 pane.foot = Some(view.footer());
             } else {
-                let (lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                // The agent picked from the keys leads with `›`, as a
+                // pick in Codex's lists does.
+                if let Some(&(row, _)) = watch.pick.and_then(|pick| marks.get(pick))
+                    && let Some(first) = lines.get_mut(row).and_then(|line| line.spans.first_mut())
+                {
+                    *first = Span::raw("›").bold();
+                    pane.screen.keep_in_view(row, 2);
+                }
                 let keys = match any_resolved && watch.resolved {
-                    true => "r hides resolved · esc closes",
-                    false => STATUS_KEYS,
+                    true => "↑↓ pick · enter open · r hide resolved · esc close",
+                    false => PICK_KEYS,
                 };
                 pane.set_card_marked(lines, marks, keys);
             }
@@ -9372,6 +9481,9 @@ impl App {
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc closes";
+
+/// What the title row says the keys do on `/status` itself.
+const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; whether any task in it
@@ -11544,7 +11656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_clean_view_keeps_the_words_and_a_task_started_but_not_a_command() {
+    async fn the_clean_view_keeps_the_words_and_a_task_started_and_folds_a_command() {
         let started = r#"{"bot":"b.fix","handle":"turn:b.fix/1","status":"running","turn":1}"#;
         let client = daemon_answering(move |asked| {
             let item = match asked["nodes"][0].as_i64() {
@@ -11595,8 +11707,11 @@ mod tests {
         ))
         .await;
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
-        assert_eq!(rows[..4], ["• I'll look.", "", "• Started b.fix ▸", ""]);
-        assert!(rows.iter().all(|row| !row.contains("Ran")), "{rows:?}");
+        // The command is one row of work, folded, that a click opens.
+        assert_eq!(
+            rows[..4],
+            ["• I'll look.", "", "• Ran ls ▸", "• Started b.fix ▸"]
+        );
         assert_eq!(rows.last().map(String::as_str), Some("• Done."));
     }
 
@@ -11795,9 +11910,8 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         assert_eq!(drawn(&mut app).len(), 3);
-        // Something drawn between, or another kind of call, starts anew;
-        // a call the clean view hides does not.
-        app.commit_call("c", "shell", &json!({"command": "ls"}), "a", false);
+        // Something drawn between, or another kind of call, starts anew,
+        // a command's row of work included.
         start(&mut app, "calc.mul");
         app.commit_call(
             "c",
@@ -12338,6 +12452,7 @@ mod tests {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         };
         // A named lead's window: its own row opens nothing, and the
         // folder's other lead opens by its own name, not its label.
@@ -12499,6 +12614,74 @@ mod tests {
         assert!(app.composer_mouse(&mouse(drag, prompt::LEAD + 6, 13)));
         let line = |n: usize| lines[..n].iter().map(|l| l.len() + 1).sum::<usize>();
         assert_eq!(app.input.selection(), Some(line(2)..line(3) + 6));
+    }
+
+    #[tokio::test]
+    async fn a_stretch_of_work_is_one_row_that_ctrl_o_opens() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.width = 80;
+        app.commit(vec![Line::from("› fix it")]);
+        app.commit_call("a", "shell", &json!({"command": "make test"}), "FAIL", true);
+        let patch =
+            "*** Begin Patch\n*** Update File: calc.py\n@@\n-a = 1\n+a = 2\n*** End Patch\n";
+        app.commit_call("b", "apply_patch", &json!({"input": patch}), "ok", false);
+        app.commit_call("c", "shell", &json!({"command": "make test"}), "ok", false);
+        let rows = drawn(&mut app);
+        assert_eq!(
+            rows,
+            [
+                "› fix it",
+                "",
+                "✗ Ran 2 commands, edited calc.py  -1 +1 · 1 failed ▸"
+            ]
+        );
+        let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_o)).await;
+        let open = drawn(&mut app);
+        assert_eq!(
+            open[2],
+            "✗ Ran 2 commands, edited calc.py  -1 +1 · 1 failed ▾"
+        );
+        assert!(
+            open.iter().any(|row| row.starts_with("• Patched calc.py")),
+            "{open:?}"
+        );
+        app.key(Event::Key(ctrl_o)).await;
+        assert_eq!(drawn(&mut app).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn status_picks_an_agent_from_the_keys() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |name: &str| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "working".into(),
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![row("add"), row("neg")],
+            read: Instant::now(),
+            lookout: String::new(),
+            resolved: false,
+            background: None,
+            usage: None,
+            commons: None,
+            picked: None,
+            pick: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let pick = |app: &App| app.watch.as_ref().unwrap().pick;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(0));
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(1), "the last stays picked");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(pick(&app), Some(0));
     }
 
     #[tokio::test]
