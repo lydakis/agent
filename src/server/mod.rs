@@ -1874,7 +1874,8 @@ impl Service {
             Ok(())
         };
         // A tool a client answers is one the caller may pass on: one it has,
-        // may call, and gives the bots it makes, answered by the same client.
+        // may call, and gives the bots it makes, answered by the same client
+        // and gated as a whole unless the caller's is gated by its steps.
         // Another could get a client to act for it.
         let callable = |own: &agent_runtime::tools::Declared| {
             own.inherit
@@ -1886,7 +1887,10 @@ impl Service {
         let passes = |tool: &agent_runtime::tools::Declared| {
             tool.answered_by.is_none()
                 || me.declared.iter().any(|own| {
-                    callable(own) && own.name == tool.name && own.answered_by == tool.answered_by
+                    callable(own)
+                        && own.name == tool.name
+                        && own.answered_by == tool.answered_by
+                        && (own.steps || !tool.steps)
                 })
         };
         // The folders a request would give a bot, each of which the caller

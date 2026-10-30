@@ -2245,8 +2245,9 @@ it:
 The folder of these sockets stays read-only in every root, so no bot can
 put its own listener in another's place. A tool a client answers, declared
 for a bot the caller makes or callable by a fork it makes, must be one the
-caller has, may call and passes on, answered by the same client; another is
-`not_permitted`, and one it may not call isn't inherited. A root reached
+caller has, may call and passes on, answered by the same client, and taking
+`steps` only if the caller's does, since a call that takes steps skips the
+gates of the call as a whole; another is `not_permitted`, and one it may not call isn't inherited. A root reached
 through a link, which something swapped in since, is `sandbox_unavailable`.
 A socket inside a writable folder
 stays read-only too. On macOS the folders between a writable folder and
