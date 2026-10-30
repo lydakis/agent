@@ -558,7 +558,7 @@ that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
-and a call answered with an error says why under it. A task's own
+and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
 `resolve_task` is read from its history: its last turn resolved it. The
 lead's Sonny keeps each task the lead resolved beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a
