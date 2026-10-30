@@ -1788,9 +1788,73 @@ fn cells(line: &Line) -> Vec<String> {
     out
 }
 
+/// `cells` from [`Screen::link_cells`] kept only where `buf` still shows
+/// what they were taken from: a link something was drawn over since, as
+/// a list over the conversation, is dropped whole, so its address never
+/// writes over what covers it and no link is left open.
+pub fn keep_shown(cells: &mut Vec<(u16, u16, Cell)>, buf: &Buffer) {
+    const CLOSE: &str = "\x1b]8;;\x1b\\";
+    // What a cell shows, its address taken off.
+    let shown = |symbol: &str| -> String {
+        let symbol = symbol.strip_suffix(CLOSE).unwrap_or(symbol);
+        match symbol.strip_prefix("\x1b]8;;") {
+            Some(rest) => rest
+                .split_once("\x1b\\")
+                .map_or(rest, |(_, s)| s)
+                .to_owned(),
+            None => symbol.to_owned(),
+        }
+    };
+    let area = buf.area;
+    let same = |(x, y, cell): &(u16, u16, Cell)| {
+        area.contains((*x, *y).into())
+            && buf[(*x, *y)].symbol() == shown(cell.symbol())
+            && buf[(*x, *y)].style() == cell.style()
+    };
+    let mut kept = Vec::with_capacity(cells.len());
+    let mut link = Vec::new();
+    for cell in cells.drain(..) {
+        let last = cell.2.symbol().ends_with(CLOSE);
+        link.push(cell);
+        if last {
+            if link.iter().all(same) {
+                kept.append(&mut link);
+            }
+            link.clear();
+        }
+    }
+    *cells = kept;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_drawn_over_is_dropped_whole_and_one_still_shown_kept() {
+        let cell = |symbol: &str| {
+            let mut cell = Cell::default();
+            cell.set_symbol(symbol);
+            cell
+        };
+        let link = || {
+            vec![
+                (0, 0, cell("\x1b]8;;https://a.b\x1b\\a")),
+                (1, 0, cell("b\x1b]8;;\x1b\\")),
+                (3, 0, cell("\x1b]8;;https://c.d\x1b\\c\x1b]8;;\x1b\\")),
+            ]
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.set_string(0, 0, "ab c", Style::default());
+        let mut cells = link();
+        keep_shown(&mut cells, &buf);
+        assert_eq!(cells.len(), 3);
+        // A list drawn over the first link's second cell.
+        buf.set_string(1, 0, "x", Style::default());
+        let mut cells = link();
+        keep_shown(&mut cells, &buf);
+        assert_eq!(cells.iter().map(|c| c.0).collect::<Vec<_>>(), [3]);
+    }
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     fn screen(lines: Vec<Line<'static>>, width: u16, height: u16) -> (Screen, Buffer) {

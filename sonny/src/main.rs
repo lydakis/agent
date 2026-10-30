@@ -8720,7 +8720,8 @@ impl App {
             Some(_) => "ctrl+\\",
             None => "tab",
         };
-        let paint = |frame: &mut ratatui::Frame| {
+        let paint = |frame: &mut ratatui::Frame,
+                     linked: &mut Vec<(u16, u16, ratatui::buffer::Cell)>| {
             // The conversation above the rows that move, which sit right
             // under it until it fills the screen.
             let (area, pane) = self.split(frame.area());
@@ -9052,7 +9053,10 @@ impl App {
         };
         let look = look::Look::now();
         terminal.draw(|frame| {
-            paint(frame);
+            paint(frame, &mut linked);
+            // A link something was drawn over since, as a list over the
+            // conversation, is left as the frame drew it.
+            screen::keep_shown(&mut linked, frame.buffer_mut());
             look.finish(frame.buffer_mut());
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
