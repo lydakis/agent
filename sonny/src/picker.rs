@@ -106,7 +106,8 @@ impl List {
     }
 
     fn type_in(&mut self, text: &str) {
-        self.filter.push_str(text.trim());
+        // A pasted line's own newline is not text; a typed space is.
+        self.filter.push_str(text.trim_matches(['\r', '\n']));
         self.marked = 0;
         self.top = 0;
     }
@@ -278,7 +279,7 @@ mod tests {
             list.key(KeyCode::Enter, none, &rows, false),
             Some(Ok(Picked::Row(2)))
         );
-        for c in "haiku".chars() {
+        for c in "claude haiku".chars() {
             list.key(KeyCode::Char(c), none, &rows, false);
         }
         assert_eq!(list.shown(&rows), vec![1]);
