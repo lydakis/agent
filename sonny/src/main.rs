@@ -2084,9 +2084,12 @@ struct App {
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
-    /// How many of what `/background` lists failed, as the footer's `✗`
-    /// says.
+    /// How many of what `/background` lists failed since the person last
+    /// opened it, as the footer's `✗` says: a count of what is unread, as
+    /// a notification badge is, cleared by looking.
     failed: usize,
+    /// The failures `/background` lists, and those the person saw there.
+    failures: (Vec<String>, std::collections::HashSet<String>),
     /// How the turns triggers' last fires sent ended, by handle, as the
     /// daemon said: asked once a turn is seen, and again while it runs.
     turns: HashMap<String, Value>,
@@ -2723,6 +2726,7 @@ impl App {
             watch: None,
             behind: (0, None),
             failed: 0,
+            failures: Default::default(),
             turns: HashMap::new(),
             yours: None,
             suggesting: None,
@@ -4920,11 +4924,13 @@ impl App {
             rest = &rest[entries.len().min(rest.len())..];
             items.extend(entries.iter().flat_map(|entry| {
                 let node = entry["node"].as_i64().unwrap_or(0);
-                // Who sent a prompt, when another bot did.
-                let from = entry["from"]["bot"].clone();
+                // Who sent a prompt, when another bot did or a client from
+                // outside (the commons, an automation).
+                let from =
+                    transcript::sender(entry["from"]["bot"].as_str(), entry["origin"].as_str());
                 responses(&entry["item"]).into_iter().map(move |mut item| {
-                    if from.is_string() && item["role"] == "user" {
-                        item["from"] = from.clone();
+                    if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
+                        item["from"] = json!(from);
                     }
                     (node, item)
                 })
@@ -6204,6 +6210,9 @@ impl App {
     /// What runs for the project's agents with no one typing:
     /// `/background` in the pane, as `/status` is, until Esc.
     fn background(&mut self) {
+        // What failed is read now: the footer stops counting it.
+        self.failures.1 = self.failures.0.iter().cloned().collect();
+        self.failed = 0;
         let scope = self.scope();
         let project = scope.project.clone();
         let view = background::View::open(
@@ -6383,10 +6392,18 @@ impl App {
         self.turns.retain(|handle, _| fired.contains(handle));
         items.retain(|item| background::shown(&scope, item));
         self.behind = (background::count(&items, &self.bot), Some(Instant::now()));
-        self.failed = background::failed(&items);
+        self.count_failures(background::failures(&items));
         if let Some(view) = (self.watch.as_mut()).and_then(|w| w.background.as_mut()) {
             view.set_turns(&self.turns);
         }
+    }
+
+    /// The failures `/background` lists now: the footer counts those the
+    /// person has not seen there.
+    fn count_failures(&mut self, failures: Vec<String>) {
+        let seen = &self.failures.1;
+        self.failed = failures.iter().filter(|f| !seen.contains(*f)).count();
+        self.failures.0 = failures;
     }
 
     /// What the lookout does for this window's lead.
@@ -8165,6 +8182,12 @@ impl App {
                     // Codex queues; Enter steers.
                     KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
                     KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
+                    // As Codex's bottom pane does, Esc closes what is open
+                    // over the composer before it stops anything: an open
+                    // question is set aside first, as its hint says.
+                    KeyCode::Esc if !self.asks.is_empty() && !self.chatting => {
+                        self.chatting = true;
+                    }
                     KeyCode::Esc => {
                         if let Some(shell) = &self.shell {
                             shell.stop();
@@ -11846,6 +11869,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failure_is_counted_until_the_person_looks_at_it() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.count_failures(vec!["Trigger/nightly/turn:calc.lead/4/bot_busy".into()]);
+        assert_eq!(app.failed, 1);
+        // /background shows it: the footer stops counting it, also when
+        // counted again while it lasts.
+        app.background();
+        assert_eq!(app.failed, 0);
+        app.count_failures(vec!["Trigger/nightly/turn:calc.lead/4/bot_busy".into()]);
+        assert_eq!(app.failed, 0);
+        // The next fire failing too is news.
+        app.count_failures(vec!["Trigger/nightly/turn:calc.lead/9/bot_busy".into()]);
+        assert_eq!(app.failed, 1);
+    }
+
+    #[tokio::test]
     async fn an_emoji_reacts_to_a_reply_without_a_turn_and_again_takes_it_off() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -12195,6 +12235,41 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn esc_sets_an_open_question_aside_before_it_stops_the_turn() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request["op"].clone());
+            json!({})
+        })
+        .await;
+        let mut app = app(client);
+        app.asks = vec![
+            asks::call(
+                "c1",
+                &json!({"question": "Keep the old API?", "options": [
+                    {"label": "Keep it", "explanation": "e"},
+                    {"label": "Drop it", "explanation": "e"}]}),
+            )
+            .unwrap(),
+        ];
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+        });
+        let esc = || Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // The question asks first: Esc sets it aside, the turn runs on.
+        app.key(esc()).await;
+        assert!(app.chatting);
+        assert!(asked.lock().unwrap().is_empty());
+        // Nothing is open over the composer now: Esc stops the turn.
+        app.key(esc()).await;
+        assert_eq!(*asked.lock().unwrap(), [json!("interrupt")]);
     }
 
     #[tokio::test]

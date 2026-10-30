@@ -197,9 +197,17 @@ fn servers(root: &Path, project: &str) -> Vec<Item> {
     items
 }
 
-/// How many of `items` failed.
-pub fn failed(items: &[Item]) -> usize {
-    items.iter().filter(|item| item.failed.is_some()).count()
+/// Each failure among `items`, as a key that stays the same while the
+/// failure does: what failed, the fire whose turn did, and why. A later
+/// fire that fails again is a failure of its own.
+pub fn failures(items: &[Item]) -> Vec<String> {
+    (items.iter())
+        .filter_map(|item| {
+            let why = item.failed.as_ref()?;
+            let fire = item.handle.as_deref().unwrap_or("");
+            Some(format!("{:?}/{}/{fire}/{why}", item.kind, item.name))
+        })
+        .collect()
 }
 
 /// The turns `items`' last fires sent whose end `turns` does not have yet.
@@ -857,7 +865,7 @@ mod tests {
                 .all(|i| i.kind == Kind::Server && i.bots.is_empty())
         );
         assert_eq!(count(&found, "calc.lead"), 0);
-        assert_eq!(failed(&found), 2);
+        assert_eq!(failures(&found).len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
