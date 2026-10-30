@@ -550,8 +550,13 @@ pub fn spans(
     marked: &[(Range<usize>, Style)],
     selected: Option<&Range<usize>>,
 ) -> Vec<Span<'static>> {
+    // The marks on this row alone, in their order: a later one is laid
+    // over an earlier.
+    let marked: Vec<_> = (marked.iter())
+        .filter(|(piece, _)| piece.start < range.end && range.start < piece.end)
+        .collect();
     let mut cuts = vec![range.start, range.end];
-    for (piece, _) in marked {
+    for (piece, _) in &marked {
         cuts.extend([piece.start, piece.end]);
     }
     if let Some(selected) = selected {

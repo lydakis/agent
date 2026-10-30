@@ -1588,10 +1588,13 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
                 row["missed"] = json!(true);
             }
             let mut bots = vec![t.bot().to_owned()];
+            // Whose it is, as an ended one's row says too: its failures
+            // are told to them.
             if let Target::Start {
                 by: Some((by, _)), ..
             } = &t.target
             {
+                row["by"] = json!(by);
                 bots.push(by.clone());
             }
             if let Some((to, _)) = &t.reply_to {
@@ -3415,8 +3418,28 @@ pub async fn tell_failed(
     (bot, turn): (&str, i64),
     error: &str,
 ) {
-    let row = Places::home().ok().and_then(|places| {
-        on_store(&places, store_id)
+    let places = Places::home().ok();
+    let (to, prompt) = failed_note(places.as_ref(), store_id, generation, (bot, turn), error);
+    let _ = client
+        .request(
+            "submit",
+            json!({"bot": to, "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
+                "prompt": prompt, "delivery": "attach", "origin": "trigger"}),
+        )
+        .await;
+}
+
+/// Who is told of a fire's failed turn, and the note: the agent that made
+/// the trigger, else the one the fire sent.
+fn failed_note(
+    places: Option<&Places>,
+    store_id: &str,
+    generation: &str,
+    (bot, turn): (&str, i64),
+    error: &str,
+) -> (String, String) {
+    let row = places.and_then(|places| {
+        on_store(places, store_id)
             .into_iter()
             .map(|(row, _)| row)
             .find(|row| row["generation"] == generation)
@@ -3430,13 +3453,7 @@ pub async fn tell_failed(
         name.unwrap_or("(ended)"),
         stamp(now())
     );
-    let _ = client
-        .request(
-            "submit",
-            json!({"bot": to, "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
-                "prompt": prompt, "delivery": "attach", "origin": "trigger"}),
-        )
-        .await;
+    (to.to_owned(), prompt)
 }
 
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire
@@ -3947,6 +3964,41 @@ mod tests {
         let prompt = submit["prompt"].as_str().unwrap();
         assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
         assert!(prompt.ends_with(" · turn 4 it sent calc.lead failed: provider_error]"));
+    }
+
+    #[test]
+    fn a_failed_fires_turn_is_told_to_whoever_made_its_installed_trigger() {
+        let w = World::new("failed-note");
+        let started = Trigger {
+            name: "p.digest".into(),
+            target: Target::Start {
+                name: "p.digest".into(),
+                model: "openai/gpt".into(),
+                effort: None,
+                by: Some(("p.lead".into(), 7)),
+            },
+            ..trigger()
+        };
+        w.install(&started).unwrap();
+        let (to, prompt) = failed_note(
+            Some(&w.places),
+            &started.store_id,
+            &started.generation,
+            ("p.digest", 3),
+            "provider_error",
+        );
+        assert_eq!(to, "p.lead");
+        assert!(prompt.starts_with("[trigger p.digest · "), "{prompt}");
+        // One no agent made, or no longer found: the agent the fire sent.
+        let (to, prompt) = failed_note(
+            Some(&w.places),
+            &started.store_id,
+            "9-9",
+            ("p.fix-login", 3),
+            "provider_error",
+        );
+        assert_eq!(to, "p.fix-login");
+        assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
     }
 
     #[test]
@@ -4560,6 +4612,7 @@ mod tests {
             ]
         );
         assert_eq!(found[1].0["when"], "every 30m");
+        assert_eq!(found[0].0["by"], "p.lead");
     }
 
     #[test]

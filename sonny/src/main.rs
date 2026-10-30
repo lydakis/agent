@@ -1210,7 +1210,7 @@ fn areas(area: ratatui::layout::Rect, live: u16) -> [ratatui::layout::Rect; 5] {
 
 /// At most `keep` of `rows`, as near the end as still shows `row`; and
 /// where `row` is among them.
-fn window(mut rows: Vec<Line<'static>>, row: usize, keep: usize) -> (Vec<Line<'static>>, usize) {
+fn window<T>(mut rows: Vec<T>, row: usize, keep: usize) -> (Vec<T>, usize) {
     let start = rows.len().saturating_sub(keep).min(row);
     rows.drain(..start);
     rows.truncate(keep);
@@ -1648,6 +1648,9 @@ struct Running {
     /// The lookout's note started it: it ends quietly unless the bot
     /// says something.
     note: bool,
+    /// The effort it runs at, when the daemon said: a boost is this turn's
+    /// alone, so the bot's own stays in `App::effort`.
+    effort: Option<String>,
 }
 
 /// Whether the lookout sent the turn: its note, by its request ID.
@@ -2759,6 +2762,7 @@ impl App {
                 started: Instant::now(),
                 phase: "Working".into(),
                 note: false,
+                effort: None,
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
@@ -3723,6 +3727,7 @@ impl App {
                     started: Instant::now(),
                     phase: "Working".into(),
                     note: false,
+                    effort: None,
                 });
                 self.turn_began().await;
                 status_report("working", &self.bot);
@@ -5701,6 +5706,7 @@ impl App {
                     started: Instant::now(),
                     phase: "Working".into(),
                     note: from_lookout(data),
+                    effort: data["effort"].as_str().map(str::to_owned),
                 });
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
@@ -5710,7 +5716,6 @@ impl App {
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
-                self.effort = data["effort"].as_str().map(str::to_owned);
                 status_report("working", &self.bot);
                 // A turn the history drew still answers the message it
                 // drew, with what the bot reacted to it with so far.
@@ -9816,13 +9821,34 @@ impl App {
         // A shell command is marked as one while it is typed.
         let shell = self.input.starts_with('!');
         let selected = self.input.selection();
-        // Markdown shows as it will read, its marks kept.
+        let keep = match self.choosing.is_some()
+            || self.approving.is_some()
+            || self.picker.is_some()
+            || self.config.is_some()
+            || self.reacting.is_some()
+            || self.finding.is_some()
+        {
+            true => 1,
+            false => COMPOSER_ROWS,
+        };
+        let rows = layout.len();
+        let (layout, row) = match &self.composing {
+            // While the mouse button is down the rows stay where the press
+            // found them, so the text under the mouse is what it selects.
+            Some((_, (_, first, _))) => {
+                let first = (*first).min(rows - 1);
+                let row = row.saturating_sub(first).min(keep - 1);
+                (layout.into_iter().skip(first).take(keep).collect(), row)
+            }
+            None => window(layout, row, keep),
+        };
+        // Markdown shows as it will read, its marks kept: styled on the
+        // rows shown alone, so a long paste costs no more to draw.
         let marked = prompt::marks(&self.input);
         let rows: Vec<Line<'static>> = layout
             .iter()
-            .enumerate()
-            .map(|(at, part)| {
-                let lead = match at {
+            .map(|part| {
+                let lead = match part.start {
                     0 if shell => Span::raw("› ").bold().fg(Color::Magenta),
                     0 if answering.is_some() => Span::raw("? ").bold().fg(Color::Yellow),
                     0 => Span::raw("› ").bold(),
@@ -9838,26 +9864,6 @@ impl App {
                 Line::from(spans)
             })
             .collect();
-        let keep = match self.choosing.is_some()
-            || self.approving.is_some()
-            || self.picker.is_some()
-            || self.config.is_some()
-            || self.reacting.is_some()
-            || self.finding.is_some()
-        {
-            true => 1,
-            false => COMPOSER_ROWS,
-        };
-        let (rows, row) = match &self.composing {
-            // While the mouse button is down the rows stay where the press
-            // found them, so the text under the mouse is what it selects.
-            Some((_, (_, first, _))) => {
-                let first = (*first).min(rows.len() - 1);
-                let row = row.saturating_sub(first).min(keep - 1);
-                (rows.into_iter().skip(first).take(keep).collect(), row)
-            }
-            None => window(rows, row, keep),
-        };
         (rows, (row, col))
     }
 
@@ -9963,7 +9969,9 @@ impl App {
         };
         let folder = tilde(&self.workspace);
         let mut left = format!("  {}", self.model);
-        if let Some(effort) = &self.effort {
+        // What the running turn runs at, as a boost has it; else the bot's.
+        let effort = (self.running.as_ref()).and_then(|running| running.effort.as_ref());
+        if let Some(effort) = effort.or(self.effort.as_ref()) {
             left.push_str(&format!(" {effort}"));
         }
         if let Some(boost) = &self.boost {
@@ -10693,6 +10701,24 @@ mod tests {
         assert_eq!(submits[0]["effort"], "max");
         assert!(submits[1]["effort"].is_null());
         assert!(app.boost.is_none());
+        // The boosted turn runs at its effort, and the bot's own is what
+        // the next boost steps up from.
+        app.effort = Some("medium".into());
+        app.daemon(turn_event("accepted", 1, json!({"effort": "max"})))
+            .await;
+        assert!(app.footer_line(120).to_string().contains(" max"));
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(app.effort.as_deref(), Some("medium"));
+        let footer = app.footer_line(120).to_string();
+        assert!(
+            footer.contains(" medium") && !footer.contains(" max"),
+            "{footer}"
+        );
     }
 
     #[tokio::test]
@@ -12510,6 +12536,7 @@ mod tests {
             started: Instant::now(),
             phase: "Working".into(),
             note: false,
+            effort: None,
         });
         assert!(!app.configure().await);
         assert!(asked.lock().unwrap().is_empty());
@@ -12545,6 +12572,7 @@ mod tests {
             started: Instant::now(),
             phase: "Working".into(),
             note: false,
+            effort: None,
         });
         let esc = || Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         // The question asks first: Esc sets it aside, the turn runs on.
@@ -12581,6 +12609,7 @@ mod tests {
             started: Instant::now(),
             phase: "Working".into(),
             note: false,
+            effort: None,
         });
         app.yours = Some(1);
         assert!(!app.status_line().to_string().contains("tab to queue"));
