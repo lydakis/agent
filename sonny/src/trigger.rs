@@ -25,6 +25,7 @@
 //! add, list, fire and remove them.
 use agent_client::Client;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -1599,6 +1600,35 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
             (row, bots)
         })
         .collect();
+    // One that ended keeps its row when it has something to say, as a
+    // one-shot that did not deliver or one stopped by an error.
+    for entry in std::fs::read_dir(&places.state)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let file = entry.file_name();
+        let Some(name) = file.to_str().and_then(|f| f.strip_suffix(".json")) else {
+            continue;
+        };
+        if valid_name(name).is_err()
+            || places.job(name).exists()
+            || found.iter().any(|(row, _)| row["name"] == name)
+        {
+            continue;
+        }
+        let Some(mut row) = read_json(&places.last(name))
+            .filter(|row| row["name"] == name && row["store_id"] == store_id)
+        else {
+            continue;
+        };
+        row["ended"] = json!(true);
+        let bots: Vec<String> = ["bot", "by", "reply_to"]
+            .iter()
+            .filter_map(|key| row[*key].as_str().map(str::to_owned))
+            .collect();
+        found.push((row, bots));
+    }
     found.sort_by(|a, b| a.0["name"].as_str().cmp(&b.0["name"].as_str()));
     found
 }
@@ -2988,6 +3018,16 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     let mut row = trigger.json(&json!({"last": last, "sent": kept.sent,
         "started_id": kept.started_id}));
     row["started_id"] = json!(kept.started_id);
+    // Whose it is once its job is gone: a failure it retired with is
+    // shown on that daemon's windows only, and on the windows of the
+    // agent that added it to start its own.
+    row["store_id"] = json!(trigger.store_id);
+    if let Target::Start {
+        by: Some((by, _)), ..
+    } = &trigger.target
+    {
+        row["by"] = json!(by);
+    }
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
     row["checked"] = kept.checked.clone();
@@ -3426,6 +3466,56 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
 
 /// What a turn's `wait` result says: its text, else its error. A turn that
 /// ended saying nothing passes on nothing, not "null".
+/// The turn the last fire of `row` sent, by handle, when it sent one.
+pub fn sent(row: &Value) -> Option<String> {
+    let last = &row["last"];
+    (last["outcome"] == "sent")
+        .then(|| last["handle"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+/// How the turns of `handles` ended, read from the daemon at once: each
+/// one that ended, by handle, as `wait` gives it. A turn still running,
+/// or a daemon that does not answer, is left out.
+pub async fn ended(client: &Client, handles: Vec<String>) -> HashMap<String, Value> {
+    let mut found = HashMap::new();
+    // As many as one `wait` takes at a time.
+    for some in handles.chunks(64) {
+        let Ok(waited) = client
+            .request("wait", json!({"handles": some, "timeout_ms": 0}))
+            .await
+        else {
+            continue;
+        };
+        found.extend(
+            (waited["results"].as_object().into_iter().flatten())
+                .filter(|(_, result)| result["pending"] != true && result["status"].is_string())
+                .map(|(handle, result)| (handle.clone(), result.clone())),
+        );
+    }
+    found
+}
+
+/// `row`, its `last` taking how the turn its fire sent ended, from
+/// `ended`: its `turn_status`, and `turn_error` when it did not complete,
+/// so a fire that went out and whose turn then failed, as when the machine
+/// was offline or a login expired, reads so wherever its row is shown.
+pub fn with_turn(row: &mut Value, ended: &HashMap<String, Value>) {
+    let Some(result) = sent(row).and_then(|handle| ended.get(&handle)) else {
+        return;
+    };
+    let status = result["status"].clone();
+    if status != "completed" {
+        let error = answer(&json!({"error": result["error"]}));
+        row["last"]["turn_error"] = json!(match result["detail"].as_str() {
+            Some(detail) if !error.is_empty() => format!("{error}: {detail}"),
+            Some(detail) => detail.to_owned(),
+            None => error,
+        });
+    }
+    row["last"]["turn_status"] = status;
+}
+
 fn answer(result: &Value) -> String {
     match (result["text"].as_str(), &result["error"]) {
         (Some(text), _) if !text.is_empty() => text.to_owned(),
@@ -5146,6 +5236,35 @@ mod tests {
                 .unwrap()
                 .starts_with("asks_stuck:")
         );
+        // Its job gone, its failure is still its store's to show, and no
+        // other's.
+        let kept = on_store(&w.places, &s.store_id);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0["ended"], true);
+        assert_eq!(kept[0].0["last"]["outcome"], "failed");
+        assert_eq!(kept[0].1, [s.bot().to_owned()]);
+        assert!(on_store(&w.places, "another-store").is_empty());
+        // One that starts its agent stays the adder's too.
+        let started = Trigger {
+            name: "digest".into(),
+            target: Target::Start {
+                name: "digest".into(),
+                model: "openai/gpt".into(),
+                effort: None,
+                by: Some(("p.lead".into(), 7)),
+            },
+            ..trigger()
+        };
+        w.install(&started).unwrap();
+        stops(&w.places, &started, "start_failed: no".into(), &|x| {
+            w.fake.call(x)
+        });
+        let kept = on_store(&w.places, &s.store_id);
+        let digest = kept
+            .iter()
+            .find(|(row, _)| row["name"] == "digest")
+            .unwrap();
+        assert_eq!(digest.1, ["digest".to_owned(), "p.lead".to_owned()]);
     }
 
     #[test]
