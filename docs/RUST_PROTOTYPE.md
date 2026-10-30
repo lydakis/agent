@@ -2594,7 +2594,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   while the holder's session is open and its lease
   runs or its serve reply is not out yet. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
-  600,000), counted from when its serve reply is queued; pushes follow
+  600,000), counted from when its serve reply is queued. A renewal on the
+  main socket is answered as it is read, ahead of the session's requests
+  still queued for the service loop, since it touches no storage; pushes follow
   the reply, so neither the rest of a storage group nor a burst of pushes
   uses up the lease or the reply's room. An accepted leased answer holds
   the tag through storage and reply backpressure, restarting the period
