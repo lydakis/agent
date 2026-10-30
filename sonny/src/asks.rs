@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 pub const TOOL: &str = "ask";
 /// Options are picked by one digit.
 const OPTIONS: usize = 9;
-/// The bar down a decision's left side.
+/// The mark a decision starts with, and the bar down its left side.
+const GLYPH: &str = "? ";
 const BAR: &str = "┃ ";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,19 +198,22 @@ pub fn answer(ask: &Ask, typed: &str) -> String {
 
 /// The decision as it is drawn where it was asked: the question, why,
 /// each option by number with what it means, and the recommendation;
-/// and the row each option starts on, which a click picks it on. A bar
-/// down its left side sets it apart from the replies around it, as a
-/// callout's does.
+/// and the row each option starts on, which a click picks it on. A `?`
+/// in yellow, what needs the person, starts it, and a muted bar down its
+/// left side sets it apart from the replies around it, as a callout's
+/// does: a shape of its own without color too.
 pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut options = Vec::new();
-    let indent = || Span::raw(BAR).fg(Color::Yellow);
+    let indent = || Span::raw(BAR).dim();
     // What the agent wrote reads as its Markdown, as a reply does; the
     // bar keeps its own look.
     let markdown = |text: &str, first: Line<'static>, rest: Line<'static>, style: Style| {
         let mut markdown = crate::transcript::Markdown::default();
         let rows = crate::transcript::markdown(&mut markdown, text, width, (first, rest));
         rows.into_iter().map(move |mut row| {
-            for span in row.spans.iter_mut().filter(|span| span.content != BAR) {
+            for span in
+                (row.spans.iter_mut()).filter(|span| ![BAR, GLYPH].contains(&&*span.content))
+            {
                 span.style = style.patch(span.style);
             }
             row
@@ -218,7 +222,7 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut rows = Vec::new();
     rows.extend(markdown(
         &ask.question,
-        Line::from(indent()),
+        Line::from(Span::raw(GLYPH).fg(Color::Yellow).bold()),
         Line::from(indent()),
         Style::new().bold(),
     ));
@@ -364,7 +368,7 @@ mod tests {
         assert_eq!(
             shown,
             [
-                "┃ Keep the old API?",
+                "? Keep the old API?",
                 "┃ The wire format changes, and 0.3 clients break.",
                 "┃ ",
                 "┃ 1  Keep it",
@@ -386,16 +390,26 @@ mod tests {
         let at = narrow.iter().position(|row| row == "┃ 1  Keep it").unwrap();
         assert_eq!(narrow[at + 1], "┃    Old clients work; a shim");
         assert_eq!(narrow[at + 2], "┃    stays a release.");
-        // The bar keeps its own look down the whole decision, dim rows
-        // and bold ones alike.
-        for row in &rows {
-            let bar = row.spans.iter().find(|span| !span.content.is_empty());
-            let bar = bar.expect("a row drawn");
-            assert_eq!(
-                (bar.content.as_ref(), bar.style.fg),
-                (BAR, Some(Color::Yellow))
-            );
-            assert!(bar.style.add_modifier.is_empty(), "{row}");
+        // A yellow ? starts it, and a muted bar goes down the rest of it,
+        // dim rows and bold ones alike.
+        for (at, row) in rows.iter().enumerate() {
+            let mark = row.spans.iter().find(|span| !span.content.is_empty());
+            let mark = mark.expect("a row drawn");
+            match at {
+                0 => assert_eq!(
+                    (mark.content.as_ref(), mark.style.fg),
+                    (GLYPH, Some(Color::Yellow))
+                ),
+                _ => assert_eq!(
+                    (
+                        mark.content.as_ref(),
+                        mark.style.fg,
+                        mark.style.add_modifier
+                    ),
+                    (BAR, None, ratatui::style::Modifier::DIM),
+                    "{row}"
+                ),
+            }
         }
     }
 
@@ -414,14 +428,17 @@ mod tests {
             .iter()
             .map(|row| row.to_string())
             .collect();
-        assert_eq!(shown[0], "┃ Ship 0.5 with --fast on?");
+        assert_eq!(shown[0], "? Ship 0.5 with --fast on?");
         assert_eq!(
             shown[3],
             "┃    Runs n² checks, see the plan (https://x.dev)."
         );
         // The question stays bold, past what its words make bold.
         let question = &lines(&ask, 80).0[0];
-        let words = question.spans.iter().skip_while(|span| span.content != BAR);
+        let words = question
+            .spans
+            .iter()
+            .skip_while(|span| span.content != GLYPH);
         assert!(words.skip(1).all(|span| {
             span.style
                 .add_modifier

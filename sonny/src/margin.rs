@@ -1056,7 +1056,7 @@ fn head(note: &Note, width: usize, live: bool) -> (Line<'static>, crate::screen:
     // The agent it is about opens beside the conversation, as a click on
     // that agent's row does.
     if let Some(agent) = &note.opens {
-        spans.extend([Span::raw("↗").fg(Color::Yellow), Span::raw("  ")]);
+        spans.extend([Span::raw("↗").fg(Color::Cyan), Span::raw("  ")]);
         buttons.push((opens, opens + 1, format!("{BUTTON}task/{agent}")));
     }
     let up = opens + 3 * u16::from(note.opens.is_some());

@@ -533,13 +533,14 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   can be undone, or ends its turn. Open questions are read from the
   history Sonny replays (its `ask` calls not yet answered), so one asked
   while Sonny was closed is answered the same way when it opens. A yellow
-  bar down its left side sets it apart from the replies around it. A task
+  `?` starts it and a muted bar runs down its left side, setting it apart
+  from the replies around it with or without color. A task
   asks the same way: its lead hears the question in its task updates
   (`shop.wire asks you`), the task's row reads `needs you`, and a click on
   it opens the task in the pane, where an option's click answers the task
   itself.
 
-  ![A task's question: the lead's task updates say the task asks, and the task opened in the pane shows the decision with a bar down its side](../docs/sonny/ask-from-task.png)
+  ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
@@ -818,8 +819,6 @@ pictures, and code in syntax colors.
 ![Closed with /margin, then the lead put up a new note: the margin opened again with it](../docs/sonny/margin-opens-again.png)
 
 ![The lead heard that wire asks you and keeps it on your list in the margin, its ↗ ready to open wire](../docs/sonny/margin-opens-task.png)
-
-![The ↗ clicked: wire opened over the margin with its question, ← going back to the margin](../docs/sonny/margin-opens-task-opened.png)
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
