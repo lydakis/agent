@@ -512,9 +512,10 @@ fn translate(from: &'static str, raw: Raw) -> Found {
     found
 }
 
-/// Each secret of `chosen` that `~/.agent/env` (`kept`) or a server before
-/// it already holds with another value stays in its server's `env`
-/// instead, since one variable can hold only one.
+/// Each secret of `chosen` that the environment children get (`kept`, the
+/// shell's with `~/.agent/env` over it) or a server before it already holds
+/// with another value stays in its server's `env` instead, since one
+/// variable can hold only one; a URL server's token takes a free name.
 fn settle(chosen: &mut [Found], kept: &[(String, String)]) {
     let mut taken: BTreeMap<String, String> = kept.iter().cloned().collect();
     for found in chosen {
@@ -566,7 +567,11 @@ fn settle(chosen: &mut [Found], kept: &[(String, String)]) {
 pub fn bring(mut chosen: Vec<Found>) -> Result<Vec<Found>, String> {
     let config = agent_client::config::path().ok_or("set HOME")?;
     let env = agent_client::env_file::path().ok_or("set HOME")?;
-    settle(&mut chosen, &agent_client::env_file::read(&env)?);
+    // What children see: the shell's environment, with the file over it.
+    // A name the file unsets stays taken: the person meant it unset.
+    let mut kept: BTreeMap<String, String> = std::env::vars().collect();
+    kept.extend(agent_client::env_file::read(&env)?);
+    settle(&mut chosen, &kept.into_iter().collect::<Vec<_>>());
     let secrets: Vec<(&str, &str)> = (chosen.iter())
         .flat_map(|f| f.secrets.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .collect();
