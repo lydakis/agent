@@ -75,12 +75,24 @@ or not a window is open. Settings go in
 `--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
 agent's when none is named) and the efforts below. When no provider is named
 and no key is set, the first `sonny` in a terminal asks for one, as Codex and
-Claude Code ask for a sign-in: a ChatGPT plan (signed in with `agent login
-chatgpt`), an Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS
-profile. A new project's model is `--model`, else the project file's or the
-role's, else `AGENT_MODEL`, else the config's `model`, else the newest
-agent's; with none, Sonny lists what the providers offer and keeps the pick
-as `model`. Either step also suggests efforts, `[sonny] lead_effort =
+Claude Code ask for a sign-in, in a list picked with the arrow keys: a
+ChatGPT plan (signed in with `agent login chatgpt`), Bedrock, or an
+Anthropic, OpenAI or OpenRouter key. It first looks at what the machine has
+and offers that first: a ChatGPT sign-in of its own or Codex's (only that
+there is one), and the AWS profiles in `~/.aws/config` and
+`~/.aws/credentials`, which Bedrock then offers by name with their regions.
+A new project's model is `--model`, else the project file's or the role's,
+else `AGENT_MODEL`, else the config's `model`, else the newest agent's; with
+none, Sonny lists what the providers offer, ranked, the first marked
+recommended so Enter takes it: models no agent runs on (embeddings, speech,
+images, realtime) and dated snapshots of a listed name are left out, and
+Bedrock's global inference profiles come first. A provider that will not
+list says how to fix it (`aws sso login --profile NAME` for an expired AWS
+session), and Enter lists again. The pick is kept as `model`, and a new
+`config.toml` starts with comments saying what each setting does. Setup
+ends with what it chose and with any tool agents need that is missing
+(bubblewrap for the sandbox on Linux, ripgrep), with the command that
+installs it. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is

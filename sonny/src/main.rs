@@ -41,6 +41,7 @@ mod mermaid;
 mod models;
 mod mux;
 mod pane;
+mod picker;
 mod place;
 mod plan;
 mod project;
@@ -208,6 +209,7 @@ fn usage() -> String {
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
+     sonny setup asks again for the provider and the default model, as the first run does.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
@@ -498,7 +500,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-            setup::provider(&bin)?;
+            setup::provider(&bin, false)?;
             start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,
@@ -747,6 +749,18 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "setup" && rest.is_empty() => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let (store, socket) = daemon_paths(None, None)?;
+                        setup::again(&store, &socket).await
+                    })
+                })
+        }
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
@@ -956,6 +970,9 @@ async fn run() -> Result<(), String> {
     // beside their edits; a side chat leaves it to its agent.
     if options.side.is_none() {
         app.upgrades = skills::upgraded();
+    }
+    if let Some(set) = setup::just_set() {
+        app.notice = Some(set);
     }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
