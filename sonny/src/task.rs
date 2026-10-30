@@ -130,6 +130,19 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     } else {
         worktree(&at, name)?
     };
+    // The task's folder in its worktree is the worktree's own, not one a
+    // link committed in its place leads out of it to.
+    if let Some((_, path)) = &place.copy {
+        let tree = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if !std::fs::canonicalize(&place.dir).is_ok_and(|dir| dir.starts_with(&tree)) {
+            undo(&place.undo);
+            return Err(format!(
+                "{} is a link in the repository's last commit, leading out of it; start the \
+                 task from a folder that is not",
+                at.display()
+            ));
+        }
+    }
     // A task given a folder writes the git folder of the repository its
     // worktree was made of, which must be inside the lead's, as the
     // lead's own is: not a repository elsewhere that a link or a `.git`

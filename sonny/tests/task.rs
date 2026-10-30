@@ -526,6 +526,18 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
         );
     }
     assert!(!lab.home.join(".agent/worktrees/demo.away").exists());
+    // As is one the last commit has as a link out of the repository,
+    // whatever is there now.
+    std::os::unix::fs::symlink(&lab.scratch, api.join("out")).unwrap();
+    lab.git(&api, &["add", "out"]);
+    lab.git(&api, &["commit", "-qm", "out"]);
+    std::fs::remove_file(api.join("out")).unwrap();
+    std::fs::create_dir(api.join("out")).unwrap();
+    let away = serde_json::json!({"name": "away", "brief": "b", "folder": "src/api/out"});
+    let (ok, said) = lab.tool(&ws, "start_task", away, false);
+    assert!(!ok && said.contains("leading out of it"), "{said}");
+    assert!(!lab.home.join(".agent/worktrees/demo.away").exists());
+    assert_eq!(lab.git(&api, &["branch", "--list", "agent/demo.away"]), "");
     // Recorded as the lead's, for its project's memory.
     let record = lab.home.join(".agent/worktrees/.folders/demo.fix");
     assert_eq!(
