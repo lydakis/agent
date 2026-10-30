@@ -314,7 +314,14 @@ forwards that path. A socket path that is not UTF-8, which the ready line
 cannot carry, is refused before anything starts (`socket_path_unsupported`). When the daemon holding the socket speaks another
 protocol, `start` still prints its ready line and then fails with
 `daemon_protocol_mismatch`, so a caller can tell an older daemon from a newer
-one. `stats` starts it as `start` does, so it answers on a fresh install;
+one. An older one that names its pid is replaced instead, by every command
+that may start the daemon (not with `--no-spawn`, and not from inside a bot's
+turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
+it is asked to shut down with a 2-minute grace, so running turns may finish
+while none starts, or sent SIGTERM when it refuses that request, as daemons
+before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
+socket and upgrades the store. Sonny starts the daemon this way, so opening it
+after an upgrade replaces the old daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
