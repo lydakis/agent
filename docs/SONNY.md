@@ -554,7 +554,9 @@ every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
 as a file; `memory`, what to save for later agents; `commons`, the threads
 agents share (see Commons); `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
-Triggers); and, depending on where it runs, `pictures`, `rex-windows`,
+Triggers); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
+flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md)); and,
+depending on where it runs, `pictures`, `rex-windows`,
 `herdr-panes` or `cmux-tabs`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
@@ -586,8 +588,9 @@ the bot to tell the person what of them matters, and once it is sent the
 new register is the heard one. No version is compared, so a skipped release
 is told with the next. The first register a person has is heard of without
 a word. The note also offers each setup step an upgrade brings that the
-person has neither done nor been offered (`setup::STEPS`, now bringing in
-MCP servers with `sonny mcp import`): each is offered once, then noted in
+person has neither done nor been offered (`setup::STEPS`: bringing in
+MCP servers with `sonny mcp import`, and a git backup with `sonny setup
+backup`): each is offered once, then noted in
 `~/.agent/sonny/offered`, as is one setup itself offers. The row reads
 `↳ Sonny upgraded · what's new · set up mcp-import`.
 

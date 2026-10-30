@@ -94,7 +94,17 @@ ends with what it chose and with any tool agents need that is missing
 (bubblewrap for the sandbox on Linux, ripgrep), with the command that
 installs it. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
 up (in your home or this folder), setup offers them too, all ticked, as
-`sonny mcp import` does. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
+`sonny mcp import` does. When no way to reach a model is ready, setup also
+offers each of those agents found on `PATH` ("Let Claude Code set up
+Sonny"): it starts that agent in this terminal (`claude`, `codex`,
+`opencode --prompt`, `kiro-cli chat`) with a first message pointing at the
+`sonny-setup` skill, in the agent's own permission mode, and goes on once
+the person leaves it with a provider set. `sonny setup` asks both again.
+With flags it asks nothing: `--provider chatgpt|anthropic|openai|openrouter|bedrock`
+(a key already set, or one on stdin with `--key-stdin`; `--profile NAME`
+for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
+(never a folder's own servers), and `--json`, which prints what the machine
+has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
@@ -114,7 +124,11 @@ cleanup find nothing to do. On a machine that never synced, setup first
 restores what the repository holds, keeping a `config.toml` it replaces as
 `config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
 backup URL`. `sonny home status` says how the last sync went. Pushing uses
-the person's own git credentials, read from the login shell.
+the person's own git credentials, read from the login shell. Sonny names
+no host for the repository. First-run setup offers it last, once, and an
+empty answer skips it; until backup is set up, the first lead after an
+upgrade offers it once, and makes the private repository wherever this
+machine keeps its own.
 
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
