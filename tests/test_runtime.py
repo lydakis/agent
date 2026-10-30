@@ -351,7 +351,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]},
                               {'type': 'function_call', 'name': 'shell', 'call_id': 'slow-1',
-                               'arguments': json.dumps({'command': 'sleep 2'})}]
+                               'arguments': json.dumps({'command': getattr(self.server, 'slow_command', 'sleep 2')})}]
                 else:
                     text = 'heard'
                     output = [{'type': 'message', 'role': 'assistant',
@@ -1600,6 +1600,22 @@ class RuntimeTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='background',
                               prompt='bg:sleep 30')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('stats')['result']['running_processes'], 1)
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+
+    def test_a_pause_ends_a_command_a_steer_moved_to_the_background(self):
+        self.model.slow_command = 'sleep 30'
+        client = self.client('echo,shell,wait')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Alice', workspace=str(self.path))
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == alice['turn'])
+        client.request('submit', bot='Alice', request_id='s', prompt='steer:on', delivery='steer')
+        self.assertEqual(client.finished(alice['turn'])['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['running_processes'], 1)
         client.request('pause', reason='the loop is sending mail', by='calc.a')
         deadline = time.monotonic() + 5

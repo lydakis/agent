@@ -829,7 +829,7 @@ async fn run() -> Result<(), String> {
         .request("follow", json!({"bot": name, "after": 0}))
         .await
         .map_err(|e| e.to_string())?;
-    let context = caught_up(&mut events).await;
+    let caught = caught_up(&mut events).await;
     let bot = client
         .request("inspect", json!({"bot": name}))
         .await
@@ -845,7 +845,8 @@ async fn run() -> Result<(), String> {
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = terminal.clear();
     let mut app = App::new(client, &name, &bot, options.clone());
-    app.context = context;
+    app.context = caught.context;
+    app.paused = caught.paused(&app.client);
     app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
@@ -1181,20 +1182,43 @@ fn status_report(state: &str, bot: &str) {
 /// the client's queue and cut the stream before it goes live.
 /// Skip the replay of a follow up to its live events; returns how big the
 /// context was after the last model round it held, when it held one.
-async fn caught_up(events: &mut Events) -> Option<u64> {
-    let mut context = None;
+async fn caught_up(events: &mut Events) -> Caught {
+    let mut caught = Caught::default();
     let replay = async {
         while let Some(event) = events.recv().await {
             if event["event"] == "follow_live" {
                 return;
             }
             if let Some(size) = context_after(&event) {
-                context = Some(size);
+                caught.context = Some(size);
+            }
+            // A pause or resume since the greeting, which no replay brings
+            // again.
+            match event["event"].as_str() {
+                Some("paused") => caught.pause = Some(event["pause"].clone()),
+                Some("resumed") => caught.pause = Some(Value::Null),
+                _ => {}
             }
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(30), replay).await;
-    context
+    caught
+}
+
+/// What a follow's replay brought before it went live: the context after
+/// its last round, and the pause as a pause or resume meanwhile left it.
+#[derive(Default)]
+struct Caught {
+    context: Option<u64>,
+    pause: Option<Value>,
+}
+
+impl Caught {
+    /// The pause now: as the greeting said, unless one came since.
+    fn paused(&self, client: &Client) -> Option<Value> {
+        let pause = self.pause.as_ref().unwrap_or(client.paused());
+        Some(pause.clone()).filter(|pause| pause.is_object())
+    }
 }
 
 /// What the next model round reads after a `usage` event's round: that
@@ -3425,21 +3449,22 @@ impl App {
                 .request("follow", json!({"bot": self.bot, "after": 0}))
                 .await
                 .map_err(|e| e.to_string())?;
-            let context = caught_up(&mut fresh).await;
+            let caught = caught_up(&mut fresh).await;
             // Read after the replay, so a turn that ends meanwhile arrives
             // as an event rather than lost between the two.
             let record = client
                 .request("inspect", json!({"bot": self.bot}))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>((client, fresh, record, context))
+            Ok::<_, String>((client, fresh, record, caught))
         };
         if self.down {
-            let Ok((client, fresh, record, context)) = lead.await else {
+            let Ok((client, fresh, record, caught)) = lead.await else {
                 self.retry = Some(Instant::now() + Duration::from_secs(2));
                 return;
             };
-            self.paused = Some(client.paused().clone()).filter(|pause| pause.is_object());
+            self.paused = caught.paused(&client);
+            let context = caught.context;
             self.client = client;
             *events = fresh;
             self.down = false;
@@ -7613,7 +7638,11 @@ impl App {
                     KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
                     KeyCode::Char('d') if ctrl => self.input.delete(),
                     KeyCode::Char(c @ ('y' | 'n'))
-                        if !ctrl && !alt && !self.approvals.is_empty() && self.input.is_empty() =>
+                        if !ctrl
+                            && !alt
+                            && !self.approvals.is_empty()
+                            && self.paused.is_none()
+                            && self.input.is_empty() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
@@ -9178,6 +9207,22 @@ impl App {
     }
 
     fn status_line(&self) -> Line<'static> {
+        // A pause holds every approved call too, so it is shown first, and
+        // the approval keys wait for the resume.
+        if let Some(pause) = &self.paused {
+            let by = pause["by"].as_str().unwrap_or("you");
+            let mut line = vec![
+                Span::raw("⏸ ").fg(Color::Red),
+                Span::raw("Every agent is paused").bold(),
+                Span::raw(format!(" by {by}: ")).dim(),
+                Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
+                Span::raw(" · /resume").dim(),
+            ];
+            if !self.approvals.is_empty() {
+                line.push(Span::raw(" · an approval waits").dim());
+            }
+            return Line::from(line);
+        }
         if let Some(call) = self.approvals.first() {
             let name = call["name"].as_str().unwrap_or("tool");
             let what = call["arguments"]["command"]
@@ -9194,16 +9239,6 @@ impl App {
                 Span::raw("n").bold(),
                 Span::raw(" deny  ").dim(),
                 Span::raw(what),
-            ]);
-        }
-        if let Some(pause) = &self.paused {
-            let by = pause["by"].as_str().unwrap_or("you");
-            return Line::from(vec![
-                Span::raw("⏸ ").fg(Color::Red),
-                Span::raw("Every agent is paused").bold(),
-                Span::raw(format!(" by {by}: ")).dim(),
-                Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
-                Span::raw(" · /resume").dim(),
             ]);
         }
         if let Some(running) = &self.running {
@@ -9914,9 +9949,17 @@ mod tests {
         app.input.set("/resume");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("the agents go on"));
+        // It holds the line over an approval, whose keys wait for it.
+        app.approvals
+            .push(json!({"name": "shell", "arguments": {"command": "rm -rf rows"}}));
+        assert_eq!(
+            shown(&app),
+            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume · an approval waits"
+        );
         app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
             .await;
         assert!(app.paused.is_none());
+        assert!(shown(&app).starts_with("⏸ Allow shell? "));
     }
 
     #[tokio::test]

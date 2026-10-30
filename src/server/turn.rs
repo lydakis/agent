@@ -4560,6 +4560,7 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
+        let run = self.registry.until_pulled(run);
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });

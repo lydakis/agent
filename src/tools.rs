@@ -1771,6 +1771,21 @@ impl Registry {
         });
     }
 
+    /// `run`, a command a steer moved to the background, ended as the pull
+    /// cord is pulled, as one started there is.
+    pub fn until_pulled<F>(&self, run: F) -> impl Future<Output = Result<Outcome>> + use<F>
+    where
+        F: Future<Output = Result<Outcome>>,
+    {
+        let mut pulls = self.pulls.subscribe();
+        async move {
+            tokio::select! {
+                result = run => result,
+                Ok(()) = pulls.changed() => Err(Error::new("daemon_paused")),
+            }
+        }
+    }
+
     /// End every background command and terminal now, as the pull cord
     /// stops the line. A detached command is no one's to stop.
     pub fn end_running(&self) {
