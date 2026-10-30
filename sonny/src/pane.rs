@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
@@ -636,7 +636,7 @@ fn preview(
             let text = text.replace('\t', "    ");
             let number = format!("{:>digits$}  ", at + 1);
             let number = match Some(at) == target {
-                true => Span::raw(number).fg(Color::Yellow).bold(),
+                true => Span::raw(number).reversed().bold(),
                 false => Span::raw(number).dim(),
             };
             let mut spans = vec![Span::raw(" "), number];
@@ -1006,7 +1006,7 @@ mod tests {
         .unwrap();
         let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 30).unwrap();
         let shown = rows(&mut pane, 30, 8);
-        assert_eq!(shown[2], "  Title");
+        assert_eq!(shown[2], "  # Title");
         assert_eq!(shown[4], "  Some code.");
         assert_eq!(shown[6], "    fn a() {}");
         std::fs::remove_dir_all(&dir).unwrap();

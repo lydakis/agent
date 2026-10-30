@@ -104,13 +104,13 @@ pub fn pull_request(text: &str) -> Option<String> {
 pub fn mark(state: &str) -> Span<'static> {
     match state {
         "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
-        "needs you" => Span::raw("◐ ").fg(Color::Magenta),
+        "needs you" => Span::raw("● ").fg(Color::Yellow),
         "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
         crate::started::CHECKED => Span::raw("✔ ").fg(Color::Green).bold(),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
-            Span::raw("◌ ").fg(Color::Yellow)
+            Span::raw("◌ ").dim()
         }
         _ => Span::raw("○ ").dim(),
     }
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(folded[1], " ● lead working · 42s");
         assert_eq!(folded[2], "   chatgpt/gpt-6.1-sol · tab 1");
         assert_eq!(folded[4], "Needs you · 1");
-        assert_eq!(folded[5], " ◐ zero needs you · 42s");
+        assert_eq!(folded[5], " ● zero needs you · 42s");
         assert_eq!(folded[8], "Ready for review · 1");
         assert_eq!(folded[9], " ◆ equal done · took 42s");
         assert_eq!(

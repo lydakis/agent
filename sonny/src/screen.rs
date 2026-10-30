@@ -1318,6 +1318,7 @@ impl Screen {
                     continue;
                 }
                 let style = match i == finding.at {
+                    true if crate::look::no_color() => Style::new().reversed(),
                     true => Style::new().fg(Color::Black).bg(Color::Yellow),
                     false => Style::new().fg(Color::Yellow).underlined(),
                 };

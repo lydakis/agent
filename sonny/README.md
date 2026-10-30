@@ -675,11 +675,26 @@ and Ctrl+] shows it again.
 
 Sonny keeps to the terminal's own 16 colors, so a theme sets their
 shades, and each means one thing: magenta is you (your `›`), blue the
-agents (task names, who sent a message, the lead in the footer, the
-headings of a reply), green what worked (a call's dot, the git branch),
-yellow what needs you, red what failed, and cyan code and work under
-way. The context in the footer turns from green to yellow at 100k
-tokens and to red at 200k.
+agents (task names, who sent a message, the lead in the footer), green
+what worked (a call's dot, `+` lines, the git branch), yellow what needs
+you (a question's `?`, an approval's `⏸`), red what failed (`✗`, `-`
+lines), and cyan code and work under way. Color only repeats what a
+mark already says: each state has its own shape (`✓ ✗ ● ◌ ?`) and a
+diff its `-` and `+`, so the screen reads with `NO_COLOR` set, which
+Sonny honors (no color, bold and dim kept), and to an eye that does
+not tell red from green. Text is the theme's own color; hues go on
+marks and names. Markdown is prose: headings bold, with their `#` marks
+dim to show the level, code in cyan, links underlined, and the marks
+of lists, quotes and rules dim. Dim text is a gray Sonny works out from
+the theme's own foreground and background, as the terminal reports them
+at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
+the theme allows; a terminal that does not say keeps its own dim. Diffs
+tint from the same background and the theme's own red and green. The
+context in the footer turns from green to yellow at 100k tokens and to
+red at 200k.
+
+![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
+![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
 
 ![The task calc.neg opened in the pane beside the lead's conversation](../docs/sonny/task-in-pane.png)
 
