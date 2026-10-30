@@ -274,14 +274,14 @@ pub fn lines(ask: &Ask, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
 pub fn hint(ask: &Ask, more: usize, width: usize) -> String {
     let keys = match ask.options.len() {
         0 => "type your answer".to_owned(),
-        1 => "1 or your own words".to_owned(),
-        n => format!("1–{n} or your own words"),
+        1 => "1 pick".to_owned(),
+        n => format!("1–{n} pick"),
     };
     let more = match more {
         0 => String::new(),
         n => format!(" · {n} more open"),
     };
-    let tail = format!(": {keys}{more} · Esc to chat");
+    let tail = format!(": {keys}{more} · esc write instead");
     let room = width.saturating_sub(tail.chars().count() + "Answer “”".chars().count());
     // The question as it reads on the card, without its Markdown marks.
     let question: String =
@@ -453,11 +453,11 @@ mod tests {
         let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(
             hint(&ask, 0, 80),
-            "Answer “Keep the old API?”: 1–2 or your own words · Esc to chat"
+            "Answer “Keep the old API?”: 1–2 pick · esc write instead"
         );
         assert_eq!(
             hint(&ask, 1, 80),
-            "Answer “Keep the old API?”: 1–2 or your own words · 1 more open · Esc to chat"
+            "Answer “Keep the old API?”: 1–2 pick · 1 more open · esc write instead"
         );
         assert!(hint(&ask, 0, 50).contains('…'));
     }

@@ -950,8 +950,10 @@ limits as text and tool history; reasoning-heavy conversations can reach the
 limits sooner. They are not discarded to make history appear smaller. Indexed
 history and bounded context selection remain the next storage work.
 
-Each session's output channel allows at most 64 queued packets and 2 MiB of
-queued/writing bytes; each packet is capped at 1 MiB. The stdio owner session
+Each session's output channel is bounded by bytes, as NATS and Redis bound a
+slow consumer: at most 2 MiB queued or being written, each packet counting
+64 bytes besides its own, and each packet capped at 1 MiB. A burst of many
+small events fits as well as a few large ones. The stdio owner session
 applies backpressure to producers. Socket followers never block a turn: a
 follower whose queue is full has its entire session closed, including blocked
 writes. This is deliberate: one session multiplexes replies and events, so
