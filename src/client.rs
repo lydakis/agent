@@ -533,6 +533,22 @@ impl Connection {
         Self::connect_until(socket, Instant::now() + STARTUP_TIMEOUT)
     }
     fn connect_until(socket: &PathBuf, deadline: Instant) -> Result<Self> {
+        let connection = Self::greeted_until(socket, deadline)?;
+        if connection.ready["protocol"].as_u64() != Some(agent_client::PROTOCOL) {
+            // The greeting goes with the error: `start` shows which daemon
+            // holds the socket, and `shutdown` may stop an older one.
+            let detail = format!(
+                "the daemon speaks protocol {}, this agent {}",
+                connection.ready["protocol"],
+                agent_client::PROTOCOL
+            );
+            return Err(Error::with("daemon_protocol_mismatch", detail)
+                .facts(json!({"ready": connection.ready})));
+        }
+        Ok(connection)
+    }
+    /// A connection to whatever daemon holds `socket`, on its protocol.
+    fn greeted_until(socket: &PathBuf, deadline: Instant) -> Result<Self> {
         startup_remaining(deadline)?;
         // Bound connect itself as well as readiness, including a full listener
         // backlog. This temporary I/O runtime has no worker threads.
@@ -560,17 +576,6 @@ impl Connection {
         connection.ready = connection.read_ready(deadline)?;
         if connection.ready["event"] != "ready" {
             return fail("daemon_protocol_mismatch");
-        }
-        if connection.ready["protocol"].as_u64() != Some(agent_client::PROTOCOL) {
-            // The greeting goes with the error: `start` shows which daemon
-            // holds the socket, and `shutdown` may stop an older one.
-            let detail = format!(
-                "the daemon speaks protocol {}, this agent {}",
-                connection.ready["protocol"],
-                agent_client::PROTOCOL
-            );
-            return Err(Error::with("daemon_protocol_mismatch", detail)
-                .facts(json!({"ready": connection.ready})));
         }
         Ok(connection)
     }
@@ -736,6 +741,74 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
 }
 
 fn ensure_daemon(options: &Options) -> Result<Connection> {
+    match connect_or_start(options) {
+        // Only an agent that can start a daemon of its own stops the older
+        // one, or the socket would be left with none.
+        Err(error)
+            if !options.no_spawn
+                && !options.providers.is_empty()
+                && replace_older(&error, &options.socket)? =>
+        {
+            connect_or_start(options)
+        }
+        result => result,
+    }
+}
+
+/// How long an older daemon's running turns may take to finish when this
+/// agent replaces it; nothing new starts on it meanwhile, and what still
+/// runs then ends as interrupted. Kubernetes and systemd give a stopping
+/// service a bounded grace in the same way.
+const REPLACE_GRACE: Duration = Duration::from_secs(120);
+
+/// Stop the older daemon `error` found on `socket`, once its running turns
+/// end or `REPLACE_GRACE` passes, so this agent's own can start: true once
+/// it is gone. The store keeps every chat, and the new daemon upgrades it
+/// as it opens. A newer daemon, or one an agent asks from inside its own
+/// turn, which would wait on itself, is left alone and `error` stands.
+fn replace_older(error: &Error, socket: &PathBuf) -> Result<bool> {
+    let Some(pid) = older_daemon(error) else {
+        return Ok(false);
+    };
+    if std::env::var_os("AGENT_BOT_ID").is_some() {
+        return Ok(false);
+    }
+    let grace_ms = REPLACE_GRACE.as_millis() as u64;
+    // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
+    // the field, or does not answer in time, and is sent SIGTERM, which
+    // every one honours.
+    let asked = match Connection::greeted_until(socket, Instant::now() + STARTUP_TIMEOUT) {
+        // Another client replaced it first: this one's daemon is up.
+        Ok(again) if again.ready["pid"].as_u64() != Some(pid as u64) => return Ok(true),
+        Ok(mut older) => older
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(STARTUP_TIMEOUT))
+            .map_err(Error::from)
+            .and_then(|()| older.request("shutdown", json!({"grace_ms": grace_ms}))),
+        Err(error) => Err(error),
+    };
+    if asked.is_err() {
+        terminate(pid)?;
+    }
+    await_exit(pid, REPLACE_GRACE + SHUTDOWN_TIMEOUT)?;
+    Ok(true)
+}
+
+/// The pid of the daemon `error` met when it speaks an older protocol than
+/// this agent.
+fn older_daemon(error: &Error) -> Option<i32> {
+    if error.code != "daemon_protocol_mismatch" {
+        return None;
+    }
+    let ready = (error.facts.as_ref()).and_then(|facts| facts.get("ready"))?;
+    (ready["protocol"].as_u64()? < agent_client::PROTOCOL).then_some(())?;
+    (ready["pid"].as_u64())
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+}
+
+fn connect_or_start(options: &Options) -> Result<Connection> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let connect = || match Connection::connect_until(&options.socket, deadline) {
         Ok(connection) => {
@@ -1192,27 +1265,25 @@ pub fn main(args: Vec<String>) -> Result<i32> {
 /// host replaces its daemon. A newer daemon, or a listener that did not greet
 /// as a daemon, is left alone and the error stands.
 fn stop_older(error: Error, pretty: bool) -> Result<i32> {
-    let ready = (error.facts.as_ref()).and_then(|facts| facts.get("ready"));
-    let older = ready
-        .and_then(|ready| ready["protocol"].as_u64())
-        .is_some_and(|protocol| protocol < agent_client::PROTOCOL);
-    let pid = (ready.and_then(|ready| ready["pid"].as_u64()))
-        .and_then(|pid| i32::try_from(pid).ok())
-        .filter(|pid| *pid > 1);
-    let (true, Some(pid)) = (older, pid) else {
+    let Some(pid) = older_daemon(&error) else {
         return Err(error);
     };
+    terminate(pid)?;
+    await_exit(pid, SHUTDOWN_TIMEOUT)?;
+    stopped(pid, pretty)
+}
+
+/// SIGTERM to the daemon `pid`; one that has exited since it greeted is
+/// already stopped.
+fn terminate(pid: i32) -> Result<()> {
     // SAFETY: a signal to the process the daemon named as itself.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         let error = std::io::Error::last_os_error();
-        // It exited after it greeted: it is stopped.
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return stopped(pid, pretty);
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return fail_with("daemon_stop_failed", error.to_string());
         }
-        return fail_with("daemon_stop_failed", error.to_string());
     }
-    await_exit(pid, SHUTDOWN_TIMEOUT)?;
-    stopped(pid, pretty)
+    Ok(())
 }
 
 /// What `shutdown` prints once the daemon is gone: which process stopped.

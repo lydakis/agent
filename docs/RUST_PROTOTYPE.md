@@ -981,8 +981,9 @@ Each socket session begins with a `ready` line and must `follow` the bots it
 wants to observe. `ready` carries the protocol version, and the CLI, the app
 and `agent_client` refuse a daemon of any other with
 `daemon_protocol_mismatch`: the daemon and its clients ship together, and
-none keeps an earlier protocol working. `agent start` and `agent run` refuse
-it too, rather than starting a second daemon for the same socket.
+none keeps an earlier protocol working. `agent start` and `agent run` never
+start a second daemon for the same socket: they refuse a newer one, and
+replace an older one once its running turns end (docs/CLI.md).
 
 `agent shutdown` returns once the daemon process has exited, so a caller may
 copy or reopen the store: the daemon answers the request first, then cancels
@@ -1115,7 +1116,11 @@ does not, and each is one op:
   the switch to live delivery, and a retention gap anywhere is announced as a
   `pruned` notice first. Live delivery has the socket follower's contract:
   a lagging session is disconnected rather than allowed to hold the daemon.
-  `agent follow --all [--after N]`. New identities publish their `created` or
+  `agent follow --all [--after N]`. With `kinds`, a list of one or more
+  event kinds (`invalid_follow_kinds` otherwise), the follow receives only
+  those, in replay and live; `follow_live` and `pruned` still come. A
+  controller that never reads streamed text leaves the deltas, most of all
+  events, out of its session's queue. New identities publish their `created` or
   `forked` entry to live followers. A store-level watermark records gaps from
   pruning and deletion even after the owning bot is removed; reading this
   watermark does not scan the fleet. Schema 14 seeds it once from surviving

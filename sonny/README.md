@@ -92,7 +92,9 @@ session), and Enter lists again. The pick is kept as `model`, and a new
 `config.toml` starts with comments saying what each setting does. Setup
 ends with what it chose and with any tool agents need that is missing
 (bubblewrap for the sandbox on Linux, ripgrep), with the command that
-installs it. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
+installs it. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
+up (in your home or this folder), setup offers them too, all ticked, as
+`sonny mcp import` does. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
@@ -516,7 +518,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
-  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
+  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
@@ -594,7 +596,7 @@ that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
-and a call answered with an error says why under it. A task's own
+and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
 `resolve_task` is read from its history: its last turn resolved it. The
 lead's Sonny keeps each task the lead resolved beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a

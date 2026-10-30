@@ -38,6 +38,7 @@ mod mac;
 mod margin;
 mod math;
 mod mcp;
+mod mcp_import;
 mod mermaid;
 mod models;
 mod mux;
@@ -515,6 +516,15 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     Ok(connected)
 }
 
+/// Whether `error` met a daemon on an older protocol than this Sonny's,
+/// one `agent start` replaces.
+fn older_daemon(error: &agent_client::Error) -> bool {
+    error.code == "daemon_protocol_mismatch"
+        && (error.facts.as_ref())
+            .and_then(|facts| facts.get("protocol")?.as_u64())
+            .is_some_and(|protocol| protocol < agent_client::PROTOCOL)
+}
+
 /// `~/.agent/models`, the list agents read with `agent models`, written
 /// from the providers' listings when there is none yet, as `agent models
 /// --discover` writes it. A provider that will not list leaves it for the
@@ -808,7 +818,19 @@ async fn run() -> Result<(), String> {
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
-    let (client, mut events) = connect(&options).await?;
+    let (client, mut events) = match Client::connect(&options.socket).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Starting replaces an older daemon once its running turns end,
+            // which can take a while; the screen is not up yet to say so.
+            if older_daemon(&error) {
+                eprintln!(
+                    "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
+                );
+            }
+            connect(&options).await?
+        }
+    };
     trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
@@ -8712,7 +8734,8 @@ impl App {
             Some(_) => "ctrl+\\",
             None => "tab",
         };
-        let paint = |frame: &mut ratatui::Frame| {
+        let paint = |frame: &mut ratatui::Frame,
+                     linked: &mut Vec<(u16, u16, ratatui::buffer::Cell)>| {
             // The conversation above the rows that move, which sit right
             // under it until it fills the screen.
             let (area, pane) = self.split(frame.area());
@@ -9044,7 +9067,10 @@ impl App {
         };
         let look = look::Look::now();
         terminal.draw(|frame| {
-            paint(frame);
+            paint(frame, &mut linked);
+            // A link something was drawn over since, as a list over the
+            // conversation, is left as the frame drew it.
+            screen::keep_shown(&mut linked, frame.buffer_mut());
             look.finish(frame.buffer_mut());
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());

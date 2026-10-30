@@ -331,7 +331,7 @@ fn aws_profile(found: &[Profile]) -> Result<Option<String>, String> {
 pub async fn model(client: &Client) -> Result<String, String> {
     let file = agent_client::config::path().ok_or("set HOME")?;
     if !WELCOMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        println!("Welcome to Sonny. One choice and it's set up.\n");
+        println!("Welcome to Sonny. A question or two and it's set up.\n");
     }
     let model = loop {
         print!("{DIM}Listing your providers' models...{RESET}");
@@ -387,7 +387,13 @@ pub async fn model(client: &Client) -> Result<String, String> {
         break typed;
     };
     save(&file, Some(("model", &model)))?;
-    summary(&model, &file);
+    // Servers the person's other agents reach, offered once a model can
+    // use them; a refusal leaves setup done.
+    let brought = crate::mcp_import::offer(false).unwrap_or_else(|error| {
+        println!("{DIM}MCP servers not brought in: {error}{RESET}");
+        Vec::new()
+    });
+    summary(&model, &file, &brought);
     Ok(model)
 }
 
@@ -419,7 +425,7 @@ fn whole(text: &str) -> bool {
 }
 
 /// What setup chose, and where to change it.
-fn summary(model: &str, file: &Path) {
+fn summary(model: &str, file: &Path, brought: &[String]) {
     let sonny = agent_client::config::read(file).map(|c| c.sonny).ok();
     let effort = |effort: Option<String>| effort.unwrap_or_else(|| "the model's own".into());
     let (lead, task) = sonny.map_or((None, None), |s| (s.lead_effort, s.task_effort));
@@ -436,6 +442,9 @@ fn summary(model: &str, file: &Path) {
         crate::approvals::MODES[0].0,
         crate::approvals::MODES[0].1
     );
+    if !brought.is_empty() {
+        println!("  MCP         {}", brought.join(", "));
+    }
     println!("  Settings    {file}");
     for missing in missing_tools() {
         println!("  {ACCENT}Missing{RESET}     {missing}");
@@ -526,6 +535,9 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
         println!(
             "Saved. The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end, and Sonny starts it again. {then}"
         );
+        if let Err(error) = crate::mcp_import::offer(false) {
+            println!("{DIM}MCP servers not brought in: {error}{RESET}");
+        }
         return Ok(());
     }
     if Client::connect(socket).await.is_err() {
