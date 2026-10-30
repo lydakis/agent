@@ -544,14 +544,31 @@ fn a_task_given_a_linked_checkout_in_the_lead_s_folder_is_removed_from_it() {
     let lab = Lab::new("linked");
     let ws = lab.scratch.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    // The repository's main checkout is outside the lead's folder.
+    // A checkout of a repository whose git folder is outside the lead's
+    // folder is refused: the task would write that folder.
+    let away = ws.join("away");
+    let target = away.to_string_lossy().into_owned();
+    lab.git(&lab.repo, &["worktree", "add", "-q", "-b", "away", &target]);
+    let start = serde_json::json!({"name": "fix", "brief": "fix it", "folder": "away"});
+    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    assert!(!ok && said.contains("outside this folder"), "{said}");
+    let worktree = lab.home.join(".agent/worktrees/demo.fix");
+    assert!(!worktree.exists());
+    assert_eq!(
+        lab.git(&lab.repo, &["branch", "--list", "agent/demo.fix"]),
+        ""
+    );
+    // One whose repository is inside it is started, and removed from the
+    // checkout it was made of.
+    let main = ws.join("main");
+    std::fs::rename(&lab.repo, &main).unwrap();
+    lab.git(&main, &["worktree", "repair"]);
     let web = ws.join("web");
     let target = web.to_string_lossy().into_owned();
-    lab.git(&lab.repo, &["worktree", "add", "-q", "-b", "web", &target]);
+    lab.git(&main, &["worktree", "add", "-q", "-b", "web", &target]);
     let start = serde_json::json!({"name": "fix", "brief": "fix it", "folder": "web"});
     let (ok, said) = lab.tool(&ws, "start_task", start, false);
     assert!(ok, "{said}");
-    let worktree = lab.home.join(".agent/worktrees/demo.fix");
     assert!(worktree.join(".git").exists());
     let (ok, err) = lab.remove(&ws, false);
     assert!(ok, "{err}");

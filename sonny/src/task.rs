@@ -130,6 +130,29 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     } else {
         worktree(&at, name)?
     };
+    // A task given a folder writes the git folder of the repository its
+    // worktree was made of, which must be inside the lead's, as the
+    // lead's own is: not a repository elsewhere that a link or a `.git`
+    // file there names, whenever it was put there.
+    if at != here
+        && let Some((_, path)) = &place.copy
+    {
+        let common = git(
+            path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .ok()
+        .and_then(|dir| std::fs::canonicalize(dir).ok());
+        let base = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_owned());
+        if !common.is_some_and(|common| common.starts_with(&base)) {
+            undo(&place.undo);
+            return Err(format!(
+                "the repository at {} keeps its git folder outside this folder; start the \
+                 task from a folder holding it",
+                at.display()
+            ));
+        }
+    }
     // A task in a folder inside the lead's is told the rules of the
     // folders above it too, which its worktree is not inside.
     // Recorded as the lead's, like an own folder, so its memory is the
