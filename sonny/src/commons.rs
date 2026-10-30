@@ -271,6 +271,9 @@ fn count_invites(dir: &Path, count: u64) -> bool {
         .is_ok()
 }
 
+/// How many pages of a word's matches an invite looks through at most.
+const SEARCH_PAGES: usize = 4;
+
 /// What of a title is searched for in agents' turns: its three longest
 /// words of four letters or more.
 fn words(title: &str) -> Vec<String> {
@@ -302,17 +305,26 @@ pub async fn invite(home: &Path, started: &Value, author: &str, title: &str) -> 
         let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
         let mut found: Vec<String> = Vec::new();
         for word in words(title) {
-            let Ok(said) = client
-                .request("history_search", json!({"bot": "*", "query": word}))
-                .await
-            else {
-                continue;
-            };
-            for bot in (said["matches"].as_array().into_iter().flatten())
-                .filter_map(|found| found["bot"].as_str())
-            {
-                if bot != author && !found.iter().any(|one| one == bot) {
-                    found.push(bot.to_owned());
+            // Older pages too, while a word's matches are all the poster's
+            // or agents already found, so a busy poster crowds out no one.
+            let mut before = Value::Null;
+            for _ in 0..SEARCH_PAGES {
+                let ask = json!({"bot": "*", "query": word, "before": before});
+                let Ok(said) = client.request("history_search", ask).await else {
+                    break;
+                };
+                let mut new = false;
+                for bot in (said["matches"].as_array().into_iter().flatten())
+                    .filter_map(|found| found["bot"].as_str())
+                {
+                    if bot != author && !found.iter().any(|one| one == bot) {
+                        found.push(bot.to_owned());
+                        new = true;
+                    }
+                }
+                before = said["next_before"].clone();
+                if new || before.is_null() {
+                    break;
                 }
             }
         }
