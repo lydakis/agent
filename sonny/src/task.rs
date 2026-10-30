@@ -841,7 +841,8 @@ fn forked(here: &Path, name: &str, source: &Source) -> Result<Place, String> {
     if path.exists() {
         return Err(format!("{} exists; pick another name", path.display()));
     }
-    crate::snapshot::restore(here, &source.snapshot, &path, &branch)?;
+    let indexes = crate::snapshot::indexes(&crate::daemon_paths(None, None)?.0);
+    crate::snapshot::restore(here, &source.snapshot, &path, &branch, &indexes)?;
     let mut note = format!(
         "{name}: a worktree at {} on branch {branch}, with {}'s files as they were after its \
          turn {}, changes since its last commit uncommitted as they were",

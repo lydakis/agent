@@ -42,6 +42,7 @@ pub struct Staged {
     top: PathBuf,
     tree: String,
     head: Option<String>,
+    sealed: Sealed,
 }
 
 /// A turn's snapshot, found to fork from.
@@ -61,21 +62,164 @@ fn git(
     index: Option<&Path>,
     input: Option<&str>,
 ) -> Result<String, String> {
-    let unfiltered = unfiltered(dir)?;
     let mut command = Command::new("git");
-    command.env("GIT_CONFIG_COUNT", unfiltered.len().to_string());
-    for (at, (key, value)) in unfiltered.into_iter().enumerate() {
+    command.arg("-C").arg(dir);
+    run(command, args, index, input)
+}
+
+/// A git folder of Sonny's own for the checkout at `work`, through which
+/// git reads and writes its files: it holds the repository's objects but
+/// none of its config, which a task may reach (an include of a file of its
+/// folder, say) and change between any reading of it and git's own. So no
+/// filter, hook, or program the folder's config names can run, whenever it
+/// names it: a file is kept, and given back, as its bytes are, and an LFS
+/// file unchanged since the commit it is on comes back as its pointer.
+/// What it gives git are the settings of how files are read and written,
+/// and of which are ignored, none of which runs anything.
+struct Sealed {
+    dir: PathBuf,
+    work: PathBuf,
+    objects: PathBuf,
+    /// The checkout's own index.
+    index: PathBuf,
+    settings: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+/// The settings a sealed git folder takes from the checkout's config.
+const KEPT: &str = r"^core\.(ignorecase|precomposeunicode|filemode|symlinks|autocrlf|eol|safecrlf|checkroundtripencoding)$";
+
+/// Make the sealed git folder for the checkout at `work` anew at `at`, on
+/// the commit `head`.
+fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let args = [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+        "--git-path",
+        "index",
+        "--git-path",
+        "info/exclude",
+        "--show-object-format",
+    ];
+    let listed = git(work, &args, None, None)?;
+    let [objects, index, exclude, format] = listed.lines().collect::<Vec<_>>()[..] else {
+        return Err("git rev-parse: an answer of another shape".into());
+    };
+    let repository = match format {
+        "sha1" => "[core]\n\trepositoryformatversion = 0\n",
+        "sha256" => {
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n"
+        }
+        _ => {
+            return Err(format!(
+                "git: objects of a format Sonny does not know, {format}"
+            ));
+        }
+    };
+    let mut settings = Vec::new();
+    for args in [
+        &["config", "-z", "--get-regexp", KEPT][..],
+        &[
+            "config",
+            "-z",
+            "--path",
+            "--get-regexp",
+            r"^core\.(excludesfile|attributesfile)$",
+        ],
+    ] {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(work)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        for key in crate::task::kept_keys() {
+            command.env_remove(key);
+        }
+        let output = command.output().map_err(|e| format!("running git: {e}"))?;
+        // 1 is none found.
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err("git config: the folder's settings could not be read".into());
+        }
+        for entry in output.stdout.split(|byte| *byte == 0) {
+            let Some(at) = entry.iter().position(|byte| *byte == b'\n') else {
+                continue;
+            };
+            settings.push((
+                std::ffi::OsStr::from_bytes(&entry[..at]).to_owned(),
+                std::ffi::OsStr::from_bytes(&entry[at + 1..]).to_owned(),
+            ));
+        }
+    }
+    match std::fs::remove_dir_all(at) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+        _ => {}
+    }
+    let made = (|| {
+        std::fs::create_dir_all(at.parent().unwrap_or(at))?;
+        std::fs::create_dir(at)?;
+        std::fs::create_dir(at.join("refs"))?;
+        std::fs::create_dir(at.join("info"))?;
+        let head = head.map_or("ref: refs/heads/none".to_owned(), str::to_owned);
+        std::fs::write(at.join("HEAD"), format!("{head}\n"))?;
+        std::fs::write(at.join("config"), repository)?;
+        match std::fs::copy(exclude, at.join("info/exclude")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    })();
+    made.map_err(|e| format!("{}: {e}", at.display()))?;
+    Ok(Sealed {
+        dir: at.to_owned(),
+        work: work.to_owned(),
+        objects: PathBuf::from(objects),
+        index: PathBuf::from(index),
+        settings,
+    })
+}
+
+/// git on the files of the checkout `sealed` is for, reading no config
+/// but what it was given.
+fn sealed(
+    sealed: &Sealed,
+    args: &[&str],
+    index: &Path,
+    input: Option<&str>,
+) -> Result<String, String> {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(&sealed.work)
+        .env("GIT_DIR", &sealed.dir)
+        .env("GIT_WORK_TREE", &sealed.work)
+        .env("GIT_OBJECT_DIRECTORY", &sealed.objects)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", sealed.settings.len().to_string());
+    for (at, (key, value)) in sealed.settings.iter().enumerate() {
         command
             .env(format!("GIT_CONFIG_KEY_{at}"), key)
             .env(format!("GIT_CONFIG_VALUE_{at}"), value);
     }
+    run(command, args, Some(index), input)
+}
+
+fn run(
+    mut command: Command,
+    args: &[&str],
+    index: Option<&Path>,
+    input: Option<&str>,
+) -> Result<String, String> {
     // The folder's own code never runs here, where the daemon's keys are:
-    // no hook, no fsmonitor, no filter, and none of the keys in its
-    // environment. Its attributes still convert line endings and
-    // encodings both ways, as git's own code does that.
+    // no hook, no fsmonitor, and none of the keys in its environment.
     command
-        .arg("-C")
-        .arg(dir)
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -120,56 +264,6 @@ fn git(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// Settings that turn off each filter the folder's config names, as a
-/// filter may run a script of the folder's when git reads or writes its
-/// files: a file is kept, and given back, as its bytes are. An LFS file
-/// unchanged since the commit it is on comes back as its pointer. Names
-/// are taken as bytes, whatever they hold, and given to git as config of
-/// the environment's, which nothing in a name can break; a config that
-/// cannot be read stops the snapshot.
-fn unfiltered(dir: &Path) -> Result<Vec<(std::ffi::OsString, &'static str)>, String> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(dir)
-        .args(["config", "--name-only", "-z", "--get-regexp", r"^filter\."])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    for key in crate::task::kept_keys() {
-        command.env_remove(key);
-    }
-    let output = command.output().map_err(|e| format!("running git: {e}"))?;
-    // 1 is none found.
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err("git config: the folder's filters could not be read".into());
-    }
-    let mut names: Vec<&[u8]> = (output.stdout.split(|byte| *byte == 0))
-        .filter_map(|key| key.strip_prefix(b"filter."))
-        .filter_map(|rest| Some(&rest[..rest.iter().rposition(|byte| *byte == b'.')?]))
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    Ok(names
-        .iter()
-        .flat_map(|name| {
-            [
-                ("clean", ""),
-                ("smudge", ""),
-                ("process", ""),
-                ("required", "false"),
-            ]
-            .map(|(setting, value)| {
-                let mut key = b"filter.".to_vec();
-                key.extend_from_slice(name);
-                key.push(b'.');
-                key.extend_from_slice(setting.as_bytes());
-                (std::ffi::OsStr::from_bytes(&key).to_owned(), value)
-            })
-        })
-        .collect())
-}
-
 /// The top of the git checkout `dir` is in, if it is in one.
 pub fn top(dir: &Path) -> Option<PathBuf> {
     git(dir, &["rev-parse", "--show-toplevel"], None, None)
@@ -184,9 +278,16 @@ pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
     let Some(top) = top(dir) else {
         return Ok(None);
     };
-    let gitdir = PathBuf::from(git(&top, &["rev-parse", "--absolute-git-dir"], None, None)?);
-    std::fs::create_dir_all(indexes).map_err(|e| format!("{}: {e}", indexes.display()))?;
-    let index = indexes.join(format!("{:016x}.index", fnv(&top)));
+    let head = git(
+        &top,
+        &["rev-parse", "-q", "--verify", "HEAD^{commit}"],
+        None,
+        None,
+    )
+    .ok();
+    let at = indexes.join(format!("{:016x}", fnv(&top)));
+    let sealed = seal(&top, &at.with_extension("git"), head.as_deref())?;
+    let index = at.with_extension("index");
     // From the checkout's own index each time: what git knows of each file
     // is kept, so only the files that changed are read again, and a file
     // ignored since an earlier snapshot is not taken as tracked. Made anew,
@@ -195,11 +296,11 @@ pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
         _ => {}
     }
-    if let Ok(mut theirs) = std::fs::File::open(gitdir.join("index")) {
+    if let Ok(mut theirs) = std::fs::File::open(&sealed.index) {
         let mut ours = std::fs::File::create_new(&index).map_err(|e| e.to_string())?;
         std::io::copy(&mut theirs, &mut ours).map_err(|e| e.to_string())?;
         // A file marked as not changing would keep its old content.
-        let listed = git(&top, &["ls-files", "-v", "-z"], Some(&index), None)?;
+        let listed = self::sealed(&sealed, &["ls-files", "-v", "-z"], &index, None)?;
         let assumed: String = (listed.split('\0'))
             .filter_map(|entry| entry.split_once(' '))
             .filter(|(tag, _)| tag.chars().all(|c| c.is_ascii_lowercase()))
@@ -207,19 +308,17 @@ pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
             .collect();
         if !assumed.is_empty() {
             let args = ["update-index", "--no-assume-unchanged", "-z", "--stdin"];
-            git(&top, &args, Some(&index), Some(&assumed))?;
+            self::sealed(&sealed, &args, &index, Some(&assumed))?;
         }
     }
-    git(&top, &["add", "-A", "--", "."], Some(&index), None)?;
-    let tree = git(&top, &["write-tree"], Some(&index), None)?;
-    let head = git(
-        &top,
-        &["rev-parse", "-q", "--verify", "HEAD^{commit}"],
-        None,
-        None,
-    )
-    .ok();
-    Ok(Some(Staged { top, tree, head }))
+    self::sealed(&sealed, &["add", "-A", "--", "."], &index, None)?;
+    let tree = self::sealed(&sealed, &["write-tree"], &index, None)?;
+    Ok(Some(Staged {
+        top,
+        tree,
+        head,
+        sealed,
+    }))
 }
 
 /// Commit what was staged as bot `bot_id`'s turn `turn`, whose checkpoint
@@ -241,7 +340,7 @@ pub fn commit(
     if let Some(head) = &staged.head {
         args.extend(["-p", head]);
     }
-    let commit = git(&staged.top, &args, None, None)?;
+    let commit = sealed(&staged.sealed, &args, &staged.sealed.index, None)?;
     let name = format!("{refs}/{bot_id}/{turn}");
     git(&staged.top, &["update-ref", &name, &commit], None, None)?;
     Ok(commit)
@@ -289,7 +388,10 @@ pub fn find(dir: &Path, refs: &str, bot_id: i64, turn: Option<i64>) -> Result<Sn
         None,
         None,
     )?;
-    let message = git(dir, &["log", "-1", "--format=%B", &commit], None, None)?;
+    // Read as the object it is, as a log could run a program of the
+    // folder's config to check a signature.
+    let object = git(dir, &["cat-file", "commit", &commit], None, None)?;
+    let message = object.split_once("\n\n").map_or("", |(_, message)| message);
     let checkpoint = (message.lines())
         .find_map(|line| line.strip_prefix(CHECKPOINT)?.trim().parse().ok())
         .ok_or_else(|| format!("{name} names no checkpoint"))?;
@@ -313,7 +415,13 @@ pub fn find(dir: &Path, refs: &str, bot_id: i64, turn: Option<i64>) -> Result<Sn
 /// new branch `branch` from the commit the snapshot's folder was on, with
 /// the snapshot's files: changes since that commit stay uncommitted, as
 /// they were.
-pub fn restore(here: &Path, snapshot: &Snapshot, path: &Path, branch: &str) -> Result<(), String> {
+pub fn restore(
+    here: &Path,
+    snapshot: &Snapshot,
+    path: &Path,
+    branch: &str,
+    indexes: &Path,
+) -> Result<(), String> {
     let base = snapshot
         .base
         .as_deref()
@@ -328,9 +436,8 @@ pub fn restore(here: &Path, snapshot: &Snapshot, path: &Path, branch: &str) -> R
         ));
     }
     let target = path.to_string_lossy();
-    // Checked out from inside the new worktree, on its branch, as the
-    // config that holds may depend on the branch: no file is written
-    // until the filters to turn off are the ones that hold there.
+    // Made without its files, which are then written through a sealed
+    // git folder, so no filter of the folder's runs as they are.
     git(
         here,
         &[
@@ -346,14 +453,14 @@ pub fn restore(here: &Path, snapshot: &Snapshot, path: &Path, branch: &str) -> R
         None,
         None,
     )?;
-    git(
-        path,
-        &["read-tree", "-u", "--reset", &snapshot.commit],
-        None,
-        None,
-    )?;
-    git(path, &["reset", "-q"], None, None)?;
-    Ok(())
+    let at = indexes.join(format!("{:016x}.git", fnv(path)));
+    let checked_out = seal(path, &at, Some(base)).and_then(|sealed| {
+        let args = ["read-tree", "-u", "--reset", &snapshot.commit];
+        self::sealed(&sealed, &args, &sealed.index, None)?;
+        self::sealed(&sealed, &["reset", "-q"], &sealed.index, None)
+    });
+    let _ = std::fs::remove_dir_all(&at);
+    checked_out.map(|_| ())
 }
 
 /// Drop bot `bot_id`'s snapshots in the repository `dir` is in; git's own
@@ -607,7 +714,7 @@ mod tests {
         assert!(find(&top, REFS, 8, None).is_err());
 
         let copy = dir.join("copy");
-        restore(&top, &older, &copy, "agent/copy").unwrap();
+        restore(&top, &older, &copy, "agent/copy", &dir).unwrap();
         let read = |name: &str| std::fs::read_to_string(copy.join(name)).ok();
         assert_eq!(read("kept.txt").as_deref(), Some("two\n"));
         assert_eq!(read("new.txt").as_deref(), Some("made\n"));
@@ -679,7 +786,7 @@ mod tests {
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
-        restore(&top, &snapshot, &copy, "agent/copy").unwrap();
+        restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert!(!ran.exists());
         assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
         let _ = std::fs::remove_dir_all(dir);
@@ -714,7 +821,49 @@ mod tests {
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
-        restore(&top, &snapshot, &copy, "agent/copy").unwrap();
+        restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
+        assert!(!ran.exists());
+        assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_program_a_file_the_config_includes_names_runs() {
+        let (dir, top) = repo("included");
+        let ran = dir.join("ran");
+        let included = top.join("shared.gitconfig");
+        let script = dir.join("script");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", ran.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A file of the folder's, which a task could write at any point:
+        // a filter, and signing on commit and on reading a log.
+        let script = script.display();
+        std::fs::write(
+            &included,
+            format!(
+                "[filter \"late\"]\n\tclean = {script}\n\tsmudge = {script}\n\
+                 \tprocess = {script}\n\trequired = true\n\
+                 [commit]\n\tgpgSign = true\n[gpg]\n\tprogram = {script}\n\
+                 [log]\n\tshowSignature = true\n"
+            ),
+        )
+        .unwrap();
+        let path = included.to_string_lossy();
+        git(&top, &["config", "include.path", &path], None, None).unwrap();
+        std::fs::write(top.join(".gitattributes"), "*.a filter=late\n").unwrap();
+        std::fs::write(top.join("x.a"), "raw\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let copy = dir.join("copy");
+        restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert!(!ran.exists());
         assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
         let _ = std::fs::remove_dir_all(dir);
@@ -750,7 +899,7 @@ mod tests {
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
-        restore(&top, &snapshot, &copy, "agent/copy").unwrap();
+        restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
         assert_eq!(std::fs::read(copy.join("y.a")).unwrap(), b"three\r\n");
         let _ = std::fs::remove_dir_all(dir);
@@ -794,7 +943,7 @@ mod tests {
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
-        let error = restore(&top, &snapshot, &copy, "agent/copy").unwrap_err();
+        let error = restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap_err();
         assert!(error.contains("submodule, dep"), "{error}");
         assert!(!copy.exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -883,7 +1032,7 @@ mod tests {
             .unwrap();
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
-        restore(&top, &snapshot, &dir.join("copy"), "agent/copy").unwrap();
+        restore(&top, &snapshot, &dir.join("copy"), "agent/copy", &dir).unwrap();
         forget(&top, REFS, 7).unwrap();
         assert!(!ran.exists());
         let _ = std::fs::remove_dir_all(dir);
