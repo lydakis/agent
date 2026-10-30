@@ -3,6 +3,8 @@
 A terminal client for the daemon that lays its work out in Rex, Herdr or
 cmux. It speaks the daemon's socket protocol through `agent-client`; nothing
 in the daemon or CLI knows it exists.
+[FEATURES.md](FEATURES.md) lists every feature Sonny has had, what became of
+it and why.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
