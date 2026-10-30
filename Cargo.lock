@@ -22,7 +22,6 @@ name = "agent-client"
 version = "0.6.0"
 dependencies = [
  "libc",
- "reqwest",
  "serde_json",
  "tokio",
  "toml",
