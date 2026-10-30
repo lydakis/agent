@@ -31,15 +31,26 @@ pub struct Step {
 }
 
 /// Each step an upgrade can offer; first-run setup offers them itself.
-pub const STEPS: [Step; 1] = [Step {
-    id: "mcp-import",
-    what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
-    how: "sonny mcp import",
-    // Done when none is left to bring; one Sonny cannot bring never counts.
-    done: || {
-        crate::mcp_import::here().map_or(true, |found| found.iter().all(|f| f.keys.is_empty()))
+pub const STEPS: [Step; 2] = [
+    Step {
+        id: "mcp-import",
+        what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
+        how: "sonny mcp import",
+        // Done when none is left to bring; one Sonny cannot bring never counts.
+        done: || {
+            crate::mcp_import::here().map_or(true, |found| found.iter().all(|f| f.keys.is_empty()))
+        },
     },
-}];
+    Step {
+        id: "backup",
+        what: "memory, skills, profiles and config pushed every ten minutes to a private git \
+               repository, so a lost machine loses little. Sonny names no host: find where \
+               this machine keeps repositories (its checkouts' remotes, the tools signed in, \
+               what the person's other agents made) and make a private one there",
+        how: "sonny setup backup URL",
+        done: || crate::home::Places::home().is_ok_and(|places| crate::home::done(&places)),
+    },
+];
 
 /// Someone is there to answer.
 pub fn interactive() -> bool {

@@ -142,7 +142,7 @@ per feature; group small things into the row they belong to.
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
 | Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |
 | Opening Sonny after an upgrade replaces the older running daemon once its turns end, and says so | shipped | added 10-30 #413 | An upgrade left the old daemon running, and every command failed until it was restarted by hand | ? |
-| `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #417 | A disposable box loses at most ten minutes of what agents learned | ? |
+| `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #417; offered after an upgrade, the lead picks where the repo lives 10-30 #PR | A disposable box loses at most ten minutes of what agents learned | ? |
 
 ## Other clients
 
