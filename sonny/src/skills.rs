@@ -22,6 +22,9 @@ pub fn install_own() {
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
     install("automation", &agent_client::policy::with_cli(automation));
+    if let Some(home) = std::env::var_os("HOME") {
+        queue_news(&PathBuf::from(home), FEATURES, &crate::setup::STEPS);
+    }
     let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), sonny_path()) else {
         return;
     };
@@ -415,8 +418,99 @@ fn unstage(home: &Path, kind: Kind, name: &str) {
     };
 }
 
-/// What Sonny's upgrade set beside the person's edits, for the next bot
-/// Sonny opens to tell the person of and offer to bring in.
+/// Sonny's feature register: what each feature is, and its history.
+const FEATURES: &str = include_str!("../FEATURES.md");
+
+/// Where this Sonny's register is, for agents to read.
+fn register(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/FEATURES.md")
+}
+
+/// The register as the person last heard of it.
+fn heard(home: &Path) -> PathBuf {
+    shipped(home).join("FEATURES.md")
+}
+
+/// The setup steps an upgrade offered the person, a line each, so none is
+/// offered twice.
+fn offered(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/offered")
+}
+
+fn offered_in(home: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(offered(home)).unwrap_or_default();
+    text.lines().map(str::to_owned).collect()
+}
+
+/// `id` offered, by setup or by a bot, so no upgrade offers it again.
+pub fn note_offered(id: &str) {
+    if let Some(home) = std::env::var_os("HOME") {
+        note_offered_in(&PathBuf::from(home), &[id.to_owned()]);
+    }
+}
+
+fn note_offered_in(home: &Path, ids: &[String]) {
+    let mut all = offered_in(home);
+    let before = all.len();
+    all.extend(
+        ids.iter()
+            .filter(|id| !all.contains(id))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if all.len() > before {
+        let text: String = all.iter().map(|id| format!("{id}\n")).collect();
+        let _ = std::fs::create_dir_all(home.join(".agent/sonny"));
+        let _ = agent_client::files::replace_mode(&offered(home), text.as_bytes(), 0o644);
+    }
+}
+
+/// What the next bot tells of beside the skills: a register changed since
+/// the person last heard of it, and each setup step neither done nor
+/// offered. The first register a person has is heard of without a word.
+fn queue_news(home: &Path, features: &str, steps: &[crate::setup::Step]) {
+    keep(&home.join(".agent/sonny"), &[("FEATURES.md", features)]);
+    match std::fs::read_to_string(heard(home)) {
+        Err(_) => {
+            keep(&shipped(home), &[("FEATURES.md", features)]);
+        }
+        Ok(before) if before != features => queue_unclaimed(home, "features"),
+        Ok(_) => {}
+    }
+    let offered = offered_in(home);
+    for step in steps {
+        if !offered.iter().any(|id| id == step.id) && !(step.done)() {
+            queue_unclaimed(home, &format!("setup {}", step.id));
+        }
+    }
+}
+
+/// `entry` among the pending ones, unless a Sonny claimed it and has not
+/// told its bot yet: until it does, what was heard and offered is as
+/// before. A claim left by a Sonny that stopped goes back on its own.
+fn queue_unclaimed(home: &Path, entry: &str) {
+    let claimed = (std::fs::read_dir(claims(home))
+        .into_iter()
+        .flatten()
+        .flatten())
+    .any(|claim| claim.path().join(entry).exists());
+    if !claimed {
+        queue(home, entry);
+    }
+}
+
+/// The register's rows that `after` has and `before` has not: each new
+/// feature, and each one whose status or history moved.
+fn changed_rows<'a>(before: &str, after: &'a str) -> Vec<&'a str> {
+    let old: std::collections::HashSet<&str> = before.lines().collect();
+    (after.lines())
+        .filter(|line| line.starts_with("| ") && !old.contains(line))
+        .collect()
+}
+
+/// What Sonny's upgrade set beside the person's edits, changed in its
+/// features, and offers to set up, for the next bot Sonny opens to tell the
+/// person of.
 pub struct Upgrades {
     home: PathBuf,
     /// The pending ones, moved aside so that one Sonny of several starting
@@ -424,15 +518,24 @@ pub struct Upgrades {
     claim: PathBuf,
     note: String,
     key: String,
+    /// The register the person hears of with this note.
+    features: Option<String>,
+    /// The setup steps it offers.
+    offering: Vec<String>,
 }
 
-/// The skills and roles Sonny set its new text beside, that no bot was
-/// told of yet and the person has not brought in.
+/// What no bot was told of yet: the skills and roles Sonny set its new
+/// text beside that the person has not brought in, what changed in its
+/// features, and the setup it offers.
 pub fn upgraded() -> Option<Upgrades> {
     upgraded_in(&PathBuf::from(std::env::var_os("HOME")?))
 }
 
 fn upgraded_in(home: &Path) -> Option<Upgrades> {
+    upgraded_with(home, FEATURES, &crate::setup::STEPS)
+}
+
+fn upgraded_with(home: &Path, features: &str, steps: &[crate::setup::Step]) -> Option<Upgrades> {
     let me = std::process::id().to_string();
     // A claim left by a Sonny that stopped before telling goes back.
     for entry in std::fs::read_dir(claims(home))
@@ -458,7 +561,30 @@ fn upgraded_in(home: &Path) -> Option<Upgrades> {
     }
     let mut lines = Vec::new();
     let mut key = String::new();
+    let mut news = None;
+    let mut setups = Vec::new();
+    let mut offering = Vec::new();
+    let offered = offered_in(home);
     for line in &taken {
+        if line == "features" {
+            let before = std::fs::read_to_string(heard(home)).unwrap_or_default();
+            let rows = changed_rows(&before, features);
+            key.push_str(&rows.join("\n"));
+            news = Some(rows);
+            continue;
+        }
+        if let Some(id) = line.strip_prefix("setup ") {
+            let step = steps.iter().find(|step| step.id == id);
+            // Offered by setup since, or done.
+            if let Some(step) = step.filter(|s| !offered.iter().any(|o| o == id) && !(s.done)()) {
+                setups.push(format!(
+                    "- set up {}: {}, with `{}`",
+                    step.id, step.what, step.how
+                ));
+                offering.push(id.to_owned());
+            }
+            continue;
+        }
         let Some((kind, name)) = line.split_once(' ') else {
             continue;
         };
@@ -491,25 +617,46 @@ fn upgraded_in(home: &Path) -> Option<Upgrades> {
             staged.display(),
         ));
     }
-    let note = (!lines.is_empty()).then(|| {
-        format!(
-            "{UPGRADED}this Sonny ships new text for skills or roles of its own that the person \
+    let mut parts = Vec::new();
+    if let Some(rows) = news.as_ref().filter(|rows| !rows.is_empty()) {
+        parts.push(format!(
+            "Sonny's features changed since the person last heard of them. The rows of its \
+             feature register (Feature | Status | History | Why | Used?) that are new or \
+             changed:\n{}\nThe whole register is at {}. Tell the person in a few lines what of \
+             this matters to them, not the whole list.",
+            rows.join("\n"),
+            register(home).display()
+        ));
+    }
+    if !setups.is_empty() {
+        parts.push(format!(
+            "Sonny offers setup the person has not done:\n{}\nOffer each once: do it with \
+             them, or tell them the command. Sonny does not offer it again either way.",
+            setups.join("\n")
+        ));
+    }
+    if !lines.is_empty() {
+        parts.push(format!(
+            "This Sonny ships new text for skills or roles of its own that the person \
              edited, so it left their copies as they were and set its new text beside them.\n{}\n\
              Tell the person, and ask whether they want you to bring Sonny's changes into their \
              copies. If they do, keep what they changed and take what Sonny changed; where both \
              changed the same part, ask them. A copy left the same as Sonny's new text gets \
              Sonny's updates again from then on.",
             lines.join("\n")
-        )
-    });
+        ));
+    }
+    let note = (!parts.is_empty()).then(|| format!("{UPGRADED}{}", parts.join("\n\n")));
     Some(Upgrades {
         home: home.to_owned(),
         claim,
         key: format!(
             "sonny-upgrade-{}",
-            crate::project::fingerprint(&format!("{note:?}{key}"))
+            crate::project::fingerprint(&format!("{note:?}{key}{}", setups.join("")))
         ),
         note: note.unwrap_or_default(),
+        features: news.map(|_| features.to_owned()),
+        offering,
     })
 }
 
@@ -545,6 +692,10 @@ impl Upgrades {
     /// Each told of, so the next bot is not told again; one Sonny sets
     /// beside them from now is.
     pub fn told(&self) {
+        if let Some(features) = &self.features {
+            keep(&shipped(&self.home), &[("FEATURES.md", features)]);
+        }
+        note_offered_in(&self.home, &self.offering);
         let _ = std::fs::remove_dir_all(&self.claim);
     }
 
@@ -808,6 +959,76 @@ mod tests {
         std::fs::write(home.join(".agents/agents/task.md"), "theirs").unwrap();
         install_role_in(&home, "task", "sonny's");
         assert!(upgraded_in(&home).is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_upgrade_tells_what_changed_and_offers_new_setup_once() {
+        use crate::setup::Step;
+        let home = std::env::temp_dir().join(format!("sonny-news-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let steps = [
+            Step {
+                id: "backup",
+                what: "a git backup",
+                how: "sonny setup backup",
+                done: || false,
+            },
+            Step {
+                id: "done",
+                what: "something set",
+                how: "sonny setup done",
+                done: || true,
+            },
+        ];
+        let one =
+            "# F\n| Feature | Status |\n|---|---|\n| Tasks | shipped |\n| Leads | experimental |\n";
+        let two = "# F\n| Feature | Status |\n|---|---|\n| Tasks | shipped |\n| Leads | shipped |\n| Backup | experimental |\n";
+        // The first register is heard of without a word; the step not done
+        // is offered.
+        queue_news(&home, one, &steps);
+        assert_eq!(std::fs::read_to_string(register(&home)).unwrap(), one);
+        let upgrades = upgraded_with(&home, one, &steps).unwrap();
+        let note = upgrades.note();
+        assert!(note.starts_with(UPGRADED), "{note}");
+        assert!(!note.contains("features changed"), "{note}");
+        assert!(
+            note.contains("- set up backup: a git backup, with `sonny setup backup`"),
+            "{note}"
+        );
+        assert!(!note.contains("set up done"), "{note}");
+        // Claimed and not told yet, a Sonny starting meanwhile does not
+        // queue it again.
+        queue_news(&home, one, &steps);
+        assert!(upgraded_with(&home, one, &steps).is_none());
+        upgrades.told();
+        // Offered once: the same Sonny starting again has nothing.
+        queue_news(&home, one, &steps);
+        assert!(upgraded_with(&home, one, &steps).is_none());
+        // The next Sonny's register: its new and changed rows.
+        queue_news(&home, two, &steps);
+        let upgrades = upgraded_with(&home, two, &steps).unwrap();
+        let note = upgrades.note();
+        assert!(
+            note.contains("| Leads | shipped |\n| Backup | experimental |"),
+            "{note}"
+        );
+        assert!(!note.contains("| Tasks |"), "{note}");
+        assert!(!note.contains("set up backup"), "{note}");
+        // Not told, it waits; told, it is heard.
+        upgrades.back();
+        let upgrades = upgraded_with(&home, two, &steps).unwrap();
+        upgrades.told();
+        assert_eq!(std::fs::read_to_string(heard(&home)).unwrap(), two);
+        queue_news(&home, two, &steps);
+        assert!(upgraded_with(&home, two, &steps).is_none());
+        // A step setup offered itself is not offered again.
+        let _ = std::fs::remove_file(offered(&home));
+        queue_news(&home, two, &steps);
+        note_offered_in(&home, &["backup".into()]);
+        let upgrades = upgraded_with(&home, two, &steps).unwrap();
+        assert_eq!(upgrades.note(), "");
+        upgrades.told();
         let _ = std::fs::remove_dir_all(&home);
     }
 

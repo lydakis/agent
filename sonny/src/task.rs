@@ -1333,7 +1333,7 @@ mod tests {
         };
         let person = |flags: &[String]| {
             let at = flags.iter().position(|f| f == "--instructions").unwrap();
-            assert!(flags[at + 1].ends_with("helping them well is the care."));
+            assert!(flags[at + 1].ends_with("their latest words override both."));
             flags[at + 1].clone()
         };
 
@@ -1373,7 +1373,7 @@ mod tests {
         let flags = told(&["--agents"]).unwrap();
         let text = flags.last().unwrap();
         assert!(
-            text.ends_with("helping them well is the care.\n\nShip small."),
+            text.ends_with("their latest words override both.\n\nShip small."),
             "{text}"
         );
         std::fs::write(

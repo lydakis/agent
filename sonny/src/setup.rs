@@ -18,6 +18,29 @@ use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+/// A step of setup that an upgrade brings, offered once by the first bot
+/// Sonny opens after it, unless the person has done it.
+pub struct Step {
+    /// Its name, kept in `~/.agent/sonny/offered` once offered.
+    pub id: &'static str,
+    /// What it sets up, for the bot to offer.
+    pub what: &'static str,
+    /// The command that does it.
+    pub how: &'static str,
+    pub done: fn() -> bool,
+}
+
+/// Each step an upgrade can offer; first-run setup offers them itself.
+pub const STEPS: [Step; 1] = [Step {
+    id: "mcp-import",
+    what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
+    how: "sonny mcp import",
+    // Done when none is left to bring; one Sonny cannot bring never counts.
+    done: || {
+        crate::mcp_import::here().map_or(true, |found| found.iter().all(|f| f.keys.is_empty()))
+    },
+}];
+
 /// Someone is there to answer.
 pub fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -389,6 +412,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
     save(&file, Some(("model", &model)))?;
     // Servers the person's other agents reach, offered once a model can
     // use them; a refusal leaves setup done.
+    crate::skills::note_offered("mcp-import");
     let brought = crate::mcp_import::offer(false).unwrap_or_else(|error| {
         println!("{DIM}MCP servers not brought in: {error}{RESET}");
         Vec::new()
@@ -535,6 +559,7 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
         println!(
             "Saved. The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end, and Sonny starts it again. {then}"
         );
+        crate::skills::note_offered("mcp-import");
         if let Err(error) = crate::mcp_import::offer(false) {
             println!("{DIM}MCP servers not brought in: {error}{RESET}");
         }
@@ -736,7 +761,7 @@ fn undated(id: &str) -> Option<&str> {
 }
 
 /// One line typed after `prompt`, trimmed.
-fn line(prompt: &str) -> Result<String, String> {
+pub(crate) fn line(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();

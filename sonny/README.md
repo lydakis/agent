@@ -100,6 +100,22 @@ Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
 none, as `agent models --discover` does.
 
+`sonny setup backup URL` keeps the person's home off the machine, for one
+that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
+`~/.agent/config.toml` are copied into a clone of URL, a private git
+repository, at `~/agent-home`, committed and pushed every ten minutes by a
+LaunchAgent or a systemd user timer (`me.lydakis.agent.backup`), which runs
+`sonny home sync`. Keys in `~/.agent/env`, logins and the daemon's store
+stay out, and so does a `config.toml` that holds a secret itself (an MCP
+server's `http_headers`, or a key named like a token), which the sync names
+and leaves behind while memory still goes. Memory's own git history stays
+out too, since a commit inside `~/.agents/memory` would make the nightly
+cleanup find nothing to do. On a machine that never synced, setup first
+restores what the repository holds, keeping a `config.toml` it replaces as
+`config.toml.before-restore`: a new box is `install.sh`, then `sonny setup
+backup URL`. `sonny home status` says how the last sync went. Pushing uses
+the person's own git credentials, read from the login shell.
+
 A lead's transcript starts with a welcome, as Claude Code's does: Sonny,
 the robot the client is named for, as a portrait drawn in half blocks,
 beside the folder, the lead's model and a few commands. A new lead opens
@@ -121,7 +137,9 @@ edited, it sets that text beside yours in `~/.agent/sonny/upgrades`, with
 what you started from in `~/.agent/sonny/shipped` when it kept it, and
 the first bot you open after the upgrade tells you and offers to bring
 Sonny's changes into your copy. A copy left the same as Sonny's new text
-is Sonny's again from the next start. A folder's own
+is Sonny's again from the next start. That bot also tells you what is new
+since the Sonny you last heard of, from [FEATURES.md](FEATURES.md), and
+offers once each new setup step you have not done. A folder's own
 `.agents/agents/lead.md` or `task.md` comes first. The task settings from `.agents/project.toml` are composed after
 the lead's role, not kept in the file.
 
@@ -470,8 +488,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   time is how long its running turn has been at it, or how long its last
   turn took. An agent with triggers or lookout subscriptions of its own
   shows `↻ 2 triggers` beside its model. A click on an agent's name opens
-  it in the pane, as a click on a task in a roster does; ‹ in its title,
+  it in the pane, as a click on a task in a roster does, and so does
+  Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`.
+
+  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
@@ -518,7 +539,10 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   its tools or why it did not start. Agents reach them through one `exec`
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
-  ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)).
+  ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)). As in Codex, each call
+  a script makes is approved on its own: a tool its server marks
+  destructive, and not read-only, waits for the agent's verdict
+  (`/approvals`), unless the server's `approval_mode` says otherwise.
 
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 
@@ -538,7 +562,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   they missed, a better way of working or a mistake, coaching a habit
   once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
   also starts, or sets up with a trigger, what the person said they will
-  do when nothing owns it, as far as their memory says they want; so
+  do when nothing owns it, as far as their memory says they want. Both
+  files say to save what the person corrected and what they welcomed, and
+  that their memory overrides the files' defaults; so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
@@ -655,7 +681,9 @@ turn's `Worked for …` line.
 The view is clean by default: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, messaged or
 waited for, a question to you, the plan, memory, a trigger, a window
-opened). Commands, reads and edits are left out. `/verbose` draws every
+opened). Commands, reads and edits are left out: agents are people you
+talk to, and the clean view shows what they say and what reaches you, not
+the work inside their turn. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
@@ -666,6 +694,8 @@ message it sent or what came back, and folds it again. Calls of one kind
 in a row, such as three tasks messaged one after another, fold into one
 such row (`• Messaged calc.add, calc.neg and calc.div ▸`). A question the
 agent asks you lists its options, and a click on one answers with it.
+Ctrl+O opens every row that folds, and folds them all again once all are
+open.
 What agents tell each other stays quiet too: a message from another agent
 is one dim row naming who sent it (`↳ From calc.neg ▸`), the lead's task
 updates one row with what happened in them, and a click opens the whole
@@ -778,7 +808,10 @@ both shows the one the keys are in. With nothing typed, Home goes up to
 the conversation's first turn, drawing the turns over it on the way, and
 End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
-newer, and Esc stops where you are.
+newer, and Esc stops where you are. Sonny draws the whole screen again on
+every resize and when the terminal regains focus, so a multiplexer that
+reattaches or a display that wakes never leaves stale rows; Ctrl+L
+redraws it by hand, as in a shell.
 
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
