@@ -210,7 +210,12 @@ anything else a failure can leave is listed and removable:
   gone, one that reached `--runs`), both under the lock
   and only while the plist is still the one it fired for: a trigger
   removed while its message went out is left as it now is. A one-off that
-  delivered leaves nothing. One that ends without delivering (its agent
+  delivered keeps its last result until its turn is known to have ended:
+  whoever asks the daemon how it ended (`/background`, the footer's count,
+  the `triggers` tool) removes the row once that turn completed with any
+  answer passed on, and one whose turn failed stays listed with
+  `last.turn_error` until it is removed, as systemd keeps a failed unit
+  until `reset-failed`. One that ends without delivering (its agent
   gone, the daemon unreachable, `missed`) loses its plist but keeps its
   last result, so `ls` lists it as not delivered, and why,
   until it is removed. When that result cannot be written, the plist stays,

@@ -2165,11 +2165,11 @@ fn settle(
         || outcome["reply"]["gone"] == true
         || trigger.runs.is_some_and(|runs| kept.sent >= runs);
     // One that did not deliver ends only once why is on disk; else its plist
-    // stays, listed.
-    // An answer that did not get through keeps its row, saying so.
-    let kept_row = !sent || outcome["reply"]["outcome"] == "failed";
+    // stays, listed. Its row stays whatever came of it: one that sent keeps
+    // it until its turn is known to have ended well (`forget_done`), so a
+    // turn that fails after the send still shows.
     if over && (sent || recorded.is_ok()) {
-        return retire(places, &trigger.name, kept_row, launchd).map_or_else(log, |_| true);
+        return retire(places, &trigger.name, true, launchd).map_or_else(log, |_| true);
     }
     recorded.is_ok()
 }
@@ -3496,6 +3496,51 @@ pub async fn ended(client: &Client, handles: Vec<String>) -> HashMap<String, Val
     found
 }
 
+/// The rows of triggers that ended, made on the daemon whose store is
+/// `store_id`, whose last fire sent a turn that `ended` says completed,
+/// with any answer passed on: nothing is left to say, so they go. One whose
+/// turn failed stays, shown until it is removed, as systemd keeps a failed
+/// unit until `reset-failed` and Kubernetes a finished Job until its TTL.
+/// Run by whoever asked the daemon how those turns ended.
+pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Value>) {
+    let done = |name: &str| {
+        let row = read_json(&places.last(name))?;
+        let handle = sent(&row)?;
+        (row["name"] == name
+            && row["store_id"] == store_id
+            && row["last"]["reply"]["outcome"] != "failed"
+            && ended.get(&handle)?["status"] == "completed"
+            && !places.job(name).exists())
+        .then_some(handle)
+    };
+    let names: Vec<String> = (std::fs::read_dir(&places.state)
+        .into_iter()
+        .flatten()
+        .flatten())
+    .filter_map(|e| Some(e.file_name().to_str()?.strip_suffix(".json")?.to_owned()))
+    .filter(|name| valid_name(name).is_ok() && done(name).is_some())
+    .collect();
+    if names.is_empty() {
+        return;
+    }
+    let Ok(_lock) = Lock::take(places) else {
+        return;
+    };
+    // Under the lock, only while it is still that row: a trigger made since
+    // under the name has a job, or a row of its own.
+    for name in names {
+        if done(&name).is_some()
+            && let Err(e) = std::fs::remove_file(places.last(&name))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "{}",
+                error_json(&format!("{}: {e}", places.last(&name).display()))
+            );
+        }
+    }
+}
+
 /// `row`, its `last` taking how the turn its fire sent ended, from
 /// `ended`: its `turn_status`, and `turn_error` when it did not complete,
 /// so a fire that went out and whose turn then failed, as when the machine
@@ -3617,12 +3662,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     // Its last run went out but its end did not (launchd would not unload
     // it): it ends now, sending nothing more.
     if trigger.runs.is_some_and(|runs| kept.sent >= runs) {
-        let last = &durable["last"];
-        return ends(
-            places,
-            trigger,
-            last["outcome"] != "sent" || last["reply"]["outcome"] == "failed",
-        );
+        return ends(places, trigger, true);
     }
     if !asked {
         // A one-off's calendar entry has no year: the same date a year early
@@ -4770,9 +4810,22 @@ mod tests {
     fn a_fire_ends_only_the_trigger_it_ran_for() {
         let w = World::new("fire");
         let one = once();
-        // Delivered: nothing is left.
+        // Delivered: its row stays until its turn is known to have ended,
+        // and stays when that turn failed.
         w.install(&one).unwrap();
-        w.settle(&one, json!({"outcome": "sent", "turn": 2}));
+        let handle = "turn:p.fix-login/2";
+        w.settle(
+            &one,
+            json!({"outcome": "sent", "turn": 2, "handle": handle}),
+        );
+        assert_eq!(w.state(&one.name), (false, false, true));
+        let ended = |status: &str| HashMap::from([(handle.to_owned(), json!({"status": status}))]);
+        forget_done(&w.places, "00ab", &ended("failed"));
+        // Another daemon's turn of that handle is not its.
+        forget_done(&w.places, "ffff", &ended("completed"));
+        assert_eq!(w.state(&one.name), (false, false, true));
+        // One that completed leaves nothing.
+        forget_done(&w.places, "00ab", &ended("completed"));
         assert_eq!(w.state(&one.name), (false, false, false));
         // Not delivered: it ends, and its row says why until it is removed.
         w.install(&one).unwrap();
@@ -4911,7 +4964,7 @@ mod tests {
         w.settle(&s, json!({"outcome": "skipped"}));
         assert_eq!(w.state(&s.name), (true, true, true));
         w.settle(&s, json!({"outcome": "sent", "turn": 5}));
-        assert_eq!(w.state(&s.name), (false, false, false));
+        assert_eq!(w.state(&s.name), (false, false, true));
     }
 
     #[test]

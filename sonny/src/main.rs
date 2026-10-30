@@ -6182,6 +6182,10 @@ impl App {
         if !unended.is_empty() {
             let ended = trigger::ended(&self.client, unended).await;
             if !ended.is_empty() {
+                // A trigger that ended goes once its last turn did well.
+                if let (Some(store), Ok(places)) = (self.client.store(), trigger::Places::home()) {
+                    trigger::forget_done(&places, store, &ended);
+                }
                 self.turns.extend(ended);
                 items = read(&self.turns);
             }
