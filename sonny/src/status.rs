@@ -72,7 +72,7 @@ pub fn group(state: &str, running: bool, asking: bool, pr: bool, resolved: bool)
         "needs you" | "failed" => Group::NeedsYou,
         _ if asking => Group::NeedsYou,
         _ if running => Group::Working,
-        "done" if pr => Group::Review,
+        "done" | crate::started::CHECKED if pr => Group::Review,
         _ => Group::Idle,
     }
 }
@@ -101,9 +101,10 @@ pub fn pull_request(text: &str) -> Option<String> {
 /// The mark and colour a state reads with.
 pub fn mark(state: &str) -> Span<'static> {
     match state {
-        "working" => Span::raw("● ").fg(Color::Cyan),
+        "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("◐ ").fg(Color::Magenta),
         "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::CHECKED => Span::raw("✔ ").fg(Color::Green).bold(),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
@@ -273,6 +274,8 @@ mod tests {
         assert_eq!(group("done", false, true, true, false), Group::NeedsYou);
         assert_eq!(group("failed", false, false, false, false), Group::NeedsYou);
         assert_eq!(group("done", false, false, true, false), Group::Review);
+        // A goal's check passed: the pull request still waits on review.
+        assert_eq!(group("checked", false, false, true, false), Group::Review);
         assert_eq!(group("stopped", false, false, true, false), Group::Idle);
         assert_eq!(group("done", false, false, false, false), Group::Idle);
         assert_eq!(group("failed", false, true, true, true), Group::Resolved);

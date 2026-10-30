@@ -10759,7 +10759,7 @@ fn an_elided_event_counts_what_the_move_takes_off_the_view() {
 
 /// The request prefix a window's view renders, as JSON items.
 fn prefix_items(window: &agent_runtime::store::Window) -> Vec<Value> {
-    let prefix = window.prefix(&[], usize::MAX).unwrap().bytes;
+    let prefix = window.prefix(&[], usize::MAX, false).unwrap().bytes;
     let prefix = &prefix[..prefix.len().saturating_sub(1)];
     serde_json::from_slice(&[b"[", prefix, b"]"].concat()).unwrap()
 }

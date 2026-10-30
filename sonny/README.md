@@ -28,8 +28,10 @@ composes, those the CLI composes for agents started through it, and the
 skills it writes name `"…/sonny" agent` wherever they would say
 `"$AGENT_BIN"`.
 
-    sonny                                    # this folder's coordinator, <project>.lead
+    sonny                                    # this folder's lead, the one last written to
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
+    sonny --lead NAME                        # another of the folder's leads
+    sonny --new-lead [NAME]                  # a new lead for the folder
     sonny --bot NAME                         # any one bot
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
@@ -47,6 +49,18 @@ that project's lead (the nearest project above decides; the home folder's
 file never does). A lead made below another project's folder says which
 lead holds the folder above. Sonny refuses to make a lead in a task's own
 folder under `~/.agent`.
+
+A folder can have several leads, each with its own conversation and tasks:
+the first is `<project>.lead`, and another is `<project>.lead.NAME`, a peer
+of the first rather than above it. `sonny` opens the one last written to in
+that folder, else the first. `--lead NAME` opens another (`--lead lead` the
+first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
+name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
+and `/lead new [NAME]` makes one. A lead hears of, shows and lists in
+`/status` only its own tasks. It is told to send work for another lead's task
+to that lead, to leave changes it did not make alone and never to switch the
+folder's branch, since the leads share one checkout; the instructions,
+skills and memory of the folder are the same for all of them.
 
 `~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
 keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
@@ -233,9 +247,12 @@ speaks the Agent Client Protocol on stdio, so T3 Code runs it as a provider,
 one process for each thread. In T3 Code's Settings, add an "ACP Registry"
 provider, configure it by hand as a local command, and give it the
 executable `sonny` (or the full path `command -v sonny` prints) with the one
-argument `acp`. A thread opened in a folder is that folder's lead, the
-one `sonny` there opens, set up the same way: its rules, skills and memory,
-Sonny's tools, its approval mode and sandbox, and the lookout. A call that
+argument `acp`. A thread opened in a folder is a lead of that folder, set
+up as the one `sonny` there opens: its rules, skills and memory, Sonny's
+tools, its approval mode and sandbox, and the lookout. Each new thread is a
+lead of its own, named after the first words it is sent (the folder's first
+lead when it has none yet), unless those words are `/lead NAME`, which
+binds the thread to that lead of the folder, or `/lead new [NAME]`. A call that
 waits for you is asked in the thread (Allow or Deny); one the judge passes
 runs without asking. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
@@ -259,9 +276,9 @@ same bot. T3 Code's model picker lists what the providers list, as `/model`
 does, with `~/.agent/models`' notes and the models only it names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
-for a lead Sonny makes: the folder's lead that is there already keeps its own,
-since T3 Code puts its last pick to every new thread. One made later is the
-lead's from its next turn. A thread offers only its bot's provider family,
+for a lead Sonny makes: a lead the thread binds to with `/lead NAME` keeps its
+own, since T3 Code puts its last pick to every new thread. One made later is
+the lead's from its next turn. A thread offers only its bot's provider family,
 since a bot changes model only within it, and a task's thread keeps the model
 its lead gave the task.
 
@@ -509,9 +526,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`resolve_task`, `show_agent` and
+`resolve_task`, `subscriptions`, `show_agent` and
 `run_in_pane`; a lead's own, which its tasks don't take, are `start_task`,
-`remove_task`, `new_project` and `subscriptions`. The daemon shows them to
+`remove_task` and `new_project`. The daemon shows them to
 the model and records each call: `react`, `ask`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's lookout answers
 those, running each call in the calling agent's folder, so they work with
@@ -613,10 +630,13 @@ failure.
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
-working, needs you, done, said nothing, failed), read again every few
-seconds. A task whose model ended its turn with nothing to say did not
-fail, but did not reply either, so it reads `said nothing`, not `done`, in
-the roster and in `/status`. A click
+working, needs you, done, said nothing, checking, checked, failed), read
+again every few seconds. A task whose model ended its turn with nothing to
+say did not fail, but did not reply either, so it reads `said nothing`, not
+`done`, in the roster and in `/status`. A task with a goal reads `checking`
+once a turn ends, and `checked` once its goal's check passed.
+
+![A task whose goal's check passed beside one still checking and one only done](../docs/sonny/tasks-checked.png) A click
 on a task opens it in the pane: its own Sonny, live, to watch and to talk
 to, as a side chat is. Ctrl+\ takes the keys back to the conversation and
 gives them to the pane again; from the conversation Ctrl+[ hides the task
@@ -713,7 +733,11 @@ conversation once there is room again. The agent's plan sits over the
 notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
 show, the newest is the whole checklist. The notes are kept by agent in
-`~/.agent/sonny/margin/`, and the calls stay in its history.
+`~/.agent/sonny/margin/`, with the newest node of the agent's history they
+were brought up to; the calls stay in its history. A window opened later
+reads the `margin` calls and closes made since that node, however far
+back they are, so a note changed while no window was open shows as it is
+now.
 A note is drawn the way the conversation and the pane draw things:
 Markdown with its tables and math, Mermaid diagrams, HTML pages,
 pictures, and code in syntax colors.

@@ -647,6 +647,7 @@ impl Service {
         for bot in &bots {
             self.seat(&client, bot).await;
         }
+        tokio::spawn(refresh_tools(client.clone(), bots.clone()));
         self.resubscribe();
         if client
             .request("follow", json!({"bot": "*", "after": 0}))
@@ -680,6 +681,7 @@ impl Service {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
             lookout.reading = 0;
+            lookout.updates.replies_dropped();
         }
         self.goals.reconnected();
         let (done, mut results) = tokio::sync::mpsc::channel(64);
@@ -815,6 +817,9 @@ impl Service {
                     let (client, done) = (client.clone(), done.clone());
                     let (lead, id) = (lookout.lead.clone(), lookout.id);
                     lookout.reading += 1;
+                    if seen.reply {
+                        lookout.updates.reading_reply(&seen.task, seen.turn);
+                    }
                     tokio::spawn(async move {
                         let seen = read_event(&client, seen).await;
                         let _ = done.send((lead, id, seen)).await;
@@ -1180,6 +1185,49 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
 }
 
 /// Every bot the daemon lists, page by page.
+/// Bring every agent Sonny declared on up to this build's tools, as
+/// opening its window would, so one no one opens after an upgrade, such
+/// as a task out of sight, gets a tool added since. A busy one is tried
+/// again each minute, for an hour.
+async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
+    let mut left = bots;
+    for _ in 0..60 {
+        let mut busy = Vec::new();
+        for bot in left {
+            let Ok(mut record) = client
+                .request(
+                    "inspect",
+                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
+                )
+                .await
+            else {
+                continue;
+            };
+            record["name"] = bot["name"].clone();
+            record["bot_id"] = bot["bot_id"].clone();
+            let Some(fields) = crate::declared::refresh(&record) else {
+                continue;
+            };
+            match client.request("configure", Value::Object(fields)).await {
+                Ok(_) => println!(
+                    "{}",
+                    json!({"event": "tools_refreshed", "bot": bot["name"]})
+                ),
+                Err(error) if error.code == "bot_busy" => busy.push(bot),
+                Err(error) => println!(
+                    "{}",
+                    json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": error.code})
+                ),
+            }
+        }
+        if busy.is_empty() {
+            return;
+        }
+        left = busy;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn all_bots(client: &Client) -> Vec<Value> {
     let mut bots = Vec::new();
     let mut after = Value::Null;
@@ -1326,7 +1374,7 @@ impl Lookout {
                         made.insert(bot.to_owned());
                     }
                 }
-                if self.sibling(bot) || self.theirs.contains(by) {
+                if self.sibling(bot) || self.sibling(by) || self.theirs.contains(by) {
                     self.theirs.insert(bot.to_owned());
                 }
                 if self.globs(bot) {
@@ -1533,9 +1581,16 @@ impl Lookout {
             grow(&mut made, records);
             self.others.insert(root, made);
         }
-        self.theirs = (records.keys())
-            .filter(|name| self.sibling(name))
-            .cloned()
+        // Another lead's tasks stay theirs once that lead is gone: their
+        // maker is still named as one.
+        self.theirs = (records.iter())
+            .filter(|(name, record)| {
+                self.sibling(name)
+                    || record["created_by"]
+                        .as_str()
+                        .is_some_and(|by| self.sibling(by))
+            })
+            .map(|(name, _)| name.clone())
             .collect();
         grow(&mut self.theirs, records);
         self.globbed = (records.iter())
@@ -1611,6 +1666,11 @@ impl Lookout {
             return;
         };
         let told = self.updates.take();
+        // All there is waits on replies being read.
+        if told.items.is_empty() && told.memory.is_none() {
+            self.updates.unsent(told);
+            return;
+        }
         let prompt = note(&told, steer);
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
@@ -2014,6 +2074,50 @@ mod tests {
              Lines marked > are a task's own reply, not the person's words.\n"
         ), "{note}");
         assert!(!note.contains("early"));
+    }
+
+    #[test]
+    fn a_steer_leaves_a_turn_whose_reply_is_being_read_for_the_next_note() {
+        let mut lookout = seated("running");
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 4, "turn_finished", done));
+        let read = lookout.due.pop().unwrap();
+        lookout.updates.reading_reply(&read.task, read.turn);
+        // The person writes in a task while the reply is read: the steer
+        // carries their words, not the turn's end without its reply.
+        lookout.heard(&said(5, PERSON, "use tabs"));
+        let told = lookout.updates.take();
+        let steered = note(&told, true);
+        assert!(steered.contains("use tabs"), "{steered}");
+        assert!(!steered.contains("turn:calc.fix/4"), "{steered}");
+        lookout.updates.sent(told);
+        assert!(lookout.updates.news());
+        // Nothing else to tell: no note until the read is in.
+        let told = lookout.updates.take();
+        assert!(told.items.is_empty());
+        lookout.updates.unsent(told);
+        lookout.heard(&Seen {
+            text: "Fixed avg.".into(),
+            ..read
+        });
+        let told = lookout.updates.take();
+        let next = note(&told, false);
+        assert!(
+            next.contains("turn:calc.fix/4 completed") && next.contains("  > Fixed avg."),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn a_reply_read_with_no_words_holds_its_turn_no_more() {
+        let mut lookout = seated("idle");
+        let done = json!({"status": "completed", "checkpoint": 42});
+        lookout.event(&ev("calc.fix", 4, "turn_finished", done));
+        let read = lookout.due.pop().unwrap();
+        lookout.updates.reading_reply(&read.task, read.turn);
+        lookout.heard(&read);
+        let told = lookout.updates.take();
+        assert!(note(&told, false).contains("turn:calc.fix/4 completed"));
     }
 
     #[test]
@@ -2492,7 +2596,16 @@ mod tests {
         // Asking leaves it held.
         assert!(lock(&store).unwrap().is_none());
         drop(held);
-        assert!(!running(&store));
+        // A process another test starts at that instant may share the lock
+        // until it runs its command, which closes it.
+        let let_go = (0..100).any(|_| {
+            let gone = !running(&store);
+            if !gone {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        });
+        assert!(let_go);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2572,6 +2685,33 @@ mod tests {
         ]));
         assert!(lookout.watches("shop.lead.billing"));
         assert!(!lookout.watches("shop.invoices"));
+    }
+
+    #[test]
+    fn a_gone_leads_tasks_stay_off_the_first_lead() {
+        let mut lookout = lookout();
+        lookout.subs = vec![subs::Sub::lead("shop.lead", "shop")];
+        lookout.lead = "shop.lead".into();
+        // shop.lead.billing was deleted; its task and the task's own task
+        // live on.
+        lookout.roots(&HashMap::from([
+            (
+                "shop.invoices".to_owned(),
+                json!({"created_by": "shop.lead.billing"}),
+            ),
+            (
+                "shop.invoices-pdf".to_owned(),
+                json!({"created_by": "shop.invoices"}),
+            ),
+            ("shop.stray".to_owned(), json!({})),
+        ]));
+        assert!(lookout.watches("shop.stray"));
+        assert!(!lookout.watches("shop.invoices"));
+        assert!(!lookout.watches("shop.invoices-pdf"));
+        // One the gone lead's name makes later is theirs too.
+        lookout.lineage_of(&json!({"event": "created", "bot": "shop.receipts",
+            "data": {"created_by": "shop.lead.billing"}}));
+        assert!(!lookout.watches("shop.receipts"));
     }
 
     /// The lead as `bots` lists it mid-turn.

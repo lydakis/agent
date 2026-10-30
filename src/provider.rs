@@ -631,7 +631,13 @@ impl Provider {
     /// five minutes whatever the bot's setting, including after a switch to
     /// such a model.
     fn cache_hour_for(&self, model: &str) -> bool {
-        self.cache_hour && !(self.bedrock && five_minute_cache(model))
+        self.cache_hour && self.takes_cache_hour(model)
+    }
+
+    /// Whether a call to `model` here may ask for the hour-long cache at
+    /// all, whatever a bot's setting.
+    pub fn takes_cache_hour(&self, model: &str) -> bool {
+        self.family == Family::Anthropic && !(self.bedrock && five_minute_cache(model))
     }
 
     /// This provider with one bot's output bound, cache lifetime and
@@ -732,12 +738,9 @@ impl Provider {
             .then(|| self.search(request.model).entry(self.family))
             .flatten();
         let max_tokens = self.anthropic_max_tokens(request.model);
-        // Both markers take the same lifetime: a longer one may not follow
-        // a shorter one.
-        let cache = match self.cache_hour_for(request.model) {
-            true => json!({"type":"ephemeral","ttl":"1h"}),
-            false => json!({"type":"ephemeral"}),
-        };
+        // Every marker takes the same lifetime, the pinned blocks' among
+        // them: a longer one may not follow a shorter one.
+        let cache = crate::codec::cache_control(self.cache_hour_for(request.model));
         // The ChatGPT plan takes function tools only grouped in a namespace
         // (OpenAI's preview limitations, read 2026-10-20); a call comes back
         // naming it, and its item is replayed as it came. Search is its own
@@ -1177,6 +1180,15 @@ impl Provider {
                 reservation.settle(0);
                 return Err(Error::with(
                     "provider_login_refreshed",
+                    body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                ));
+            }
+            // A signature refused for its time is made again on the retry,
+            // as AWS's SDKs retry their clock-skew codes.
+            if matches!(status, 401 | 403) && signer.is_some() && aws::clock_skewed(&headers) {
+                reservation.settle(0);
+                return Err(Error::with(
+                    "provider_signature_expired",
                     body.detail.unwrap_or_else(|| format!("HTTP {status}")),
                 ));
             }

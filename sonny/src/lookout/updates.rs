@@ -229,6 +229,9 @@ pub struct Updates {
     opened: u64,
     /// Tasks' turns that resolved them, until they are told.
     resolving: crate::resolved::Own,
+    /// Turns whose reply is being read: how each ends waits for it, so a
+    /// note tells a turn's end with its reply or not yet.
+    replying: HashSet<Key>,
 }
 
 /// A turn whose answer a trigger passes to the lead: when it becomes news
@@ -289,6 +292,7 @@ impl Updates {
             memory_seen: None,
             opened: now_ms(),
             resolving: Default::default(),
+            replying: HashSet::new(),
         }
     }
 
@@ -625,6 +629,8 @@ impl Updates {
     /// cut at `REPLY_CHARS`, or with a trigger's answer once it is news.
     /// A turn that is no news, or no longer, drops it.
     pub fn replied(&mut self, name: &str, turn: i64, text: &str) {
+        // Read, whether or not it found words: the turn waits no more.
+        self.replying.remove(&(name.to_owned(), turn));
         let text = text.trim();
         if !self.live || text.is_empty() {
             return;
@@ -888,17 +894,41 @@ impl Updates {
         Some(std::mem::replace(&mut lead.status, "idle".into()))
     }
 
+    /// The reply that ends a task's turn is being read.
+    pub fn reading_reply(&mut self, name: &str, turn: i64) {
+        self.replying.insert((name.to_owned(), turn));
+    }
+
+    /// Reads under way were cut off, as by a dropped connection: no turn
+    /// waits on them.
+    pub fn replies_dropped(&mut self) {
+        self.replying.clear();
+    }
+
     /// The news for the next note, taken: every task's, those with the
     /// person's words first, then those with news to act on.
     pub fn take(&mut self) -> Told {
-        let mut tasks = std::mem::take(&mut self.tasks);
+        // A task whose only news is a turn whose reply is still being read
+        // has nothing for this note, so it leaves its place to one that has.
+        let replying = |name: &String, t: &Option<Turn>| {
+            (t.as_ref()).is_none_or(|t| self.replying.contains(&(name.clone(), t.turn)))
+        };
+        let (held, mut tasks): (Vec<_>, Vec<_>) = std::mem::take(&mut self.tasks)
+            .into_iter()
+            .partition(|(name, news)| {
+                news.said.is_empty()
+                    && news.notes.is_empty()
+                    && (news.act.is_some() || news.theirs.is_some())
+                    && replying(name, &news.act)
+                    && replying(name, &news.theirs)
+            });
         tasks.sort_by_key(|(_, news)| (!news.quotes(), news.said.is_empty() && news.act.is_none()));
         let rest = tasks.split_off(tasks.len().min(WAKE_TASKS));
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
         let mut sent = Vec::new();
         // What does not fit in this note's bytes waits for the next.
-        let mut later = Vec::new();
+        let mut later = held;
         let mut bytes = 0;
         for (name, mut news) in tasks {
             if bytes >= NOTE_BYTES {
@@ -917,6 +947,18 @@ impl Updates {
                 }
             }
             news.said = kept;
+            // A turn whose reply is still being read is told with it, in a
+            // later note.
+            let replying = |t: &Option<Turn>| {
+                (t.as_ref()).is_some_and(|t| self.replying.contains(&(name.clone(), t.turn)))
+            };
+            let mut held = News::default();
+            if replying(&news.act) {
+                held.act = news.act.take();
+            }
+            if replying(&news.theirs) {
+                held.theirs = news.theirs.take();
+            }
             // How its turns end, each with its reply, as they will read: the
             // first thing a note tells always fits; past that, turns that do
             // not wait for the next note.
@@ -929,14 +971,11 @@ impl Updates {
             let size: usize = turns.iter().map(|l| l.text.len() + 1).sum();
             let first = items.is_empty() && news.said.is_empty();
             let fits = first || bytes + size <= NOTE_BYTES;
-            if !wait.is_empty() || !fits {
-                let mut waiting = News {
-                    said: wait,
-                    ..News::default()
-                };
+            if !wait.is_empty() || !fits || held != News::default() {
+                let mut waiting = News { said: wait, ..held };
                 if !fits {
-                    waiting.act = news.act.take();
-                    waiting.theirs = news.theirs.take();
+                    waiting.act = waiting.act.or(news.act.take());
+                    waiting.theirs = waiting.theirs.or(news.theirs.take());
                     waiting.notes = std::mem::take(&mut news.notes);
                 }
                 later.push((name.clone(), waiting));
@@ -1697,6 +1736,25 @@ mod tests {
         );
         assert_eq!(told.more, 9);
         assert!(!updates.quoting());
+    }
+
+    #[test]
+    fn turns_whose_replies_are_being_read_leave_the_note_to_others() {
+        let mut updates = fleet();
+        let lead = json!({"from": {"bot": "shop.lead"}});
+        for n in 0..WAKE_TASKS + 1 {
+            let name = format!("shop.t{n}");
+            updates.seat(&json!({"name": name, "bot_id": 10 + n, "status": "idle"}));
+            updates.watched.insert(name.clone());
+            turn(&mut updates, &name, 1, lead.clone(), "completed");
+            updates.reading_reply(&name, 1);
+        }
+        turn(&mut updates, "shop.fix", 2, lead, "completed");
+        let told = updates.take();
+        let text = text(&told);
+        assert!(text.contains("turn:shop.fix/2"), "{text}");
+        assert!(!text.contains("shop.t0"), "{text}");
+        assert_eq!(told.more, WAKE_TASKS + 1);
     }
 
     #[test]

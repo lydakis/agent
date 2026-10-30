@@ -885,7 +885,7 @@ impl Session {
         }
         let client = bound.client.clone();
         // The lead its folder opens next in Sonny.
-        project::wrote_to(&bound.workspace, &bound.bot);
+        project::wrote_to(bound.client.store(), &bound.workspace, &bound.bot);
         // A prompt that steers joins the turn an earlier one waits on,
         // which is answered now: its words are in. Its own turn is the one
         // the daemon names for it, which the running turn may take in.

@@ -408,7 +408,7 @@ keep-warm when it sets any of them.
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
-| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. | `5m` |
+| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. | `5m` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
@@ -490,7 +490,11 @@ A call with no usable keys fails before it is paced, admitted or its body
 read.
 Temporary keys are re-resolved in the
 background five minutes before they expire, at most every ten seconds, and
-once on a 401 or 403, which retries the call as `provider_login_refreshed`;
+once on a 401 or 403, which retries the call as `provider_login_refreshed`.
+A 401 or 403 whose `x-amzn-ErrorType` is one of the AWS SDKs' clock-skew
+codes (`RequestExpired`, `InvalidSignatureException` and the rest), as for
+a request signed before the machine slept, retries at once as
+`provider_signature_expired`, signed again with the time now.
 Bedrock URLs must be https; the key id, secret and session token are
 redacted from tool output and, from the environment, kept out of shells, as
 are the `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_REGION` and

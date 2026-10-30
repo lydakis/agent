@@ -127,6 +127,39 @@ fn write(store: &Path, goal: &Goal) -> Result<(), String> {
         })
 }
 
+/// Where a goal whose check passed is noted, by the turn that met it:
+/// `STORE.lookout/goals/met/BOT.json`, so the roster and `/status` can
+/// tell a task that did what was asked from one that only stopped.
+fn met_file(store: &Path, bot: &str) -> PathBuf {
+    dir(store).join("met").join(format!("{bot}.json"))
+}
+
+/// Note that `turn` met the goal, written whole and moved in.
+fn met(store: &Path, goal: &Goal, turn: i64) {
+    let path = met_file(store, &goal.bot);
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let partial = dir.join(format!(".{}.{}.partial", goal.bot, std::process::id()));
+    let text = json!({"turn": turn, "check": goal.check}).to_string();
+    if std::fs::write(&partial, text).is_err() || std::fs::rename(&partial, &path).is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+}
+
+/// How a task whose turn `turn` completed stands with its goal: `checking`
+/// while it has one, which that turn has not met yet; `checked` when that
+/// turn met it; nothing when it has none.
+pub fn standing(store: &Path, bot: &str, turn: Option<i64>) -> Option<&'static str> {
+    if read(store, bot).is_some() {
+        return Some(crate::started::CHECKING);
+    }
+    let text = std::fs::read_to_string(met_file(store, bot)).ok()?;
+    let noted: Value = serde_json::from_str(&text).ok()?;
+    (turn.is_some() && noted["turn"].as_i64() == turn).then_some(crate::started::CHECKED)
+}
+
 /// The goal ends: its file goes, unless it was set again since.
 fn end(store: &Path, goal: &Goal) {
     if read(store, &goal.bot).is_some_and(|now| now.set_ms == goal.set_ms) {
@@ -427,6 +460,7 @@ impl Goals {
                 if let Some(goal) = self.goals.remove(bot) {
                     end(&self.store, &goal);
                 }
+                let _ = std::fs::remove_file(met_file(&self.store, bot));
                 None
             }
             "turn_finished" => {
@@ -542,6 +576,7 @@ async fn pursue(
         _ => return Some(String::new()),
     }
     if code == Some(0) {
+        met(store, goal, turn);
         end(store, goal);
         return Some(", and met its goal: its check exits 0".to_owned());
     }
@@ -739,6 +774,26 @@ mod tests {
     }
 
     #[test]
+    fn a_task_stands_checking_while_its_goal_is_set_and_checked_by_the_turn_that_met_it() {
+        let dir = scratch("standing");
+        let store = dir.join("state.sqlite");
+        let set = goal(&store, "p.fix");
+        assert_eq!(standing(&store, "p.fix", Some(4)), None);
+        write(&store, &set).unwrap();
+        assert_eq!(standing(&store, "p.fix", Some(4)), Some("checking"));
+        met(&store, &set, 4);
+        end(&store, &set);
+        assert_eq!(standing(&store, "p.fix", Some(4)), Some("checked"));
+        // A later turn is plain news, and so is a goal set again.
+        assert_eq!(standing(&store, "p.fix", Some(5)), None);
+        write(&store, &set).unwrap();
+        assert_eq!(standing(&store, "p.fix", Some(4)), Some("checking"));
+        // The goals list never takes the note for a goal.
+        assert_eq!(all(&store).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_goal_reads_back_as_written_and_ends_only_as_set() {
         let dir = scratch("read");
         let store = dir.join("state.sqlite");
@@ -775,6 +830,9 @@ mod tests {
         // One that prints without end keeps only the end of it.
         let mut loud = goal(&store, "p.fix");
         loud.check = "head -c 50000000 /dev/zero | tr '\\0' x; echo; echo last".into();
+        // What is kept is under test, not how fast 50 MB goes through `tr`:
+        // a slow runner takes more than the 5 s the others get.
+        loud.timeout_s = TIMEOUT_S;
         let (code, output) = runtime.block_on(run(&loud, &store, &store));
         assert_eq!(code, Some(0));
         assert!(

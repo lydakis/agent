@@ -67,9 +67,10 @@ const SPLIT: [&str; 4] = crate::mux::SIDES;
 pub fn tools(lead: bool) -> Vec<Value> {
     let mut tools = Vec::new();
     if lead {
-        tools.extend([start(), remove(), project(), subscriptions()]);
+        tools.extend([start(), remove(), project()]);
     }
     tools.extend([
+        subscriptions(),
         show(),
         run(),
         triggers(),
@@ -105,10 +106,11 @@ fn start() -> Value {
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
                 "model": {"type": "string", "minLength": 1,
-                    "description": "PROVIDER/MODEL, when the person asked for one; else the one this \
-                        project's task rule names, else yours."},
+                    "description": "PROVIDER/MODEL, one of the models \"$AGENT_BIN\" models lists with \
+                        the person's notes on them, when the work suits another model than yours; \
+                        without one, the project's threads_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
-                    "description": "The task's effort level."},
+                    "description": "The task's effort level, when the work calls for one."},
                 "from": {"type": "string", "minLength": 1,
                     "description": "Another task to fork instead of starting afresh, to try another way \
                         from where it was: the new task gets its conversation up to a turn it completed \
@@ -219,8 +221,7 @@ fn subscriptions() -> Value {
             },
             "additionalProperties": false
         },
-        "answered_by": TAG,
-        "inherit": false
+        "answered_by": TAG
     })
 }
 
@@ -1013,7 +1014,10 @@ mod tests {
                 .filter(|name| name != EXEC)
                 .collect()
         };
-        assert_eq!(names(tools(false)), [SHOW, RUN, TRIGGERS, MEMORY, GOAL]);
+        assert_eq!(
+            names(tools(false)),
+            [SUBSCRIPTIONS, SHOW, RUN, TRIGGERS, MEMORY, GOAL]
+        );
         assert_eq!(
             names(tools(true)),
             [
