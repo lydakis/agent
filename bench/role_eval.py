@@ -423,6 +423,11 @@ def run(arm, n, bins, model, spec=None):
         (out / 'bots.txt').write_text(bots.stdout)
         if acp:
             acp.close()
+        # A trigger is loaded in the user's own scheduler whatever HOME made
+        # it (#453): take the run's out before its HOME goes.
+        listed = subprocess.run([str(sonny), 'trigger', 'ls'], env=env, capture_output=True, text=True)
+        for t in json.loads(listed.stdout or '{}').get('triggers', []):
+            subprocess.run([str(sonny), 'trigger', 'rm', t['name']], env=env, capture_output=True)
         subprocess.run([str(agent), 'shutdown'], env=env, capture_output=True)
         # Saved facts; `~/.agent/memory` is the memory script, not a folder.
         if (home / '.agents/memory').is_dir():
