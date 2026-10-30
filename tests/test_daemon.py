@@ -343,6 +343,21 @@ class DaemonTests(ModelFixture):
             self.assertEqual(stats['bytes'], path.stat().st_size)
             self.assertEqual(stats['wal_bytes'], wal.stat().st_size)
 
+    def test_a_client_that_connects_later_is_greeted_with_the_pause_as_it_holds(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        def greeting():
+            with socket.socket(socket.AF_UNIX) as peer:
+                peer.settimeout(3)
+                peer.connect(str(client.socket_path))
+                with peer.makefile('rb') as reader:
+                    return json.loads(reader.readline())
+        self.assertIsNone(greeting()['paused'])
+        pause = client.control.request('pause', reason='look at this', by='calc.a')['result']['pause']
+        self.assertEqual(greeting()['paused'], pause)
+        client.control.request('resume')
+        self.assertIsNone(greeting()['paused'])
+
     def test_slow_rpc_reader_does_not_delay_other_clients(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

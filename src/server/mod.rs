@@ -1535,7 +1535,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     match message {
                         Inbound::Open(id, output, caller, _) => {
-                            let _ = output.try_send(ready.clone());
+                            // With the pause as it holds now: one taken or
+                            // lifted since start was told only to sessions then.
+                            let mut ready = ready.clone();
+                            ready["paused"] = json!(service.paused);
+                            let _ = output.try_send(ready);
                             sessions.insert(id, output);
                             if let Some(caller) = caller { callers.insert(id, caller); }
                             if companion { companion_sessions.insert(id); }
