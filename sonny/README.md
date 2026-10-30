@@ -481,7 +481,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   removes it; the subscription Sonny keeps for a lead's tasks stays. The
   footer says `↻ 2 in background` while the window's agent has any.
   What failed is listed first, with a red `✗` and the error: a trigger
-  whose fire failed, or whose fire went out and whose turn then failed (as
+  whose fire failed (one that ended on it stays listed until `d` removes
+  it), or whose fire went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says

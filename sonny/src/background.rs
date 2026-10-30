@@ -255,6 +255,9 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     if row["missed"] == true {
         facts.push("missed its time".into());
     }
+    if row["ended"] == true {
+        facts.push("ended".into());
+    }
     if let Some(gate) = row["if"].as_str() {
         facts.push(format!("if {}", first_line(gate)));
     }

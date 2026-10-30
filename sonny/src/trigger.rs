@@ -1600,6 +1600,33 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
             (row, bots)
         })
         .collect();
+    // One that ended keeps its row when it has something to say, as a
+    // one-shot that did not deliver or one stopped by an error.
+    for entry in std::fs::read_dir(&places.state)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let file = entry.file_name();
+        let Some(name) = file.to_str().and_then(|f| f.strip_suffix(".json")) else {
+            continue;
+        };
+        if valid_name(name).is_err()
+            || places.job(name).exists()
+            || found.iter().any(|(row, _)| row["name"] == name)
+        {
+            continue;
+        }
+        let Some(mut row) = read_json(&places.last(name))
+            .filter(|row| row["name"] == name && row["store_id"] == store_id)
+        else {
+            continue;
+        };
+        row["ended"] = json!(true);
+        let mut bots: Vec<String> = row["bot"].as_str().map(str::to_owned).into_iter().collect();
+        bots.extend(row["reply_to"].as_str().map(str::to_owned));
+        found.push((row, bots));
+    }
     found.sort_by(|a, b| a.0["name"].as_str().cmp(&b.0["name"].as_str()));
     found
 }
@@ -2989,6 +3016,9 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     let mut row = trigger.json(&json!({"last": last, "sent": kept.sent,
         "started_id": kept.started_id}));
     row["started_id"] = json!(kept.started_id);
+    // Whose it is once its job is gone: a failure it retired with is
+    // shown on that daemon's windows only.
+    row["store_id"] = json!(trigger.store_id);
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
     row["checked"] = kept.checked.clone();
@@ -3475,14 +3505,6 @@ pub fn with_turn(row: &mut Value, ended: &HashMap<String, Value>) {
         });
     }
     row["last"]["turn_status"] = status;
-}
-
-/// [`with_turn`] for each of `rows`, reading their turns from the daemon.
-pub async fn with_turns(client: &Client, rows: &mut [Value]) {
-    let found = ended(client, rows.iter().filter_map(sent).collect()).await;
-    for row in rows {
-        with_turn(row, &found);
-    }
 }
 
 fn answer(result: &Value) -> String {
@@ -5205,6 +5227,14 @@ mod tests {
                 .unwrap()
                 .starts_with("asks_stuck:")
         );
+        // Its job gone, its failure is still its store's to show, and no
+        // other's.
+        let kept = on_store(&w.places, &s.store_id);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0["ended"], true);
+        assert_eq!(kept[0].0["last"]["outcome"], "failed");
+        assert_eq!(kept[0].1, [s.bot().to_owned()]);
+        assert!(on_store(&w.places, "another-store").is_empty());
     }
 
     #[test]

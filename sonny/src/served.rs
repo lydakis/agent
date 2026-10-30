@@ -604,13 +604,33 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("trigger_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
+            // Only a trigger made on this daemon's store: a turn handle names
+            // a bot and a turn, which another store's daemon has its own of.
             if let Ok((_, socket)) = crate::daemon_paths(None, None)
                 && let Ok((client, _events)) = Client::connect(&socket).await
             {
-                if let Some(rows) = said.get_mut("triggers").and_then(Value::as_array_mut) {
-                    crate::trigger::with_turns(&client, rows).await;
+                let ours: Vec<Value> = match (client.store(), crate::trigger::Places::home()) {
+                    (Some(store), Ok(places)) => crate::trigger::on_store(&places, store)
+                        .into_iter()
+                        .map(|(row, _)| row["name"].clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut rows: Vec<&mut Value> = if said["triggers"].is_array() {
+                    (said["triggers"].as_array_mut().into_iter().flatten()).collect()
                 } else if said["last"].is_object() {
-                    crate::trigger::with_turns(&client, std::slice::from_mut(&mut said)).await;
+                    vec![&mut said]
+                } else {
+                    Vec::new()
+                };
+                rows.retain(|row| ours.contains(&row["name"]));
+                let handles = rows
+                    .iter()
+                    .filter_map(|row| crate::trigger::sent(row))
+                    .collect();
+                let ended = crate::trigger::ended(&client, handles).await;
+                for row in rows {
+                    crate::trigger::with_turn(row, &ended);
                 }
                 client.close().await;
             }
