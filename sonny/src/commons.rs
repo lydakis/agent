@@ -431,6 +431,7 @@ fn paid(dir: &Path, thread: &str, bot: &str, turn: i64) {
     if let Some(invite) =
         (sent.iter_mut()).find(|invite| invite["thread"] == thread && invite["bot"] == bot)
         && let Some(turns) = invite["turns"].as_array_mut()
+        && !turns.contains(&json!(turn))
     {
         turns.push(json!(turn));
         keep(dir, &sent, count);
@@ -438,7 +439,9 @@ fn paid(dir: &Path, thread: &str, bot: &str, turn: i64) {
 }
 
 /// What is left of an invite that paid for `turns` of `bot`; none when a
-/// turn cannot be read.
+/// turn cannot be read. A turn not yet finished holds its whole cap, which
+/// it may still spend, so a reply meanwhile joins it rather than funding
+/// another.
 async fn left(client: &agent_client::Client, bot: &str, turns: &[i64]) -> u64 {
     let mut spent = 0;
     for &turn in turns {
@@ -451,8 +454,13 @@ async fn left(client: &agent_client::Client, bot: &str, turns: &[i64]) -> u64 {
         else {
             return 0;
         };
-        spent +=
+        let used =
             row["input_tokens"].as_u64().unwrap_or(0) + row["output_tokens"].as_u64().unwrap_or(0);
+        let holds = match row["finished_ms"].is_null() {
+            true => row["budget_tokens"].as_u64().unwrap_or(u64::MAX).max(used),
+            false => used,
+        };
+        spent = holds.saturating_add(spent);
     }
     invite_tokens().saturating_sub(spent)
 }
