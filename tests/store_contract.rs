@@ -1936,7 +1936,8 @@ fn schema_62_had_no_steps_and_no_paused_calls() {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "ALTER TABLE approvals DROP COLUMN step_of; ALTER TABLE answers DROP COLUMN paused_ms;
+            "DROP INDEX approvals_steps; DROP INDEX answers_paused;
+             ALTER TABLE approvals DROP COLUMN step_of; ALTER TABLE answers DROP COLUMN paused_ms;
              PRAGMA user_version=62;",
         )
         .unwrap();

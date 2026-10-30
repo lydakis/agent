@@ -2398,7 +2398,8 @@ whole: its call starts at once, and the gates that name the tool judge its
 steps instead. The client asks with
 `{"op":"approve_step","bot","turn","call_id","step","name","arguments"}`:
 `step` its own id for the step within the call (1 to 128 of `A-Z a-z 0-9
-. _ -`, never reused for the call), `name` the step's tool, and
+. _ -`, never reused for the call), `name` the step's tool (1 to 512 bytes,
+no control characters), and
 `arguments` an object of at most 64 KiB (`invalid_step`,
 `step_arguments_limit`). The call must be the bot's and still waiting for
 its answer (`turn_not_found`, `stale_turn`, `no_pending_call`,

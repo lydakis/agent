@@ -3307,11 +3307,17 @@ impl Service {
                 if call_id.is_empty() {
                     return fail_with("invalid_call_id", "call_id may not be empty");
                 }
-                for (field, value) in [("step", &step), ("name", &tool)] {
-                    name(field, value).map_err(|e| Error {
-                        code: "invalid_step".into(),
-                        ..e
-                    })?;
+                name("step", &step).map_err(|e| Error {
+                    code: "invalid_step".into(),
+                    ..e
+                })?;
+                // The client's name for the step's tool, which only its
+                // approver reads: a script's identifier can be long.
+                if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
+                    return fail_with(
+                        "invalid_step",
+                        "name must be 1 to 512 bytes, no control characters",
+                    );
                 }
                 if !arguments.is_object() {
                     return fail_with("invalid_step", "arguments must be an object");

@@ -552,16 +552,17 @@ async fn run(
         calls: Arc::default(),
         stopped: Arc::default(),
         steps: steps.map(Arc::new),
-        clock: Clock::new(Instant::now() + timeout),
+        clock: Clock::new(Instant::now() + timeout, running),
     };
     let stopped = Arc::clone(&run.stopped);
     let _stop = Stop(Arc::clone(&stopped));
     let started = Instant::now();
     let (said, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
+    let clock = Arc::clone(&run.clock);
     let ended = tokio::task::spawn_blocking(move || {
-        // Held until the script's runtime is gone, so an interrupted turn
-        // frees its place only once its script has stopped.
-        let _running = running;
+        // Its place is held until the script's runtime is gone, so an
+        // interrupted turn frees it only once its script has stopped.
+        let _running = clock;
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -693,19 +694,38 @@ struct Run {
 }
 
 /// A script's time, which stops while any of its calls waits for the
-/// agent's gate, as the time of its `exec` call does in the daemon.
+/// agent's gate, as the time of its `exec` call does in the daemon, and its
+/// place among the scripts running, which it gives up meanwhile: a verdict
+/// can take a person hours, and four scripts waiting on theirs would hold
+/// back every other agent's.
 struct Clock {
     /// The deadline, the calls waiting, and since when they have.
     state: Mutex<(Instant, usize, Instant)>,
     resumed: tokio::sync::Notify,
+    place: Mutex<Option<tokio::sync::SemaphorePermit<'static>>>,
+    /// Taken while a call takes the place back, so only one waits for it.
+    returning: tokio::sync::Mutex<()>,
 }
 
 impl Clock {
-    fn new(deadline: Instant) -> Arc<Self> {
+    fn new(deadline: Instant, place: tokio::sync::SemaphorePermit<'static>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new((deadline, 0, Instant::now())),
             resumed: tokio::sync::Notify::new(),
+            place: Mutex::new(Some(place)),
+            returning: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Take the script's place back once a call's verdict came, waiting
+    /// for one as a new script does, with the time running.
+    async fn take_place(&self) -> Result<(), String> {
+        let _one = self.returning.lock().await;
+        if self.place.lock().unwrap().is_none() {
+            let place = RUNNING.acquire().await.map_err(|e| e.to_string())?;
+            *self.place.lock().unwrap() = Some(place);
+        }
+        Ok(())
     }
 
     fn out(&self) -> bool {
@@ -713,11 +733,12 @@ impl Clock {
         waiting == 0 && Instant::now() >= deadline
     }
 
-    /// Stop the clock until the guard is dropped.
+    /// Stop the clock until the guard is dropped, and give up the place.
     fn stop(self: &Arc<Self>) -> Stopped {
         let mut state = self.state.lock().unwrap();
         if state.1 == 0 {
             state.2 = Instant::now();
+            self.place.lock().unwrap().take();
         }
         state.1 += 1;
         Stopped(Arc::clone(self))
@@ -981,12 +1002,18 @@ impl Caller {
                 Value::Null => json!({}),
                 arguments => arguments.clone(),
             };
-            let _stopped = self.clock.stop();
+            let stopped = self.clock.stop();
             let approval = Abort(
                 self.lookout
                     .spawn(async move { steps.ask(&id, asked).await }),
             );
-            match approval.await {
+            let approved = approval.await;
+            drop(stopped);
+            // Whatever the verdict, the script runs on from here.
+            if let Err(error) = self.clock.take_place().await {
+                return json!({"error": error});
+            }
+            match approved {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => return json!({"error": error}),
                 Err(e) => return json!({"error": e.to_string()}),
@@ -1422,6 +1449,43 @@ text("done");"#;
         .await
         .unwrap();
         assert!(said.ends_with("Output:\nhi\ntrue\ndone"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn scripts_waiting_for_verdicts_leave_their_places_to_others() {
+        let dir = scratch("steps-places");
+        let hub = hub(&dir).await;
+        let mut servers = hub.servers();
+        servers.get_mut("test").unwrap().default_tools_approval_mode =
+            agent_client::config::ApprovalMode::Prompt;
+        hub.configure(&servers).await;
+        let (client, _steps) = gate(&dir, Duration::from_secs(3)).await;
+        let waiting: Vec<_> = (0..SCRIPTS)
+            .map(|n| {
+                let (hub, dir) = (hub.clone(), dir.clone());
+                let asker = Steps::new(client.clone(), "shop.lead".into(), 7, format!("c{n}"));
+                tokio::spawn(async move {
+                    let script = "await tools.mcp__test__slow({ms: 1}); text('approved');";
+                    run(
+                        &hub,
+                        Some(&dir),
+                        "shop.lead",
+                        script,
+                        Duration::from_secs(30),
+                        Some(asker),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        // Every place is free while their verdicts are out: another runs.
+        let said = ran(&hub, &dir, "text('meanwhile');").await;
+        assert!(said.ends_with("Output:\nmeanwhile"), "{said}");
+        assert!(waiting.iter().all(|script| !script.is_finished()));
+        for script in waiting {
+            let said = script.await.unwrap().unwrap();
+            assert!(said.ends_with("Output:\napproved"), "{said}");
+        }
     }
 
     #[tokio::test]

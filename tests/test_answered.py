@@ -371,7 +371,7 @@ class StepTests(ModelFixture):
     def test_a_step_is_refused_what_its_call_would_refuse(self):
         client, turn, _ = self.script(tool=EXEC)
         ask = dict(bot='Lead', turn=turn, call_id='script-0', step='1', name='mcp__chat__send', arguments={})
-        for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': ''}, 'invalid_step'),
+        for change, error in [({'step': 'a b'}, 'invalid_step'), ({'name': ''}, 'invalid_step'), ({'name': 'x' * 513}, 'invalid_step'),
                               ({'arguments': []}, 'invalid_step'),
                               ({'arguments': {'text': 'x' * 65537}}, 'step_arguments_limit'),
                               ({'call_id': 'nope'}, 'no_pending_call'), ({'bot': 'Other'}, 'turn_not_found')]:
