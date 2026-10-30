@@ -154,6 +154,8 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
             ));
         }
     }
+    // Written whole, as the folder holds no shared index of its own.
+    settings.push(("core.splitIndex".into(), "false".into()));
     match std::fs::remove_dir_all(at) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
         _ => {}
@@ -299,6 +301,13 @@ pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
     if let Ok(mut theirs) = std::fs::File::open(&sealed.index) {
         let mut ours = std::fs::File::create_new(&index).map_err(|e| e.to_string())?;
         std::io::copy(&mut theirs, &mut ours).map_err(|e| e.to_string())?;
+        // A split index keeps most of its entries in a shared index beside
+        // it, where the sealed git folder looks.
+        let args = ["rev-parse", "--shared-index-path"];
+        let shared = git(&top, &args, Some(&index), None)?;
+        if let Some(name) = Path::new(&shared).file_name() {
+            std::fs::copy(top.join(&shared), sealed.dir.join(name)).map_err(|e| e.to_string())?;
+        }
         // A file marked as not changing would keep its old content.
         let listed = self::sealed(&sealed, &["ls-files", "-v", "-z"], &index, None)?;
         let assumed: String = (listed.split('\0'))
@@ -948,6 +957,26 @@ mod tests {
         assert!(!copy.exists());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(other.parent().unwrap());
+    }
+
+    #[test]
+    fn a_checkout_whose_index_is_split_is_snapshotted() {
+        let (dir, top) = repo("split");
+        git(&top, &["update-index", "--split-index"], None, None).unwrap();
+        std::fs::write(top.join("kept.txt"), "changed\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let kept = git(
+            &top,
+            &["show", &format!("{}:kept.txt", snapshot.commit)],
+            None,
+            None,
+        );
+        assert_eq!(kept.unwrap(), "changed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
