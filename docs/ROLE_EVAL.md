@@ -20,8 +20,10 @@ been quiet for a minute.
 
 Output goes under `.local/role-eval/<model>/`. Each run writes `acp.jsonl`,
 `transcript.md` (what the person saw), `usage.json`, `bots.txt`, `git.txt`
-and the memory saved. `blind` copies the transcripts under shuffled names
-for scoring.
+and the memory saved. A run whose lead turn fails, whether a prompt or a turn
+the lookout started, stops and writes no transcript. `blind` copies the
+finished runs' transcripts under shuffled names for scoring, with each build's
+path (`bin.txt`) hidden.
 
 ```
 cargo build --release --locked -p agent-runtime -p sonny   # in each arm's checkout

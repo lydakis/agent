@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -31,6 +32,34 @@ class SetupTests(unittest.TestCase):
         rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
         for plant in plants:
             self.assertIn(f'| {plant} |', rubric)
+
+
+class BlindTests(unittest.TestCase):
+    def run_dir(self, runs, name, build, rows):
+        out = runs / name
+        out.mkdir(parents=True)
+        (out / 'bin.txt').write_text(build)
+        (out / 'acp.jsonl').write_text(''.join(json.dumps({'t': 0, 'm': m}) + '\n' for m in rows))
+        (out / 'transcript.md').write_text(f'- call exec: "{build}/agent ls"\n')
+
+    def test_failed_turns_stay_out_and_builds_are_hidden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'out'
+            runs = out / 'runs'
+            ok = {'method': 'session/update', 'params': {'update': {'sessionUpdate': 'state_update', 'state': 'idle'}}}
+            bad = {'method': 'session/update', 'params': {'update': {
+                'sessionUpdate': 'state_update', 'state': 'idle', 'error': {'message': 'rate limited'}}}}
+            self.run_dir(runs, 'A1', '/work/baseline/target/release', [ok])
+            self.run_dir(runs, 'B1', '/work/trim/target/release', [ok])
+            self.run_dir(runs, 'B2', '/work/trim/target/release', [bad])
+            with mock.patch.object(role_eval, 'OUT', out), mock.patch.object(role_eval, 'RUNS', runs):
+                role_eval.blind()
+            key = json.loads((out / 'blind-key.json').read_text())
+            self.assertEqual(sorted(key.values()), ['A1', 'B1'])
+            for path in (out / 'blind').iterdir():
+                text = path.read_text()
+                self.assertNotIn('baseline', text)
+                self.assertNotIn('trim', text)
 
 
 if __name__ == '__main__':

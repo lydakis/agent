@@ -380,6 +380,8 @@ def run(arm, n, bins, model, spec=None):
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
+    # The build, so `blind` can hide it from the scorer.
+    (out / 'bin.txt').write_text(bins[arm])
     log = out / 'acp.jsonl'
     sh([str(agent), 'start', '--idle-exit', '0'], env=env)
     acp = None
@@ -410,6 +412,9 @@ def run(arm, n, bins, model, spec=None):
             if s.get('events'):
                 time.sleep(30)  # the sources run every 15 s
             timeline[-1]['settled'] = settle(env, agent, acp)
+            # So is a turn the lookout started, which fails in an update.
+            if failed := failures(out):
+                raise RuntimeError(f'step {step}: {failed[0]}')
     finally:
         (out / 'timeline.json').write_text(json.dumps(timeline, indent=1))
         usage = subprocess.run([str(agent), 'usage', '--name', 'shop.*'], env=env, capture_output=True, text=True)
@@ -430,6 +435,21 @@ def run(arm, n, bins, model, spec=None):
 
 
 # --- what the person saw ----------------------------------------------------
+
+def failures(out):
+    """The errors of the lead's failed turns in `acp.jsonl`: those a prompt
+    answered with and those of turns it took on its own."""
+    found = []
+    for line in open(out / 'acp.jsonl'):
+        m = json.loads(line).get('m', {})
+        update = (m.get('params') or {}).get('update') or {}
+        error = m.get('error') or (m.get('result') or {}).get('error') if 'id' in m and 'method' not in m else None
+        if update.get('sessionUpdate') == 'state_update':
+            error = update.get('error')
+        if error:
+            found.append(error)
+    return found
+
 
 def transcript(out):
     """`acp.jsonl` as the person's view: each lead turn's start (their words,
@@ -473,7 +493,18 @@ def transcript(out):
 
 def blind():
     """Every run's transcript under a shuffled name, the key kept apart."""
-    runs = sorted(p.name for p in RUNS.iterdir() if (p / 'transcript.md').exists())
+    # A run that failed has no transcript; one an older harness finished
+    # despite a failed turn is left out here.
+    runs = []
+    for p in sorted(RUNS.iterdir()):
+        if (p / 'transcript.md').exists() and failures(p):
+            print(p.name, 'left out: a lead turn failed', file=sys.stderr)
+        elif (p / 'transcript.md').exists():
+            runs.append(p.name)
+    # Each build's path names its arm: hide it, and the folder under which the
+    # builds part, such as two checkouts side by side.
+    builds = {name: (RUNS / name / 'bin.txt').read_text() for name in runs if (RUNS / name / 'bin.txt').exists()}
+    shared = os.path.commonpath(list(builds.values())) if len(set(builds.values())) > 1 else None
     names = [f'run-{i:02d}' for i in range(1, len(runs) + 1)]
     random.shuffle(names)
     dest = OUT / 'blind'
@@ -485,6 +516,12 @@ def blind():
         # Paths in calls name the arm (the run's root, the build): hide them.
         text = (RUNS / run_name / 'transcript.md').read_text()
         text = re.sub(re.escape(str(ROOT)) + r'/[0-9a-f]{8}-' + re.escape(run_name), str(ROOT / 'RUN'), text)
+        if run_name in builds:
+            build = builds[run_name]
+            text = text.replace(build, '/BUILD')
+            if shared:
+                text = text.replace(os.path.join(shared, Path(build).relative_to(shared).parts[0]),
+                                    os.path.join(shared, 'ARM'))
         for arm in 'AB':
             text = text.replace(f'/src-{arm}/', '/src-ARM/')
         (dest / f'{name}.md').write_text(text)
@@ -528,8 +565,9 @@ def main():
     elif a.cmd == 'blind':
         blind()
     else:
+        # Only runs that finished: a failed run stays out of scoring.
         for p in RUNS.iterdir():
-            if (p / 'acp.jsonl').exists():
+            if (p / 'transcript.md').exists():
                 transcript(p)
 
 
