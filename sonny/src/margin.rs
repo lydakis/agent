@@ -503,6 +503,8 @@ pub struct Margin {
     /// Counts each change to the notes or the files they show.
     changes: u64,
     drawn: Option<(Drawn, Rows)>,
+    /// Counts each note put up or changed by the bot.
+    posted: u64,
     /// The bot's plan as its newest `plan` call set it, shown over the
     /// notes: one, however often it changes.
     plan: Vec<String>,
@@ -665,8 +667,17 @@ impl Margin {
             return None;
         }
         let change = self.change(id, call, arguments, after, turn);
+        if matches!(change, Some(Change::Posted(_) | Change::Updated(_))) {
+            self.posted += 1;
+        }
         self.save();
         change
+    }
+
+    /// Counts each note the bot put up or changed while this margin was
+    /// read: a different count, something new to show.
+    pub fn posted(&self) -> u64 {
+        self.posted
     }
 
     fn change(

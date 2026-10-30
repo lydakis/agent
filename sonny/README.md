@@ -162,6 +162,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | What `/side`'s copy may do | `[sonny] side_chat` (`answer` or `fork`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
 `start_task` applies them in code, so the lead's prompt says nothing about
@@ -376,7 +377,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `suggest`) through them
+  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `suggest`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
@@ -726,9 +727,13 @@ shows as the task keeps it, follows the task's title until the lead gives
 its own, and stays once the task is gone. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
-opens by itself with its first note, once the window leaves the
-conversation its 100 columns and the margin 40 more, and goes once it
-holds nothing; closed with Esc, it stays closed as notes come; in a narrower one the footer counts the notes
+opens by itself when the agent puts up or changes a note, once the window
+leaves the conversation its 100 columns and the margin 40 more, even
+after Esc closed it, under whatever is open over it, as VS Code's
+`reveal` shows a task's output; `[sonny] margin_opens = "unless-closed"`
+leaves it closed after Esc until `/margin`, and `"never"` opens it only
+with `/margin`. It never closes by itself: emptied, or opened to look at
+with nothing in it, it stays until Esc. In a narrower window the footer counts the notes
 (`✎ 3`), and Tab with nothing typed shows the margin. Where the margin
 cannot show, because the window is narrower or it is closed, each note is
 drawn in the conversation where it was put instead of its marker, up to
@@ -759,8 +764,6 @@ pictures, and code in syntax colors.
 ![/status laid over the margin: its title's ← goes back, and the footer counts the note the margin holds](../docs/sonny/margin-status.png)
 
 ![The margin opened by itself with the lead's first notes, two tasks' tables shown as the tasks keep them](../docs/sonny/margin-opens-with-a-note.png)
-
-![Both notes taken away with ×: the margin goes and the conversation has the window back](../docs/sonny/margin-gone-once-empty.png)
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 

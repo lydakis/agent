@@ -857,6 +857,7 @@ async fn run() -> Result<(), String> {
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
+    app.margin_opens = settings.margin_opens;
     // A bot keeps the model it was made with; --model runs this window's
     // turns on another.
     if let Some(model) = options.model.as_ref().filter(|m| **m != app.model) {
@@ -1733,9 +1734,10 @@ struct App {
     pane: Option<pane::Pane>,
     pane_keys: bool,
     pane_mouse: bool,
-    /// Whether the margin held anything when last looked at: emptied, it
-    /// goes, keys or not.
-    margin_held: bool,
+    /// How many notes the agent had put up or changed when the margin was
+    /// last looked at, and whether such a note opens it.
+    margin_posted: u64,
+    margin_opens: agent_client::config::MarginOpens,
     /// The pane closed last, with its `/status` or `/background`, which
     /// Ctrl+] opens again.
     closed: Option<(pane::Pane, Option<Watch>)>,
@@ -2559,7 +2561,8 @@ impl App {
             full_width: 0,
             pane: None,
             pane_keys: false,
-            margin_held: false,
+            margin_posted: 0,
+            margin_opens: Default::default(),
             pane_mouse: false,
             closed: None,
             composer_at: None,
@@ -6772,39 +6775,40 @@ impl App {
     }
 
     /// The margin back beside the conversation when nothing else is
-    /// there and it holds something, unless the person closed it: out of
-    /// the way again once it holds nothing, unless it was asked for so.
+    /// there and it holds something, unless the person closed it, as
+    /// `[sonny] margin_opens` says: a note put up or changed opens it
+    /// again even then, by default, under what is open over it, as VS
+    /// Code's `reveal` shows a task's output. It never closes by itself,
+    /// so one opened to look at stays, empty or not.
     fn margin_back(&mut self) {
+        use agent_client::config::MarginOpens;
+        let posted = self.margin.posted();
+        let fresh = std::mem::replace(&mut self.margin_posted, posted) != posted;
+        if fresh && self.margin_opens == MarginOpens::Always && self.margin.closed() {
+            self.margin.close(false);
+            if self.under.is_none()
+                && let Some(over) = &mut self.pane
+            {
+                over.over = true;
+                self.under = Some(pane::Pane::margin());
+            }
+        }
         if self.margin.closed() {
             self.under = None;
             if let Some(over) = &mut self.pane {
                 over.over = false;
             }
         }
-        let empty = self.margin.is_empty();
-        let emptied = std::mem::replace(&mut self.margin_held, !empty) && empty;
-        // Emptied under what is open over it, there is none to go back to.
-        if emptied
-            && self.under.take().is_some()
-            && let Some(over) = &mut self.pane
-        {
-            over.over = false;
-        }
-        if empty
-            && (emptied || !self.pane_keys)
-            && self.pane.as_ref().is_some_and(pane::Pane::is_margin)
-        {
-            self.pane = None;
-            self.pane_keys = false;
-        }
-        if self.pane.is_none() && !self.margin.closed() && (!empty || self.pane_keys) {
+        let shows = !self.margin.is_empty() && self.margin_opens != MarginOpens::Never;
+        if self.pane.is_none() && !self.margin.closed() && (shows || self.pane_keys) {
             self.pane = Some(self.under.take().unwrap_or_else(pane::Pane::margin));
         }
     }
 
     /// `/margin`: the margin shown, with the keys, or closed.
     fn toggle_margin(&mut self) {
-        // Out of the way while it holds nothing, it is not shown either.
+        // Not open though not closed, empty or set never to open by
+        // itself, it is not shown either.
         let shown = !self.margin.closed()
             && (self.under.is_some() || self.pane.as_ref().is_some_and(pane::Pane::is_margin));
         self.margin.close(shown);
@@ -6881,6 +6885,7 @@ impl App {
                 }
                 if !self.pane.as_ref().is_some_and(pane::Pane::is_margin) {
                     self.close_pane(true);
+                    self.pane_keys = true;
                     self.margin_back();
                 }
                 // Shown where there is no room for it beside the
@@ -7323,6 +7328,7 @@ impl App {
             // The chime and the view as the file now has them.
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
+            self.margin_opens = settings.margin_opens;
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
@@ -8333,8 +8339,13 @@ impl App {
         open_rows.drain(..hidden);
         let live_rows = open_rows.len().max(1) as u16;
         self.flush();
-        let beside =
-            !self.margin.closed() && pane::margin_width(size.width, PROSE as u16).is_some();
+        // Set never to open by itself, it is beside only once opened.
+        let opened = self.margin_opens != agent_client::config::MarginOpens::Never
+            || self.under.is_some()
+            || self.pane.as_ref().is_some_and(pane::Pane::is_margin);
+        let beside = !self.margin.closed()
+            && opened
+            && pane::margin_width(size.width, PROSE as u16).is_some();
         self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
@@ -12168,7 +12179,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_margin_opens_with_its_first_note_and_goes_once_it_holds_none() {
+    async fn a_note_opens_the_margin_as_set_and_it_never_closes_by_itself() {
+        use agent_client::config::MarginOpens;
         let mut app = app(daemon_with(json!([])).await);
         let margin = |app: &App| app.pane.as_ref().is_some_and(pane::Pane::is_margin);
         app.margin_back();
@@ -12177,33 +12189,54 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         assert!(margin(&app));
-        // Its last note taken away, with the keys in it, it goes.
-        app.pane_keys = true;
+        // Its last note taken away, it stays, as one opened empty does.
         app.margin
             .apply("m2", &json!({"id": "repro", "remove": true}), None, None);
         app.margin_back();
-        assert!(!margin(&app) && !app.pane_keys && !app.margin.closed());
-        // Asked for, it shows with nothing in it.
-        app.toggle_margin();
-        app.margin_back();
-        assert!(margin(&app) && app.pane_keys && !app.margin.closed());
-        // Closed by the person, a note does not open it again.
+        assert!(margin(&app) && !app.margin.closed());
+        // Closed by the person, a note opens it again by default.
         app.close_pane(true);
-        app.margin.apply("m3", &post, None, None);
         app.margin_back();
         assert!(!margin(&app) && app.margin.closed());
-        // Emptied under /status, Esc there goes back to no margin.
-        app.toggle_margin();
+        app.margin.apply("m3", &post, None, None);
         app.margin_back();
+        assert!(margin(&app) && !app.margin.closed());
+        // Under what is open, to go back to; emptied there, it is still
+        // there to go back to.
         app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
-        assert!(app.under.is_some());
-        app.margin
-            .apply("m4", &json!({"id": "repro", "remove": true}), None, None);
-        app.margin_back();
-        assert!(app.under.is_none() && !app.pane.as_ref().unwrap().over);
         app.close_pane(true);
+        app.close_pane(true);
+        app.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        let change = json!({"id": "repro", "markdown": "y"});
+        app.margin.apply("m4", &change, None, None);
         app.margin_back();
-        assert!(app.pane.is_none());
+        assert!(app.under.is_some() && app.pane.as_ref().unwrap().over);
+        app.margin
+            .apply("m5", &json!({"id": "repro", "remove": true}), None, None);
+        app.margin_back();
+        app.close_pane(true);
+        assert!(margin(&app));
+        // Unless closed: a note leaves it closed until /margin.
+        app.margin_opens = MarginOpens::UnlessClosed;
+        app.close_pane(true);
+        app.margin.apply("m6", &post, None, None);
+        app.margin_back();
+        assert!(!margin(&app) && app.margin.closed());
+        app.toggle_margin();
+        assert!(margin(&app) && app.pane_keys);
+        // Never: only /margin opens it.
+        app.margin_opens = MarginOpens::Never;
+        app.pane = None;
+        app.pane_keys = false;
+        app.margin.apply("m7", &change, None, None);
+        app.margin_back();
+        assert!(!margin(&app) && !app.margin.closed());
+        app.toggle_margin();
+        assert!(margin(&app) && app.pane_keys);
+        app.pane_keys = false;
+        app.margin.apply("m8", &post, None, None);
+        app.margin_back();
+        assert!(margin(&app));
     }
 
     #[tokio::test]
