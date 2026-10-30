@@ -186,12 +186,20 @@ fn codex(name: &str, server: &toml::Value) -> Option<Raw> {
                     }
                 }
             }
+            // Literal headers go where the other agents' do, so a secret
+            // in one moves out like theirs.
+            "http_headers" => {
+                for (header, value) in value.as_table().into_iter().flatten() {
+                    if let Some(value) = value.as_str() {
+                        raw.headers.insert(header.clone(), value.to_owned());
+                    }
+                }
+            }
             "command"
             | "args"
             | "cwd"
             | "url"
             | "bearer_token_env_var"
-            | "http_headers"
             | "enabled"
             | "enabled_tools"
             | "disabled_tools"
@@ -269,10 +277,49 @@ fn opencode(name: &str, server: &Value) -> Raw {
     raw
 }
 
-/// JSONC as JSON: `//` and `/* */` comments and trailing commas outside
-/// strings dropped.
+/// JSONC as JSON: `//` and `/* */` comments, then trailing commas,
+/// outside strings dropped.
 fn uncommented(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+    let mut bare = String::with_capacity(text.len());
+    outside_strings(text, &mut bare, |c, chars, out| match (c, chars.peek()) {
+        ('/', Some('/')) => {
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        }
+        ('/', Some('*')) => {
+            chars.next();
+            let mut last = ' ';
+            for c in chars.by_ref() {
+                if last == '*' && c == '/' {
+                    break;
+                }
+                last = c;
+            }
+        }
+        _ => out.push(c),
+    });
+    let mut out = String::with_capacity(bare.len());
+    outside_strings(&bare, &mut out, |c, chars, out| {
+        let trailing =
+            c == ',' && matches!(chars.clone().find(|c| !c.is_whitespace()), Some('}' | ']'));
+        if !trailing {
+            out.push(c);
+        }
+    });
+    out
+}
+
+/// Copies `text` to `out`, handing each character outside a JSON string to
+/// `each` with the characters after it.
+fn outside_strings(
+    text: &str,
+    out: &mut String,
+    mut each: impl FnMut(char, &mut std::iter::Peekable<std::str::Chars>, &mut String),
+) {
     let mut chars = text.chars().peekable();
     let mut string = false;
     while let Some(c) = chars.next() {
@@ -283,41 +330,13 @@ fn uncommented(text: &str) -> String {
                 '"' => string = false,
                 _ => {}
             }
-            continue;
-        }
-        match (c, chars.peek()) {
-            ('"', _) => {
-                string = true;
-                out.push(c);
-            }
-            ('/', Some('/')) => {
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            ('/', Some('*')) => {
-                chars.next();
-                let mut last = ' ';
-                for c in chars.by_ref() {
-                    if last == '*' && c == '/' {
-                        break;
-                    }
-                    last = c;
-                }
-            }
-            (',', _) => {
-                let rest = chars.clone().find(|c| !c.is_whitespace() && *c != '/');
-                if !matches!(rest, Some('}' | ']')) {
-                    out.push(c);
-                }
-            }
-            _ => out.push(c),
+        } else if c == '"' {
+            string = true;
+            out.push(c);
+        } else {
+            each(c, &mut chars, out);
         }
     }
-    out
 }
 
 /// The variable a value only names, in any of the agents' spellings:
@@ -504,6 +523,26 @@ fn settle(chosen: &mut [Found], kept: &[(String, String)]) {
             .remove("env")
             .and_then(|v| v.as_table().cloned())
             .unwrap_or_default();
+        let bearer = found
+            .keys
+            .get("bearer_token_env_var")
+            .and_then(|v| v.as_str());
+        let bearer = bearer.map(str::to_owned);
+        for (var, value) in &mut found.secrets {
+            // A URL server takes no env, so its token gets a free name.
+            if bearer.as_ref() != Some(var) {
+                continue;
+            }
+            let base = var.clone();
+            let mut n = 2;
+            while taken.get(var.as_str()).is_some_and(|held| held != value) {
+                *var = format!("{base}_{n}");
+                n += 1;
+            }
+            found
+                .keys
+                .insert("bearer_token_env_var".into(), var.clone().into());
+        }
         found.secrets.retain(|(var, value)| match taken.get(var) {
             Some(held) if held != value => {
                 env.insert(var.clone(), value.clone().into());
@@ -809,6 +848,48 @@ mod tests {
         assert_eq!(chosen[1].keys["env"]["API_KEY"].as_str(), Some("two"));
         assert_eq!(chosen[2].secrets.len(), 1);
         assert!(chosen[2].keys.get("env").is_none());
+
+        // A URL server takes no env: its token gets a free variable.
+        let remote = |name: &str, token: &str| {
+            let headers = json!({"Authorization": format!("Bearer {token}")});
+            translate(
+                "Claude Code",
+                claude(
+                    name,
+                    &json!({"type": "http", "url": "https://x", "headers": headers}),
+                ),
+            )
+        };
+        let mut chosen = vec![remote("foo-bar", "one"), remote("foo_bar", "two")];
+        settle(
+            &mut chosen,
+            &[("SONNY_MCP_FOO_BAR_TOKEN_2".into(), "three".into())],
+        );
+        assert_eq!(
+            chosen[1].keys["bearer_token_env_var"].as_str(),
+            Some("SONNY_MCP_FOO_BAR_TOKEN_3")
+        );
+        assert_eq!(
+            chosen[1].secrets,
+            vec![("SONNY_MCP_FOO_BAR_TOKEN_3".into(), "two".into())]
+        );
+        assert!(chosen.iter().all(|found| found.keys.get("env").is_none()));
+    }
+
+    #[test]
+    fn a_codex_literal_bearer_moves_out_of_the_config() {
+        let server: toml::Value = toml::from_str(
+            "url = \"https://x\"\nhttp_headers = { Authorization = \"Bearer sk\", X-Team = \"a\" }",
+        )
+        .unwrap();
+        let found = translate("Codex", codex("docs", &server).unwrap());
+        assert_eq!(
+            found.keys["bearer_token_env_var"].as_str(),
+            Some("SONNY_MCP_DOCS_TOKEN")
+        );
+        assert_eq!(found.keys["http_headers"]["X-Team"].as_str(), Some("a"));
+        assert!(found.keys["http_headers"].get("Authorization").is_none());
+        assert!(!json(&[found]).to_string().contains("sk"));
     }
 
     #[test]
@@ -830,6 +911,10 @@ mod tests {
         assert_eq!(
             uncommented("{\"a\": [1, 2,], \"b\": \",}\",\n}"),
             "{\"a\": [1, 2], \"b\": \",}\"\n}"
+        );
+        assert_eq!(
+            uncommented("{\"d\": {\"u\": 1}, /* c */}"),
+            "{\"d\": {\"u\": 1} }"
         );
     }
 }
