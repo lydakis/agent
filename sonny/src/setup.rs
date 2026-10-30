@@ -544,6 +544,13 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
             agent_client::env_file::set(&env, &pairs)?;
         }
         save(&config, Some(("provider", provider)))?;
+        // Another provider's model would not start; without `--model`,
+        // the next new project asks for one.
+        let other = (agent_client::config::read(&config)?.model)
+            .is_some_and(|set| set.split_once('/').map(|(p, _)| p) != Some(provider.as_str()));
+        if model.is_none() && other {
+            agent_client::config::write(&config, &[("model", None)])?;
+        }
     } else if profile.is_some() || key_stdin {
         return Err(format!(
             "--profile and --key-stdin go with --provider\n{USAGE}"
@@ -561,14 +568,21 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
         Some(agents) => {
             let agents: Vec<&str> = agents.split(',').filter(|a| !a.is_empty()).collect();
             crate::skills::note_offered("mcp-import");
-            crate::mcp_import::offer_from(true, &agents)?
+            // `--json` keeps stdout for its one value.
+            let say = |line: &str| match json {
+                true => eprintln!("{line}"),
+                false => println!("{line}"),
+            };
+            crate::mcp_import::offer_from(true, &agents, &say)?
         }
         None => Vec::new(),
     };
     if reached()? != before && Client::connect(socket).await.is_ok() {
-        println!(
-            "The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end."
-        );
+        let notice = "The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end.";
+        match json {
+            true => eprintln!("{notice}"),
+            false => println!("{notice}"),
+        }
     }
     match json {
         true => println!("{}", state(&home)?),
