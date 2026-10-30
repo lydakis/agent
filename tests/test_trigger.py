@@ -359,9 +359,20 @@ class TriggerFireTests(ModelFixture):
         record = next(b for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == 'p.review')
         # Made in the folder `add` ran in, under the agent that added it.
         self.assertEqual((record['workspace'], record['created_by']), (str(work), 'p.lead'))
-        self.settle('p.review')
-        again = self.fire('p.review', 'Review the newest commit.', target=target, extra=extra, app=self.bundle(),
-                          env=env, generation='g1')
+        # With Sonny's tools, as an agent Sonny opens has them.
+        connection = Connection(str(self.store) + '.sock')
+        declared = lambda: [t['name'] for t in connection.request('inspect', bot='p.review')['result'].get('declared', [])]
+        try:
+            self.assertIn('memory', declared())
+            self.settle('p.review')
+            # One a trigger made before it had them takes them at its next fire.
+            connection.request('configure', bot='p.review', bot_id=review, declare=[])
+            self.assertEqual(declared(), [])
+            again = self.fire('p.review', 'Review the newest commit.', target=target, extra=extra,
+                              app=self.bundle(), env=env, generation='g1')
+            self.assertIn('memory', declared())
+        finally:
+            connection.close()
         self.assertEqual((again['last']['outcome'], again['sent']), ('sent', 2), again)
         self.assertNotIn('started', again['last'])
         self.settle('p.review')

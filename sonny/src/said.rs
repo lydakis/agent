@@ -5,6 +5,7 @@
 //! left out, so the cleanup learns nothing from text no person wrote.
 use agent_client::Client;
 use serde_json::{Value, json};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -219,15 +220,52 @@ fn cut(mut text: String) -> String {
 /// The person's words since `since_ms`, else over the last day, from the
 /// daemon this shell reaches.
 pub async fn read(since_ms: Option<i64>) -> Result<Value, String> {
+    let client = connect().await?;
+    said(&client, since_ms.unwrap_or(now_ms() - DAY_MS)).await
+}
+
+/// Whether the nightly cleanup has work, for its trigger's `--if`: what
+/// memory's own `changed` says, or, when nothing was saved or removed,
+/// whether the person wrote to any agent since the last finished cleanup
+/// started, so the night they say something is the night it is read, as
+/// Generative Agents and sleep-time agents reflect on the day's events and
+/// not only on what was stored.
+pub async fn changed(home: &Path, cwd: &Path) -> Result<Value, String> {
+    changed_on(home, cwd, connect()).await
+}
+
+/// [`changed`], reaching the daemon with `client` only when memory alone
+/// says nothing changed.
+pub async fn changed_on(
+    home: &Path,
+    cwd: &Path,
+    client: impl std::future::Future<Output = Result<impl Borrow<Client>, String>>,
+) -> Result<Value, String> {
+    let unchanged = match agent_client::memory::call(home, cwd, &json!({"changed": true})) {
+        Err(error) if error.starts_with("unchanged:") => error,
+        done => return done,
+    };
+    let root = home.join(".agents/memory");
+    let since = agent_client::memory::said_since(&root).unwrap_or(now_ms() - DAY_MS);
+    let said = said(client.await?.borrow(), since).await?;
+    match said["said"].as_array().map_or(0, Vec::len) {
+        0 => Err(format!("{unchanged}, and the person wrote nothing since")),
+        _ => Ok(json!({"changed": true, "said": true})),
+    }
+}
+
+async fn connect() -> Result<std::sync::Arc<Client>, String> {
     let (_, socket) = crate::daemon_paths(None, None).map_err(|e| format!("said_unread: {e}"))?;
-    let client = Client::connect(&socket)
+    Ok(Client::connect(&socket)
         .await
         .map_err(|e| format!("said_unread: {e}"))?
-        .0;
-    let now = std::time::SystemTime::now()
+        .0)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-    said(&client, since_ms.unwrap_or(now - DAY_MS)).await
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// `memory said [SINCE_MS]`, as `~/.agent/memory` runs it: one JSON line
@@ -238,14 +276,34 @@ pub fn cli(args: &[String]) -> i32 {
         [ms] => ms.parse::<i64>().map(Some).map_err(|_| ()),
         _ => Err(()),
     };
-    let done = match since {
+    printed(match since {
         Err(()) => Err("usage: memory said [SINCE_MS]".to_owned()),
-        Ok(since) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("said_unread: {e}"))
-            .and_then(|runtime| runtime.block_on(read(since))),
-    };
+        Ok(since) => block_on(read(since)),
+    })
+}
+
+/// `memory changed`, as `~/.agent/memory` runs it for the cleanup's
+/// trigger: [`changed`], printed as [`cli`] prints.
+pub fn changed_cli() -> i32 {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    printed(match (home, cwd) {
+        (Some(home), Some(cwd)) => block_on(changed(&home, &cwd)),
+        _ => Err("memory_failed: no HOME or working folder".into()),
+    })
+}
+
+fn block_on(
+    done: impl std::future::Future<Output = Result<Value, String>>,
+) -> Result<Value, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("said_unread: {e}"))
+        .and_then(|runtime| runtime.block_on(done))
+}
+
+fn printed(done: Result<Value, String>) -> i32 {
     match done {
         Ok(value) => {
             println!("{value}");

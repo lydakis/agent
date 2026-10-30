@@ -86,8 +86,11 @@ pinned by its id: a bot deleted since, or a new bot under its name, is not
 reached (`bot_not_found`), and the trigger ends. `--start NAME --model
 PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
 the first fire makes it as Sonny makes an agent (the daemon's `create`,
-in the folder `add` ran in, with that folder's composed policy and the
-default tools), made by the agent that added the trigger when one did, so
+in the folder `add` ran in, with that folder's composed policy, the
+default tools and Sonny's own a task has: the memory tool, and `exec` while
+an MCP server is on, so an agent no one opens reaches the person's servers
+as one they open does; one a trigger made before it had them takes them at
+its next fire), made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
 state when the fire settles, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
@@ -414,8 +417,19 @@ agent's or named client's mark, steers included, newest first and at most
 that turn ran in. It saves what no
 agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
 the day's notes, taking only the person's own words and their scope, as
-Codex's extraction does. The trigger still wakes it only when memory
-changed; words from a quiet night are read the next time it runs.
+Codex's extraction does.
+
+The same night it looks for habits, as Generative Agents reflect on the
+day's memories and Letta's sleep-time agents rework memory between
+conversations: a move that cost the person and that they made again,
+across `said`, the facts memory holds and, through `exec`, what they sent
+in their chat, mail and the like when they connected servers for those. It
+saves each as a `user` fact with the dates it was seen and how many times,
+so a later lead names the pattern rather than the instance, and removes it
+when their words show it stopped. It also saves how they took what an
+agent did unasked, which is how far leads go on their own. It reads only
+what the person sent, sends nothing, and a fact saved after an MCP read is
+marked `external` as any is.
 
 `read` gives one fact's whole file as `text` and records the read in the
 folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
@@ -459,8 +473,10 @@ a skill and a trigger, not part of the daemon. `schedule` adds
 the trigger `memory-cleanup`: at 03:30 by default (`--cron` moves it) it
 starts, on its first fire, an agent of that name in `~/.agents/memory` on
 the model given, and sends it "Clean up memory as the memory-cleanup skill
-says." The trigger's `--if` runs `changed`, so a night after nothing was
-saved or removed costs no turn. Each turn is capped at 1,000,000 tokens:
+says." The trigger's `--if` runs `changed`, which Sonny answers true also
+when the person wrote to any agent since the last finished cleanup
+started, so a night after nothing was saved or removed and nothing said
+costs no turn. Each turn is capped at 1,000,000 tokens:
 the agent keeps one conversation, as every `--start` agent does, so each
 call carries earlier nights up to where compaction summarizes them.
 Nothing is scheduled until the person runs `schedule`, since Sonny has no
