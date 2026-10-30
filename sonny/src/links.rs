@@ -168,8 +168,8 @@ pub const AGENT: &str = "sonny:agent/";
 
 /// Whether `word` may be an agent's name, as the daemon names bots (1 to
 /// 128 of `A-Z a-z 0-9 . _ -`) and as a project names its agents: a
-/// project and a name a dot apart (`calc.neg`), a letter in it, starting
-/// and ending with a letter or digit. So `e.g` may be and is asked, and a
+/// project and a name a dot apart (`calc.neg`, `_tools.lead`), a letter in
+/// it, and no dot at either end. So `e.g` may be and is asked, and a
 /// version (`0.7.0`) or a plain word is not.
 pub fn may_name(word: &str) -> bool {
     let bytes = word.as_bytes();
@@ -177,8 +177,8 @@ pub fn may_name(word: &str) -> bool {
         && word.contains('.')
         && !word.contains("..")
         && bytes.iter().any(u8::is_ascii_alphabetic)
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes[0] != b'.'
+        && bytes[bytes.len() - 1] != b'.'
         && (bytes.iter()).all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(b))
 }
 
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn a_word_may_be_an_agents_name_only_as_a_project_names_them() {
-        for word in ["calc.neg", "shop.web.fix", "a1.b_2-c", "e.g"] {
+        for word in ["calc.neg", "shop.web.fix", "a1.b_2-c", "e.g", "_tools.lead"] {
             assert!(may_name(word), "{word}");
         }
         for word in [
