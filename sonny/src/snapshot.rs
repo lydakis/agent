@@ -36,6 +36,7 @@ fn fnv(path: &Path) -> u64 {
 }
 const CHECKPOINT: &str = "Agent-Checkpoint: ";
 const LATE: &str = "Agent-Snapshot: late";
+const FOLDER: &str = "Agent-Folder: ";
 
 /// A folder's files added and written as a tree, not yet committed.
 pub struct Staged {
@@ -54,6 +55,8 @@ pub struct Snapshot {
     pub base: Option<String>,
     pub checkpoint: i64,
     pub late: bool,
+    /// Where in the checkout the turn worked, when it said.
+    pub folder: Option<PathBuf>,
 }
 
 fn git(
@@ -79,6 +82,9 @@ fn git(
 struct Sealed {
     dir: PathBuf,
     work: PathBuf,
+    /// The repository's objects, read but never written: a task can make a
+    /// folder of them a link out of its sandbox. What git writes goes to
+    /// the sealed folder's own, which `publish` then moves in.
     objects: PathBuf,
     /// The checkout's own index.
     index: PathBuf,
@@ -95,19 +101,18 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
     let args = [
         "rev-parse",
         "--path-format=absolute",
-        "--git-path",
-        "objects",
         "--git-dir",
         "--git-common-dir",
         "--show-object-format",
     ];
     let listed = git(work, &args, None, None)?;
-    let [objects, gitdir, common, format] = listed.lines().collect::<Vec<_>>()[..] else {
+    let [gitdir, common, format] = listed.lines().collect::<Vec<_>>()[..] else {
         return Err("git rev-parse: an answer of another shape".into());
     };
     // Named here, not by git, which would give where a link leads.
     let (gitdir, common) = (Path::new(gitdir), Path::new(common));
     let index = gitdir.join("index");
+    let objects = common.join("objects");
     let exclude = common.join("info/exclude");
     let attributes = common.join("info/attributes");
     let repository = match format {
@@ -167,6 +172,7 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
         std::fs::create_dir_all(at.parent().unwrap_or(at))?;
         std::fs::create_dir(at)?;
         std::fs::create_dir(at.join("refs"))?;
+        std::fs::create_dir(at.join("objects"))?;
         std::fs::create_dir(at.join("info"))?;
         let head = head.map_or("ref: refs/heads/none".to_owned(), str::to_owned);
         std::fs::write(at.join("HEAD"), format!("{head}\n"))?;
@@ -182,10 +188,81 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
     Ok(Sealed {
         dir: at.to_owned(),
         work: work.to_owned(),
-        objects: PathBuf::from(objects),
+        objects,
         index,
         settings,
     })
+}
+
+/// Move the objects git wrote to `from` into the repository's `to`,
+/// through each folder of it opened without following a link, so none can
+/// lead a write out of what a task may write: a folder of `to` that is a
+/// link stops the snapshot. A pack goes in before its index.
+fn publish(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let c = |name: &[u8]| std::ffi::CString::new(name).map_err(|e| e.to_string());
+    let failed = |what: &Path| format!("{}: {}", what.display(), std::io::Error::last_os_error());
+    let folder = |at: libc::c_int, name: &std::ffi::CStr, what: &Path| {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `name` is NUL-terminated and outlives the call.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(failed(what));
+        }
+        // SAFETY: `fd` was just opened, and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let listed = |dir: &Path| -> Result<Vec<std::ffi::OsString>, String> {
+        let mut names: Vec<_> = (std::fs::read_dir(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?)
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+        names.sort_by_key(|name| (name.as_bytes().ends_with(b".idx"), name.clone()));
+        Ok(names)
+    };
+    let root = folder(libc::AT_FDCWD, &c(to.as_os_str().as_bytes())?, to)?;
+    for name in listed(from)? {
+        let (source, what) = (from.join(&name), to.join(&name));
+        if !source.is_dir() {
+            continue;
+        }
+        let name = c(name.as_bytes())?;
+        // SAFETY: as above. One already there is opened as it is.
+        unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o755) };
+        let dir = folder(root.as_raw_fd(), &name, &what)?;
+        for file in listed(&source)? {
+            let what = what.join(&file);
+            let name = c(file.as_bytes())?;
+            let mut temporary = format!(".sonny-{}-", std::process::id()).into_bytes();
+            temporary.extend_from_slice(file.as_bytes());
+            let temporary = c(&temporary)?;
+            let flags =
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            // SAFETY: as above.
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), temporary.as_ptr(), flags, 0o444) };
+            if fd < 0 {
+                return Err(failed(&what));
+            }
+            // SAFETY: `fd` was just opened, and nothing else owns it.
+            let mut made = unsafe { std::fs::File::from_raw_fd(fd) };
+            let copied = std::fs::File::open(source.join(&file))
+                .and_then(|mut object| std::io::copy(&mut object, &mut made))
+                .and_then(|_| made.sync_all());
+            let at = dir.as_raw_fd();
+            // SAFETY: both names are NUL-terminated, in the folder opened.
+            let moved = copied.is_ok()
+                && unsafe { libc::renameat(at, temporary.as_ptr(), at, name.as_ptr()) } == 0;
+            if !moved {
+                let error = failed(&what);
+                // SAFETY: as above.
+                unsafe { libc::unlinkat(at, temporary.as_ptr(), 0) };
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Copy the file `from`, in a git folder a task may write, to `to`, made
@@ -236,7 +313,8 @@ fn sealed(
         .current_dir(&sealed.work)
         .env("GIT_DIR", &sealed.dir)
         .env("GIT_WORK_TREE", &sealed.work)
-        .env("GIT_OBJECT_DIRECTORY", &sealed.objects)
+        .env("GIT_OBJECT_DIRECTORY", sealed.dir.join("objects"))
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &sealed.objects)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_COUNT", sealed.settings.len().to_string());
@@ -374,17 +452,22 @@ pub fn commit(
     turn: i64,
     checkpoint: i64,
     late: bool,
+    folder: Option<&Path>,
 ) -> Result<String, String> {
     let mut message = format!("Files after turn {turn}\n\n{CHECKPOINT}{checkpoint}");
     if late {
         message.push('\n');
         message.push_str(LATE);
     }
+    if let Some(folder) = folder.and_then(Path::to_str).filter(|f| !f.contains('\n')) {
+        message.push_str(&format!("\n{FOLDER}{folder}"));
+    }
     let mut args = vec!["commit-tree", staged.tree.as_str(), "-m", message.as_str()];
     if let Some(head) = &staged.head {
         args.extend(["-p", head]);
     }
     let commit = sealed(&staged.sealed, &args, &staged.sealed.index, None)?;
+    publish(&staged.sealed.dir.join("objects"), &staged.sealed.objects)?;
     let name = format!("{refs}/{bot_id}/{turn}");
     git(&staged.top, &["update-ref", &name, &commit], None, None)?;
     Ok(commit)
@@ -452,6 +535,9 @@ pub fn find(dir: &Path, refs: &str, bot_id: i64, turn: Option<i64>) -> Result<Sn
         base,
         checkpoint,
         late: message.lines().any(|line| line == LATE),
+        folder: (message.lines())
+            .find_map(|line| line.strip_prefix(FOLDER))
+            .map(PathBuf::from),
     })
 }
 
@@ -653,9 +739,12 @@ pub async fn after_turn(done: Completed) {
         checkpoint,
         ended,
     } = done;
-    let Some((top, lock)) = checkout(workspace).await else {
+    let Some((top, lock)) = checkout(workspace.clone()).await else {
         return;
     };
+    // Where in it the turn worked, which a fork of it starts in.
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let folder = (real(&workspace).strip_prefix(real(&top)).ok()).map(Path::to_owned);
     let _held = lock.lock().await;
     let Ok(_running) = AT_ONCE.acquire().await else {
         return;
@@ -669,9 +758,18 @@ pub async fn after_turn(done: Completed) {
         Ok(Err(error)) => return failed(bot_id, turn, &error),
     };
     let late = worked_since(&staged.top, ended) || busy(&staged.top);
-    let committed =
-        tokio::task::spawn_blocking(move || commit(&staged, &refs, bot_id, turn, checkpoint, late))
-            .await;
+    let committed = tokio::task::spawn_blocking(move || {
+        commit(
+            &staged,
+            &refs,
+            bot_id,
+            turn,
+            checkpoint,
+            late,
+            folder.as_deref(),
+        )
+    })
+    .await;
     match committed {
         Ok(Ok(commit)) => println!(
             "{}",
@@ -745,7 +843,7 @@ mod tests {
         let staged = stage(&top.join("target"), &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 41, 900, false).unwrap();
+        commit(&staged, REFS, 7, 41, 900, false, None).unwrap();
         let status = git(&top, &["status", "--porcelain"], None, None).unwrap();
         assert!(status.contains("M  kept.txt"), "{status}");
         assert!(status.contains("?? new.txt"), "{status}");
@@ -754,7 +852,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 44, 950, true).unwrap();
+        commit(&staged, REFS, 7, 44, 950, true, None).unwrap();
 
         let older = find(&top, REFS, 7, Some(41)).unwrap();
         assert_eq!((older.turn, older.checkpoint, older.late), (41, 900, false));
@@ -797,7 +895,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let first = find(&top, REFS, 7, Some(1)).unwrap();
         let listed =
             |commit: &str| git(&top, &["ls-tree", "--name-only", commit], None, None).unwrap();
@@ -807,7 +905,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 2, 20, false).unwrap();
+        commit(&staged, REFS, 7, 2, 20, false, None).unwrap();
         let second = find(&top, REFS, 7, Some(2)).unwrap();
         assert!(!listed(&second.commit).contains("generated.log"));
         let _ = std::fs::remove_dir_all(dir);
@@ -836,7 +934,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
@@ -871,7 +969,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
@@ -913,7 +1011,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
@@ -949,7 +1047,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
@@ -975,11 +1073,62 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_of_objects_that_links_out_takes_no_write() {
+        let (dir, top) = repo("objects");
+        std::fs::write(top.join("new.txt"), "made\n").unwrap();
+        let id = Command::new("git")
+            .arg("-C")
+            .arg(&top)
+            .args(["hash-object", "new.txt"])
+            .output()
+            .unwrap();
+        let id = String::from_utf8(id.stdout).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let fan = top.join(".git/objects").join(&id[..2]);
+        let _ = std::fs::remove_dir_all(&fan);
+        std::os::unix::fs::symlink(&outside, &fan).unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        assert!(commit(&staged, REFS, 7, 1, 10, false, None).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(find(&top, REFS, 7, None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_snapshot_names_the_folder_its_turn_worked_in() {
+        let (dir, top) = repo("folder");
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(
+            &staged,
+            REFS,
+            7,
+            1,
+            10,
+            false,
+            Some(Path::new("packages/a")),
+        )
+        .unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 2, 20, false, None).unwrap();
+        let folder = |turn| find(&top, REFS, 7, Some(turn)).unwrap().folder;
+        assert_eq!(folder(1), Some(PathBuf::from("packages/a")));
+        assert_eq!(folder(2), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1019,7 +1168,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         assert!(!ran.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1040,7 +1189,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         let error = restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap_err();
@@ -1058,7 +1207,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let kept = git(
             &top,
@@ -1076,7 +1225,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let copy = dir.join("copy");
         // A file where its sealed git folder would go.
@@ -1105,7 +1254,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         let kept = git(
             &top,
@@ -1187,7 +1336,7 @@ mod tests {
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
-        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         restore(&top, &snapshot, &dir.join("copy"), "agent/copy", &dir).unwrap();
         forget(&top, REFS, 7).unwrap();

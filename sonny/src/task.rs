@@ -822,12 +822,14 @@ fn source(agent: &Path, project: &str, from: &str, start: &Start) -> Result<Sour
         .filter(|top| is_worktree(top))
         .ok_or_else(|| format!("{name} works in no worktree of its own"))?;
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let prefix = (real(&workspace).strip_prefix(real(&top)))
+    let now = (real(&workspace).strip_prefix(real(&top)))
         .map_err(|_| format!("{name} works outside its worktree"))?
         .to_owned();
     let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
     let snapshot = crate::snapshot::find(&top, &refs, bot_id, start.turn)
         .map_err(|e| format!("{name}: {e}"))?;
+    // Where it worked in that turn, which may not be where it works now.
+    let prefix = snapshot.folder.clone().unwrap_or(now);
     Ok(Source {
         name,
         top,
