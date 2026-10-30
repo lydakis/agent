@@ -2,14 +2,16 @@
 //! each feeding bounded JSONL requests into the service loop.
 use super::{Command, Request, hub::Hub};
 use agent_runtime::{Error, Result, fail, output::Output};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read};
+use std::sync::{Arc, Mutex};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    sync::mpsc,
+    sync::{Notify, Semaphore},
 };
 
-// Keep requests inline in the 64-slot input queue instead of allocating a
-// box for every request. Open/Closed messages are infrequent control traffic.
+// Keep requests inline in the input queue instead of allocating a box for
+// every request. Open/Closed messages are infrequent control traffic.
 #[allow(clippy::large_enum_variant)]
 pub enum Inbound {
     /// A connection, the sandboxed bot whose own socket it came in on, and
@@ -17,6 +19,132 @@ pub enum Inbound {
     Open(u64, Output, Option<i64>, Option<u32>),
     Request(u64, Result<Request>),
     Closed(u64),
+}
+impl Inbound {
+    fn session(&self) -> u64 {
+        match self {
+            Inbound::Open(id, ..) | Inbound::Request(id, _) | Inbound::Closed(id) => *id,
+        }
+    }
+}
+
+/// The service loop's input: each session's messages in its own queue, and
+/// the sessions with any taken in turn, one message each, as Redis and NATS
+/// serve their clients. A client that pipelines thousands of requests then
+/// holds every other session up by one of them, not by all those read
+/// before theirs. `capacity` bounds what all sessions have read ahead
+/// together; a reader waits for room in the order it asked.
+pub fn channel(capacity: usize) -> (Sender, Receiver) {
+    let shared = Arc::new(Shared {
+        queues: Mutex::new(Queues::default()),
+        room: Semaphore::new(capacity),
+        arrived: Notify::new(),
+    });
+    shared.lock().senders = 1;
+    (Sender(shared.clone()), Receiver(shared))
+}
+
+struct Shared {
+    queues: Mutex<Queues>,
+    room: Semaphore,
+    arrived: Notify,
+}
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queues> {
+        self.queues.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[derive(Default)]
+struct Queues {
+    sessions: HashMap<u64, VecDeque<Inbound>>,
+    /// The sessions with a message queued, each once, next first.
+    turns: VecDeque<u64>,
+    senders: usize,
+}
+
+/// The service loop is gone: nothing more is taken.
+#[derive(Debug)]
+pub struct Gone;
+
+pub struct Sender(Arc<Shared>);
+impl Sender {
+    /// Queue `message` once there is room.
+    pub async fn send(&self, message: Inbound) -> std::result::Result<(), Gone> {
+        self.0.room.acquire().await.map_err(|_| Gone)?.forget();
+        let mut guard = self.0.lock();
+        let queues = &mut *guard;
+        let session = message.session();
+        let queue = queues.sessions.entry(session).or_default();
+        if queue.is_empty() {
+            queues.turns.push_back(session);
+        }
+        queue.push_back(message);
+        drop(guard);
+        self.0.arrived.notify_one();
+        Ok(())
+    }
+    /// `send` from a thread outside the runtime, which `runtime` serves.
+    pub fn blocking_send(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        message: Inbound,
+    ) -> std::result::Result<(), Gone> {
+        runtime.block_on(self.send(message))
+    }
+}
+impl Clone for Sender {
+    fn clone(&self) -> Self {
+        self.0.lock().senders += 1;
+        Sender(self.0.clone())
+    }
+}
+impl Drop for Sender {
+    fn drop(&mut self) {
+        self.0.lock().senders -= 1;
+        self.0.arrived.notify_one();
+    }
+}
+
+pub struct Receiver(Arc<Shared>);
+impl Receiver {
+    /// The next session's oldest message, or `None` once every sender is
+    /// gone and nothing is queued. Cancel-safe: a message is taken only
+    /// when it is returned.
+    pub async fn recv(&mut self) -> Option<Inbound> {
+        loop {
+            {
+                let mut guard = self.0.lock();
+                let queues = &mut *guard;
+                if let Some(session) = queues.turns.pop_front() {
+                    let queue = queues
+                        .sessions
+                        .get_mut(&session)
+                        .expect("a turn has a queue");
+                    let message = queue
+                        .pop_front()
+                        .expect("a queue with a turn has a message");
+                    if queue.is_empty() {
+                        queues.sessions.remove(&session);
+                    } else {
+                        queues.turns.push_back(session);
+                    }
+                    drop(guard);
+                    self.0.room.add_permits(1);
+                    return Some(message);
+                }
+                if queues.senders == 0 {
+                    return None;
+                }
+            }
+            self.0.arrived.notified().await;
+        }
+    }
+}
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.0.room.close();
+    }
 }
 
 /// Room for a prompt with its pictures: 5 MiB of images, in base64.
@@ -40,7 +168,8 @@ fn parse(line: &[u8]) -> Result<Request> {
     })
 }
 
-pub fn stdio_reader(sender: mpsc::Sender<Inbound>) {
+pub fn stdio_reader(sender: Sender) {
+    let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
@@ -53,18 +182,23 @@ pub fn stdio_reader(sender: mpsc::Sender<Inbound>) {
                 Ok(0) => break,
                 Ok(_) if line.len() <= LINE_LIMIT && line.ends_with(b"\n") => {
                     let request = parse(&line);
-                    if sender.blocking_send(Inbound::Request(0, request)).is_err() {
+                    if sender
+                        .blocking_send(&runtime, Inbound::Request(0, request))
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 _ => {
-                    let _ = sender
-                        .blocking_send(Inbound::Request(0, fail("input_line_limit_or_truncation")));
+                    let _ = sender.blocking_send(
+                        &runtime,
+                        Inbound::Request(0, fail("input_line_limit_or_truncation")),
+                    );
                     break;
                 }
             }
         }
-        let _ = sender.blocking_send(Inbound::Closed(0));
+        let _ = sender.blocking_send(&runtime, Inbound::Closed(0));
     });
 }
 
@@ -73,7 +207,7 @@ pub fn stdio_reader(sender: mpsc::Sender<Inbound>) {
 /// With `hub`, each session's lease renewals are answered as they are read.
 pub async fn accept(
     listener: tokio::net::UnixListener,
-    sender: mpsc::Sender<Inbound>,
+    sender: Sender,
     next: std::sync::Arc<std::sync::atomic::AtomicU64>,
     caller: Option<i64>,
     hub: Option<Hub>,
@@ -123,7 +257,7 @@ fn renewal(hub: &Hub, session: u64, request: &Request) -> Option<Result<serde_js
 pub async fn socket_reader(
     id: u64,
     mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    sender: mpsc::Sender<Inbound>,
+    sender: Sender,
     renewals: Option<(Hub, Output)>,
 ) {
     loop {
@@ -169,6 +303,46 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    fn order(messages: &[Inbound]) -> Vec<u64> {
+        messages.iter().map(Inbound::session).collect()
+    }
+
+    #[tokio::test]
+    async fn sessions_take_turns_however_much_one_sent_first() {
+        let (sender, mut inbound) = channel(64);
+        for _ in 0..3 {
+            sender.send(Inbound::Closed(1)).await.unwrap();
+        }
+        sender.send(Inbound::Closed(2)).await.unwrap();
+        sender.send(Inbound::Closed(3)).await.unwrap();
+        sender.send(Inbound::Closed(2)).await.unwrap();
+        let mut taken = Vec::new();
+        for _ in 0..6 {
+            taken.push(inbound.recv().await.unwrap());
+        }
+        assert_eq!(order(&taken), [1, 2, 3, 1, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_holds_a_reader_until_one_is_taken() {
+        let (sender, mut inbound) = channel(1);
+        sender.send(Inbound::Closed(1)).await.unwrap();
+        let waiting = sender.clone();
+        let blocked = tokio::spawn(async move { waiting.send(Inbound::Closed(2)).await.is_ok() });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        assert_eq!(inbound.recv().await.unwrap().session(), 1);
+        assert!(blocked.await.unwrap());
+        assert_eq!(inbound.recv().await.unwrap().session(), 2);
+        // Every sender gone and nothing queued: the loop's input ends.
+        drop(sender);
+        assert!(inbound.recv().await.is_none());
+        // And with the loop gone, a reader is told so.
+        let (sender, inbound) = channel(1);
+        drop(inbound);
+        assert!(sender.send(Inbound::Closed(1)).await.is_err());
+    }
+
     #[tokio::test]
     async fn a_renewal_is_answered_while_the_service_loop_is_busy() {
         let (daemon, client) = tokio::net::UnixStream::pair().unwrap();
@@ -178,7 +352,7 @@ mod tests {
         let (lease, _) = hub.serve("auto", 7, output.clone(), 5000).unwrap();
         hub.start("auto", 7, lease);
         // A service loop that takes nothing: a request sent to it waits.
-        let (sender, _inbound) = mpsc::channel(1);
+        let (sender, _inbound) = channel(1);
         sender.send(Inbound::Closed(99)).await.unwrap();
         tokio::spawn(socket_reader(
             7,
