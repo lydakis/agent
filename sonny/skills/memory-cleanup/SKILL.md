@@ -94,8 +94,9 @@ of it ends `tool_unserved`, run the same command with
    - When a server you meant to read fails, as when its sign-in expired,
      save or update a `reference` fact named `unreadable-SERVER` with the
      error and since when, and remove it the night that server reads
-     again. Then skip step 6 tonight, unless `since_ms` is more than three
-     days old: memory stays as you leave it, and the next night starts
+     again. Then skip step 6 tonight, unless `since_ms` is null (the first
+     cleanup, which has no earlier night to read again) or more than
+     three days old: memory stays as you leave it, and the next night starts
      from the same `since_ms` and reads what was missed. Habits keep their
      dates, so a night read twice counts nothing twice.
 6. Call it with `cleanup` `finish`. It commits the cleanup, or
