@@ -1287,6 +1287,63 @@ class CliTests(ModelFixture):
                     self.assertIn(b'daemon_protocol_mismatch', stderr)
                     self.assertIsNone(daemon.poll())
 
+    def test_start_replaces_an_older_daemon_once_its_turns_end(self):
+        # An upgrade leaves the older daemon running. Starting asks it to
+        # stop with a grace for its running turns (SIGTERM when it refuses),
+        # waits for it to exit, then starts this one on the same socket; an
+        # agent asking from inside a turn is left with the error.
+        provider = 'openai=responses,http://127.0.0.1:9/v1'
+        for answer, inside in (('ok', False), ('refused', False), ('ok', True)):
+            with self.subTest(answer=answer, inside=inside), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                path, store = Path(directory)/'daemon.sock', Path(directory)/'state.db'
+                daemon = subprocess.Popen(['sleep', '30'])
+                self.addCleanup(self.stop_process, daemon)
+                env = {**clean_env(), **({'AGENT_BOT_ID': '7'} if inside else {})}
+                asked = []
+                listener = socket.socket(socket.AF_UNIX)
+                listener.bind(str(path))
+                listener.listen(4)
+                listener.settimeout(5)
+                def older():
+                    greeting = (json.dumps(dict(event='ready', protocol=PROTOCOL - 1, pid=daemon.pid))+'\n').encode()
+                    try:
+                        with listener:
+                            while daemon.poll() is None:
+                                peer = listener.accept()[0]
+                                with peer:
+                                    peer.sendall(greeting)
+                                    line = peer.makefile().readline()
+                                    if not line:
+                                        continue
+                                    request = json.loads(line)
+                                    asked.append(request)
+                                    if answer == 'ok':
+                                        peer.sendall((json.dumps(dict(id=request['id'], result={}))+'\n').encode())
+                                        daemon.terminate()
+                                    else:
+                                        peer.sendall((json.dumps(dict(id=request['id'], error='invalid_request'))+'\n').encode())
+                                    # Its socket goes with it.
+                                    return
+                    except (socket.timeout, OSError):
+                        pass
+                server = threading.Thread(target=older, daemon=True)
+                server.start()
+                result = subprocess.run([str(self.binary), 'start', '--store', str(store), '--socket', str(path),
+                                         '--provider', provider], env=env, capture_output=True, timeout=30)
+                if inside:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(b'daemon_protocol_mismatch', result.stderr)
+                    self.assertIsNone(daemon.poll())
+                    self.assertEqual(asked, [])
+                    continue
+                self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(store), '--socket', str(path)],
+                                env=clean_env(), capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
+                self.assertEqual(daemon.wait(timeout=3), -15)
+                self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
+                server.join(timeout=5)
+
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
         self.addCleanup(client.close)

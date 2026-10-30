@@ -511,6 +511,15 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
     Ok(connected)
 }
 
+/// Whether `error` met a daemon on an older protocol than this Sonny's,
+/// one `agent start` replaces.
+fn older_daemon(error: &agent_client::Error) -> bool {
+    error.code == "daemon_protocol_mismatch"
+        && (error.facts.as_ref())
+            .and_then(|facts| facts.get("protocol")?.as_u64())
+            .is_some_and(|protocol| protocol < agent_client::PROTOCOL)
+}
+
 /// `~/.agent/models`, the list agents read with `agent models`, written
 /// from the providers' listings when there is none yet, as `agent models
 /// --discover` writes it. A provider that will not list leaves it for the
@@ -771,7 +780,19 @@ async fn run() -> Result<(), String> {
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
-    let (client, mut events) = connect(&options).await?;
+    let (client, mut events) = match Client::connect(&options.socket).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Starting replaces an older daemon once its running turns end,
+            // which can take a while; the screen is not up yet to say so.
+            if older_daemon(&error) {
+                eprintln!(
+                    "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
+                );
+            }
+            connect(&options).await?
+        }
+    };
     trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
