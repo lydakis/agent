@@ -590,6 +590,24 @@ drops it, and `sonny mcp list` starts each and says what it offers or why
 it did not start. `/mcp` in Sonny shows the same from the last listings,
 and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
 
+`sonny mcp import` brings in the servers other agents have, as Claude Code's
+`claude mcp add-from-claude-desktop` does, from Codex's
+`~/.codex/config.toml`, Claude Code's `~/.claude.json` (the user's and this
+folder's) and `.mcp.json`, OpenCode's `opencode.json` and Kiro's
+`.kiro/settings/mcp.json`, at home and in the folder it runs in. It lists
+them all ticked; Space unticks one and Enter brings the rest, `--yes` takes
+them all, and `--json` only prints what it found. First-run setup offers the
+same. A name Sonny has already, or that an agent earlier in that list has,
+is skipped, and the other agents' files are left as they were. A secret
+written into a server's entry (an `env` value named like a key or token, or
+a literal `Authorization: Bearer`) goes to `~/.agent/env`, which stdio
+servers are started with and `bearer_token_env_var` names, never to
+`config.toml`; a value that only names a variable (`${VAR}`, `{env:VAR}`)
+is left to the environment, and the import says when that variable is not
+set. Servers on the old SSE transport are named and left out.
+
+![sonny mcp import](sonny/mcp-import.png)
+
 Agents do not get a tool per MCP tool. While any server is on, every agent
 Sonny opens has one tool, `exec`, with Codex's code mode contract
 ([exec.rs](../sonny/src/exec.rs)): the model writes JavaScript, each tool is

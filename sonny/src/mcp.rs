@@ -363,8 +363,14 @@ async fn connect(config: &McpServer) -> Result<Live, String> {
     let (client, group, stderr) = match (&config.command, &config.url) {
         (Some(command), _) => {
             let mut process = tokio::process::Command::new(command);
+            // Under the server's own env, ~/.agent/env as it is now, where
+            // `sonny mcp import` puts the secrets other agents' files held.
+            let kept = agent_client::env_file::path()
+                .and_then(|file| agent_client::env_file::read(&file).ok())
+                .unwrap_or_default();
             process
                 .args(&config.args)
+                .envs(kept)
                 .envs(&config.env)
                 .process_group(0);
             if let Some(cwd) = config.cwd.as_ref().map(|cwd| home_relative(cwd)) {
@@ -555,6 +561,7 @@ const USAGE: &str = "sonny mcp list [--json]
 sonny mcp add NAME [--env KEY=VALUE]... [--description TEXT] -- COMMAND [ARG]...
 sonny mcp add NAME --url URL [--bearer-token-env-var VAR] [--description TEXT]
 sonny mcp remove NAME
+sonny mcp import [--yes | --json]
 sonny mcp tool";
 
 /// `sonny mcp`: the person's servers, as `codex mcp` keeps Codex's, in
@@ -593,6 +600,29 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             // Listed now, so agents opened from here on are told its tools.
             let mut servers = agent_client::config::read(&path)?.sonny.mcp_servers;
             servers.retain(|server, _| server == name);
+            for server in listed(&servers)? {
+                println!("added {}", line(&server));
+            }
+            Ok(())
+        }
+        // Servers Claude Code, Codex, OpenCode and Kiro have, ticked to
+        // bring in: `--yes` takes them all, `--json` only says what it found.
+        Some((verb, rest)) if verb == "import" => {
+            match rest {
+                [flag] if flag == "--json" => {
+                    println!("{}", crate::mcp_import::json(&crate::mcp_import::here()?));
+                    return Ok(());
+                }
+                [] | [_] if rest.iter().all(|flag| flag == "--yes") => {}
+                _ => return Err(USAGE.into()),
+            }
+            let brought = crate::mcp_import::offer(!rest.is_empty())?;
+            if brought.is_empty() {
+                println!("no MCP servers brought in from Claude Code, Codex, OpenCode or Kiro");
+                return Ok(());
+            }
+            let mut servers = agent_client::config::read(&path)?.sonny.mcp_servers;
+            servers.retain(|server, _| brought.contains(server));
             for server in listed(&servers)? {
                 println!("added {}", line(&server));
             }

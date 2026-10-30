@@ -206,7 +206,8 @@ sonny                                   # in your project's folder
 The first run looks at what your machine already has (a provider key, a
 ChatGPT sign-in, your AWS profiles), asks how your agents reach a model only
 when nothing does, and offers the providers' models ranked, the first marked
-so Enter takes it. `sonny setup` asks again. As Codex does, it keeps the settings in
+so Enter takes it, then offers the MCP servers Claude Code, Codex, OpenCode
+or Kiro already have. `sonny setup` asks again. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
 which Sonny applies to the daemon and everything else it starts, so nothing
 goes in your shell profile. Bots search the web where their provider offers
