@@ -47,7 +47,7 @@ from pathlib import Path
 OUT = Path(__file__).resolve().parents[1] / '.local/role-eval'
 RUNS = OUT / 'runs'
 MODEL = 'chatgpt/gpt-6.1-sol'
-LOGIN = Path.home() / '.agent/chatgpt.json'
+LOGIN = Path(os.environ.get('AGENT_CHATGPT_LOGIN') or Path.home() / '.agent/chatgpt.json')
 # The key variable each built-in provider reads.
 KEYS = {'openai': 'OPENAI_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY'}
 # Unix socket paths are short on macOS: keep each run's root short.
