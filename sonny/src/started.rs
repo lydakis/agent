@@ -38,7 +38,7 @@ pub fn state(turn: &Value) -> String {
 
 /// The state of a task whose turn ended with the model saying nothing: no
 /// failure, and not a reply either.
-pub const QUIET: &str = "said nothing";
+pub const QUIET: &str = "no reply";
 
 /// The state of a task whose turn ended while it has a goal that turn did
 /// not meet yet: its check runs, or it works on.
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(state(&json!({"status": "waiting"})), "working");
         assert_eq!(state(&json!({"status": "completed"})), "done");
         let empty = json!({"status": "failed", "error": "empty_completion"});
-        assert_eq!(state(&empty), "said nothing");
+        assert_eq!(state(&empty), "no reply");
         assert_eq!(state(&json!({"status": "failed"})), "failed");
     }
 

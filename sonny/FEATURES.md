@@ -69,7 +69,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326; drawn whole again on resize, focus and Ctrl+L 10-30 #424 | Room for the pane, folds, buttons and drag-to-copy | ? |
+| Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326; drawn whole again on resize, focus and Ctrl+L 10-30 #424; composer pinned to the bottom, the conversation right above it, in a side chat too 10-30 #438 | Room for the pane, folds, buttons and drag-to-copy | ? |
 | Inline mode (Sonny drawn into the terminal's scrollback) | removed | added 10-26 #146; removed 10-29 #326 | The first view; full screen became the experience, and one view is less to keep | ? |
 | Clean view; `/verbose` shows every tool call | shipped | quiet steps 10-27 #188; clean view 10-27 #221; Ctrl+O opens every fold 10-30 #421 | Agents are people you talk to: show what they say and what reaches you, not their tool calls | ? |
 | Your messages on a tinted band; no `•` before a reply that opens with a heading; rules end at the edge | shipped | added 10-30 #432 | Your turns are the anchors you scroll back for, as Codex and Claude Code tint them | ? |
@@ -93,8 +93,9 @@ per feature; group small things into the row they belong to.
 | Editing: wrap, arrow keys, shell keys, Shift-Enter, mouse selection | shipped | wrap 10-26 #157; arrows 10-27 #174; shell keys and pictures in messages 10-28 #242; Shift-Enter, selection 10-29 #297 | A composer that edits like a shell | ? |
 | `!COMMAND`: run your own shell command and tell the agent | shipped | added 10-27 #209 | Do it yourself without leaving the conversation | ? |
 | A guess at your next message, Tab takes it (`[sonny] suggest`) | experimental | added 10-29 #329 | As Claude Code and Codex do; cost per guess not yet measured | ? |
-| Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #427 |
-| One list over the composer (slash menu, `/model`, `/approvals`, `/approve`, `/react`): up to 8 rows, the pick reversed, `•` what is in effect | shipped | added 10-30 #427 | As Codex's one popup: every list reads and moves the same | ? | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
+| Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #427 | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
+| One list over the composer (slash menu, `/model`, `/approvals`, `/retry`, `/react`): up to 8 rows, the pick reversed, `•` what is in effect | shipped | added 10-30 #427 | As Codex's one popup: every list reads and moves the same | ? |
+| One vocabulary: slash descriptions as imperatives; automation, follow, reviewer, `no reply`, `Edited`, `/retry`, `sonny --agent` | shipped | added 10-30 #438 | One word per idea, the same word everywhere the person reads, as Codex and Claude Code word their commands; the agents' tool names follow after an eval | ? |
 | Messages to a busy agent: Enter steers, Tab queues for after the turn | shipped | Tab queues 10-30 #400 | As Codex does: the person knows whether it should wait, so no judge guesses | ? |
 
 ## Side pane
@@ -127,13 +128,13 @@ per feature; group small things into the row they belong to.
 | Lookout: tells a lead what its tasks did | shipped | added 10-26 #154, #161; one per daemon 10-27 #180; subscriptions 10-27 #195; subscribers only, leads subscribed 10-27 #212; news within a minute 10-27 #228, #232; a companion of the daemon 10-29 #370; a turn's end carries its reply 10-30 #378; stays light with thousands of bots 10-30 #398; a task's question is news 10-30 #395; follows only the event kinds it reads 10-30 #407 | A lead can rest while tasks work and hear the moment they need it | ? |
 | Lookout judge: a model decides what interrupts the lead (drift, interruptions, look-fors) | removed | added 10-26 #154; judge forks expire 10-27 #203; drift check 10-27 #204; interruptions only 10-27 #215; one judge with the approver 10-27 #217; picks 10-28 #239, #273; removed 10-29 #310 | Removed because the checks felt ad hoc and did not scale; the lookout now forwards everything and only picks the timing | ? |
 | Lookout sources: pollers the person sets up feed news to agents | experimental | added 10-29 #305 | Agents hear about the world, not only their tasks | ? |
-| `/background`: triggers and lookout subscriptions, fire or remove | shipped | added 10-28 #267; in the pane 10-28 #283; what failed first, `✗ N failed` in the footer and the glance, turn failures in the triggers tool 10-30; a one-off whose turn fails after it sent still shows 10-30 #442 | See and control what runs while nobody watches; a nightly run that failed while the laptop was offline or a login expired otherwise fails unseen | ? |
+| `/background`: automations and follows, run now or remove | shipped | added 10-28 #267; in the pane 10-28 #283; what failed first, `✗ N failed` in the footer and the glance, turn failures in the triggers tool 10-30; a one-off whose turn fails after it sent still shows 10-30 #442; automations and follows, `r` runs now 10-30 #438 | See and control what runs while nobody watches; a nightly run that failed while the laptop was offline or a login expired otherwise fails unseen | ? |
 
 ## Approvals
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| `/approvals`, auto-review shown in progress, `/approve` retries a denial | shipped | added 10-28 #261 | Approvals stay visible and easy to override | ? |
+| `/approvals`, the reviewer shown in progress, `/retry` retries a denial | shipped | added 10-28 #261; `/approve` is `/retry`, the judge is the reviewer 10-30 #438 | Approvals stay visible and easy to override | ? |
 | Auto approver (a model judges gated calls) | shipped | added 09-27 #47; permissive 10-27 #176; Codex's guardian policy 10-28 #237; sees history 10-28 #243; sandbox escapes only 10-28 #275; moved out of the CLI into `sonny approver`, the daemon's companion, 10-30 (the daemon keeps only the gate) | Few prompts, stop only likely unasked danger | ? |
 | Pull cord: `/pause REASON` and `agent pause --reason` stop every agent until `/resume`, across restarts | experimental | added 10-30 #408 | One stop for the whole line when agents do harm someone needs to look at; agents pull it from the CLI, with no tool | ? |
 | OpenAI Decisions judge for the approver | removed | added 10-25 #141; removed 10-30 #389 | Removed as unused, with no clear gain over the other judges; may come back when the API matures | no |

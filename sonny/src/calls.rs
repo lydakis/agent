@@ -36,7 +36,7 @@ pub fn attempted(verb: &str) -> String {
         "Cleaned" => "clean",
         "Cleared" => "clear",
         "Discarded" => "discard",
-        "Fired" => "fire",
+        "Ran" => "run",
         "Followed" => "follow",
         "Forked" => "fork",
         "Indexed" => "index",
@@ -55,9 +55,8 @@ pub fn attempted(verb: &str) -> String {
         "Scheduled" => "schedule",
         "Started" => "start",
         "Steered" => "steer",
-        "Subscribed" => "subscribe",
         "Typed" => "type",
-        "Unsubscribed" => "unsubscribe",
+        "Unfollowed" => "unfollow",
         "Updated" => "update",
         "Waited" => "wait",
         _ => return format!("Failed: {}", verb.to_lowercase()),
@@ -326,9 +325,9 @@ fn trigger(words: &[String], output: &str, failed: bool) -> Option<Said> {
                     .push(Line::from(first_line(message)).italic().dim());
             }
         }
-        "rm" => said.verb = "Removed the trigger".into(),
-        "fire" => said.verb = "Fired the trigger".into(),
-        "ls" => said.verb = "Listed the triggers".into(),
+        "rm" => said.verb = "Removed the automation".into(),
+        "fire" => said.verb = "Ran the automation".into(),
+        "ls" => said.verb = "Listed the automations".into(),
         _ => return None,
     }
     if let Some(refusal) = refusal {
@@ -771,9 +770,9 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
         crate::served::PROJECT => Some(said("Added the project", field("folder")?)),
         crate::served::SUBSCRIPTIONS => {
             Some(match (arguments["add"]["name"].as_str(), field("remove")) {
-                (Some(added), _) => said("Subscribed to", added),
-                (None, Some(removed)) => said("Unsubscribed from", removed),
-                (None, None) => said("Listed subscriptions", ""),
+                (Some(added), _) => said("Followed", added),
+                (None, Some(removed)) => said("Unfollowed", removed),
+                (None, None) => said("Listed follows", ""),
             })
         }
         crate::served::MEMORY => Some(
@@ -826,10 +825,10 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
                     }
                     said
                 }
-                (_, Some(removed), ..) => said("Removed the trigger", removed),
-                (_, _, Some(fired), _) => said("Fired the trigger", fired),
-                (_, _, _, Some(shown)) => said("Read the trigger", shown),
-                _ => said("Listed triggers", ""),
+                (_, Some(removed), ..) => said("Removed the automation", removed),
+                (_, _, Some(fired), _) => said("Ran the automation", fired),
+                (_, _, _, Some(shown)) => said("Read the automation", shown),
+                _ => said("Listed automations", ""),
             },
         ),
         crate::asks::TOOL => {
@@ -939,8 +938,8 @@ mod tests {
     fn a_failed_call_reads_as_what_it_tried() {
         assert_eq!(attempted("Started"), "Couldn't start");
         assert_eq!(
-            attempted("Removed the trigger"),
-            "Couldn't remove the trigger"
+            attempted("Removed the automation"),
+            "Couldn't remove the automation"
         );
         assert_eq!(attempted("Queued for"), "Couldn't queue for");
         assert_eq!(attempted("Saved to memory"), "Couldn't save to memory");
@@ -1113,7 +1112,7 @@ Keep the rest.'"#,
                 "subscriptions",
                 serde_json::json!({"add": {"name": "prs", "bots": ["a"]}})
             ),
-            "Subscribed to prs"
+            "Followed prs"
         );
         // An agent that runs no Sonny tool is said some other way.
         assert!(declared("start_task", &serde_json::json!({}), false).is_none());
@@ -1178,7 +1177,7 @@ Keep the rest.'"#,
         );
         assert_eq!(
             (removed.verb.as_str(), removed.what.as_str()),
-            ("Removed the trigger", "watch")
+            ("Removed the automation", "watch")
         );
     }
 

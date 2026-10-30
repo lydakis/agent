@@ -918,12 +918,14 @@ impl Screen {
             let line = row.line.clone();
             // A picture's row is cut at the edge, not wrapped into pieces:
             // Kitty's placeholders, or one drawn in half blocks. So is a
-            // rule, as "Worked for" draws: its line just ends sooner.
+            // rule, a last span of nothing but "─" as "Worked for" draws: its
+            // line just ends sooner. Text that only ends in "──" still wraps.
             let picture = (line.spans.iter()).any(|span| {
                 span.content.starts_with(crate::image::PLACEHOLDER)
                     || span.content.contains(['▀', '▄'])
-            }) || (line.spans.last())
-                .is_some_and(|span| span.content.ends_with("──"));
+            }) || (line.spans.last()).is_some_and(|span| {
+                !span.content.is_empty() && span.content.chars().all(|c| c == '─')
+            });
             let link = row.link.clone();
             let buttons = row.buttons.clone();
             let rows = match line.width() <= width || picture {
@@ -2621,6 +2623,10 @@ mod tests {
         let rule = crate::transcript::finished("completed", "", Some(48), 80);
         let (mut worked, _) = screen(vec![rule], 20, 5);
         assert_eq!(worked.height(20), 1);
+        // Text that only ends in a rule's characters still wraps.
+        let text = Line::from("a box drawn as a line of text ──");
+        let (mut diagram, _) = screen(vec![text], 20, 5);
+        assert_eq!(diagram.height(20), 2);
     }
 
     #[test]

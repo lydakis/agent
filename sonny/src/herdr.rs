@@ -760,12 +760,12 @@ if out is not None:
             .show(
                 "graft.docs",
                 "docs",
-                &["/bin/sonny".into(), "--bot".into(), "graft.docs".into()],
+                &["/bin/sonny".into(), "--agent".into(), "graft.docs".into()],
             )
             .unwrap();
         let last = super::tests::calls(&dir).pop().unwrap();
         assert_eq!(last[..2], ["pane", "run"]);
-        assert_eq!(last[3], "exec /bin/sonny --bot graft.docs");
+        assert_eq!(last[3], "exec /bin/sonny --agent graft.docs");
         assert_eq!(
             labels(&dir),
             ["graft.lead", "graft.fix", "graft.fix/tests", "graft.docs"]
@@ -902,7 +902,11 @@ if out is not None:
             shown: "Sonny: fix-cart".into(),
             name: agent_name("shop.fix-cart"),
             bot: "shop.fix-cart".into(),
-            resume: Some(vec!["sonny".into(), "--bot".into(), "shop.fix-cart".into()]),
+            resume: Some(vec![
+                "sonny".into(),
+                "--agent".into(),
+                "shop.fix-cart".into(),
+            ]),
             no_resume: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             named: AtomicBool::new(false),
@@ -943,7 +947,7 @@ if out is not None:
             Some("shop.fix-cart")
         );
         let resume = first.iter().position(|a| a == "--").unwrap();
-        assert_eq!(first[resume + 1..], ["sonny", "--bot", "shop.fix-cart"]);
+        assert_eq!(first[resume + 1..], ["sonny", "--agent", "shop.fix-cart"]);
         assert_eq!(
             flag(&calls[1], "--display-agent").as_deref(),
             Some("Sonny: fix-cart")
@@ -1012,9 +1016,9 @@ if out is not None:
         assert_eq!(agent_name("2048.lead"), None);
         assert_eq!(agent_name(&"a".repeat(40)).unwrap().len(), 32);
         let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
-        assert!(resumable(words("sh --bot shop.lead")).is_some());
-        assert!(resumable(words("no-such-program-sonny --bot x")).is_none());
-        assert!(resumable(words("/bin/sh --bot x")).is_none());
+        assert!(resumable(words("sh --agent shop.lead")).is_some());
+        assert!(resumable(words("no-such-program-sonny --agent x")).is_none());
+        assert!(resumable(words("/bin/sh --agent x")).is_none());
         assert!(resumable(words("sh --workspace it's")).is_none());
         assert!(resumable(vec!["sh".into(); 65]).is_none());
     }

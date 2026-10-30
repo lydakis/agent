@@ -34,7 +34,7 @@ skills it writes name `"…/sonny" agent` wherever they would say
     sonny --model PROVIDER/MODEL             # the same, making the project the first time
     sonny --lead NAME                        # another of the folder's leads
     sonny --new-lead [NAME]                  # a new lead for the folder
-    sonny --bot NAME                         # any one bot
+    sonny --agent NAME                       # any one agent
 
 Opened in a folder, Sonny is that project's lead, `<project>.lead`, made by
 Sonny in its `lead` role, with the folder's
@@ -280,7 +280,7 @@ lookout answering them runs, which is in neither. A task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
-run `sonny --bot NAME`. `--rex-host HOST` puts the session on another Rex
+run `sonny --agent NAME`. `--rex-host HOST` puts the session on another Rex
 server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
@@ -295,7 +295,7 @@ their tasks: `show_agent` on `PROJECT.lead`, from another project's lead (one
 that leads the projects in its folder), opens that lead's Sonny in its own
 project's session or workspace, made when needed in the same multiplexer,
 and leaves one already open alone. Sonny never lays another project's lead,
-or its tasks, out in this one's home. `sonny --bot PROJECT.lead` anywhere is
+or its tasks, out in this one's home. `sonny --agent PROJECT.lead` anywhere is
 that lead's Sonny too, laying out its tasks where it runs. Opened in a
 session that already holds other work, Sonny takes that session as the
 project's home and leaves the rest alone: tasks get tabs of their own, and a
@@ -318,7 +318,7 @@ tools, its approval mode and sandbox, and the lookout. Each new thread is a
 lead of its own, named after the first words it is sent (the folder's first
 lead when it has none yet), unless those words are `/lead NAME`, which
 binds the thread to that lead of the folder, or `/lead new [NAME]`. A call that
-waits for you is asked in the thread (Allow or Deny); one the judge passes
+waits for you is asked in the thread (Allow or Deny); one the reviewer passes
 runs without asking. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
@@ -469,18 +469,18 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   role, `AGENTS.md`, skills and memory. Sonny does this on its own when
   it opens a lead whose instructions it saw composed from the folder, and
   leaves ones set any other way alone.
-- `/approvals` picks whether calls wait for a verdict: `auto`, a judge
+- `/approvals` picks whether calls wait for a review: `auto`, a reviewer
   model (a new lead starts here, and Sonny keeps `sonny approver` as the
   daemon's companion when nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
   the gate it had; a pick reaches every agent the lead made too, one busy
-  now once it is idle. While the judge reviews a call the status row says
+  now once it is idle. While the reviewer looks at a call the status row says
   `Reviewing approval request`, and a denied call is drawn as
-  `✗ Request denied for …` with the judge's reason, in either view.
+  `✗ Request denied for …` with the reviewer's reason, in either view.
   The mode sets the lead's sandbox too, as Codex's modes do: in `auto`
   and `ask` its commands, writes and edits stay in its folder (and
   `/tmp`), reach the network, and may commit to the folder's repository,
   whose hooks and config stay read-only; a call that leaves the sandbox
-  waits for the verdict. In `full` the lead runs unconfined. Every task
+  waits for the review. In `full` the lead runs unconfined. Every task
   is sandboxed the same way in its own folder, but in `full`, where
   nothing would answer a call that asks to leave the sandbox, tasks run
   unconfined too, as under Codex's full access; a pick sets the tasks'
@@ -494,11 +494,11 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   call runs outside only when everything it runs is named, so
   `mcpx … | jq` still asks. Sonny gives a lead the list again when it opens
   it.
-- `/approve` lists the calls the judge denied while Sonny watched, with
+- `/retry` lists the calls the reviewer denied while Sonny watched, with
   the reason for each. Enter writes the call out whole, and a second
   Enter sends your approval of that exact call as your own message, so
-  the agent may retry it once; the retry is still reviewed, and the judge
-  reads your words as consent. This is Codex's `/approve`.
+  the agent may retry it once; the retry is still reviewed, and the
+  reviewer reads your words as consent. Codex calls this `/approve`.
 - `/status` shows the project's agents in the pane beside the
   conversation. The lead comes first; its tasks
   follow grouped by where they stand: **Needs you** (waiting on your
@@ -514,8 +514,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   task's window closes once its turn ends. New work sent to the task
   reopens it. Each agent's
   time is how long its running turn has been at it, or how long its last
-  turn took. An agent with triggers or lookout subscriptions of its own
-  shows `↻ 2 triggers` beside its model. A click on an agent's name opens
+  turn took. An agent with automations or follows of its own
+  shows `↻ 2 automations` beside its model. A click on an agent's name opens
   it in the pane, as a click on a task in a roster does, and so does
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
@@ -527,21 +527,22 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
-  no one typing: the triggers that wake them, with
-  when each fires, its message and what its last fire did, and the
-  lookout's subscriptions, with how many checks each asked for in the last
-  day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
-  removes it; the subscription Sonny keeps for a lead's tasks stays. The
+  no one typing: the automations that wake them, with
+  when each runs, its message and what its last run did, and the
+  lookout's follows, with how many checks each asked for in the last
+  day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
+  removes it; the follow Sonny keeps for a lead's tasks stays. The
   footer says `↻ 2 in background` while the window's agent has any.
-  What failed is listed first, with a red `✗` and the error: a trigger
-  whose fire failed (one that ended on it stays listed until `d` removes
-  it), or whose fire went out and whose turn then failed (as
+  What failed is listed first, with a red `✗` and the error: an automation
+  whose run failed (one that ended on it stays listed until `d` removes
+  it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says
   `✗ 1 failed` in red, left of the `↻`, and a click on either opens
-  `/background`. An agent sees the same in its triggers tool, whose rows
-  say how the turn their last fire sent ended.
+  `/background`. An agent sees the same in its `triggers` tool, whose rows
+  say how the turn their last run sent ended. Automations and follows are
+  what the agents' `triggers` and `subscriptions` tools make.
 
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
   ![The footer: ✗ 2 failed in red, left of ↻ 1 in background](../docs/sonny/footer-failed.png)
@@ -776,9 +777,9 @@ failure.
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
-working, needs you, done, said nothing, checking, checked, failed), read
+working, needs you, done, no reply, checking, checked, failed), read
 again every few seconds. A task whose model ended its turn with nothing to
-say did not fail, but did not reply either, so it reads `said nothing`, not
+say did not fail, but did not reply either, so it reads `no reply`, not
 `done`, in the roster and in `/status`. A task with a goal reads `checking`
 once a turn ends, and `checked` once its goal's check passed.
 
@@ -892,17 +893,17 @@ With nothing typed, `?` lists every key beside the conversation. Every
 hint on screen is written one way, as Codex writes them: the key, then
 what it does muted, `·` between them (`↑↓ pick · enter open · esc
 close`). Every list over the composer (the slash menu, `/model`,
-`/approvals`, `/approve`, a reply to react to) is one list: up to 8 rows
+`/approvals`, `/retry`, a reply to react to) is one list: up to 8 rows
 under a blank one, the pick in reverse video, `•` before what is in
 effect.
 
 ![? with nothing typed: every key beside the conversation](../docs/sonny/shortcuts.png)
 
-![The slash menu: 8 commands under a blank row; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
+![The slash menu: 8 commands under a blank row, each described as an imperative; the footer says ? 1 needs you](../docs/sonny/slash-menu.png)
 
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: a red `✗` for what
-failed in the background and `↻` for its triggers and subscriptions (a
+failed in the background and `↻` for its automations and follows (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts what needs you and the

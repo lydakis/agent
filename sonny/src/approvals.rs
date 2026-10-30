@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 /// New leads start in the first.
 pub const MODES: [(&str, &str); 3] = [
-    ("auto", "a judge model decides each call"),
+    ("auto", "a reviewer model decides each call"),
     ("ask", "you answer each call here"),
     ("full", "every call runs"),
 ];

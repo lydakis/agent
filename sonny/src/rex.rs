@@ -409,7 +409,7 @@ if out is not None:
         );
         let rex = super::Rex::open(bin, None, "web", false, None).unwrap();
         let mut layout = crate::mux::Layout::new(Box::new(rex));
-        let sonny = ["sonny".to_owned(), "--bot".into(), "web.lead".into()];
+        let sonny = ["sonny".to_owned(), "--agent".into(), "web.lead".into()];
         assert!(layout.show("web.lead", "lead", &sonny).unwrap());
         // The shell the session came with goes; the other lead's is left.
         assert_eq!(labels(&dir, "01made"), ["web.lead"]);
@@ -417,7 +417,7 @@ if out is not None:
         let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
         assert!(calls.contains("new web --json"), "{calls}");
         assert!(
-            calls.contains("window new -s 01made lead --shell=none --focus=false --json -- sonny --bot web.lead"),
+            calls.contains("window new -s 01made lead --shell=none --focus=false --json -- sonny --agent web.lead"),
             "{calls}"
         );
         // Opened again, the lead's Sonny is there already.

@@ -329,7 +329,7 @@ mod tests {
             row("zero", "needs you", Group::NeedsYou),
             Row {
                 pr: "o/r#9".into(),
-                background: "↻ 1 trigger".into(),
+                background: "↻ 1 automation".into(),
                 ..row("equal", "done", Group::Review)
             },
             row("old", "done", Group::Resolved),
@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(folded[9], " ◆ equal done · took 42s");
         assert_eq!(
             folded[10],
-            "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9 · ↻ 1 trigger"
+            "   chatgpt/gpt-6.1-sol · tab 1 · o/r#9 · ↻ 1 automation"
         );
         assert_eq!(folded.last().unwrap(), "1 resolved · r shows them");
         let (_, named) = card("calc", &rows, 100, false);

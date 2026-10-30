@@ -34,9 +34,10 @@ impl Item {
 }
 
 /// `items` with `pick` picked, `width` wide: the blank row, then up to
-/// `ROWS` rows around the pick.
-pub fn lines(items: &[Item], pick: usize, width: usize) -> Vec<Line<'static>> {
-    let shown = items.len().min(ROWS);
+/// `ROWS` rows around the pick, fewer when only `room` rows are free above
+/// the composer, so the pick is always among those drawn.
+pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line<'static>> {
+    let shown = items.len().min(ROWS).min(room.saturating_sub(1));
     let first = (pick + 1)
         .saturating_sub(shown)
         .min(items.len().saturating_sub(shown));
@@ -84,13 +85,18 @@ mod tests {
         let text = |lines: Vec<Line>| -> Vec<String> {
             lines.iter().map(|line| line.to_string()).collect()
         };
-        let top = text(lines(&items, 3, 40));
+        let top = text(lines(&items, 3, 40, 20));
         assert_eq!(top.len(), 9);
         assert_eq!(top[0], "");
         assert_eq!(top[1], "    /c0   does");
         assert_eq!(top[4], "  • /c3   does ");
-        let end = text(lines(&items, 20, 40));
+        let end = text(lines(&items, 20, 40, 20));
         assert_eq!(end[8], "    /c20  does ");
         assert_eq!(end[1], "    /c13  does");
+        // With four rows free above the composer, three items show, the
+        // pick among them.
+        let short = text(lines(&items, 20, 40, 4));
+        assert_eq!(short.len(), 4);
+        assert_eq!(short[3], "    /c20  does ");
     }
 }
