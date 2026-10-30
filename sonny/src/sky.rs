@@ -451,7 +451,13 @@ impl View {
     /// (in from the rim), or the person.
     fn sender(&self, data: &Value, at: usize) -> End {
         if let Some(by) = data["from"]["bot"].as_str() {
-            return self.agent(by).map_or(End::Rim(at), End::Agent);
+            // A name used again is someone else: from outside, then.
+            let id = data["from"]["bot_id"].as_i64();
+            return (self.agent(by))
+                .filter(|&by| {
+                    id.is_none() || self.agents[by].id.is_none_or(|known| Some(known) == id)
+                })
+                .map_or(End::Rim(at), End::Agent);
         }
         match data["origin"].as_str() {
             Some(_) => End::Rim(at),
@@ -1479,6 +1485,21 @@ mod tests {
         view.drain();
         assert_eq!(view.maker(view.index["b"]), None);
         assert_eq!(view.maker(view.index["c"]), Some(view.index["a"]));
+    }
+
+    #[tokio::test]
+    async fn a_sender_whose_name_was_used_again_comes_from_outside() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a", "bot_id": 7}),
+            json!({"name": "b", "bot_id": 2}),
+        ]))
+        .unwrap();
+        view.drain();
+        let (a, b) = (view.index["a"], view.index["b"]);
+        let from = |id: i64| json!({"from": {"bot": "a", "bot_id": id, "turn": 1}});
+        assert_eq!(view.sender(&from(1), b), End::Rim(b));
+        assert_eq!(view.sender(&from(7), b), End::Agent(a));
     }
 
     #[tokio::test]
