@@ -20,6 +20,16 @@ when its identity was known at creation. Address that creator with
 `run --detach --bot "$AGENT_PARENT" --bot-id "$AGENT_PARENT_ID" -- TASK`.
 The ID stays pinned after deletion, so a replacement with the same name rejects
 the call instead of receiving the work.
+
+A bot's shell gets the daemon's environment without the keys its providers
+use, which are also redacted from what tools return. `serve --shell-exclude
+PATTERN`, repeatable, leaves out more: every variable whose name matches, with
+`*` for any run and `?` for any one character, in any case. A client that
+starts a daemon passes it Codex's `[shell_environment_policy]` from
+`~/.agent/config.toml`: each name in `exclude`, and `*KEY*`, `*SECRET*` and
+`*TOKEN*` too with `ignore_default_excludes = false`. As in Codex, those three
+are kept by default. A running daemon keeps the excludes it started with, and
+a variable a bot or caller sets with `--env` is still set.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 
