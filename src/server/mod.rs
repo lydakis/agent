@@ -3065,6 +3065,8 @@ impl Service {
                     interrupted = (self.active.values())
                         .filter(|active| active.cancel(turn::PAUSED))
                         .count();
+                    // And what they started that runs on without them.
+                    self.registry.end_running();
                     self.notices
                         .push(json!({"event": "paused", "pause": pause, "durable": false}));
                 }

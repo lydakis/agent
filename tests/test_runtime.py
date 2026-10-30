@@ -1589,6 +1589,21 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'changed': False})
         self.assertIsNone(restarted.request('stats')['result']['paused'])
 
+    def test_a_pause_ends_the_background_commands_agents_started(self):
+        self.model.background_timeout_ms = 30000
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='background',
+                              prompt='bg:sleep 30')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('stats')['result']['running_processes'], 1)
+        client.request('pause', reason='the loop is sending mail', by='calc.a')
+        deadline = time.monotonic() + 5
+        while client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+
     def test_shutdown_grace_lets_running_turns_finish_and_holds_new_ones(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers

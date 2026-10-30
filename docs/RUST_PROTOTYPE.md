@@ -1006,7 +1006,9 @@ Protocol 24 also adds the pull cord: `pause` stops every agent until
 one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
 reason of 1 to 4096 bytes. `by` is who pulled it; on a bot's own socket it is
 that bot, whatever the request says. It ends every running turn as
-`interrupted` with `daemon_paused`, and from then no turn starts: a `reject`
+`interrupted` with `daemon_paused`, ends every background command (whose
+handle then answers `daemon_paused`) and terminal, though not a detached
+command, which no one tracks, and from then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, triggers and notes with them, and parked and paced turns
 stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
