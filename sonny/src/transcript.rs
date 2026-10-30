@@ -1369,6 +1369,8 @@ fn news(text: &str) -> Option<Vec<String>> {
                 parts.push(format!("{name} took a note away"));
             } else if status.starts_with("waiting for the person") {
                 parts.push(format!("{name} needs you"));
+            } else if status.starts_with("put a question to the person") {
+                parts.push(format!("{name} asks you"));
             } else if status.starts_with("has printed nothing") {
                 parts.push(format!("{name} quiet"));
             } else if let Some(who) = status.strip_suffix(" wrote in it") {
@@ -2786,11 +2788,12 @@ mod tests {
              - shop.fix: turn:shop.fix/3, put the note \"bench\" in its own margin; the margin tool with from \"shop.fix/bench\" shows it in yours\n\
              - shop.web: turn:shop.web/2, took its margin note \"old\" away\n\
              - shop.docs: turn:shop.docs/2 waiting for the person's approval\n\
-             - shop.api: turn:shop.api/3 has printed nothing for 30 minutes";
+             - shop.api: turn:shop.api/3 has printed nothing for 30 minutes\n\
+             - shop.db: turn:shop.db/4, put a question to the person, which they answer in shop.db:\n  > Keep it?";
         assert_eq!(
             text(&super::prompt(note, None, 160)),
             [
-                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet"
+                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet · shop.db asks you"
             ]
         );
     }
