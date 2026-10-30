@@ -2969,6 +2969,7 @@ impl Turn {
                     }
                     if let Some(usage) = &mut completion.usage {
                         usage.sent_ms = sent_ms;
+                        usage.context_window = self.window.get().copied().unwrap_or(0);
                         self.tokens.add(usage);
                     }
                     for (from, to) in &completion.fallbacks {

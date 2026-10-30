@@ -280,7 +280,9 @@ cached for an hour; `sent_ms`, when the request was sent in Unix-epoch
 milliseconds, so a cache miss can be set against the gap since the call before
 it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
-fallback the last attempt's); a prompt-cache refresh's event carries
+fallback the last attempt's); `context_window`, the model's context window
+in tokens on a model round's event, so a client can say how full the
+conversation is; a prompt-cache refresh's event carries
 `purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
@@ -2598,7 +2600,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   while the holder's session is open and its lease
   runs or its serve reply is not out yet. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
-  600,000), counted from when its serve reply is queued; pushes follow
+  600,000), counted from when its serve reply is queued. A renewal on the
+  main socket is answered as it is read, ahead of the session's requests
+  still queued for the service loop, since it touches no storage; pushes follow
   the reply, so neither the rest of a storage group nor a burst of pushes
   uses up the lease or the reply's room. An accepted leased answer holds
   the tag through storage and reply backpressure, restarting the period

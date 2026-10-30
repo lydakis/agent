@@ -606,6 +606,7 @@ mod tests {
                 sent_ms: 0,
                 models: Vec::new(),
                 served_model: "claude-test-20260926".to_owned(),
+                context_window: 0,
             })
         );
     }
