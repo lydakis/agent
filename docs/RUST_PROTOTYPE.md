@@ -2236,7 +2236,7 @@ it:
 
 | Request | On a bot's own socket |
 |---|---|
-| `configure`, `answer`, `tool_result`, `approve_step`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `configure`, `answer`, `tool_result`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
 | `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
@@ -2418,7 +2418,12 @@ step. Each decided step is recorded in a `step_decided` event with
 previews a call's), `decision`, `reason` and `approvals`, and `denied`
 when its gates refused it, which a judge of a later call sees among the
 turn's refused calls; it counts toward the bot's denial counts as a call
-does. While any step of a
+does. A step its gates allowed is among the turn's calls a judge of a
+later call sees, as running until its client reports how it ended:
+`{"op":"step_result","bot","turn","call_id","step","failed"}` records
+`step_completed` (`call_id`, `step_of`, and `failed` when it did), so the
+step counts as done; told twice it keeps the first, and a step no gate
+allowed is `no_allowed_step`. While any step of a
 call waits, the call's time stops: it cannot run out, its parked turn has
 no deadline, and once the last step is decided it gets back what was left.
 A step lives only as long as the request waiting on it: asking for one

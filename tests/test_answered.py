@@ -313,6 +313,34 @@ class StepTests(ModelFixture):
         self.answer(client, turn, output='sent')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
+    def test_a_judge_sees_the_steps_a_turn_ran(self):
+        client, turn, _ = self.script(approve=['exec'], approver='manual')
+        for step, decision in (('1', 'allow'), ('2', 'allow'), ('3', 'deny')):
+            request = self.ask(client, turn, step=step, arguments={'text': step})
+            self.announced(client, turn)
+            self.verdict(client, turn, f'script-0/{step}', decision=decision)
+            self.reply(client, request)
+
+        def result(step, **extra):
+            return client.request('step_result', bot='Lead', turn=turn, call_id='script-0', step=step, **extra)
+
+        self.assertEqual(result('1')['result'], {'call_id': 'script-0/1'})
+        self.assertEqual(result('2', failed=True)['result'], {'call_id': 'script-0/2'})
+        # Told twice, the first stands.
+        self.assertEqual(result('2')['result'], {'call_id': 'script-0/2'})
+        self.assertEqual(result('3')['error'], 'no_allowed_step')
+        self.assertEqual(result('4')['error'], 'no_allowed_step')
+        calls = client.request('prompts', bot='Lead', turn=turn)['result']['calls']
+        steps = [(c['call_id'], c['name'], c['arguments'], c['done'], c.get('failed')) for c in calls
+                 if c['call_id'].startswith('script-0/')]
+        self.assertEqual(steps, [('script-0/1', 'mcp__chat__send', '{"text":"1"}', True, None),
+                                 ('script-0/2', 'mcp__chat__send', '{"text":"2"}', True, True)])
+        self.assertEqual([e['call_id'] for e in self.events(client, turn, 'step_completed')],
+                         ['script-0/1', 'script-0/2'])
+        self.answer(client, turn, output='sent')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(result('1')['error'], 'stale_turn')
+
     def test_a_step_s_wait_stops_its_call_s_time(self):
         # The call has 600 ms and its turn parks at once; its step waits
         # longer than that, and the call's time runs on only after.

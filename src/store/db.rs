@@ -6658,6 +6658,43 @@ impl Database {
         tx.commit()?;
         Ok(self.stepped(&bot, turn, &request, resumed, data))
     }
+    /// Record how a step its gates allowed ended once its client ran it,
+    /// so a judge of a later call sees it among the turn's calls as done.
+    /// Told twice, it keeps the first.
+    pub fn step_result(
+        &mut self,
+        name: &str,
+        turn: i64,
+        call_id: &str,
+        step: &str,
+        failed: bool,
+    ) -> Result<Value> {
+        self.step_turn(name, turn)?;
+        let id = format!("{call_id}/{step}");
+        let (allowed, done): (bool, bool) = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_decided'
+                 AND json_extract(data,'$.call_id')=?2 AND json_extract(data,'$.decision')='allow'),
+               EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_completed'
+                 AND json_extract(data,'$.call_id')=?2)",
+            )?
+            .query_row(params![turn, id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if !allowed {
+            return fail_with(
+                "no_allowed_step",
+                format!("no step {step} of {call_id} was allowed"),
+            );
+        }
+        if !done {
+            let mut data = json!({"call_id":id,"step_of":call_id});
+            if failed {
+                data["failed"] = json!(true);
+            }
+            event(&self.conn, name, Some(turn), "step_completed", data)?;
+        }
+        Ok(json!({"call_id":id}))
+    }
     /// The bot's turn a step names, while a call of it can still be
     /// answered.
     fn step_turn(&self, name: &str, turn: i64) -> Result<()> {
@@ -7253,9 +7290,11 @@ impl Database {
         for (after, call) in self.refused(turn, &mut left)? {
             attach(&mut prompts, after, call);
         }
+        // A step its gates allowed is among the calls, done once its
+        // client says it ran.
         let mut completed = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.call_id'),json_extract(data,'$.failed')
-             FROM events WHERE turn=? AND kind='tool_completed' ORDER BY id",
+             FROM events WHERE turn=? AND kind IN ('tool_completed','step_completed') ORDER BY id",
         )?;
         let mut rows = completed.query([turn])?;
         while let Some(r) = rows.next()? {
@@ -7266,7 +7305,8 @@ impl Database {
             done.insert(call_id);
         }
         let mut started = self.conn.prepare_cached(
-            "SELECT data FROM events WHERE turn=? AND kind='tool_started' ORDER BY id",
+            "SELECT data FROM events WHERE turn=? AND (kind='tool_started'
+               OR kind='step_decided' AND json_extract(data,'$.decision')='allow') ORDER BY id",
         )?;
         let mut calls = Vec::new();
         let mut calls_more = false;

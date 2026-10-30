@@ -585,6 +585,9 @@ The script waits for the verdict with its 10 minutes stopped and its place
 among the four running given to another, though it stays among the sixteen
 alive; JavaScript it runs meanwhile, beside the waiting call, still spends
 its time. A denied call rejects with the reason, which the script can catch.
+Once a call a gate allowed has run, Sonny tells the daemon how it ended
+(`step_result`), so the judge of the agent's next call counts it among those
+the turn already ran.
 
 ## Checks
 

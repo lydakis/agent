@@ -473,6 +473,15 @@ enum Command {
         name: String,
         arguments: Value,
     },
+    /// How a step its gates allowed ended once the client ran it.
+    StepResult {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        step: String,
+        #[serde(default)]
+        failed: bool,
+    },
     /// Calls still waiting for the client `tag` names, oldest first.
     ToolCalls {
         tag: String,
@@ -1843,6 +1852,7 @@ impl Service {
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
+            Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
@@ -3354,6 +3364,19 @@ impl Service {
                         Err(Error::new("deferred"))
                     }
                 }
+            }
+            Command::StepResult {
+                bot,
+                turn,
+                call_id,
+                step,
+                failed,
+            } => {
+                store
+                    .op("step_result", move |db| {
+                        db.step_result(&bot, turn, &call_id, &step, failed)
+                    })
+                    .await
             }
             Command::ToolCalls { tag, after, limit } => {
                 store

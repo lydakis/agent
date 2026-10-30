@@ -469,19 +469,31 @@ impl Steps {
     }
 
     /// Put the call of `tool` to the agent's gate: none, an allow, or why
-    /// it may not run.
-    async fn ask(&self, tool: &str, arguments: Value) -> Result<(), String> {
-        let step = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+    /// it may not run. An allow a gate gave names the step, to say how it
+    /// ended once it ran.
+    async fn ask(&self, tool: &str, arguments: Value) -> Result<Option<String>, String> {
+        let step = (self.next.fetch_add(1, Ordering::SeqCst) + 1).to_string();
         let asked = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
-            "step": step.to_string(), "name": tool, "arguments": arguments});
+            "step": step, "name": tool, "arguments": arguments});
         match self.client.request("approve_step", asked).await {
-            Ok(reply) if reply["decision"] == "allow" => Ok(()),
+            Ok(reply) if reply["decision"] == "allow" => Ok(reply["approvals"]
+                .as_array()
+                .is_some_and(|approvals| !approvals.is_empty())
+                .then_some(step)),
             Ok(reply) => Err(format!(
                 "tools.{tool} was not approved: {}",
                 reply["reason"].as_str().unwrap_or("denied")
             )),
             Err(error) => Err(format!("tools.{tool} could not be approved: {error}")),
         }
+    }
+
+    /// Tell the agent how an allowed step ended, so its judge counts it
+    /// among the calls done. Its turn may be gone by then: nothing to tell.
+    async fn ran(&self, step: String, failed: bool) {
+        let ran = json!({"bot": self.bot, "turn": self.turn, "call_id": self.call_id,
+            "step": step, "failed": failed});
+        let _ = self.client.request("step_result", ran).await;
     }
 }
 
@@ -1057,15 +1069,17 @@ impl Caller {
         };
         // Put to the agent's gate first, with the script's time stopped,
         // on the lookout's runtime, where its connection lives.
+        let mut allowed = None;
         if let Some(steps) = self.steps.clone().filter(|_| nested.asks) {
             let asked = match &arguments {
                 Value::Null => json!({}),
                 arguments => arguments.clone(),
             };
             let stopped = self.clock.stop();
+            let asking = Arc::clone(&steps);
             let approval = Abort(
                 self.lookout
-                    .spawn(async move { steps.ask(&id, asked).await }),
+                    .spawn(async move { asking.ask(&id, asked).await }),
             );
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
@@ -1076,7 +1090,7 @@ impl Caller {
                 return json!({"error": error});
             }
             match approved {
-                Ok(Ok(())) => {}
+                Ok(Ok(step)) => allowed = step.map(|step| (steps, step)),
                 Ok(Err(error)) => return json!({"error": error}),
                 Err(e) => return json!({"error": e.to_string()}),
             }
@@ -1092,11 +1106,17 @@ impl Caller {
             self.lookout
                 .spawn(async move { hub.call(&nested.server, &nested.tool, arguments).await }),
         );
-        match call.await {
+        let result = match call.await {
             Ok(Ok(result)) => json!({"ok": result}),
             Ok(Err(error)) => json!({"error": error}),
             Err(e) => json!({"error": e.to_string()}),
+        };
+        if let Some((steps, step)) = allowed {
+            let failed = result.get("ok").is_none_or(|ok| ok["isError"] == true);
+            self.lookout
+                .spawn(async move { steps.ran(step, failed).await });
         }
+        result
     }
 }
 
@@ -1421,6 +1441,7 @@ mod tests {
                 let go = go.clone();
                 tokio::spawn(async move {
                     let result = match request["name"].as_str() {
+                        _ if request["op"] == "step_result" => json!({}),
                         Some("mcp__test__add") => {
                             json!({"decision": "deny", "reason": "no adding"})
                         }
@@ -1429,7 +1450,7 @@ mod tests {
                                 Some(go) => go.acquire().await.unwrap().forget(),
                                 None => tokio::time::sleep(wait).await,
                             }
-                            json!({"decision": "allow"})
+                            json!({"decision": "allow", "approvals": [{"tag": "manual", "allow": true}]})
                         }
                     };
                     let reply = json!({"id": request["id"], "result": result});
@@ -1482,10 +1503,18 @@ text("done");"#;
             ),
             "{said}"
         );
+        // The step the gate allowed is told how it ended, after the call.
         let mut asked = Vec::new();
-        while let Ok(step) = steps.try_recv() {
-            asked.push(step);
+        while asked.len() < 3 {
+            asked.push(steps.recv().await.unwrap());
         }
+        let ran: Vec<_> = asked.iter().filter(|s| s["op"] == "step_result").collect();
+        assert_eq!(ran.len(), 1, "{asked:?}");
+        assert_eq!(
+            (ran[0]["step"].as_str(), ran[0]["failed"].as_bool()),
+            (Some("2"), Some(false))
+        );
+        asked.retain(|s| s["op"] == "approve_step");
         let seen: Vec<(&str, &str, &str, i64, &str)> = asked
             .iter()
             .map(|s| {
