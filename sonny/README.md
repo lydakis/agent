@@ -56,7 +56,9 @@ of the first rather than above it. `sonny` opens the one last written to in
 that folder, else the first. `--lead NAME` opens another (`--lead lead` the
 first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
-and `/lead new [NAME]` makes one. A lead hears of, shows and lists in
+and `/lead new [NAME]` makes one. `/goal WHAT` asks the agent to set a goal
+on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
+clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
 to that lead, to leave changes it did not make alone and never to switch the
 folder's branch, since the leads share one checkout; the instructions,

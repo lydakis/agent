@@ -1474,7 +1474,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 19] = [
+const COMMANDS: [(&str, &str); 20] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1492,6 +1492,10 @@ const COMMANDS: [(&str, &str); 19] = [
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     ("/lead", "the folder's leads: open another, or make one"),
+    (
+        "/goal",
+        "ask the agent to work until something is done; show or clear goals",
+    ),
     (
         "/margin",
         "the agent's notes beside the conversation, shown or closed",
@@ -7742,6 +7746,16 @@ impl App {
             self.lead_command(rest.trim()).await;
             return;
         }
+        // `/goal WHAT` goes to the agent as typed, which sets its goal.
+        if let Some(rest) = prompt
+            .strip_prefix("/goal")
+            .map(str::trim)
+            .filter(|rest| matches!(*rest, "" | "clear"))
+        {
+            self.input.clear();
+            self.notice = Some(self.goal_command(rest == "clear").await);
+            return;
+        }
         if let Some(question) = prompt
             .strip_prefix("/side")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
@@ -8188,6 +8202,44 @@ impl App {
         // Beside the conversation, on a terminal of its own.
         if let Err(error) = self.embed("side chat", &args) {
             self.notice = Some(format!("no side chat: {error}"));
+        }
+    }
+
+    /// `/goal` shows the goals of this agent and its tasks, and `/goal
+    /// clear` clears its own, as its goal tool would.
+    async fn goal_command(&mut self, clear: bool) -> String {
+        let arguments = match clear {
+            true => json!({"clear": self.bot}),
+            false => json!({}),
+        };
+        let said =
+            lookout::goals::call(&self.options.store, &self.client, &self.bot, &arguments).await;
+        match said {
+            Err(error) => error,
+            Ok(said) if clear => match said["cleared"] == true {
+                true => "goal cleared".into(),
+                false => "no goal to clear".into(),
+            },
+            Ok(said) => {
+                let goals = said["goals"].as_array().cloned().unwrap_or_default();
+                if goals.is_empty() {
+                    return "no goal; /goal WHAT asks the agent to work until WHAT is done".into();
+                }
+                let shown: Vec<String> = goals
+                    .iter()
+                    .map(|goal| {
+                        format!(
+                            "{}: done when {}",
+                            goal["bot"].as_str().unwrap_or_default(),
+                            goal["done_when"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "goals: {}; /goal clear clears this agent's",
+                    shown.join("; ")
+                )
+            }
         }
     }
 
@@ -9699,6 +9751,58 @@ mod tests {
             2,
             "the person's and the copy's"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_words_go_to_the_agent_as_typed_and_goal_alone_shows_or_clears() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |asked| {
+            seen.lock().unwrap().push(asked.clone());
+            match asked["op"].as_str() {
+                Some("inspect") => json!({"bot_id": 1, "workspace": "/"}),
+                Some("submit") => json!({"turn": 1}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        let store = std::env::temp_dir().join(format!("goal-window-{}", std::process::id()));
+        app.options.store = store.clone();
+        app.input.set("/goal");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("no goal; /goal WHAT asks the agent to work until WHAT is done")
+        );
+        // The words reach the agent as the person typed them.
+        app.input.set("/goal the tests pass");
+        app.submit().await;
+        let ops = asked.lock().unwrap().clone();
+        let submits: Vec<_> = ops.iter().filter(|op| op["op"] == "submit").collect();
+        assert_eq!(submits.len(), 1);
+        assert!(submits[0].to_string().contains("/goal the tests pass"));
+        // The agent sets one with its tool; /goal shows it and clears it.
+        let set = json!({"set": {"done_when": "the tests pass", "check": "true"}});
+        lookout::goals::call(&store, &app.client, "b", &set)
+            .await
+            .unwrap();
+        app.input.set("/goal");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("goals: b: done when the tests pass; /goal clear clears this agent's")
+        );
+        app.input.set("/goal clear");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("goal cleared"));
+        assert!(lookout::goals::read(&store, "b").is_none());
+        app.input.set("/goal clear");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no goal to clear"));
+        let ops = asked.lock().unwrap().clone();
+        assert_eq!(ops.iter().filter(|op| op["op"] == "submit").count(), 1);
+        std::fs::remove_dir_all(lookout::subs::dir(&store)).unwrap();
     }
 
     #[tokio::test]
