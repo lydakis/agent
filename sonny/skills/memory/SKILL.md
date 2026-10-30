@@ -122,9 +122,11 @@ a mistake they pointed out, since memory that holds only corrections
 steers later agents away from what already works. A reaction of theirs to
 one of your replies is feedback on that reply. Save the approach they
 confirmed, never that they liked being agreed with. When the same
-feedback comes again, add the date to the fact that holds it and raise its
-`confirmed` count, or its `pushed_back` count when they push back on what
-it says. A save that leaves a count out keeps the one the fact had.
+feedback comes again, add where it came from (`turn:BOT/N`) and the date to
+the fact that holds it and raise its `confirmed` count, or its
+`pushed_back` count when they push back on what it says; one already listed
+there was counted, so it counts nothing again. A save that leaves a count
+out keeps the one the fact had.
 
 Do not save:
 
