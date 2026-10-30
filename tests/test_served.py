@@ -402,7 +402,7 @@ class ServedToolTests(ModelFixture):
         [ended] = [e['cursor'] for e in self.daemon.request('events', bot='calc.fix', after=0, limit=256)
                    ['result']['events'] if e['event'] == 'turn_finished']
         saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
-        self.assertLess(int(saved[0]), ended)
+        self.assertLess(int(saved[0].split()[0]), ended)
         # Another build's lookout takes over, stopping this one's check.
         (self.path / 'state.sqlite.lookout.sonny').write_text('0.0.1 1')
         (self.path / 'state.sqlite.lookout/goals/calc.fix.json').write_text(json.dumps(dict(
@@ -428,7 +428,7 @@ class ServedToolTests(ModelFixture):
         # though no subscriber holds it.
         time.sleep(1.5)
         saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
-        self.assertLess(int(saved[0]), ended)
+        self.assertLess(int(saved[0].split()[0]), ended)
         old.kill()
         old.wait(timeout=10)
         self.lookout()
