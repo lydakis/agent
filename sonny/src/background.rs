@@ -640,12 +640,12 @@ impl View {
             keys.push("↑↓ pick");
         }
         match self.items.get(self.selected) {
-            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fires now", "d removes"]),
-            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d removes"),
+            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fire", "d remove"]),
+            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
             _ => {}
         }
-        keys.push("esc to close");
-        Line::from(format!("  {}", keys.join(" · "))).dim()
+        keys.push("esc close");
+        Line::from(crate::hint::spans(&format!("  {}", keys.join(" · "))))
     }
 }
 

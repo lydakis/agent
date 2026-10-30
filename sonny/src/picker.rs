@@ -290,12 +290,12 @@ fn draw(title: &str, rows: &[Row], list: &mut List, hint: Hint, drawn: usize) ->
         n => format!("{n} more · "),
     };
     let hint = match (hint, shown.is_empty()) {
-        (Hint::Tick, _) => format!("{more}↑↓ move · Space tick · a all · Enter done · Esc none"),
+        (Hint::Tick, _) => format!("{more}↑↓ move · space tick · a all · enter done · esc none"),
         (Hint::Pick { typed: true }, true) => {
-            "nothing listed matches; Enter takes what you typed".to_owned()
+            "nothing listed matches · enter take what you typed".to_owned()
         }
-        (Hint::Pick { .. }, true) => "nothing matches; Backspace to widen".to_owned(),
-        (Hint::Pick { .. }, false) => format!("{more}↑↓ move · Enter choose · type to narrow"),
+        (Hint::Pick { .. }, true) => "nothing matches · ⌫ widen".to_owned(),
+        (Hint::Pick { .. }, false) => format!("{more}↑↓ move · enter choose · type to narrow"),
     };
     lines.push(format!(
         "{DIM}{}{RESET}",

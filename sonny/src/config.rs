@@ -324,11 +324,15 @@ impl View {
     pub fn keys(&self) -> Line<'static> {
         let file = crate::tilde(&self.path.display().to_string());
         let keys = match (&self.typing, SETTINGS[self.pick].values.is_empty()) {
-            (Some(_), _) => "  enter to save, empty for the default · esc".to_owned(),
-            (None, true) => format!("  ↑↓ setting · enter to type · ⌫ default · esc · {file}"),
-            (None, false) => format!("  ↑↓ setting · ←→ value · ⌫ default · esc · {file}"),
+            (Some(_), _) => "  enter save, empty for the default · esc cancel",
+            (None, true) => "  ↑↓ pick · enter type · ⌫ default · esc close",
+            (None, false) => "  ↑↓ pick · ←→ change · ⌫ default · esc close",
         };
-        Line::from(keys).dim()
+        let mut spans = crate::hint::spans(keys);
+        if self.typing.is_none() {
+            spans.push(Span::raw(format!("  {file}")).dim());
+        }
+        Line::from(spans)
     }
 }
 

@@ -25,6 +25,7 @@ mod embed;
 mod exec;
 mod herdr;
 mod highlight;
+mod hint;
 mod home;
 mod html;
 mod image;
@@ -7083,6 +7084,41 @@ impl App {
 
     /// `pane` beside the conversation, with the keys; what was selected
     /// or being found in the conversation let go.
+    /// Every key Sonny takes, beside the conversation.
+    fn shortcuts(&mut self) {
+        let rows = [
+            ("enter", "send, or steer the running turn"),
+            ("tab", "queue for after the running turn"),
+            ("shift+enter", "new line (alt+enter, ctrl+j)"),
+            ("esc", "interrupt, or stop a ! command"),
+            ("/", "commands"),
+            ("!", "run a command of your own"),
+            ("ctrl+o", "open or fold every row that folds"),
+            ("ctrl+f", "find in the conversation"),
+            ("home end", "first turn, newest turn"),
+            ("pgup pgdn", "scroll"),
+            ("tab", "with nothing typed, keys to the pane"),
+            ("ctrl+\\", "keys to the pane and back"),
+            ("ctrl+[ ctrl+]", "hide the pane, show it again"),
+            ("ctrl+v", "paste a picture"),
+            ("ctrl+c", "copy the selection, clear, or quit"),
+        ];
+        let width = rows.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
+        let lines = rows
+            .iter()
+            .map(|(key, does)| {
+                Line::from(vec![
+                    Span::raw(format!("{key:width$}  ")),
+                    Span::raw(*does).dim(),
+                ])
+            })
+            .collect();
+        self.watch = None;
+        let mut pane = pane::Pane::card("shortcuts", "esc close");
+        pane.set_card(lines, "esc close");
+        self.open_pane(pane);
+    }
+
     fn open_pane(&mut self, mut pane: pane::Pane) {
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
@@ -7842,6 +7878,17 @@ impl App {
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
+                    // With nothing typed, ? shows the keys, as it does in
+                    // Codex and Claude Code.
+                    KeyCode::Char('?')
+                        if !alt
+                            && self.input.is_empty()
+                            && self.asks.is_empty()
+                            && self.approvals.is_empty()
+                            && self.react_to.is_none() =>
+                    {
+                        self.shortcuts()
+                    }
                     KeyCode::Char(c) if !ctrl => self.input.insert(c.encode_utf8(&mut [0; 4])),
                     KeyCode::Backspace if ctrl || alt => self.input.delete_word(),
                     KeyCode::Backspace => self.input.backspace(),
@@ -7968,8 +8015,8 @@ impl App {
             let lines = mcp::card();
             // In the place of `/status` or `/background`, if open.
             self.watch = None;
-            let mut pane = pane::Pane::card("/mcp", "esc closes");
-            pane.set_card(lines, "esc closes");
+            let mut pane = pane::Pane::card("/mcp", "esc close");
+            pane.set_card(lines, "esc close");
             self.open_pane(pane);
             return;
         }
@@ -9012,10 +9059,9 @@ impl App {
                     Some((at, count)) if count > 0 => format!("  {at} of {count} · "),
                     _ => "  ".to_owned(),
                 };
-                let keys = Line::from(vec![
-                    Span::raw(place),
-                    Span::raw("↑ or enter older · ↓ newer · esc").dim(),
-                ]);
+                let mut keys = vec![Span::raw(place)];
+                keys.extend(hint::spans("↑ older · ↓ newer · esc stop"));
+                let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9054,7 +9100,7 @@ impl App {
                     Span::raw("which reply to react to").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from("  ↑↓ reply · enter, then send an emoji · esc").dim();
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter react · esc close"));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9108,10 +9154,9 @@ impl App {
                     Span::raw("auto-review denials: approve one retry").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from(
-                    "  ↑↓ denial · enter to read it whole, again to approve one retry · esc",
-                )
-                .dim();
+                let keys = Line::from(hint::spans(
+                    "  ↑↓ pick · enter read, again approve one retry · esc close",
+                ));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9151,7 +9196,7 @@ impl App {
                     Span::raw("approvals for this agent and those it makes").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
-                let keys = Line::from("  ↑↓ mode · enter to choose · esc").dim();
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9222,11 +9267,12 @@ impl App {
                     composer.x + 2 + picker.filter.width() as u16,
                     composer.y,
                 ));
-                let keys = Line::from(vec![
+                let mut keys = vec![
                     Span::raw("  effort ").dim(),
                     Span::raw(format!("‹ {effort} ›")).bold(),
-                    Span::raw("  ↑↓ model · ←→ effort · enter to switch · esc").dim(),
-                ]);
+                ];
+                keys.extend(hint::spans("  ↑↓ pick · ←→ effort · enter switch · esc close"));
+                let keys = Line::from(keys);
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
@@ -9305,8 +9351,8 @@ impl App {
                 _ if let Some(ask) = answering => {
                     asks::hint(ask, self.asks.len() - 1, width.saturating_sub(prompt::LEAD))
                 }
-                _ if self.react_to.is_some() => "An emoji for that reply, or Esc".into(),
-                _ if !self.asks.is_empty() => "A message of your own, or Esc to answer".into(),
+                _ if self.react_to.is_some() => "An emoji for that reply · esc cancel".into(),
+                _ if !self.asks.is_empty() => "A message of your own · esc answer".into(),
                 Some(_) => format!("Steer {name}"),
                 None => format!("Message {name}"),
             };
@@ -9314,10 +9360,17 @@ impl App {
                 Some(_) => Span::raw("? ").bold().fg(Color::Yellow),
                 None => Span::raw("› ").bold(),
             };
-            return (
-                vec![Line::from(vec![lead, Span::raw(hint).dim()])],
-                (0, prompt::LEAD),
-            );
+            let mut spans = vec![lead, Span::raw(hint).dim()];
+            // Where the keys are, while nothing else is asked.
+            if answering.is_none()
+                && self.asks.is_empty()
+                && self.react_to.is_none()
+                && self.approvals.is_empty()
+            {
+                spans.push(Span::raw(" · ").dim());
+                spans.extend(hint::spans("? shortcuts"));
+            }
+            return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
         let layout = self.input.layout(width);
         let (row, col) = self.input.cursor(&layout);
@@ -9384,9 +9437,9 @@ impl App {
             return Line::from(vec![
                 Span::raw("⏸ ").fg(Color::Yellow),
                 Span::raw(format!("Allow {name}? ")).bold(),
-                Span::raw("y").bold(),
+                Span::raw("y"),
                 Span::raw(" allow · ").dim(),
-                Span::raw("n").bold(),
+                Span::raw("n"),
                 Span::raw(" deny  ").dim(),
                 Span::raw(what),
             ]);
@@ -9469,7 +9522,7 @@ impl App {
         let right = match (self.options.side, self.context) {
             // Said for as long as the side chat is open.
             (Some(_), _) => format!(
-                "side chat with {} · esc goes back  ",
+                "side chat with {} · esc back  ",
                 self.bot
                     .rsplit_once(".side-")
                     .map_or(self.bot.as_str(), |(s, _)| s)
@@ -9582,7 +9635,7 @@ impl App {
 }
 
 /// What the pane's title row says the keys do on `/status`.
-const STATUS_KEYS: &str = "esc closes";
+const STATUS_KEYS: &str = "esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
@@ -12795,6 +12848,19 @@ mod tests {
         assert_eq!(pick(&app), Some(1), "the last stays picked");
         app.key(key(KeyCode::Up)).await;
         assert_eq!(pick(&app), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_question_mark_with_nothing_typed_shows_the_keys() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let key = |c| Event::Key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.key(key('?')).await;
+        assert!(app.input.is_empty());
+        assert!(app.pane.as_ref().is_some_and(|pane| pane.is_card()));
+        app.close_pane(false);
+        app.key(key('w')).await;
+        app.key(key('?')).await;
+        assert_eq!(&*app.input, "w?", "typed after a word, it is a question mark");
     }
 
     #[tokio::test]
