@@ -232,6 +232,8 @@ fn usage() -> String {
      and follow agents in the lookout with tools Sonny gives them, which the lookout answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
+     sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
+     on its own in the whole terminal.\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -788,6 +790,7 @@ fn main() -> std::process::ExitCode {
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "home" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
@@ -834,6 +837,27 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// `sonny sky [--store PATH] [--socket PATH]`: `/sky` on its own,
+/// the whole terminal, until q.
+fn sky_cli(args: &[String]) -> Result<(), String> {
+    let (mut store, mut socket) = (None, None);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--store" => store = args.next().map(PathBuf::from),
+            "--socket" => socket = args.next().map(PathBuf::from),
+            _ => return Err("usage: sonny sky [--store PATH] [--socket PATH]".into()),
+        }
+    }
+    let (_, socket) = daemon_paths(store, socket)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    sky::watch(&runtime, socket)
 }
 
 async fn run() -> Result<(), String> {
@@ -1627,7 +1651,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 24] = [
+const COMMANDS: [(&str, &str); 25] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -1642,6 +1666,10 @@ const COMMANDS: [(&str, &str); 24] = [
     ),
     ("/status", "Show this project's agents"),
     ("/lead", "Open another of the folder's leads, or make one"),
+    (
+        "/switch",
+        "Open any agent in this window, or the one beside it",
+    ),
     (
         "/goal",
         "Ask the agent to work until something is done; show or clear goals",
@@ -4046,8 +4074,14 @@ impl App {
             .find(|task| task.bot == bot)
             .map_or(bot.to_owned(), |task| task.name.clone());
         let args = ["--no-sound", "--no-layout", "--embedded", "--agent", bot].map(str::to_owned);
-        if let Err(error) = self.embed(&name, &args) {
-            self.notice = Some(format!("could not open {name}: {error}"));
+        match self.embed(&name, &args) {
+            // Its title's button opens it in the main view.
+            Ok(()) => {
+                if let Some(pane) = &mut self.pane {
+                    pane.agent = Some(bot.to_owned());
+                }
+            }
+            Err(error) => self.notice = Some(format!("could not open {name}: {error}")),
         }
     }
 
@@ -7587,6 +7621,8 @@ impl App {
                 }
             }
             "status" if self.options.side.is_none() => self.status().await,
+            // An agent's title button: this window becomes its Sonny.
+            "main" => self.switch_command(id).await,
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
             _ => self.press_row(what).await,
@@ -8479,6 +8515,14 @@ impl App {
             self.lead_command(rest.trim()).await;
             return;
         }
+        if let Some(rest) = prompt
+            .strip_prefix("/switch")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.switch_command(rest.trim()).await;
+            return;
+        }
         // `/goal WHAT` goes to the agent as typed, which sets its goal.
         if let Some(rest) = prompt
             .strip_prefix("/goal")
@@ -9049,6 +9093,74 @@ impl App {
             }
             Err(error) => self.notice = Some(error),
         }
+    }
+
+    /// `/switch NAME`: this window becomes NAME's Sonny, whatever agent it
+    /// is (a lead, a task, one the person made), as `sonny --agent NAME`
+    /// opens it; a name of this project's may leave out the project.
+    /// `/switch` alone opens the agent beside the conversation, or the one
+    /// `/status` has picked, closing the pane.
+    async fn switch_command(&mut self, name: &str) {
+        if self.options.side.is_some() || self.options.embedded {
+            self.notice = Some("/switch is for the main window; this one is beside it".into());
+            return;
+        }
+        let name = match name {
+            "" => match self.beside() {
+                Some(bot) => bot,
+                None => {
+                    self.notice = Some(
+                        "/switch NAME, or open an agent beside the conversation (/status) first"
+                            .into(),
+                    );
+                    return;
+                }
+            },
+            name => name.to_owned(),
+        };
+        let mut names = vec![name.clone()];
+        if let Some(project) = &self.project
+            && !name.contains('.')
+        {
+            names.push(format!("{project}.{name}"));
+        }
+        for bot in names {
+            if bot == self.bot {
+                self.notice = Some(format!("this window is {bot}'s already"));
+                return;
+            }
+            match self.client.request("inspect", json!({"bot": bot})).await {
+                Ok(_) => {
+                    self.switch_to = Some(bot);
+                    self.quit = true;
+                    return;
+                }
+                Err(error) if error.code == "bot_not_found" => continue,
+                Err(error) => {
+                    self.notice = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+        self.notice = Some(format!("no agent named {name}"));
+    }
+
+    /// The agent beside the conversation: one open in the pane, else the
+    /// one `/status` has picked.
+    fn beside(&self) -> Option<String> {
+        if let Some(agent) = self.pane.as_ref().and_then(|pane| pane.agent.clone()) {
+            return Some(agent);
+        }
+        let watch = self.watch.as_ref()?;
+        let open = self.pane.as_ref().is_some_and(|pane| pane.is_card());
+        let listing = watch.background.is_none()
+            && watch.usage.is_none()
+            && watch.commons.is_none()
+            && watch.sky.is_none();
+        let bots = card_bots(watch, self.width.max(40), &self.bot);
+        (open && listing)
+            .then(|| watch.pick.and_then(|at| bots.get(at).cloned()))
+            .flatten()
     }
 
     /// The pane gone once the side chat in it has ended.
@@ -10459,6 +10571,51 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn switch_opens_any_agent_here_or_the_one_beside() {
+        let client = daemon_answering(|asked| match asked["bot"].as_str() {
+            Some("shop.fix" | "shop.lead") => json!({"name": asked["bot"]}),
+            _ => json!({"error": "bot_not_found", "detail": "no such bot"}),
+        })
+        .await;
+        let mut app = app(client);
+        app.project = Some("shop".into());
+        // By its whole name, or its name in this window's project.
+        app.input.set("/switch fix");
+        app.submit().await;
+        assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
+        assert!(app.quit);
+        (app.switch_to, app.quit) = (None, false);
+        app.input.set("/switch nobody");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no agent named nobody"));
+        assert!(!app.quit);
+        app.input.set("/switch b");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("this window is b's already"));
+        // Alone, the agent open beside the conversation, as its title's
+        // button does.
+        app.input.set("/switch");
+        app.submit().await;
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("/switch NAME"))
+        );
+        let mut pane = pane::Pane::card("shop.lead", STATUS_KEYS);
+        pane.agent = Some("shop.lead".into());
+        app.open_pane(pane);
+        app.input.set("/switch");
+        app.submit().await;
+        assert_eq!(app.switch_to.as_deref(), Some("shop.lead"));
+        // A window drawn beside another keeps to its agent.
+        (app.switch_to, app.quit) = (None, false);
+        app.options.embedded = true;
+        app.input.set("/switch shop.fix");
+        app.submit().await;
+        assert!(app.switch_to.is_none());
     }
 
     #[tokio::test]

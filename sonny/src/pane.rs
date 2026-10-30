@@ -89,7 +89,14 @@ pub struct Pane {
     margin: bool,
     /// The margin is under it, which its title's arrow goes back to.
     pub over: bool,
+    /// The agent whose Sonny the program is, which the title's button
+    /// opens in the main view; and that button's columns as last drawn.
+    pub agent: Option<String>,
+    main_at: Option<(u16, u16)>,
 }
+
+/// The button on an agent's title that opens it in the main view.
+const MAIN: &str = "↗ main view";
 
 impl Pane {
     /// A file's preview, from a `file://` address as a link holds it,
@@ -154,6 +161,8 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            agent: None,
+            main_at: None,
         })
     }
 
@@ -258,6 +267,8 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            agent: None,
+            main_at: None,
         }
     }
 
@@ -283,6 +294,8 @@ impl Pane {
             marks: Vec::new(),
             margin: false,
             over: false,
+            agent: None,
+            main_at: None,
         }
     }
 
@@ -338,6 +351,11 @@ impl Pane {
         let at = column.checked_sub(self.area.x)?;
         if self.over && at < 3 {
             return Some(format!("{}back", crate::screen::BUTTON));
+        }
+        if let (Some(agent), Some((from, to))) = (&self.agent, self.main_at)
+            && (from..to).contains(&column)
+        {
+            return Some(format!("{}main/{agent}", crate::screen::BUTTON));
         }
         let (_, buttons) = self.head.as_ref()?;
         (buttons.iter())
@@ -451,11 +469,29 @@ impl Pane {
                 Line::from(spans)
             }
             None => {
+                // An agent's Sonny opens in the main view from its title,
+                // where there is room for the button beside the name.
+                let button = match &self.agent {
+                    Some(_) => format!("  {MAIN}"),
+                    None => String::new(),
+                };
                 let used: usize = head.iter().map(|s| s.content.width()).sum();
                 let room = (area.width as usize).saturating_sub(used + keys.width());
-                let title = crate::transcript::cut(&self.title, room);
-                let gap = (area.width as usize).saturating_sub(used + title.width() + keys.width());
+                let button = match self.title.width() + button.width() <= room {
+                    true => button,
+                    false => String::new(),
+                };
+                let title = crate::transcript::cut(&self.title, room - button.width());
+                let gap = (area.width as usize)
+                    .saturating_sub(used + title.width() + button.width() + keys.width());
+                let at = area.x + (used + title.width()) as u16 + 2;
                 head.push(Span::styled(title, style));
+                self.main_at = None;
+                if !button.is_empty() {
+                    self.main_at = Some((at, at + MAIN.width() as u16));
+                    head.push(Span::raw("  "));
+                    head.push(Span::raw(MAIN).fg(ratatui::style::Color::Blue));
+                }
                 head.push(Span::raw(" ".repeat(gap)));
                 head.extend(key_spans);
                 Line::from(head)
@@ -702,6 +738,24 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn an_agents_title_opens_it_in_the_main_view_where_it_fits() {
+        let mut pane = Pane::card("shop.fix", "esc close");
+        pane.agent = Some("shop.fix".into());
+        let head = rows(&mut pane, 60, 3).remove(0);
+        assert!(head.starts_with(" shop.fix  ↗ main view"), "{head}");
+        let column = " shop.fix  ".width() as u16;
+        assert_eq!(
+            pane.head_button(column).as_deref(),
+            Some("sonny:main/shop.fix")
+        );
+        assert_eq!(pane.head_button(1), None);
+        // Too narrow for both: the name stays, the button goes.
+        let head = rows(&mut pane, 24, 3).remove(0);
+        assert!(!head.contains("main view"), "{head}");
+        assert_eq!(pane.head_button(column), None);
     }
 
     #[test]

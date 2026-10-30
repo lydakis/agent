@@ -58,7 +58,10 @@ of the first rather than above it. `sonny` opens the one last written to in
 that folder, else the first. `--lead NAME` opens another (`--lead lead` the
 first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
-and `/lead new [NAME]` makes one. `/goal WHAT` asks the agent to set a goal
+and `/lead new [NAME]` makes one. `/switch NAME` opens any agent in the
+window instead, a task or any other the daemon keeps (a name in this project
+may leave out the project); `/switch` alone, or `↗ main view` on the title of
+an agent open in the pane, moves that agent into the window. `/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
 clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
@@ -571,7 +574,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   across, a follow's or an automation's in from the rim), a commons post
   ripples out, a tool call twinkles, and whoever was lit fades. Faint lines
   join who made whom and who talked to whom; the last messages are listed
-  under the sky.
+  under the sky. `sonny sky` draws the same sky on its own, in the whole
+  terminal, to keep in another one beside the work; `q` leaves it, and a
+  daemon that goes is followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
 - `/pause REASON` stops every agent, in every project, until `/resume`:

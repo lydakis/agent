@@ -197,6 +197,12 @@ impl View {
         self.down = None;
     }
 
+    /// Whether the follow ended, as when the daemon went: `resume`
+    /// follows again.
+    pub fn down(&self) -> bool {
+        self.down.is_some()
+    }
+
     /// Take what the follow brought, and let what landed light up.
     pub fn drain(&mut self) {
         let now = Instant::now();
@@ -1086,6 +1092,101 @@ impl Sky {
     }
 }
 
+/// How often `sonny sky` draws: smooth enough for a spark's flight.
+const FRAME: Duration = Duration::from_millis(60);
+/// How long `sonny sky` waits before following a daemon that went again.
+const RETRY: Duration = Duration::from_secs(3);
+/// What the keys do in `sonny sky`.
+const KEYS: &str = "q quit";
+
+/// `sonny sky`: the same sky, the whole terminal, on its own, to keep
+/// beside the work as btop is kept: its title and the keys over it, the
+/// counts under it. A daemon that goes is followed again once it is back.
+/// Its follow runs on `runtime`; the drawing and the keys on this thread.
+pub fn watch(runtime: &tokio::runtime::Runtime, socket: PathBuf) -> Result<(), String> {
+    use ratatui::crossterm::{
+        cursor, event, execute,
+        terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    let _inside = runtime.enter();
+    let mut view = View::open(socket);
+    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide);
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let drawn = ratatui::Terminal::new(backend)
+        .map_err(|e| e.to_string())
+        .and_then(|mut terminal| {
+            let mut down_since: Option<Instant> = None;
+            loop {
+                view.drain();
+                // Gone: tried again a little later, the sky drawn anew.
+                match (view.down(), down_since) {
+                    (false, _) => down_since = None,
+                    (true, None) => down_since = Some(Instant::now()),
+                    (true, Some(at)) if at.elapsed() >= RETRY => {
+                        view.resume();
+                        down_since = None;
+                    }
+                    (true, Some(_)) => {}
+                }
+                terminal
+                    .draw(|frame| frame.render_widget(&mut view, frame.area()))
+                    .map_err(|e| e.to_string())?;
+                if !event::poll(FRAME).map_err(|e| e.to_string())? {
+                    continue;
+                }
+                if let event::Event::Key(key) = event::read().map_err(|e| e.to_string())?
+                    && key.kind != event::KeyEventKind::Release
+                    && quits(&key)
+                {
+                    return Ok(());
+                }
+            }
+        });
+    let _ = execute!(std::io::stdout(), cursor::Show, LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+    drawn
+}
+
+/// q, Esc and Ctrl+C leave `sonny sky`.
+fn quits(key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+/// The whole of `sonny sky`: a title row as the pane's, the sky a column
+/// in from the edge, and the counts on the last row.
+impl ratatui::widgets::Widget for &mut View {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        if area.height < 3 || area.width < 4 {
+            return;
+        }
+        let width = area.width as usize;
+        let mut head = vec![Span::raw(" "), Span::raw("sky").bold()];
+        let keys = crate::hint::spans(&format!("{KEYS} "));
+        let used = 4 + KEYS.width() + 1;
+        head.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        head.extend(keys);
+        buf.set_line(area.x, area.y, &Line::from(head), area.width);
+        // The rows between the title's and the counts', a row apart from each.
+        let rows = area.height.saturating_sub(4) as usize;
+        for (at, line) in self
+            .card(width.saturating_sub(2), rows)
+            .into_iter()
+            .take(rows)
+            .enumerate()
+        {
+            buf.set_line(area.x + 1, area.y + 2 + at as u16, &line, area.width - 1);
+        }
+        let foot = Line::from(format!(" {}", self.footer())).dim();
+        buf.set_line(area.x, area.bottom() - 1, &foot, area.width);
+    }
+}
+
 /// The view's own connection: every agent, then who talked to whom in the
 /// turns kept, then live. A daemon gone ends it, saying so.
 async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
@@ -1210,6 +1311,40 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn sonny_sky_draws_its_title_the_sky_and_the_counts() {
+        use ratatui::widgets::Widget;
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "running_turn": 3}),
+        ]))
+        .unwrap();
+        view.drain();
+        let area = ratatui::layout::Rect::new(0, 0, 60, 30);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut view).render(area, &mut buf);
+        let row = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        assert!(row(0).starts_with(" sky") && row(0).ends_with("q quit"));
+        assert!((2..29).any(|y| row(y).contains("shop lead")));
+        assert_eq!(
+            row(29),
+            " 1 agent · 1 working · 0 messages in the last minute"
+        );
+        // q, Esc and Ctrl+C leave it; other keys do not.
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code, mods| quits(&KeyEvent::new(code, mods));
+        assert!(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!key(KeyCode::Char('c'), KeyModifiers::NONE));
     }
 
     #[tokio::test]
