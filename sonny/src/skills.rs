@@ -474,14 +474,28 @@ fn queue_news(home: &Path, features: &str, steps: &[crate::setup::Step]) {
         Err(_) => {
             keep(&shipped(home), &[("FEATURES.md", features)]);
         }
-        Ok(before) if before != features => queue(home, "features"),
+        Ok(before) if before != features => queue_unclaimed(home, "features"),
         Ok(_) => {}
     }
     let offered = offered_in(home);
     for step in steps {
         if !offered.iter().any(|id| id == step.id) && !(step.done)() {
-            queue(home, &format!("setup {}", step.id));
+            queue_unclaimed(home, &format!("setup {}", step.id));
         }
+    }
+}
+
+/// `entry` among the pending ones, unless a Sonny claimed it and has not
+/// told its bot yet: until it does, what was heard and offered is as
+/// before. A claim left by a Sonny that stopped goes back on its own.
+fn queue_unclaimed(home: &Path, entry: &str) {
+    let claimed = (std::fs::read_dir(claims(home))
+        .into_iter()
+        .flatten()
+        .flatten())
+    .any(|claim| claim.path().join(entry).exists());
+    if !claimed {
+        queue(home, entry);
     }
 }
 
@@ -983,6 +997,10 @@ mod tests {
             "{note}"
         );
         assert!(!note.contains("set up done"), "{note}");
+        // Claimed and not told yet, a Sonny starting meanwhile does not
+        // queue it again.
+        queue_news(&home, one, &steps);
+        assert!(upgraded_with(&home, one, &steps).is_none());
         upgrades.told();
         // Offered once: the same Sonny starting again has nothing.
         queue_news(&home, one, &steps);
