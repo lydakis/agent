@@ -223,6 +223,11 @@ pub struct Declared {
     /// the declaring bot's own.
     #[serde(default = "inherited", skip_serializing_if = "is_inherited")]
     pub inherit: bool,
+    /// Whether a gate that names the tool judges the steps its client puts
+    /// to it with `approve_step` instead of the call as a whole: a script
+    /// whose nested calls are each approved, as in Codex's code mode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steps: bool,
 }
 fn declared_result() -> String {
     "ok".into()
@@ -337,10 +342,10 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                     );
                 }
             }
-            None if tool.expire_ms.is_some() => {
+            None if tool.expire_ms.is_some() || tool.steps => {
                 return fail_with(
                     "invalid_declare",
-                    format!("{name}: expire_ms goes with answered_by"),
+                    format!("{name}: expire_ms and steps go with answered_by"),
                 );
             }
             None => {}

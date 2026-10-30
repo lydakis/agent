@@ -2236,7 +2236,7 @@ it:
 
 | Request | On a bot's own socket |
 |---|---|
-| `configure`, `answer`, `tool_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `configure`, `answer`, `tool_result`, `approve_step`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
 | `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
@@ -2389,6 +2389,40 @@ must take `input` as a required string (`invalid_declare` otherwise).
 Either way the call's `arguments` are `{"input": TEXT}` and its answer is
 the provider's custom tool output where it has one. The grammar counts
 toward the 64 KiB. A client's code-running tool is one.
+
+Protocol version 24 lets the client answering a call put each step of it
+to the bot's gates, as Codex approves each nested call of a code-mode
+script rather than the script. A tool declared with `"steps": true` (only
+with `answered_by`; `invalid_declare` otherwise) is never gated as a
+whole: its call starts at once, and the gates that name the tool judge its
+steps instead. The client asks with
+`{"op":"approve_step","bot","turn","call_id","step","name","arguments"}`:
+`step` its own id for the step within the call (1 to 128 of `A-Z a-z 0-9
+. _ -`, never reused for the call), `name` the step's tool, and
+`arguments` an object of at most 64 KiB (`invalid_step`,
+`step_arguments_limit`). The call must be the bot's and still waiting for
+its answer (`turn_not_found`, `stale_turn`, `no_pending_call`,
+`call_already_answered`), of a tool that takes steps (`invalid_step`).
+Under no gate the reply comes at once:
+`{call_id: CALL/STEP, decision: "allow", approvals: []}`. Otherwise the
+step is announced in its own `approval_requested`, listed, served and
+answered exactly as a gated call is, under the call id `CALL/STEP`, with
+`step_of` naming its call, `node` 0 (a step has no item of its own) and
+its arguments whole. The reply waits for the decision, off the service's
+loop: `{call_id, decision, approvals}`, with the deny's `reason`, and
+`expired` when a gate lapsed without a verdict, which denies the step
+(`not reviewed: no verdict`) and nothing more: the turn never waits on a
+step. Each decided step is recorded in a `step_decided` event with
+`call_id`, `step_of`, `name`, `decision`, `reason` and `approvals`, and
+counts toward the bot's denial counts as a call does. While any step of a
+call waits, the call's time stops: it cannot run out, its parked turn has
+no deadline, and once the last step is decided it gets back what was left.
+A step lives only as long as the request waiting on it: asking for one
+already waiting is `step_waiting`; a client that closes its session takes
+its waiting steps with it (`step_decided` with `its client stopped
+waiting`), an answer to the call ends them (the waiting request gets
+`no_pending_step`), as does the turn's end (`stale_turn`), and a restart
+drops them all. Schema 63 adds the steps' and paused calls' columns.
 
 ### Tool approval
 
