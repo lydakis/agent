@@ -980,8 +980,8 @@ async fn run() -> Result<(), String> {
     {
         app.gating = Some(mode);
     }
-    // A bot made before Sonny gave its model a prompt-cache lifetime takes
-    // it, so an idle gap of over five minutes no longer rereads it all.
+    // A bot made with no prompt-cache lifetime takes Sonny's, so an idle gap
+    // of over five minutes no longer rereads it all; a chosen one stays.
     if options.side.is_none() {
         app.cache = cache_to_take(&bot);
     }
@@ -1082,14 +1082,15 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 }
 
 /// The prompt-cache lifetime Sonny gives the model of `bot`, as `inspect`
-/// gives it, when the bot has another.
+/// gives it, when the bot has none set. One someone chose, five minutes
+/// included, stays.
 fn cache_to_take(bot: &Value) -> Option<&'static str> {
     let model = format!(
         "{}/{}",
         bot["provider"].as_str().unwrap_or_default(),
         bot["model"].as_str().unwrap_or_default()
     );
-    agent_client::policy::cache_ttl(&model).filter(|ttl| bot["settings"]["cache_ttl"] != *ttl)
+    agent_client::policy::cache_ttl(&model).filter(|_| bot["settings"]["cache_ttl"].is_null())
 }
 
 /// A link, file or page, opened as the system opens it, by the first of
@@ -11538,12 +11539,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claude_bot_made_on_the_five_minute_cache_takes_the_hour() {
-        let bot = |provider: &str, ttl: &str| json!({"provider": provider, "model": "m", "settings": {"cache_ttl": ttl}});
-        assert_eq!(cache_to_take(&bot("anthropic", "5m")), Some("1h"));
-        assert_eq!(cache_to_take(&bot("bedrock", "5m")), Some("1h"));
-        assert_eq!(cache_to_take(&bot("anthropic", "1h")), None);
-        assert_eq!(cache_to_take(&bot("openai", "5m")), None);
+    async fn a_claude_bot_made_with_no_cache_lifetime_takes_the_hour() {
+        let bot = |provider: &str, ttl: Value| json!({"provider": provider, "model": "m", "settings": {"cache_ttl": ttl}});
+        assert_eq!(cache_to_take(&bot("anthropic", Value::Null)), Some("1h"));
+        assert_eq!(cache_to_take(&bot("bedrock", Value::Null)), Some("1h"));
+        assert_eq!(cache_to_take(&bot("anthropic", json!("1h"))), None);
+        // Five minutes someone chose stays five minutes.
+        assert_eq!(cache_to_take(&bot("anthropic", json!("5m"))), None);
+        assert_eq!(cache_to_take(&bot("openai", Value::Null)), None);
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let client = daemon_answering(move |request| {
