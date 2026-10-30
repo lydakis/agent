@@ -1591,10 +1591,11 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
             // Whose it is, as an ended one's row says too: its failures
             // are told to them.
             if let Target::Start {
-                by: Some((by, _)), ..
+                by: Some((by, by_id)),
+                ..
             } = &t.target
             {
-                row["by"] = json!(by);
+                (row["by"], row["by_id"]) = (json!(by), json!(by_id));
                 bots.push(by.clone());
             }
             if let Some((to, _)) = &t.reply_to {
@@ -3036,10 +3037,11 @@ fn write_row(places: &Places, trigger: &Trigger, last: &Value, kept: &Kept) -> R
     // agent that added it to start its own.
     row["store_id"] = json!(trigger.store_id);
     if let Target::Start {
-        by: Some((by, _)), ..
+        by: Some((by, by_id)),
+        ..
     } = &trigger.target
     {
-        row["by"] = json!(by);
+        (row["by"], row["by_id"]) = (json!(by), json!(by_id));
     }
     row["head"] = json!(kept.seen.head);
     row["seen_at"] = json!(kept.seen.at);
@@ -3415,29 +3417,37 @@ pub async fn tell_failed(
     client: &Client,
     store_id: &str,
     generation: &str,
-    (bot, turn): (&str, i64),
+    (bot, bot_id, turn): (&str, Option<i64>, i64),
     error: &str,
 ) {
     let places = Places::home().ok();
-    let (to, prompt) = failed_note(places.as_ref(), store_id, generation, (bot, turn), error);
-    let _ = client
-        .request(
-            "submit",
-            json!({"bot": to, "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
-                "prompt": prompt, "delivery": "attach", "origin": "trigger"}),
-        )
-        .await;
+    let (to, to_id, prompt) = failed_note(
+        places.as_ref(),
+        store_id,
+        generation,
+        (bot, bot_id, turn),
+        error,
+    );
+    let mut submit = json!({"bot": to,
+        "request_id": format!("trigger_{generation}_failed.{bot}.{turn}"),
+        "prompt": prompt, "delivery": "attach", "origin": "trigger"});
+    // By its id too, as every delivery of a trigger's: a name used again
+    // is not who it was for.
+    if let Some(id) = to_id {
+        submit["bot_id"] = json!(id);
+    }
+    let _ = client.request("submit", submit).await;
 }
 
-/// Who is told of a fire's failed turn, and the note: the agent that made
-/// the trigger, else the one the fire sent.
+/// Who is told of a fire's failed turn, by name and id when known, and the
+/// note: the agent that made the trigger, else the one the fire sent.
 fn failed_note(
     places: Option<&Places>,
     store_id: &str,
     generation: &str,
-    (bot, turn): (&str, i64),
+    (bot, bot_id, turn): (&str, Option<i64>, i64),
     error: &str,
-) -> (String, String) {
+) -> (String, Option<i64>, String) {
     let row = places.and_then(|places| {
         on_store(places, store_id)
             .into_iter()
@@ -3445,15 +3455,16 @@ fn failed_note(
             .find(|row| row["generation"] == generation)
     });
     let name = (row.as_ref()).and_then(|row| row["name"].as_str());
-    let to = (row.as_ref())
-        .and_then(|row| row["by"].as_str())
-        .unwrap_or(bot);
+    let (to, to_id) = match (row.as_ref()).and_then(|row| Some((row["by"].as_str()?, row))) {
+        Some((by, row)) => (by, row["by_id"].as_i64()),
+        None => (bot, bot_id),
+    };
     let prompt = format!(
         "[trigger {} · {} · turn {turn} it sent {bot} failed: {error}]",
         name.unwrap_or("(ended)"),
         stamp(now())
     );
-    (to.to_owned(), prompt)
+    (to.to_owned(), to_id, prompt)
 }
 
 /// A fire's request id, which says its trigger sent it (`sent_by`). A fire
@@ -3952,12 +3963,13 @@ mod tests {
             &client,
             "no-such-store",
             "1-2",
-            ("calc.lead", 4),
+            ("calc.lead", Some(5), 4),
             "provider_error",
         )
         .await;
         let submit = asked.lock().unwrap()[0].clone();
         assert_eq!(submit["bot"], "calc.lead");
+        assert_eq!(submit["bot_id"], 5);
         assert_eq!(submit["delivery"], "attach");
         assert_eq!(submit["origin"], "trigger");
         assert_eq!(submit["request_id"], "trigger_1-2_failed.calc.lead.4");
@@ -3980,24 +3992,24 @@ mod tests {
             ..trigger()
         };
         w.install(&started).unwrap();
-        let (to, prompt) = failed_note(
+        let (to, to_id, prompt) = failed_note(
             Some(&w.places),
             &started.store_id,
             &started.generation,
-            ("p.digest", 3),
+            ("p.digest", Some(12), 3),
             "provider_error",
         );
-        assert_eq!(to, "p.lead");
+        assert_eq!((to.as_str(), to_id), ("p.lead", Some(7)));
         assert!(prompt.starts_with("[trigger p.digest · "), "{prompt}");
         // One no agent made, or no longer found: the agent the fire sent.
-        let (to, prompt) = failed_note(
+        let (to, to_id, prompt) = failed_note(
             Some(&w.places),
             &started.store_id,
             "9-9",
-            ("p.fix-login", 3),
+            ("p.fix-login", Some(12), 3),
             "provider_error",
         );
-        assert_eq!(to, "p.fix-login");
+        assert_eq!((to.as_str(), to_id), ("p.fix-login", Some(12)));
         assert!(prompt.starts_with("[trigger (ended) · "), "{prompt}");
     }
 

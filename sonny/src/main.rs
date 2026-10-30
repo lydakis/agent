@@ -3293,8 +3293,10 @@ impl App {
                     }
                     self.model = model;
                     self.effort = effort;
-                    // The bot's own model now, for this window's turns too.
+                    // The bot's own model now, for this window's turns too,
+                    // and a boost armed against the old effort let go.
                     self.turn_model = None;
+                    self.boost = None;
                 }
                 if let Some(mode) = gating {
                     self.mode = Some(mode);
@@ -3390,6 +3392,7 @@ impl App {
             self.model = format!("{provider}/{model}");
             self.turn_model = None;
             self.effort = record["effort"].as_str().map(str::to_owned);
+            self.boost = None;
         }
         if let Some(workspace) = record["workspace"].as_str() {
             self.workspace = workspace.to_owned();
@@ -8310,7 +8313,7 @@ impl App {
     fn boost_step(&mut self) {
         let model = self.turn_model.as_deref().unwrap_or(&self.model);
         let levels = boosts(self.client.providers(), model, self.effort.as_deref());
-        if levels.is_empty() {
+        if levels.is_empty() && self.boost.take().is_none() {
             self.notice = Some("this model takes no higher effort".into());
             return;
         }
@@ -10719,6 +10722,17 @@ mod tests {
             footer.contains(" medium") && !footer.contains(" max"),
             "{footer}"
         );
+        // One armed against an effort since changed is let go, and Alt+T
+        // turns one off where nothing is higher.
+        app.boost = Some("xhigh".into());
+        app.refresh(
+            &json!({"provider": "anthropic", "model": "opus", "effort": "max"}),
+            true,
+        );
+        assert!(app.boost.is_none());
+        app.boost = Some("xhigh".into());
+        app.boost_step();
+        assert!(app.boost.is_none() && app.notice.is_none());
     }
 
     #[tokio::test]

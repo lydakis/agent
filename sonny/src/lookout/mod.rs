@@ -835,7 +835,7 @@ impl Service {
                         tokio::spawn(async move {
                             let (generation, bot, turn, error) = failed;
                             if let Some(store) = client.store() {
-                                crate::trigger::tell_failed(&client, store, &generation, (&bot, turn), &error)
+                                crate::trigger::tell_failed(&client, store, &generation, (&bot, bot_id, turn), &error)
                                     .await;
                             }
                         });
@@ -851,7 +851,12 @@ impl Service {
                     let hearing = self.hearing(&event);
                     if let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) {
                         match event["event"].as_str() {
-                            Some("accepted" | "queued") if !hearing.is_empty() => {
+                            // A fire's turn too, so a restart still sees
+                            // it end.
+                            Some("accepted" | "queued")
+                                if !hearing.is_empty()
+                                    || self.fires.contains_key(&(bot.to_owned(), turn)) =>
+                            {
                                 if let Some(at) = cursor {
                                     self.in_flight.entry((bot.to_owned(), turn)).or_insert(at);
                                 }
