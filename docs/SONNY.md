@@ -301,6 +301,12 @@ agent's other calls do (`/approvals`). Each goal is
 `STORE.lookout/goals/BOT.json`; setting the same goal again changes
 nothing.
 
+In a window, `/goal WHAT` sends the agent `/goal WHAT` as the person's
+message, and the goal tool's description asks it to set a goal on itself
+for it: like Codex's `/goal`, the agent picks the check. `/goal` shows the
+goals of the agent and its tasks, and `/goal clear` clears its own, as the
+tool would.
+
 Each time a turn of that agent completes, the lookout runs the check, for
 up to `timeout_s` (600 when left out, at most 3,600), killing its process
 group past that. While it fails, it queues the agent a turn (origin
