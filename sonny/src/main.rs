@@ -2400,7 +2400,9 @@ impl Fleet {
                 }
                 // The judge handed a call to the person.
                 "approval_asked" => self.doing(bot, "needs you"),
-                "tool_completed" | "turn_resumed" if self.doing.get(bot) == Some(&"needs you") => {
+                "tool_completed" | "turn_resumed" | "step_decided"
+                    if self.doing.get(bot) == Some(&"needs you") =>
+                {
                     self.doing(bot, "working")
                 }
                 "turn_finished" => {
@@ -5581,7 +5583,9 @@ impl App {
                     };
                 }
             }
-            "approval_requested" | "approval_asked" => self.approvals_for(turn).await,
+            "approval_requested" | "approval_asked" | "step_decided" => {
+                self.approvals_for(turn).await
+            }
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -8276,6 +8280,10 @@ impl App {
             Span::raw(format!("Allow {name}?")).bold(),
         ])];
         lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        // A call an exec script makes, which waits while it is asked.
+        if call["step_of"].is_string() {
+            lines.push(Line::from("  a call in a running script").dim());
+        }
         if call["incomplete"] == true {
             lines.push(
                 Line::from("  … cut; the rest could not be read, so y is off: n denies it").dim(),
