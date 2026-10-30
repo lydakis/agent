@@ -4042,10 +4042,16 @@ mod tests {
             let (writer, reader) = tokio::io::duplex(4096);
             let output = Output::writer(writer);
             let closed = output.subscribe_closed();
-            output.send(json!({"first":"x".repeat(8192)})).await.unwrap();
+            output
+                .send(json!({"first":"x".repeat(8192)}))
+                .await
+                .unwrap();
             // Block the writer on its first packet, then fill the queue.
             tokio::task::yield_now().await;
-            for filler in [json!({"filler":"x".repeat(64 * 1024)}), json!({"filler":true})] {
+            for filler in [
+                json!({"filler":"x".repeat(64 * 1024)}),
+                json!({"filler":true}),
+            ] {
                 while output.try_send(filler.clone()).is_ok() {}
             }
             let response = output.clone();

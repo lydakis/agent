@@ -5800,3 +5800,32 @@ they measure the unfiltered path. Filtering pays off in
 of `*` no longer carries the deltas, and it hears all 6,000 task endings,
 where before the daemon dropped it.
 
+
+## A session's queue is bounded by bytes, not 64 messages (#425)
+
+A session's output channel is now unbounded, and its 2 MiB budget, at 64
+bytes per packet on top of the packet's own size, is the only bound;
+admission compares the same cost. The Perf workflow's matched screen, base
+main 2cf8337 against the PR head 31a2e78, on the GitHub runner
+(2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 27.321 | 27.04 | -1.0% |
+| admission | burst submit p99, ms | 4.044 | 3.885 | -3.9% |
+| completion | release to terminal p99, ms | 8.7 | 8.335 | -4.2% |
+| footprint | idle RSS, MiB | 19.334 | 19.188 | -0.8% |
+| footprint | per idle bot, KiB | 1.248 | 1.484 | +18.9% |
+| footprint | RSS after a turn each, MiB | 28.061 | 29.012 | +3.4% |
+| footprint | CPU per turn, ms | 0.788 | 0.786 | -0.3% |
+| lifecycle | CPU, s | 0.67 | 0.66 | -1.5% |
+| lifecycle | p95 turn, ms | 581.069 | 580.929 | -0.0% |
+| lifecycle | peak RSS, MiB | 25.262 | 25.326 | +0.3% |
+
+The per-idle-bot figure is past the gate's 15% warning, but it is the
+bench's noise (#349, #407): an idle bot has no session and no queue, the
+base's own runs spread 1.17 to 1.33 KiB, and the absolute change is a
+quarter of a KiB. The change pays off in `bench/lookout_scale.py`: with
+1,100 streaming bots, the lookout's follow of `*` is no longer dropped by
+the count bound, and at 5,000 gated calls the approver's session stays
+open.

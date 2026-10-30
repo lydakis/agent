@@ -545,7 +545,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             if user == 'burst':
                 text = 'reply:burst'
-                deltas = [{'type': 'response.output_text.delta', 'delta': ''}] * 2000
+                deltas = [{'type': 'response.output_text.delta', 'delta': ''}] * 20000
                 frames = deltas + events
                 body = b''.join(('data: ' + json.dumps(e) + '\n\n').encode() for e in frames)
                 self.wfile.write(f'{len(body):x}\r\n'.encode() + body + b'\r\n0\r\n\r\n')
