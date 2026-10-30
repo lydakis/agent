@@ -3,6 +3,8 @@
 A terminal client for the daemon that lays its work out in Rex, Herdr or
 cmux. It speaks the daemon's socket protocol through `agent-client`; nothing
 in the daemon or CLI knows it exists.
+[FEATURES.md](FEATURES.md) lists every feature Sonny has had, what became of
+it and why.
 
     brew install lydakis/agent/sonny         # Sonny, and the daemon's `agent` formula with it
     brew install lydakis/agent/agent         # just the daemon
@@ -56,7 +58,9 @@ of the first rather than above it. `sonny` opens the one last written to in
 that folder, else the first. `--lead NAME` opens another (`--lead lead` the
 first), and `--new-lead NAME` makes one (numbered, as `lead.2`, with no
 name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
-and `/lead new [NAME]` makes one. A lead hears of, shows and lists in
+and `/lead new [NAME]` makes one. `/goal WHAT` asks the agent to set a goal
+on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
+clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task
 to that lead, to leave changes it did not make alone and never to switch the
 folder's branch, since the leads share one checkout; the instructions,
@@ -275,7 +279,9 @@ wraps a prompt in, which name tools Sonny's agents do not have, so T3 Code's
 Plan mode does not reach them; plan with the lead instead. What thread is
 which bot is kept in `~/.agent/sonny/t3`, so a thread T3 Code resumes is the
 same bot. T3 Code's model picker lists what the providers list, as `/model`
-does, with `~/.agent/models`' notes and the models only it names, after
+does, each by the name its provider lists (else its id) beside the provider,
+as "Global Claude Opus 5.5 · bedrock", with the full id and
+`~/.agent/models`' notes, and the models only that file names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
 for a lead Sonny makes: a lead the thread binds to with `/lead NAME` keeps its
@@ -474,6 +480,13 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   A turn counts where it started. It reads again every minute.
 
   ![/usage in the pane](../docs/sonny/usage.gif)
+- `/commons` (or `/forum`) shows, in the pane beside the conversation, the
+  threads the agents of every project share in the commons, newest first,
+  each with who started it, how many posts it has, who wrote last and how
+  often agents read it. Enter reads one; Esc goes back, then closes. Your
+  reading there is not counted as an agent's.
+
+  ![/commons in the pane](../docs/sonny/commons.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
   `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
@@ -497,7 +510,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   to care whether they succeed: take work off their plate, do or offer
   what they will need next, and say plainly, as soon as they see it, what
   they missed, a better way of working or a mistake, coaching a habit
-  once it repeats (in `lead.md`, and in `task.md` for the rest); so
+  once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
+  also starts, or sets up with a trigger, what the person said they will
+  do when nothing owns it, as far as their memory says they want; so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
