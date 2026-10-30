@@ -40,7 +40,8 @@ pub enum Picked {
     Typed(String),
 }
 
-/// Rows drawn at once; the marked row scrolls the rest into view.
+/// Rows drawn at most at once, fewer in a shorter terminal; the marked
+/// row scrolls the rest into view.
 const SHOWN: usize = 10;
 
 const ACCENT: &str = "\x1b[38;2;255;190;60m";
@@ -159,19 +160,23 @@ impl List {
 /// Draws the list over the `drawn` lines it drew before; how many it drew.
 fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -> usize {
     let shown = list.shown(rows);
+    // Lines that wrapped or scrolled off the top would throw off the
+    // count redrawing goes back by, so the list fits the terminal: every
+    // line cut to its width, and rows enough for its height with the
+    // title, the hint and the line after them.
+    let (columns, height) =
+        ratatui::crossterm::terminal::size().map_or((80, 24), |(c, r)| (c as usize, r as usize));
+    let fit = SHOWN.min(height.saturating_sub(3)).max(1);
     if list.marked < list.top {
         list.top = list.marked;
-    } else if list.marked >= list.top + SHOWN {
-        list.top = list.marked + 1 - SHOWN;
+    } else if list.marked >= list.top + fit {
+        list.top = list.marked + 1 - fit;
     }
     let mut out = String::new();
     if drawn > 0 {
         out.push_str(&format!("\x1b[{drawn}F"));
     }
     out.push_str("\x1b[J");
-    // A line that wrapped would throw off the count redrawing goes back
-    // by, so every line is cut to the terminal's width.
-    let columns = ratatui::crossterm::terminal::size().map_or(80, |(c, _)| c as usize);
     let asked = clip(
         &format!("{title} {}", list.filter),
         columns.saturating_sub(1),
@@ -190,7 +195,7 @@ fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -
         .max()
         .unwrap_or(0)
         .min(columns.saturating_sub(3));
-    for (place, &index) in shown.iter().enumerate().skip(list.top).take(SHOWN) {
+    for (place, &index) in shown.iter().enumerate().skip(list.top).take(fit) {
         let row = &rows[index];
         let label = clip(&row.label, width);
         let pad = " ".repeat(width - label.chars().count());
@@ -213,7 +218,7 @@ fn draw(title: &str, rows: &[Row], list: &mut List, typed: bool, drawn: usize) -
             false => format!("  {label}{pad}{detail}{badge}"),
         });
     }
-    let hidden = shown.len().saturating_sub(list.top + SHOWN);
+    let hidden = shown.len().saturating_sub(list.top + fit);
     let hint = match (shown.is_empty(), typed) {
         (true, true) => "nothing listed matches; Enter takes what you typed".to_owned(),
         (true, false) => "nothing matches; Backspace to widen".to_owned(),

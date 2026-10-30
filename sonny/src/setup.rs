@@ -236,7 +236,22 @@ pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
     // The provider to name in the config, and what goes in the env file.
     let (named, kept): (Option<&str>, Vec<(&str, String)>) = match ways[chosen].0 {
         Way::Keep => (None, Vec::new()),
-        Way::ChatGpt if found.chatgpt => (Some("chatgpt"), Vec::new()),
+        // Asked again, a sign-in that has expired can be made anew.
+        Way::ChatGpt if found.chatgpt && !again => (Some("chatgpt"), Vec::new()),
+        Way::ChatGpt
+            if found.chatgpt
+                && picker::pick(
+                    "ChatGPT",
+                    &[
+                        Row::new("Keep the sign-in", "the one this machine has"),
+                        Row::new("Sign in again", "in your browser, as the first time"),
+                    ],
+                    0,
+                    false,
+                )? == Picked::Row(0) =>
+        {
+            (Some("chatgpt"), Vec::new())
+        }
         Way::ChatGpt => {
             let mut command = crate::agent_command(bin)?;
             let status = command
