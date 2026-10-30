@@ -22,8 +22,9 @@ const POSTS: usize = 256;
 /// The most of one read's posts, so a read fits a served tool's answer:
 /// the rest come with `from`.
 const READ_BYTES: usize = 40 * 1024;
-/// The most threads a listing shows, newest first.
-const LISTED: usize = 200;
+/// The most of one listing's threads, newest first: the rest come with
+/// `from`.
+const LIST_BYTES: usize = 40 * 1024;
 const READS: &str = ".reads";
 /// For each thread, how many times each agent has read it or posted in
 /// it: a reply tells an agent once until it looks again.
@@ -43,8 +44,8 @@ pub fn call(
     arguments: &Value,
 ) -> Result<Value, String> {
     let dir = dir(home);
+    let from = arguments["from"].as_u64().unwrap_or(0) as usize;
     if let Some(name) = arguments["read"].as_str() {
-        let from = arguments["from"].as_u64().unwrap_or(0) as usize;
         return read(&dir, name, author, from);
     }
     if arguments["post"].is_object() {
@@ -62,7 +63,7 @@ pub fn call(
         let text = reply["text"].as_str().unwrap_or_default();
         return add(&dir, thread, &entry(author, author_id, text, reply)?);
     }
-    list(&dir)
+    list(&dir, from, LIST_BYTES)
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -167,8 +168,10 @@ fn append(path: &Path, post: &Value) -> Result<(), String> {
 
 fn start(dir: &Path, name: &str, title: &str, post: &Value) -> Result<Value, String> {
     valid_name(name)?;
-    if title.trim().is_empty() || title.contains('\n') {
-        return Err("commons_invalid: a thread's title is one line".into());
+    if title.trim().is_empty() || title.contains('\n') || title.chars().count() > 200 {
+        return Err(
+            "commons_invalid: a thread's title is one line of at most 200 characters".into(),
+        );
     }
     let _lock = lock(dir)?;
     let path = dir.join(format!("{name}.jsonl"));
@@ -313,7 +316,9 @@ fn read(dir: &Path, name: &str, author: &str, from: usize) -> Result<Value, Stri
     Ok(shown)
 }
 
-fn list(dir: &Path) -> Result<Value, String> {
+/// The threads from the `from`th newest, as many as `bytes` holds, with
+/// `next` where the rest start.
+fn list(dir: &Path, from: usize, bytes: usize) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(json!({"dir": dir, "threads": []}));
@@ -346,16 +351,23 @@ fn list(dir: &Path) -> Result<Value, String> {
         }));
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t["at"].as_i64().unwrap_or(0)));
-    let more = threads.len().saturating_sub(LISTED);
-    threads.truncate(LISTED);
-    for thread in &mut threads {
+    let of = threads.len();
+    let (mut shown, mut size) = (Vec::new(), 0);
+    for mut thread in threads.into_iter().skip(from) {
         let at = thread["at"].as_i64().unwrap_or(0);
         thread["last_when"] = json!(when(at));
         thread.as_object_mut().map(|t| t.remove("at"));
+        size += thread.to_string().len();
+        if !shown.is_empty() && size > bytes {
+            break;
+        }
+        shown.push(thread);
     }
-    let mut listed = json!({"dir": dir, "threads": threads});
-    if more > 0 {
-        listed["more"] = json!(more);
+    let next = from + shown.len();
+    let mut listed = json!({"dir": dir, "threads": shown});
+    if next < of {
+        listed["next"] = json!(next);
+        listed["of"] = json!(of);
     }
     Ok(listed)
 }
@@ -444,7 +456,7 @@ impl View {
     /// Read it all again, the pick kept on the same thread where it still is.
     pub fn reload(&mut self) {
         let picked = self.picked().map(str::to_owned);
-        match list(&self.dir) {
+        match list(&self.dir, 0, usize::MAX) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
             }
@@ -896,5 +908,34 @@ mod tests {
         call(home, "a.x", None, &reply).unwrap();
         let tell = call(home, "b.y", Some(8), &reply).unwrap()["tell"].clone();
         assert_eq!(tell, json!([{"bot": "a.x", "seen": 3}]));
+    }
+
+    #[test]
+    fn a_long_listing_comes_in_pieces_that_fit_an_answer() {
+        let home = &home("listing_in_pieces");
+        let title = "t".repeat(200);
+        for n in 0..300 {
+            let post =
+                json!({"post": {"name": format!("thread-{n}"), "title": title, "text": "hi"}});
+            call(home, "a.x", None, &post).unwrap();
+        }
+        let long = json!({"post": {"name": "long", "title": "t".repeat(201), "text": "hi"}});
+        assert!(
+            call(home, "a.x", None, &long)
+                .unwrap_err()
+                .starts_with("commons_invalid")
+        );
+        let (mut from, mut threads) = (0, 0);
+        loop {
+            let listed = call(home, "b.y", None, &json!({"from": from})).unwrap();
+            assert!(listed.to_string().len() <= LIST_BYTES + 1024);
+            threads += listed["threads"].as_array().unwrap().len();
+            match listed["next"].as_u64() {
+                Some(next) => from = next as usize,
+                None => break,
+            }
+        }
+        assert_eq!(threads, 300);
+        assert!(from > 0);
     }
 }

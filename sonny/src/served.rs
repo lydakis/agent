@@ -365,7 +365,7 @@ fn commons() -> Value {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
                 "from": {"type": "integer", "minimum": 0,
-                    "description": "With read: the post to start at, as an earlier read's next says."},
+                    "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
                     "type": "object",
                     "properties": {
