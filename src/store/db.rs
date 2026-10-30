@@ -400,7 +400,8 @@ impl Settings {
         }
         Ok(())
     }
-    /// Every setting as it applies, defaults included, for clients.
+    /// Every setting as it applies, defaults included, for clients; a
+    /// lifetime never set is null.
     pub fn resolved(&self) -> Value {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
@@ -408,7 +409,9 @@ impl Settings {
             "keep_turns":self.keep_turns,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
-            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes),
+            // Null when never set (five minutes), so a client's default can
+            // tell it from five minutes someone chose.
+            "cache_ttl":self.cache_ttl,
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
     }
