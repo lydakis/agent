@@ -598,11 +598,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         TRIGGERS => {
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
-            tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
+            let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
                 .await
                 .map_err(|e| ("tool_failed", e.to_string()))?
-                .map(|said| said.to_string())
-                .map_err(|e| ("trigger_refused", e))
+                .map_err(|e| ("trigger_refused", e))?;
+            // How the turns their last fires sent ended, as the person's
+            // `/background` shows them; without the daemon, as the files say.
+            if let Ok((_, socket)) = crate::daemon_paths(None, None)
+                && let Ok((client, _events)) = Client::connect(&socket).await
+            {
+                if let Some(rows) = said.get_mut("triggers").and_then(Value::as_array_mut) {
+                    crate::trigger::with_turns(&client, rows).await;
+                } else if said["last"].is_object() {
+                    crate::trigger::with_turns(&client, std::slice::from_mut(&mut said)).await;
+                }
+                client.close().await;
+            }
+            Ok(said.to_string())
         }
         _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
     }

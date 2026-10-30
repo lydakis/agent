@@ -1961,6 +1961,12 @@ struct App {
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
+    /// How many of what `/background` lists failed, as the footer's `✗`
+    /// says.
+    failed: usize,
+    /// How the turns triggers' last fires sent ended, by handle, as the
+    /// daemon said: asked once a turn is seen, and again while it runs.
+    turns: HashMap<String, Value>,
     /// The turn the person's words last went to from this window: only
     /// its end is followed by a guess at their next message.
     yours: Option<i64>,
@@ -2588,6 +2594,8 @@ impl App {
             pick: 0,
             watch: None,
             behind: (0, None),
+            failed: 0,
+            turns: HashMap::new(),
             yours: None,
             suggesting: None,
             suggestion: None,
@@ -2854,7 +2862,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
-            self.count_behind();
+            self.count_behind().await;
             self.read_tasks().await;
             self.read_running_tasks().await;
             self.read_references().await;
@@ -5930,6 +5938,7 @@ impl App {
             self.options.store.clone(),
             self.client.store().map(str::to_owned),
             self.bot.clone(),
+            self.turns.clone(),
         );
         self.watch = Some(Watch {
             project,
@@ -6034,8 +6043,9 @@ impl App {
     }
 
     /// Count what runs for this agent in the background again, every ten
-    /// seconds: files read, no daemon call.
-    fn count_behind(&mut self) {
+    /// seconds, and what failed of what `/background` lists: files read,
+    /// and the daemon asked at once how the turns fires sent ended.
+    async fn count_behind(&mut self) {
         if self
             .behind
             .1
@@ -6044,10 +6054,28 @@ impl App {
         {
             return;
         }
-        let items = background::read(&self.options.store, self.client.store(), |bot| {
-            bot == self.bot
-        });
+        let scope = self.scope();
+        let read = |turns: &HashMap<String, Value>| {
+            background::read_around(&self.options.store, self.client.store(), turns, &scope)
+        };
+        let mut items = read(&self.turns);
+        let unended = background::unended(&items, &self.turns);
+        if !unended.is_empty() {
+            let ended = trigger::ended(&self.client, unended).await;
+            if !ended.is_empty() {
+                self.turns.extend(ended);
+                items = read(&self.turns);
+            }
+        }
+        let fired: std::collections::HashSet<&String> =
+            items.iter().filter_map(|i| i.handle.as_ref()).collect();
+        self.turns.retain(|handle, _| fired.contains(handle));
+        items.retain(|item| background::shown(&scope, item));
         self.behind = (background::count(&items, &self.bot), Some(Instant::now()));
+        self.failed = background::failed(&items);
+        if let Some(view) = (self.watch.as_mut()).and_then(|w| w.background.as_mut()) {
+            view.set_turns(&self.turns);
+        }
     }
 
     /// What the lookout does for this window's lead.
@@ -6087,9 +6115,12 @@ impl App {
             lead,
             glob: pattern,
         } = self.scope();
-        let behind = background::read(&self.options.store, self.client.store(), |bot| {
-            lookout::subs::matches(&pattern, bot)
-        });
+        let behind = background::read(
+            &self.options.store,
+            self.client.store(),
+            &self.turns,
+            |bot| lookout::subs::matches(&pattern, bot),
+        );
         let Ok(page) = self
             .client
             .request("bots", json!({"name": pattern, "limit": 256}))
@@ -7037,6 +7068,7 @@ impl App {
         margin::Glance {
             name: self.bot.clone(),
             behind: self.behind.0,
+            failed: self.failed,
             context: self.context,
         }
     }
@@ -9293,6 +9325,13 @@ impl App {
             _ if glancing => right,
             n => format!("↻ {n} in background · {right}"),
         };
+        // What failed of it, in red: /background lists it first.
+        let failed = format!("✗ {} failed", self.failed);
+        let right = match self.failed {
+            0 => right,
+            _ if glancing => right,
+            _ => format!("{failed} · {right}"),
+        };
         let right = match self.margin.notes().len() {
             n if n > 0 && !glancing => format!("✎ {n} · {right}"),
             _ => right,
@@ -9317,9 +9356,12 @@ impl App {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
         let place = format!(" · {}{folder}", if cut { "…" } else { "" });
-        let fill = width.saturating_sub(
-            left.width() + place.width() + branch.width() + right.width() + counted_width,
-        );
+        // A space at least, so a branch never runs into what follows it.
+        let fill = width
+            .saturating_sub(
+                left.width() + place.width() + branch.width() + right.width() + counted_width,
+            )
+            .max(1);
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
         let at = left.width() + place.width() + branch.width() + fill;
@@ -9336,7 +9378,16 @@ impl App {
         }
         match right.rfind(&self.bot) {
             Some(at) => {
-                spans.push(Span::raw(right[..at].to_owned()));
+                let before = &right[..at];
+                match before.find(&failed).filter(|_| self.failed > 0) {
+                    Some(from) => {
+                        let to = from + failed.len();
+                        spans.push(Span::raw(before[..from].to_owned()));
+                        spans.push(Span::raw(failed.clone()).fg(Color::Red).not_dim());
+                        spans.push(Span::raw(before[to..].to_owned()));
+                    }
+                    None => spans.push(Span::raw(before.to_owned())),
+                }
                 spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
                 let rest = &right[at + self.bot.len()..];
                 // How full the context is: green, then yellow, then red.
@@ -11044,6 +11095,31 @@ mod tests {
             .await;
         }
         assert!(!app.footer_line(120).to_string().contains('📎'));
+    }
+
+    #[tokio::test]
+    async fn what_failed_in_the_background_is_red_left_of_what_runs() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.behind = (2, Some(Instant::now()));
+        app.failed = 1;
+        let line = app.footer_line(140);
+        let text = line.to_string();
+        assert!(text.contains("✗ 1 failed · ↻ 2 in background · "), "{text}");
+        let mark = line
+            .spans
+            .iter()
+            .find(|s| s.content == "✗ 1 failed")
+            .unwrap();
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        assert!(
+            mark.style.sub_modifier.contains(Modifier::DIM),
+            "red, not dimmed"
+        );
+        app.failed = 2;
+        assert!(app.footer_line(140).to_string().contains("✗ 2 failed · "));
+        app.failed = 0;
+        assert!(!app.footer_line(140).to_string().contains('✗'));
     }
 
     #[tokio::test]

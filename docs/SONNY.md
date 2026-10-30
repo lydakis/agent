@@ -28,6 +28,9 @@ Sonny's lookout answers outside the agent's sandbox, since a trigger is a
 job of the system's scheduler: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
+A row whose last fire sent a turn says how that turn ended, as the daemon
+has it: `last.turn_status`, and `last.turn_error` when it did not complete,
+so an agent sees the failure the person sees in `/background`.
 It waits for a verdict wherever the agent's other calls do (`/approvals`),
 since a trigger runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes

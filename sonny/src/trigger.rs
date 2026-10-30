@@ -25,6 +25,7 @@
 //! add, list, fire and remove them.
 use agent_client::Client;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -3426,6 +3427,64 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
 
 /// What a turn's `wait` result says: its text, else its error. A turn that
 /// ended saying nothing passes on nothing, not "null".
+/// The turn the last fire of `row` sent, by handle, when it sent one.
+pub fn sent(row: &Value) -> Option<String> {
+    let last = &row["last"];
+    (last["outcome"] == "sent")
+        .then(|| last["handle"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+/// How the turns of `handles` ended, read from the daemon at once: each
+/// one that ended, by handle, as `wait` gives it. A turn still running,
+/// or a daemon that does not answer, is left out.
+pub async fn ended(client: &Client, handles: Vec<String>) -> HashMap<String, Value> {
+    let mut found = HashMap::new();
+    // As many as one `wait` takes at a time.
+    for some in handles.chunks(64) {
+        let Ok(waited) = client
+            .request("wait", json!({"handles": some, "timeout_ms": 0}))
+            .await
+        else {
+            continue;
+        };
+        found.extend(
+            (waited["results"].as_object().into_iter().flatten())
+                .filter(|(_, result)| result["pending"] != true && result["status"].is_string())
+                .map(|(handle, result)| (handle.clone(), result.clone())),
+        );
+    }
+    found
+}
+
+/// `row`, its `last` taking how the turn its fire sent ended, from
+/// `ended`: its `turn_status`, and `turn_error` when it did not complete,
+/// so a fire that went out and whose turn then failed, as when the machine
+/// was offline or a login expired, reads so wherever its row is shown.
+pub fn with_turn(row: &mut Value, ended: &HashMap<String, Value>) {
+    let Some(result) = sent(row).and_then(|handle| ended.get(&handle)) else {
+        return;
+    };
+    let status = result["status"].clone();
+    if status != "completed" {
+        let error = answer(&json!({"error": result["error"]}));
+        row["last"]["turn_error"] = json!(match result["detail"].as_str() {
+            Some(detail) if !error.is_empty() => format!("{error}: {detail}"),
+            Some(detail) => detail.to_owned(),
+            None => error,
+        });
+    }
+    row["last"]["turn_status"] = status;
+}
+
+/// [`with_turn`] for each of `rows`, reading their turns from the daemon.
+pub async fn with_turns(client: &Client, rows: &mut [Value]) {
+    let found = ended(client, rows.iter().filter_map(sent).collect()).await;
+    for row in rows {
+        with_turn(row, &found);
+    }
+}
+
 fn answer(result: &Value) -> String {
     match (result["text"].as_str(), &result["error"]) {
         (Some(text), _) if !text.is_empty() => text.to_owned(),
