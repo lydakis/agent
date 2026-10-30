@@ -474,7 +474,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`.
 
-  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/work-status.png)
+  ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 - `/background` (or `/triggers`, `/lookout`) lists, in the pane beside the
@@ -646,17 +646,11 @@ turn's `Worked for …` line.
 The view is clean by default: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, messaged or
 waited for, a question to you, the plan, memory, a trigger, a window
-opened). Commands, reads, edits and lookups between them are one row
-that sums them up, as Codex's `Ran` and Claude Code's `Read 3 files` do
-(`• Ran 2 commands, edited calc.py  -1 +1 ▸`), with `✗` and how many
-failed when one did; a click opens it to every call in it. Ctrl+O opens
-every row that folds, and folds them all again once all are open.
-`/verbose` draws every call, the conversation so far included, and is
-kept with the other settings; `/verbose` again goes back to clean.
-
-![A stretch of work as one row each, a failed command marked ✗](../docs/sonny/work-top.png)
-
-![Ctrl+O opening both rows to the commands and the edit](../docs/sonny/work-opened.png)
+opened). Commands, reads and edits are left out: agents are people you
+talk to, and the clean view shows what they say and what reaches you, not
+the work inside their turn. `/verbose` draws every
+call, the conversation so far included, and is kept with the other
+settings; `/verbose` again goes back to clean.
 
 Some rows are buttons. A call that starts, messages, steers, queues for,
 waits for or changes agents is one row that says what it did and to whom
@@ -665,6 +659,8 @@ message it sent or what came back, and folds it again. Calls of one kind
 in a row, such as three tasks messaged one after another, fold into one
 such row (`• Messaged calc.add, calc.neg and calc.div ▸`). A question the
 agent asks you lists its options, and a click on one answers with it.
+Ctrl+O opens every row that folds, and folds them all again once all are
+open.
 What agents tell each other stays quiet too: a message from another agent
 is one dim row naming who sent it (`↳ From calc.neg ▸`), the lead's task
 updates one row with what happened in them, and a click opens the whole

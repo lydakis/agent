@@ -3604,32 +3604,10 @@ impl App {
             &self.workspace,
             self.prose(),
         ));
-        // Ordinary work the clean view leaves out (commands, reads,
-        // edits) is said in one row for each stretch of it, which opens
-        // to every call as the verbose view draws it.
-        let (lines, work) = match lines.is_empty() && !self.verbose {
-            true => (
-                transcript::quiet(transcript::tool(
-                    name,
-                    arguments,
-                    Some(output),
-                    failed,
-                    &self.workspace,
-                    self.prose(),
-                )),
-                Some((
-                    transcript::WORK.to_owned(),
-                    transcript::work_item(name, arguments, failed, &self.workspace),
-                )),
-            ),
-            false => (lines, None),
-        };
         if lines.is_empty() {
             return;
         }
-        let Some((verb, what)) =
-            work.or_else(|| transcript::folds(name, arguments, Some(output), failed))
-        else {
+        let Some((verb, what)) = transcript::folds(name, arguments, Some(output), failed) else {
             self.commit(lines);
             return;
         };
@@ -4373,8 +4351,6 @@ impl App {
         (lines, marks)
     }
 
-    /// The cluster `at` drawn again where it is; whether it is still in
-    /// the conversation.
     /// Opens every fold and gathered row still in the conversation, or
     /// folds them all again when none is left shut.
     fn open_all(&mut self) {
@@ -4404,6 +4380,8 @@ impl App {
         }
     }
 
+    /// The cluster `at` drawn again where it is; whether it is still in
+    /// the conversation.
     fn draw_cluster(&mut self, at: usize) -> bool {
         let (lines, marks) = self.cluster_lines(at);
         self.flush();
@@ -11656,7 +11634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_clean_view_keeps_the_words_and_a_task_started_and_folds_a_command() {
+    async fn the_clean_view_keeps_the_words_and_a_task_started_but_not_a_command() {
         let started = r#"{"bot":"b.fix","handle":"turn:b.fix/1","status":"running","turn":1}"#;
         let client = daemon_answering(move |asked| {
             let item = match asked["nodes"][0].as_i64() {
@@ -11707,11 +11685,8 @@ mod tests {
         ))
         .await;
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
-        // The command is one row of work, folded, that a click opens.
-        assert_eq!(
-            rows[..4],
-            ["• I'll look.", "", "• Ran ls ▸", "• Started b.fix ▸"]
-        );
+        assert_eq!(rows[..4], ["• I'll look.", "", "• Started b.fix ▸", ""]);
+        assert!(rows.iter().all(|row| !row.contains("Ran")), "{rows:?}");
         assert_eq!(rows.last().map(String::as_str), Some("• Done."));
     }
 
@@ -11910,8 +11885,9 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         assert_eq!(drawn(&mut app).len(), 3);
-        // Something drawn between, or another kind of call, starts anew,
-        // a command's row of work included.
+        // Something drawn between, or another kind of call, starts anew;
+        // a call the clean view hides does not.
+        app.commit_call("c", "shell", &json!({"command": "ls"}), "a", false);
         start(&mut app, "calc.mul");
         app.commit_call(
             "c",
@@ -12617,37 +12593,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stretch_of_work_is_one_row_that_ctrl_o_opens() {
+    async fn ctrl_o_opens_every_fold_and_folds_them_again() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.width = 80;
-        app.commit(vec![Line::from("› fix it")]);
-        app.commit_call("a", "shell", &json!({"command": "make test"}), "FAIL", true);
-        let patch =
-            "*** Begin Patch\n*** Update File: calc.py\n@@\n-a = 1\n+a = 2\n*** End Patch\n";
-        app.commit_call("b", "apply_patch", &json!({"input": patch}), "ok", false);
-        app.commit_call("c", "shell", &json!({"command": "make test"}), "ok", false);
-        let rows = drawn(&mut app);
-        assert_eq!(
-            rows,
-            [
-                "› fix it",
-                "",
-                "✗ Ran 2 commands, edited calc.py  -1 +1 · 1 failed ▸"
-            ]
-        );
+        let start = |app: &mut App, name: &str| {
+            let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
+            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+        };
+        start(&mut app, "calc.add");
+        start(&mut app, "calc.neg");
+        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
         let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_o)).await;
         let open = drawn(&mut app);
-        assert_eq!(
-            open[2],
-            "✗ Ran 2 commands, edited calc.py  -1 +1 · 1 failed ▾"
-        );
-        assert!(
-            open.iter().any(|row| row.starts_with("• Patched calc.py")),
-            "{open:?}"
-        );
+        assert_eq!(open[0], "• Messaged calc.add and calc.neg ▾");
+        assert!(open.len() > 1, "{open:?}");
         app.key(Event::Key(ctrl_o)).await;
-        assert_eq!(drawn(&mut app).len(), 3);
+        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
     }
 
     #[tokio::test]
