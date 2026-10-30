@@ -63,7 +63,7 @@ pub fn call(
         let text = reply["text"].as_str().unwrap_or_default();
         return add(&dir, thread, &entry(author, author_id, text, reply)?);
     }
-    list(&dir, from, LIST_BYTES)
+    list(&dir, from, LIST_BYTES, &mut Summaries::new())
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -316,9 +316,39 @@ fn read(dir: &Path, name: &str, author: &str, from: usize) -> Result<Value, Stri
     Ok(shown)
 }
 
+/// Each thread's summary as last read, by name, with the file's size and
+/// time it was read at: a listing reads again only a thread that changed.
+type Summaries = std::collections::HashMap<String, (u64, std::time::SystemTime, Value)>;
+
+/// A thread's line in a listing, from its first and last posts and its
+/// count of lines, decoding no post between them.
+fn summary(name: &str, path: &Path) -> Option<Value> {
+    let text = std::fs::read(path).ok()?;
+    let mut lines =
+        (text.split(|b| *b == b'\n')).filter(|line| !line.iter().all(u8::is_ascii_whitespace));
+    let first: Value = serde_json::from_slice(lines.next()?).ok()?;
+    let (mut count, mut last) = (1, None);
+    for line in lines {
+        count += 1;
+        last = Some(line);
+    }
+    let last: Value = match last {
+        Some(line) => serde_json::from_slice(line).ok()?,
+        None => first.clone(),
+    };
+    Some(json!({
+        "thread": name,
+        "title": first["title"],
+        "started_by": first["by"],
+        "posts": count,
+        "last_by": last["by"],
+        "at": last["at"],
+    }))
+}
+
 /// The threads from the `from`th newest, as many as `bytes` holds, with
-/// `next` where the rest start.
-fn list(dir: &Path, from: usize, bytes: usize) -> Result<Value, String> {
+/// `next` where the rest start; `known` keeps what each read found.
+fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(json!({"dir": dir, "threads": []}));
@@ -335,20 +365,21 @@ fn list(dir: &Path, from: usize, bytes: usize) -> Result<Value, String> {
         else {
             continue;
         };
-        // A thread that will not read is left for read to name.
-        let Ok(posts) = posts(&path) else { continue };
-        let (Some(first), Some(last)) = (posts.first(), posts.last()) else {
-            continue;
+        let Ok(meta) = entry.metadata() else { continue };
+        let stamp = (meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH));
+        let mut thread = match known.get(name) {
+            Some((len, at, thread)) if (*len, *at) == stamp => thread.clone(),
+            // A thread that will not read is left for read to name.
+            _ => match summary(name, &path) {
+                Some(thread) => {
+                    known.insert(name.to_owned(), (stamp.0, stamp.1, thread.clone()));
+                    thread
+                }
+                None => continue,
+            },
         };
-        threads.push(json!({
-            "thread": name,
-            "title": first["title"],
-            "started_by": first["by"],
-            "posts": posts.len(),
-            "last_by": last["by"],
-            "at": last["at"],
-            "reads": counts.get(name).map_or(json!(0), |r| r["count"].clone()),
-        }));
+        thread["reads"] = counts.get(name).map_or(json!(0), |r| r["count"].clone());
+        threads.push(thread);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t["at"].as_i64().unwrap_or(0)));
     let of = threads.len();
@@ -430,6 +461,10 @@ pub struct View {
     selected: usize,
     /// The thread opened, by name, and its posts as last read.
     open: Option<(String, Value)>,
+    /// The opened thread's file size and time when its posts were read.
+    open_stamp: Option<(u64, std::time::SystemTime)>,
+    /// What the listing last read of each thread.
+    known: Summaries,
     notice: Option<String>,
 }
 
@@ -447,6 +482,8 @@ impl View {
             threads: Vec::new(),
             selected: 0,
             open: None,
+            open_stamp: None,
+            known: Summaries::new(),
             notice: None,
         };
         view.reload();
@@ -456,7 +493,7 @@ impl View {
     /// Read it all again, the pick kept on the same thread where it still is.
     pub fn reload(&mut self) {
         let picked = self.picked().map(str::to_owned);
-        match list(&self.dir, 0, usize::MAX) {
+        match list(&self.dir, 0, usize::MAX, &mut self.known) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
             }
@@ -471,6 +508,14 @@ impl View {
             .unwrap_or(self.selected)
             .min(self.threads.len().saturating_sub(1));
         if let Some((name, _)) = &self.open {
+            // Read again only once it changed.
+            let stamp = std::fs::metadata(self.dir.join(format!("{name}.jsonl")))
+                .ok()
+                .map(|meta| (meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            if stamp.is_some() && stamp == self.open_stamp {
+                return;
+            }
+            self.open_stamp = stamp;
             match thread(&self.dir, name) {
                 Ok(read) => self.open = Some((name.clone(), read)),
                 Err(error) => {
@@ -507,7 +552,10 @@ impl View {
             KeyCode::Enter | KeyCode::Right if !opened => {
                 if let Some(name) = self.picked().map(str::to_owned) {
                     match thread(&self.dir, &name) {
-                        Ok(read) => self.open = Some((name, read)),
+                        Ok(read) => {
+                            self.open = Some((name, read));
+                            self.open_stamp = None;
+                        }
                         Err(error) => self.notice = Some(error),
                     }
                 }
@@ -937,5 +985,26 @@ mod tests {
         }
         assert_eq!(threads, 300);
         assert!(from > 0);
+    }
+
+    #[test]
+    fn the_view_reads_again_only_a_thread_that_changed() {
+        let home = &home("reads_again");
+        let post = json!({"post": {"name": "t", "title": "T", "text": "one"}});
+        call(home, "a.x", None, &post).unwrap();
+        let mut view = View::open(home);
+        assert_eq!(view.threads[0]["posts"], 1);
+        // A summary kept for a file as it was is used again.
+        view.known.get_mut("t").unwrap().2["title"] = json!("kept");
+        view.reload();
+        assert_eq!(view.threads[0]["title"], "kept");
+        let reply = json!({"reply": {"thread": "t", "text": "two"}});
+        call(home, "b.y", None, &reply).unwrap();
+        view.reload();
+        assert_eq!(view.threads[0]["title"], "T");
+        assert_eq!(
+            (&view.threads[0]["posts"], &view.threads[0]["last_by"]),
+            (&json!(2), &json!("b.y"))
+        );
     }
 }
