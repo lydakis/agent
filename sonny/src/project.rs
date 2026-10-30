@@ -39,10 +39,17 @@ const BUDGETS: [(&str, usize); 3] = [
     ("superlead", 3 * 1024),
 ];
 
+/// [`BUILTINS`] as agents read them: without the commons while it is off.
+pub fn builtins() -> [(&'static str, std::borrow::Cow<'static, str>); 3] {
+    BUILTINS.map(|(name, text)| (name, crate::commons::role(text)))
+}
+
 /// The profile `name` for an agent in `dir`, which must exist: the folder's
 /// or the person's file, else the one Sonny ships.
 pub fn profile(dir: &Path, name: &str) -> Result<agent_client::policy::Profile, String> {
-    agent_client::policy::profile_with(dir, name, &BUILTINS)
+    let roles = builtins();
+    let roles = roles.each_ref().map(|(name, text)| (*name, text.as_ref()));
+    agent_client::policy::profile_with(dir, name, &roles)
         .map_err(|e| format!("{}: {e}", e.code()))?
         .ok_or_else(|| {
             let missing = agent_client::policy::Failure::Missing {

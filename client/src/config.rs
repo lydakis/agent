@@ -30,6 +30,7 @@
 //! verbose = true                # every tool call drawn, not the clean view
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
 //! suggest = false               # no guess at the next message, on by default
+//! commons = false               # agents go without the commons, on by default
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
@@ -154,6 +155,9 @@ pub struct Sonny {
     /// Whether the daemon starts when the machine does, for a box whose
     /// agents keep working after a restart. Sonny keeps the job.
     pub start_at_boot: bool,
+    /// Whether agents have the commons: its tool, skill and the roles'
+    /// lines about it.
+    pub commons: bool,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
 }
@@ -169,6 +173,7 @@ impl Default for Sonny {
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             suggest: true,
+            commons: true,
             chime: true,
             verbose: false,
             start_at_boot: false,
@@ -515,6 +520,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "margin_opens",
                 "suggest",
                 "start_at_boot",
+                "commons",
                 "unsandboxed",
             ],
             _ => return Err(format!("unknown table [{name}]")),
@@ -559,6 +565,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
+                "commons" => Some(&mut config.sonny.commons),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 _ => None,
@@ -858,6 +865,8 @@ mod tests {
         assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
         assert!(config.sonny.suggest);
         assert!(!parse("[sonny]\nsuggest = false").unwrap().sonny.suggest);
+        assert!(config.sonny.commons);
+        assert!(!parse("[sonny]\ncommons = false").unwrap().sonny.commons);
         assert_eq!(
             parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
             "sonny.suggest must be true or false"

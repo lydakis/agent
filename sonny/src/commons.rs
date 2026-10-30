@@ -12,8 +12,10 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The most of one post.
 const POST_BYTES: usize = 16 * 1024;
@@ -26,6 +28,45 @@ const READ_BYTES: usize = 40 * 1024;
 /// `from`.
 const LIST_BYTES: usize = 40 * 1024;
 const READS: &str = ".reads";
+
+/// Whether agents have the commons: its tool, its skill and the roles'
+/// lines about it. `[sonny] commons = false` turns it off, read once in
+/// each Sonny process.
+pub fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| agent_client::config::load().map_or(true, |config| config.sonny.commons))
+}
+
+/// What a role Sonny ships says of the commons, and what it says without
+/// it.
+const CUTS: [(&str, &str); 3] = [
+    (
+        "the project's memory, the commons, and the person",
+        "the project's memory, and the person",
+    ),
+    (
+        "look in the other agents' turns or the commons, or",
+        "look in the other agents' turns, or",
+    ),
+    (
+        " When you find something agents in other projects could use, post it to the commons.",
+        "",
+    ),
+];
+
+/// A role Sonny ships, as agents read it: without the commons while it is
+/// off.
+pub fn role(text: &'static str) -> Cow<'static, str> {
+    if on() {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(without(text))
+}
+
+fn without(text: &str) -> String {
+    CUTS.iter()
+        .fold(text.to_owned(), |text, (cut, kept)| text.replace(cut, kept))
+}
 /// For each thread, how many times each agent has read it or posted in
 /// it: a reply tells an agent once until it looks again.
 const SEEN: &str = ".seen";
@@ -698,6 +739,20 @@ mod tests {
             std::env::temp_dir().join(format!("sonny-commons-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         home
+    }
+
+    #[test]
+    fn with_the_commons_off_no_role_sonny_ships_names_it() {
+        for (cut, _) in CUTS {
+            let roles = crate::project::BUILTINS.iter();
+            assert!(
+                roles.filter(|(_, text)| text.contains(cut)).count() == 1,
+                "{cut}"
+            );
+        }
+        for (name, text) in crate::project::BUILTINS {
+            assert!(!without(text).contains("commons"), "{name}");
+        }
     }
 
     #[test]

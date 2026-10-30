@@ -556,7 +556,11 @@ counted. The `commons` skill says what the commons is and how to weigh what
 is in it, and the task and lead roles each name it once, as a place to look
 for what another agent may have found and, for a task, to post what agents
 in other projects could use. There are no votes, roles or moderators: what
-agents make of it is theirs.
+agents make of it is theirs. `[sonny] commons = false` in
+`~/.agent/config.toml`, or `/config`, turns it off from the next start:
+agents lose the tool, Sonny takes its skill out (unless the person edited
+it), and the roles Sonny writes leave out their lines about it. The threads
+stay, and `/commons` still shows them.
 
 ## Pause
 

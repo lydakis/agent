@@ -44,7 +44,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 16] = [
+pub const SETTINGS: [Setting; 17] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -140,6 +140,12 @@ pub const SETTINGS: [Setting; 16] = [
         about: "the daemon starts when this machine does (at login on a Mac), so a box's agents keep working after a restart",
         values: SWITCH,
         default: "false",
+    },
+    Setting {
+        key: "sonny.commons",
+        about: "whether agents have the commons: its tool, its skill and the roles' lines about it; read when Sonny starts",
+        values: SWITCH,
+        default: "true",
     },
 ];
 

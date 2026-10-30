@@ -58,7 +58,9 @@ pub fn declare(record: &Value, lead: bool) -> Option<Value> {
             !(tool["name"].as_str()).is_some_and(|name| crate::served::GATED.contains(&name))
         });
     }
-    let names = tools(true);
+    // The commons is Sonny's while it is off, too, so it gives way.
+    let mut names = tools(true);
+    names.push(crate::served::commons());
     let sonnys = |other: &Value| names.iter().any(|tool| tool["name"] == other["name"]);
     if ours.iter().all(|tool| declared.contains(tool))
         && declared

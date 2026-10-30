@@ -70,15 +70,11 @@ pub fn tools(lead: bool) -> Vec<Value> {
     if lead {
         tools.extend([start(), remove(), project()]);
     }
-    tools.extend([
-        subscriptions(),
-        show(),
-        run(),
-        triggers(),
-        memory(),
-        commons(),
-        crate::lookout::goals::tool(GOAL, TAG),
-    ]);
+    tools.extend([subscriptions(), show(), run(), triggers(), memory()]);
+    if crate::commons::on() {
+        tools.push(commons());
+    }
+    tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools
 }
@@ -367,7 +363,7 @@ fn memory() -> Value {
     })
 }
 
-fn commons() -> Value {
+pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
     json!({
         "name": COMMONS,
@@ -620,6 +616,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("memory_refused", e))
         }
         COMMONS => {
+            if !crate::commons::on() {
+                return Err(("commons_refused", "the commons is off".to_owned()));
+            }
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("commons_refused", "no HOME".to_owned()))?;

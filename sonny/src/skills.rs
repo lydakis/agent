@@ -9,16 +9,21 @@ use std::path::{Path, PathBuf};
 /// `~/.agent/memory` and `~/.agent/trigger`, which run this Sonny. Written
 /// at each start, so they lead to this copy.
 pub fn install_own() {
-    install_role("lead", crate::project::LEAD);
-    install_role("task", crate::project::TASK);
-    install_role("superlead", crate::project::SUPERLEAD);
+    for (name, text) in crate::project::builtins() {
+        install_role(name, &text);
+    }
     install("memory", include_str!("../skills/memory/SKILL.md"));
     install(
         "memory-cleanup",
         include_str!("../skills/memory-cleanup/SKILL.md"),
     );
     install("plan", include_str!("../skills/plan/SKILL.md"));
-    install("commons", include_str!("../skills/commons/SKILL.md"));
+    // `[sonny] commons = false`: agents go without it.
+    if crate::commons::on() {
+        install("commons", include_str!("../skills/commons/SKILL.md"));
+    } else {
+        remove("commons");
+    }
     install("sonny-setup", crate::setup::SKILL);
     // A job reaches the daemon the way every agent Sonny runs does.
     let automation = include_str!("../skills/automation/SKILL.md");
