@@ -3501,8 +3501,8 @@ pub async fn ended(client: &Client, handles: Vec<String>) -> HashMap<String, Val
 /// with any answer passed on: nothing is left to say, so they go. One whose
 /// turn failed stays, shown until it is removed, as systemd keeps a failed
 /// unit until `reset-failed` and Kubernetes a finished Job until its TTL.
-/// Run by whoever asked the daemon how those turns ended.
-pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Value>) {
+/// Run by whoever asked the daemon how those turns ended. How many went.
+pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Value>) -> usize {
     let done = |name: &str| {
         let row = read_json(&places.last(name))?;
         let handle = sent(&row)?;
@@ -3521,24 +3521,28 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
     .filter(|name| valid_name(name).is_ok() && done(name).is_some())
     .collect();
     if names.is_empty() {
-        return;
+        return 0;
     }
     let Ok(_lock) = Lock::take(places) else {
-        return;
+        return 0;
     };
     // Under the lock, only while it is still that row: a trigger made since
     // under the name has a job, or a row of its own.
+    let mut gone = 0;
     for name in names {
-        if done(&name).is_some()
-            && let Err(e) = std::fs::remove_file(places.last(&name))
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!(
+        if done(&name).is_none() {
+            continue;
+        }
+        match std::fs::remove_file(places.last(&name)) {
+            Ok(()) => gone += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
                 "{}",
                 error_json(&format!("{}: {e}", places.last(&name).display()))
-            );
+            ),
         }
     }
+    gone
 }
 
 /// `row`, its `last` taking how the turn its fire sent ended, from
@@ -4820,12 +4824,12 @@ mod tests {
         );
         assert_eq!(w.state(&one.name), (false, false, true));
         let ended = |status: &str| HashMap::from([(handle.to_owned(), json!({"status": status}))]);
-        forget_done(&w.places, "00ab", &ended("failed"));
+        assert_eq!(forget_done(&w.places, "00ab", &ended("failed")), 0);
         // Another daemon's turn of that handle is not its.
         forget_done(&w.places, "ffff", &ended("completed"));
         assert_eq!(w.state(&one.name), (false, false, true));
         // One that completed leaves nothing.
-        forget_done(&w.places, "00ab", &ended("completed"));
+        assert_eq!(forget_done(&w.places, "00ab", &ended("completed")), 1);
         assert_eq!(w.state(&one.name), (false, false, false));
         // Not delivered: it ends, and its row says why until it is removed.
         w.install(&one).unwrap();
