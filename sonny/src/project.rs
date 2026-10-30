@@ -27,6 +27,18 @@ pub const SUPERLEAD: &str = include_str!("../agents/superlead.md");
 /// replace, or build on with `extends`.
 pub const BUILTINS: [(&str, &str); 3] = [("lead", LEAD), ("task", TASK), ("superlead", SUPERLEAD)];
 
+/// The most bytes each shipped role may hold. Every agent reads its role
+/// on every call, so a role only grows by cutting elsewhere: merge or drop
+/// a sentence, or leave to memory what the person can teach. Budgets come
+/// down as evals show shorter text does as well, and go up only with the
+/// owner's say.
+#[cfg(test)]
+const BUDGETS: [(&str, usize); 3] = [
+    ("lead", 20 * 1024),
+    ("task", 4 * 1024),
+    ("superlead", 3 * 1024),
+];
+
 /// The profile `name` for an agent in `dir`, which must exist: the folder's
 /// or the person's file, else the one Sonny ships.
 pub fn profile(dir: &Path, name: &str) -> Result<agent_client::policy::Profile, String> {
@@ -996,6 +1008,21 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_roles_fit_their_budgets() {
+        for (name, text) in BUILTINS {
+            let (_, budget) = BUDGETS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("a budget per role");
+            assert!(
+                text.len() <= *budget,
+                "sonny/agents/{name}.md is {} bytes, over its {budget}: cut as much as you add",
+                text.len()
+            );
+        }
+    }
 
     #[test]
     fn each_store_notes_its_own_last_lead_in_a_folder() {
