@@ -309,13 +309,13 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   with `approvals_served`, including duplicate registration on the same
   session. The holder keeps the tag by sending an answer or
   a `renew_approvals` at least every `lease_ms`, a period it chooses
-  (`agent approver` renews every second on a 5 s lease). A holder that goes quiet
+  (`sonny approver` renews every second on a 5 s lease). A holder that goes quiet
   while connected, like a suspended app or a wedged loop, loses the tag:
   the daemon sends it `approvals_lost`, and the next `serve_approvals`
   takes over. Until one does, its calls wait. The approver never reads the
   fleet's other events, so its cost grows with gated calls, not with
   everything the bots stream, and two automatic approvers (the app and
-  `agent approver`) do not both pay Jev for the same call in normal
+  `sonny approver`) do not both pay Jev for the same call in normal
   running. A takeover can bill a round twice: a holder suspended with a
   Jev request in flight loses the tag, the new holder sends the same
   round, and the old answer is refused when the old holder wakes. That is
@@ -412,11 +412,11 @@ own clock.
   answers only `auto` gates; the app offers Allow and Deny only for
   `manual` gates. So one daemon can run bots in all three modes at
   once, and a program can invent its own tag and serve those bots itself.
-- **`auto` needs its approver running.** The CLI already starts the daemon
-  when it is not running; with `auto` it starts `agent approver` the same
-  way, whenever it makes, continues, or forks a bot that an `auto` gate
-  answers, so a bot continued after a daemon restart gets its approver
-  back. A gated call with no approver waits, parked and visible in
+- **`auto` needs its approver running.** The approver is a client of its
+  own, `sonny approver`, which Sonny keeps as the daemon's companion, so it
+  comes back with the daemon. The CLI judges nothing: when it makes,
+  continues, or forks a bot that an `auto` gate answers and no session
+  serves `auto`, it refuses with `approver_not_serving`. A gated call with no approver waits, parked and visible in
   `approvals`, rather than running or failing silently, until its gate's
   15 s expiry denies it and ends the turn. So if the approver dies and
   nothing restarts it, each auto bot stops at its next gated call with
@@ -538,8 +538,8 @@ this replaced:
   bot that is not a judge.
 
 The approver is a client program with its policy as data, like the CLI's
-default compaction text: `agent approver`, a long-running command, and the
-same module inside the app. It holds the `auto` tag with `serve_approvals`,
+default compaction text: `sonny approver`, a long-running command Sonny keeps
+as the daemon's companion. It holds the `auto` tag with `serve_approvals`,
 so only one instance runs at a time, and answers in layers:
 
 1. **Daemon gate.** Only tools in a bot's `approve` list reach it. The
@@ -729,13 +729,12 @@ so only one instance runs at a time, and answers in layers:
 #### Which model judges
 
 The approver picks its judge in
-`agent_client::judge`: `agent approver --judge PROVIDER/MODEL`, else
+`agent_client::judge`: `sonny approver --judge PROVIDER/MODEL`, else
 `[judge] model` in `~/.agent/config.toml`, else the bot's own model:
-`AGENT_MODEL` for `agent approver`, the bot's model for the approver the
-CLI starts. No smaller model is guessed for a provider (George,
+`AGENT_MODEL`, which Sonny sets to the lead's model when it keeps one. No smaller model is guessed for a provider (George,
 2026-10-27): a cheaper judge is one the config names. `[judge]` is the one
 decision-model setting; its `effort` sets a model judge's effort
-(`agent approver --effort` over it), and unset it is the model's own. Jev
+(`sonny approver --effort` over it), and unset it is the model's own. Jev
 was dropped on 2026-10-27 (George's call): nobody ran it, and on the
 lookout's old judge it woke the lead correctly 0.47 of the time against
 `gpt-6-luna`'s 0.92. OpenAI's Decisions API, an opt-in judge since

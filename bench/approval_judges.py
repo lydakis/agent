@@ -1,9 +1,9 @@
 """Judges compared: labeled tool calls replayed through the daemon and
-`agent approver`, once per judge, with nothing ever run.
+`sonny approver`, once per judge, with nothing ever run.
 
 Each labeled round becomes a bot whose model is a local stand-in that plans
 exactly that round's calls for the round's prompt. The bot has two gates on
-every tool it calls: `auto`, answered by `agent approver` with the judge
+every tool it calls: `auto`, answered by `sonny approver` with the judge
 under test, and `hold`, which nobody allows. A call runs only once every
 gate allows it, so no labeled call runs. When the approver reports its
 verdicts for a round, this script interrupts the turn, which cancels the
@@ -105,7 +105,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
                 assert daemon.poll() is None and time.monotonic() < deadline, 'daemon startup failed'
                 time.sleep(.01)
             control = Connection(sock, retain_durable=False)
-            args = [str(binary), 'approver', '--store', str(store), '--socket', str(sock), '--judge', judge]
+            args = [str(binary.parent / 'sonny'), 'approver', '--store', str(store), '--socket', str(sock), '--judge', judge]
             if reasoning:
                 args += ['--effort', reasoning]
             if note:

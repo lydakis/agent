@@ -1,4 +1,4 @@
-//! The judge that `agent approver` and Sonny's lookout ask yes/no questions
+//! The judge that `sonny approver` and Sonny's lookout ask yes/no questions
 //! of: which one, picked in one order, and how it answers. A judge is a
 //! `provider/model` the daemon runs, as a fork of an idle base bot that
 //! takes one turn, so checks run at once and none sees another.
@@ -130,7 +130,16 @@ impl Base {
                     &format!("{name} is a bot that is not a judge; rename it"),
                 ));
             }
-            Ok(bot) if same(&bot) => return base(&bot),
+            Ok(bot) if same(&bot) => {
+                // A sandbox can go after the judge was made: asking for it
+                // again is refused where none runs now.
+                if !tools.is_empty() {
+                    client
+                        .request("configure", json!({"bot": name, "sandbox": "read-only"}))
+                        .await?;
+                }
+                return base(&bot);
+            }
             Ok(_) => match client.request("delete", json!({"bot": name})).await {
                 Err(error) if error.code != "bot_not_found" => return Err(error),
                 _ => {}

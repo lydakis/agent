@@ -470,8 +470,8 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   it opens a lead whose instructions it saw composed from the folder, and
   leaves ones set any other way alone.
 - `/approvals` picks whether calls wait for a verdict: `auto`, a judge
-  model (a new lead starts here, and Sonny starts `agent approver` when
-  nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
+  model (a new lead starts here, and Sonny keeps `sonny approver` as the
+  daemon's companion when nothing serves it), `ask`, you, or `full`, none. Tasks the lead makes take
   the gate it had; a pick reaches every agent the lead made too, one busy
   now once it is idle. While the judge reviews a call the status row says
   `Reviewing approval request`, and a denied call is drawn as

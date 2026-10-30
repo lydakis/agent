@@ -129,14 +129,6 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
-        name: "approver",
-        about: "Judge a gate's calls with a model, until stopped",
-        usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE]",
-        flags: "--tag --judge --effort --note",
-        settings: "",
-        startup: false,
-    },
-    Command {
         name: "models",
         about: "The models the providers serve",
         usage: "models [--discover]",
@@ -299,7 +291,7 @@ fn print_flags(flags: &str) {
             ),
             "--effort" => (
                 "LEVEL",
-                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn; the approver's judge's (default [judge] effort in ~/.agent/config.toml)",
+                "Effort: low, medium, high, or xhigh; Claude also max. A new bot keeps it (default AGENT_EFFORT on AGENT_MODEL, else the model's own); on an existing bot, for this turn",
             ),
             "--request-id" => (
                 "ID",
@@ -470,15 +462,7 @@ fn print_flags(flags: &str) {
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
-                "The gate to list, answer, or serve; default: the call's only gate, or auto",
-            ),
-            "--note" => (
-                "FILE",
-                "Text the judge always sees: trusted remotes, hosts, limits; default AGENT_APPROVER_NOTE",
-            ),
-            "--judge" => (
-                "PROVIDER/MODEL",
-                "Who judges: any model the daemon serves; default [judge] model in ~/.agent/config.toml, else AGENT_MODEL",
+                "The gate to list or answer; default: the call's only gate, or auto",
             ),
             "--reason" => (
                 "TEXT",

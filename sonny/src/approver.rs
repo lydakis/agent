@@ -1,11 +1,13 @@
-//! `agent approver`: serve a gate tag and have a judge model decide every
+//! `sonny approver`: serve a gate tag and have a judge model decide every
 //! call waiting on it, in one request a round. The policy (what the judge is
 //! told, the verdicts, what it sees, and redaction) is
 //! `agent_client::approver` and the judge's transport `agent_client::judge`;
-//! this is the loop.
+//! this is the loop. Sonny keeps it as the daemon's companion; the daemon
+//! holds only the gates it serves.
 //! As in Codex, a denial goes back to the model at once, and a round the
 //! judge never assessed is denied as a review failure; only a call too long
 //! to show is handed to a person, where one can be asked.
+use agent_client::Error;
 use agent_client::{
     Client,
     approver::{
@@ -14,7 +16,6 @@ use agent_client::{
     },
     judge::{self, Failed, Usage},
 };
-use agent_runtime::{Error, Result};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -67,16 +68,92 @@ const HISTORY_PAGE: usize = 50;
 /// name fits 128 bytes.
 const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - judge::FORK_SUFFIX;
 
+type Result<T> = std::result::Result<T, Error>;
+
+/// What the daemon counts for each prompt a `prompts` read returns, past
+/// its text, against the read's `bytes`.
+const PROMPTS_ENTRY: usize = 64;
+
 fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+const USAGE: &str = "usage: sonny approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--store PATH] [--socket PATH]";
+
+/// `sonny approver`: the flags over the person's `[judge]` in
+/// ~/.agent/config.toml, then `AGENT_MODEL` for the judge, and
+/// `AGENT_APPROVER_NOTE` for the note.
+pub fn run(args: &[String]) -> std::result::Result<(), String> {
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let (mut store, mut socket, mut tag, mut judge, mut effort) = (None, None, None, None, None);
+    let mut note = env("AGENT_APPROVER_NOTE").map(PathBuf::from);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (arg.as_str(), None),
+        };
+        let mut value = || inline.clone().or_else(|| args.next().cloned()).ok_or(USAGE);
+        match flag {
+            "--store" => store = Some(PathBuf::from(value()?)),
+            "--socket" => socket = Some(PathBuf::from(value()?)),
+            "--tag" => tag = Some(value()?),
+            "--judge" => judge = Some(value()?),
+            "--effort" => effort = Some(value()?),
+            "--note" => note = Some(PathBuf::from(value()?)),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let (_, socket) = crate::daemon_paths(store, socket)?;
+    let config = agent_client::config::load()?;
+    let note = note.as_deref().map(read_note).transpose()?;
+    let settings = Settings {
+        socket,
+        tag: tag.unwrap_or_else(|| "auto".into()),
+        judge: judge.or(config.judge.model),
+        caller: env("AGENT_MODEL"),
+        effort: effort.or(config.judge.effort),
+        note,
+    };
+    main(settings).map(drop).map_err(|error| {
+        serde_json::json!({"error": error.code, "detail": error.detail}).to_string()
+    })
+}
+
+/// The note file, which the judge sees whole: refused past what it reads.
+fn read_note(path: &Path) -> std::result::Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let unreadable = || format!("cannot read {}", path.display());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| unreadable())?;
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Err(unreadable());
+    }
+    let limit = policy::STATE_TOKENS * 3;
+    let mut note = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut note)
+        .map_err(|_| unreadable())?;
+    if note.len() > limit {
+        return Err(format!(
+            "{} is over {limit} bytes, more than a judge sees",
+            path.display()
+        ));
+    }
+    String::from_utf8(note).map_err(|_| unreadable())
+}
+
 pub fn main(settings: Settings) -> Result<i32> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
+        .build()
+        .map_err(|e| Error::with("io", &e.to_string()))?
         .block_on(serve(settings))
 }
 
@@ -150,9 +227,7 @@ struct Shared {
 
 async fn serve(settings: Settings) -> Result<i32> {
     let tag = settings.tag.clone();
-    let (client, mut events) = Client::connect(&settings.socket)
-        .await
-        .map_err(Error::from)?;
+    let (client, mut events) = Client::connect(&settings.socket).await?;
     client.bound(IN_FLIGHT);
     let named =
         judge::pick(settings.judge.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
@@ -166,13 +241,13 @@ async fn serve(settings: Settings) -> Result<i32> {
     if !judge::is_model(&named) {
         return Err(Error::with(
             "invalid_judge",
-            format!("{named} is not PROVIDER/MODEL"),
+            &format!("{named} is not PROVIDER/MODEL"),
         ));
     }
     if tag.len() > JUDGE_NAME_ROOM {
         return Err(Error::with(
             "invalid_tag",
-            format!("a judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
+            &format!("a judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
         ));
     }
     let served = client
@@ -180,26 +255,29 @@ async fn serve(settings: Settings) -> Result<i32> {
             "serve_approvals",
             json!({"tag":tag,"lease_ms":LEASE_MS,"limit":256}),
         )
-        .await
-        .map_err(Error::from)?;
+        .await?;
     let (Some(lease), Some(through)) = (served["lease"].as_u64(), served["through"].as_i64())
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
     };
-    let base = judge::Base::make(
-        &client,
-        &format!("approver.{tag}"),
-        &named,
-        settings.effort.as_deref(),
-        policy::JUDGE_INSTRUCTIONS,
-        // It looks before it answers only where a sandbox keeps it
-        // read-only, as Codex's guardian does.
-        match agent_runtime::sandbox::available() {
-            Ok(()) => &judge::LOOKING,
-            Err(_) => &[],
-        },
-    )
-    .await?;
+    // It looks before it answers only where a sandbox keeps it read-only,
+    // as Codex's guardian does: the daemon refuses the sandbox where none
+    // runs.
+    let name = format!("approver.{tag}");
+    let make = |tools: &'static [&'static str]| {
+        judge::Base::make(
+            &client,
+            &name,
+            &named,
+            settings.effort.as_deref(),
+            policy::JUDGE_INSTRUCTIONS,
+            tools,
+        )
+    };
+    let base = match make(&judge::LOOKING).await {
+        Err(error) if error.code == "sandbox_unavailable" => make(&[]).await?,
+        made => made?,
+    };
     let shared = Arc::new(Shared {
         client,
         judge: Judge {
@@ -239,8 +317,7 @@ async fn serve(settings: Settings) -> Result<i32> {
                 "approvals",
                 json!({"tag":tag,"after":after,"through":through,"limit":256}),
             )
-            .await
-            .map_err(Error::from)?;
+            .await?;
     }
     for (bot, turn, calls) in group(waiting) {
         rounds.spawn(round(shared.clone(), bot, turn, calls));
@@ -593,10 +670,7 @@ fn mentions(text: &str, path: &str) -> bool {
 fn prompt_bytes(prompts: &[Value]) -> usize {
     prompts
         .iter()
-        .map(|prompt| {
-            prompt["text"].as_str().map_or(0, str::len)
-                + agent_runtime::store::Database::PROMPTS_ENTRY
-        })
+        .map(|prompt| prompt["text"].as_str().map_or(0, str::len) + PROMPTS_ENTRY)
         .sum()
 }
 

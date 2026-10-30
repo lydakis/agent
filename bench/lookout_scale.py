@@ -2,7 +2,7 @@
 
 One socket daemon on a streaming synthetic model, P projects of T tasks
 each (every project's lead subscribed to its tasks, as Sonny does), and the
-companions in a bot's path: `sonny lookout` and `agent approver`. Phases:
+companions in a bot's path: `sonny lookout` and `sonny approver`. Phases:
 
 - idle: the lookout's start (until every lead is seated), RSS and CPU idle;
 - load: every task runs back-to-back turns that stream K deltas MS apart;
@@ -437,7 +437,7 @@ class Bench:
         self.create(names, tools=('echo', 'shell'), approve=['shell'], approver='auto')
         log = open(self.out / 'approver.out', 'w')
         process = subprocess.Popen(
-            [str(self.agent), 'approver', '--store', str(self.store), '--socket', str(self.socket),
+            [str(self.agent.parent / 'sonny'), 'approver', '--store', str(self.store), '--socket', str(self.socket),
              '--judge', 'openai/synthetic-model'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, env=self.env, text=True,
             start_new_session=True)

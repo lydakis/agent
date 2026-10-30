@@ -1,4 +1,3 @@
-mod approver;
 mod cli;
 mod client;
 mod client_path;

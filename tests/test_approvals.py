@@ -1048,14 +1048,10 @@ class ApprovalCliTests(ModelFixture):
         self.assertNotIn('\x1b', shown)
 
     def test_modes_are_validated_before_anything_is_created(self):
-        # A judge that cannot start leaves no bot waiting on it.
-        home = self.path / 'home'
-        (home / '.agent').mkdir(parents=True)
-        (home / '.agent/config.toml').write_text('[judge]\nmodel = "nowhere/judge"\n')
-        auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False,
-                          env={'HOME': str(home)})
+        # With no approver serving auto, no bot is left waiting on one.
+        auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False)
         self.assertEqual(auto.returncode, 1)
-        self.assertIn('approver_start_failed', auto.stderr)
+        self.assertEqual(json.loads(auto.stderr)['error'], 'approver_not_serving')
         full = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approve', 'shell', 'hi', check=False)
         self.assertEqual(full.returncode, 2)
         self.assertIn('--approval manual', full.stderr)
@@ -1126,7 +1122,7 @@ FAILED = 'Automatic approval review failed: '
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AutoApproverTests(ModelFixture):
-    """`agent approver` serves `auto`: a judge model decides every call."""
+    """`sonny approver` serves `auto`: a judge model decides every call."""
 
     def setUp(self):
         super().setUp()
@@ -1145,7 +1141,7 @@ class AutoApproverTests(ModelFixture):
         """The stand-in judge, unless `judge` names another model the
         daemon serves."""
         process = subprocess.Popen(
-            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), '--judge', judge or f'openai/{Judge.model}'],
             env={**clean_env(), **(env or {})},
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -1213,7 +1209,7 @@ class AutoApproverTests(ModelFixture):
         daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
                        instructions='Help with the repo.', tools=[])
         refused = subprocess.run(
-            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), '--judge', 'openai/judge-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
@@ -1338,7 +1334,7 @@ class AutoApproverTests(ModelFixture):
         self.approver(daemon, judge='openai/judge-model')
         base = daemon.request('inspect', bot='approver.auto')['result']
         refused = subprocess.run(
-            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), '--judge', 'openai/other-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
@@ -1623,7 +1619,7 @@ class AutoApproverTests(ModelFixture):
         # Edited since the bot was made: not what it was given.
         self.assertFalse([f for f in second.get('standing_instructions', []) if f['path'] == str(agents)])
 
-    def test_the_cli_starts_the_approver_for_an_auto_bot(self):
+    def test_an_auto_bot_runs_once_sonny_approver_serves_auto(self):
         store = self.path / 'state.sqlite'
         common = ['--store', str(store), '--provider', f'openai=responses,{self.url}',
                   '--model', 'openai/synthetic-model', '--tools', 'echo,shell,read']
@@ -1632,8 +1628,17 @@ class AutoApproverTests(ModelFixture):
             return subprocess.run([str(self.binary), *args], env=env,
                                   capture_output=True, text=True, timeout=30, cwd=self.path)
         self.addCleanup(lambda: agent('shutdown', '--store', str(store)))
-        # With no judge named and no Haiku listed, the bot's own model
-        # judges, through the daemon.
+        # The CLI judges nothing itself: it refuses until an approver serves.
+        refused = agent('run', *common, '--new', '--bot', 'Bob', 'shell:printf hi > hi')
+        self.assertEqual(json.loads(refused.stderr)['error'], 'approver_not_serving')
+        self.assertEqual(agent('start', *common[:4]).returncode, 0)
+        # With no judge named, the caller's model judges, through the daemon.
+        approver = subprocess.Popen(
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(store)],
+            env={**env, 'AGENT_MODEL': 'openai/synthetic-model'},
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.addCleanup(lambda: (approver.kill(), approver.wait(), approver.stdout.close()))
+        self.assertEqual(json.loads(approver.stdout.readline())['event'], 'serving')
         self.model.reply_for = lambda request, user: allow_all(user) if user.startswith('{"state"') else None
         done = agent('run', *common, '--new', '--bot', 'Bob', 'shell:printf hi > hi')
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1644,7 +1649,6 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools']), ('synthetic-model', LOOKING))
         stats = json.loads(agent('stats', '--store', str(store)).stdout)
         self.assertEqual(stats['approvers'], ['auto'])
-        self.assertTrue((self.path / 'state.sqlite.approver.log').exists())
 
 if __name__ == '__main__':
     unittest.main()

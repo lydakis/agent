@@ -2682,14 +2682,13 @@ The CLI turns a mode into a gate. `run --new --approval manual`, or
 `wait`, `note`, and `echo`, tagged `manual`; `--approve LIST` picks the
 tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools but `read`, tagged `auto`, with a 105 s
-expiry (the approver's 90 s review budget plus margin), and
-starts `agent approver` detached if no session serves `auto`, logging to
-`STORE.approver.log`; its judge is `[judge] model` in `~/.agent/config.toml`, else the bot's own model, and a judge that
-cannot start fails the command before any bot is made
-(`approver_start_failed`). `agent approver [--tag TAG] [--judge
-PROVIDER/MODEL] [--effort LEVEL] [--note FILE]` serves
-a tag and has a judge decide every call waiting on it, printing one JSON
-line per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
+expiry (the approver's 90 s review budget plus margin), and refuses with
+`approver_not_serving`, before any bot is made, when no session serves
+`auto`: the CLI judges nothing. The approver is a client of its own,
+`sonny approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
+[--note FILE]`, which Sonny keeps as the daemon's companion: it serves a
+tag and has a judge decide every call waiting on it, printing one JSON line
+per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
 [--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
 tool shell, and `run --pretty` prints each pending call with the commands
