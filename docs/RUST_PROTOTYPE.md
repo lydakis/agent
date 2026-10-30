@@ -1075,6 +1075,7 @@ own path from the turn. Example requests:
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
+{"id":31,"op":"history_search","bot":"*","query":"checkpoint","before":null}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","request_id":"alt-1"}
 {"id":28,"op":"fork","source":"Bob","bot":"Bob.side","allow":[],"expire_ms":900000,"request_id":"side-1"}
@@ -1101,6 +1102,14 @@ own path from the turn. Example requests:
 {"id":12,"op":"shutdown"}
 {"id":21,"op":"shutdown","grace_ms":30000}
 ```
+
+`history_search` is the history tool's query for clients: literal text, ASCII
+case ignored, in `bot`'s turns, or with a GLOB of `*`, `?` and `[...]` in every
+matching bot's, newest first. It answers as the tool does, `{bots or bot, query,
+matches: [{bot, turn, handle, type, text}], done, next_before}`, up to 20 matches;
+pass `next_before` as `before` for older ones. Like `usage` it reads off the
+dispatch path. Sonny's commons uses it to find a bot whose history touches a new
+thread.
 
 `history_nodes` lists immutable node references in a bot's lineage, newest first,
 including inherited fork history. `from` is an inclusive node ID and defaults to
@@ -2484,7 +2493,9 @@ already waiting is `step_waiting`; a client that closes its session takes
 its waiting steps with it (`step_decided` with `its client stopped
 waiting`), an answer to the call ends them (the waiting request gets
 `no_pending_step`), as does the turn's end (`stale_turn`), and a restart
-drops them all. Schema 63 adds the steps' and paused calls' columns.
+drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
+also adds `history_search`, the history tool's query for clients (see
+`history_nodes` above).
 
 ### Tool approval
 

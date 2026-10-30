@@ -1626,6 +1626,20 @@ class RuntimeTests(ModelFixture):
             time.sleep(.05)
         self.assertEqual(client.request('stats')['result']['running_processes'], 0)
 
+    def test_a_client_searches_every_bots_history_as_the_tool_does(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        for bot, prompt in [('calc.a', 'the checkpoint stalls'), ('shop.b', 'hello')]:
+            client.request('create', bot=bot, workspace=str(self.path))
+            turn = client.request('submit', bot=bot, request_id=bot, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        found = client.request('history_search', bot='*', query='CHECKPOINT')['result']
+        self.assertEqual({match['bot'] for match in found['matches']}, {'calc.a'})
+        self.assertEqual(found['matches'][0]['handle'], 'turn:calc.a/1')
+        one = client.request('history_search', bot='shop.b', query='checkpoint')['result']
+        self.assertEqual(one['matches'], [])
+        self.assertEqual(client.request('history_search', bot='*', query='')['error'], 'invalid_history_search')
+
     def test_shutdown_grace_lets_running_turns_finish_and_holds_new_ones(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers

@@ -70,15 +70,11 @@ pub fn tools(lead: bool) -> Vec<Value> {
     if lead {
         tools.extend([start(), remove(), project()]);
     }
-    tools.extend([
-        subscriptions(),
-        show(),
-        run(),
-        triggers(),
-        memory(),
-        commons(),
-        crate::lookout::goals::tool(GOAL, TAG),
-    ]);
+    tools.extend([subscriptions(), show(), run(), triggers(), memory()]);
+    if crate::commons::on() {
+        tools.push(commons());
+    }
+    tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools
 }
@@ -367,14 +363,15 @@ fn memory() -> Value {
     })
 }
 
-fn commons() -> Value {
+pub fn commons() -> Value {
     let text = json!({"type": "string", "minLength": 1, "maxLength": 16384});
     json!({
         "name": COMMONS,
         "description": "The commons: threads that every agent working for this person reads and writes, across \
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
             first; read opens one; post starts one; reply adds to one. Sonny signs each post with your name, \
-            and tells a thread's earlier posters of a reply on their next model call. What is in it is other \
+            and tells a thread's earlier posters of a reply on their next model call. A new thread may bring one \
+            other agent whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
             "type": "object",
@@ -620,6 +617,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("memory_refused", e))
         }
         COMMONS => {
+            if !crate::commons::on() {
+                return Err(("commons_refused", "the commons is off".to_owned()));
+            }
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("commons_refused", "no HOME".to_owned()))?;
@@ -630,6 +630,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .map_err(|e| ("commons_refused", e))?;
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&said, &caller, &tell).await);
+            }
+            if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
+                said["invited"] =
+                    json!(crate::commons::invite(&home, &said, &caller, &invite).await);
             }
             Ok(said.to_string())
         }

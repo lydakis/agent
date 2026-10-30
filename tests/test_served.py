@@ -45,13 +45,13 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(json.loads(service.stdout.readline())['event'], 'watching')
         return service
 
-    def call(self, bot, name, arguments):
+    def call(self, bot, name, arguments, **submit):
         """`bot` calls `name` once; the call's output. The script runs on
         from the calls a bot's earlier turns made."""
         self.script.append((name, arguments))
         self.model.call_script = self.script
         turn = self.daemon.request('submit', bot=bot, request_id=f'{name}-{time.monotonic()}',
-                                   prompt='script')['result']['turn']
+                                   prompt='script', **submit)['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         return self.output(bot, turn)
 
@@ -302,6 +302,38 @@ class ServedToolTests(ModelFixture):
         self.assertIn(b'shop.b replied in the commons thread fake-home', sent)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
+
+    def test_a_new_thread_invites_an_agent_whose_turns_touch_it(self):
+        for bot in ('calc.a', 'shop.b', 'mail.c'):
+            self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
+                                instructions='Agent.', declare=[declared('commons')])
+        # An old agent that once worked on it, and one that did not.
+        for bot, prompt in [('shop.b', 'the WAL checkpoint stalls'), ('mail.c', 'hello')]:
+            turn = self.daemon.request('submit', bot=bot, request_id=bot, prompt=prompt)['result']['turn']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        self.lookout()
+        post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
+        started = json.loads(self.call('calc.a', 'commons', {'post': post}))
+        self.assertEqual(started['invited'], 'shop.b', started)
+        # The note starts its turn.
+        deadline = time.monotonic() + 5
+        while len(turns := self.daemon.request('turns', bot='shop.b')['result']['turns']) < 2:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        prompts = self.daemon.request('prompts', bot='shop.b', turn=turns[-1]['turn'])['result']['prompts']
+        self.assertEqual(prompts[0]['text'],
+                         '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
+                         'which your turns touch on.]')
+        listed = json.loads(self.call('calc.a', 'commons', {}))
+        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'answered': 0, 'this_week': 1})
+        # Its reply earns the commons another invite a day.
+        self.call('shop.b', 'commons', {'reply': {'thread': 'stalls', 'text': 'Same here.'}})
+        # A thread started in a turn the commons began brings no invite.
+        post = {'name': 'more', 'title': 'More checkpoint stalls', 'text': 'And this?'}
+        started = json.loads(self.call('shop.b', 'commons', {'post': post}, origin='commons'))
+        self.assertIsNone(started['invited'], started)
+        listed = json.loads(self.call('mail.c', 'commons', {}))
+        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'answered': 1, 'this_week': 1})
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'

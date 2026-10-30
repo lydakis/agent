@@ -406,6 +406,14 @@ enum Command {
         bot: String,
         nodes: Vec<i64>,
     },
+    /// Literal text in a bot's history, or with a GLOB pattern every
+    /// matching bot's, newest first, as the history tool's query finds
+    /// it. A read.
+    HistorySearch {
+        bot: String,
+        query: String,
+        before: Option<i64>,
+    },
     /// A turn's prompts with who wrote each, its started calls, and the
     /// bot's earlier prompts, within `bytes` of text.
     Prompts {
@@ -3820,6 +3828,22 @@ impl Service {
                 store
                     .read("history_items", move |db| db.history_items(&bot, &nodes))
                     .await
+            }
+            Command::HistorySearch { bot, query, before } => {
+                // Off the dispatch path, as usage is: a pattern reads every
+                // matching bot's history.
+                let (reader, output) = (store.reader(), output.clone());
+                tokio::spawn(async move {
+                    let many = bot.contains(['*', '?', '[']);
+                    let result = reader
+                        .read("history_search", move |db| match many {
+                            true => db.history_search_bots(&bot, &query, before, None),
+                            false => db.history_search(&bot, &query, before, false),
+                        })
+                        .await;
+                    retention_reply(session, &output, id, result).await;
+                });
+                Err(Error::new("deferred"))
             }
             Command::Prompts { bot, turn, bytes } => {
                 store
