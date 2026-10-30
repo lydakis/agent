@@ -751,7 +751,7 @@ impl Clock {
     }
 
     /// Take the script's place back once a call's verdict came, waiting
-    /// for one as a new script does, with the time running.
+    /// for one as a new script does, with the time still stopped.
     async fn take_place(&self) -> Result<(), String> {
         let _one = self.returning.lock().await;
         if self.place.lock().unwrap().is_none() {
@@ -1068,9 +1068,11 @@ impl Caller {
                     .spawn(async move { steps.ask(&id, asked).await }),
             );
             let approved = approval.await;
+            // Whatever the verdict, the script runs on from here, its time
+            // starting again once it has a place, as a new script's does.
+            let placed = self.clock.take_place().await;
             drop(stopped);
-            // Whatever the verdict, the script runs on from here.
-            if let Err(error) = self.clock.take_place().await {
+            if let Err(error) = placed {
                 return json!({"error": error});
             }
             match approved {
