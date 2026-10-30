@@ -294,7 +294,10 @@ fn reserve(dir: &Path, thread: &str) -> Option<bool> {
     if budget["today"].as_u64() >= budget["a_day"].as_u64() {
         return None;
     }
-    let golden = count % GOLDEN_EVERY == GOLDEN_EVERY - 1;
+    // Its place counts those still being sent, so two at once neither
+    // share a golden ticket nor skip one.
+    let pending = sent.iter().filter(|invite| invite["bot"].is_null()).count() as u64;
+    let golden = (count + pending) % GOLDEN_EVERY == GOLDEN_EVERY - 1;
     sent.push(json!({"thread": thread, "at": now(), "golden": golden}));
     keep(dir, &sent, count).then_some(golden)
 }
@@ -1036,6 +1039,9 @@ mod tests {
             call(&home, "a.x", None, &post).unwrap()["invite"]["golden"] == true
         };
         assert!(post("tenth"));
+        // One posted while the tenth is still being sent is the eleventh.
+        assert!(!post("meanwhile"));
+        settle(&dir, "meanwhile", None);
         // Given back, it is still the tenth to send; sent, the next is not.
         settle(&dir, "tenth", None);
         assert!(post("again"));
