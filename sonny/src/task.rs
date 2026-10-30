@@ -46,8 +46,10 @@ pub struct Start {
 /// The task a fork copies, and its files after the turn it copies.
 struct Source {
     name: String,
-    /// The top of its worktree, which its snapshot holds.
+    /// The top of its worktree, which its snapshot holds, and where in
+    /// it the task worked.
     top: PathBuf,
+    prefix: PathBuf,
     snapshot: crate::snapshot::Snapshot,
 }
 
@@ -93,11 +95,11 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         flags.extend(["--effort".to_owned(), effort]);
     }
     let source = match &start.from {
-        Some(from) => Some(source(&agent, project, from, start, here)?),
+        Some(from) => Some(source(&agent, project, from, start)?),
         None => None,
     };
     let mut place = match &source {
-        Some(source) => forked(here, name, source)?,
+        Some(source) => forked(name, source)?,
         None if info["threads_in"] == "project" => in_place(here),
         None => worktree(here, name)?,
     };
@@ -798,13 +800,7 @@ fn record(agent: &Path, name: &str) -> Option<Value> {
 
 /// The task of `project` named `from` that a start forks, and its files
 /// after `start.turn`, or after its newest turn that kept them.
-fn source(
-    agent: &Path,
-    project: &str,
-    from: &str,
-    start: &Start,
-    here: &Path,
-) -> Result<Source, String> {
+fn source(agent: &Path, project: &str, from: &str, start: &Start) -> Result<Source, String> {
     if start.profile.is_some() || start.model.is_some() || start.effort.is_some() {
         return Err("a fork keeps its source's role, model and effort; name none".into());
     }
@@ -820,29 +816,45 @@ fn source(
     let bot_id = bot["bot_id"]
         .as_i64()
         .ok_or("the daemon listed no bot_id")?;
+    // Its repository, which need not be the lead's: a lead's folder may
+    // hold several, or be in none.
+    let top = crate::snapshot::top(&workspace)
+        .filter(|top| is_worktree(top))
+        .ok_or_else(|| format!("{name} works in no worktree of its own"))?;
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let prefix = (real(&workspace).strip_prefix(real(&top)))
+        .map_err(|_| format!("{name} works outside its worktree"))?
+        .to_owned();
     let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
-    let snapshot = crate::snapshot::find(here, &refs, bot_id, start.turn)
+    let snapshot = crate::snapshot::find(&top, &refs, bot_id, start.turn)
         .map_err(|e| format!("{name}: {e}"))?;
-    let top = crate::snapshot::top(&workspace).unwrap_or(workspace);
     Ok(Source {
         name,
         top,
+        prefix,
         snapshot,
     })
 }
 
-/// A git worktree on branch agent/NAME holding the files `source` had
-/// after its turn, on the commit it was on, in the lead's subfolder of it.
-fn forked(here: &Path, name: &str, source: &Source) -> Result<Place, String> {
-    let top = PathBuf::from(git(here, &["rev-parse", "--show-toplevel"])?);
-    let prefix = git(here, &["rev-parse", "--show-prefix"])?;
+/// A git worktree of `source`'s repository on branch agent/NAME holding
+/// the files it had after its turn, on the commit it was on, in the folder
+/// of it `source` worked in.
+fn forked(name: &str, source: &Source) -> Result<Place, String> {
+    // The repository's own checkout, whose paths a brief names; a bare
+    // one has none, and the source's worktree stands in.
+    let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    let common = PathBuf::from(git(&source.top, &args)?);
+    let here = match common.file_name().is_some_and(|name| name == ".git") {
+        true => common.parent().map_or(source.top.clone(), Path::to_owned),
+        false => source.top.clone(),
+    };
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let branch = format!("agent/{name}");
     if path.exists() {
         return Err(format!("{} exists; pick another name", path.display()));
     }
     let indexes = crate::snapshot::indexes(&crate::daemon_paths(None, None)?.0);
-    crate::snapshot::restore(here, &source.snapshot, &path, &branch, &indexes)?;
+    crate::snapshot::restore(&here, &source.snapshot, &path, &branch, &indexes)?;
     let mut note = format!(
         "{name}: a worktree at {} on branch {branch}, with {}'s files as they were after its \
          turn {}, changes since its last commit uncommitted as they were",
@@ -857,14 +869,14 @@ fn forked(here: &Path, name: &str, source: &Source) -> Result<Place, String> {
         );
     }
     Ok(Place {
-        dir: within(&path, Path::new(prefix.trim_end_matches('/'))),
+        dir: within(&path, &source.prefix),
         note: Some(note),
         undo: Undo::Worktree {
-            here: here.to_owned(),
+            here: here.clone(),
             path: path.clone(),
             branch,
         },
-        copy: Some((top, path)),
+        copy: Some((here, path)),
     })
 }
 

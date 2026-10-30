@@ -664,6 +664,13 @@ impl Service {
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
+        // Turns begun before the lookout watched, whose start it may not
+        // hear again.
+        crate::snapshot::running_now(
+            (bots.iter())
+                .filter(|b| b["status"] == "running")
+                .filter_map(|b| Some((b["name"].as_str()?, Path::new(b["workspace"].as_str()?)))),
+        );
         self.subscribers = subs::all(&self.store).into_iter().collect();
         for bot in &bots {
             self.seat(&client, bot).await;
@@ -763,7 +770,7 @@ impl Service {
                     let event = whole_margin_call(&client, event).await;
                     served.event(&event);
                     streaming |= event["event"] == "follow_live";
-                    self.snapshot(&client, &event, streaming);
+                    self.snapshot(&event, streaming);
                     // A `subscriptions` call this lookout answered counts
                     // from the next event on, not from the next tick.
                     if served.subscribed() {
@@ -942,7 +949,7 @@ impl Service {
     /// are taken only once `streaming`, so a replay never takes one of
     /// files that changed since, but a deleted bot's are dropped either
     /// way.
-    fn snapshot(&mut self, client: &Arc<Client>, event: &Value, streaming: bool) {
+    fn snapshot(&mut self, event: &Value, streaming: bool) {
         let (Some(bot), Some(kind)) = (event["bot"].as_str(), event["event"].as_str()) else {
             return;
         };
@@ -954,6 +961,7 @@ impl Service {
                 if let Some(workspace) = data["workspace"].as_str() {
                     let workspace = PathBuf::from(workspace);
                     crate::snapshot::worked(&workspace);
+                    crate::snapshot::running(bot, Some(&workspace));
                     self.working.insert((bot.to_owned(), turn), workspace);
                 }
                 return;
@@ -963,11 +971,13 @@ impl Service {
                 // bot is.
                 let folder = (self.working.remove(&(bot.to_owned(), turn)))
                     .or_else(|| record?["workspace"].as_str().map(PathBuf::from));
+                crate::snapshot::running(bot, None);
                 let Some(folder) = folder else { return };
                 let ended = crate::snapshot::worked(&folder);
                 (folder, ended)
             }
             ("deleted", _) => {
+                crate::snapshot::running(bot, None);
                 self.working.retain(|(name, _), _| name != bot);
                 let Some(folder) = record.and_then(|r| r["workspace"].as_str()) else {
                     return;
@@ -999,7 +1009,7 @@ impl Service {
                     checkpoint,
                     ended,
                 };
-                tokio::spawn(crate::snapshot::after_turn(client.clone(), done));
+                tokio::spawn(crate::snapshot::after_turn(done));
             }
             // A task's own folder may be gone, and `remove_task` drops its
             // snapshots once it is.

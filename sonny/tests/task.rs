@@ -420,18 +420,57 @@ fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
 }
 
 #[test]
+fn a_fork_is_made_in_its_source_s_repository_from_a_lead_folder_outside_git() {
+    let lab = Lab::new("fork-nested");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let source = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::write(source.join("src/lib.rs"), "three\n").unwrap();
+    snapshot(&lab, &source, 12, 77);
+    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
+        "workspace": source.join("src")}]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    // A lead's folder that holds repositories and is in none.
+    let workspace = lab.scratch.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let (ok, said) = lab.tool(
+        &workspace,
+        "start_task",
+        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
+        false,
+    );
+    assert!(ok, "{said}");
+    let copy = lab.home.join(".agent/worktrees/demo.try");
+    assert_eq!(
+        std::fs::read_to_string(copy.join("src/lib.rs")).unwrap(),
+        "three\n"
+    );
+    let ran = lab.ran();
+    assert_eq!(ran[5], copy.join("src").to_string_lossy());
+    // A worktree of the source's repository, on the fork's branch.
+    assert_eq!(
+        lab.git(&copy, &["branch", "--show-current"]),
+        "agent/demo.try"
+    );
+    let listed = lab.git(&lab.repo, &["worktree", "list", "--porcelain"]);
+    assert!(listed.contains("demo.try"), "{listed}");
+}
+
+#[test]
 fn a_fork_whose_files_lead_out_of_its_worktree_starts_nothing() {
     let lab = Lab::new("fork-out");
     let (ok, said) = lab.task(false, false);
     assert!(ok, "{said}");
-    // A task's commit, as any task can write one, makes the lead's
-    // subfolder a link to the home.
+    // A task's files, as any task can write them, make the folder it
+    // works in a link to the home, then a folder again.
     let source = lab.home.join(".agent/worktrees/demo.fix");
-    std::fs::remove_dir_all(source.join("src")).unwrap();
+    std::fs::rename(source.join("src"), source.join("kept")).unwrap();
     std::os::unix::fs::symlink(&lab.home, source.join("src")).unwrap();
     snapshot(&lab, &source, 12, 77);
+    std::fs::remove_file(source.join("src")).unwrap();
+    std::fs::rename(source.join("kept"), source.join("src")).unwrap();
     let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
-        "workspace": source}]);
+        "workspace": source.join("src")}]);
     std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
     let (ok, err) = lab.tool(
         &lab.repo.join("src"),

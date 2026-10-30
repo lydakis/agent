@@ -528,6 +528,40 @@ static WORKED: std::sync::LazyLock<
     std::sync::Mutex<(u64, std::collections::HashMap<PathBuf, u64>)>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The folder each bot works in now, as the lookout saw its turns start
+/// and end: by its real path.
+static RUNNING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Note that `bot` works in `workspace` now, or, with `None`, no longer.
+pub fn running(bot: &str, workspace: Option<&Path>) {
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    match workspace {
+        Some(workspace) => {
+            let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
+            running.insert(bot.to_owned(), real);
+        }
+        None => {
+            running.remove(bot);
+        }
+    }
+}
+
+/// Start over from the bots `listed` as running, each in its folder.
+pub fn running_now<'a>(listed: impl Iterator<Item = (&'a str, &'a Path)>) {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    for (bot, workspace) in listed {
+        running(bot, Some(workspace));
+    }
+}
+
+/// Whether an agent works in the checkout `top` now: from what the
+/// lookout already knows, so a snapshot asks the daemon nothing.
+fn busy(top: &Path) -> bool {
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    running.values().any(|folder| folder.starts_with(top))
+}
+
 /// Note that a turn started or ended in `workspace`; how many have now.
 pub fn worked(workspace: &Path) -> u64 {
     let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
@@ -583,7 +617,7 @@ pub struct Completed {
 /// stream, so a big checkout never holds it up. It is late if an agent
 /// worked in the checkout since, or works there now. What happens is a
 /// line of its log.
-pub async fn after_turn(client: std::sync::Arc<agent_client::Client>, done: Completed) {
+pub async fn after_turn(done: Completed) {
     let Completed {
         refs,
         indexes,
@@ -608,7 +642,7 @@ pub async fn after_turn(client: std::sync::Arc<agent_client::Client>, done: Comp
         Ok(Ok(None)) | Err(_) => return,
         Ok(Err(error)) => return failed(bot_id, turn, &error),
     };
-    let late = worked_since(&staged.top, ended) || busy(&client, &staged.top).await;
+    let late = worked_since(&staged.top, ended) || busy(&staged.top);
     let committed =
         tokio::task::spawn_blocking(move || commit(&staged, &refs, bot_id, turn, checkpoint, late))
             .await;
@@ -641,40 +675,6 @@ fn failed(bot_id: i64, turn: i64, error: &str) {
         serde_json::json!({"event": "snapshot_failed", "bot_id": bot_id, "turn": turn,
             "error": error})
     );
-}
-
-/// Whether an agent works in the checkout `top` now; unknown counts as
-/// one does.
-async fn busy(client: &agent_client::Client, top: &Path) -> bool {
-    let mut after = serde_json::Value::Null;
-    loop {
-        let Ok(page) = client
-            .request(
-                "bots",
-                serde_json::json!({"active": true, "limit": 256, "after": after}),
-            )
-            .await
-        else {
-            return true;
-        };
-        let inside = |bot: &serde_json::Value| {
-            bot["workspace"].as_str().is_some_and(|dir| {
-                std::fs::canonicalize(dir)
-                    .unwrap_or_else(|_| PathBuf::from(dir))
-                    .starts_with(top)
-            })
-        };
-        if page["bots"]
-            .as_array()
-            .is_some_and(|bots| bots.iter().any(inside))
-        {
-            return true;
-        }
-        match &page["next_after"] {
-            serde_json::Value::Null => return false,
-            next => after = next.clone(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1087,6 +1087,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "mine\n");
         assert!(!std::fs::symlink_metadata(&index).unwrap().is_symlink());
         assert!(!top.join(".git/agent-snapshot.index").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_checkout_is_busy_while_an_agent_works_in_it() {
+        let dir = scratch("busy");
+        let (one, two) = (dir.join("one"), dir.join("two"));
+        std::fs::create_dir_all(one.join("sub")).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        running("busy.a", Some(&one.join("sub")));
+        running("busy.b", Some(&two));
+        assert!(busy(&one) && busy(&two));
+        running("busy.a", None);
+        assert!(!busy(&one) && busy(&two));
+        running("busy.b", None);
+        assert!(!busy(&two));
         let _ = std::fs::remove_dir_all(dir);
     }
 
