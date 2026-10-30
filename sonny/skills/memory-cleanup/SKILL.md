@@ -56,7 +56,11 @@ of it ends `tool_unserved`, run the same command with
    out when that is null). It lists what the person wrote to any agent
    since the last cleanup, newest first, each message with its agent
    (`bot`), `turn`, `text` and `project` (null when the agent's folder is
-   in none); `cut: true` means older messages were left out. Save a fact
+   in none); `cut: true` means older messages were left out. A message
+   with `reacted_to` is their reaction to the agent's reply that begins
+   with that line (null when the reply is out of reach): feedback on that
+   reply. One with `recommended` answers an agent's ask, and names the
+   option the agent recommended. Save a fact
    for what they said that a later agent would otherwise have to ask
    again and no fact holds yet: a decision and why, a correction, how
    they want work done, a constraint, where something lives. Follow the
@@ -87,6 +91,19 @@ of it ends `tool_unserved`, run the same command with
    - Save how they took what an agent did or said unasked, welcomed or
      pushed back on, to the fact that holds how far agents may go on
      their own, or a new `feedback` fact. Later agents follow it.
+   - Look the same way for what worked: an approach they welcomed in
+     words or with a reaction, or picked when an agent recommended it,
+     more than once. Save it as a `feedback` fact with each time's
+     source (`turn:BOT/TURN`) and date in its text, or add to the one
+     that holds it, and raise its `confirmed` count by the times not
+     listed there yet; raise `pushed_back` the same way on a fact whose
+     approach they pushed back on or picked against. A turn can reach
+     two nights, so a time already listed counts nothing again. Save the
+     approach, never that they liked being agreed with. Picking against
+     the recommendation on one kind of question again and again is a
+     preference too: save what they pick.
+   - A fact pushed back on more times than it was confirmed no longer
+     holds: remove it, or save what still holds.
    - Only what the person wrote counts. In chat and mail read what they
      sent, not what others sent them, and save nothing about other
      people. Read only: send, reply, mark or move nothing there. A fact

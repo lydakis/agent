@@ -10411,7 +10411,7 @@ mod tests {
             }
         })
         .await;
-        let read = said::said(&client, 1000).await.unwrap();
+        let read = said::said(&client, None, 1000).await.unwrap();
         assert_eq!(
             read,
             json!({"since_ms": 1000, "cut": false, "said": [
@@ -10421,6 +10421,151 @@ mod tests {
                     "project": null}]})
         );
         std::fs::remove_dir_all(shop).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_reads_the_persons_reactions_and_picks_with_what_each_answers() {
+        let message = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
+        };
+        let ask = json!({"question": "Ship it now?", "why": "w", "reason": "r",
+            "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
+        let items = json!([
+            // An answer to an ask, with what the ask recommended.
+            {"node": 17, "item": message("user", "You asked: Ship it now?\n\nLater")},
+            {"node": 16, "item": {"type": "function_call", "name": "ask", "call_id": "c1",
+                "arguments": ask.to_string()}},
+            // One to an older reply names it; one to the last reply is the
+            // emoji alone, and answers the reply before it.
+            {"node": 15, "item": message("user", "> Tagged 0.6.0.\n\n🎉")},
+            {"node": 14, "item": message("user", "👍")},
+            {"node": 13, "item": message("user", "👀"), "from": {"bot": "shop.fix", "turn": 1}},
+            {"node": 12, "item": message("assistant",
+                "\nSplit the review into a task of its own.\nIt runs now.")},
+            {"node": 11, "item": message("user", "Review the cart change.")}]);
+        let nodes: Vec<Value> = (items.as_array().unwrap().iter())
+            .map(|entry| json!({"node": entry["node"], "turn": if entry["node"] == 11 || entry["node"] == 12 { 3 } else { 4 }}))
+            .collect();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "turns" => json!({"turns": [
+                {"turn": 4, "started_ms": 2500, "finished_ms": 2600},
+                {"turn": 3, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
+                    "history_nodes" => json!({"nodes": nodes, "next_from": null}),
+                    "history_items" => json!({"items": items}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let read = said::said(&client, None, 1000).await.unwrap();
+        let entry = |turn: i64, text: &str| json!({"bot": "shop.lead", "turn": turn, "text": text, "project": null});
+        let mut answer = entry(4, "You asked: Ship it now?\n\nLater");
+        answer["recommended"] = json!("Now");
+        let mut older = entry(4, "🎉");
+        older["reacted_to"] = json!("Tagged 0.6.0.");
+        let mut last = entry(4, "👍");
+        last["reacted_to"] = json!("Split the review into a task of its own.");
+        assert_eq!(
+            read["said"],
+            json!([answer, older, last, entry(3, "Review the cart change.")])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_counts_only_reactions_still_on_and_reads_anthropic_asks() {
+        let message = |role: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": "text", "text": text}]});
+        let ask = json!({"question": "Ship it now?", "why": "w", "reason": "r",
+            "options": [{"label": "Now"}, {"label": "Later"}], "recommended": 1});
+        let tag = json!({"question": "Tag it too?", "options": [{"label": "Yes"}, {"label": "No"}],
+            "recommended": 1});
+        let items = json!([
+            // An answer against what the ask recommended.
+            {"node": 13, "item": message("user", "You asked: Tag it too?\n\nNo")},
+            // A 🙌 on the last finished reply, which waited for its call
+            // while another reply was written.
+            {"node": 12, "item": message("user", "🙌")},
+            {"node": 11, "item": message("assistant", "Still working.")},
+            // A 🚀 on the older of two replies that begin alike.
+            {"node": 10, "item": message("user", "> Done.\n\n🚀")},
+            {"node": 9, "item": message("user", "You asked: Ship it now?\n\nNow")},
+            // A 👍 on the ask's reply, taken off and put on again: once.
+            {"node": 8, "item": message("user", "👍")},
+            {"node": 7, "item": message("user", "👍")},
+            // An Anthropic reply holds its ask as a `tool_use` block.
+            {"node": 6, "item": {"role": "assistant", "content": [
+                {"type": "text", "text": "Ready to ship."},
+                {"type": "tool_use", "id": "t1", "name": "ask", "input": ask},
+                {"type": "tool_use", "id": "t2", "name": "ask", "input": tag}]}},
+            // A 🎉 on an older reply, taken off since.
+            {"node": 5, "item": message("user", "> Split the review.\n\n🎉")},
+            {"node": 4, "item": message("assistant", "Split the review.")},
+            {"node": 3, "item": message("assistant", "Done.")},
+            {"node": 2, "item": message("assistant", "Done.")}]);
+        let nodes: Vec<Value> = (items.as_array().unwrap().iter())
+            .map(|entry| json!({"node": entry["node"], "turn": 2}))
+            .collect();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => {
+                        json!({"bots": [{"name": "shop.lead", "bot_id": 3}], "next_after": null})
+                    }
+                    "turns" => {
+                        json!({"turns": [{"turn": 2, "started_ms": 1500, "finished_ms": 1800}],
+                    "next_before": null})
+                    }
+                    "history_nodes" => json!({"nodes": nodes, "next_from": null}),
+                    "history_items" => json!({"items": items}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let home = std::env::temp_dir().join(format!("said-reactions-{}", std::process::id()));
+        let store = home.join("state.sqlite");
+        let dir = home.join(".agent/sonny/reactions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = reactions::key(&store, 3);
+        std::fs::write(
+            dir.join(format!("{key}.json")),
+            r#"{"6": ["👍", "🙌"], "2": ["🚀"]}"#,
+        )
+        .unwrap();
+        let read = said::said(&client, Some((&home, &store)), 1000)
+            .await
+            .unwrap();
+        let entry =
+            |text: &str| json!({"bot": "shop.lead", "turn": 2, "text": text, "project": null});
+        let mut answer = entry("You asked: Ship it now?\n\nNow");
+        answer["recommended"] = json!("Now");
+        let mut liked = entry("👍");
+        liked["reacted_to"] = json!("Ready to ship.");
+        let mut launched = entry("🚀");
+        launched["reacted_to"] = json!("Done.");
+        let mut cheered = entry("🙌");
+        cheered["reacted_to"] = json!("Ready to ship.");
+        let mut against = entry("You asked: Tag it too?\n\nNo");
+        against["recommended"] = json!("Yes");
+        assert_eq!(
+            read["said"],
+            json!([against, cheered, launched, answer, liked])
+        );
+        // Without the windows' file, nothing says which were taken off.
+        let read = said::said(&client, None, 1000).await.unwrap();
+        let mut older = entry("🎉");
+        older["reacted_to"] = json!("Split the review.");
+        cheered["reacted_to"] = json!("Still working.");
+        assert_eq!(
+            read["said"],
+            json!([against, cheered, launched, answer, liked, older])
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]

@@ -2,7 +2,11 @@
 //! cleanup to find what no agent saved, as Codex mines finished sessions
 //! and OpenClaw's dreaming reads the day's notes. The person's words only:
 //! a prompt another agent or a named client sent, and a tool's result, are
-//! left out, so the cleanup learns nothing from text no person wrote.
+//! left out, so the cleanup learns nothing from text no person wrote. Their
+//! reactions to a bot's replies are in too, each with the first line of the
+//! reply it answers, as ChatGPT Pulse keeps feedback with the card it was
+//! on, so the cleanup can tell what they welcomed.
+use crate::reactions::Reactions;
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::borrow::Borrow;
@@ -14,14 +18,22 @@ use std::path::{Path, PathBuf};
 const BYTES: usize = 56 * 1024;
 /// The most of one message returned; the rest is cut.
 const MESSAGE_BYTES: usize = 4 * 1024;
+/// The most of a reply's first line a reaction carries.
+const REPLY_CHARS: usize = 200;
 /// How far back the cleanup looks when no earlier one finished.
 pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Every message the person wrote to an agent at or after `since_ms`,
 /// newest first, each with its agent, turn, and the project whose memory
 /// the turn's folder reads (null for none). The one that started a turn
-/// before `since_ms` is older, though the turn still ran after.
-pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
+/// before `since_ms` is older, though the turn still ran after. With the
+/// `home` and canonical store path the windows keep reactions under, a
+/// reaction the person took back since is left out.
+pub async fn said(
+    client: &Client,
+    kept: Option<(&Path, &Path)>,
+    since_ms: i64,
+) -> Result<Value, String> {
     let failed = |e: agent_client::Error| format!("said_unread: {e}");
     let mut said = Newest::default();
     let mut after = Value::Null;
@@ -46,17 +58,35 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
                 (turns.get(&turn).and_then(|t| t.started_ms)).is_none_or(|ms| ms >= since_ms)
             };
             let mut held: Option<(i64, i64, Value)> = None;
+            // What the bot's replies are reacted with now, by node; none
+            // when no window kept a file for it.
+            let on = kept
+                .zip(bot["bot_id"].as_i64())
+                .and_then(|((home, store), id)| {
+                    Reactions::kept(home, &crate::reactions::key(store, id))
+                });
+            // Reactions, kept as they are read and each waiting for the
+            // reply it answers, which comes later walking back: the next
+            // reply for one to the bot's last reply, else a reply it
+            // quotes.
+            let mut waiting: Vec<Waiting> = Vec::new();
+            // The oldest node walked.
+            let mut oldest = i64::MAX;
+            // Answers to the bot's asks, each waiting for the ask it
+            // answers, which comes later walking back, for what it
+            // recommended.
+            let mut answers: Vec<(String, i64)> = Vec::new();
             walk(client, name, first, |turn, entry| {
                 if held.as_ref().is_some_and(|(at, ..)| *at != turn)
                     && let Some((at, node, message)) = held.take()
                     && opened(at)
                 {
-                    said.add(node, message);
+                    admit(&mut said, &mut answers, node, message);
                 }
+                let project = turns.get(&turn).and_then(|t| t.project.clone());
                 let later = match crate::lookout::said_by_person(entry) {
                     Some(node) => {
                         let text = cut(crate::text(&entry["item"]));
-                        let project = turns.get(&turn).and_then(|t| t.project.clone());
                         let message =
                             json!({"bot": name, "turn": turn, "text": text, "project": project});
                         held.replace((turn, node, message))
@@ -64,8 +94,56 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
                     None => held.take(),
                 };
                 if let Some((_, node, message)) = later {
-                    said.add(node, message);
+                    admit(&mut said, &mut answers, node, message);
                 }
+                if let Some((node, quote, emoji)) = reaction(entry)
+                    // One no reply holds now was taken off: it takes no room.
+                    && (on.as_ref()).is_none_or(|on| on.before(i64::MAX, &emoji))
+                {
+                    said.add(
+                        node,
+                        json!({"bot": name, "turn": turn, "text": emoji,
+                        "reacted_to": quote, "project": project}),
+                    );
+                    waiting.retain(|waiting| said.kept.contains_key(&waiting.node));
+                    waiting.push(Waiting { node, quote, emoji });
+                }
+                for (question, recommended) in asked(entry) {
+                    if let Some(at) = answers.iter().position(|(q, _)| *q == question) {
+                        let (_, node) = answers.remove(at);
+                        said.amend(node, "recommended", json!(recommended));
+                    }
+                }
+                if let Some(reply) = reply(entry)
+                    && let Some(at) = entry["node"].as_i64()
+                {
+                    let quoted = crate::transcript::cut(&reply, crate::QUOTED);
+                    let has = |emoji: &str| {
+                        on.as_ref()
+                            .is_none_or(|on| on.on(at).iter().any(|e| e == emoji))
+                    };
+                    // Each emoji once per reply, the newest kept.
+                    let mut counted: Vec<String> = Vec::new();
+                    waiting.retain_mut(|waiting| {
+                        // The newest reply it can answer that holds it: a
+                        // reply of the bot's may come between the reply and
+                        // a reaction that waited for its call, and two
+                        // replies may begin alike.
+                        let can = (waiting.quote.as_ref()).is_none_or(|quote| *quote == quoted);
+                        if !(can && has(&waiting.emoji)) {
+                            return true;
+                        }
+                        if counted.contains(&waiting.emoji) {
+                            // Put on again.
+                            said.remove(waiting.node);
+                        } else {
+                            counted.push(waiting.emoji.clone());
+                            said.amend(waiting.node, "reacted_to", json!(cut_reply(&reply)));
+                        }
+                        false
+                    });
+                }
+                oldest = oldest.min(entry["node"].as_i64().unwrap_or(i64::MAX));
                 false
             })
             .await
@@ -73,7 +151,20 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
             if let Some((at, node, message)) = held
                 && opened(at)
             {
-                said.add(node, message);
+                admit(&mut said, &mut answers, node, message);
+            }
+            // A reaction no reply in reach holds answers one out of reach,
+            // when what is on those says so, else it was taken off. Each
+            // counts once.
+            let mut counted: Vec<(Option<String>, String)> = Vec::new();
+            for waiting in waiting {
+                let out_of_reach = (on.as_ref()).is_none_or(|on| on.before(oldest, &waiting.emoji));
+                let key = (waiting.quote, waiting.emoji);
+                if !out_of_reach || counted.contains(&key) {
+                    said.remove(waiting.node);
+                } else {
+                    counted.push(key);
+                }
             }
         }
         after = page["next_after"].clone();
@@ -88,6 +179,25 @@ pub async fn said(client: &Client, since_ms: i64) -> Result<Value, String> {
         .map(|(_, entry)| entry)
         .collect();
     Ok(json!({"since_ms": since_ms, "said": kept, "cut": said.left_out}))
+}
+
+/// A message of the person's into the answer; an answer to an ask also
+/// waits for the ask, for what it recommended.
+fn admit(said: &mut Newest, answers: &mut Vec<(String, i64)>, node: i64, message: Value) {
+    let question = crate::asks::answered(message["text"].as_str().unwrap_or_default());
+    let question = question.map(str::to_owned);
+    said.add(node, message);
+    if let Some(question) = question {
+        answers.retain(|(_, node)| said.kept.contains_key(node));
+        answers.push((question, node));
+    }
+}
+
+/// A reaction of the person's waiting for the reply it answers.
+struct Waiting {
+    node: i64,
+    quote: Option<String>,
+    emoji: String,
 }
 
 /// The newest messages that fit in `BYTES`, by node: node ids grow as
@@ -115,6 +225,30 @@ impl Newest {
         let size = entry.to_string().len() + 1;
         self.bytes += size;
         self.kept.insert(node, (size, entry));
+        self.trim();
+    }
+
+    /// Sets `field` on the message kept at `node`, if it still is.
+    fn amend(&mut self, node: i64, field: &str, value: Value) {
+        let Some((size, entry)) = self.kept.get_mut(&node) else {
+            return;
+        };
+        entry[field] = value;
+        let grown = entry.to_string().len() + 1;
+        self.bytes = self.bytes - *size + grown;
+        *size = grown;
+        self.trim();
+    }
+
+    /// Drops the message kept at `node`, if it still is.
+    fn remove(&mut self, node: i64) {
+        if let Some((size, _)) = self.kept.remove(&node) {
+            self.bytes -= size;
+        }
+    }
+
+    /// Drops the oldest messages until the answer fits.
+    fn trim(&mut self) {
         while self.bytes + Self::FRAME > BYTES {
             let Some((oldest, (size, _))) = self.kept.pop_first() else {
                 break;
@@ -251,6 +385,54 @@ pub async fn walk(
     }
 }
 
+/// A reaction of the person's to one of the bot's replies, which is
+/// feedback on that reply: its node, the first line of the reply when the
+/// reaction quotes it, and the emoji.
+fn reaction(entry: &Value) -> Option<(i64, Option<String>, String)> {
+    if !(entry["from"].is_null() && entry["origin"].is_null() && entry["item"]["role"] == "user") {
+        return None;
+    }
+    let text = crate::text(&entry["item"]);
+    let (quote, emoji) = crate::reactions::parse(&text)?;
+    Some((
+        entry["node"].as_i64()?,
+        quote.map(str::to_owned),
+        emoji.to_owned(),
+    ))
+}
+
+/// The questions the bot's `ask` calls in an entry put, each with the
+/// label of the option it recommended, if any. An Anthropic message holds
+/// its calls as `tool_use` blocks, any number of them.
+fn asked(entry: &Value) -> Vec<(String, Option<String>)> {
+    (crate::responses(&entry["item"]).iter())
+        .filter_map(|item| {
+            if item["type"] != "function_call" || item["name"] != crate::asks::TOOL {
+                return None;
+            }
+            let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
+            let ask = crate::asks::call("", &arguments)?;
+            let recommended = (ask.recommended).map(|at| ask.options[at].label.clone());
+            Some((ask.question, recommended))
+        })
+        .collect()
+}
+
+/// The first line of a reply of the bot's, trimmed, as a window quotes it.
+fn reply(entry: &Value) -> Option<String> {
+    if entry["item"]["role"] != "assistant" {
+        return None;
+    }
+    let text = crate::text(&entry["item"]);
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    Some(first.to_owned())
+}
+
+/// The first line of a reply as a reaction to it carries.
+fn cut_reply(first: &str) -> String {
+    first.chars().take(REPLY_CHARS).collect()
+}
+
 fn cut(mut text: String) -> String {
     if text.len() > MESSAGE_BYTES {
         let mut end = MESSAGE_BYTES;
@@ -267,7 +449,14 @@ fn cut(mut text: String) -> String {
 /// daemon this shell reaches.
 pub async fn read(since_ms: Option<i64>) -> Result<Value, String> {
     let client = connect().await?;
-    said(&client, since_ms.unwrap_or(now_ms() - DAY_MS)).await
+    // Where the windows keep reactions: the store as the CLI finds it.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let store = crate::trigger::Daemon::current()
+        .ok()
+        .and_then(|daemon| daemon.store);
+    let store = store.map(|store| std::fs::canonicalize(&store).unwrap_or(store));
+    let kept = home.as_deref().zip(store.as_deref());
+    said(&client, kept, since_ms.unwrap_or(now_ms() - DAY_MS)).await
 }
 
 /// Whether the nightly cleanup has work, for its trigger's `--if`: what
@@ -293,7 +482,7 @@ pub async fn changed_on(
     };
     let root = home.join(".agents/memory");
     let since = agent_client::memory::said_since(&root).unwrap_or(now_ms() - DAY_MS);
-    let said = said(client.await?.borrow(), since).await?;
+    let said = said(client.await?.borrow(), None, since).await?;
     match said["said"].as_array().map_or(0, Vec::len) {
         0 => Err(format!("{unchanged}, and the person wrote nothing since")),
         _ => Ok(json!({"changed": true, "said": true})),
