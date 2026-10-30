@@ -1115,7 +1115,11 @@ does not, and each is one op:
   the switch to live delivery, and a retention gap anywhere is announced as a
   `pruned` notice first. Live delivery has the socket follower's contract:
   a lagging session is disconnected rather than allowed to hold the daemon.
-  `agent follow --all [--after N]`. New identities publish their `created` or
+  `agent follow --all [--after N]`. With `kinds`, a list of one or more
+  event kinds (`invalid_follow_kinds` otherwise), the follow receives only
+  those, in replay and live; `follow_live` and `pruned` still come. A
+  controller that never reads streamed text leaves the deltas, most of all
+  events, out of its session's queue. New identities publish their `created` or
   `forked` entry to live followers. A store-level watermark records gaps from
   pruning and deletion even after the owning bot is removed; reading this
   watermark does not scan the fleet. Schema 14 seeds it once from surviving

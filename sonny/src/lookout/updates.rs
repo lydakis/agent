@@ -576,7 +576,9 @@ impl Updates {
             }
             // A turn that was running before its bot was watched is
             // tracked from the first thing it does since.
-            "text_delta" | "tool_started" | "tool_completed" if !self.quiet.contains_key(task) => {
+            "text_delta" | "usage" | "tool_started" | "tool_completed"
+                if !self.quiet.contains_key(task) =>
+            {
                 self.quiet.insert(task.to_owned(), (turn, now, false));
             }
             _ => {
