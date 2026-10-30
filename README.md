@@ -207,7 +207,12 @@ The first run looks at what your machine already has (a provider key, a
 ChatGPT sign-in, your AWS profiles), asks how your agents reach a model only
 when nothing does, and offers the providers' models ranked, the first marked
 so Enter takes it, then offers the MCP servers Claude Code, Codex, OpenCode
-or Kiro already have. `sonny setup` asks again. As Codex does, it keeps the settings in
+or Kiro already have. With nothing ready and Claude Code, Codex, OpenCode or
+Kiro on the machine, it also offers to let that agent set Sonny up with you,
+in a session of its own, since it reaches a model already. `sonny setup` asks
+again; with flags (`--provider`, `--profile`, `--key-stdin`, `--model`,
+`--import-mcp`, `--json`) it asks nothing, for scripts and agents, and the
+`sonny-setup` skill tells any agent how to use them. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
 which Sonny applies to the daemon and everything else it starts, so nothing
 goes in your shell profile. Tool shells never get the keys the daemon's

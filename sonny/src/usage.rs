@@ -490,7 +490,9 @@ impl View {
             true => "c hide cached",
             false => "c show cached",
         };
-        Line::from(format!("  d w m period · {scope} · {cached} · esc closes")).dim()
+        Line::from(crate::hint::spans(&format!(
+            "  d/w/m period · {scope} · {cached} · esc close"
+        )))
     }
 }
 

@@ -20,7 +20,7 @@ use std::{
 /// The job's launchd label and systemd unit name.
 const LABEL: &str = "me.lydakis.agent.backup";
 /// How often the job runs.
-const EVERY_SECONDS: u32 = 600;
+pub const EVERY_SECONDS: u32 = 600;
 /// Names never copied, at any depth: a repository's own, and what memory
 /// keeps out of its history (a lock, read counts, an open cleanup that
 /// names a commit the copy does not have).

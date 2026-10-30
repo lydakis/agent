@@ -11,7 +11,13 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
 };
 
+/// What a session may have queued, in bytes, as NATS and Redis bound a
+/// slow consumer: a burst of many small events fits as well as a few large
+/// ones, where a count of messages would close a session holding little.
 const QUEUE_BYTES: usize = 2 * 1024 * 1024;
+/// What a queued packet costs besides its bytes, so a flood of tiny ones
+/// is bounded too.
+pub const PACKET_BYTES: usize = 64;
 pub const MAX_EVENT: usize = 1024 * 1024;
 /// A refusal's detail is at most about this long in a response. A detail
 /// can echo what the client sent, up to a whole request line; its middle is
@@ -22,7 +28,7 @@ type Packet = (Vec<u8>, OwnedSemaphorePermit, Option<oneshot::Sender<()>>);
 
 #[derive(Clone)]
 pub struct Output {
-    sender: mpsc::Sender<Packet>,
+    sender: mpsc::UnboundedSender<Packet>,
     budget: Arc<Semaphore>,
     closed: watch::Sender<bool>,
 }
@@ -44,8 +50,9 @@ pub fn bounded(detail: String) -> String {
 }
 
 impl Output {
-    fn channel() -> (Self, mpsc::Receiver<Packet>) {
-        let (sender, receiver) = mpsc::channel::<Packet>(64);
+    fn channel() -> (Self, mpsc::UnboundedReceiver<Packet>) {
+        // The byte budget bounds it.
+        let (sender, receiver) = mpsc::unbounded_channel::<Packet>();
         let budget = Arc::new(Semaphore::new(QUEUE_BYTES));
         let (closed, _) = watch::channel(false);
         (
@@ -132,7 +139,6 @@ impl Output {
             .map_err(|_| Error::new("output_closed"))?;
         self.sender
             .send((Vec::new(), permit, Some(done)))
-            .await
             .map_err(|_| Error::new("output_closed"))?;
         drained.await.map_err(|_| Error::new("output_closed"))
     }
@@ -189,18 +195,18 @@ impl Output {
         let permit = self
             .budget
             .clone()
-            .acquire_many_owned(bytes.len() as u32)
+            .acquire_many_owned(cost(&bytes))
             .await
             .map_err(|_| Error::new("output_closed"))?;
         self.sender
             .send((bytes, permit, None))
-            .await
             .map_err(|_| Error::new("output_closed"))
     }
 
-    /// Bytes and packets `try_send` would accept right now.
-    pub fn room(&self) -> (usize, usize) {
-        (self.budget.available_permits(), self.sender.capacity())
+    /// The budget `try_send` would accept right now, in bytes, each packet
+    /// counting `PACKET_BYTES` besides its own.
+    pub fn room(&self) -> usize {
+        self.budget.available_permits()
     }
 
     /// Never waits. `output_lagged` means the consumer has not kept up.
@@ -209,15 +215,17 @@ impl Output {
         let permit = self
             .budget
             .clone()
-            .try_acquire_many_owned(bytes.len() as u32)
+            .try_acquire_many_owned(cost(&bytes))
             .map_err(|_| Error::new("output_lagged"))?;
         self.sender
-            .try_send((bytes, permit, None))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => Error::new("output_lagged"),
-                mpsc::error::TrySendError::Closed(_) => Error::new("output_closed"),
-            })
+            .send((bytes, permit, None))
+            .map_err(|_| Error::new("output_closed"))
     }
+}
+
+/// What a packet of `bytes` takes from the budget.
+fn cost(bytes: &[u8]) -> u32 {
+    (bytes.len() + PACKET_BYTES) as u32
 }
 
 /// Count encoded bytes without allocating another copy of a replay event.
@@ -306,6 +314,18 @@ mod tests {
             serde_json::from_slice::<Value>(&bytes).unwrap()["result"],
             "still here"
         );
+    }
+    #[tokio::test]
+    async fn many_small_events_fit_where_a_count_of_messages_would_not() {
+        let (output, _receiver) = Output::channel();
+        let event = serde_json::json!({"event":"text_delta","bot":"b","data":{"text":"word"}});
+        for _ in 0..4096 {
+            output.try_send(event.clone()).unwrap();
+        }
+        // The budget still ends it, counting each packet's cost.
+        let fits = QUEUE_BYTES / (Output::encode(&event).unwrap().len() + PACKET_BYTES);
+        let error = (4096..=fits).find_map(|_| output.try_send(event.clone()).err());
+        assert_eq!(error.unwrap().code, "output_lagged");
     }
     #[tokio::test]
     async fn slow_consumers_hold_byte_budget_until_packets_are_released() {

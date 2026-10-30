@@ -640,12 +640,12 @@ impl View {
             keys.push("↑↓ pick");
         }
         match self.items.get(self.selected) {
-            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fires now", "d removes"]),
-            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d removes"),
+            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fire", "d remove"]),
+            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
             _ => {}
         }
-        keys.push("esc to close");
-        Line::from(format!("  {}", keys.join(" · "))).dim()
+        keys.push("esc close");
+        Line::from(crate::hint::spans(&format!("  {}", keys.join(" · "))))
     }
 }
 
@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(lines[8], "    chat server: auth_expired");
         assert_eq!(lines[9], "    memory fact unreadable-chat");
         assert_eq!(lines[11], "Triggers · 1");
-        assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc to close");
+        assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc close");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         press(&mut view, KeyCode::Char('d'));
         assert_eq!(view.confirm, None);

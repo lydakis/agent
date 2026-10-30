@@ -56,12 +56,22 @@ const AGENTS: [&str; 4] = ["Codex", "Claude Code", "OpenCode", "Kiro"];
 
 /// Every server the other agents have in `home` and `folder` that Sonny's
 /// config does not name yet, and the names skipped for that.
-pub fn found(home: &Path, folder: &Path, var: &dyn Fn(&str) -> Option<String>) -> Vec<Found> {
+/// Only `from`'s agents are read when it names any, so an agent left out
+/// never hides a name another brings.
+pub fn found(
+    home: &Path,
+    folder: &Path,
+    var: &dyn Fn(&str) -> Option<String>,
+    from: &[&str],
+) -> Vec<Found> {
     let mine = agent_client::config::load()
         .map(|config| config.sonny.mcp_servers)
         .unwrap_or_default();
     let mut found: Vec<Found> = Vec::new();
-    for agent in AGENTS {
+    for agent in AGENTS
+        .iter()
+        .filter(|agent| from.is_empty() || from.contains(agent))
+    {
         for raw in read(agent, home, folder, var) {
             let found_now = translate(agent, raw);
             if mine.contains_key(&found_now.name) || found.iter().any(|f| f.name == found_now.name)
@@ -642,17 +652,48 @@ fn row(found: &Found) -> Row {
 
 /// The servers found here, unless Sonny's config names them already.
 pub fn here() -> Result<Vec<Found>, String> {
+    here_from(&[])
+}
+
+/// [`here`] of `from`'s agents alone, or of every agent's.
+fn here_from(from: &[&str]) -> Result<Vec<Found>, String> {
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("set HOME")?);
     let folder = std::env::current_dir().map_err(|e| e.to_string())?;
-    Ok(found(&home, &folder, &|name| std::env::var(name).ok()))
+    Ok(found(
+        &home,
+        &folder,
+        &|name| std::env::var(name).ok(),
+        from,
+    ))
 }
 
 /// The servers found here that the person ticks, all ticked to start,
 /// brought in; with `all`, every one without asking. What each did not
 /// bring is said. The names brought.
 pub fn offer(all: bool) -> Result<Vec<String>, String> {
+    offer_from(all, &[], &|line| println!("{line}"))
+}
+
+/// [`offer`] of the servers of `agents` alone (`codex`, `claude`,
+/// `opencode`, `kiro`), or of every agent's when it names none; `say`
+/// takes what it says about each.
+pub fn offer_from(all: bool, agents: &[&str], say: &dyn Fn(&str)) -> Result<Vec<String>, String> {
+    let unknown: Vec<&&str> = (agents.iter())
+        .filter(|agent| short(agent).is_none())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "no agent {}: name codex, claude, opencode or kiro",
+            unknown
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let from: Vec<&str> = agents.iter().filter_map(|agent| short(agent)).collect();
     let (bringable, refused): (Vec<Found>, Vec<Found>) =
-        here()?.into_iter().partition(|f| !f.keys.is_empty());
+        (here_from(&from)?.into_iter()).partition(|f| !f.keys.is_empty());
     let (bringable, unasked): (Vec<Found>, Vec<Found>) = match all {
         true => bringable.into_iter().partition(|f| !f.folder),
         false => (bringable, Vec::new()),
@@ -676,24 +717,35 @@ pub fn offer(all: bool) -> Result<Vec<String>, String> {
             .filter(|var| agent_client::env_file::var(var).is_none())
             .map(|var| format!("set {var} in ~/.agent/env; it is not set"));
         for note in server.notes.iter().cloned().chain(unset) {
-            println!("  {}: {note}", server.name);
+            say(&format!("  {}: {note}", server.name));
         }
     }
     for server in &unasked {
-        println!(
+        say(&format!(
             "\x1b[2mNot bringing {} from {} in this folder without asking: `sonny mcp import` offers it\x1b[0m",
             server.name, server.from
-        );
+        ));
     }
     for server in &refused {
         let why = server.notes.join("; ");
         let why = why.strip_prefix("not brought in: ").unwrap_or(&why);
-        println!(
+        say(&format!(
             "\x1b[2mNot bringing {} from {}: {why}\x1b[0m",
             server.name, server.from
-        );
+        ));
     }
     Ok(brought.into_iter().map(|f| f.name).collect())
+}
+
+/// The agent a short name, as `claude`, names.
+fn short(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "codex" => Some("Codex"),
+        "claude" | "claude-code" => Some("Claude Code"),
+        "opencode" => Some("OpenCode"),
+        "kiro" => Some("Kiro"),
+        _ => None,
+    }
 }
 
 /// What `sonny mcp import --json` prints for `found`: never a secret's
@@ -860,6 +912,14 @@ mod tests {
         assert!(names.contains(&("shared".into(), "Claude Code")));
         assert!(names.contains(&("oc".into(), "OpenCode")));
         assert!(names.contains(&("kiro".into(), "Kiro")));
+        // Codex's docs comes first; Claude Code's alone is Claude Code's.
+        let docs = |from: &[&str]| {
+            (found(&home, &folder, &|_| None, from).into_iter())
+                .find(|f| f.name == "docs")
+                .map(|f| f.from)
+        };
+        assert_eq!(docs(&[]), Some("Codex"));
+        assert_eq!(docs(&["Claude Code"]), Some("Claude Code"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
