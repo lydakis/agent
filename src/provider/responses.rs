@@ -22,6 +22,9 @@ struct Event<'a> {
     response: Option<&'a RawValue>,
     #[serde(borrow)]
     item: Option<&'a RawValue>,
+    /// The output item a delta belongs to; one left out reads as the first.
+    #[serde(default)]
+    output_index: usize,
 }
 
 #[derive(Default)]
@@ -52,7 +55,10 @@ impl State {
                     return fail("output_limit");
                 }
                 self.text.push_str(&part);
-                Ok(Frame::Delta(Delta::Text(part.into_owned())))
+                Ok(Frame::Delta(Delta::Text(
+                    event.output_index,
+                    part.into_owned(),
+                )))
             }
             "response.reasoning_summary_text.delta" => {
                 let part = event.delta.ok_or(Error::new("missing_text_delta"))?;
@@ -60,7 +66,10 @@ impl State {
                 if self.text_bytes + self.thinking > MAX_OUTPUT {
                     return fail("output_limit");
                 }
-                Ok(Frame::Delta(Delta::Thinking(part.into_owned())))
+                Ok(Frame::Delta(Delta::Thinking(
+                    event.output_index,
+                    part.into_owned(),
+                )))
             }
             "response.output_item.done" => {
                 let item = event.item.ok_or(Error::new("missing_output_item"))?;
@@ -367,12 +376,36 @@ mod tests {
         }
     }
     #[test]
+    fn each_delta_names_the_output_item_it_streams() {
+        let mut state = State::default();
+        let mut index = |frame: &str| match state.frame(frame.as_bytes()).unwrap() {
+            Frame::Delta(Delta::Text(index, _) | Delta::Thinking(index, _)) => index,
+            frame => panic!("{frame:?}"),
+        };
+        let reasoning =
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"hmm"}"#;
+        let first =
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"Let me check."}"#;
+        let second = r#"{"type":"response.output_text.delta","output_index":2,"delta":"Done."}"#;
+        let unnamed = r#"{"type":"response.output_text.delta","delta":"x"}"#;
+        assert_eq!(
+            [
+                index(reasoning),
+                index(first),
+                index(second),
+                index(unnamed)
+            ],
+            [0, 1, 2, 0]
+        );
+    }
+
+    #[test]
     fn reasoning_summaries_stream_and_usage_is_extracted() {
         let mut state = State::default();
         let delta = state
             .frame(br#"{"type":"response.reasoning_summary_text.delta","delta":"hmm"}"#)
             .unwrap();
-        assert!(matches!(delta, Frame::Delta(Delta::Thinking(t)) if t == "hmm"));
+        assert!(matches!(delta, Frame::Delta(Delta::Thinking(_, t)) if t == "hmm"));
         state
             .frame(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
             .unwrap();

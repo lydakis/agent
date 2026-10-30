@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
@@ -22,7 +22,7 @@ pub const NARROWEST: u16 = 50;
 /// that has all it is written at.
 pub const MARGIN: u16 = 40;
 /// What the keys do in the margin.
-pub const MARGIN_KEYS: &str = "esc closes";
+pub const MARGIN_KEYS: &str = "esc close";
 /// The most of a file read for its preview, and the most lines shown.
 const MOST_BYTES: u64 = 4 << 20;
 const MOST_LINES: usize = 9_000;
@@ -142,7 +142,7 @@ impl Pane {
             screen,
             area: Rect::default(),
             card: None,
-            keys: "esc closes",
+            keys: "esc close",
             program: None,
             foot: None,
             prose,
@@ -400,7 +400,7 @@ impl Pane {
             return None;
         }
         let keys = match focused {
-            true if !self.back.is_empty() => format!("  ← back  {} ", self.keys),
+            true if !self.back.is_empty() => format!("  ← back · {} ", self.keys),
             true => format!("  {} ", self.keys),
             false => format!("  {switch} "),
         };
@@ -430,6 +430,11 @@ impl Pane {
             head.push(arrow("›", !self.forward.is_empty()));
             head.push(Span::raw(" "));
         }
+        // Keys in their one grammar while they go here, else dim.
+        let key_spans = match focused {
+            true => crate::hint::spans(&keys),
+            false => vec![Span::raw(keys.clone()).dim()],
+        };
         let head = match &self.head {
             // The margin's glance in place of a title, its keys after.
             Some((glance, _)) => {
@@ -442,7 +447,7 @@ impl Pane {
                 let gap =
                     (area.width as usize).saturating_sub(glance.width().min(room) + keys.width());
                 spans.push(Span::raw(" ".repeat(gap)));
-                spans.push(Span::raw(keys).dim());
+                spans.extend(key_spans);
                 Line::from(spans)
             }
             None => {
@@ -452,7 +457,7 @@ impl Pane {
                 let gap = (area.width as usize).saturating_sub(used + title.width() + keys.width());
                 head.push(Span::styled(title, style));
                 head.push(Span::raw(" ".repeat(gap)));
-                head.push(Span::raw(keys).dim());
+                head.extend(key_spans);
                 Line::from(head)
             }
         };
@@ -636,7 +641,7 @@ fn preview(
             let text = text.replace('\t', "    ");
             let number = format!("{:>digits$}  ", at + 1);
             let number = match Some(at) == target {
-                true => Span::raw(number).fg(Color::Yellow).bold(),
+                true => Span::raw(number).reversed().bold(),
                 false => Span::raw(number).dim(),
             };
             let mut spans = vec![Span::raw(" "), number];
@@ -702,12 +707,12 @@ mod tests {
 
     #[test]
     fn a_cards_foot_stays_on_the_last_row_however_it_is_scrolled() {
-        let mut pane = Pane::card("/background", "esc closes");
+        let mut pane = Pane::card("/background", "esc close");
         let lines = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
-        pane.set_card(lines, "esc closes");
+        pane.set_card(lines, "esc close");
         pane.foot = Some(Line::from("d again removes nightly"));
         let shown = rows(&mut pane, 30, 8);
-        assert_eq!(shown[0], " /background       esc closes");
+        assert_eq!(shown[0], " /background        esc close");
         assert_eq!(shown[2], "row 0");
         assert_eq!(shown[5], "row 3");
         assert_eq!(shown[6], "");
@@ -757,7 +762,7 @@ mod tests {
         let mut pane = Pane::preview(&url, &dir, 40).unwrap();
         let shown = rows(&mut pane, 40, 7);
         assert!(shown[0].starts_with(" a.rs"), "{shown:?}");
-        assert!(shown[0].ends_with("esc closes"), "{shown:?}");
+        assert!(shown[0].ends_with("esc close"), "{shown:?}");
         // Three rows above the line linked to, so it reads in place.
         assert_eq!(shown[2], " 17  let x17 = 17;");
         assert_eq!(shown[5], " 20  let x20 = 20;");
@@ -883,7 +888,7 @@ mod tests {
         assert_eq!(a.title, "a.md");
         assert!(rows(&mut a, 60, 3)[0].contains("← back"));
         // A pane with nowhere to go has no arrows.
-        let mut card = Pane::card("/status", "esc closes");
+        let mut card = Pane::card("/status", "esc close");
         assert!(!rows(&mut card, 30, 2)[0].contains('‹'));
         assert_eq!(card.on_arrow(1, 0), None);
         // Over the margin, its ← comes first and the arrows after it.
@@ -960,7 +965,7 @@ mod tests {
         let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 100).unwrap();
         let shown = rows(&mut pane, 150, 5);
         // The title spans the pane; the file's rows stop at 100 columns.
-        assert!(shown[0].ends_with("esc closes"), "{shown:?}");
+        assert!(shown[0].ends_with("esc close"), "{shown:?}");
         assert!(shown[2].width() <= crate::PROSE, "{}", shown[2].width());
         assert!(shown[3].starts_with("    word"), "{shown:?}");
         // Code goes as wide as the pane.
@@ -975,8 +980,8 @@ mod tests {
         let shown = rows(&mut pane, 150, 4);
         assert!(shown[2].width() <= crate::PROSE, "{shown:?}");
         // A card is not a file, and keeps the pane's width.
-        let mut card = Pane::card("/status", "esc closes");
-        card.set_card(vec![Line::from("x".repeat(140))], "esc closes");
+        let mut card = Pane::card("/status", "esc close");
+        card.set_card(vec![Line::from("x".repeat(140))], "esc close");
         assert_eq!(rows(&mut card, 150, 3)[2].width(), 140);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1006,7 +1011,7 @@ mod tests {
         .unwrap();
         let mut pane = Pane::preview(&format!("file://{}", file.display()), &dir, 30).unwrap();
         let shown = rows(&mut pane, 30, 8);
-        assert_eq!(shown[2], "  Title");
+        assert_eq!(shown[2], "  # Title");
         assert_eq!(shown[4], "  Some code.");
         assert_eq!(shown[6], "    fn a() {}");
         std::fs::remove_dir_all(&dir).unwrap();

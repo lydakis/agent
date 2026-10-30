@@ -56,7 +56,8 @@ ends. It never reads the whole log again; only a lookout with no cursor yet
 reads it all, once, as history rather than news.
 
 It is built to stay light with thousands of bots, as a Kubernetes
-controller is with a large cluster. Each event reaches only the
+controller is with a large cluster. It follows only the event kinds it
+reads, so the text models stream never reaches it. Each event reaches only the
 subscribers that watch its bot, or every one for a bot made or deleted,
 and each checks that one bot alone. Each subscriber keeps only the bots it
 watches. Notes and status checks go to the daemon beside the stream, so no
@@ -198,6 +199,9 @@ those with subscriptions of their own:
 - a turn the subscriber asked for and did not wait on, or another agent or a
   trigger asked for, once it ends, with what the task replied;
 - an approval only the person can give, once it has waited 2 minutes;
+- a question a task put to the person with the `ask` tool, once the call
+  ran: its question and options, marked with `>` as the task's words,
+  which the person answers in that task;
 - a running turn that has printed nothing for 30 minutes, once per
   silence; a turn waiting on the person, on other turns or for a slot is
   not silent;
@@ -231,7 +235,7 @@ Task updates: what happened in your tasks since you last heard; the wait tool re
 The person asked for these in the task themselves, so they are theirs:
 - calc.ui: turn:calc.ui/2 completed, asked by the person
 A quoted message is the person's own words.
-Lines marked > are a task's own reply, not the person's words.
+Lines marked > are a task's own words, not the person's.
 Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 ```
 

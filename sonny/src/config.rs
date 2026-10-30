@@ -27,6 +27,22 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// A switch, written as TOML's own true or false.
 const SWITCH: &[&str] = &["true", "false"];
 
+/// The rows `/config` takes with room for all: the blank one, a heading
+/// for each table, and the settings.
+pub fn height() -> usize {
+    let mut tables: Vec<&str> = SETTINGS
+        .iter()
+        .map(|s| s.key.split_once('.').map_or("", |(table, _)| table))
+        .collect();
+    tables.dedup();
+    1 + tables.len() + SETTINGS.len()
+}
+
+/// A key without its table, which its heading names.
+fn short(key: &str) -> &str {
+    key.split_once('.').map_or(key, |(_, key)| key)
+}
+
 /// Every key `agent_client::config` reads.
 pub const SETTINGS: [Setting; 15] = [
     Setting {
@@ -271,37 +287,65 @@ impl View {
         Key::Stay
     }
 
-    /// Up to `room` settings around the pick, each with its value.
+    /// Every setting under its table's name, each with its value, under a
+    /// blank row: up to `room` rows, around the pick. A value set in the
+    /// file reads plain and a default muted, so what was changed stands
+    /// out.
     pub fn rows(&self, room: usize) -> Vec<Line<'static>> {
-        let shown = SETTINGS.len().min(room.max(1));
-        let first = (self.pick + 1).saturating_sub(shown);
-        let wide = SETTINGS.iter().map(|s| s.key.len()).max().unwrap_or(0);
-        (SETTINGS.iter().zip(&self.values))
-            .enumerate()
-            .skip(first)
-            .take(shown)
-            .map(|(i, (setting, value))| {
-                let key = format!("{:<wide$}", setting.key);
-                let value = match value {
-                    Some(value) => Span::raw(format!("  {value}")),
-                    None => Span::raw(format!("  {} (default)", setting.default)).dim(),
+        let wide = SETTINGS
+            .iter()
+            .map(|s| short(s.key).len())
+            .max()
+            .unwrap_or(0);
+        let mut out = vec![Line::default()];
+        let mut picked = 0;
+        let mut table = "";
+        for (i, (setting, value)) in SETTINGS.iter().zip(&self.values).enumerate() {
+            let (this, _) = setting.key.split_once('.').unwrap_or(("", setting.key));
+            if this != table || i == 0 {
+                table = this;
+                let name = match this {
+                    "" => "agent".to_owned(),
+                    this => format!("[{this}]"),
                 };
-                if i == self.pick {
-                    let value = match &self.typing {
-                        Some(typed) => Span::raw(format!("  {typed}")),
-                        None => value,
-                    };
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::raw(format!(" {key}")).reversed(),
-                        value.reversed(),
-                        Span::raw(" ").reversed(),
-                    ])
-                } else {
-                    Line::from(vec![Span::raw(format!("   {key}")), value])
-                }
-            })
-            .collect()
+                out.push(Line::from(format!("    {name}")).dim().bold());
+            }
+            if i == self.pick {
+                picked = out.len();
+            }
+            out.push(self.row(i, setting, value, wide));
+        }
+        let shown = out.len().min(room.max(1));
+        let first = (picked + 1).saturating_sub(shown);
+        out.into_iter().skip(first).take(shown).collect()
+    }
+
+    /// The setting `i`'s row, its key `wide` wide.
+    fn row(
+        &self,
+        i: usize,
+        setting: &Setting,
+        value: &Option<String>,
+        wide: usize,
+    ) -> Line<'static> {
+        let key = format!("{:<wide$}", short(setting.key));
+        let value = match value {
+            Some(value) => Span::raw(format!("  {value}")),
+            None => Span::raw(format!("  {}", setting.default)).dim(),
+        };
+        if i != self.pick {
+            return Line::from(vec![Span::raw(format!("      {key}")), value]);
+        }
+        let value = match &self.typing {
+            Some(typed) => Span::raw(format!("  {typed}")),
+            None => value,
+        };
+        Line::from(vec![
+            Span::raw("      "),
+            Span::raw(key).reversed(),
+            value.reversed(),
+            Span::raw(" ").reversed(),
+        ])
     }
 
     /// The composer's line: what the picked setting sets, what the last
@@ -314,7 +358,7 @@ impl View {
         }
         let what = match &self.said {
             Some(Ok(saved)) => Span::raw(format!("saved {saved}")).fg(Color::Green),
-            Some(Err(error)) => Span::raw(error.clone()).fg(Color::Red),
+            Some(Err(error)) => Span::raw(format!("✗ {error}")),
             None => Span::raw(SETTINGS[self.pick].about).dim(),
         };
         (Line::from(vec![Span::raw("› ").bold(), what]), None)
@@ -324,11 +368,15 @@ impl View {
     pub fn keys(&self) -> Line<'static> {
         let file = crate::tilde(&self.path.display().to_string());
         let keys = match (&self.typing, SETTINGS[self.pick].values.is_empty()) {
-            (Some(_), _) => "  enter to save, empty for the default · esc".to_owned(),
-            (None, true) => format!("  ↑↓ setting · enter to type · ⌫ default · esc · {file}"),
-            (None, false) => format!("  ↑↓ setting · ←→ value · ⌫ default · esc · {file}"),
+            (Some(_), _) => "  enter save, empty for the default · esc cancel",
+            (None, true) => "  ↑↓ pick · enter type · ⌫ default · esc close",
+            (None, false) => "  ↑↓ pick · ←→ change · ⌫ default · esc close",
         };
-        Line::from(keys).dim()
+        let mut spans = crate::hint::spans(keys);
+        if self.typing.is_none() {
+            spans.push(Span::raw(format!("  {file}")).dim());
+        }
+        Line::from(spans)
     }
 }
 

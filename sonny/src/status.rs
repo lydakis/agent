@@ -47,7 +47,7 @@ pub enum Group {
     Review,
     /// Finished, stopped, or never started, with nothing open.
     #[default]
-    Idle,
+    Done,
     /// Marked resolved: nothing left to do, until new work reopens it.
     Resolved,
 }
@@ -58,7 +58,7 @@ impl Group {
             Group::NeedsYou => "Needs you",
             Group::Working => "Working",
             Group::Review => "Ready for review",
-            Group::Idle => "Idle",
+            Group::Done => "Done",
             Group::Resolved => "Resolved",
         }
     }
@@ -75,7 +75,7 @@ pub fn group(state: &str, running: bool, asking: bool, pr: bool, resolved: bool)
         _ if asking => Group::NeedsYou,
         _ if running => Group::Working,
         "done" | crate::started::CHECKED if pr => Group::Review,
-        _ => Group::Idle,
+        _ => Group::Done,
     }
 }
 
@@ -104,13 +104,13 @@ pub fn pull_request(text: &str) -> Option<String> {
 pub fn mark(state: &str) -> Span<'static> {
     match state {
         "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
-        "needs you" => Span::raw("◐ ").fg(Color::Magenta),
+        "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
         "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
-        crate::started::CHECKED => Span::raw("✔ ").fg(Color::Green).bold(),
+        crate::started::CHECKED => Span::raw("✓ ").fg(Color::Green),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
-            Span::raw("◌ ").fg(Color::Yellow)
+            Span::raw("◌ ").dim()
         }
         _ => Span::raw("○ ").dim(),
     }
@@ -173,7 +173,7 @@ pub fn card(
         Group::NeedsYou,
         Group::Working,
         Group::Review,
-        Group::Idle,
+        Group::Done,
         Group::Resolved,
     ] {
         let n = count(group);
@@ -288,8 +288,8 @@ mod tests {
         assert_eq!(group("done", false, false, true, false), Group::Review);
         // A goal's check passed: the pull request still waits on review.
         assert_eq!(group("checked", false, false, true, false), Group::Review);
-        assert_eq!(group("stopped", false, false, true, false), Group::Idle);
-        assert_eq!(group("done", false, false, false, false), Group::Idle);
+        assert_eq!(group("stopped", false, false, true, false), Group::Done);
+        assert_eq!(group("done", false, false, false, false), Group::Done);
         assert_eq!(group("failed", false, true, true, true), Group::Resolved);
     }
 
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(folded[1], " ● lead working · 42s");
         assert_eq!(folded[2], "   chatgpt/gpt-6.1-sol · tab 1");
         assert_eq!(folded[4], "Needs you · 1");
-        assert_eq!(folded[5], " ◐ zero needs you · 42s");
+        assert_eq!(folded[5], " ? zero needs you · 42s");
         assert_eq!(folded[8], "Ready for review · 1");
         assert_eq!(folded[9], " ◆ equal done · took 42s");
         assert_eq!(

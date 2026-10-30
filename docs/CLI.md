@@ -20,6 +20,16 @@ when its identity was known at creation. Address that creator with
 `run --detach --bot "$AGENT_PARENT" --bot-id "$AGENT_PARENT_ID" -- TASK`.
 The ID stays pinned after deletion, so a replacement with the same name rejects
 the call instead of receiving the work.
+
+A bot's shell gets the daemon's environment without the keys its providers
+use, which are also redacted from what tools return. `serve --shell-exclude
+PATTERN`, repeatable, leaves out more: every variable whose name matches, with
+`*` for any run and `?` for any one character, in any case. A client that
+starts a daemon passes it Codex's `[shell_environment_policy]` from
+`~/.agent/config.toml`: each name in `exclude`, and `*KEY*`, `*SECRET*` and
+`*TOKEN*` too with `ignore_default_excludes = false`. As in Codex, those three
+are kept by default. A running daemon keeps the excludes it started with, and
+a variable a bot or caller sets with `--env` is still set.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 
@@ -304,7 +314,14 @@ forwards that path. A socket path that is not UTF-8, which the ready line
 cannot carry, is refused before anything starts (`socket_path_unsupported`). When the daemon holding the socket speaks another
 protocol, `start` still prints its ready line and then fails with
 `daemon_protocol_mismatch`, so a caller can tell an older daemon from a newer
-one. `stats` starts it as `start` does, so it answers on a fresh install;
+one. An older one that names its pid is replaced instead, by every command
+that may start the daemon (not with `--no-spawn`, and not from inside a bot's
+turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
+it is asked to shut down with a 2-minute grace, so running turns may finish
+while none starts, or sent SIGTERM when it refuses that request, as daemons
+before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
+socket and upgrades the store. Sonny starts the daemon this way, so opening it
+after an upgrade replaces the old daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an

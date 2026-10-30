@@ -1929,6 +1929,34 @@ fn schema_49_waiting_calls_were_not_handed_to_anyone() {
 }
 
 #[test]
+fn schema_62_had_no_steps_and_no_paused_calls() {
+    let path = std::env::temp_dir().join(format!("agent-schema62-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX approvals_steps; DROP INDEX answers_paused;
+             ALTER TABLE approvals DROP COLUMN step_of; ALTER TABLE answers DROP COLUMN paused_ms;
+             PRAGMA user_version=62;",
+        )
+        .unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let columns: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM pragma_table_info('approvals') WHERE name='step_of')
+                  + (SELECT count(*) FROM pragma_table_info('answers') WHERE name='paused_ms')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 2);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_new_turn_starts_its_denials_from_none() {
     let mut db = db();
     let deny = |db: &mut Database, turn: i64, n: usize| {
@@ -3288,6 +3316,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         answered_by: None,
         expire_ms: None,
         grammar: None,
+        steps: false,
     };
     // The lead's own tool, which a bot it creates does not take.
     let resolve = Declared {
@@ -3299,6 +3328,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         answered_by: None,
         expire_ms: None,
         grammar: None,
+        steps: false,
     };
     let declared = [react.clone()];
     let leads = [react.clone(), resolve];
@@ -3396,6 +3426,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         answered_by: Some("sonny".into()),
         expire_ms: None,
         grammar: None,
+        steps: false,
         inherit: true,
     };
     db.create(

@@ -201,6 +201,27 @@ class DaemonTests(ModelFixture):
         self.assertGreaterEqual(groups['jobs'], groups['count'])
         self.assertEqual(stats['handles'], {'waiters': 0, 'retained': 0})
 
+    def test_a_follow_that_names_kinds_gets_only_those(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Alice', workspace=str(self.path))
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        client.finished(first)
+        # A controller that reads only how turns end leaves the rest, the
+        # streamed text most of all, out of its queue, in replay and live.
+        ends = Connection(client.socket_path)
+        self.addCleanup(ends.close)
+        following = ends.request('follow', bot='*', after=0, kinds=['turn_finished'])['result']
+        self.assertEqual(following['kinds'], ['turn_finished'])
+        ends.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([(e['event'], e['turn']) for e in ends.durable], [('turn_finished', first)])
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        ends.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
+        kinds = {e.get('event') for e in ends.saved + ends.durable if 'bot' in e}
+        self.assertEqual(kinds - {'follow_live'}, {'turn_finished'})
+        refused = ends.request('follow', bot='*', after=0, kinds=[])
+        self.assertEqual(refused['error'], 'invalid_follow_kinds')
+
     def test_configure_changes_a_bot_and_tells_its_followers(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

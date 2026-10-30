@@ -223,6 +223,11 @@ pub struct Declared {
     /// the declaring bot's own.
     #[serde(default = "inherited", skip_serializing_if = "is_inherited")]
     pub inherit: bool,
+    /// Whether a gate that names the tool judges the steps its client puts
+    /// to it with `approve_step` instead of the call as a whole: a script
+    /// whose nested calls are each approved, as in Codex's code mode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub steps: bool,
 }
 fn declared_result() -> String {
     "ok".into()
@@ -337,10 +342,10 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                     );
                 }
             }
-            None if tool.expire_ms.is_some() => {
+            None if tool.expire_ms.is_some() || tool.steps => {
                 return fail_with(
                     "invalid_declare",
-                    format!("{name}: expire_ms goes with answered_by"),
+                    format!("{name}: expire_ms and steps go with answered_by"),
                 );
             }
             None => {}
@@ -476,6 +481,38 @@ struct CredentialSet {
     /// of a new token. Refreshes pay for insertion; tool output stays sorted.
     values: Vec<Credential>,
     names: Vec<String>,
+}
+
+/// Whether a variable's `name` matches `pattern`: `*` any run of
+/// characters and `?` any one, in any ASCII case, as Codex matches its
+/// shell environment excludes.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let name: Vec<char> = name.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut p, mut n) = (0, 0);
+    // The last `*` seen, and where in the name its run ends so far.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((at, end)) => {
+                    star = Some((at, end + 1));
+                    p = at + 1;
+                    n = end + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
 }
 
 impl Credentials {
@@ -2272,6 +2309,20 @@ async fn shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_name_matches_a_pattern_s_wildcards_in_any_case() {
+        assert!(name_matches("*KEY*", "OPENAI_API_KEY"));
+        assert!(name_matches("*KEY*", "ssh_key_path"));
+        assert!(name_matches("*TOKEN*", "GITHUB_TOKEN"));
+        assert!(name_matches("AWS_*", "AWS_PROFILE"));
+        assert!(name_matches("A?S_*", "AWS_"));
+        assert!(name_matches("*_*_KEY", "OPENAI_API_KEY"));
+        assert!(name_matches("*", ""));
+        assert!(!name_matches("*KEY*", "PATH"));
+        assert!(!name_matches("AWS_*", "MY_AWS_PROFILE"));
+        assert!(!name_matches("A?S", "AS"));
+        assert!(!name_matches("*_KEY", "OPENAI_API_KEYS"));
+    }
     #[test]
     fn one_bot_runs_at_most_half_the_process_budget_at_once() {
         let wide = |budget| {

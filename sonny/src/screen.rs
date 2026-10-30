@@ -77,6 +77,9 @@ pub enum Tag {
     Note(u64),
     /// A `plan` call, by the client's number for it.
     Plan(u64),
+    /// The last row of the words streamed as this item of the running
+    /// turn, until their message names its node.
+    Streamed(u64),
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -313,6 +316,15 @@ impl Screen {
     /// The row tagged `tag`, the newest if more are.
     fn tagged(&self, tag: Tag) -> Option<usize> {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
+    }
+
+    /// The row tagged `from` tagged `to` instead; whether there was one.
+    pub fn retag(&mut self, from: Tag, to: Tag) -> bool {
+        let Some(at) = self.tagged(from) else {
+            return false;
+        };
+        self.rows[at].tag = Some(to);
+        true
     }
 
     /// The tags the lines kept carry, oldest first: what is still there
@@ -1306,6 +1318,7 @@ impl Screen {
                     continue;
                 }
                 let style = match i == finding.at {
+                    true if crate::look::no_color() => Style::new().reversed(),
                     true => Style::new().fg(Color::Black).bg(Color::Yellow),
                     false => Style::new().fg(Color::Yellow).underlined(),
                 };
@@ -1775,9 +1788,73 @@ fn cells(line: &Line) -> Vec<String> {
     out
 }
 
+/// `cells` from [`Screen::link_cells`] kept only where `buf` still shows
+/// what they were taken from: a link something was drawn over since, as
+/// a list over the conversation, is dropped whole, so its address never
+/// writes over what covers it and no link is left open.
+pub fn keep_shown(cells: &mut Vec<(u16, u16, Cell)>, buf: &Buffer) {
+    const CLOSE: &str = "\x1b]8;;\x1b\\";
+    // What a cell shows, its address taken off.
+    let shown = |symbol: &str| -> String {
+        let symbol = symbol.strip_suffix(CLOSE).unwrap_or(symbol);
+        match symbol.strip_prefix("\x1b]8;;") {
+            Some(rest) => rest
+                .split_once("\x1b\\")
+                .map_or(rest, |(_, s)| s)
+                .to_owned(),
+            None => symbol.to_owned(),
+        }
+    };
+    let area = buf.area;
+    let same = |(x, y, cell): &(u16, u16, Cell)| {
+        area.contains((*x, *y).into())
+            && buf[(*x, *y)].symbol() == shown(cell.symbol())
+            && buf[(*x, *y)].style() == cell.style()
+    };
+    let mut kept = Vec::with_capacity(cells.len());
+    let mut link = Vec::new();
+    for cell in cells.drain(..) {
+        let last = cell.2.symbol().ends_with(CLOSE);
+        link.push(cell);
+        if last {
+            if link.iter().all(same) {
+                kept.append(&mut link);
+            }
+            link.clear();
+        }
+    }
+    *cells = kept;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_drawn_over_is_dropped_whole_and_one_still_shown_kept() {
+        let cell = |symbol: &str| {
+            let mut cell = Cell::default();
+            cell.set_symbol(symbol);
+            cell
+        };
+        let link = || {
+            vec![
+                (0, 0, cell("\x1b]8;;https://a.b\x1b\\a")),
+                (1, 0, cell("b\x1b]8;;\x1b\\")),
+                (3, 0, cell("\x1b]8;;https://c.d\x1b\\c\x1b]8;;\x1b\\")),
+            ]
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.set_string(0, 0, "ab c", Style::default());
+        let mut cells = link();
+        keep_shown(&mut cells, &buf);
+        assert_eq!(cells.len(), 3);
+        // A list drawn over the first link's second cell.
+        buf.set_string(1, 0, "x", Style::default());
+        let mut cells = link();
+        keep_shown(&mut cells, &buf);
+        assert_eq!(cells.iter().map(|c| c.0).collect::<Vec<_>>(), [3]);
+    }
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     fn screen(lines: Vec<Line<'static>>, width: u16, height: u16) -> (Screen, Buffer) {

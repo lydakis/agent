@@ -5744,3 +5744,114 @@ Store jobs per turn did not change (7.5 on both), and no change is a cost
 past the gate's 15%; the per-idle-bot drop is the bench's noise, as the
 change adds nothing to an idle bot. The refused path is not measured: it
 runs once per refusal, a second request to the provider.
+
+## Text deltas name their item (#396)
+
+Each `text_delta` and `thinking_delta` notification carries one more
+integer, `item`: the call's last node plus the output index the provider
+names, worked out per delta with no store work and nothing kept per bot.
+The Responses parser reads one more field of the delta frame. The Perf
+workflow's matched screen, base main 96ae19a against the PR head 9e9034b, on
+the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 25.835 | 25.585 | -1.0% |
+| admission | burst submit p99, ms | 3.271 | 3.085 | -5.7% |
+| completion | release to terminal p99, ms | 7.458 | 7.152 | -4.1% |
+| footprint | idle RSS, MiB | 19.211 | 19.146 | -0.3% |
+| footprint | per idle bot, KiB | 1.494 | 1.486 | -0.5% |
+| footprint | RSS after a turn each, MiB | 28.596 | 30.133 | +5.4% |
+| footprint | CPU per turn, ms | 0.718 | 0.701 | -2.3% |
+| lifecycle | CPU, s | 0.7 | 0.675 | -3.6% |
+| lifecycle | p95 turn, ms | 575.754 | 575.038 | -0.1% |
+| lifecycle | peak RSS, MiB | 25.477 | 25.488 | +0.0% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The RSS after a turn each moves by about this much between runs
+of one build (27.7 to 30.3 MiB across the head's own runs); the change keeps
+nothing between deltas.
+
+## A follow can name the event kinds it wants (#407)
+
+`fan_out` now checks each live follower's kinds before it queues an event,
+a set lookup that a follow naming none skips, and a replay filters its
+pages the same way. The Perf workflow's matched screen, base main c220be7
+against the PR head 9ef1e5d, on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.937 | 28.814 | -0.4% |
+| admission | burst submit p99, ms | 4.164 | 4.117 | -1.1% |
+| completion | release to terminal p99, ms | 9.213 | 8.815 | -4.3% |
+| footprint | idle RSS, MiB | 19.303 | 19.279 | -0.1% |
+| footprint | per idle bot, KiB | 1.34 | 1.478 | +10.3% |
+| footprint | RSS after a turn each, MiB | 28.34 | 28.639 | +1.1% |
+| footprint | CPU per turn, ms | 0.871 | 0.849 | -2.5% |
+| lifecycle | CPU, s | 0.685 | 0.7 | +2.2% |
+| lifecycle | p95 turn, ms | 579.55 | 574.058 | -0.9% |
+| lifecycle | peak RSS, MiB | 25.436 | 25.426 | -0.0% |
+
+Store jobs per turn did not change, and no change is a cost past the gate's
+15%. The per-idle-bot rise is the bench's noise, as before (#349): the
+change adds nothing to an idle bot. None of these benches names kinds, so
+they measure the unfiltered path. Filtering pays off in
+`bench/lookout_scale.py`: with 1,100 streaming bots, the lookout's follow
+of `*` no longer carries the deltas, and it hears all 6,000 task endings,
+where before the daemon dropped it.
+
+## Approving each step of an exec script (#393)
+
+A client answering a declared call can ask the bot's gate about each step
+inside it (`approve_step`) and record how an allowed step ended
+(`step_result`). Both run only for steps a client sends, so an ordinary turn
+gains one check of whether the bot has gates, and the judge's history
+queries read step events beside tool events. The Perf workflow's matched
+screen, base main 91d7150 against the PR head afa2a54, on the GitHub runner
+(2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 38.463 | 37.973 | -1.3% |
+| admission | burst submit p99, ms | 6.065 | 5.91 | -2.6% |
+| completion | release to terminal p99, ms | 13.072 | 13.291 | +1.7% |
+| footprint | idle RSS, MiB | 18.998 | 19.277 | +1.5% |
+| footprint | per idle bot, KiB | 1.568 | 1.49 | -5.0% |
+| footprint | RSS after a turn each, MiB | 27.676 | 27.77 | +0.3% |
+| footprint | CPU per turn, ms | 1.224 | 1.237 | +1.0% |
+| lifecycle | CPU, s | 1.1 | 1.12 | +1.8% |
+| lifecycle | p95 turn, ms | 580.302 | 581.017 | +0.1% |
+| lifecycle | peak RSS, MiB | 25.193 | 25.289 | +0.4% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The steps path itself is not measured: it runs once per step a
+client asks about, one store job to decide it and one to record its end.
+
+## A session's queue is bounded by bytes, not 64 messages (#425)
+
+A session's output channel is now unbounded, and its 2 MiB budget, at 64
+bytes per packet on top of the packet's own size, is the only bound;
+admission compares the same cost. The Perf workflow's matched screen, base
+main 2cf8337 against the PR head 31a2e78, on the GitHub runner
+(2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 27.321 | 27.04 | -1.0% |
+| admission | burst submit p99, ms | 4.044 | 3.885 | -3.9% |
+| completion | release to terminal p99, ms | 8.7 | 8.335 | -4.2% |
+| footprint | idle RSS, MiB | 19.334 | 19.188 | -0.8% |
+| footprint | per idle bot, KiB | 1.248 | 1.484 | +18.9% |
+| footprint | RSS after a turn each, MiB | 28.061 | 29.012 | +3.4% |
+| footprint | CPU per turn, ms | 0.788 | 0.786 | -0.3% |
+| lifecycle | CPU, s | 0.67 | 0.66 | -1.5% |
+| lifecycle | p95 turn, ms | 581.069 | 580.929 | -0.0% |
+| lifecycle | peak RSS, MiB | 25.262 | 25.326 | +0.3% |
+
+The per-idle-bot figure is past the gate's 15% warning, but it is the
+bench's noise (#349, #407): an idle bot has no session and no queue, the
+base's own runs spread 1.17 to 1.33 KiB, and the absolute change is a
+quarter of a KiB. The change pays off in `bench/lookout_scale.py`: with
+1,100 streaming bots, the lookout's follow of `*` is no longer dropped by
+the count bound, and at 5,000 gated calls the approver's session stays
+open.

@@ -4,7 +4,11 @@
 //! for them (`lookout::subs`). From there a trigger is fired now or
 //! removed, and a subscription removed; the one Sonny writes for a lead
 //! stays, since its project opening writes it again. How many an agent
-//! has is the `↻` its footer and its `/status` row show.
+//! has is the `↻` its footer and its `/status` row show. What failed comes
+//! first, and is the `✗` beside it: a trigger whose fire failed, or whose
+//! fire went out and whose turn then failed, as when the machine was
+//! offline or a login expired, the daemon saying how the turn ended; and a
+//! server the nightly memory cleanup could not read, by the fact it saves.
 use crate::{lookout, trigger};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -12,12 +16,16 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Trigger,
     Subscription,
+    /// A server the nightly memory cleanup could not read: its
+    /// `unreadable-SERVER` fact.
+    Server,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,15 +49,27 @@ pub struct Item {
     /// Sonny's own: a lead's `tasks` subscription. Never counted, never
     /// removed.
     pub own: bool,
+    /// Why it failed, when its last fire or the turn it sent did, or the
+    /// server could not be read.
+    pub failed: Option<String>,
+    /// The turn a trigger's last fire sent, whose end `turns` tells.
+    pub handle: Option<String>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
-/// subscription beside `store` that is for an agent `ours` takes.
-pub fn read(store: &Path, store_id: Option<&str>, ours: impl Fn(&str) -> bool) -> Vec<Item> {
+/// subscription beside `store` that is for an agent `ours` takes, each
+/// trigger's last fire with how its turn ended where `turns` has it.
+pub fn read(
+    store: &Path,
+    store_id: Option<&str>,
+    turns: &HashMap<String, Value>,
+    ours: impl Fn(&str) -> bool,
+) -> Vec<Item> {
     let mut items = Vec::new();
     if let (Some(id), Ok(places)) = (store_id, trigger::Places::home()) {
-        for (row, bots) in trigger::on_store(&places, id) {
+        for (mut row, bots) in trigger::on_store(&places, id) {
             if bots.iter().any(|bot| ours(bot)) {
+                trigger::with_turn(&mut row, turns);
                 items.push(trigger_item(&row, bots));
             }
         }
@@ -79,10 +99,115 @@ pub fn read(store: &Path, store_id: Option<&str>, ours: impl Fn(&str) -> bool) -
                 },
                 reply_to: None,
                 own,
+                failed: None,
+                handle: None,
             });
         }
     }
     items
+}
+
+/// The person's own agents, which no project names, as the one the nightly
+/// memory cleanup starts: what fails for them is the person's to know in
+/// every window.
+pub fn personal(bot: &str) -> bool {
+    !bot.contains('.')
+}
+
+/// Whether a window of `scope` shows `item`: one of its agents is the
+/// scope's, or it failed and is the person's own.
+pub fn shown(scope: &Scope, item: &Item) -> bool {
+    item.bots.iter().any(|bot| scope.takes(bot))
+        || (item.failed.is_some() && item.bots.iter().all(|bot| personal(bot)))
+}
+
+/// What a window of `scope` lists: its triggers and subscriptions, the
+/// person's own that failed, and the servers the nightly memory cleanup
+/// could not read, for the person and the project.
+pub fn read_scope(
+    store: &Path,
+    store_id: Option<&str>,
+    turns: &HashMap<String, Value>,
+    scope: &Scope,
+) -> Vec<Item> {
+    let mut items = read_around(store, store_id, turns, scope);
+    items.retain(|item| shown(scope, item));
+    items
+}
+
+/// [`read_scope`] before what it does not show is left out: the person's
+/// own triggers too, whose turns must be asked about before it is known
+/// whether they failed.
+pub fn read_around(
+    store: &Path,
+    store_id: Option<&str>,
+    turns: &HashMap<String, Value>,
+    scope: &Scope,
+) -> Vec<Item> {
+    let mut items = read(store, store_id, turns, |bot| {
+        scope.takes(bot) || personal(bot)
+    });
+    if let Some(home) = std::env::var_os("HOME") {
+        let root = PathBuf::from(home).join(".agents/memory");
+        items.extend(servers(&root, &scope.project));
+    }
+    items
+}
+
+/// The `unreadable-SERVER` facts the nightly memory cleanup saves, the
+/// person's and `project`'s, each as the server it names.
+fn servers(root: &Path, project: &str) -> Vec<Item> {
+    let view = agent_client::memory::view(root, Some(project));
+    let scopes =
+        std::iter::once(&view["user"]).chain(view["projects"].as_array().into_iter().flatten());
+    let mut items = Vec::new();
+    for scope in scopes {
+        for fact in scope["facts"].as_array().into_iter().flatten() {
+            let name = fact["name"].as_str().unwrap_or_default();
+            let Some(server) = name.strip_prefix("unreadable-").filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let why = fact["description"].as_str().unwrap_or_default();
+            let mut facts = vec![format!("memory fact {name}")];
+            if let Some(project) = scope["name"].as_str() {
+                facts[0].push_str(&format!(" in {project}"));
+            }
+            if let Some(at) = fact["modified"].as_u64().filter(|at| *at > 0) {
+                facts.push(format!("saved {}", ago(now_ms().saturating_sub(at) / 1000)));
+            }
+            facts.push("read again each night".into());
+            items.push(Item {
+                kind: Kind::Server,
+                name: server.to_owned(),
+                bot: String::new(),
+                bots: Vec::new(),
+                when: String::new(),
+                what: String::new(),
+                facts,
+                reply_to: None,
+                own: false,
+                failed: Some(match why.is_empty() {
+                    true => "could not be read".into(),
+                    false => first_line(why),
+                }),
+                handle: None,
+            });
+        }
+    }
+    items
+}
+
+/// How many of `items` failed.
+pub fn failed(items: &[Item]) -> usize {
+    items.iter().filter(|item| item.failed.is_some()).count()
+}
+
+/// The turns `items`' last fires sent whose end `turns` does not have yet.
+pub fn unended(items: &[Item], turns: &HashMap<String, Value>) -> Vec<String> {
+    (items.iter())
+        .filter_map(|item| item.handle.clone())
+        .filter(|handle| !turns.contains_key(handle))
+        .collect()
 }
 
 fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
@@ -90,6 +215,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     let mut facts = Vec::new();
     let sent = row["sent"].as_u64().unwrap_or(0);
     let last = &row["last"];
+    let mut failed = None;
     facts.push(match row["runs"].as_u64() {
         Some(runs) => format!("sent {sent} of {runs}"),
         None if sent == 0 && last.is_null() => "not fired yet".into(),
@@ -101,13 +227,44 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
             .map(|at| format!(" {}", ago(now_ms().saturating_sub(at) / 1000)))
             .unwrap_or_default();
         let detail = match last["detail"].as_str() {
+            Some(detail) if outcome == "failed" => {
+                failed = Some(first_line(detail));
+                String::new()
+            }
             Some(detail) if outcome != "sent" => format!(": {}", first_line(detail)),
             _ => String::new(),
         };
         facts.push(format!("last {outcome}{ago}{detail}"));
+        match last["turn_status"].as_str() {
+            Some("completed") | None => {}
+            // A turn the person stopped, or steered into another, ended as
+            // they asked.
+            Some(status) if status != "failed" => facts.push(format!("its turn {status}")),
+            Some(_) => {
+                facts.push("its turn failed".into());
+                failed = Some(match last["turn_error"].as_str() {
+                    Some(error) if !error.is_empty() => first_line(error),
+                    _ => "its turn failed".into(),
+                });
+            }
+        }
+        if outcome == "failed" && failed.is_none() {
+            failed = Some("failed".into());
+        }
+        // Its turn went well and its answer did not reach `--reply-to`.
+        if last["reply"]["outcome"] == "failed" && failed.is_none() {
+            facts.push("its answer was not passed on".into());
+            failed = Some(match last["reply"]["detail"].as_str() {
+                Some(detail) if !detail.is_empty() => first_line(detail),
+                _ => "its answer was not passed on".into(),
+            });
+        }
     }
     if row["missed"] == true {
         facts.push("missed its time".into());
+    }
+    if row["ended"] == true {
+        facts.push("ended".into());
     }
     if let Some(gate) = row["if"].as_str() {
         facts.push(format!("if {}", first_line(gate)));
@@ -122,6 +279,8 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         facts,
         reply_to: row["reply_to"].as_str().map(str::to_owned),
         own: false,
+        failed,
+        handle: trigger::sent(row),
     }
 }
 
@@ -188,6 +347,9 @@ pub struct View {
     /// The window's own agent, whose lookout line heads the card.
     bot: String,
     items: Vec<Item>,
+    /// How the turns triggers' last fires sent ended, as the window last
+    /// asked the daemon.
+    turns: HashMap<String, Value>,
     lookout: String,
     selected: usize,
     /// The item the first `d` picked, by kind, agent and name.
@@ -203,13 +365,20 @@ pub enum Key {
 }
 
 impl View {
-    pub fn open(scope: Scope, store: PathBuf, store_id: Option<String>, bot: String) -> Self {
+    pub fn open(
+        scope: Scope,
+        store: PathBuf,
+        store_id: Option<String>,
+        bot: String,
+        turns: HashMap<String, Value>,
+    ) -> Self {
         let mut view = Self {
             scope,
             store,
             store_id,
             bot,
             items: Vec::new(),
+            turns,
             lookout: String::new(),
             selected: 0,
             confirm: None,
@@ -222,10 +391,13 @@ impl View {
     /// Read it all again, the pick kept on the same row where it still is.
     pub fn reload(&mut self) {
         let picked = self.items.get(self.selected).map(key_of);
-        let mut items = read(&self.store, self.store_id.as_deref(), |b| {
-            self.scope.takes(b)
-        });
-        items.sort_by_key(|item| item.kind == Kind::Subscription);
+        let mut items = read_scope(
+            &self.store,
+            self.store_id.as_deref(),
+            &self.turns,
+            &self.scope,
+        );
+        items.sort_by_key(|item| (item.failed.is_none(), item.kind != Kind::Trigger));
         self.items = items;
         self.selected = picked
             .and_then(|k| self.items.iter().position(|i| key_of(i) == k))
@@ -236,6 +408,14 @@ impl View {
             self.confirm = None;
         }
         self.lookout = lookout::status(&self.store, &self.bot);
+    }
+
+    /// How the turns ended, as the window has since asked the daemon.
+    pub fn set_turns(&mut self, turns: &HashMap<String, Value>) {
+        if *turns != self.turns {
+            self.turns = turns.clone();
+            self.reload();
+        }
     }
 
     /// The item a removal was asked for is kept: a key went elsewhere.
@@ -271,6 +451,10 @@ impl View {
                     self.notice = Some(
                         "Sonny keeps the lead's tasks subscription; the lookout watches its tasks with it"
                             .into(),
+                    );
+                } else if item.kind == Kind::Server {
+                    self.notice = Some(
+                        "the nightly cleanup removes it the night the server reads again".into(),
                     );
                 } else if confirm == Some(key_of(&item)) {
                     self.remove(&item);
@@ -308,6 +492,7 @@ impl View {
             Kind::Subscription => {
                 lookout::subs::remove(&self.store, &item.bot, &item.name).map(drop)
             }
+            Kind::Server => return,
         };
         self.notice = Some(match done {
             Ok(()) => format!("removed {}", item.name),
@@ -337,11 +522,15 @@ impl View {
             );
             return (out, 0);
         }
-        for (kind, heading) in [
-            (Kind::Trigger, "Triggers"),
-            (Kind::Subscription, "Lookout subscriptions"),
-        ] {
-            let n = self.items.iter().filter(|i| i.kind == kind).count();
+        // What failed first, whatever it is; then the rest by kind.
+        let section = |item: &Item| match (&item.failed, item.kind) {
+            (Some(_), _) => "Failed",
+            (None, Kind::Subscription) => "Lookout subscriptions",
+            (None, _) => "Triggers",
+        };
+        for heading in ["Failed", "Triggers", "Lookout subscriptions"] {
+            let takes = |item: &Item| section(item) == heading;
+            let n = self.items.iter().filter(|i| takes(i)).count();
             if n == 0 {
                 continue;
             }
@@ -351,7 +540,7 @@ impl View {
                 Span::raw(format!(" · {n}")).dim(),
             ]));
             for (index, item) in self.items.iter().enumerate() {
-                if item.kind != kind {
+                if !takes(item) {
                     continue;
                 }
                 if index == self.selected {
@@ -365,13 +554,19 @@ impl View {
 
     fn item_lines(&self, item: &Item, picked: bool, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
+        // The pick has a column of its own, as the composer's `› ` does,
+        // so it never touches the row's mark; what follows lines up under
+        // the name.
         let pick = match picked {
-            true => Span::raw("›").fg(Color::Cyan).bold(),
-            false => Span::raw(" "),
+            true => Span::raw("› ").bold(),
+            false => Span::raw("  "),
         };
+        // Sonny's one mark for what failed, as `/status` shows a task.
         let mark = match item.kind {
-            Kind::Trigger => Span::raw("↻ ").fg(Color::Cyan),
-            Kind::Subscription => Span::raw("◎ ").fg(Color::Magenta),
+            _ if item.failed.is_some() => Span::raw("✗ ").fg(Color::Red),
+            Kind::Trigger => Span::raw("↻ ").dim(),
+            Kind::Subscription => Span::raw("◎ ").dim(),
+            Kind::Server => Span::raw("  "),
         };
         let name = match picked {
             true => Span::raw(item.name.clone()).bold().reversed(),
@@ -386,13 +581,24 @@ impl View {
             Kind::Subscription => {
                 spans.push(Span::raw(format!(" for {}", self.scope.short(&item.bot))).dim());
             }
+            Kind::Server => {
+                spans.push(Span::raw(" could not be read by the nightly memory cleanup").dim());
+            }
         }
         out.extend(crate::transcript::wrap(
             Line::from(spans),
             width,
             Span::raw(""),
-            Span::raw("   "),
+            Span::raw(INDENT),
         ));
+        if let Some(why) = &item.failed {
+            out.extend(crate::transcript::wrap(
+                Line::from(why.clone()),
+                width,
+                Span::raw(INDENT),
+                Span::raw(INDENT),
+            ));
+        }
         let mut facts = item.facts.clone();
         if let Some(to) = item.reply_to.as_ref().filter(|to| **to != item.bot) {
             facts.push(format!("answers go to {}", self.scope.short(to)));
@@ -401,15 +607,15 @@ impl View {
             out.extend(crate::transcript::wrap(
                 Line::from(facts.join(" · ")).dim(),
                 width,
-                Span::raw("   "),
-                Span::raw("   "),
+                Span::raw(INDENT),
+                Span::raw(INDENT),
             ));
         }
         if !item.what.is_empty() {
             out.extend(crate::transcript::capped(
                 Line::from(item.what.clone()).dim(),
                 width,
-                Span::raw("   └ ").dim(),
+                Span::raw(format!("{INDENT}└ ")).dim(),
                 1,
             ));
         }
@@ -420,12 +626,12 @@ impl View {
     /// the keys the picked row takes.
     pub fn footer(&self) -> Line<'static> {
         if let Some(notice) = &self.notice {
-            return Line::from(format!("  {notice}")).fg(Color::Yellow);
+            return Line::from(format!("  {notice}"));
         }
         if let Some((_, _, name)) = &self.confirm {
             return Line::from(vec![
-                Span::raw("  d again removes ").fg(Color::Yellow),
-                Span::raw(name.clone()).bold().fg(Color::Yellow),
+                Span::raw("  d again removes "),
+                Span::raw(name.clone()).bold(),
                 Span::raw(" · any other key keeps it").dim(),
             ]);
         }
@@ -434,14 +640,18 @@ impl View {
             keys.push("↑↓ pick");
         }
         match self.items.get(self.selected) {
-            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fires now", "d removes"]),
-            Some(item) if !item.own => keys.push("d removes"),
+            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fire", "d remove"]),
+            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
             _ => {}
         }
-        keys.push("esc to close");
-        Line::from(format!("  {}", keys.join(" · "))).dim()
+        keys.push("esc close");
+        Line::from(crate::hint::spans(&format!("  {}", keys.join(" · "))))
     }
 }
+
+/// Where a row's lines after the first start: under its name, past the
+/// pick and the mark.
+const INDENT: &str = "    ";
 
 fn key_of(item: &Item) -> (Kind, String, String) {
     (item.kind, item.bot.clone(), item.name.clone())
@@ -489,6 +699,8 @@ mod tests {
             facts: vec!["sent 2".into()],
             reply_to: None,
             own,
+            failed: None,
+            handle: None,
         }
     }
 
@@ -522,16 +734,190 @@ mod tests {
             "last": {"outcome": "failed", "fired_ms": fired, "detail": "bot_busy: it works"}});
         let item = trigger_item(&row, vec!["calc.lead".into()]);
         assert_eq!(item.what, "Read the inbox…");
-        assert_eq!(
-            item.facts,
-            ["sent 4 of 10", "last failed 3h ago: bot_busy: it works"]
-        );
+        assert_eq!(item.facts, ["sent 4 of 10", "last failed 3h ago"]);
+        assert_eq!(item.failed.as_deref(), Some("bot_busy: it works"));
         assert_eq!(item.reply_to.as_deref(), Some("calc.lead"));
         let fresh = trigger_item(
             &json!({"name": "new", "when": "fire", "bot": "calc.lead", "sent": 0, "last": null}),
             vec!["calc.lead".into()],
         );
         assert_eq!(fresh.facts, ["not fired yet"]);
+        assert_eq!(fresh.failed, None);
+    }
+
+    #[test]
+    fn a_fire_that_went_out_fails_when_its_turn_did() {
+        let row = |handle: &str| {
+            json!({"name": "nightly", "when": "cron 0 5 * * *", "bot": "memory-cleanup",
+                "message": "Clean up memory", "sent": 3,
+                "last": {"outcome": "sent", "handle": handle, "fired_ms": now_ms()}})
+        };
+        let turns = HashMap::from([
+            (
+                "h1".to_owned(),
+                json!({"status": "failed", "error": "provider_failed", "detail": "login expired\nsign in again"}),
+            ),
+            ("h2".to_owned(), json!({"status": "interrupted"})),
+            (
+                "h3".to_owned(),
+                json!({"status": "completed", "text": "No changes."}),
+            ),
+        ]);
+        let ended = |handle: &str| {
+            let mut row = row(handle);
+            trigger::with_turn(&mut row, &turns);
+            trigger_item(&row, vec!["memory-cleanup".into()])
+        };
+        let failed = ended("h1");
+        assert_eq!(
+            failed.failed.as_deref(),
+            Some("provider_failed: login expired…")
+        );
+        assert_eq!(
+            failed.facts,
+            ["sent 3", "last sent 0s ago", "its turn failed"]
+        );
+        assert_eq!(failed.handle.as_deref(), Some("h1"));
+        // Stopped by the person: how it ended, not a failure.
+        let stopped = ended("h2");
+        assert_eq!(stopped.failed, None);
+        assert_eq!(stopped.facts[2], "its turn interrupted");
+        assert_eq!(ended("h3").failed, None);
+        // Its answer did not reach the agent it was for.
+        let mut lost = row("h3");
+        lost["reply_to"] = json!("calc.lead");
+        lost["last"]["reply"] = json!({"outcome": "failed", "detail": "bot_not_found: calc.lead"});
+        trigger::with_turn(&mut lost, &turns);
+        let lost = trigger_item(&lost, vec!["memory-cleanup".into()]);
+        assert_eq!(lost.failed.as_deref(), Some("bot_not_found: calc.lead"));
+        assert_eq!(lost.facts[2], "its answer was not passed on");
+        // Not asked yet: the window asks the daemon for it.
+        let running = ended("h4");
+        assert_eq!(running.failed, None);
+        assert_eq!(unended(&[running, failed], &turns), ["h4"]);
+    }
+
+    #[test]
+    fn what_fails_for_the_person_shows_in_every_window_and_a_server_by_its_fact() {
+        let scope = Scope {
+            project: "calc".into(),
+            lead: "calc.lead".into(),
+            glob: "calc.*".into(),
+        };
+        let mut cleanup = item(Kind::Trigger, "memory", &["memory-cleanup"], false);
+        assert!(!shown(&scope, &cleanup));
+        cleanup.failed = Some("provider_failed".into());
+        assert!(shown(&scope, &cleanup));
+        let mut other = item(Kind::Trigger, "digest", &["web.lead"], false);
+        other.failed = Some("bot_busy".into());
+        assert!(!shown(&scope, &other));
+        assert!(shown(
+            &scope,
+            &item(Kind::Trigger, "nightly", &["calc.lead"], false)
+        ));
+
+        let root = std::env::temp_dir().join(format!("background-servers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fact = |dir: &Path, name: &str, description: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: {description}\ntype: reference\nsource: memory-cleanup\nverified: 2026-10-30\n---\n\nsince 10-29\n"),
+            )
+            .unwrap();
+        };
+        fact(
+            &root,
+            "unreadable-chat",
+            "chat server: auth_expired since 2026-10-29",
+        );
+        fact(&root, "prefers-short-replies", "George wants short replies");
+        fact(
+            &root.join("projects/calc"),
+            "unreadable-mail",
+            "mail server: timeout",
+        );
+        fact(
+            &root.join("projects/web"),
+            "unreadable-tracker",
+            "tracker: 401",
+        );
+        let found = servers(&root, "calc");
+        let names: Vec<&str> = found.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["chat", "mail"]);
+        assert_eq!(
+            found[0].failed.as_deref(),
+            Some("chat server: auth_expired since 2026-10-29")
+        );
+        assert_eq!(found[0].facts[0], "memory fact unreadable-chat");
+        assert_eq!(found[1].facts[0], "memory fact unreadable-mail in calc");
+        assert!(
+            found
+                .iter()
+                .all(|i| i.kind == Kind::Server && i.bots.is_empty())
+        );
+        assert_eq!(count(&found, "calc.lead"), 0);
+        assert_eq!(failed(&found), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_card_lists_what_failed_first_marked_with_its_error() {
+        let dir = std::env::temp_dir().join(format!("background-failed-{}", std::process::id()));
+        let mut broken = item(Kind::Trigger, "memory", &["memory-cleanup"], false);
+        broken.failed = Some("provider_failed: login expired".into());
+        let mut server = item(Kind::Server, "chat", &["calc.lead"], false);
+        (server.bot, server.bots, server.what) = (String::new(), Vec::new(), String::new());
+        server.facts = vec!["memory fact unreadable-chat".into()];
+        server.failed = Some("chat server: auth_expired".into());
+        let mut view = View {
+            scope: Scope {
+                project: "calc".into(),
+                lead: "calc.lead".into(),
+                glob: "calc.*".into(),
+            },
+            store: dir.join("state.sqlite"),
+            store_id: None,
+            bot: "calc.lead".into(),
+            items: vec![
+                broken,
+                server,
+                item(Kind::Trigger, "nightly", &["calc.lead"], false),
+            ],
+            turns: HashMap::new(),
+            lookout: String::new(),
+            selected: 1,
+            confirm: None,
+            notice: None,
+        };
+        let (card, at) = view.card(100);
+        let lines: Vec<String> = card.iter().map(|l| l.to_string()).collect();
+        assert_eq!(lines[2], "Failed · 2");
+        assert_eq!(lines[3], "  ✗ memory every 1d → memory-cleanup");
+        let mark = card[3]
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with('✗'))
+            .unwrap();
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        assert_eq!(lines[4], "    provider_failed: login expired");
+        assert_eq!(
+            card[4].style.add_modifier,
+            ratatui::style::Modifier::empty()
+        );
+        assert_eq!(
+            lines[7],
+            "› ✗ chat could not be read by the nightly memory cleanup"
+        );
+        assert_eq!(at, 7);
+        assert_eq!(lines[8], "    chat server: auth_expired");
+        assert_eq!(lines[9], "    memory fact unreadable-chat");
+        assert_eq!(lines[11], "Triggers · 1");
+        assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc close");
+        let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut view, KeyCode::Char('d'));
+        assert_eq!(view.confirm, None);
+        assert!(view.notice.as_deref().unwrap().contains("reads again"));
     }
 
     #[test]
@@ -553,6 +939,7 @@ mod tests {
                 item(Kind::Trigger, "nightly", &["calc.lead"], false),
                 item(Kind::Subscription, "tasks", &["calc.lead"], true),
             ],
+            turns: HashMap::new(),
             lookout: "Lookout · not running".into(),
             selected: 0,
             confirm: None,
@@ -568,11 +955,11 @@ mod tests {
         let lines = text(&view);
         assert_eq!(lines[0], "calc · in the background");
         assert_eq!(lines[3], "Triggers · 1");
-        assert_eq!(lines[4], "›↻ nightly every 1d → lead");
-        assert_eq!(lines[5], "   sent 2");
-        assert_eq!(lines[6], "   └ Read preferences.md");
+        assert_eq!(lines[4], "› ↻ nightly every 1d → lead");
+        assert_eq!(lines[5], "    sent 2");
+        assert_eq!(lines[6], "    └ Read preferences.md");
         assert_eq!(lines[8], "Lookout subscriptions · 1");
-        assert_eq!(lines[9], " ◎ tasks for lead");
+        assert_eq!(lines[9], "  ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         // Ctrl+D is not d.
         view.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));

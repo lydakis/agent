@@ -2873,6 +2873,15 @@ impl Turn {
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
             accounting.begin(attempt > 0);
+            // Deltas name their item past the last node the call sends, so
+            // the numbers grow through the turn, and a call retried or
+            // resumed streams its items again under the same ones.
+            let after = match body {
+                Body::Window(context) => (context.window.as_ref())
+                    .and_then(|window| window.ids.last())
+                    .map_or(0, |&node| node as u64),
+                _ => 0,
+            };
             (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
             let sent = agent_runtime::provider::Sent::default();
             // The call's own provider and model, and where this attempt goes.
@@ -2904,13 +2913,14 @@ impl Turn {
                         sent: Some(&sent),
                     },
                     |delta| {
-                        let (kind, text) = match delta {
-                            Delta::Text(text) => (if summary { "compaction_text_delta" } else { "text_delta" }, text),
-                            Delta::Thinking(text) => (if summary { "compaction_thinking_delta" } else { "thinking_delta" }, text),
+                        let (kind, index, text) = match delta {
+                            Delta::Text(index, text) => (if summary { "compaction_text_delta" } else { "text_delta" }, index, text),
+                            Delta::Thinking(index, text) => (if summary { "compaction_thinking_delta" } else { "thinking_delta" }, index, text),
                         };
+                        let item = after + index as u64 + 1;
                         self.hub.live(
                             &self.bot,
-                            json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"text":text}),
+                            json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"item":item,"text":text}),
                         )
                     },
                     &mut accounting.report,
@@ -4202,9 +4212,11 @@ impl Turn {
                 CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(outcome)),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
-            let lapse = tokio::time::Instant::now()
-                + Duration::from_millis(expires_ms.saturating_sub(now_ms()));
-            let wake = lapse.min(hold);
+            // No deadline while a step of the call waits on a gate.
+            let lapse = expires_ms.map(|at| {
+                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
+            });
+            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
             if tokio::time::Instant::now() < wake {
                 tokio::select! {
                     () = notify.notified() => continue,
@@ -4212,7 +4224,7 @@ impl Turn {
                 }
             }
             // A call out of time is answered by the next check.
-            if tokio::time::Instant::now() >= lapse {
+            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
                 continue;
             }
             let pending: Vec<ToolCall> = calls.as_slice().to_vec();
@@ -4233,7 +4245,8 @@ impl Turn {
             {
                 // An answer landed as the hold ran out.
                 None => continue,
-                Some(at) => return Ok(ControlFlow::Break(Stop::Lapses(at))),
+                Some(Some(at)) => return Ok(ControlFlow::Break(Stop::Lapses(at))),
+                Some(None) => return Ok(ControlFlow::Break(Stop::Parked)),
             }
         }
     }

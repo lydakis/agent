@@ -291,9 +291,12 @@ impl Markdown {
         }
         let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-            // A heading is the agent's own voice: the agents' color.
-            let style = Style::new().add_modifier(Modifier::BOLD).fg(Color::Blue);
-            return Some(Line::from(inline(trimmed[hashes + 1..].trim(), style)));
+            // Prose takes no hue: a heading is bold, and its marks stay,
+            // dim, so its level reads.
+            let style = Style::new().add_modifier(Modifier::BOLD);
+            let mut spans = vec![Span::raw(format!("{} ", &trimmed[..hashes])).dim()];
+            spans.extend(inline(trimmed[hashes + 1..].trim(), style));
+            return Some(Line::from(spans));
         }
         let indent = &text[..text.len() - trimmed.len()];
         let bare = trimmed.trim_end();
@@ -328,7 +331,7 @@ impl Markdown {
             return Some(Line::from(spans));
         }
         if let Some(rest) = trimmed.strip_prefix("> ") {
-            let mut spans = vec![Span::raw("▌ ").fg(Color::Green)];
+            let mut spans = vec![Span::raw("▌ ").dim()];
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
         }
@@ -813,10 +816,14 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                     },
                     false,
                 )),
-                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "summary" => {
-                    if tag.name == "summary" {
-                        spans.push(Span::styled("▸ ", base.dim()));
-                    }
+                "summary" => {
+                    spans.push(Span::styled("▸ ", base.dim()));
+                    within(base.add_modifier(Modifier::BOLD), &mut spans);
+                }
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    // As a Markdown heading draws: its level in dim marks.
+                    let level = usize::from(tag.name.as_bytes()[1] - b'0');
+                    spans.push(Span::styled(format!("{} ", "#".repeat(level)), base.dim()));
                     within(base.add_modifier(Modifier::BOLD), &mut spans);
                 }
                 "del" | "s" | "strike" => {
@@ -1324,10 +1331,17 @@ fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
         return Some(sourced(rest));
     }
-    // "- the lead role: theirs at …" is the lead role.
+    // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
+    // the backup, and a register's rows are what's new.
     if let Some(rest) = text.strip_prefix(crate::skills::UPGRADED) {
         let mut parts = vec!["Sonny upgraded".to_owned()];
+        if rest.lines().any(|line| line.starts_with("| ")) {
+            parts.push("what's new".to_owned());
+        }
         parts.extend(rest.lines().filter_map(|line| {
+            if let Some(step) = line.strip_prefix("- set up ") {
+                return Some(format!("set up {}", step.split_once(": ")?.0));
+            }
             let what = line.strip_prefix("- the ")?.split_once(": ")?.0;
             Some(format!("{what} edited"))
         }));
@@ -1362,6 +1376,8 @@ fn news(text: &str) -> Option<Vec<String>> {
                 parts.push(format!("{name} took a note away"));
             } else if status.starts_with("waiting for the person") {
                 parts.push(format!("{name} needs you"));
+            } else if status.starts_with("put a question to the person") {
+                parts.push(format!("{name} asks you"));
             } else if status.starts_with("has printed nothing") {
                 parts.push(format!("{name} quiet"));
             } else if let Some(who) = status.strip_suffix(" wrote in it") {
@@ -1855,7 +1871,7 @@ fn drawn(
         // One Sonny answered with an error says why, so the call is not
         // read as done.
         if let Some(why) = failed.then(|| refusal(output)).flatten() {
-            said.under.insert(0, Line::from(why).red());
+            said.under.insert(0, Line::from(why));
         }
         return said_lines(said, width);
     }
@@ -2181,12 +2197,17 @@ pub fn plan_lines(steps: &[String], full: bool, width: usize) -> Vec<Line<'stati
 }
 
 fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
-    let bullet = if said.failed {
-        Span::raw("• ").fg(Color::Red)
-    } else {
-        Span::raw("• ").fg(Color::Green)
+    // A call that failed did not do what its verb says: it is marked
+    // failed and said as what it tried, as Codex and Claude Code lead a
+    // failure with its mark.
+    let (bullet, verb) = match said.failed {
+        true => (
+            Span::raw("✗ ").fg(Color::Red),
+            crate::calls::attempted(&said.verb),
+        ),
+        false => (Span::raw("• ").fg(Color::Green), said.verb),
     };
-    let mut spans = vec![Span::raw(said.verb).bold()];
+    let mut spans = vec![Span::raw(verb).bold()];
     if !said.what.is_empty() {
         spans.extend([Span::raw(" "), Span::raw(said.what)]);
     }
@@ -2683,7 +2704,7 @@ mod tests {
         };
         assert_eq!(
             shown("<p align=\"center\">\n  <b>Agent</b>\n</p>\n<h1 align=\"center\">Title</h1>"),
-            vec!["    Agent", "  Title"]
+            vec!["    Agent", "  # Title"]
         );
         assert_eq!(
             shown(
@@ -2779,11 +2800,12 @@ mod tests {
              - shop.fix: turn:shop.fix/3, put the note \"bench\" in its own margin; the margin tool with from \"shop.fix/bench\" shows it in yours\n\
              - shop.web: turn:shop.web/2, took its margin note \"old\" away\n\
              - shop.docs: turn:shop.docs/2 waiting for the person's approval\n\
-             - shop.api: turn:shop.api/3 has printed nothing for 30 minutes";
+             - shop.api: turn:shop.api/3 has printed nothing for 30 minutes\n\
+             - shop.db: turn:shop.db/4, put a question to the person, which they answer in shop.db:\n  > Keep it?";
         assert_eq!(
             text(&super::prompt(note, None, 160)),
             [
-                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet"
+                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet · shop.db asks you"
             ]
         );
     }
@@ -2849,6 +2871,19 @@ mod tests {
         assert_eq!(
             text(&super::prompt(&note, None, 90)),
             ["↳ Sonny upgraded · lead role edited · plan skill edited"]
+        );
+        let note = format!(
+            "{}Sonny's features changed since the person last heard of them. The rows:\n\
+             | Tasks | shipped | added 10-26 #142 | Why | ? |\n\
+             The whole register is at /h/FEATURES.md.\n\n\
+             Sonny offers setup the person has not done:\n\
+             - set up backup: a git backup of ~/.agents, with `sonny setup backup`\n\
+             Offer each once.",
+            crate::skills::UPGRADED
+        );
+        assert_eq!(
+            text(&super::prompt(&note, None, 90)),
+            ["↳ Sonny upgraded · what's new · set up backup"]
         );
     }
 
@@ -2916,7 +2951,7 @@ mod tests {
         );
         assert_eq!(
             text(&rows),
-            ["• Hi x", "  Head", "    let a = 1;", "  - item"]
+            ["• Hi x", "  ## Head", "    let a = 1;", "  - item"]
         );
     }
 
@@ -3042,11 +3077,11 @@ mod tests {
             text(&rows),
             [
                 "• Edited calc.py  -1 +1",
-                "   1   def average(values):",
-                "   2 ▎     return sum(values) / (len(values) - 1)",
-                "   2 ▎     return sum(values) / len(values)",
-                "   3   ",
-                "   4   print(average([2, 4]))",
+                "   1    def average(values):",
+                "   2 ▎-     return sum(values) / (len(values) - 1)",
+                "   2 ▎+     return sum(values) / len(values)",
+                "   3    ",
+                "   4    print(average([2, 4]))",
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -3145,11 +3180,11 @@ mod tests {
         let rows = text(&rows);
         assert_eq!(rows[0], "• Patched calc.py, notes.md, old.py  -1 +2");
         assert!(
-            rows.contains(&"   2 ▎     return sum(values) / (len(values) - 1)".to_owned()),
+            rows.contains(&"   2 ▎-     return sum(values) / (len(values) - 1)".to_owned()),
             "{rows:#?}"
         );
         assert!(
-            rows.contains(&"   2 ▎     return sum(values) / len(values)".to_owned()),
+            rows.contains(&"   2 ▎+     return sum(values) / len(values)".to_owned()),
             "{rows:#?}"
         );
         assert!(
@@ -3251,7 +3286,7 @@ mod tests {
             "Started calc.fix: {\"handle\":\"turn:calc.fix/3\"}",
         );
         assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
-        // One that failed says why first.
+        // One that failed says what it tried, and why first.
         let shown = text(&super::clean(
             "show_agent",
             &serde_json::json!({"agent": "calc.fix", "split": "right"}),
@@ -3263,7 +3298,7 @@ mod tests {
         assert_eq!(
             shown,
             [
-                "• Moved calc.fix to a split right of you",
+                "✗ Couldn't move calc.fix to a split right of you",
                 "  └ neither rex nor herdr was found"
             ]
         );
@@ -3290,7 +3325,7 @@ mod tests {
         assert_eq!(
             scheduled,
             [
-                "• Scheduled every 30m",
+                "✗ Couldn't schedule every 30m",
                 "  └ triggers_unsupported: only macOS",
                 "    Check the queue."
             ]

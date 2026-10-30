@@ -28,6 +28,9 @@ Sonny's lookout answers outside the agent's sandbox, since a trigger is a
 job of the system's scheduler: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
+A row whose last fire sent a turn says how that turn ended, as the daemon
+has it: `last.turn_status`, and `last.turn_error` when it did not complete,
+so an agent sees the failure the person sees in `/background`.
 It waits for a verdict wherever the agent's other calls do (`/approvals`),
 since a trigger runs as the person and its `if` command outside any
 sandbox. For people, scripts and other harnesses, Sonny writes
@@ -86,8 +89,11 @@ pinned by its id: a bot deleted since, or a new bot under its name, is not
 reached (`bot_not_found`), and the trigger ends. `--start NAME --model
 PROVIDER/MODEL [--effort LEVEL]` names an agent that does not exist yet:
 the first fire makes it as Sonny makes an agent (the daemon's `create`,
-in the folder `add` ran in, with that folder's composed policy and the
-default tools), made by the agent that added the trigger when one did, so
+in the folder `add` ran in, with that folder's composed policy, the
+default tools and Sonny's own a task has: the memory tool, and `exec` while
+an MCP server is on, so an agent no one opens reaches the person's servers
+as one they open does; one a trigger made before it had them takes them at
+its next fire, gated as its mode gates the rest), made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
 state when the fire settles, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
@@ -338,7 +344,8 @@ when the goal ends, and the note goes with the agent.
 ## Memory
 
 Memory is what earlier agents learned that a later one needs: decisions,
-the person's preferences and corrections, traps, pointers. Each fact is one
+the person's preferences, what they corrected and what they confirmed
+worked, traps, pointers. Each fact is one
 Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
 `verified`, and `external` when it is so). The person's facts are in `~/.agents/memory`, a project's in
@@ -414,8 +421,22 @@ agent's or named client's mark, steers included, newest first and at most
 that turn ran in. It saves what no
 agent saved, as Codex mines finished sessions and OpenClaw's dreaming reads
 the day's notes, taking only the person's own words and their scope, as
-Codex's extraction does. The trigger still wakes it only when memory
-changed; words from a quiet night are read the next time it runs.
+Codex's extraction does.
+
+The same night it looks for habits, as Generative Agents reflect on the
+day's memories and Letta's sleep-time agents rework memory between
+conversations: a move that cost the person and that they made again,
+across `said`, the facts memory holds and, through `exec`, what they sent
+in their chat, mail and the like when they connected servers for those. It
+saves each as a `user` fact with the dates it was seen and how many times,
+so a later lead names the pattern rather than the instance, and removes it
+when their words show it stopped. It also saves how they took what an
+agent did unasked, which is how far leads go on their own. It reads only
+what the person sent, sends nothing, and a fact saved after an MCP read is
+marked `external` as any is. A server it cannot read, as one whose sign-in
+expired, gets an `unreadable-SERVER` fact, and that night is left
+unfinished, so the next one reads from the same time and catches up; the first night, and after
+three days, it finishes without it.
 
 `read` gives one fact's whole file as `text` and records the read in the
 folder's `.reads` (`{NAME: {last, count}}`), which is neither a fact nor
@@ -459,8 +480,10 @@ a skill and a trigger, not part of the daemon. `schedule` adds
 the trigger `memory-cleanup`: at 03:30 by default (`--cron` moves it) it
 starts, on its first fire, an agent of that name in `~/.agents/memory` on
 the model given, and sends it "Clean up memory as the memory-cleanup skill
-says." The trigger's `--if` runs `changed`, so a night after nothing was
-saved or removed costs no turn. Each turn is capped at 1,000,000 tokens:
+says." The trigger's `--if` runs `changed`, which Sonny answers true also
+when the person wrote to any agent since the last finished cleanup
+started (starting a stopped daemon to read it, as a fire would), so a night after nothing was saved or removed and nothing said
+costs no turn. Each turn is capped at 1,000,000 tokens:
 the agent keeps one conversation, as every `--start` agent does, so each
 call carries earlier nights up to where compaction summarizes them.
 Nothing is scheduled until the person runs `schedule`, since Sonny has no
@@ -520,7 +543,9 @@ every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
 as a file; `memory`, what to save for later agents; `commons`, the threads
 agents share (see Commons); `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
-Triggers); and, depending on where it runs, `pictures`, `rex-windows`,
+Triggers); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
+flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md)); and,
+depending on where it runs, `pictures`, `rex-windows`,
 `herdr-panes` or `cmux-tabs`. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
@@ -543,6 +568,21 @@ not changed since; a copy left the same as it is Sonny's
 again from the next start. A file of the person's own that Sonny never
 wrote, or a link, is not offered.
 
+The same note carries what changed in Sonny, from its feature register
+([FEATURES.md](../sonny/FEATURES.md)), which Sonny writes to
+`~/.agent/sonny/FEATURES.md` at each start. Sonny keeps the register as the
+person last heard of it in `~/.agent/sonny/shipped/FEATURES.md`; when this
+Sonny's differs, the note lists the rows that are new or changed and asks
+the bot to tell the person what of them matters, and once it is sent the
+new register is the heard one. No version is compared, so a skipped release
+is told with the next. The first register a person has is heard of without
+a word. The note also offers each setup step an upgrade brings that the
+person has neither done nor been offered (`setup::STEPS`: bringing in
+MCP servers with `sonny mcp import`, and a git backup with `sonny setup
+backup`): each is offered once, then noted in
+`~/.agent/sonny/offered`, as is one setup itself offers. The row reads
+`↳ Sonny upgraded · what's new · set up mcp-import`.
+
 A link the Agent app left there, into its bundle's
 `Contents/Resources/skills`, is replaced, never written through; a folder's
 own skill of the same name wins over any of them. Agents already running
@@ -563,16 +603,43 @@ description = "Issues and projects in Linear"
 command = "npx"
 args = ["@playwright/mcp@latest"]
 enabled_tools = ["browser_navigate", "browser_snapshot", "browser_click"]
+default_tools_approval_mode = "writes"     # ask before every call but reads
+
+[sonny.mcp_servers.playwright.tools.browser_snapshot]
+approval_mode = "approve"                  # never ask for this one
 ```
 
 A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
 `bearer_token_env_var` and `http_headers` (streamable HTTP), and either way
 `enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_sec`,
-`tool_timeout_sec` and `description`. `sonny mcp add NAME -- COMMAND ARGS`
+`tool_timeout_sec`, `description`, `default_tools_approval_mode` and
+`tools.TOOL.approval_mode` (next section). `sonny mcp add NAME -- COMMAND ARGS`
 (or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
 drops it, and `sonny mcp list` starts each and says what it offers or why
 it did not start. `/mcp` in Sonny shows the same from the last listings,
 and `sonny mcp tool` prints the `exec` tool agents are given, as JSON.
+
+`sonny mcp import` brings in the servers other agents have, as Claude Code's
+`claude mcp add-from-claude-desktop` does, from Codex's
+`~/.codex/config.toml`, Claude Code's `~/.claude.json` (the user's and this
+folder's) and `.mcp.json`, OpenCode's `opencode.json` and Kiro's
+`.kiro/settings/mcp.json`, at home and in the folder it runs in. It lists
+them ticked, but for those from a file in the folder: whoever wrote the
+folder wrote those, and one can send a key the person has to its own URL,
+so, as Claude Code asks before it starts a project's `.mcp.json` servers,
+they start unticked and each row says what variables it reads. Space ticks
+or unticks one and Enter brings the ticked ones; `--yes` takes all but the
+folder's, and `--json` only prints what it found. First-run setup offers the
+same. A name Sonny has already, or that an agent earlier in that list has,
+is skipped, and the other agents' files are left as they were. A secret
+written into a server's entry (an `env` value named like a key or token, or
+a literal `Authorization: Bearer`) goes to `~/.agent/env`, which stdio
+servers are started with and `bearer_token_env_var` names, never to
+`config.toml`; a value that only names a variable (`${VAR}`, `{env:VAR}`)
+is left to the environment, and the import says when that variable is not
+set. Servers on the old SSE transport are named and left out.
+
+![sonny mcp import](sonny/mcp-import.png)
 
 Agents do not get a tool per MCP tool. While any server is on, every agent
 Sonny opens has one tool, `exec`, with Codex's code mode contract
@@ -585,7 +652,8 @@ later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, four at once in the lookout (more wait their turn), and returns
+10 minutes, four at once in the lookout and sixteen alive (more wait
+their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
 the whole to a file; saved outputs and images are kept a week. A first
 line such as
@@ -597,9 +665,25 @@ started by the first call and stopped after ten idle minutes, with each
 server's tool list kept in `~/.agent/sonny/mcp` so agents are told of its
 tools without starting it. Servers run as the person, beside the lookout and
 outside every agent's sandbox, as Codex starts its own: a sandboxed task
-reaches them only through `exec`, which waits for a verdict as Sonny's other
-gated tools do, one per script. A turn that ends, as one the person
+reaches them only through `exec`. A turn that ends, as one the person
 interrupts, stops its script and the calls it has in flight.
+
+As in Codex, a script is not approved as a whole: each call it makes is
+checked on its own, by its server's `approval_mode`, Codex's names and
+rule. `auto`, the default, asks first for a call of a tool the server marks
+destructive (`destructiveHint`) unless it also marks it read-only
+(`readOnlyHint`, which wins), and runs the rest; `writes` asks for every
+call but a read-only tool's; `prompt` asks for every call; `approve` never
+asks. Asking puts the call to the agent's own gate, through the daemon's
+`approve_step`: in `full` nothing waits, in `auto` the judge decides it, in
+`ask` the person does, the call drawn with `a call in a running script`.
+The script waits for the verdict with its 10 minutes stopped and its place
+among the four running given to another, though it stays among the sixteen
+alive; JavaScript it runs meanwhile, beside the waiting call, still spends
+its time. A denied call rejects with the reason, which the script can catch.
+Once a call a gate allowed has run, Sonny tells the daemon how it ended
+(`step_result`), so the judge of the agent's next call counts it among those
+the turn already ran.
 
 ## Checks
 

@@ -1,7 +1,9 @@
 //! Diffs drawn the way diffs.com draws them, in a terminal: numbered rows,
-//! a coloured bar for each changed line, a tint on the line and a stronger
-//! one on the words that changed, nearby lines dim for context, and
-//! `⋯ N unmodified lines` between hunks. An edit's change and a unified
+//! a coloured bar and a `-` or `+` for each changed line (the sign says it
+//! where color does not: with `NO_COLOR`, or to an eye that does not tell
+//! red from green), a tint on the line and a stronger one on the words
+//! that changed, nearby lines dim for context, and `⋯ N unmodified lines`
+//! between hunks. An edit's change and a unified
 //! diff a command printed (`git diff`) read the same.
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
@@ -11,6 +13,7 @@ use similar::{ChangeTag, TextDiff};
 
 /// The bar, the line's tint and the changed words' tint, for removed
 /// and added lines, on the terminal's background.
+#[derive(Clone, Copy)]
 struct Palette {
     removed: Color,
     added: Color,
@@ -38,8 +41,38 @@ const LIGHT: Palette = Palette {
     added_word: Color::Rgb(171, 242, 188),
 };
 
-fn palette() -> &'static Palette {
-    if crate::term::light() { &LIGHT } else { &DARK }
+/// The palette for the terminal's background: with the theme's colors
+/// known, its own red and green (else these), tinted onto its own
+/// background; else the fixed one for a light or a dark background.
+fn palette() -> Palette {
+    let light = crate::term::light();
+    let fixed = if light { LIGHT } else { DARK };
+    let theme = crate::term::theme();
+    let Some(background) = theme.background else {
+        return fixed;
+    };
+    let bar = |answered: Option<crate::term::Rgb>, fallback: Color| match (answered, fallback) {
+        (Some(rgb), _) => rgb,
+        (None, Color::Rgb(r, g, b)) => (r, g, b),
+        (None, _) => unreachable!("the fixed palettes are RGB"),
+    };
+    let (removed, added) = (bar(theme.red, fixed.removed), bar(theme.green, fixed.added));
+    // How much of the bar's color a tint takes: less on a light background,
+    // where a little color already shows.
+    let (line, word) = if light { (0.10, 0.28) } else { (0.16, 0.40) };
+    let tint = |rgb, alpha| {
+        let (r, g, b) = crate::look::blend(rgb, background, alpha);
+        Color::Rgb(r, g, b)
+    };
+    let rgb = |(r, g, b)| Color::Rgb(r, g, b);
+    Palette {
+        removed: rgb(removed),
+        added: rgb(added),
+        removed_line: tint(removed, line),
+        added_line: tint(added, line),
+        removed_word: tint(removed, word),
+        added_word: tint(added, word),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -70,22 +103,24 @@ fn row(
     let number = number.map_or(" ".repeat(digits), |n| format!("{n:>digits$}"));
     let p = palette();
     let (bar, line, word) = match kind {
-        Kind::Context => (
-            Span::raw("  "),
-            Style::new().add_modifier(Modifier::DIM),
-            None,
-        ),
+        Kind::Context => (("  ", "  "), Style::new().add_modifier(Modifier::DIM), None),
         Kind::Removed => (
-            Span::raw("▎ ").fg(p.removed),
+            ("▎-", "▎ "),
             Style::new().bg(p.removed_line),
             Some(Style::new().bg(p.removed_word)),
         ),
         Kind::Added => (
-            Span::raw("▎ ").fg(p.added),
+            ("▎+", "▎ "),
             Style::new().bg(p.added_line),
             Some(Style::new().bg(p.added_word)),
         ),
     };
+    let color = match kind {
+        Kind::Context => Style::new(),
+        Kind::Removed => Style::new().fg(p.removed),
+        Kind::Added => Style::new().fg(p.added),
+    };
+    let (first, more) = (Span::styled(bar.0, color), Span::styled(bar.1, color));
     let spans: Vec<Span<'static>> = pieces
         .iter()
         .map(|(changed, text)| {
@@ -96,8 +131,12 @@ fn row(
             }
         })
         .collect();
-    let lead = Line::from(vec![Span::raw(format!("  {number} ")).dim(), bar.clone()]);
-    let rest = Line::from(vec![Span::raw(" ".repeat(digits + 3)), bar]);
+    let lead = Line::from(vec![
+        Span::raw(format!("  {number} ")).dim(),
+        first,
+        " ".into(),
+    ]);
+    let rest = Line::from(vec![Span::raw(" ".repeat(digits + 3)), more, " ".into()]);
     crate::transcript::wrap_lines(Line::from(spans), width, lead, rest)
 }
 
@@ -411,9 +450,9 @@ mod tests {
         assert_eq!(
             text(&lines),
             [
-                "   1   def average(values):",
-                "   2 ▎     return sum(values) / (len(values) - 1)",
-                "   2 ▎     return sum(values) / len(values)",
+                "   1    def average(values):",
+                "   2 ▎-     return sum(values) / (len(values) - 1)",
+                "   2 ▎+     return sum(values) / len(values)",
             ]
         );
         // The removed words carry the stronger tint.
@@ -437,7 +476,7 @@ mod tests {
             "{text:?}"
         );
         assert!(
-            text.iter().any(|l| l.starts_with("  21 ▎ z = 3")),
+            text.iter().any(|l| l.starts_with("  21 ▎+ z = 3")),
             "{text:?}"
         );
         assert!(unified("just text\n", 80, 100).is_none());
