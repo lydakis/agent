@@ -203,9 +203,10 @@ brew install lydakis/agent/sonny        # or, on Linux, install.sh above
 sonny                                   # in your project's folder
 ```
 
-The first run asks how your agents reach a model (a ChatGPT plan, an
-Anthropic, OpenAI or OpenRouter key, or Bedrock with your AWS profile) and
-which model new projects use. As Codex does, it keeps the settings in
+The first run looks at what your machine already has (a provider key, a
+ChatGPT sign-in, your AWS profiles), asks how your agents reach a model only
+when nothing does, and offers the providers' models ranked, the first marked
+so Enter takes it. `sonny setup` asks again. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
 which Sonny applies to the daemon and everything else it starts, so nothing
 goes in your shell profile. Bots search the web where their provider offers
