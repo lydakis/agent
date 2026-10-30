@@ -571,6 +571,12 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("memory_refused", "no HOME".to_owned()))?;
+            if arguments["changed"] == true {
+                return crate::said::changed(&home, &here)
+                    .await
+                    .map(|said| said.to_string())
+                    .map_err(|e| ("memory_refused", e));
+            }
             agent_client::memory::call(&home, &here, arguments)
                 .map(|said| said.to_string())
                 .map_err(|e| ("memory_refused", e))

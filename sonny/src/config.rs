@@ -314,7 +314,7 @@ impl View {
         }
         let what = match &self.said {
             Some(Ok(saved)) => Span::raw(format!("saved {saved}")).fg(Color::Green),
-            Some(Err(error)) => Span::raw(error.clone()).fg(Color::Red),
+            Some(Err(error)) => Span::raw(format!("✗ {error}")),
             None => Span::raw(SETTINGS[self.pick].about).dim(),
         };
         (Line::from(vec![Span::raw("› ").bold(), what]), None)

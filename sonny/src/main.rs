@@ -30,6 +30,7 @@ mod image;
 mod js;
 mod links;
 mod login;
+mod look;
 mod lookout;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -40,6 +41,7 @@ mod mermaid;
 mod models;
 mod mux;
 mod pane;
+mod picker;
 mod place;
 mod plan;
 mod project;
@@ -207,6 +209,7 @@ fn usage() -> String {
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
+     sonny setup asks again for the provider and the default model, as the first run does.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
@@ -497,7 +500,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-            setup::provider(&bin)?;
+            setup::provider(&bin, false)?;
             start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,
@@ -733,8 +736,16 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "memory" => {
             // The person's words are read from the daemon, which only
             // Sonny reaches; the rest is memory's own.
-            if let Some(("said", since)) = rest.split_first().map(|(v, r)| (v.as_str(), r)) {
-                return std::process::ExitCode::from(said::cli(since) as u8);
+            match rest.split_first().map(|(v, r)| (v.as_str(), r)) {
+                Some(("said", since)) => {
+                    return std::process::ExitCode::from(said::cli(since) as u8);
+                }
+                // The person's words count as a change, so a night they
+                // wrote is cleaned up whether or not an agent saved.
+                Some(("changed", [])) => {
+                    return std::process::ExitCode::from(said::changed_cli() as u8);
+                }
+                _ => {}
             }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
@@ -747,6 +758,18 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "setup" && rest.is_empty() => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let (store, socket) = daemon_paths(None, None)?;
+                        setup::again(&store, &socket).await
+                    })
+                })
+        }
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
@@ -968,6 +991,9 @@ async fn run() -> Result<(), String> {
     // beside their edits; a side chat leaves it to its agent.
     if options.side.is_none() {
         app.upgrades = skills::upgraded();
+    }
+    if let Some(set) = setup::just_set() {
+        app.notice = Some(set);
     }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
@@ -9023,8 +9049,10 @@ impl App {
             frame.render_widget(Paragraph::new(line), footer);
             counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
         };
+        let look = look::Look::now();
         terminal.draw(|frame| {
             paint(frame);
+            look.finish(frame.buffer_mut());
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
         })?;
@@ -9032,6 +9060,7 @@ impl App {
         self.counter_at = counter_at;
         // Over themselves, the cursor kept where the frame left it.
         if !linked.is_empty() {
+            linked.iter_mut().for_each(|(_, _, cell)| look.cell(cell));
             execute!(
                 terminal.backend_mut(),
                 ratatui::crossterm::cursor::SavePosition
@@ -9183,7 +9212,7 @@ impl App {
             return Line::from(spans);
         }
         match &self.notice {
-            Some(notice) => Line::from(Span::raw(notice.clone()).fg(Color::Yellow)),
+            Some(notice) => Line::from(Span::raw(notice.clone())),
             None if self.input.starts_with('!') => Line::from(vec![
                 Span::raw("! ").bold().fg(Color::Magenta),
                 Span::raw(format!(
@@ -9478,10 +9507,7 @@ const INLINE_ROWS: usize = 40;
 /// margin when it is `beside` the conversation, else the note's own head
 /// over its rows.
 fn note_marker(title: String, beside: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::raw("  ✎ ").fg(Color::Yellow).dim(),
-        Span::raw(title).dim().underlined(),
-    ];
+    let mut spans = vec![Span::raw("  ✎ ").dim(), Span::raw(title).dim().underlined()];
     if beside {
         spans.push(Span::raw(" · in the margin").dim());
     }
@@ -9913,6 +9939,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_night_the_person_wrote_is_cleaned_up_though_no_agent_saved() {
+        let home = std::env::temp_dir().join(format!("said-changed-{}", std::process::id()));
+        let root = home.join(".agents/memory");
+        std::fs::create_dir_all(&root).unwrap();
+        // The last cleanup started at 1000; nothing was saved since.
+        std::fs::write(root.join(".said"), "1000").unwrap();
+        let answering = |text: &'static str| {
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.lead"}], "next_after": null}),
+                    "turns" => json!({"turns": [
+                    {"turn": 2, "started_ms": 1500, "finished_ms": 1800}], "next_before": null}),
+                    "history_nodes" => {
+                        json!({"nodes": [{"node": 5, "turn": 2}], "next_from": null})
+                    }
+                    "history_items" => json!({"items": [{"node": 5, "item": {"type": "message",
+                    "role": "user", "content": [{"type": "input_text", "text": text}]},
+                    "origin": if text.is_empty() { json!("trigger") } else { Value::Null }}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+        };
+        let wrote = answering("I keep forgetting to rebase.").await;
+        let done = said::changed_on(&home, &home, async { Ok::<_, String>(wrote) }).await;
+        assert_eq!(done, Ok(json!({"changed": true, "said": true})));
+        // Only a trigger's words since: nothing to clean up.
+        let quiet = answering("").await;
+        let done = said::changed_on(&home, &home, async { Ok::<_, String>(quiet) }).await;
+        assert!(done.unwrap_err().starts_with("unchanged: "));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
     async fn after_a_turn_of_the_persons_a_copy_guesses_their_next_message_for_tab() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -10175,8 +10234,8 @@ mod tests {
             .iter()
             .position(|r| r == "? Tag 0.4.1?")
             .expect("asked");
-        assert_eq!(rows[at + 4], "     Brew gets it tonight.");
-        assert_eq!(rows[at + 8], "  Why 1: Nothing else is due.");
+        assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
+        assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
         assert!(app.asks.is_empty());
