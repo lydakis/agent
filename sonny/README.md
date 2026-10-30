@@ -766,7 +766,10 @@ both shows the one the keys are in. With nothing typed, Home goes up to
 the conversation's first turn, drawing the turns over it on the way, and
 End comes back to the newest. Ctrl+F finds text in
 the conversation, from the newest place back: ↑ or Enter steps older, ↓
-newer, and Esc stops where you are.
+newer, and Esc stops where you are. Sonny draws the whole screen again on
+every resize and when the terminal regains focus, so a multiplexer that
+reattaches or a display that wakes never leaves stale rows; Ctrl+L
+redraws it by hand, as in a shell.
 
 The pane's place, when nothing else is open there, is the margin. Its
 first row is a glance at what runs for the agent: `↻` for its triggers

@@ -56,7 +56,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326 | Room for the pane, folds, buttons and drag-to-copy | ? |
+| Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326; drawn whole again on resize, focus and Ctrl+L 10-30 #PR | Room for the pane, folds, buttons and drag-to-copy | ? |
 | Inline mode (Sonny drawn into the terminal's scrollback) | removed | added 10-26 #146; removed 10-29 #326 | The first view; full screen became the experience, and one view is less to keep | ? |
 | Clean view; `/verbose` shows every tool call | shipped | quiet steps 10-27 #188; clean view 10-27 #221 | Show what moves the work on, hide ordinary calls | ? |
 | Folds: an agent call is one row, agent messages and task updates are quiet rows, started tasks a live roster | shipped | task updates as one row 10-26 #177; rows, roster 10-29 #326; one row per call 10-29 #369; updates gather into one row 10-30 #384; a failed call says what it tried 10-30 #416 | Less noise between the person's words and the replies | ? |

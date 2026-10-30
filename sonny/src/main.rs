@@ -80,12 +80,16 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
-            self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-            EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+            self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
+            EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent,
+            KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+            PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+        terminal::{
+            BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+            LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        },
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -146,8 +150,18 @@ static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 fn own_screen(own: bool) {
     keys_apart(false);
     let _ = match own {
-        true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
-        false => execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen),
+        true => execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange
+        ),
+        false => execute!(
+            std::io::stdout(),
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        ),
     };
     keys_apart(true);
 }
@@ -1767,6 +1781,9 @@ struct App {
     /// The background switched, or the view did: the conversation is
     /// drawn again once idle.
     repaint: bool,
+    /// What the terminal shows may not be the frame last drawn, so the
+    /// next draw writes every cell again.
+    stale: bool,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
@@ -2617,6 +2634,7 @@ impl App {
             options,
             down: false,
             repaint: false,
+            stale: false,
             first_node: None,
             older: None,
             unpaired: Vec::new(),
@@ -2768,7 +2786,12 @@ impl App {
         loop {
             match self.draw(terminal) {
                 Ok(()) => failed_draws = 0,
-                Err(_) if failed_draws < DRAW_ATTEMPTS => failed_draws += 1,
+                // What it wrote before failing is on the screen, not in
+                // what the next draw compares with.
+                Err(_) if failed_draws < DRAW_ATTEMPTS => {
+                    failed_draws += 1;
+                    self.stale = true;
+                }
                 Err(error) => return Err(error.to_string()),
             }
             if self.quit {
@@ -7371,6 +7394,28 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
+        // The terminal may no longer show what was drawn: a multiplexer
+        // sizes a pane down and back to have its program draw it whole
+        // again (Herdr, tmux and screen do), a window can be resized and
+        // back between two draws, and a terminal regains focus after the
+        // display slept. Every cell is written again then, as vim and
+        // ncurses programs do on each resize, and on Ctrl-L as a shell does.
+        match &event {
+            Event::Resize(..) => self.stale = true,
+            Event::FocusGained => {
+                self.stale = true;
+                return;
+            }
+            Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && key.code == KeyCode::Char('l')
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.stale = true;
+                return;
+            }
+            _ => {}
+        }
         // Keys a shell reads as others: Ctrl-H is the backspace a terminal
         // sends as 0x08, which reads as Ctrl and `h` (with Alt, it deletes
         // a word, as Alt-Backspace does); Ctrl-P and Ctrl-N go up and down.
@@ -8566,7 +8611,20 @@ impl App {
         self.commit(lines);
     }
 
+    /// A frame drawn, the whole screen written again when it is stale:
+    /// cleared first, and shown at once with what replaces it where the
+    /// terminal holds a frame back until it is done.
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        if !std::mem::take(&mut self.stale) {
+            return self.frame(terminal);
+        }
+        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let drawn = terminal.clear().and_then(|()| self.frame(terminal));
+        execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+        drawn
+    }
+
+    fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -12511,6 +12569,26 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn a_resize_focus_or_ctrl_l_draws_the_whole_screen_again() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.input.set("hello");
+        // Sized down and back before a draw: still drawn whole.
+        app.key(Event::Resize(80, 23)).await;
+        app.key(Event::Resize(80, 24)).await;
+        assert!(std::mem::take(&mut app.stale));
+        assert_eq!(app.width, 80);
+        app.key(Event::FocusGained).await;
+        assert!(std::mem::take(&mut app.stale));
+        let ctrl_l = event::KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_l)).await;
+        assert!(std::mem::take(&mut app.stale));
+        assert_eq!(&*app.input, "hello", "nothing typed");
+        app.key(Event::Key(KeyCode::Char('l').into())).await;
+        assert!(!app.stale);
+        assert_eq!(&*app.input, "hellol");
     }
 
     #[tokio::test]
