@@ -1289,12 +1289,17 @@ class CliTests(ModelFixture):
 
     def test_start_replaces_an_older_daemon_once_its_turns_end(self):
         # An upgrade leaves the older daemon running. Starting asks it to
-        # stop with a grace for its running turns (SIGTERM when it refuses),
-        # waits for it to exit, then starts this one on the same socket; an
-        # agent asking from inside a turn is left with the error.
-        provider = 'openai=responses,http://127.0.0.1:9/v1'
-        for answer, inside in (('ok', False), ('refused', False), ('ok', True)):
-            with self.subTest(answer=answer, inside=inside), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+        # stop with a grace for its running turns (SIGTERM when it refuses
+        # or does not answer), waits for it to exit, then starts this one on
+        # the same socket. One another client already replaced is not asked;
+        # an agent asking from inside a turn, or one with no provider to
+        # start a daemon with, leaves it running and the error stands.
+        provider = ['--provider', 'openai=responses,http://127.0.0.1:9/v1']
+        cases = (('ok', False, provider), ('refused', False, provider), ('silent', False, provider),
+                 ('replaced', False, provider), ('ok', True, provider), ('ok', False, []))
+        for answer, inside, flags in cases:
+            with self.subTest(answer=answer, inside=inside, provider=bool(flags)), \
+                    tempfile.TemporaryDirectory(dir='/tmp') as directory:
                 path, store = Path(directory)/'daemon.sock', Path(directory)/'state.db'
                 daemon = subprocess.Popen(['sleep', '30'])
                 self.addCleanup(self.stop_process, daemon)
@@ -1308,9 +1313,17 @@ class CliTests(ModelFixture):
                     greeting = (json.dumps(dict(event='ready', protocol=PROTOCOL - 1, pid=daemon.pid))+'\n').encode()
                     try:
                         with listener:
+                            first = True
                             while daemon.poll() is None:
                                 peer = listener.accept()[0]
                                 with peer:
+                                    if answer == 'replaced' and not first:
+                                        # The older one is gone and a stand-in greets: it must not be asked.
+                                        daemon.terminate()
+                                        peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1, pid=1234567))+'\n').encode())
+                                        asked.append(peer.makefile().readline() or None)
+                                        return
+                                    first = False
                                     peer.sendall(greeting)
                                     line = peer.makefile().readline()
                                     if not line:
@@ -1320,17 +1333,20 @@ class CliTests(ModelFixture):
                                     if answer == 'ok':
                                         peer.sendall((json.dumps(dict(id=request['id'], result={}))+'\n').encode())
                                         daemon.terminate()
-                                    else:
+                                    elif answer == 'refused':
                                         peer.sendall((json.dumps(dict(id=request['id'], error='invalid_request'))+'\n').encode())
+                                    else:
+                                        # Holds the connection without answering until SIGTERM ends it.
+                                        daemon.wait(timeout=20)
                                     # Its socket goes with it.
                                     return
                     except (socket.timeout, OSError):
                         pass
                 server = threading.Thread(target=older, daemon=True)
                 server.start()
-                result = subprocess.run([str(self.binary), 'start', '--store', str(store), '--socket', str(path),
-                                         '--provider', provider], env=env, capture_output=True, timeout=30)
-                if inside:
+                result = subprocess.run([str(self.binary), 'start', '--store', str(store), '--socket', str(path), *flags],
+                                        env=env, capture_output=True, timeout=40)
+                if inside or not flags:
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', result.stderr)
                     self.assertIsNone(daemon.poll())
@@ -1339,10 +1355,13 @@ class CliTests(ModelFixture):
                 self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(store), '--socket', str(path)],
                                 env=clean_env(), capture_output=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
+                server.join(timeout=5)
+                if answer == 'replaced':
+                    self.assertEqual(asked, [None])
+                else:
+                    self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
                 self.assertEqual(daemon.wait(timeout=3), -15)
                 self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
-                server.join(timeout=5)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')

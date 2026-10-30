@@ -742,7 +742,13 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
 
 fn ensure_daemon(options: &Options) -> Result<Connection> {
     match connect_or_start(options) {
-        Err(error) if !options.no_spawn && replace_older(&error, &options.socket)? => {
+        // Only an agent that can start a daemon of its own stops the older
+        // one, or the socket would be left with none.
+        Err(error)
+            if !options.no_spawn
+                && !options.providers.is_empty()
+                && replace_older(&error, &options.socket)? =>
+        {
             connect_or_start(options)
         }
         result => result,
@@ -769,9 +775,19 @@ fn replace_older(error: &Error, socket: &PathBuf) -> Result<bool> {
     }
     let grace_ms = REPLACE_GRACE.as_millis() as u64;
     // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
-    // the field and is sent SIGTERM, which every one honours.
-    let asked = Connection::greeted_until(socket, Instant::now() + STARTUP_TIMEOUT)
-        .and_then(|mut older| older.request("shutdown", json!({"grace_ms": grace_ms})));
+    // the field, or does not answer in time, and is sent SIGTERM, which
+    // every one honours.
+    let asked = match Connection::greeted_until(socket, Instant::now() + STARTUP_TIMEOUT) {
+        // Another client replaced it first: this one's daemon is up.
+        Ok(again) if again.ready["pid"].as_u64() != Some(pid as u64) => return Ok(true),
+        Ok(mut older) => older
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(STARTUP_TIMEOUT))
+            .map_err(Error::from)
+            .and_then(|()| older.request("shutdown", json!({"grace_ms": grace_ms}))),
+        Err(error) => Err(error),
+    };
     if asked.is_err() {
         terminate(pid)?;
     }
