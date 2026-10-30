@@ -510,11 +510,18 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
                     return Err(format!("no provider {spec}\n{USAGE}"));
                 };
                 if key_stdin {
-                    let mut key = String::new();
-                    std::io::stdin()
-                        .read_line(&mut key)
-                        .map_err(|e| e.to_string())?;
-                    let key = key.trim();
+                    // Typed or pasted at a terminal, the key is not shown.
+                    let key = match std::io::stdin().is_terminal() {
+                        true => secret(&format!("{name} key: "))?,
+                        false => {
+                            let mut key = String::new();
+                            std::io::stdin()
+                                .read_line(&mut key)
+                                .map_err(|e| e.to_string())?;
+                            key.trim().to_owned()
+                        }
+                    };
+                    let key = key.as_str();
                     if key.is_empty() {
                         return Err(format!("no {name} key on stdin"));
                     }
