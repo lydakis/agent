@@ -5492,10 +5492,12 @@ impl App {
             "retry" => {
                 // Messages written as the next began may come again, or
                 // not: what was shown stays, and the call's own is drawn.
+                // The retry numbers its items afresh, so its first is still
+                // the message being streamed.
+                self.live_item = None;
                 if !self.ahead.is_empty() {
                     self.end_live(Words::Reply);
                     self.ahead.clear();
-                    self.live_item = None;
                     self.streamed = false;
                     self.said.clear();
                     self.notice = Some("the model retried; its reply may repeat".into());
@@ -10463,6 +10465,41 @@ mod tests {
         );
         assert!(app.notice.as_deref().is_some_and(|n| n.contains("retried")));
         assert!(app.ahead.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_message_streams_under_another_item_draws_it_once() {
+        let client = daemon_with(json!({
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "All good."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        app.daemon(said(1, "All good.")).await;
+        // The retry thinks first, so its message is the call's second item.
+        app.daemon(event("retry", json!({"error": "provider_http_529"})))
+            .await;
+        app.daemon(said(2, "All good.")).await;
+        app.daemon(event("message", json!({"node": 3}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("All good.")).count(),
+            1,
+            "{drawn:?}"
+        );
+        assert!(app.ahead.is_empty());
+        assert!(!app.kept(screen::Tag::Streamed(1)));
     }
 
     #[test]
