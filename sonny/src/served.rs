@@ -337,7 +337,8 @@ fn memory() -> Value {
     json!({
         "name": MEMORY,
         "description": "Memory: facts earlier agents saved for this person and project, which the memory skill \
-            says how to read and what to save. Read one fact, save one, or remove one; index or check a folder's facts; \
+            says how to read and what to save, what the person confirmed worked as well as what they \
+            corrected. Read one fact, save one, or remove one; index or check a folder's facts; \
             with none of these, the result shows both indexes (the person's and this project's), each with its \
             folder. A save that would push an index past 16 KiB is refused with memory_full and changes \
             nothing: merge or remove facts first.",

@@ -540,7 +540,9 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   they missed, a better way of working or a mistake, coaching a habit
   once it repeats (in `lead.md`, and in `task.md` for the rest). A lead
   also starts, or sets up with a trigger, what the person said they will
-  do when nothing owns it, as far as their memory says they want; so
+  do when nothing owns it, as far as their memory says they want. Both
+  files say to save what the person corrected and what they welcomed, and
+  that their memory overrides the files' defaults; so
   `start_task` gives what `--agents` or `--profile` would compose as the
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths

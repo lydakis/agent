@@ -344,7 +344,8 @@ when the goal ends, and the note goes with the agent.
 ## Memory
 
 Memory is what earlier agents learned that a later one needs: decisions,
-the person's preferences and corrections, traps, pointers. Each fact is one
+the person's preferences, what they corrected and what they confirmed
+worked, traps, pointers. Each fact is one
 Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `type` of `user`, `feedback`, `project` or `reference`, `source`,
 `verified`, and `external` when it is so). The person's facts are in `~/.agents/memory`, a project's in
