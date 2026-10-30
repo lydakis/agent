@@ -4212,9 +4212,11 @@ impl Turn {
                 CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(outcome)),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
-            let lapse = tokio::time::Instant::now()
-                + Duration::from_millis(expires_ms.saturating_sub(now_ms()));
-            let wake = lapse.min(hold);
+            // No deadline while a step of the call waits on a gate.
+            let lapse = expires_ms.map(|at| {
+                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
+            });
+            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
             if tokio::time::Instant::now() < wake {
                 tokio::select! {
                     () = notify.notified() => continue,
@@ -4222,7 +4224,7 @@ impl Turn {
                 }
             }
             // A call out of time is answered by the next check.
-            if tokio::time::Instant::now() >= lapse {
+            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
                 continue;
             }
             let pending: Vec<ToolCall> = calls.as_slice().to_vec();
@@ -4243,7 +4245,8 @@ impl Turn {
             {
                 // An answer landed as the hold ran out.
                 None => continue,
-                Some(at) => return Ok(ControlFlow::Break(Stop::Lapses(at))),
+                Some(Some(at)) => return Ok(ControlFlow::Break(Stop::Lapses(at))),
+                Some(None) => return Ok(ControlFlow::Break(Stop::Parked)),
             }
         }
     }

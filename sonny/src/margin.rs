@@ -1164,11 +1164,13 @@ fn is_id(id: &str) -> bool {
 }
 
 /// What runs for the agent, as the margin's first row says it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Glance {
     pub name: String,
     /// Triggers and subscriptions.
     pub behind: usize,
+    /// What of `/background` failed.
+    pub failed: usize,
     pub context: Option<u64>,
 }
 
@@ -1191,6 +1193,15 @@ impl Glance {
             spans.push(span);
             at += width;
         };
+        if self.failed > 0 {
+            let text = format!("✗ {}", self.failed);
+            fact(
+                &mut spans,
+                text.clone(),
+                Span::raw(text).fg(Color::Red),
+                Some("background"),
+            );
+        }
         if self.behind > 0 {
             let text = format!("↻ {}", self.behind);
             fact(
@@ -1777,6 +1788,7 @@ mod tests {
         let busy = Glance {
             name: "calc".into(),
             behind: 3,
+            failed: 0,
             context: Some(41_000),
         };
         let (line, buttons) = busy.line();
@@ -1784,6 +1796,18 @@ mod tests {
         assert!(text.starts_with(" calc · ↻ 3 · "), "{text}");
         let urls: Vec<&str> = buttons.iter().map(|b| b.2.as_str()).collect();
         assert_eq!(urls, ["sonny:background"]);
+        let (failing, failed_buttons) = Glance {
+            failed: 2,
+            ..busy.clone()
+        }
+        .line();
+        assert!(
+            failing.to_string().starts_with(" calc · ✗ 2 · ↻ 3 · "),
+            "{failing}"
+        );
+        assert_eq!(failing.spans[3].style.fg, Some(Color::Red));
+        assert_eq!(failed_buttons.len(), 2);
+        assert!(failed_buttons.iter().all(|b| b.2 == "sonny:background"));
         let slice = |(from, to): (u16, u16)| -> String {
             text.chars()
                 .skip(from as usize)

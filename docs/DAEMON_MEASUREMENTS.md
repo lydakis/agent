@@ -5800,6 +5800,32 @@ they measure the unfiltered path. Filtering pays off in
 of `*` no longer carries the deltas, and it hears all 6,000 task endings,
 where before the daemon dropped it.
 
+## Approving each step of an exec script (#393)
+
+A client answering a declared call can ask the bot's gate about each step
+inside it (`approve_step`) and record how an allowed step ended
+(`step_result`). Both run only for steps a client sends, so an ordinary turn
+gains one check of whether the bot has gates, and the judge's history
+queries read step events beside tool events. The Perf workflow's matched
+screen, base main 91d7150 against the PR head afa2a54, on the GitHub runner
+(2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 38.463 | 37.973 | -1.3% |
+| admission | burst submit p99, ms | 6.065 | 5.91 | -2.6% |
+| completion | release to terminal p99, ms | 13.072 | 13.291 | +1.7% |
+| footprint | idle RSS, MiB | 18.998 | 19.277 | +1.5% |
+| footprint | per idle bot, KiB | 1.568 | 1.49 | -5.0% |
+| footprint | RSS after a turn each, MiB | 27.676 | 27.77 | +0.3% |
+| footprint | CPU per turn, ms | 1.224 | 1.237 | +1.0% |
+| lifecycle | CPU, s | 1.1 | 1.12 | +1.8% |
+| lifecycle | p95 turn, ms | 580.302 | 581.017 | +0.1% |
+| lifecycle | peak RSS, MiB | 25.193 | 25.289 | +0.4% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The steps path itself is not measured: it runs once per step a
+client asks about, one store job to decide it and one to record its end.
 
 ## A session's queue is bounded by bytes, not 64 messages (#425)
 

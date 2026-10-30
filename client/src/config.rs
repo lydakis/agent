@@ -230,9 +230,61 @@ pub struct McpServer {
     pub tool_timeout_sec: Option<f64>,
     /// What it offers, in a sentence, for the agents told of it.
     pub description: Option<String>,
+    /// When a script's call of one of its tools asks the agent's gate
+    /// first, unless `tools` says otherwise for the tool.
+    pub default_tools_approval_mode: ApprovalMode,
+    /// Each tool's own `approval_mode`.
+    pub tools: BTreeMap<String, ApprovalMode>,
 }
 
-const MCP_KEYS: [&str; 13] = [
+impl McpServer {
+    /// The approval mode of a call of `tool`: its own, else the server's.
+    pub fn approval_mode(&self, tool: &str) -> ApprovalMode {
+        self.tools
+            .get(tool)
+            .copied()
+            .unwrap_or(self.default_tools_approval_mode)
+    }
+}
+
+/// When a script's call of an MCP tool asks the agent's gate first, under
+/// Codex's names: `auto` when the tool says it is destructive and not that
+/// it only reads, `writes` unless it says it only reads, `prompt` always,
+/// `approve` never. An agent under no gate never asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApprovalMode {
+    #[default]
+    Auto,
+    Writes,
+    Prompt,
+    Approve,
+}
+
+impl ApprovalMode {
+    fn parse(at: &str, value: &toml::Value) -> Result<Self, String> {
+        match value.as_str() {
+            Some("auto") => Ok(Self::Auto),
+            Some("writes") => Ok(Self::Writes),
+            Some("prompt") => Ok(Self::Prompt),
+            Some("approve") => Ok(Self::Approve),
+            _ => Err(format!("{at} is auto, writes, prompt or approve")),
+        }
+    }
+
+    /// Whether a call of a tool with these MCP annotations asks first. A
+    /// read-only hint wins over a destructive one, as in Codex.
+    pub fn asks(self, annotations: &serde_json::Value) -> bool {
+        let reads = annotations["readOnlyHint"] == true;
+        match self {
+            Self::Auto => annotations["destructiveHint"] == true && !reads,
+            Self::Writes => !reads,
+            Self::Prompt => true,
+            Self::Approve => false,
+        }
+    }
+}
+
+const MCP_KEYS: [&str; 15] = [
     "command",
     "args",
     "env",
@@ -246,6 +298,8 @@ const MCP_KEYS: [&str; 13] = [
     "startup_timeout_sec",
     "tool_timeout_sec",
     "description",
+    "default_tools_approval_mode",
+    "tools",
 ];
 
 /// The server `[sonny.mcp_servers.NAME]` describes.
@@ -308,6 +362,28 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
                     .ok_or_else(|| format!("{at}.enabled must be true or false"))?
             }
             "startup_timeout_sec" => server.startup_timeout_sec = Some(seconds(key, value)?),
+            "default_tools_approval_mode" => {
+                server.default_tools_approval_mode =
+                    ApprovalMode::parse(&format!("{at}.{key}"), value)?
+            }
+            "tools" => {
+                let tools = value
+                    .as_table()
+                    .ok_or_else(|| format!("{at}.tools must be a table of tools"))?;
+                for (tool, settings) in tools {
+                    let at = format!("{at}.tools.{tool}");
+                    let settings = settings
+                        .as_table()
+                        .ok_or_else(|| format!("{at} must be a table"))?;
+                    for (key, value) in settings {
+                        if key != "approval_mode" {
+                            return Err(format!("unknown key {at}.{key}"));
+                        }
+                        let mode = ApprovalMode::parse(&format!("{at}.{key}"), value)?;
+                        server.tools.insert(tool.clone(), mode);
+                    }
+                }
+            }
             "tool_timeout_sec" => server.tool_timeout_sec = Some(seconds(key, value)?),
             _ => {
                 let text = string(&format!("{at}.{key}"), value)?;
@@ -859,6 +935,27 @@ mod tests {
             Some(&["read".to_owned()][..])
         );
         assert_eq!(files.tool_timeout_sec, Some(30.0));
+        assert_eq!(files.approval_mode("read"), ApprovalMode::Auto);
+        let modes = parse(
+            "[sonny.mcp_servers.chat]\ncommand = \"chat\"\ndefault_tools_approval_mode = \"writes\"\n\n[sonny.mcp_servers.chat.tools.post]\napproval_mode = \"prompt\"\n",
+        )
+        .unwrap();
+        let chat = &modes.sonny.mcp_servers["chat"];
+        assert_eq!(
+            (chat.approval_mode("post"), chat.approval_mode("search")),
+            (ApprovalMode::Prompt, ApprovalMode::Writes)
+        );
+        // Codex's rule: a read-only hint wins over a destructive one.
+        let hints = |read: bool, destructive: bool| serde_json::json!({"readOnlyHint": read, "destructiveHint": destructive});
+        let asks = |mode: ApprovalMode| {
+            [hints(false, false), hints(false, true), hints(true, true)]
+                .map(|annotations| mode.asks(&annotations))
+        };
+        assert_eq!(asks(ApprovalMode::Auto), [false, true, false]);
+        assert_eq!(asks(ApprovalMode::Writes), [true, true, false]);
+        assert_eq!(asks(ApprovalMode::Prompt), [true, true, true]);
+        assert_eq!(asks(ApprovalMode::Approve), [false, false, false]);
+        assert!(!ApprovalMode::Auto.asks(&serde_json::Value::Null));
         for (text, error) in [
             (
                 "[sonny.mcp_servers.x]\nenabled = true",
@@ -883,6 +980,14 @@ mod tests {
             (
                 "[sonny.mcp_servers.x]\ncommand = \"a\"\ncolour = 1",
                 "unknown key sonny.mcp_servers.x.colour",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\ndefault_tools_approval_mode = \"never\"",
+                "sonny.mcp_servers.x.default_tools_approval_mode is auto, writes, prompt or approve",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\n[sonny.mcp_servers.x.tools.t]\nmode = \"auto\"",
+                "unknown key sonny.mcp_servers.x.tools.t.mode",
             ),
             (
                 "[sonny.mcp_servers.\"a b\"]\ncommand = \"a\"",

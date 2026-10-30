@@ -598,11 +598,43 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         TRIGGERS => {
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
-            tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
+            let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
                 .await
                 .map_err(|e| ("tool_failed", e.to_string()))?
-                .map(|said| said.to_string())
-                .map_err(|e| ("trigger_refused", e))
+                .map_err(|e| ("trigger_refused", e))?;
+            // How the turns their last fires sent ended, as the person's
+            // `/background` shows them; without the daemon, as the files say.
+            // Only a trigger made on this daemon's store: a turn handle names
+            // a bot and a turn, which another store's daemon has its own of.
+            if let Ok((_, socket)) = crate::daemon_paths(None, None)
+                && let Ok((client, _events)) = Client::connect(&socket).await
+            {
+                let ours: Vec<Value> = match (client.store(), crate::trigger::Places::home()) {
+                    (Some(store), Ok(places)) => crate::trigger::on_store(&places, store)
+                        .into_iter()
+                        .map(|(row, _)| row["name"].clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut rows: Vec<&mut Value> = if said["triggers"].is_array() {
+                    (said["triggers"].as_array_mut().into_iter().flatten()).collect()
+                } else if said["last"].is_object() {
+                    vec![&mut said]
+                } else {
+                    Vec::new()
+                };
+                rows.retain(|row| ours.contains(&row["name"]));
+                let handles = rows
+                    .iter()
+                    .filter_map(|row| crate::trigger::sent(row))
+                    .collect();
+                let ended = crate::trigger::ended(&client, handles).await;
+                for row in rows {
+                    crate::trigger::with_turn(row, &ended);
+                }
+                client.close().await;
+            }
+            Ok(said.to_string())
         }
         _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
     }
@@ -713,7 +745,7 @@ async fn serve(
                         let job = tokio::spawn(async move {
                             let answer = match call["name"] == EXEC {
                                 // In the lookout, where the servers stay up.
-                                true => script(&hub, &call).await,
+                                true => script(&hub, &client, &call).await,
                                 false => answer(&client, &call, &me, &store, &socket).await,
                             };
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
@@ -789,9 +821,16 @@ fn cut(mut text: String) -> String {
 
 /// An `exec` call answered here, with its script's time bounded by the
 /// call's.
-async fn script(hub: &crate::mcp::Hub, call: &Value) -> Answer {
+async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> Answer {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
-    crate::exec::answer(hub, &str_of(&call["bot"]), input, left(call))
+    let bot = str_of(&call["bot"]);
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot.clone(),
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
 }

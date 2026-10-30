@@ -15,7 +15,7 @@ use agent_runtime::{
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        Settings, Started, Store, TurnOptions, Waiting, Wake,
+        Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -33,7 +33,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     task::JoinSet,
 };
 use turn::Turn;
@@ -470,6 +470,27 @@ enum Command {
         output: Option<String>,
         error: Option<ToolError>,
     },
+    /// Put one step of a declared call this client answers to the bot's
+    /// gates that name the tool, and answer once it is decided: a script's
+    /// nested call, say. `step` is the client's id for it within the call.
+    ApproveStep {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        step: String,
+        /// The step's own tool, which its approver judges.
+        name: String,
+        arguments: Value,
+    },
+    /// How a step its gates allowed ended once the client ran it.
+    StepResult {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        step: String,
+        #[serde(default)]
+        failed: bool,
+    },
     /// Calls still waiting for the client `tag` names, oldest first.
     ToolCalls {
         tag: String,
@@ -773,6 +794,76 @@ fn name(field: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+/// An `approve_step` waiting for its step's decision, off the service's
+/// loop: woken by an answer, at the gate's lapse, or when the turn ends. A
+/// client whose session closes takes its step with it.
+struct StepWait {
+    store: Store,
+    handles: Handles,
+    bot: String,
+    turn: i64,
+    id: String,
+}
+impl StepWait {
+    /// Tell the turn waiting on the step's call that the call's time runs
+    /// again, and give the reply once the step is decided.
+    fn settle(&self, stepped: Stepped) -> std::result::Result<Value, (Arc<Notify>, Option<u64>)> {
+        if let Some(notify) = stepped.notify {
+            notify.notify_one();
+        }
+        if stepped.wake {
+            self.handles.wake(self.bot.clone(), self.turn);
+        }
+        match stepped.step {
+            Step::Decided(reply) => Ok(reply),
+            Step::Pending { notify, expires_ms } => Err((notify, expires_ms)),
+        }
+    }
+    async fn wait(
+        self,
+        mut notify: Arc<Notify>,
+        mut expires_ms: Option<u64>,
+        output: Output,
+        mut closed: watch::Receiver<bool>,
+        request: Value,
+    ) {
+        loop {
+            let lapse = expires_ms.map(|at| {
+                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
+            });
+            let gone = tokio::select! {
+                () = notify.notified() => false,
+                () = async {
+                    match lapse {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => false,
+                _ = closed.wait_for(|closed| *closed) => true,
+            };
+            let (bot, turn, id) = (self.bot.clone(), self.turn, self.id.clone());
+            let stepped = self
+                .store
+                .op("step_check", move |db| match gone {
+                    true => db.step_abandon(&bot, turn, &id, now_ms()),
+                    false => db.step_check(&bot, turn, &id, now_ms()),
+                })
+                .await;
+            let result = match stepped.map(|stepped| self.settle(stepped)) {
+                Ok(Err((next, at))) => {
+                    (notify, expires_ms) = (next, at);
+                    continue;
+                }
+                Ok(Ok(reply)) => Ok(reply),
+                Err(error) => Err(error),
+            };
+            if !gone && output.try_respond(request, result).is_err() {
+                output.close();
+            }
+            return;
+        }
+    }
+}
 /// The most bytes a prompt's pictures may have together, decoded: what
 /// Anthropic takes for one image, so one alone always fits.
 const IMAGES_BYTES: usize = 5 << 20;
@@ -911,6 +1002,9 @@ fn gate(
 }
 struct Service {
     store: Store,
+    /// For each session with a step waiting, what tells its waits that the
+    /// session closed: a step goes with the client that put it.
+    stepping: HashMap<u64, watch::Sender<bool>>,
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
@@ -1413,6 +1507,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     let mut service = Service {
         store,
+        stepping: HashMap::new(),
         companions,
         identity,
         transport,
@@ -1549,6 +1644,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
+                            if let Some(stepping) = service.stepping.remove(&id) {
+                                stepping.send_replace(true);
+                            }
                             if id == 0 && stdio_owner { break; }
                         }
                         Inbound::Request(id, request) => {
@@ -1776,6 +1874,8 @@ impl Service {
                 return refuse("serve approvals");
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
+            Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
+            Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
             // A companion runs as the daemon does, outside any sandbox.
             Command::Companions { .. } => return refuse("manage the daemon's companions"),
@@ -1797,7 +1897,8 @@ impl Service {
             Ok(())
         };
         // A tool a client answers is one the caller may pass on: one it has,
-        // may call, and gives the bots it makes, answered by the same client.
+        // may call, and gives the bots it makes, answered by the same client
+        // and gated as a whole unless the caller's is gated by its steps.
         // Another could get a client to act for it.
         let callable = |own: &agent_runtime::tools::Declared| {
             own.inherit
@@ -1809,7 +1910,10 @@ impl Service {
         let passes = |tool: &agent_runtime::tools::Declared| {
             tool.answered_by.is_none()
                 || me.declared.iter().any(|own| {
-                    callable(own) && own.name == tool.name && own.answered_by == tool.answered_by
+                    callable(own)
+                        && own.name == tool.name
+                        && own.answered_by == tool.answered_by
+                        && (own.steps || !tool.steps)
                 })
         };
         // The folders a request would give a bot, each of which the caller
@@ -3228,6 +3332,78 @@ impl Service {
                 }
                 Ok(answered.reply)
             }
+            Command::ApproveStep {
+                bot,
+                turn,
+                call_id,
+                step,
+                name: tool,
+                arguments,
+            } => {
+                if call_id.is_empty() {
+                    return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                name("step", &step).map_err(|e| Error {
+                    code: "invalid_step".into(),
+                    ..e
+                })?;
+                // The client's name for the step's tool, which only its
+                // approver reads: a script's identifier can be long.
+                if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
+                    return fail_with(
+                        "invalid_step",
+                        "name must be 1 to 512 bytes, no control characters",
+                    );
+                }
+                if !arguments.is_object() {
+                    return fail_with("invalid_step", "arguments must be an object");
+                }
+                if serde_json::to_vec(&arguments)?.len() > ANSWER_BYTES {
+                    return fail_with(
+                        "step_arguments_limit",
+                        format!("arguments may be up to {ANSWER_BYTES} bytes"),
+                    );
+                }
+                let wait = StepWait {
+                    store: store.clone(),
+                    handles: self.handles.clone(),
+                    bot: bot.clone(),
+                    turn,
+                    id: format!("{call_id}/{step}"),
+                };
+                let name = bot;
+                let stepped = store
+                    .op("approve_step", move |db| {
+                        db.step_announce(&name, turn, &call_id, &step, &tool, arguments, now_ms())
+                    })
+                    .await?;
+                match wait.settle(stepped) {
+                    Ok(reply) => Ok(reply),
+                    Err((notify, expires_ms)) => {
+                        let closed = self
+                            .stepping
+                            .entry(session)
+                            .or_insert_with(|| watch::channel(false).0)
+                            .subscribe();
+                        tokio::spawn(wait.wait(notify, expires_ms, output.clone(), closed, id));
+                        // The response is sent by the wait, not by this dispatch.
+                        Err(Error::new("deferred"))
+                    }
+                }
+            }
+            Command::StepResult {
+                bot,
+                turn,
+                call_id,
+                step,
+                failed,
+            } => {
+                store
+                    .op("step_result", move |db| {
+                        db.step_result(&bot, turn, &call_id, &step, failed)
+                    })
+                    .await
+            }
             Command::ToolCalls { tag, after, limit } => {
                 store
                     .op("tool_calls", move |db| {
@@ -4298,6 +4474,7 @@ mod tests {
         let ending: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let mut service = Service {
             store: store.clone(),
+            stepping: HashMap::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4468,6 +4645,7 @@ mod tests {
         let (cancel, cancelled) = watch::channel(None);
         let mut service = Service {
             store: store.clone(),
+            stepping: HashMap::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4681,6 +4859,7 @@ mod tests {
         let mut service = Service {
             identity: 0,
             store: store.clone(),
+            stepping: HashMap::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
@@ -4918,6 +5097,7 @@ mod tests {
         Service {
             identity: 0,
             store: store.clone(),
+            stepping: HashMap::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
                 Vec::new(),
