@@ -718,7 +718,11 @@ conversation once there is room again. The agent's plan sits over the
 notes, one plan however often it changes; each `plan` call in the
 conversation is a row of how far it had got, and where the margin cannot
 show, the newest is the whole checklist. The notes are kept by agent in
-`~/.agent/sonny/margin/`, and the calls stay in its history.
+`~/.agent/sonny/margin/`, with the newest node of the agent's history they
+were brought up to; the calls stay in its history. A window opened later
+reads the `margin` calls and closes made since that node, however far
+back they are, so a note changed while no window was open shows as it is
+now.
 A note is drawn the way the conversation and the pane draw things:
 Markdown with its tables and math, Mermaid diagrams, HTML pages,
 pictures, and code in syntax colors.
