@@ -392,6 +392,8 @@ pub fn tool(name: &str, tag: &str) -> Value {
 pub struct Settled {
     pub bot: String,
     pub turn: i64,
+    /// The goal checked, by when it was set.
+    pub set_ms: u64,
     pub outcome: Option<String>,
 }
 
@@ -440,17 +442,20 @@ impl Goals {
         }
     }
 
-    /// The check of `bot`'s `turn` said how its goal stands.
-    pub fn settled(&mut self, bot: &str, turn: i64) {
+    /// The check of `bot`'s `turn`, for the goal set at `set_ms`, said how
+    /// it stands; one of a goal since replaced touches nothing of its own.
+    pub fn settled(&mut self, bot: &str, turn: i64, set_ms: u64) {
         if self
             .checking
             .get(bot)
-            .is_some_and(|check| check.turn == turn)
+            .is_some_and(|check| (check.turn, check.set_ms) == (turn, set_ms))
         {
             self.checking.remove(bot);
         }
         // A goal checked at once was: what follows is the agent's turns.
-        if let Some(goal) = read(&self.store, bot).filter(|goal| goal.check_after == Some(turn)) {
+        if let Some(goal) = read(&self.store, bot)
+            .filter(|goal| goal.set_ms == set_ms && goal.check_after == Some(turn))
+        {
             checked_now(&self.store, &goal);
         }
     }
@@ -559,6 +564,7 @@ impl Goals {
                         let _ = done.try_send(Settled {
                             bot: bot.to_owned(),
                             turn: check.turn,
+                            set_ms: check.set_ms,
                             outcome: Some(String::new()),
                         });
                     }
@@ -613,6 +619,7 @@ impl Goals {
                         let _ = done.try_send(Settled {
                             bot: bot.clone(),
                             turn: check.turn,
+                            set_ms: check.set_ms,
                             outcome: Some(String::new()),
                         });
                     }
@@ -645,7 +652,14 @@ impl Goals {
         let checking = bot.clone();
         let pursuit = tokio::spawn(async move {
             let outcome = pursue(&client, &store, &socket, &goal, turn, idle).await;
-            let _ = done.send(Settled { bot, turn, outcome }).await;
+            let _ = done
+                .send(Settled {
+                    bot,
+                    turn,
+                    set_ms,
+                    outcome,
+                })
+                .await;
         });
         let check = Check {
             pursuit: pursuit.abort_handle(),
