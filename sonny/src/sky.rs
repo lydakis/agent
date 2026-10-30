@@ -215,7 +215,47 @@ impl View {
                 Feed::Down(why) => self.down = Some(why),
             }
         }
+        self.sweep();
         self.land(now);
+    }
+
+    /// Let removed agents go for good, and whatever pointed at them.
+    fn sweep(&mut self) {
+        if !self.agents.iter().any(|agent| agent.gone) {
+            return;
+        }
+        let mut moved = vec![None; self.agents.len()];
+        let mut kept = 0;
+        for (at, agent) in self.agents.iter().enumerate() {
+            if !agent.gone {
+                moved[at] = Some(kept);
+                kept += 1;
+            }
+        }
+        let end = |end: End| match end {
+            End::Person => Some(End::Person),
+            End::Agent(at) => moved[at].map(End::Agent),
+            End::Rim(at) => moved[at].map(End::Rim),
+        };
+        self.agents.retain(|agent| !agent.gone);
+        for agent in &mut self.agents {
+            agent.sender = agent.sender.and_then(end);
+        }
+        self.sparks
+            .retain_mut(|spark| match (end(spark.from), end(spark.to)) {
+                (Some(from), Some(to)) => {
+                    (spark.from, spark.to) = (from, to);
+                    true
+                }
+                _ => false,
+            });
+        self.talks = (self.talks.iter())
+            .filter_map(|&(a, b)| Some((moved[a]?, moved[b]?)))
+            .collect();
+        self.index = (self.agents.iter().enumerate())
+            .map(|(at, agent)| (agent.name.clone(), at))
+            .collect();
+        self.laid = false;
     }
 
     fn land(&mut self, now: Instant) {
@@ -1296,7 +1336,33 @@ mod tests {
         view.drain();
         let at = |name: &str| &view.agents[view.index[name]];
         assert_eq!(at("a").running, Some(3));
-        assert!(at("b").gone && !at("c").gone);
+        assert!(!view.index.contains_key("b") && !at("c").gone);
+    }
+
+    #[tokio::test]
+    async fn a_removed_agent_leaves_nothing_behind() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a"}),
+            json!({"name": "b"}),
+            json!({"name": "c"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "c", "turn": 1,
+            "data": {"from": {"bot": "b", "turn": 1}}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "deleted", "bot": "a", "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.agents.len(), 2);
+        let (b, c) = (view.index["b"], view.index["c"]);
+        assert_eq!(view.talks.back(), Some(&(b, c)));
+        assert_eq!(view.agents[c].sender, Some(End::Agent(b)));
+        assert!(view.sparks.iter().all(|spark| spark.to == End::Agent(c)));
     }
 
     #[tokio::test]
