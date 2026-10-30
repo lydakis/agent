@@ -2488,9 +2488,9 @@ already waiting is `step_waiting`; a client that closes its session takes
 its waiting steps with it (`step_decided` with `its client stopped
 waiting`), an answer to the call ends them (the waiting request gets
 `no_pending_step`), as does the turn's end (`stale_turn`), and a restart
-drops them all. Schema 63 adds the steps' and paused calls' columns. It also adds
-`history_search`, the history tool's query for clients (see `history_nodes`
-above).
+drops them all. Schema 63 adds the steps' and paused calls' columns. Protocol 24
+also adds `history_search`, the history tool's query for clients (see
+`history_nodes` above).
 
 ### Tool approval
 
