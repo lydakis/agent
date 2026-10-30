@@ -31,8 +31,11 @@ const READS: &str = ".reads";
 /// The invites of the last week, and how many were ever sent: `{"sent":
 /// [{"thread", "at", "bot", "golden", "answered"}], "count"}`.
 const INVITES: &str = ".invites";
+/// The origin of the notes the commons sends agents.
+const ORIGIN: &str = "commons";
 /// The invites a day the commons has whatever came of earlier ones; each
-/// invite of the last week that drew a reply adds one.
+/// invite of the last week that drew a reply adds one, up to as many again,
+/// so answers can double the day's invites but never set off more.
 const INVITES_A_DAY: u64 = 3;
 /// How long an answered invite earns its extra one a day, in seconds.
 const EARNS_FOR: i64 = 7 * 86_400;
@@ -289,7 +292,8 @@ fn budget(sent: &[Value]) -> Value {
         .iter()
         .filter(|invite| invite["answered"] == true)
         .count();
-    json!({"today": today, "a_day": INVITES_A_DAY + answered as u64,
+    let earned = (answered as u64).min(INVITES_A_DAY);
+    json!({"today": today, "a_day": INVITES_A_DAY + earned,
         "answered": answered, "this_week": sent.len()})
 }
 
@@ -436,6 +440,9 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
 /// queued note, which starts its turn. One drawn at random from those
 /// whose turns mention the title's words, or, on a golden ticket, from
 /// every agent. The one invited, if any; else the invite is given back.
+/// A thread started in a turn the commons itself began brings none: as an
+/// automatic reply never answers another (RFC 3834), so an invited agent's
+/// threads cannot set off a chain of invites with no person behind them.
 pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) -> Option<String> {
     let thread = started["thread"].as_str().unwrap_or_default();
     let title = invite["title"].as_str().unwrap_or_default();
@@ -443,6 +450,19 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
     let invited = async {
         let (_, socket) = crate::daemon_paths(None, None).ok()?;
         let (client, _events) = agent_client::Client::connect(&socket).await.ok()?;
+        if let Ok(turn) = std::env::var("AGENT_TURN") {
+            let turn: i64 = turn.parse().ok()?;
+            // Someone who steered it there, a person or an agent, is behind it.
+            let asked = json!({"bot": author, "turn": turn});
+            let prompts = client.request("prompts", asked).await.ok()?;
+            let prompts = prompts["prompts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !prompts.iter().any(|prompt| prompt["origin"] != ORIGIN) {
+                return None;
+            }
+        }
         let found = match golden {
             true => everyone(&client, author).await,
             false => touched(&client, title, author).await,
@@ -450,7 +470,7 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
         let bot = found.get(draw() % found.len().max(1))?.clone();
         let note = invited(thread, title, author, golden);
         let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-            "origin": "commons", "request_id": format!("commons.invite.{thread}")});
+            "origin": ORIGIN, "request_id": format!("commons.invite.{thread}")});
         client.request("submit", submit).await.ok().map(|_| bot)
     }
     .await;
@@ -711,7 +731,7 @@ pub async fn tell(replied: &Value, author: &str, tell: &Value) -> Vec<String> {
             told_one["seen"]
         );
         let mut submit = json!({"bot": bot, "prompt": note, "delivery": "attach",
-            "origin": "commons", "request_id": request});
+            "origin": ORIGIN, "request_id": request});
         if told_one["bot_id"].is_i64() {
             submit["bot_id"] = told_one["bot_id"].clone();
         }
@@ -1017,6 +1037,16 @@ mod tests {
             assert!(post(&format!("t{n}")).get("invite").is_some());
         }
         assert!(post("over").get("invite").is_none());
+        // Answers double the day's invites at most.
+        let (mut sent, count) = load(&dir);
+        for n in 0..2 * INVITES_A_DAY {
+            sent.push(
+                json!({"thread": format!("a{n}"), "at": now() - 86_400, "bot": "b.y",
+                "answered": true}),
+            );
+        }
+        assert!(keep(&dir, &sent, count));
+        assert_eq!(budget(&super::sent(&dir))["a_day"], 2 * INVITES_A_DAY);
         let listed = call(&home, "a.x", None, &json!({})).unwrap();
         assert_eq!(listed["invites"]["today"], earned);
         assert_eq!(

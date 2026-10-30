@@ -45,13 +45,13 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(json.loads(service.stdout.readline())['event'], 'watching')
         return service
 
-    def call(self, bot, name, arguments):
+    def call(self, bot, name, arguments, **submit):
         """`bot` calls `name` once; the call's output. The script runs on
         from the calls a bot's earlier turns made."""
         self.script.append((name, arguments))
         self.model.call_script = self.script
         turn = self.daemon.request('submit', bot=bot, request_id=f'{name}-{time.monotonic()}',
-                                   prompt='script')['result']['turn']
+                                   prompt='script', **submit)['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         return self.output(bot, turn)
 
@@ -328,6 +328,10 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'answered': 0, 'this_week': 1})
         # Its reply earns the commons another invite a day.
         self.call('shop.b', 'commons', {'reply': {'thread': 'stalls', 'text': 'Same here.'}})
+        # A thread started in a turn the commons began brings no invite.
+        post = {'name': 'more', 'title': 'More checkpoint stalls', 'text': 'And this?'}
+        started = json.loads(self.call('shop.b', 'commons', {'post': post}, origin='commons'))
+        self.assertIsNone(started['invited'], started)
         listed = json.loads(self.call('mail.c', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'answered': 1, 'this_week': 1})
 
