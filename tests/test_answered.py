@@ -296,6 +296,23 @@ class StepTests(ModelFixture):
         self.assertEqual(self.output(client), 'sent once')
         self.assertEqual(client.request('stats')['result']['approval_requests'], 0)
 
+    def test_a_judge_sees_the_steps_a_turn_was_refused(self):
+        client, turn, _ = self.script(approve=['exec'], approver='manual')
+        for step, text, decision in (('1', 'everyone', 'deny'), ('2', 'a friend', 'deny'), ('3', 'a friend', 'allow')):
+            request = self.ask(client, turn, step=step, arguments={'text': text})
+            self.announced(client, turn)
+            self.verdict(client, turn, f'script-0/{step}', decision=decision)
+            self.reply(client, request)
+        # Each decided step carries what it was asked with.
+        decided = self.events(client, turn, 'step_decided')
+        self.assertEqual([(d['arguments'], d.get('denied')) for d in decided],
+                         [('{"text":"everyone"}', True), ('{"text":"a friend"}', True), ('{"text":"a friend"}', None)])
+        # Allowed later as it was refused, a step's go-ahead is used.
+        [prompt] = client.request('prompts', bot='Lead', turn=turn)['result']['prompts']
+        self.assertEqual(prompt['refused'], [{'name': 'mcp__chat__send', 'arguments': '{"text":"everyone"}'}])
+        self.answer(client, turn, output='sent')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
     def test_a_step_s_wait_stops_its_call_s_time(self):
         # The call has 600 ms and its turn parks at once; its step waits
         # longer than that, and the call's time runs on only after.

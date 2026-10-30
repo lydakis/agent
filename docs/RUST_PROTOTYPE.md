@@ -2414,8 +2414,11 @@ loop: `{call_id, decision, approvals}`, with the deny's `reason`, and
 `expired` when a gate lapsed without a verdict, which denies the step
 (`not reviewed: no verdict`) and nothing more: the turn never waits on a
 step. Each decided step is recorded in a `step_decided` event with
-`call_id`, `step_of`, `name`, `decision`, `reason` and `approvals`, and
-counts toward the bot's denial counts as a call does. While any step of a
+`call_id`, `step_of`, `name`, `arguments` (previewed as `tool_started`
+previews a call's), `decision`, `reason` and `approvals`, and `denied`
+when its gates refused it, which a judge of a later call sees among the
+turn's refused calls; it counts toward the bot's denial counts as a call
+does. While any step of a
 call waits, the call's time stops: it cannot run out, its parked turn has
 no deadline, and once the last step is decided it gets back what was left.
 A step lives only as long as the request waiting on it: asking for one

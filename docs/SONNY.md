@@ -556,7 +556,8 @@ later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, four at once in the lookout (more wait their turn), and returns
+10 minutes, four at once in the lookout and sixteen alive (more wait
+their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
 the whole to a file; saved outputs and images are kept a week. A first
 line such as
@@ -580,8 +581,10 @@ call but a read-only tool's; `prompt` asks for every call; `approve` never
 asks. Asking puts the call to the agent's own gate, through the daemon's
 `approve_step`: in `full` nothing waits, in `auto` the judge decides it, in
 `ask` the person does, the call drawn with `a call in a running script`.
-The script waits for the verdict with its 10 minutes stopped; a denied call
-rejects with the reason, which the script can catch.
+The script waits for the verdict with its 10 minutes stopped and its place
+among the four running given to another, though it stays among the sixteen
+alive; JavaScript it runs meanwhile, beside the waiting call, still spends
+its time. A denied call rejects with the reason, which the script can catch.
 
 ## Checks
 

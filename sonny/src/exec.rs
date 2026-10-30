@@ -36,10 +36,16 @@ const PRAGMA: &str = "// @exec:";
 /// expiry say less.
 const MEMORY: usize = 256 << 20;
 pub const TIMEOUT: Duration = Duration::from_secs(600);
-/// Scripts that run at once in the lookout, so that agents' scripts at the
-/// memory cap hold at most a gigabyte; the rest wait their turn.
+/// Scripts that run at once in the lookout; the rest wait their turn.
 const SCRIPTS: usize = 4;
 static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SCRIPTS);
+/// Scripts alive at once, running or waiting for verdicts, so that their
+/// heaps at the memory cap hold at most 4 GB however many calls wait.
+const LIVE: usize = 16;
+static ALIVE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LIVE);
+/// The longest pause between two of a script's interrupt checks that is
+/// still one stretch of running JavaScript.
+const RUNNING_GAP: Duration = Duration::from_millis(50);
 /// The output a script returns, in tokens of about four bytes, unless its
 /// options line says otherwise.
 const OUTPUT_TOKENS: usize = 10_000;
@@ -506,6 +512,7 @@ async fn run(
 ) -> Result<String, String> {
     let script = parse(input)?;
     let waiting = Instant::now();
+    let alive = ALIVE.acquire().await.map_err(|e| e.to_string())?;
     let running = RUNNING.acquire().await.map_err(|e| e.to_string())?;
     let left = left.saturating_sub(waiting.elapsed());
     let mut nested: BTreeMap<String, Nested> = BTreeMap::new();
@@ -560,9 +567,9 @@ async fn run(
     let (said, calls) = (Arc::clone(&run.said), Arc::clone(&run.calls));
     let clock = Arc::clone(&run.clock);
     let ended = tokio::task::spawn_blocking(move || {
-        // Its place is held until the script's runtime is gone, so an
-        // interrupted turn frees it only once its script has stopped.
-        let _running = clock;
+        // Its places are held until the script's runtime is gone, so an
+        // interrupted turn frees them only once its script has stopped.
+        let _running = (clock, alive);
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -697,20 +704,46 @@ struct Run {
 /// agent's gate, as the time of its `exec` call does in the daemon, and its
 /// place among the scripts running, which it gives up meanwhile: a verdict
 /// can take a person hours, and four scripts waiting on theirs would hold
-/// back every other agent's.
+/// back every other agent's. JavaScript that runs meanwhile, beside the
+/// calls waiting, still spends the time.
 struct Clock {
-    /// The deadline, the calls waiting, and since when they have.
-    state: Mutex<(Instant, usize, Instant)>,
+    times: Mutex<Times>,
     resumed: tokio::sync::Notify,
     place: Mutex<Option<tokio::sync::SemaphorePermit<'static>>>,
     /// Taken while a call takes the place back, so only one waits for it.
     returning: tokio::sync::Mutex<()>,
 }
 
+struct Times {
+    deadline: Instant,
+    /// The calls waiting, since when, and how long JavaScript has run since.
+    waiting: usize,
+    since: Instant,
+    ran: Duration,
+    /// The last interrupt check while calls wait.
+    checked: Option<Instant>,
+}
+
+impl Times {
+    fn out(&self, now: Instant) -> bool {
+        match self.waiting {
+            0 => now >= self.deadline,
+            _ => self.ran >= self.deadline.saturating_duration_since(self.since),
+        }
+    }
+}
+
 impl Clock {
     fn new(deadline: Instant, place: tokio::sync::SemaphorePermit<'static>) -> Arc<Self> {
+        let now = Instant::now();
         Arc::new(Self {
-            state: Mutex::new((deadline, 0, Instant::now())),
+            times: Mutex::new(Times {
+                deadline,
+                waiting: 0,
+                since: now,
+                ran: Duration::ZERO,
+                checked: None,
+            }),
             resumed: tokio::sync::Notify::new(),
             place: Mutex::new(Some(place)),
             returning: tokio::sync::Mutex::new(()),
@@ -729,18 +762,42 @@ impl Clock {
     }
 
     fn out(&self) -> bool {
-        let (deadline, waiting, _) = *self.state.lock().unwrap();
-        waiting == 0 && Instant::now() >= deadline
+        self.times.lock().unwrap().out(Instant::now())
+    }
+
+    /// Whether the time ran out, from the script's interrupt checks, which
+    /// come only while JavaScript runs: checks close together while calls
+    /// wait are a stretch of it, and spend the time they span.
+    fn check(&self) -> bool {
+        let now = Instant::now();
+        let mut times = self.times.lock().unwrap();
+        if times.waiting == 0 {
+            return times.out(now);
+        }
+        if let Some(checked) = times.checked
+            && now - checked <= RUNNING_GAP
+        {
+            times.ran += now - checked;
+        }
+        times.checked = Some(now);
+        let out = times.out(now);
+        drop(times);
+        if out {
+            self.resumed.notify_waiters();
+        }
+        out
     }
 
     /// Stop the clock until the guard is dropped, and give up the place.
     fn stop(self: &Arc<Self>) -> Stopped {
-        let mut state = self.state.lock().unwrap();
-        if state.1 == 0 {
-            state.2 = Instant::now();
+        let mut times = self.times.lock().unwrap();
+        if times.waiting == 0 {
+            times.since = Instant::now();
+            times.ran = Duration::ZERO;
+            times.checked = None;
             self.place.lock().unwrap().take();
         }
-        state.1 += 1;
+        times.waiting += 1;
         Stopped(Arc::clone(self))
     }
 
@@ -750,31 +807,34 @@ impl Clock {
             let resumed = self.resumed.notified();
             tokio::pin!(resumed);
             resumed.as_mut().enable();
-            let (deadline, waiting, _) = *self.state.lock().unwrap();
+            let (deadline, waiting) = {
+                let times = self.times.lock().unwrap();
+                if times.out(Instant::now()) {
+                    return;
+                }
+                (times.deadline, times.waiting)
+            };
             if waiting > 0 {
                 resumed.await;
                 continue;
             }
             tokio::time::sleep_until(deadline.into()).await;
-            if self.out() {
-                return;
-            }
         }
     }
 }
 
-/// A stopped clock, which runs again, later by as long as it was stopped,
-/// once no call waits.
+/// A stopped clock, which runs again once no call waits, later by as long
+/// as it was stopped less the JavaScript that ran meanwhile.
 struct Stopped(Arc<Clock>);
 
 impl Drop for Stopped {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        state.1 -= 1;
-        if state.1 == 0 {
-            let stopped = state.2.elapsed();
-            state.0 += stopped;
-            drop(state);
+        let mut times = self.0.times.lock().unwrap();
+        times.waiting -= 1;
+        if times.waiting == 0 {
+            let stopped = times.since.elapsed().saturating_sub(times.ran);
+            times.deadline += stopped;
+            drop(times);
             self.0.resumed.notify_waiters();
         }
     }
@@ -813,7 +873,7 @@ impl Run {
         let (stopped, clock) = (Arc::clone(&self.stopped), Arc::clone(&self.clock));
         runtime
             .set_interrupt_handler(Some(Box::new(move || {
-                stopped.load(Ordering::SeqCst) || clock.out()
+                stopped.load(Ordering::SeqCst) || clock.check()
             })))
             .await;
         let context = AsyncContext::full(&runtime)
@@ -1329,9 +1389,12 @@ mod tests {
     /// A daemon that only greets and answers `approve_step`: `add` is
     /// denied, and `slow` allowed after `wait`, with each step it was
     /// asked sent on.
+    /// A daemon that denies `add` and allows other steps after `wait`, or
+    /// once the test lets one through `go`.
     async fn gate(
         dir: &Path,
         wait: Duration,
+        go: Option<Arc<tokio::sync::Semaphore>>,
     ) -> (Arc<Client>, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let socket = dir.join("gate.sock");
@@ -1353,13 +1416,17 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).unwrap();
                 asked.send(request.clone()).unwrap();
                 let write = Arc::clone(&write);
+                let go = go.clone();
                 tokio::spawn(async move {
                     let result = match request["name"].as_str() {
                         Some("mcp__test__add") => {
                             json!({"decision": "deny", "reason": "no adding"})
                         }
                         _ => {
-                            tokio::time::sleep(wait).await;
+                            match go {
+                                Some(go) => go.acquire().await.unwrap().forget(),
+                                None => tokio::time::sleep(wait).await,
+                            }
                             json!({"decision": "allow"})
                         }
                     };
@@ -1387,7 +1454,7 @@ mod tests {
         test.tools
             .insert("fail".into(), agent_client::config::ApprovalMode::Approve);
         hub.configure(&servers).await;
-        let (client, mut steps) = gate(&dir, Duration::from_millis(600)).await;
+        let (client, mut steps) = gate(&dir, Duration::from_millis(600), None).await;
         let asker = Steps::new(client, "shop.lead".into(), 7, "c1".into());
         // A script with 300 ms whose `slow` waits 600 ms for its verdict.
         let script = r#"// @exec: {"timeout_ms": 300}
@@ -1459,7 +1526,7 @@ text("done");"#;
         servers.get_mut("test").unwrap().default_tools_approval_mode =
             agent_client::config::ApprovalMode::Prompt;
         hub.configure(&servers).await;
-        let (client, _steps) = gate(&dir, Duration::from_secs(3)).await;
+        let (client, _steps) = gate(&dir, Duration::from_secs(3), None).await;
         let waiting: Vec<_> = (0..SCRIPTS)
             .map(|n| {
                 let (hub, dir) = (hub.clone(), dir.clone());
@@ -1486,6 +1553,84 @@ text("done");"#;
             let said = script.await.unwrap().unwrap();
             assert!(said.ends_with("Output:\napproved"), "{said}");
         }
+    }
+
+    #[tokio::test]
+    async fn scripts_waiting_for_verdicts_still_count_toward_those_alive() {
+        let dir = scratch("steps-alive");
+        let hub = hub(&dir).await;
+        let mut servers = hub.servers();
+        servers.get_mut("test").unwrap().default_tools_approval_mode =
+            agent_client::config::ApprovalMode::Prompt;
+        hub.configure(&servers).await;
+        let go = Arc::new(tokio::sync::Semaphore::new(0));
+        let (client, mut steps) = gate(&dir, Duration::ZERO, Some(Arc::clone(&go))).await;
+        assert_eq!(LIVE, 16);
+        let waiting: Vec<_> = (0..LIVE)
+            .map(|n| {
+                let (hub, dir) = (hub.clone(), dir.clone());
+                let asker = Steps::new(client.clone(), "shop.lead".into(), 7, format!("c{n}"));
+                tokio::spawn(async move {
+                    let script = "await tools.mcp__test__slow({ms: 1}); text('approved');";
+                    run(
+                        &hub,
+                        Some(&dir),
+                        "shop.lead",
+                        script,
+                        Duration::from_secs(30),
+                        Some(asker),
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for _ in 0..LIVE {
+            steps.recv().await.unwrap();
+        }
+        // Every one waits with its heap kept: none is left for another.
+        assert_eq!(ALIVE.available_permits(), 0);
+        go.add_permits(LIVE);
+        for script in waiting {
+            let said = script.await.unwrap().unwrap();
+            assert!(said.ends_with("Output:\napproved"), "{said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn javascript_running_beside_a_waiting_call_spends_the_script_s_time() {
+        let dir = scratch("steps-busy");
+        let hub = hub(&dir).await;
+        let mut servers = hub.servers();
+        let test = servers.get_mut("test").unwrap();
+        test.default_tools_approval_mode = agent_client::config::ApprovalMode::Prompt;
+        test.tools
+            .insert("echo".into(), agent_client::config::ApprovalMode::Approve);
+        hub.configure(&servers).await;
+        // No verdict ever comes: only the time the spinning spends ends it.
+        let go = Arc::new(tokio::sync::Semaphore::new(0));
+        let (client, _steps) = gate(&dir, Duration::ZERO, Some(go)).await;
+        let asker = Steps::new(client, "shop.lead".into(), 7, "c1".into());
+        // `slow` waits for its verdict while the other branch spins.
+        let script = r#"// @exec: {"timeout_ms": 300}
+await Promise.all([
+  tools.mcp__test__slow({ms: 1}),
+  tools.mcp__test__echo({text: "x"}).then(() => { for (;;) {} }),
+]);"#;
+        let said = run(
+            &hub,
+            Some(&dir),
+            "shop.lead",
+            script,
+            Duration::from_secs(30),
+            Some(asker),
+        )
+        .await
+        .unwrap();
+        assert!(
+            said.starts_with("Script terminated: it ran out of time"),
+            "{said}"
+        );
+        hub.stop().await;
     }
 
     #[tokio::test]

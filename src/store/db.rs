@@ -6625,6 +6625,11 @@ impl Database {
         if let Some(reason) = &reason {
             data["reason"] = json!(reason);
         }
+        if !allow {
+            // Refused by its gates, unlike a step its client left or its
+            // call outran.
+            data["denied"] = json!(true);
+        }
         if expired {
             data["expired"] = json!(true);
         }
@@ -7401,8 +7406,8 @@ impl Database {
         }
         Ok(Some(reply))
     }
-    /// The calls a turn was refused and did not then run as they were,
-    /// each `{name, arguments}` with its
+    /// The calls a turn was refused, and the steps of its running calls,
+    /// that did not then run as they were, each `{name, arguments}` with its
     /// arguments cut to the budget left, and the turn whose words it came
     /// after: the steer the turn last absorbed before it, else the turn's
     /// own. A denial recorded before refused calls were kept has no name
@@ -7412,8 +7417,9 @@ impl Database {
             "SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
                 json_extract(e.data,'$.arguments_truncated'),
                 (SELECT json_extract(s.data,'$.steer') FROM events s
-                  WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1)
-             FROM events e WHERE e.turn=? AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
+                  WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1),
+                e.id
+             FROM events e WHERE e.turn=?1 AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
                AND json_extract(e.data,'$.name') IS NOT NULL
                -- Run later in the turn as it was refused, and done: its go-ahead is used.
                AND NOT EXISTS (SELECT 1 FROM events r JOIN events d ON d.turn=r.turn
@@ -7422,7 +7428,21 @@ impl Database {
                  WHERE r.turn=e.turn AND r.kind='tool_started' AND r.id>e.id
                    AND json_extract(r.data,'$.name')=json_extract(e.data,'$.name')
                    AND json_extract(r.data,'$.arguments')=json_extract(e.data,'$.arguments'))
-             ORDER BY e.id",
+             UNION ALL
+             -- A step of a running call its gates refused, unless allowed
+             -- later in the turn as it was.
+             SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
+                json_extract(e.data,'$.arguments_truncated'),
+                (SELECT json_extract(s.data,'$.steer') FROM events s
+                  WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1),
+                e.id
+             FROM events e WHERE e.turn=?1 AND e.kind='step_decided' AND json_extract(e.data,'$.denied')
+               AND NOT EXISTS (SELECT 1 FROM events r
+                 WHERE r.turn=e.turn AND r.kind='step_decided' AND r.id>e.id
+                   AND json_extract(r.data,'$.decision')='allow'
+                   AND json_extract(r.data,'$.name')=json_extract(e.data,'$.name')
+                   AND json_extract(r.data,'$.arguments')=json_extract(e.data,'$.arguments'))
+             ORDER BY 5",
         )?;
         let mut refused = Vec::new();
         let mut rows = statement.query([turn])?;
@@ -9751,11 +9771,20 @@ fn end_step(
         .step_of
         .as_deref()
         .ok_or(Error::new("invalid_tool_state"))?;
-    let name: String = tx
-        .prepare_cached("DELETE FROM approvals WHERE id=? RETURNING name")?
-        .query_row([request.id], |r| r.get(0))?;
+    let (name, arguments): (String, String) = tx
+        .prepare_cached(
+            "DELETE FROM approvals WHERE id=? RETURNING name,json_extract(arguments,'$.arguments')",
+        )?
+        .query_row([request.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     data["step_of"] = json!(parent);
+    // Previewed as a started call is, for a judge of a later call that
+    // weighs what this turn was refused.
+    let preview: String = arguments.chars().take(2048).collect();
+    if preview.len() < arguments.len() {
+        data["arguments_truncated"] = json!(true);
+    }
     data["name"] = json!(name);
+    data["arguments"] = json!(preview);
     event(tx, bot, Some(turn), "step_decided", data)?;
     let waiting: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM approvals WHERE turn=? AND step_of=?)")?
