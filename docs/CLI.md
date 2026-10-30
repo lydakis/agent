@@ -121,25 +121,18 @@ identity is `bot_not_found`.
 - `run --new --approval MODE` chooses whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
   gate), `manual` waits for an answer from any client, and `auto` has a
-  judge model decide each call. For `auto`, and whenever `run` continues or
-  `fork` copies a bot an `auto` gate answers, the CLI starts `agent
-  approver` detached when no session serves the `auto` tag, and gives a
-  call 105 s before its gate lapses (the approver's 90 s review budget,
+  judge model decide each call. The CLI judges nothing itself: an
+  approver must serve the `auto` tag, such as `sonny approver`, which Sonny
+  keeps as the daemon's companion. For `auto`, and whenever `run` continues
+  or `fork` copies a bot an `auto` gate answers, the CLI refuses with
+  `approver_not_serving` when none does, before any bot is made, and gives
+  a call 105 s before its gate lapses (the approver's 90 s review budget,
   plus margin).
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`, and in `auto` `read` too. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)); `fork` takes no approval flags, and a
   program that wants a fork gated further passes `approve` on the protocol's `fork`.
-- `approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
-  [--note FILE]` serves a gate tag (default `auto`) and
-  has a judge decide every call waiting on it, one request per round,
-  printing one JSON line per round. The judge is `--judge`, else
-  `[judge] model` in `~/.agent/config.toml`, else `AGENT_MODEL`. It runs
-  through the daemon, with a tag of at most 67 bytes, and `--effort` (default
-  `[judge] effort`) sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
-  is a regular file of at most 96,000 bytes the judge always sees, such as
-  trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
   Each previews its arguments; `--full` reads the whole arguments of a
   call whose preview was cut from the node that planned it.
@@ -233,8 +226,8 @@ Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
 return arrays. Every command prints its reply: `interrupt` the turn view,
 `answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
-daemon is gone. Every client command takes `--pretty`; `approver` and `serve`
-run until stopped and print no reply to render.
+daemon is gone. Every client command takes `--pretty`; `serve` runs until
+stopped and prints no reply to render.
 `shutdown` returns once the daemon process has exited and its store is closed.
 `shutdown --grace DURATION` first lets running turns finish for up to that long
 while starting none; turns still running then end `interrupted` with

@@ -1126,7 +1126,7 @@ FAILED = 'Automatic approval review failed: '
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AutoApproverTests(ModelFixture):
-    """`agent approver` serves `auto`: a judge model decides every call."""
+    """`sonny approver` serves `auto`: a judge model decides every call."""
 
     def setUp(self):
         super().setUp()
@@ -1145,7 +1145,7 @@ class AutoApproverTests(ModelFixture):
         """The stand-in judge, unless `judge` names another model the
         daemon serves."""
         process = subprocess.Popen(
-            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), '--judge', judge or f'openai/{Judge.model}'],
             env={**clean_env(), **(env or {})},
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -1213,7 +1213,7 @@ class AutoApproverTests(ModelFixture):
         daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
                        instructions='Help with the repo.', tools=[])
         refused = subprocess.run(
-            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), '--judge', 'openai/judge-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
@@ -1338,7 +1338,7 @@ class AutoApproverTests(ModelFixture):
         self.approver(daemon, judge='openai/judge-model')
         base = daemon.request('inspect', bot='approver.auto')['result']
         refused = subprocess.run(
-            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
              '--socket', str(daemon.socket_path), '--judge', 'openai/other-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)

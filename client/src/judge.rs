@@ -1,4 +1,4 @@
-//! The judge that `agent approver` and Sonny's lookout ask yes/no questions
+//! The judge that `sonny approver` and Sonny's lookout ask yes/no questions
 //! of: which one, picked in one order, and how it answers. A judge is a
 //! `provider/model` the daemon runs, as a fork of an idle base bot that
 //! takes one turn, so checks run at once and none sees another.

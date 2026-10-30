@@ -117,7 +117,7 @@ pub enum WebSearch {
     Disabled,
 }
 
-/// The judge `agent approver` and Sonny's lookout ask.
+/// The judge `sonny approver` and Sonny's lookout ask.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Judge {
     /// `provider/model`; unset, the judged bot's own model.

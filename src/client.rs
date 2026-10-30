@@ -123,9 +123,6 @@ struct Options {
     request: Option<i64>,
     tag: Option<String>,
     reason: Option<String>,
-    /// `approver`: the environment note file and the judge.
-    note: Option<PathBuf>,
-    judge: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     /// A new bot's settings, as `create` takes them, and the flags that set them.
@@ -197,8 +194,6 @@ fn parse(args: &[String]) -> Result<Options> {
         request: None,
         tag: None,
         reason: None,
-        note: std::env::var_os("AGENT_APPROVER_NOTE").map(PathBuf::from),
-        judge: None,
         daemon_flags: Vec::new(),
         settings: serde_json::Map::new(),
         settings_flags: Vec::new(),
@@ -279,8 +274,6 @@ fn parse(args: &[String]) -> Result<Options> {
                         )
                     }
                     "--reason" => options.reason = Some(value),
-                    "--note" => options.note = Some(PathBuf::from(value)),
-                    "--judge" => options.judge = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
                         options.instructions =
@@ -1025,99 +1018,22 @@ fn answered_by_auto(bot: &Value) -> bool {
         .is_some_and(|gates| gates.iter().any(|gate| gate["tag"] == "auto"))
 }
 
-/// A bot record's model, as `provider/model`.
-fn bot_model(bot: &Value) -> Option<String> {
-    Some(format!(
-        "{}/{}",
-        bot["provider"].as_str()?,
-        bot["model"].as_str()?
-    ))
-}
-
-/// Whether the approver `pid` logged that it serves, after byte `start`.
-fn serving(log: &std::ffi::OsStr, start: u64, pid: u32) -> Result<bool> {
-    use std::io::{BufRead, Seek};
-    let mut file = std::fs::File::open(log)?;
-    file.seek(std::io::SeekFrom::Start(start))?;
-    for line in std::io::BufReader::new(file).lines() {
-        let Ok(line) = serde_json::from_str::<Value>(&line?) else {
-            continue;
-        };
-        if line["event"] == "serving" && line["pid"] == pid {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// An `auto` bot needs an approver serving `auto`. If none is, start one:
-/// detached, logging its verdicts next to the store, judged by the judge it
-/// picks, with the bot's own model as the last choice.
-fn ensure_approver(
-    options: &Options,
-    connection: &mut Connection,
-    model: Option<String>,
-) -> Result<()> {
-    let served = |connection: &mut Connection| -> Result<bool> {
-        let stats = connection.request("stats", json!({}))?;
-        Ok(stats["approvers"]
-            .as_array()
-            .is_some_and(|tags| tags.iter().any(|tag| tag == "auto")))
-    };
-    if served(connection)? {
+/// An `auto` bot needs an approver serving `auto`, such as the one Sonny
+/// keeps as the daemon's companion (`sonny approver`): the CLI judges
+/// nothing itself, so without one its calls could only wait and be denied.
+fn require_approver(connection: &mut Connection) -> Result<()> {
+    let stats = connection.request("stats", json!({}))?;
+    let served = stats["approvers"]
+        .as_array()
+        .is_some_and(|tags| tags.iter().any(|tag| tag == "auto"));
+    if served {
         return Ok(());
     }
-    let mut log = options.store.clone().into_os_string();
-    log.push(".approver.log");
-    let path = log;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    // Where this approver's lines start: it is ready once it says so there.
-    let start = log.metadata()?.len();
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg("approver")
-        .arg("--store")
-        .arg(&options.store)
-        .arg("--socket")
-        .arg(&options.socket);
-    if let Some(judge) = &options.judge {
-        command.arg("--judge").arg(judge);
-    }
-    if let Some(model) = model {
-        command.env("AGENT_MODEL", model);
-    }
-    if let Some(note) = &options.note {
-        command.arg("--note").arg(note);
-    }
-    agent_client::own_session(&mut command);
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .spawn()?;
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        // The tag is served as soon as the lease is held, before the judge
-        // is ready, so wait for the approver's own word.
-        if serving(&path, start, child.id())? {
-            return Ok(());
-        }
-        // Another approver won the tag first: that one serves it.
-        if let Some(status) = child.try_wait()? {
-            if served(connection)? {
-                return Ok(());
-            }
-            return fail_with(
-                "approver_start_failed",
-                format!("approver exited with {status}"),
-            );
-        }
-        startup_remaining(deadline)?;
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    Err(Error::with(
+        "approver_not_serving",
+        "no approver serves auto; one must, such as `sonny approver`, which Sonny keeps running",
+    )
+    .facts(json!({"tag":"auto"})))
 }
 
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
@@ -1209,7 +1125,6 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "compact" => compact(&options),
         "approvals" => approvals(&options),
         "answer" => answer(&options),
-        "approver" => approver(&options),
         "companion" => companion(&options),
         "models" => models(&options),
         // The daemon's ready line, from the running one or one started now,
@@ -1542,9 +1457,9 @@ fn run(options: &Options) -> Result<i32> {
             "compaction_model":options.compaction_model,"fallback":fallback,
             "settings":settings,"request_id":request_id});
         if let Value::Object(gate) = requested_gate(options, &tools)? {
-            // Its approver first, so a missing judge leaves no bot behind.
+            // An approver first, so a gate nobody serves leaves no bot behind.
             if gate.get("approver").is_some_and(|tag| tag == "auto") {
-                ensure_approver(options, &mut connection, Some(model.clone()))?;
+                require_approver(&mut connection)?;
             }
             create.as_object_mut().expect("object").extend(gate);
         }
@@ -1554,7 +1469,7 @@ fn run(options: &Options) -> Result<i32> {
         // `auto` gets its approver back, as after a daemon restart.
         let record = connection.request("inspect", json!({"bot":bot}))?;
         if answered_by_auto(&record) {
-            ensure_approver(options, &mut connection, bot_model(&record))?;
+            require_approver(&mut connection)?;
         }
     }
     // Existing bots keep their model and effort unless --model or
@@ -1760,7 +1675,7 @@ fn make_fork(
         request["allow"] = json!(allow);
     }
     // A fork keeps its source's tools and gates. An approver its inherited
-    // `auto` gate needs starts first, so a missing judge leaves no fork behind.
+    // `auto` gate needs is checked first, so a gate nobody serves leaves no fork behind.
     let state = match connection.request("inspect", json!({"bot":source})) {
         // A keyed fork outlives its source: its resend is answered from the
         // fork, so it needs nothing from the source.
@@ -1770,7 +1685,7 @@ fn make_fork(
         state => state?,
     };
     if answered_by_auto(&state) {
-        ensure_approver(options, connection, bot_model(&state))?;
+        require_approver(connection)?;
     }
     connection.request("fork", request)
 }
@@ -1980,56 +1895,6 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
         }
     }
     Ok(())
-}
-
-/// Allow or deny one gated call. The request number is required, so a
-/// decision made on what a person saw cannot land on a call announced
-/// again since.
-/// The approver's note: a regular file no larger than a judge's whole
-/// state, opened without blocking so a FIFO cannot hold startup.
-fn note(path: &Path) -> Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let unreadable = || Error::with("usage", format!("cannot read {}", path.display()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| unreadable())?;
-    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
-        return Err(unreadable());
-    }
-    let limit = agent_client::approver::STATE_TOKENS * 3;
-    let mut note = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut note)
-        .map_err(|_| unreadable())?;
-    if note.len() > limit {
-        return fail_with(
-            "usage",
-            format!(
-                "{} is over {limit} bytes, more than a judge sees",
-                path.display()
-            ),
-        );
-    }
-    String::from_utf8(note).map_err(|_| unreadable())
-}
-
-/// Serve a gate tag, `auto` by default, with a judge model deciding every
-/// call; runs until the daemon goes away or another session takes the tag.
-fn approver(options: &Options) -> Result<i32> {
-    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let note = options.note.as_deref().map(note).transpose()?;
-    // The flags over the person's `[judge]` in ~/.agent/config.toml.
-    let config = config()?;
-    crate::approver::main(crate::approver::Settings {
-        socket: options.socket.clone(),
-        tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
-        judge: (options.judge.clone()).or(config.judge.model),
-        caller: env("AGENT_MODEL"),
-        effort: (options.effort.clone()).or(config.judge.effort),
-        note,
-    })
 }
 
 /// `companion add`, `rm` or `ls`: what the daemon keeps running beside it.

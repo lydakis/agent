@@ -10,6 +10,7 @@
 //! has run and how to stop it.
 mod acp;
 mod approvals;
+mod approver;
 mod asks;
 mod attach;
 mod background;
@@ -444,13 +445,13 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
     Ok(())
 }
 
-/// The daemon's companion that answers an `auto` gate: `agent approver`,
+/// The daemon's companion that answers an `auto` gate: `sonny approver`,
 /// judged by `model` unless a judge is set, which the daemon then keeps
 /// running for as long as it runs, as it does the lookout. One kept already
 /// keeps the judge it was given first, so leads on other models do not
 /// start it again.
 async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
-    let bin = agent_bin().ok_or("Agent's binary was not found to judge calls; set AGENT_BIN")?;
+    let bin = std::env::current_exe().map_err(|e| e.to_string())?;
     let args = daemon_args("approver");
     let kept = client
         .request("companions", json!({}))
@@ -783,6 +784,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "home" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);

@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// The CLI's own files, which are a client: everything else under `src/` is
 /// the daemon.
-const CLIENT: [&str; 6] = [
-    "src/approver.rs",
+const CLIENT: [&str; 5] = [
     "src/cli.rs",
     "src/client.rs",
     "src/client_path.rs",

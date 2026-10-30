@@ -105,7 +105,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
                 assert daemon.poll() is None and time.monotonic() < deadline, 'daemon startup failed'
                 time.sleep(.01)
             control = Connection(sock, retain_durable=False)
-            args = [str(binary), 'approver', '--store', str(store), '--socket', str(sock), '--judge', judge]
+            args = [str(binary.parent / 'sonny'), 'approver', '--store', str(store), '--socket', str(sock), '--judge', judge]
             if reasoning:
                 args += ['--effort', reasoning]
             if note:

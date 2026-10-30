@@ -266,7 +266,7 @@ def run_socket(binary, arm, *, bots, turns):
                                                    approve=['shell'], approver=tag,
                                                    settings={'approval_hold_ms': 2000})
             if arm != 'socket':
-                args = [str(binary), 'approver', '--store', str(path / 'state.sqlite'),
+                args = [str(binary.parent / 'sonny'), 'approver', '--store', str(path / 'state.sqlite'),
                         '--socket', str(sock), '--judge', 'openai/synthetic-model']
                 approver = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             text=True, env=clean_env())

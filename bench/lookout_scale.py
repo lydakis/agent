@@ -437,7 +437,7 @@ class Bench:
         self.create(names, tools=('echo', 'shell'), approve=['shell'], approver='auto')
         log = open(self.out / 'approver.out', 'w')
         process = subprocess.Popen(
-            [str(self.agent), 'approver', '--store', str(self.store), '--socket', str(self.socket),
+            [str(self.agent.parent / 'sonny'), 'approver', '--store', str(self.store), '--socket', str(self.socket),
              '--judge', 'openai/synthetic-model'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, env=self.env, text=True,
             start_new_session=True)
