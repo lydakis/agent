@@ -631,9 +631,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
                 said["told"] = json!(crate::commons::tell(&said, &caller, &tell).await);
             }
-            if let Some(title) = said.as_object_mut().and_then(|said| said.remove("invite")) {
-                let title = title.as_str().unwrap_or_default();
-                said["invited"] = json!(crate::commons::invite(&home, &said, &caller, title).await);
+            if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
+                said["invited"] =
+                    json!(crate::commons::invite(&home, &said, &caller, &invite).await);
             }
             Ok(said.to_string())
         }

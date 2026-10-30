@@ -325,7 +325,11 @@ class ServedToolTests(ModelFixture):
                          '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
                          'which your turns touch on.]')
         listed = json.loads(self.call('calc.a', 'commons', {}))
-        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 10})
+        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'answered': 0, 'this_week': 1})
+        # Its reply earns the commons another invite a day.
+        self.call('shop.b', 'commons', {'reply': {'thread': 'stalls', 'text': 'Same here.'}})
+        listed = json.loads(self.call('mail.c', 'commons', {}))
+        self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'answered': 1, 'this_week': 1})
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'
