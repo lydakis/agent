@@ -59,13 +59,35 @@ pub struct Snapshot {
     pub folder: Option<PathBuf>,
 }
 
+/// The git Sonny runs: the first on `PATH` in a folder named from the
+/// root, found once. A folder named relative to where git runs, `.` say,
+/// would be inside the checkout, where a task may put a git of its own.
+fn git_program() -> &'static Path {
+    static FOUND: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        // None found runs nothing: an absolute path that is not there.
+        find_git(&std::env::var_os("PATH").unwrap_or_default())
+            .unwrap_or_else(|| PathBuf::from("/nonexistent/git"))
+    });
+    &FOUND
+}
+
+fn find_git(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    (std::env::split_paths(path))
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|git| {
+            std::fs::metadata(git).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
 fn git(
     dir: &Path,
     args: &[&str],
     index: Option<&Path>,
     input: Option<&str>,
 ) -> Result<String, String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program());
     command.arg("-C").arg(dir);
     run(command, args, index, input)
 }
@@ -139,7 +161,7 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
             r"^core\.(excludesfile|attributesfile)$",
         ],
     ] {
-        let mut command = Command::new("git");
+        let mut command = Command::new(git_program());
         command
             .arg("-C")
             .arg(work)
@@ -385,7 +407,7 @@ fn sealed(
     index: &Path,
     input: Option<&str>,
 ) -> Result<String, String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program());
     for (key, _) in std::env::vars_os() {
         if key.as_encoded_bytes().starts_with(b"GIT_") {
             command.env_remove(key);
@@ -1510,6 +1532,29 @@ mod tests {
         assert!(!busy(&one) && busy(&two));
         running("busy.b", None);
         assert!(!busy(&two));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_git_run_is_found_in_a_folder_named_from_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("program");
+        let (planted, real) = (dir.join("checkout"), dir.join("bin"));
+        for folder in [&planted, &real] {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(folder.join("git"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(folder.join("git"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        // The planted one, named from where this runs.
+        let here = std::env::current_dir().unwrap();
+        let mut relative: PathBuf = here.components().skip(1).map(|_| "..").collect();
+        relative.push(planted.strip_prefix("/").unwrap());
+        assert!(relative.join("git").exists());
+        let path = std::env::join_paths([relative.as_path(), &real]).unwrap();
+        assert_eq!(find_git(&path), Some(real.join("git")));
+        assert_eq!(find_git(relative.as_os_str()), None);
+        assert!(git_program().is_absolute());
         let _ = std::fs::remove_dir_all(dir);
     }
 
