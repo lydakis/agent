@@ -389,6 +389,21 @@ fn a_done_worktree_task_is_removed_with_its_merged_branch() {
     );
 }
 
+#[test]
+fn a_task_outside_git_is_removed_with_no_snapshots_to_drop() {
+    let lab = Lab::new("rm-outside");
+    let workspace = lab.scratch.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let start = serde_json::json!({"name": "demo.fix", "brief": "fix it"});
+    let (ok, said) = lab.tool(&workspace, "start_task", start, false);
+    assert!(ok, "{said}");
+    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5, "workspace": workspace}]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    let (ok, said) = lab.remove(&workspace, false);
+    assert!(ok, "{said}");
+    assert!(lab.scratch.join("run.log.rm").exists());
+}
+
 /// Keep the worktree's files as the lookout does after a completed turn
 /// (snapshot.rs): bot 5's turn `turn`, at history node `checkpoint`.
 fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {

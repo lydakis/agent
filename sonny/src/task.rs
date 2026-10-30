@@ -1048,8 +1048,8 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         git(here, &args)?;
     }
     // Its snapshots go with it once its folder is gone, so one still being
-    // taken of it fails rather than lands after.
-    if let Some(bot_id) = bot_id {
+    // taken of it fails rather than lands after. Only a worktree has any.
+    if let (Some(bot_id), Some(_)) = (bot_id, &worktree) {
         let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
         crate::snapshot::forget(here, &refs, bot_id)?;
     }
