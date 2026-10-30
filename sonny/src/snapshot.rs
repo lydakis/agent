@@ -298,9 +298,21 @@ pub fn restore(here: &Path, snapshot: &Snapshot, path: &Path, branch: &str) -> R
         .as_deref()
         .ok_or("the folder had no commit yet, so there is nothing to branch from")?;
     let target = path.to_string_lossy();
+    // Checked out from inside the new worktree, on its branch, as the
+    // config that holds may depend on the branch: no file is written
+    // until the filters to turn off are the ones that hold there.
     git(
         here,
-        &["worktree", "add", "-q", "-b", branch, &target, base],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--no-checkout",
+            "-b",
+            branch,
+            &target,
+            base,
+        ],
         None,
         None,
     )?;
@@ -627,6 +639,41 @@ mod tests {
         .unwrap();
         std::fs::write(top.join("x.a"), "raw\n").unwrap();
         std::fs::write(top.join("y.b"), "raw too\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let copy = dir.join("copy");
+        restore(&top, &snapshot, &copy, "agent/copy").unwrap();
+        assert!(!ran.exists());
+        assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_filter_of_the_fork_s_branch_runs() {
+        let (dir, top) = repo("onbranch");
+        let ran = dir.join("ran");
+        let included = dir.join("included");
+        let script = format!("sh -c 'touch {}; cat'", ran.display());
+        std::fs::write(
+            &included,
+            format!("[filter \"branchy\"]\n\tsmudge = \"{script}\"\n\tclean = \"{script}\"\n"),
+        )
+        .unwrap();
+        let key = "includeIf.onbranch:agent/**.path";
+        git(
+            &top,
+            &["config", key, &included.to_string_lossy()],
+            None,
+            None,
+        )
+        .unwrap();
+        std::fs::write(top.join(".gitattributes"), "*.a filter=branchy\n").unwrap();
+        std::fs::write(top.join("x.a"), "raw\n").unwrap();
+        git(&top, &["add", "-A"], None, None).unwrap();
+        git(&top, &["commit", "-q", "-m", "filtered"], None, None).unwrap();
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
