@@ -77,6 +77,9 @@ pub enum Tag {
     Note(u64),
     /// A `plan` call, by the client's number for it.
     Plan(u64),
+    /// The last row of the words streamed as this item of the running
+    /// turn, until their message names its node.
+    Streamed(u64),
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -313,6 +316,15 @@ impl Screen {
     /// The row tagged `tag`, the newest if more are.
     fn tagged(&self, tag: Tag) -> Option<usize> {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
+    }
+
+    /// The row tagged `from` tagged `to` instead; whether there was one.
+    pub fn retag(&mut self, from: Tag, to: Tag) -> bool {
+        let Some(at) = self.tagged(from) else {
+            return false;
+        };
+        self.rows[at].tag = Some(to);
+        true
     }
 
     /// The tags the lines kept carry, oldest first: what is still there
@@ -1306,6 +1318,7 @@ impl Screen {
                     continue;
                 }
                 let style = match i == finding.at {
+                    true if crate::look::no_color() => Style::new().reversed(),
                     true => Style::new().fg(Color::Black).bg(Color::Yellow),
                     false => Style::new().fg(Color::Yellow).underlined(),
                 };
@@ -2484,6 +2497,22 @@ mod tests {
             screen.render(area, &mut buf, |_| None);
             assert_eq!(row(&buf, 0), before);
         }
+    }
+
+    #[test]
+    fn another_card_shown_from_its_top_drops_the_kept_scroll() {
+        let lines: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("row {i}"))).collect();
+        let (mut screen, _) = screen(lines, 10, 5);
+        let area = Rect::new(0, 0, 10, 5);
+        let mut buf = Buffer::empty(area);
+        screen.show_row(10, 0);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "row 10");
+        let other: Vec<Line<'static>> = (0..20).map(|i| Line::from(format!("post {i}"))).collect();
+        screen.replace_marked(other, Vec::new());
+        screen.show_row(0, 0);
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(row(&buf, 0).trim_end(), "post 0");
     }
 
     #[test]

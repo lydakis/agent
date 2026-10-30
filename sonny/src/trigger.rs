@@ -3079,8 +3079,8 @@ fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(),
 }
 
 /// The first fire of a `--start` trigger: the agent is made as Sonny
-/// makes one, with its folder's composed policy and the default tools, and
-/// shown under the agent that added the trigger. Its request id is the
+/// makes one, with its folder's composed policy, the default tools and
+/// Sonny's own, and shown under the agent that added the trigger. Its request id is the
 /// trigger's: a fire cut short after the daemon made it asks again and gets
 /// the same agent, and a name anyone else took fails, so a trigger never
 /// takes over an agent it did not make.
@@ -3112,6 +3112,10 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
                 "instructions": instructions,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
                 "tools": agent_client::default_tools(client.providers(), model, config.web_search),
+                // The memory tool, and `exec` while MCP servers are on, so
+                // an agent no one opens reaches the person's chat, mail
+                // and the like as one they open does.
+                "declare": crate::declared::tools(false),
                 "created_by": by.as_ref().map(|(bot, _)| bot),
                 "created_by_id": by.as_ref().map(|(_, id)| id),
                 "settings": settings,
@@ -3122,6 +3126,24 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
     made["bot_id"]
         .as_i64()
         .ok_or_else(|| "create: no bot id".into())
+}
+
+/// Give the agent a `--start` trigger made before its agents had Sonny's
+/// tools those tools, as [`start`] gives them now; the lookout keeps them
+/// up to date from then on. One that has any declared tools is left as it
+/// is, and a failure leaves it to the next fire.
+async fn adopt(client: &Client, name: &str, id: i64) {
+    let Ok(mut record) = client
+        .request("inspect", json!({"bot": name, "bot_id": id}))
+        .await
+    else {
+        return;
+    };
+    record["name"] = json!(name);
+    record["bot_id"] = json!(id);
+    if let Some(fields) = crate::declared::adopt(&record) {
+        let _ = client.request("configure", Value::Object(fields)).await;
+    }
 }
 
 /// What came of a fire whose agent could not be made. Pinned by id, an
@@ -3172,7 +3194,10 @@ async fn deliver(
     );
     let (bot, id, started) = match (&trigger.target, kept.started_id) {
         (Target::Bot { name, id }, _) => (name, *id, false),
-        (Target::Start { name, .. }, Some(id)) => (name, id, false),
+        (Target::Start { name, .. }, Some(id)) => {
+            adopt(client, name, id).await;
+            (name, id, false)
+        }
         (Target::Start { name, .. }, None) => match start(client, trigger).await {
             Ok(id) => (name, id, true),
             Err(error) => return unmade(error),
@@ -3679,7 +3704,10 @@ fn ends(places: &Places, trigger: &Trigger, keep: bool) {
 /// The daemon, started the way Sonny starts one when none answers and
 /// the trigger names its store, on the socket the trigger was made with,
 /// with the login shell's environment, since launchd's has no provider keys.
-async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client>, String> {
+pub(crate) async fn connect(
+    socket: &Path,
+    daemon: &Daemon,
+) -> Result<std::sync::Arc<Client>, String> {
     match Client::connect(socket).await {
         Ok((client, _events)) => Ok(client),
         Err(error) if error.code == "daemon_unavailable" => {

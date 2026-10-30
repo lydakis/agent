@@ -233,10 +233,7 @@ fn memory(words: &[String], output: &str, failed: bool) -> Said {
     Said {
         verb,
         what,
-        under: refusal
-            .map(|refusal| Line::from(refusal).fg(Color::Red))
-            .into_iter()
-            .collect(),
+        under: refusal.map(Line::from).into_iter().collect(),
         failed: failed || reply.get("error").is_some(),
         output: None,
     }
@@ -290,7 +287,7 @@ fn trigger(words: &[String], output: &str, failed: bool) -> Option<Said> {
         _ => return None,
     }
     if let Some(refusal) = refusal {
-        said.under.push(Line::from(refusal).fg(Color::Red));
+        said.under.push(Line::from(refusal));
     }
     Some(said)
 }
@@ -470,7 +467,7 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
         _ => return None,
     }
     if let Some(refusal) = refusal {
-        said.under.push(Line::from(refusal).fg(Color::Red));
+        said.under.push(Line::from(refusal));
     }
     Some(said)
 }

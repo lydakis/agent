@@ -2201,6 +2201,9 @@ struct Renderer {
     pretty: bool,
     color: bool,
     mode: Mode,
+    /// The item the text printed last belongs to: the next one is another
+    /// message, printed apart.
+    item: Option<u64>,
     turn: Option<i64>,
     usage: (u64, u64, u64),
     /// The daemon's flags for the answer commands it prints.
@@ -2216,6 +2219,7 @@ impl Renderer {
             pretty,
             color: terminal,
             mode: Mode::Idle,
+            item: None,
             turn,
             usage: (0, 0, 0),
             target: target.to_owned(),
@@ -2292,7 +2296,15 @@ impl Renderer {
         }
         let data = &event["data"];
         match event["event"].as_str().unwrap_or("") {
-            "text_delta" => self.print(Mode::Text, event["text"].as_str().unwrap_or("")),
+            "text_delta" => {
+                let item = event["item"].as_u64();
+                if self.mode == Mode::Text && item != self.item {
+                    self.flush();
+                    say!();
+                }
+                self.item = item;
+                self.print(Mode::Text, event["text"].as_str().unwrap_or(""))
+            }
             "thinking_delta" => self.print(Mode::Thinking, event["text"].as_str().unwrap_or("")),
             "tool_started" => {
                 self.flush();

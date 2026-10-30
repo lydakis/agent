@@ -877,13 +877,19 @@ fn started(root: &Path, commit: &str, facts: u64, duplicate: bool) -> Result<Val
     )?;
     let (removed, added, changed) = fact_changes(&since);
     let saved: Vec<_> = added.into_iter().chain(changed).collect();
-    let since_ms = std::fs::read_to_string(root.join(SAID))
-        .ok()
-        .and_then(|ms| ms.trim().parse::<i64>().ok());
+    let since_ms = said_since(root);
     Ok(
         json!({"started": commit, "facts": facts, "saved": saved, "removed": removed,
         "unread": unread(root)?, "since_ms": since_ms, "duplicate": duplicate}),
     )
+}
+
+/// When the last finished cleanup started, in unix milliseconds, from
+/// which the next reads what the person wrote; `None` before the first.
+pub fn said_since(root: &Path) -> Option<i64> {
+    std::fs::read_to_string(root.join(SAID))
+        .ok()
+        .and_then(|ms| ms.trim().parse::<i64>().ok())
 }
 
 /// Fact files in a `--name-status` listing: removed, added and changed.
@@ -961,8 +967,8 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
 }
 
 /// The trigger that runs the cleanup each night: an agent of its own,
-/// started on the first fire in the memory folder, woken only when memory
-/// changed, and each turn capped.
+/// started on the first fire in the memory folder, woken only when
+/// `changed` says so, and each turn capped.
 fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> {
     let usage = || format!("usage: {USAGE}");
     let (mut model, mut effort, mut cron) = (None, None, None);

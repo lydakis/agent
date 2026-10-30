@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 /// The most tools a bot may have declared, and the most bytes they take,
 /// as the daemon counts them.
-const MAX_DECLARED: usize = 16;
+const MAX_DECLARED: usize = 32;
 const DECLARED_BYTES: usize = 64 * 1024;
 
 /// Sonny's tools, as it declares them on a lead, or on another bot.
@@ -93,6 +93,23 @@ pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
     let lead = declared
         .iter()
         .any(|tool| tool["name"] == crate::served::START);
+    fields(record, lead)
+}
+
+/// The `configure` fields that give Sonny's tools, a task's, to the bot
+/// `record` describes when it declares none, as an agent a `--start`
+/// trigger made before its agents had them: gated as its mode gates the
+/// rest, and left to [`refresh`] after.
+pub fn adopt(record: &Value) -> Option<Map<String, Value>> {
+    if (record["declared"].as_array()).is_some_and(|tools| !tools.is_empty()) {
+        return None;
+    }
+    fields(record, false)
+}
+
+/// The `configure` fields that bring `record` to Sonny's tools, a lead's
+/// or not, with the approvals its mode gives the ones it gates.
+fn fields(record: &Value, lead: bool) -> Option<Map<String, Value>> {
     let declare = declare(record, lead)?;
     let mut fields = Map::new();
     if let Some(mode) = crate::approvals::mode(record).filter(|mode| *mode != "full") {
@@ -156,7 +173,7 @@ mod tests {
         let auto = json!({"gates": [{"tag": "auto", "tools": ["shell"]}]});
         assert!(names(declare(&auto, true).unwrap()).contains(&"run_in_pane".to_owned()));
         // A bot whose own tools leave no room keeps them as they are.
-        let full: Vec<Value> = (0..14)
+        let full: Vec<Value> = (0..30)
             .map(|n| {
                 json!({"name": format!("t{n}"), "description": "d",
                 "parameters": {"type": "object"}, "result": "ok"})
@@ -206,6 +223,28 @@ mod tests {
         let approve = fields["approve"].as_array().unwrap();
         assert!(approve.iter().any(|tool| tool == "shell"));
         assert!(approve.iter().any(|tool| tool == crate::served::RUN));
+    }
+
+    #[test]
+    fn an_agent_declaring_nothing_takes_a_tasks_tools_gated_as_its_mode_gates() {
+        let names = |fields: &Map<String, Value>| -> Vec<String> {
+            (fields["declare"].as_array().unwrap().iter())
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Ungated: the tools, nothing to approve.
+        let full = adopt(&json!({"name": "memory-cleanup", "bot_id": 3})).unwrap();
+        assert!(names(&full).contains(&crate::served::MEMORY.to_owned()));
+        assert!(!names(&full).contains(&crate::served::START.to_owned()));
+        assert!(!full.contains_key("approve"));
+        // Under auto, the ones Sonny gates wait for the verdict as the rest do.
+        let auto = json!({"name": "memory-cleanup", "bot_id": 3, "tools": ["shell"],
+            "gates": [{"tag": "auto", "tools": ["shell"]}]});
+        let fields = adopt(&auto).unwrap();
+        let approve = fields["approve"].as_array().unwrap();
+        assert!(approve.iter().any(|tool| tool == crate::served::RUN));
+        // One that declares anything is left to refresh.
+        assert_eq!(adopt(&json!({"declared": [{"name": "theirs"}]})), None);
     }
 
     #[test]
