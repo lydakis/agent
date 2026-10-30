@@ -76,13 +76,13 @@ pub const SETTINGS: [Setting; 19] = [
     },
     Setting {
         key: "judge.model",
-        about: "who judges for auto approvals (provider/model)",
+        about: "the reviewer for auto approvals (provider/model)",
         values: &[],
         default: "the agent's own model",
     },
     Setting {
         key: "judge.effort",
-        about: "the judge's effort",
+        about: "the reviewer's effort",
         values: EFFORTS,
         default: "the model's own",
     },

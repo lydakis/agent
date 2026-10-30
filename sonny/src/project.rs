@@ -1,4 +1,4 @@
-//! The folder's coordinator: opened with no `--bot`, Sonny talks to the
+//! The folder's coordinator: opened with no `--agent`, Sonny talks to the
 //! project's lead, `<project>.lead`, the same bot whichever Sonny opens
 //! that folder. A folder that is not
 //! a project yet becomes one: its lead, then its `.agents/project.toml`.
@@ -554,7 +554,7 @@ pub async fn open(
         if there != dir.to_str().unwrap_or("") && same_name(Path::new(there), &project) {
             return Err(format!(
                 "project_exists: {first} is the lead of {there}, a project of the same name; \
-                 name this one in .agents/project.toml or pass --bot"
+                 name this one in .agents/project.toml or pass --agent"
             ));
         }
     }
@@ -746,7 +746,7 @@ fn folder_in(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
         let task = task.as_os_str().to_string_lossy();
         return Err(format!(
             "task_folder: {} is in task {task}'s folder; run sonny in its project's \
-             folder, or sonny --bot {task} for the task",
+             folder, or sonny --agent {task} for the task",
             dir.display()
         ));
     }
@@ -1224,7 +1224,7 @@ mod tests {
         std::fs::create_dir_all(&task).unwrap();
         let error = folder_in(&task.canonicalize().unwrap(), Some(&home)).unwrap_err();
         assert!(error.starts_with("task_folder: "), "{error}");
-        assert!(error.contains("sonny --bot ws.fix"), "{error}");
+        assert!(error.contains("sonny --agent ws.fix"), "{error}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

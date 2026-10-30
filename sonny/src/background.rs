@@ -218,7 +218,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     let mut failed = None;
     facts.push(match row["runs"].as_u64() {
         Some(runs) => format!("sent {sent} of {runs}"),
-        None if sent == 0 && last.is_null() => "not fired yet".into(),
+        None if sent == 0 && last.is_null() => "not run yet".into(),
         None => format!("sent {sent}"),
     });
     if let Some(outcome) = last["outcome"].as_str() {
@@ -292,7 +292,7 @@ pub fn count(items: &[Item], bot: &str) -> usize {
         .count()
 }
 
-/// What `/status` says of `bot`'s: `↻ 2 triggers, 1 subscription`, or
+/// What `/status` says of `bot`'s: `↻ 2 automations, 1 follow`, or
 /// nothing.
 pub fn fact(items: &[Item], bot: &str) -> String {
     let of = |kind: Kind| {
@@ -302,8 +302,8 @@ pub fn fact(items: &[Item], bot: &str) -> String {
             .count()
     };
     let said: Vec<String> = [
-        (of(Kind::Trigger), "trigger"),
-        (of(Kind::Subscription), "subscription"),
+        (of(Kind::Trigger), "automation"),
+        (of(Kind::Subscription), "follow"),
     ]
     .into_iter()
     .filter(|(n, _)| *n > 0)
@@ -433,7 +433,7 @@ impl View {
                 return Key::Close;
             }
             // A letter with Ctrl or Alt is another shortcut, such as Ctrl+F's
-            // find: never a fire or a removal.
+            // find: never a run or a removal.
             KeyCode::Char(_)
                 if key.modifiers.intersects(
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
@@ -442,14 +442,14 @@ impl View {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
             }
-            KeyCode::Char('f') => self.fire(),
+            KeyCode::Char('r') => self.fire(),
             KeyCode::Char('d') | KeyCode::Delete => {
                 let Some(item) = self.items.get(self.selected).cloned() else {
                     return Key::Stay;
                 };
                 if item.own {
                     self.notice = Some(
-                        "Sonny keeps the lead's tasks subscription; the lookout watches its tasks with it"
+                        "Sonny keeps the lead's tasks follow; the lookout watches its tasks with it"
                             .into(),
                     );
                 } else if item.kind == Kind::Server {
@@ -472,13 +472,13 @@ impl View {
             return;
         };
         if item.kind != Kind::Trigger {
-            self.notice = Some("only a trigger fires".into());
+            self.notice = Some("only an automation runs now".into());
             return;
         }
         let name = item.name.clone();
         self.notice = Some(
             match trigger::Places::home().and_then(|places| trigger::fire_now(&places, &name)) {
-                Ok(_) => format!("fired {name}"),
+                Ok(_) => format!("ran {name}"),
                 Err(error) => error,
             },
         );
@@ -516,7 +516,7 @@ impl View {
             ));
             out.push(
                 Line::from(
-                    "An agent adds a trigger with its triggers tool, and a lookout subscription with its subscriptions tool.",
+                    "An agent adds an automation with its triggers tool, and a follow with its subscriptions tool.",
                 )
                 .dim(),
             );
@@ -525,10 +525,10 @@ impl View {
         // What failed first, whatever it is; then the rest by kind.
         let section = |item: &Item| match (&item.failed, item.kind) {
             (Some(_), _) => "Failed",
-            (None, Kind::Subscription) => "Lookout subscriptions",
-            (None, _) => "Triggers",
+            (None, Kind::Subscription) => "Follows",
+            (None, _) => "Automations",
         };
-        for heading in ["Failed", "Triggers", "Lookout subscriptions"] {
+        for heading in ["Failed", "Automations", "Follows"] {
             let takes = |item: &Item| section(item) == heading;
             let n = self.items.iter().filter(|i| takes(i)).count();
             if n == 0 {
@@ -640,7 +640,7 @@ impl View {
             keys.push("↑↓ pick");
         }
         match self.items.get(self.selected) {
-            Some(item) if item.kind == Kind::Trigger => keys.extend(["f fire", "d remove"]),
+            Some(item) if item.kind == Kind::Trigger => keys.extend(["r run now", "d remove"]),
             Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
             _ => {}
         }
@@ -720,8 +720,8 @@ mod tests {
         assert_eq!(count(&items, "calc.lead"), 3);
         assert_eq!(count(&items, "calc.digest"), 1);
         assert_eq!(count(&items, "calc.fix"), 0);
-        assert_eq!(fact(&items, "calc.lead"), "↻ 2 triggers, 1 subscription");
-        assert_eq!(fact(&items, "calc.digest"), "↻ 1 trigger");
+        assert_eq!(fact(&items, "calc.lead"), "↻ 2 automations, 1 follow");
+        assert_eq!(fact(&items, "calc.digest"), "↻ 1 automation");
         assert_eq!(fact(&items, "calc.fix"), "");
     }
 
@@ -741,7 +741,7 @@ mod tests {
             &json!({"name": "new", "when": "fire", "bot": "calc.lead", "sent": 0, "last": null}),
             vec!["calc.lead".into()],
         );
-        assert_eq!(fresh.facts, ["not fired yet"]);
+        assert_eq!(fresh.facts, ["not run yet"]);
         assert_eq!(fresh.failed, None);
     }
 
@@ -912,7 +912,7 @@ mod tests {
         assert_eq!(at, 7);
         assert_eq!(lines[8], "    chat server: auth_expired");
         assert_eq!(lines[9], "    memory fact unreadable-chat");
-        assert_eq!(lines[11], "Triggers · 1");
+        assert_eq!(lines[11], "Automations · 1");
         assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc close");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         press(&mut view, KeyCode::Char('d'));
@@ -954,11 +954,11 @@ mod tests {
         };
         let lines = text(&view);
         assert_eq!(lines[0], "calc · in the background");
-        assert_eq!(lines[3], "Triggers · 1");
+        assert_eq!(lines[3], "Automations · 1");
         assert_eq!(lines[4], "› ↻ nightly every 1d → lead");
         assert_eq!(lines[5], "    sent 2");
         assert_eq!(lines[6], "    └ Read preferences.md");
-        assert_eq!(lines[8], "Lookout subscriptions · 1");
+        assert_eq!(lines[8], "Follows · 1");
         assert_eq!(lines[9], "  ◎ tasks for lead");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         // Ctrl+D is not d.

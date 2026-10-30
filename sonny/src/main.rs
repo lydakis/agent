@@ -216,19 +216,19 @@ struct Options {
     /// Drawn in another Sonny's pane: the terminal's tab is that Sonny's,
     /// so this one claims nothing of it.
     embedded: bool,
-    /// Which of the folder's leads to open, with no `--bot`.
+    /// Which of the folder's leads to open, with no `--agent`.
     lead: project::Pick,
 }
 
 fn usage() -> String {
     "usage: sonny [--store PATH] [--socket PATH] [--model PROVIDER/MODEL] [--no-layout] [--rex-host HOST] [--no-sound]\n\
-     \x20      [--bot NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
-     With no --bot, the folder's lead you last wrote to, its first made with --model the\n\
+     \x20      [--agent NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
+     With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
      tasks open beside it in Rex or Herdr, each in a git worktree of its own. Type /status\n\
      for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
-     and subscribe to the lookout with tools Sonny gives them, which the lookout answers.\n\
+     and follow agents in the lookout with tools Sonny gives them, which the lookout answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
@@ -271,7 +271,7 @@ async fn show(
         "--socket".into(),
         socket.to_string_lossy().into_owned(),
         "--no-sound".into(),
-        "--bot".into(),
+        "--agent".into(),
         bot.to_owned(),
     ];
     let short = bot.strip_prefix(&format!("{project}.")).unwrap_or(bot);
@@ -312,7 +312,7 @@ fn open_lead(
     command.extend([
         "--socket".into(),
         socket.to_string_lossy().into_owned(),
-        "--bot".into(),
+        "--agent".into(),
         bot.clone(),
     ]);
     let label = match bot.ends_with(".lead") {
@@ -678,7 +678,7 @@ fn parse() -> Result<Options, String> {
         match arg.as_str() {
             "--store" => store = Some(PathBuf::from(value()?)),
             "--socket" => socket = Some(PathBuf::from(value()?)),
-            "--bot" => bot = Some(value()?),
+            "--agent" => bot = Some(value()?),
             "--new" => new = true,
             "--model" => model = Some(value()?),
             "--workspace" => workspace = Some(value()?),
@@ -720,7 +720,7 @@ fn reopen(bot: &str) -> Vec<String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--new" => {}
-            "--workspace" | "--lead" | "--bot" => {
+            "--workspace" | "--lead" | "--agent" => {
                 args.next();
             }
             "--new-lead" => {
@@ -729,12 +729,12 @@ fn reopen(bot: &str) -> Vec<String> {
             _ => command.push(arg),
         }
     }
-    let named = std::env::args().any(|arg| arg == "--bot");
+    let named = std::env::args().any(|arg| arg == "--agent");
     // A lead by its name, the first one too, so a pane restored later
     // opens the same lead, whichever the folder opens by then.
     match project::lead_project(bot) {
         Some(_) if !named => command.extend(["--lead".into(), project::lead_short(bot).into()]),
-        _ => command.extend(["--bot".into(), bot.to_owned()]),
+        _ => command.extend(["--agent".into(), bot.to_owned()]),
     }
     for (flag, var) in [("--store", "AGENT_STORE"), ("--socket", "AGENT_SOCKET")] {
         if !command.iter().any(|a| a == flag)
@@ -973,7 +973,7 @@ async fn run() -> Result<(), String> {
         && app.notice.is_none()
     {
         app.notice = Some(format!(
-            "a new lead for this folder; {above} leads the folder above: sonny --bot {above}"
+            "a new lead for this folder; {above} leads the folder above: sonny --agent {above}"
         ));
     }
     app.lead = project::lead(&app.options.socket, &bot);
@@ -1063,13 +1063,13 @@ async fn run() -> Result<(), String> {
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
         use std::os::unix::process::CommandExt;
         let me = std::env::current_exe().map_err(|e| e.to_string())?;
-        // Named by --bot, whatever folder this window is in.
+        // Named by --agent, whatever folder this window is in.
         let mut args = reopen(&other).split_off(1);
         if let Some(at) = args.iter().position(|arg| arg == "--lead") {
             args.drain(at..at + 2);
         }
-        if !args.iter().any(|arg| arg == "--bot") {
-            args.extend(["--bot".into(), other.clone()]);
+        if !args.iter().any(|arg| arg == "--agent") {
+            args.extend(["--agent".into(), other.clone()]);
         }
         let error = std::process::Command::new(me).args(&args).exec();
         return Err(format!("could not open {other}: {error}"));
@@ -1529,14 +1529,17 @@ fn steps(key: &KeyEvent) -> Option<bool> {
     }
 }
 
-/// The most denials `/approve` offers.
+/// The most nodes the daemon's `history_items` reads in one call.
+const HISTORY_NODES: usize = 400;
+
+/// The most denials `/retry` offers.
 const DENIALS: usize = 8;
 
 /// What the person sends to approve one retry of a denied call: their own
 /// words, so the judge reads the consent, as Codex words it.
 fn approval(denial: &Denial) -> String {
     format!(
-        "I approve one retry of the action auto-review denied: {} {}\n\n\
+        "I approve one retry of the action the reviewer denied: {} {}\n\n\
          Treat this as approval to perform that exact action in the same context in which it \
          was originally requested. Do not assume this also authorizes similar operations with \
          different payloads.",
@@ -1544,7 +1547,7 @@ fn approval(denial: &Denial) -> String {
     )
 }
 
-/// The most rows of a denied call `/approve` writes out for the person to
+/// The most rows of a denied call `/retry` writes out for the person to
 /// read; a longer one is approved in words.
 const RETRY_ROWS: usize = 500;
 
@@ -1624,50 +1627,44 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
 const COMMANDS: [(&str, &str); 23] = [
-    (
-        "/side",
-        "a side chat with a copy of this agent, which carries on",
-    ),
-    ("/model", "the model and effort"),
+    ("/side", "Start a side chat with a copy of this agent"),
+    ("/model", "Pick the model and effort"),
     (
         "/compact",
-        "summarize the lead's conversation before its next call",
+        "Summarize the lead's conversation before its next call",
     ),
-    ("/approvals", "whether calls wait for a verdict"),
+    ("/approvals", "Choose whether calls wait for a review"),
+    ("/retry", "Allow one retry of a call the reviewer denied"),
     (
-        "/approve",
-        "approve one retry of a recent auto-review denial",
+        "/instructions",
+        "Reload the lead's instructions from its folder",
     ),
-    ("/instructions", "the lead's, from its folder again"),
-    ("/status", "this project's agents"),
-    ("/lead", "the folder's leads: open another, or make one"),
+    ("/status", "Show this project's agents"),
+    ("/lead", "Open another of the folder's leads, or make one"),
     (
         "/goal",
-        "ask the agent to work until something is done; show or clear goals",
+        "Ask the agent to work until something is done; show or clear goals",
     ),
     (
         "/margin",
-        "the agent's notes beside the conversation, shown or closed",
+        "Show or close the agent's notes beside the conversation",
     ),
-    (
-        "/background",
-        "triggers and lookout subscriptions: fire or remove them",
-    ),
-    ("/commons", "what the agents of every project share"),
-    ("/usage", "the tokens the agents spent, over time"),
-    ("/pause", "stop every agent until /resume, saying why"),
-    ("/resume", "let the agents go on after a pause"),
-    ("/mcp", "the MCP servers agents' scripts call"),
-    ("/config", "the settings in ~/.agent/config.toml"),
-    ("/sound", "the chime when work ends, on or off"),
+    ("/background", "Run or remove automations and follows"),
+    ("/commons", "Read what the agents of every project share"),
+    ("/usage", "Show the tokens the agents spent, over time"),
+    ("/pause", "Stop every agent until /resume, saying why"),
+    ("/resume", "Let the agents go on after a pause"),
+    ("/mcp", "List the MCP servers agents' scripts call"),
+    ("/config", "Change the settings in ~/.agent/config.toml"),
+    ("/sound", "Turn the chime when work ends on or off"),
     (
         "/verbose",
-        "every tool call, or only what moves the work on",
+        "Show every tool call, or only what moves the work on",
     ),
-    ("/react", "react to one of the agent's replies"),
-    ("/copy", "the last reply, as Markdown"),
-    ("/open", "the last HTML page, in your browser"),
-    ("/quit", "the agents keep working"),
+    ("/react", "React to one of the agent's replies"),
+    ("/copy", "Copy the last reply as Markdown"),
+    ("/open", "Open the last HTML page in your browser"),
+    ("/quit", "Quit; the agents keep working"),
 ];
 
 /// What an agent's last few items say, for `/status`.
@@ -1728,8 +1725,9 @@ struct Watch {
     usage: Option<usage::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
-    /// The row of `/background`'s picked item as the pane last drew it,
-    /// so a new pick scrolls to it and scrolling otherwise stays put.
+    /// The row of the picked item (`/background`'s, `/commons`'s or
+    /// `/status`'s) as the pane last drew it, so a new pick scrolls to it
+    /// and scrolling otherwise stays put.
     picked: Option<usize>,
     /// The agent `/status` has picked from the keys, by its place among
     /// the agents it lists: ↑ and ↓ move it, Enter opens it.
@@ -1976,6 +1974,9 @@ struct App {
     names: std::cell::RefCell<links::Names>,
     /// The words being asked about, and what the daemon said of each.
     naming: Option<tokio::task::JoinHandle<Vec<(String, bool)>>>,
+    /// Ctrl+O pressed: every row a click opens is opened, or folded again,
+    /// once the loop can read the messages between agents.
+    opening_all: bool,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2014,10 +2015,10 @@ struct App {
     choosing: Option<usize>,
     /// Calls the approver serving `auto` is reviewing in this turn.
     reviewing: std::collections::HashSet<String>,
-    /// Calls it denied while Sonny watched, newest last: what `/approve`
+    /// Calls it denied while Sonny watched, newest last: what `/retry`
     /// offers to retry once.
     denials: Vec<Denial>,
-    /// `/approve`, open over the composer: the denial picked.
+    /// `/retry`, open over the composer: the denial picked.
     approving: Option<usize>,
     /// The denied call written out whole for the person to read, which a
     /// second Enter then approves.
@@ -2355,7 +2356,7 @@ impl Fleet {
 
     fn show(&mut self, bot: &str) -> Result<bool, String> {
         let mut command = self.command.clone();
-        command.extend(["--bot".into(), bot.into()]);
+        command.extend(["--agent".into(), bot.into()]);
         let name = format!("{} · working", self.short(bot));
         let opened = self.layout.show(bot, &name, &command)?;
         self.doing(bot, "working");
@@ -2787,6 +2788,7 @@ impl App {
             pressed: Vec::new(),
             names: Default::default(),
             naming: None,
+            opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -4035,7 +4037,7 @@ impl App {
         let name = (self.tasks.values().flatten())
             .find(|task| task.bot == bot)
             .map_or(bot.to_owned(), |task| task.name.clone());
-        let args = ["--no-sound", "--no-layout", "--embedded", "--bot", bot].map(str::to_owned);
+        let args = ["--no-sound", "--no-layout", "--embedded", "--agent", bot].map(str::to_owned);
         if let Err(error) = self.embed(&name, &args) {
             self.notice = Some(format!("could not open {name}: {error}"));
         }
@@ -4403,9 +4405,9 @@ impl App {
             }
             // Gone from the conversation: this one starts a cluster of
             // its own.
-            let message = (self.clusters.remove(&at))
-                .and_then(|mut cluster| cluster.messages.pop())
-                .expect("the message just put in");
+            let mut gone = self.clusters.remove(&at).expect("the cluster just drawn");
+            let message = gone.messages.pop().expect("the message just put in");
+            self.forget(gone, node);
             return self.new_cluster(message);
         }
         self.new_cluster(message);
@@ -4418,7 +4420,9 @@ impl App {
             if self.kept(screen::Tag::Group(first as u64)) {
                 break;
             }
-            self.clusters.remove(&first);
+            if let Some(gone) = self.clusters.remove(&first) {
+                self.forget(gone, message.node);
+            }
         }
         let at = self.group();
         self.clusters.insert(
@@ -4436,6 +4440,21 @@ impl App {
         self.marks
             .extend(marks.into_iter().map(|(line, mark)| (from + line, mark)));
         self.clustering = Some((at, self.rows_drawn));
+    }
+
+    /// A cluster the conversation let go, and its messages with it, so
+    /// Ctrl+O reads none of them again; a message a page drawn again put
+    /// in a newer cluster stays for that one, as `landing` does for the
+    /// cluster about to be made for it.
+    fn forget(&mut self, cluster: Cluster, landing: i64) {
+        for message in cluster.messages {
+            let held = message.node == landing
+                || (self.clusters.values())
+                    .any(|kept| kept.messages.iter().any(|m| m.node == message.node));
+            if !held {
+                self.relayed.remove(&message.node);
+            }
+        }
     }
 
     /// The rows of the message between agents at `node`, open or shut,
@@ -4492,12 +4511,13 @@ impl App {
         (lines, marks)
     }
 
-    /// Opens every fold and gathered row still in the conversation, or
-    /// folds them all again when none is left shut.
-    fn open_all(&mut self) {
+    /// Opens every fold, gathered row and message between agents still in
+    /// the conversation, or folds them all again when none is left shut.
+    async fn open_all(&mut self) {
         let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
         let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
-            || self.clusters.values().any(|cluster| !cluster.open);
+            || self.clusters.values().any(|cluster| !cluster.open)
+            || self.relayed.values().any(|relayed| relayed.text.is_none());
         let folds: Vec<usize> = (self.folds.iter())
             .filter(|(_, fold)| opens(fold))
             .map(|(at, _)| *at)
@@ -4510,11 +4530,27 @@ impl App {
                 self.draw_fold(at);
             }
         }
+        // A message's words are read again from the history, all at once,
+        // as a click on one reads it.
+        let shut: Vec<i64> = match open {
+            true => (self.relayed.iter())
+                .filter(|(_, relayed)| relayed.text.is_none())
+                .map(|(node, _)| *node)
+                .collect(),
+            false => Vec::new(),
+        };
+        let read = self.items_at(&shut).await;
+        for relayed in self.relayed.values_mut().filter(|_| !open) {
+            relayed.text = None;
+        }
+        for (node, item) in read {
+            if let Some(relayed) = self.relayed.get_mut(&node) {
+                relayed.text = Some(text(&item));
+            }
+        }
         let clusters: Vec<usize> = self.clusters.keys().copied().collect();
         for at in clusters {
-            if let Some(cluster) = self.clusters.get_mut(&at)
-                && cluster.open != open
-            {
+            if let Some(cluster) = self.clusters.get_mut(&at) {
                 cluster.open = open;
                 self.draw_cluster(at);
             }
@@ -4862,9 +4898,11 @@ impl App {
         let mut items = Vec::new();
         let mut rest = nodes;
         while !rest.is_empty() {
+            // The daemon reads at most `HISTORY_NODES` nodes a call.
+            let ask = &rest[..rest.len().min(HISTORY_NODES)];
             let Ok(read) = self
                 .client
-                .request("history_items", json!({"bot": bot, "nodes": rest}))
+                .request("history_items", json!({"bot": bot, "nodes": ask}))
                 .await
             else {
                 self.short_read.set(true);
@@ -5890,7 +5928,7 @@ impl App {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
                     self.commit_denied(&name, &arguments, &reason);
-                    // The approver's, not the person's: `/approve` may
+                    // The approver's, not the person's: `/retry` may
                     // retry it once.
                     let by_auto = data["approvals"].as_array().is_some_and(|verdicts| {
                         verdicts
@@ -6977,7 +7015,9 @@ impl App {
             let bots = card_bots(watch, self.width.max(40), &self.bot);
             if !bots.is_empty() {
                 let last = bots.len() - 1;
-                let pick = watch.pick.map(|pick| pick.min(last));
+                // A pick the list no longer has (resolved agents hidden) is
+                // no pick: Enter opens only the agent marked `›`.
+                let pick = watch.pick.filter(|pick| *pick <= last);
                 let pick = match (key.code, pick) {
                     (KeyCode::Up, Some(at)) => Some(at.saturating_sub(1)),
                     (KeyCode::Up, None) => Some(last),
@@ -7195,7 +7235,7 @@ impl App {
             }
             // Every row a click opens, opened or folded from the keys, as
             // Claude Code's Ctrl+O shows a turn's calls.
-            KeyCode::Char('o') if ctrl => self.open_all(),
+            KeyCode::Char('o') if ctrl => self.opening_all = true,
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
@@ -7775,6 +7815,9 @@ impl App {
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
+            if std::mem::take(&mut self.opening_all) {
+                self.open_all().await;
+            }
             return;
         }
         if let Some(pick) = &mut self.reacting {
@@ -8291,10 +8334,10 @@ impl App {
             }
             return;
         }
-        if prompt == "/approve" {
+        if prompt == "/retry" {
             self.input.clear();
             match self.denials.len() {
-                0 => self.notice = Some("no recent auto-review denials".into()),
+                0 => self.notice = Some("no recent reviewer denials".into()),
                 newest => self.approving = Some(newest - 1),
             }
             return;
@@ -8832,9 +8875,16 @@ impl App {
             self.notice = Some(format!("the side chat did not take the question: {error}"));
         }
         let head = forked["head"].as_i64().unwrap_or(0).to_string();
-        let mut args = ["--no-sound", "--no-layout", "--bot", &name, "--side", &head]
-            .map(str::to_owned)
-            .to_vec();
+        let mut args = [
+            "--no-sound",
+            "--no-layout",
+            "--agent",
+            &name,
+            "--side",
+            &head,
+        ]
+        .map(str::to_owned)
+        .to_vec();
         // On the model this window's turns run on, whose cache is warm.
         if let Some(model) = &self.turn_model {
             args.extend(["--model".to_owned(), model.clone()]);
@@ -9054,7 +9104,7 @@ impl App {
             || self.pane.as_ref().is_some_and(pane::Pane::is_margin);
         let beside = !self.margin.closed()
             && opened
-            && pane::margin_width(size.width, PROSE as u16).is_some();
+            && pane::margin_width(size.width, PROSE as u16 + GUTTER).is_some();
         self.fold_notes(beside);
         let below = VIEWPORT - 2 + live_rows + composer_rows.len() as u16;
         let workspace = std::path::PathBuf::from(&self.workspace);
@@ -9136,19 +9186,29 @@ impl App {
                 pane.foot = Some(view.footer());
             } else {
                 let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                let mut picked = None;
                 // The agent picked from the keys leads with `›`, as a
                 // pick in Codex's lists does.
                 if let Some(&(row, _)) = watch.pick.and_then(|pick| marks.get(pick))
                     && let Some(first) = lines.get_mut(row).and_then(|line| line.spans.first_mut())
                 {
                     *first = Span::raw("›").bold();
-                    pane.screen.keep_in_view(row, 2);
+                    picked = Some(row);
                 }
                 let keys = match any_resolved && watch.resolved {
                     true => "↑↓ pick · enter open · r hide resolved · esc close",
                     false => PICK_KEYS,
                 };
                 pane.set_card_marked(lines, marks, keys);
+                // Scrolled to once, as a new pick, so the page keys still
+                // move away from it; after the card, whose swap would
+                // drop the request.
+                if let Some(row) = picked
+                    && watch.picked != Some(row)
+                {
+                    watch.picked = Some(row);
+                    pane.screen.keep_in_view(row, 2);
+                }
             }
         }
         // The links drawn, to be written again as hyperlinks.
@@ -9162,8 +9222,8 @@ impl App {
         };
         let paint = |frame: &mut ratatui::Frame,
                      linked: &mut Vec<(u16, u16, ratatui::buffer::Cell)>| {
-            // The conversation above the rows that move, which sit right
-            // under it until it fills the screen.
+            // The rows that move stay at the bottom, as a chat's composer
+            // does, and the conversation sits right above them.
             let (area, pane) = self.split(frame.area());
             if let (Some(at), Some(open)) = (pane, &mut self.pane) {
                 // Paths in a file are read from its folder first.
@@ -9200,17 +9260,15 @@ impl App {
                 Some(_) => (rows + config::height()).min(room as usize),
                 None => rows,
             };
-            let [history, view, _] = Layout::vertical([
-                Constraint::Length(rows as u16),
-                Constraint::Length(below),
-                Constraint::Min(0),
-            ])
-            .areas(area);
+            let [history, view] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(below)]).areas(area);
             let file = |word: &str| {
                 links::file_line(&workspace, word).or_else(|| self.names.borrow_mut().link(word))
             };
             let history = ratatui::layout::Rect {
+                y: history.bottom().saturating_sub(rows as u16),
                 width: column,
+                height: (rows as u16).min(history.height),
                 ..history
             };
             self.screen.render(history, frame.buffer_mut(), file);
@@ -9225,7 +9283,11 @@ impl App {
                     .map(|(name, about)| list::Item::new(*name, *about))
                     .collect();
                 let [_, _, _, composer_row, _] = areas(view, live_rows);
-                over(frame, list::lines(&items, pick, width), composer_row);
+                over(
+                    frame,
+                    list::lines(&items, pick, width, composer_row.y as usize),
+                    composer_row,
+                );
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -9254,7 +9316,11 @@ impl App {
                     })
                     .collect();
                 let pick = items.len().saturating_sub(pick + 1);
-                over(frame, list::lines(&items, pick, width), composer);
+                over(
+                    frame,
+                    list::lines(&items, pick, width, composer.y as usize),
+                    composer,
+                );
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("which reply to react to").dim(),
@@ -9283,10 +9349,14 @@ impl App {
                         list::Item::new(transcript::cut(&what, room / 2), why)
                     })
                     .collect();
-                over(frame, list::lines(&items, pick, width), composer);
+                over(
+                    frame,
+                    list::lines(&items, pick, width, composer.y as usize),
+                    composer,
+                );
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
-                    Span::raw("auto-review denials: approve one retry").dim(),
+                    Span::raw("reviewer denials: approve one retry").dim(),
                 ]);
                 frame.render_widget(Paragraph::new(line), composer);
                 let keys = Line::from(hint::spans(
@@ -9301,7 +9371,11 @@ impl App {
                         list::Item::new(*mode, *about).current(Some(*mode) == self.mode)
                     })
                     .collect();
-                over(frame, list::lines(&items, pick, width), composer);
+                over(
+                    frame,
+                    list::lines(&items, pick, width, composer.y as usize),
+                    composer,
+                );
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("approvals for this agent and those it makes").dim(),
@@ -9335,10 +9409,11 @@ impl App {
                 let items: Vec<list::Item> = (shown.iter())
                     .map(|model| list::Item::new(*model, "").current(*model == self.model))
                     .collect();
-                let mut rows = list::lines(&items, at, width);
+                let room = composer.y as usize;
+                let mut rows = list::lines(&items, at, width, room);
                 // Why the list is short, in the rows it leaves.
-                for refused in
-                    (picker.refused.iter()).take((list::ROWS + 1).saturating_sub(rows.len()))
+                for refused in (picker.refused.iter())
+                    .take((list::ROWS + 1).min(room).saturating_sub(rows.len()))
                 {
                     rows.push(Line::from(format!("    {refused}")).dim());
                 }
@@ -10987,10 +11062,10 @@ mod tests {
                 .any(|row| row == "    Reason: It force-pushes the default branch."),
             "{rows:?}"
         );
-        // `/approve` offers it; Enter sends the person's approval of that
+        // `/retry` offers it; Enter sends the person's approval of that
         // exact call, once.
         app.running = None;
-        app.input.set("/approve");
+        app.input.set("/retry");
         app.submit().await;
         assert_eq!(app.approving, Some(0));
         let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -11010,13 +11085,13 @@ mod tests {
         assert!(app.approving.is_none() && app.denials.is_empty());
         let prompt = sent.lock().unwrap()[0].as_str().unwrap().to_owned();
         assert!(prompt.starts_with(
-            "I approve one retry of the action auto-review denied: shell {\"command\":\"git push --force origin main\"}"
+            "I approve one retry of the action the reviewer denied: shell {\"command\":\"git push --force origin main\"}"
         ));
         assert!(prompt.contains("Do not assume this also authorizes similar operations"));
         // Nothing left to approve.
-        app.input.set("/approve");
+        app.input.set("/retry");
         app.submit().await;
-        assert_eq!(app.notice.as_deref(), Some("no recent auto-review denials"));
+        assert_eq!(app.notice.as_deref(), Some("no recent reviewer denials"));
     }
 
     #[test]
@@ -12307,6 +12382,12 @@ mod tests {
         );
         app.press("said/4").await;
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
+        // Ctrl+O opens it too, reading it again, and folds it again.
+        let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_o)).await;
+        assert_eq!(drawn(&mut app)[1], "  The build is green.");
+        app.key(Event::Key(ctrl_o)).await;
+        assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
         // Those that come one after another are one row that counts them,
         // with what the agent did about them while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
@@ -12378,6 +12459,15 @@ mod tests {
             drawn(&mut app).last().unwrap(),
             "  - calc.neg: turn:calc.neg/3 completed"
         );
+        // A cluster let go takes its messages with it, so Ctrl+O reads
+        // none of them; one a newer cluster holds stays.
+        let stale = app.clusters.remove(&1).unwrap();
+        app.forget(stale, 0);
+        assert!(app.relayed.contains_key(&8));
+        let first = app.clusters.remove(&0).unwrap();
+        // The message landing, which a new cluster is about to hold, stays.
+        app.forget(first, 4);
+        assert!(app.relayed.contains_key(&4) && !app.relayed.contains_key(&5));
     }
 
     #[tokio::test]
@@ -12767,7 +12857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_that_ended_with_nothing_to_say_said_nothing_and_did_not_fail() {
+    async fn a_task_that_ended_with_nothing_to_say_has_no_reply_and_did_not_fail() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("wait") => json!({"results": {"turn:calc.quiet/1":
                 {"status": "failed", "error": "empty_completion"}}}),
@@ -12789,8 +12879,8 @@ mod tests {
         }
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ✓ quiet  said nothing  Fix quiet");
-        assert_eq!(rows[2], "  ✗ bad    failed        Fix bad");
+        assert_eq!(rows[1], "  ✓ quiet  no reply  Fix quiet");
+        assert_eq!(rows[2], "  ✗ bad    failed    Fix bad");
     }
 
     #[tokio::test]

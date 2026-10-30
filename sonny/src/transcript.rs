@@ -1737,14 +1737,14 @@ const KEPT: [&str; 26] = [
     "Updated in memory",
     "Removed from memory",
     "Scheduled",
-    "Removed the trigger",
-    "Fired the trigger",
+    "Removed the automation",
+    "Ran the automation",
     "Added the project",
     "Moved",
     "Opened",
     "Discarded",
-    "Subscribed to",
-    "Unsubscribed from",
+    "Followed",
+    "Unfollowed",
     "Opened a tab",
     "Opened a split",
 ];
@@ -1772,10 +1772,10 @@ const FOLDS: [&str; 22] = [
     "Updated in memory",
     "Removed from memory",
     "Scheduled",
-    "Removed the trigger",
-    "Fired the trigger",
-    "Subscribed to",
-    "Unsubscribed from",
+    "Removed the automation",
+    "Ran the automation",
+    "Followed",
+    "Unfollowed",
     "Moved",
     "Opened",
     "Opened a tab",
@@ -2056,7 +2056,7 @@ fn drawn(
         "write" => ("Wrote", shown(&field("path"), workspace)),
         "edit" => ("Edited", shown(&field("path"), workspace)),
         "apply_patch" => (
-            "Patched",
+            "Edited",
             patch_files(&field("input"))
                 .iter()
                 .map(|path| shown(path, workspace))
@@ -2562,7 +2562,12 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) 
     } else {
         Style::new().fg(Color::Red)
     };
-    Line::from(Span::styled(format!("{text}{}", "─".repeat(fill)), style))
+    // The fill is a span of its own: a row that ends in one is a rule, cut
+    // at the edge rather than wrapped (`screen`).
+    Line::from(vec![
+        Span::styled(text, style),
+        Span::styled("─".repeat(fill), style),
+    ])
 }
 
 /// How full a conversation of `size` tokens is, as the footer says it:
@@ -3219,7 +3224,7 @@ mod tests {
             80,
         );
         let rows = text(&rows);
-        assert_eq!(rows[0], "• Patched calc.py, notes.md, old.py  -1 +2");
+        assert_eq!(rows[0], "• Edited calc.py, notes.md, old.py  -1 +2");
         assert!(
             rows.contains(&"   2 ▎-     return sum(values) / (len(values) - 1)".to_owned()),
             "{rows:#?}"

@@ -659,12 +659,15 @@ print(json.dumps(out))
                 "initial_divider_position": 0.65, "working_directory": "/work"})
         );
         // A task's own Sonny runs in its tab's place, in the lead's pane.
-        let sonny = ["/bin/sonny".into(), "--bot".into(), "graft.docs".into()];
+        let sonny = ["/bin/sonny".into(), "--agent".into(), "graft.docs".into()];
         assert!(layout.show("graft.docs", "docs", &sonny).unwrap());
         let made = last(&dir, "surface.create");
         assert_eq!(
             (&made["pane_id"], &made["initial_input"]),
-            (&json!("pn-1"), &json!("exec /bin/sonny --bot graft.docs\r"))
+            (
+                &json!("pn-1"),
+                &json!("exec /bin/sonny --agent graft.docs\r")
+            )
         );
         assert_eq!(made.get("working_directory"), None);
         assert_eq!(
@@ -780,7 +783,7 @@ print(json.dumps(out))
             bin,
             surface: "sf-4".into(),
         };
-        let resume = ["sonny".to_owned(), "--bot".into(), "shop.fix-cart".into()];
+        let resume = ["sonny".to_owned(), "--agent".into(), "shop.fix-cart".into()];
         assert!(me.set("shop.fix-cart", Path::new("/work"), &resume));
         assert!(me.clear());
         let calls = calls(&dir);
@@ -802,7 +805,7 @@ print(json.dumps(out))
                 "/work",
                 "--",
                 "sonny",
-                "--bot",
+                "--agent",
                 "shop.fix-cart"
             ]
         );
