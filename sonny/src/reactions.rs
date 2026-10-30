@@ -121,13 +121,13 @@ pub const TOOL: &str = "react";
 pub fn tool() -> Value {
     json!({
         "name": TOOL,
-        "description": "React with one emoji to the person's newest message, as a colleague would in a chat: \
-            👍 to acknowledge, 👀 while you look into it, 🎉 for good news. React rarely. A reaction never \
+        "description": "React with one emoji to the person's newest message, as a colleague would in a chat, \
+            such as to acknowledge it, to show you are looking into it, or for good news. A reaction never \
             replaces an answer: when the person asked something, answer in words. When a reaction is all \
             their message needs, react and end your turn without words. `remove` takes off a reaction you \
-            added, such as 👀 once you have answered. React only to the person, never to another agent's \
-            messages. With `bot`, it reacts to the person's newest message in that agent instead, such as \
-            what they wrote in one of your tasks that you picked up.",
+            added, such as one that said you were looking into it, once you have answered. React only to \
+            the person, never to another agent's messages. With `bot`, it reacts to the person's newest \
+            message in that agent instead, such as what they wrote in one of your tasks that you picked up.",
         "parameters": {
             "type": "object",
             "properties": {
