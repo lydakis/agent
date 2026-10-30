@@ -9636,10 +9636,6 @@ const STATUS_KEYS: &str = "esc close";
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
-/// `/status`'s card at `width`, each line after a space, its times
-/// running turns counted on from when its rows were read; whether any task in it
-/// is resolved; and the line each agent but `me` starts on, which a click
-/// opens in the pane.
 /// The agents `/status` lists, in its order: what its keys pick from.
 fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
     (watch_card(watch, width, me).2)
@@ -9653,6 +9649,10 @@ fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
         .collect()
 }
 
+/// `/status`'s card at `width`, each line after a space, its times
+/// running turns counted on from when its rows were read; whether any task in it
+/// is resolved; and the line each agent but `me` starts on, which a click
+/// opens in the pane.
 fn watch_card(
     watch: &Watch,
     width: usize,
