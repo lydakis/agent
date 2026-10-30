@@ -162,7 +162,13 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    let mut flags = match told(&place.dir, &info, &flags) {
+    // A fork's instructions are its source's, kept by the daemon; a role
+    // named now may not be in the files it gets back.
+    let composed = match &source {
+        Some(_) => Ok(Vec::new()),
+        None => told(&place.dir, &info, &flags),
+    };
+    let mut flags = match composed {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };

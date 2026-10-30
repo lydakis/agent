@@ -838,7 +838,8 @@ impl Service {
     /// turn's start and end is noted however the stream stands, so a
     /// snapshot knows of work in its checkout after its turn; snapshots
     /// are taken only once `streaming`, so a replay never takes one of
-    /// files that changed since.
+    /// files that changed since, but a deleted bot's are dropped either
+    /// way.
     fn snapshot(&mut self, client: &Arc<Client>, event: &Value, streaming: bool) {
         let (Some(bot), Some(kind)) = (event["bot"].as_str(), event["event"].as_str()) else {
             return;
@@ -877,7 +878,8 @@ impl Service {
             return;
         };
         // Only a task's own worktree: what forks from, and no one else's.
-        if !streaming || !crate::task::in_worktree(&folder) {
+        // A deletion replayed is still dropped, as no snapshot comes after.
+        if !(streaming || kind == "deleted") || !crate::task::in_worktree(&folder) {
             return;
         }
         let refs = crate::snapshot::refs(&self.store);
