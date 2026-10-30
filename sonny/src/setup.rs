@@ -314,14 +314,6 @@ fn aws_profile(found: &[Profile]) -> Result<Option<String>, String> {
 /// Asks for the default model of new projects from what the daemon's
 /// providers list, ranked, and keeps it as the config's `model`.
 pub async fn model(client: &Client) -> Result<String, String> {
-    model_of(client, None)
-        .await?
-        .ok_or_else(|| "no model listed".to_owned())
-}
-
-/// The model asked for, from `only` that provider's models when named; none
-/// when the daemon lists none of them.
-async fn model_of(client: &Client, only: Option<&str>) -> Result<Option<String>, String> {
     let file = agent_client::config::path().ok_or("set HOME")?;
     if !WELCOMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         println!("Welcome to Sonny. One choice and it's set up.\n");
@@ -334,15 +326,7 @@ async fn model_of(client: &Client, only: Option<&str>) -> Result<Option<String>,
             .await
             .map_err(|e| e.to_string())?;
         print!("\r\x1b[K");
-        let (mut models, mut refused) = listed(&listing);
-        if let Some(only) = only {
-            let of = |id: &str| id.split_once('/').is_some_and(|(p, _)| p == only);
-            models.retain(|model| of(&model.id));
-            refused.retain(|(provider, _)| provider == only);
-            if models.is_empty() && refused.is_empty() {
-                return Ok(None);
-            }
-        }
+        let (models, refused) = listed(&listing);
         for (provider, error) in &refused {
             println!("Could not list {provider}'s models: {error}");
             if let Some(hint) = hint(provider, error) {
@@ -389,7 +373,7 @@ async fn model_of(client: &Client, only: Option<&str>) -> Result<Option<String>,
     };
     save(&file, Some(("model", &model)))?;
     summary(&model, &file);
-    Ok(Some(model))
+    Ok(model)
 }
 
 /// What a refusal to list asks of the person, where Sonny knows.
@@ -508,34 +492,54 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
     if !interactive() {
         return Err("sonny setup asks its questions in a terminal".into());
     }
-    let before = agent_client::config::load()?.provider;
+    let before = reached()?;
     let bin = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     provider(&bin, true)?;
-    let running = Client::connect(socket).await.is_ok();
-    let after = agent_client::config::load()?.provider;
-    // A daemon already running lists the providers it started with, so
-    // only the chosen one's models are offered from it.
-    let only = match (running, &after) {
-        (true, Some(after)) if Some(after) != before.as_ref() => {
-            Some(after.split('=').next().unwrap_or(after).to_owned())
-        }
-        _ => None,
-    };
-    if !running {
+    let after = reached()?;
+    if after != before && Client::connect(socket).await.is_ok() {
+        // A running daemon keeps the provider and keys it started with, so
+        // its listing would be of those. A model of another provider is
+        // dropped, and the next new project asks again.
+        let then = match after.provider != before.provider {
+            true => {
+                let file = agent_client::config::path().ok_or("set HOME")?;
+                agent_client::config::write(&file, &[("model", None)])?;
+                "Then run `sonny setup` again, or open a new project, to choose the model."
+            }
+            false => "It uses what you chose from then on.",
+        };
+        println!(
+            "Saved. The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end, and Sonny starts it again. {then}"
+        );
+        return Ok(());
+    }
+    if Client::connect(socket).await.is_err() {
         crate::start_daemon(store, socket, false).map_err(|e| e.to_string())?;
     }
     let (client, _events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
-    if model_of(&client, only.as_deref()).await?.is_none() {
-        // The model chosen before is another provider's; the next new
-        // project asks again once the daemon runs this one.
-        let file = agent_client::config::path().ok_or("set HOME")?;
-        agent_client::config::write(&file, &[("model", None)])?;
-        println!(
-            "The running daemon keeps its providers until it restarts: `sonny agent stop` restarts it, ending agents' turns. The next new project then asks for a {} model.",
-            only.unwrap_or_default()
-        );
-    }
-    Ok(())
+    model(&client).await.map(|_| ())
+}
+
+/// What decides how the daemon reaches a model, as setup leaves it.
+#[derive(PartialEq)]
+struct Reached {
+    provider: Option<String>,
+    /// `~/.agent/env`, whole.
+    env: Vec<u8>,
+    /// The ChatGPT sign-in, whole.
+    login: Vec<u8>,
+}
+
+fn reached() -> Result<Reached, String> {
+    let read = |path: Option<PathBuf>| path.and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+    let login = agent_client::env_file::var("AGENT_CHATGPT_LOGIN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent/chatgpt.json")));
+    Ok(Reached {
+        provider: agent_client::config::load()?.provider,
+        env: read(agent_client::env_file::path()),
+        login: read(login),
+    })
 }
 
 /// The first lines of a new `~/.agent/config.toml`, saying what each
