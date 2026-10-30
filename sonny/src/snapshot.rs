@@ -4,7 +4,7 @@
 //! `completed`, the only point a fork starts from: the files git does not
 //! ignore, tracked or not, added through an index of Sonny's own so the
 //! person's staging is never touched, committed on the HEAD of the time
-//! (no hook runs) under `refs/agent/snapshots/STORE/BOT_ID/TURN`, STORE
+//! (no hook or filter runs) under `refs/agent/snapshots/STORE/BOT_ID/TURN`, STORE
 //! naming the daemon's store, whose bot and turn IDs are its own. The
 //! commit names the turn's checkpoint, and says it is late when an agent in
 //! the folder was already working again by the time it was taken, so its
@@ -16,12 +16,23 @@ use std::process::{Command, Stdio};
 /// hash of its real path, the name Sonny knows it by everywhere.
 pub fn refs(store: &Path) -> String {
     let store = agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
-    // FNV-1a: stable across builds, as std's hasher is not.
-    let hash = (store.as_os_str().as_encoded_bytes().iter())
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-        });
-    format!("refs/agent/snapshots/{hash:016x}")
+    format!("refs/agent/snapshots/{:016x}", fnv(&store))
+}
+
+/// Where the lookout of the store `store` keeps the indexes it snapshots
+/// through: beside the store, where no task can write, never in a
+/// checkout's git folder, which a task's commits write.
+pub fn indexes(store: &Path) -> PathBuf {
+    let mut indexes = store.as_os_str().to_owned();
+    indexes.push(".snapshot-indexes");
+    PathBuf::from(indexes)
+}
+
+/// FNV-1a of a path: stable across builds, as std's hasher is not.
+fn fnv(path: &Path) -> u64 {
+    (path.as_os_str().as_encoded_bytes().iter()).fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 const CHECKPOINT: &str = "Agent-Checkpoint: ";
 const LATE: &str = "Agent-Snapshot: late";
@@ -52,7 +63,8 @@ fn git(
 ) -> Result<String, String> {
     let mut command = Command::new("git");
     // The folder's own code never runs here, where the daemon's keys are:
-    // no hook, no fsmonitor, and none of the keys in its environment.
+    // no hook, no fsmonitor, no filter, and none of the keys in its
+    // environment.
     command
         .arg("-C")
         .arg(dir)
@@ -62,6 +74,7 @@ fn git(
             "-c",
             "core.fsmonitor=false",
         ])
+        .args(unfiltered(dir))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(if input.is_some() {
@@ -100,6 +113,42 @@ fn git(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Settings that turn off each filter the folder's config names, as a
+/// filter may run a script of the folder's when git reads or writes its
+/// files: a file is kept, and given back, as its bytes are. An LFS file
+/// unchanged since the commit it is on comes back as its pointer.
+fn unfiltered(dir: &Path) -> Vec<String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--name-only", "--get-regexp", r"^filter\."])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    for key in crate::task::kept_keys() {
+        command.env_remove(key);
+    }
+    let Ok(output) = command.output() else {
+        return Vec::new();
+    };
+    let mut names: Vec<&str> = (std::str::from_utf8(&output.stdout)
+        .unwrap_or_default()
+        .lines())
+    .filter_map(|key| key.strip_prefix("filter.")?.rsplit_once('.'))
+    .map(|(name, _)| name)
+    .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .iter()
+        .flat_map(|name| {
+            ["clean=", "smudge=", "process=", "required=false"]
+                .map(|setting| ["-c".to_owned(), format!("filter.{name}.{setting}")])
+        })
+        .flatten()
+        .collect()
+}
+
 /// The top of the git checkout `dir` is in, if it is in one.
 pub fn top(dir: &Path) -> Option<PathBuf> {
     git(dir, &["rev-parse", "--show-toplevel"], None, None)
@@ -108,24 +157,38 @@ pub fn top(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Add the files of the checkout `dir` is in, as they are now, and write
-/// them as a tree; `None` outside git.
-pub fn stage(dir: &Path) -> Result<Option<Staged>, String> {
+/// them as a tree, through an index of its own in `indexes`; `None`
+/// outside git.
+pub fn stage(dir: &Path, indexes: &Path) -> Result<Option<Staged>, String> {
     let Some(top) = top(dir) else {
         return Ok(None);
     };
     let gitdir = PathBuf::from(git(&top, &["rev-parse", "--absolute-git-dir"], None, None)?);
-    let index = gitdir.join("agent-snapshot.index");
+    std::fs::create_dir_all(indexes).map_err(|e| format!("{}: {e}", indexes.display()))?;
+    let index = indexes.join(format!("{:016x}.index", fnv(&top)));
     // From the checkout's own index each time: what git knows of each file
     // is kept, so only the files that changed are read again, and a file
-    // ignored since an earlier snapshot is not taken as tracked.
-    match gitdir.join("index").exists() {
-        true => std::fs::copy(gitdir.join("index"), &index).map(drop),
-        false => std::fs::remove_file(&index).or_else(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Ok(()),
-            _ => Err(e),
-        }),
+    // ignored since an earlier snapshot is not taken as tracked. Made anew,
+    // so nothing already at its name is written through.
+    match std::fs::remove_file(&index) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+        _ => {}
     }
-    .map_err(|e| e.to_string())?;
+    if let Ok(mut theirs) = std::fs::File::open(gitdir.join("index")) {
+        let mut ours = std::fs::File::create_new(&index).map_err(|e| e.to_string())?;
+        std::io::copy(&mut theirs, &mut ours).map_err(|e| e.to_string())?;
+        // A file marked as not changing would keep its old content.
+        let listed = git(&top, &["ls-files", "-v", "-z"], Some(&index), None)?;
+        let assumed: String = (listed.split('\0'))
+            .filter_map(|entry| entry.split_once(' '))
+            .filter(|(tag, _)| tag.chars().all(|c| c.is_ascii_lowercase()))
+            .map(|(_, path)| format!("{path}\0"))
+            .collect();
+        if !assumed.is_empty() {
+            let args = ["update-index", "--no-assume-unchanged", "-z", "--stdin"];
+            git(&top, &args, Some(&index), Some(&assumed))?;
+        }
+    }
     git(&top, &["add", "-A", "--", "."], Some(&index), None)?;
     let tree = git(&top, &["write-tree"], Some(&index), None)?;
     let head = git(
@@ -283,6 +346,29 @@ static AT_ONCE: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLoc
     tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()))
 });
 
+/// When each folder last had a turn start or end, in the order the
+/// lookout saw them, and how many it has seen.
+static WORKED: std::sync::LazyLock<
+    std::sync::Mutex<(u64, std::collections::HashMap<PathBuf, u64>)>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Note that a turn started or ended in `workspace`; how many have now.
+pub fn worked(workspace: &Path) -> u64 {
+    let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
+    let mut worked = WORKED.lock().unwrap_or_else(|e| e.into_inner());
+    worked.0 += 1;
+    let at = worked.0;
+    worked.1.insert(real, at);
+    at
+}
+
+/// Whether a turn started or ended in the checkout `top` after the
+/// `since`th.
+fn worked_since(top: &Path, since: u64) -> bool {
+    let worked = WORKED.lock().unwrap_or_else(|e| e.into_inner());
+    (worked.1.iter()).any(|(folder, at)| *at > since && folder.starts_with(top))
+}
+
 fn gone(bot_id: i64) -> bool {
     (GONE.lock().unwrap_or_else(|e| e.into_inner())).contains(&bot_id)
 }
@@ -299,17 +385,34 @@ async fn checkout(dir: PathBuf) -> Option<(PathBuf, std::sync::Arc<tokio::sync::
     Some((top, lock))
 }
 
-/// Snapshot `workspace` as bot `bot_id`'s turn `turn` just completed at
-/// `checkpoint`, under `refs`: the lookout's part, beside its stream, so a
-/// big checkout never holds it up. What happens is a line of its log.
-pub async fn after_turn(
-    client: std::sync::Arc<agent_client::Client>,
-    refs: String,
-    workspace: PathBuf,
-    bot_id: i64,
-    turn: i64,
-    checkpoint: i64,
-) {
+/// A turn just completed, to snapshot.
+pub struct Completed {
+    /// Where its bot's store keeps snapshots, and the indexes for them.
+    pub refs: String,
+    pub indexes: PathBuf,
+    /// The folder it worked in.
+    pub workspace: PathBuf,
+    pub bot_id: i64,
+    pub turn: i64,
+    pub checkpoint: i64,
+    /// What `worked` said as it ended.
+    pub ended: u64,
+}
+
+/// Snapshot the folder of the turn `done`: the lookout's part, beside its
+/// stream, so a big checkout never holds it up. It is late if an agent
+/// worked in the checkout since, or works there now. What happens is a
+/// line of its log.
+pub async fn after_turn(client: std::sync::Arc<agent_client::Client>, done: Completed) {
+    let Completed {
+        refs,
+        indexes,
+        workspace,
+        bot_id,
+        turn,
+        checkpoint,
+        ended,
+    } = done;
     let Some((top, lock)) = checkout(workspace).await else {
         return;
     };
@@ -320,12 +423,12 @@ pub async fn after_turn(
     if gone(bot_id) {
         return;
     }
-    let staged = match tokio::task::spawn_blocking(move || stage(&top)).await {
+    let staged = match tokio::task::spawn_blocking(move || stage(&top, &indexes)).await {
         Ok(Ok(Some(staged))) => staged,
         Ok(Ok(None)) | Err(_) => return,
         Ok(Err(error)) => return failed(bot_id, turn, &error),
     };
-    let late = busy(&client, &staged.top).await;
+    let late = worked_since(&staged.top, ended) || busy(&client, &staged.top).await;
     let committed =
         tokio::task::spawn_blocking(move || commit(&staged, &refs, bot_id, turn, checkpoint, late))
             .await;
@@ -433,14 +536,18 @@ mod tests {
         std::fs::write(top.join("new.txt"), "made\n").unwrap();
         std::fs::create_dir(top.join("target")).unwrap();
         std::fs::write(top.join("target/build"), "ignored\n").unwrap();
-        let staged = stage(&top.join("target")).unwrap().unwrap();
+        let staged = stage(&top.join("target"), &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
         commit(&staged, REFS, 7, 41, 900, false).unwrap();
         let status = git(&top, &["status", "--porcelain"], None, None).unwrap();
         assert!(status.contains("M  kept.txt"), "{status}");
         assert!(status.contains("?? new.txt"), "{status}");
         // Later work is not in the turn's files.
         std::fs::write(top.join("kept.txt"), "three\n").unwrap();
-        let staged = stage(&top).unwrap().unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
         commit(&staged, REFS, 7, 44, 950, true).unwrap();
 
         let older = find(&top, REFS, 7, Some(41)).unwrap();
@@ -481,7 +588,9 @@ mod tests {
     fn a_file_ignored_since_an_earlier_snapshot_is_left_out() {
         let (dir, top) = repo("ignored");
         std::fs::write(top.join("generated.log"), "one\n").unwrap();
-        let staged = stage(&top).unwrap().unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let first = find(&top, REFS, 7, Some(1)).unwrap();
         let listed =
@@ -489,10 +598,106 @@ mod tests {
         assert!(listed(&first.commit).contains("generated.log"));
         std::fs::write(top.join(".gitignore"), "target/\ngenerated.log\n").unwrap();
         std::fs::write(top.join("generated.log"), "two\n").unwrap();
-        let staged = stage(&top).unwrap().unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
         commit(&staged, REFS, 7, 2, 20, false).unwrap();
         let second = find(&top, REFS, 7, Some(2)).unwrap();
         assert!(!listed(&second.commit).contains("generated.log"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_filter_of_the_folder_runs_and_files_keep_their_bytes() {
+        let (dir, top) = repo("filters");
+        let ran = dir.join("ran");
+        let script = format!("sh -c 'touch {}; cat'", ran.display());
+        for (key, value) in [
+            ("filter.mine.clean", script.as_str()),
+            ("filter.mine.smudge", script.as_str()),
+            ("filter.mine.required", "true"),
+            ("filter.my.own.process", script.as_str()),
+        ] {
+            git(&top, &["config", key, value], None, None).unwrap();
+        }
+        std::fs::write(
+            top.join(".gitattributes"),
+            "*.a filter=mine\n*.b filter=my.own\n",
+        )
+        .unwrap();
+        std::fs::write(top.join("x.a"), "raw\n").unwrap();
+        std::fs::write(top.join("y.b"), "raw too\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let copy = dir.join("copy");
+        restore(&top, &snapshot, &copy, "agent/copy").unwrap();
+        assert!(!ran.exists());
+        assert_eq!(std::fs::read_to_string(copy.join("x.a")).unwrap(), "raw\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_marked_as_not_changing_is_kept_as_it_is_now() {
+        let (dir, top) = repo("assumed");
+        git(
+            &top,
+            &["update-index", "--assume-unchanged", "kept.txt"],
+            None,
+            None,
+        )
+        .unwrap();
+        std::fs::write(top.join("kept.txt"), "changed\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let kept = git(
+            &top,
+            &["show", &format!("{}:kept.txt", snapshot.commit)],
+            None,
+            None,
+        );
+        assert_eq!(kept.unwrap(), "changed");
+        // The person's own mark stays.
+        let listed = git(&top, &["ls-files", "-v", "kept.txt"], None, None).unwrap();
+        assert!(listed.starts_with('h'), "{listed}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_index_is_kept_out_of_the_git_folder_and_made_anew() {
+        let (dir, top) = repo("index");
+        let indexes = dir.join("indexes");
+        std::fs::create_dir(&indexes).unwrap();
+        // Something already at the index's name is replaced, not written
+        // through.
+        let outside = dir.join("outside");
+        std::fs::write(&outside, "mine\n").unwrap();
+        let index = indexes.join(format!("{:016x}.index", fnv(&top)));
+        std::os::unix::fs::symlink(&outside, &index).unwrap();
+        stage(&top, &indexes).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "mine\n");
+        assert!(!std::fs::symlink_metadata(&index).unwrap().is_symlink());
+        assert!(!top.join(".git/agent-snapshot.index").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn work_in_the_checkout_after_a_turn_ends_makes_its_snapshot_late() {
+        let dir = scratch("worked");
+        let (one, two) = (dir.join("one"), dir.join("two"));
+        std::fs::create_dir_all(one.join("sub")).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let ended = worked(&one);
+        assert!(!worked_since(&one, ended));
+        worked(&two);
+        assert!(!worked_since(&one, ended));
+        worked(&one.join("sub"));
+        assert!(worked_since(&one, ended));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -511,7 +716,9 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(top.join("new.txt"), "x\n").unwrap();
-        let staged = stage(&top).unwrap().unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
         restore(&top, &snapshot, &dir.join("copy"), "agent/copy").unwrap();
@@ -530,6 +737,10 @@ mod tests {
 
     #[test]
     fn a_folder_outside_git_has_no_snapshot() {
-        assert!(stage(&scratch("outside")).unwrap().is_none());
+        assert!(
+            stage(&scratch("outside"), &std::env::temp_dir())
+                .unwrap()
+                .is_none()
+        );
     }
 }

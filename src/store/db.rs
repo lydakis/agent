@@ -4644,6 +4644,20 @@ impl Database {
         before: Option<i64>,
         skip: Option<i64>,
     ) -> Result<Value> {
+        // One read of the store throughout, so a bot deleted meanwhile
+        // takes no node from under a walk.
+        let snapshot = self.conn.unchecked_transaction()?;
+        let found = self.search_bots(pattern, query, before, skip)?;
+        snapshot.commit()?;
+        Ok(found)
+    }
+    fn search_bots(
+        &self,
+        pattern: &str,
+        query: &str,
+        before: Option<i64>,
+        skip: Option<i64>,
+    ) -> Result<Value> {
         if query.is_empty() || query.len() > HISTORY_QUERY_BYTES {
             return fail_with(
                 "invalid_history_search",

@@ -420,6 +420,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         runner: sources::Runner::new(beside(&settings.store, ".sources"), sent),
         store: settings.store.clone(),
         records: HashMap::new(),
+        working: HashMap::new(),
         subscribers: HashMap::new(),
         socket: settings.socket.clone(),
         lookouts: HashMap::new(),
@@ -479,6 +480,9 @@ struct Service {
     /// Every bot as the daemon lists it, kept up from the stream: who made
     /// whom, for subscriptions to tasks of a bot other than the lead.
     records: HashMap<String, Value>,
+    /// The folder each turn under way works in, as it started: a bot may
+    /// move between turns.
+    working: HashMap<(String, i64), PathBuf>,
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
@@ -698,9 +702,7 @@ impl Service {
                     let event = whole_margin_call(&client, event).await;
                     served.event(&event);
                     streaming |= event["event"] == "follow_live";
-                    if streaming {
-                        self.snapshot(&client, &event);
-                    }
+                    self.snapshot(&client, &event, streaming);
                     // A `subscriptions` call this lookout answered counts
                     // from the next event on, not from the next tick.
                     if served.subscribed() {
@@ -832,46 +834,73 @@ impl Service {
     }
 
     /// Keep a task's worktree as a completed turn left it, for a task
-    /// forked from that turn (snapshot.rs); drop a deleted task's.
-    fn snapshot(&self, client: &Arc<Client>, event: &Value) {
-        let Some(record) = event["bot"].as_str().and_then(|bot| self.records.get(bot)) else {
+    /// forked from that turn (snapshot.rs); drop a deleted task's. Each
+    /// turn's start and end is noted however the stream stands, so a
+    /// snapshot knows of work in its checkout after its turn; snapshots
+    /// are taken only once `streaming`, so a replay never takes one of
+    /// files that changed since.
+    fn snapshot(&mut self, client: &Arc<Client>, event: &Value, streaming: bool) {
+        let (Some(bot), Some(kind)) = (event["bot"].as_str(), event["event"].as_str()) else {
             return;
         };
-        let (Some(bot_id), Some(workspace)) =
-            (record["bot_id"].as_i64(), record["workspace"].as_str())
-        else {
-            return;
-        };
-        let workspace = PathBuf::from(workspace);
-        // Only a task's own worktree: what forks from, and no one else's.
-        if !crate::task::in_worktree(&workspace) {
-            return;
-        }
         let data = &event["data"];
-        match event["event"].as_str() {
-            Some("turn_finished") if data["status"] == "completed" => {
-                let (Some(turn), Some(checkpoint)) =
-                    (event["turn"].as_i64(), data["checkpoint"].as_i64())
-                else {
+        let turn = event["turn"].as_i64();
+        let record = self.records.get(bot);
+        let (folder, ended) = match (kind, turn) {
+            ("accepted", Some(turn)) => {
+                if let Some(workspace) = data["workspace"].as_str() {
+                    let workspace = PathBuf::from(workspace);
+                    crate::snapshot::worked(&workspace);
+                    self.working.insert((bot.to_owned(), turn), workspace);
+                }
+                return;
+            }
+            ("turn_finished", Some(turn)) => {
+                // A turn begun before the lookout watched worked where its
+                // bot is.
+                let folder = (self.working.remove(&(bot.to_owned(), turn)))
+                    .or_else(|| record?["workspace"].as_str().map(PathBuf::from));
+                let Some(folder) = folder else { return };
+                let ended = crate::snapshot::worked(&folder);
+                (folder, ended)
+            }
+            ("deleted", _) => {
+                self.working.retain(|(name, _), _| name != bot);
+                let Some(folder) = record.and_then(|r| r["workspace"].as_str()) else {
                     return;
                 };
-                tokio::spawn(crate::snapshot::after_turn(
-                    client.clone(),
-                    crate::snapshot::refs(&self.store),
-                    workspace,
+                (PathBuf::from(folder), 0)
+            }
+            _ => return,
+        };
+        let Some(bot_id) = record.and_then(|r| r["bot_id"].as_i64()) else {
+            return;
+        };
+        // Only a task's own worktree: what forks from, and no one else's.
+        if !streaming || !crate::task::in_worktree(&folder) {
+            return;
+        }
+        let refs = crate::snapshot::refs(&self.store);
+        match kind {
+            "turn_finished" if data["status"] == "completed" => {
+                let (Some(turn), Some(checkpoint)) = (turn, data["checkpoint"].as_i64()) else {
+                    return;
+                };
+                let done = crate::snapshot::Completed {
+                    refs,
+                    indexes: crate::snapshot::indexes(&self.store),
+                    workspace: folder,
                     bot_id,
                     turn,
                     checkpoint,
-                ));
+                    ended,
+                };
+                tokio::spawn(crate::snapshot::after_turn(client.clone(), done));
             }
             // A task's own folder may be gone, and `remove_task` drops its
             // snapshots once it is.
-            Some("deleted") => {
-                tokio::spawn(crate::snapshot::deleted(
-                    crate::snapshot::refs(&self.store),
-                    workspace,
-                    bot_id,
-                ));
+            "deleted" => {
+                tokio::spawn(crate::snapshot::deleted(refs, folder, bot_id));
             }
             _ => {}
         }
@@ -2361,6 +2390,7 @@ mod tests {
             records: (records.iter())
                 .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                 .collect(),
+            working: HashMap::new(),
             subscribers: HashMap::new(),
             socket: PathBuf::new(),
             lookouts: HashMap::new(),

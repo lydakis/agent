@@ -46,7 +46,8 @@ pub struct Start {
 /// The task a fork copies, and its files after the turn it copies.
 struct Source {
     name: String,
-    workspace: PathBuf,
+    /// The top of its worktree, which its snapshot holds.
+    top: PathBuf,
     snapshot: crate::snapshot::Snapshot,
 }
 
@@ -199,7 +200,10 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
                 shell_quote(&place.dir)
             ),
         );
-        brief = in_copy(&brief, &source.workspace, &place.dir).0;
+        // Its files are where they were in its worktree, from the top.
+        if let Some((_, worktree)) = &place.copy {
+            brief = in_copy(&brief, &source.top, worktree).0;
+        }
     }
     let (brief, moved) = match &place.copy {
         Some((from, to)) => in_copy(&brief, from, to),
@@ -739,9 +743,10 @@ fn source(
     let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
     let snapshot = crate::snapshot::find(here, &refs, bot_id, start.turn)
         .map_err(|e| format!("{name}: {e}"))?;
+    let top = crate::snapshot::top(&workspace).unwrap_or(workspace);
     Ok(Source {
         name,
-        workspace,
+        top,
         snapshot,
     })
 }
