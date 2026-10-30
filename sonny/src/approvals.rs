@@ -71,7 +71,9 @@ pub fn gate(mode: &str, tools: &[String]) -> Map<String, Value> {
 /// hold them, for an agent working in `workspace`: Codex's
 /// `workspace-write`, reaching the network, with the folder's repository
 /// writable too so a commit runs without asking (its hooks and config stay
-/// read-only), and the commands the person's config lets out of it
+/// read-only), as is each repository inside it, given as a folder of its
+/// own so the daemon keeps its hooks and config too, and the commands the
+/// person's config lets out of it
 /// (`[sonny] unsandboxed`). In `full` mode an agent runs unconfined, as
 /// under Codex's full access, where nothing would answer a call that asks
 /// to leave the sandbox.
@@ -88,7 +90,14 @@ fn sandbox_with(
     let fields = match mode {
         "full" => json!({"sandbox": "danger-full-access"}),
         _ => {
-            let writable: Vec<String> = repository(workspace).into_iter().collect();
+            let mut writable: Vec<String> = repository(workspace).into_iter().collect();
+            writable.extend(repositories(workspace));
+            // As many as the daemon takes, the shallowest kept.
+            writable.truncate(MAX_WRITABLE);
+            while serde_json::to_string(&writable).map_or(0, |json| json.len()) > MAX_WRITABLE_JSON
+            {
+                writable.pop();
+            }
             let mut fields =
                 json!({"sandbox": "workspace-write", "writable": writable, "network": true});
             if !unsandboxed.is_empty() {
@@ -127,6 +136,60 @@ pub fn repository(dir: &std::path::Path) -> Option<String> {
     real.to_str()
         .filter(|path| path.ends_with(".git"))
         .map(str::to_owned)
+}
+
+/// The most writable folders a bot takes, as the daemon bounds them.
+const MAX_WRITABLE: usize = 64;
+const MAX_WRITABLE_JSON: usize = 32 << 10;
+/// How many folders deep below an agent's folder repositories are looked
+/// for, and how many folders are looked in at most, so a start never walks
+/// a whole tree: a workspace's repositories sit a few folders down, not
+/// past its build folders.
+const NESTED_DEPTH: usize = 6;
+const NESTED_FOLDERS: usize = 10_000;
+
+/// The git folders of the repositories inside `dir`, below its own,
+/// shallowest first, by their real paths: each `.git` folder found, not
+/// looked inside, nor below it, nor in hidden folders, which hold caches
+/// and tools' state rather than the person's repositories, nor through
+/// links. A `.git` file, a linked checkout's, names a folder elsewhere,
+/// whose repository is not this folder's to keep.
+fn repositories(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut folders = std::collections::VecDeque::from([(dir.to_owned(), 0)]);
+    let mut looked = 0;
+    while let Some((folder, depth)) = folders.pop_front() {
+        looked += 1;
+        if looked > NESTED_FOLDERS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        let mut below = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            if name == ".git" {
+                if depth > 0 {
+                    found.extend(std::fs::canonicalize(entry.path()).ok());
+                }
+                below.clear();
+                break;
+            }
+            if depth + 1 < NESTED_DEPTH && !name.to_string_lossy().starts_with('.') {
+                below.push(entry.path());
+            }
+        }
+        below.sort();
+        folders.extend(below.into_iter().map(|path| (path, depth + 1)));
+    }
+    found
+        .into_iter()
+        .filter_map(|path| path.to_str().map(str::to_owned))
+        .collect()
 }
 
 /// Whether `record`'s sandbox is the one `fields` give it: its mode, its
@@ -289,7 +352,8 @@ mod tests {
         // Outside a repository, only its own folder; with a git folder
         // named otherwise, whose hooks the daemon wouldn't know to keep,
         // commits ask.
-        let plain = std::env::temp_dir();
+        let plain = std::env::temp_dir().join(format!("sonny-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
         assert_eq!(sandbox_with("ask", &plain, &[])["writable"], json!([]));
         let apart = dir.join("apart");
         let tree = dir.join("tree");
@@ -300,6 +364,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sandbox_with("ask", &tree, &[])["writable"], json!([]));
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&plain).unwrap();
+    }
+
+    #[test]
+    fn the_repositories_inside_an_agent_s_folder_are_given_as_folders_of_their_own() {
+        let dir = std::env::temp_dir().join(format!("sonny-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        // A workspace that isn't git, holding repositories a few folders
+        // down; one inside another's tree, one in a hidden folder, one too
+        // deep, and a linked checkout's `.git` file are left to their own.
+        let repos = [
+            "src/api",
+            "src/web/ui",
+            "a/b/c/d/e/f",
+            ".cache/x",
+            "src/api/vendor/y",
+        ];
+        for repo in repos {
+            std::fs::create_dir_all(dir.join(repo)).unwrap();
+            crate::task::git(&dir.join(repo), &["init", "-q"]).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("src/linked")).unwrap();
+        std::fs::write(dir.join("src/linked/.git"), "gitdir: /elsewhere\n").unwrap();
+        let git = |repo: &str| dir.join(repo).join(".git").display().to_string();
+        let fields = sandbox_with("auto", &dir, &[]);
+        assert_eq!(
+            fields["writable"],
+            json!([git("src/api"), git("src/web/ui")])
+        );
+        // A repository's own folder comes first, and what is inside its
+        // tree is its own.
+        let fields = sandbox_with("auto", &dir.join("src/api"), &[]);
+        assert_eq!(fields["writable"], json!([git("src/api")]));
+        // A repository cloned since makes an agent's sandbox stale, so it
+        // is given its folder too.
+        let before = sandbox_with("auto", &dir, &[]);
+        std::fs::create_dir_all(dir.join("src/new")).unwrap();
+        crate::task::git(&dir.join("src/new"), &["init", "-q"]).unwrap();
+        assert!(!sandboxed_as(
+            &json!({"settings": before}),
+            &sandbox_with("auto", &dir, &[])
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
