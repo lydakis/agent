@@ -119,6 +119,15 @@ fn start() -> Value {
                         without one, the project's threads_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
+                "from": {"type": "string", "minLength": 1,
+                    "description": "Another task to fork instead of starting afresh, to try another way \
+                        from where it was: the new task gets its conversation up to a turn it completed \
+                        and its files as they were then, in a worktree of its own, and keeps its role, \
+                        model and effort, so name none of those. Setup never runs on its files, which a \
+                        task wrote. The brief is its next message."},
+                "turn": {"type": "integer", "minimum": 1,
+                    "description": "With from, the turn to fork after: the number in its turn handle. \
+                        Without it, the newest turn whose files were kept."},
                 "reason": {"type": "string", "minLength": 1,
                     "description": "Why this is work none of your tasks still there should take, when you \
                         have any: a task given more work keeps what it learned. Without it, a start while \
@@ -494,8 +503,11 @@ async fn called(name: &str, arguments: &Value) -> Answer {
     match name {
         START => {
             // Work that one of the lead's tasks may hold already goes to
-            // it, unless the lead says why it is separate.
-            if text("reason").is_none_or(|reason| reason.trim().is_empty()) {
+            // it, unless the lead says why it is separate; a fork is a
+            // second try beside its source by its nature.
+            if text("from").is_none()
+                && text("reason").is_none_or(|reason| reason.trim().is_empty())
+            {
                 let there = crate::task::still_there(&caller);
                 if !there.is_empty() {
                     let listed: Vec<String> = (there.iter())
@@ -520,6 +532,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 effort: text("effort"),
                 own_folder: arguments["own_folder"] == true,
                 folder: text("folder"),
+                from: text("from"),
+                turn: arguments["turn"].as_i64(),
             };
             let started =
                 crate::task::start(&here, &caller, &start).map_err(|e| ("task_not_started", e))?;

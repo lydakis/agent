@@ -422,6 +422,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         runner: sources::Runner::new(beside(&settings.store, ".sources"), sent),
         store: settings.store.clone(),
         records: HashMap::new(),
+        working: HashMap::new(),
         subscribers: HashMap::new(),
         socket: settings.socket.clone(),
         lookouts: HashMap::new(),
@@ -483,6 +484,9 @@ struct Service {
     /// Every bot as the daemon lists it, kept up from the stream: who made
     /// whom, for subscriptions to tasks of a bot other than the lead.
     records: HashMap<String, Value>,
+    /// The folder each turn under way works in, as it started: a bot may
+    /// move between turns.
+    working: HashMap<(String, i64), PathBuf>,
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
@@ -662,6 +666,18 @@ impl Service {
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
+        // Turns begun before the lookout watched, whose start it may not
+        // hear again.
+        crate::snapshot::running_now(
+            (bots.iter())
+                .filter(|b| b["status"] == "running")
+                .filter_map(|b| Some((b["name"].as_str()?, Path::new(b["workspace"].as_str()?)))),
+        );
+        for bot in &bots {
+            if let Some(name) = bot["name"].as_str() {
+                crate::snapshot::housed(name, Some(&crate::snapshot::writable(bot)));
+            }
+        }
         self.subscribers = subs::all(&self.store).into_iter().collect();
         for bot in &bots {
             self.seat(&client, bot).await;
@@ -742,6 +758,8 @@ impl Service {
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);
         let mut reread: Option<Instant> = None;
+        // Past the replay: a turn that ends now left its folder as it is.
+        let mut streaming = false;
         loop {
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
@@ -758,7 +776,13 @@ impl Service {
                         println!("{}", json!({"event": "lagged", "reason": event["reason"]}));
                     }
                     let event = whole_call(&client, event).await;
+                    if event["event"] == "configured" {
+                        self.configured(&client, &event).await;
+                        continue;
+                    }
                     served.event(&event);
+                    streaming |= event["event"] == "follow_live";
+                    self.snapshot(&event, streaming);
                     // A `subscriptions` call this lookout answered counts
                     // from the next event on, not from the next tick.
                     if served.subscribed() {
@@ -927,6 +951,109 @@ impl Service {
                 lookout.wake(&client, &woken);
                 lookout.wake_sources(&client, &woken);
             }
+        }
+    }
+
+    /// A bot whose sandbox changed is read again before any later event,
+    /// so a snapshot knows each folder it may now write; one that cannot
+    /// be read may write any.
+    async fn configured(&mut self, client: &Client, event: &Value) {
+        let Some(bot) = event["bot"].as_str() else {
+            return;
+        };
+        let sandbox =
+            (event["changed"].as_array()).is_some_and(|c| c.iter().any(|f| f == "sandbox"));
+        let Some(record) = self.records.get_mut(bot).filter(|_| sandbox) else {
+            return;
+        };
+        let read =
+            (client.request("inspect", json!({"bot": bot, "bot_id": event["bot_id"]}))).await;
+        record["settings"] = match read {
+            Ok(read) => read["settings"].clone(),
+            Err(_) => json!({"writable": ["/"]}),
+        };
+        crate::snapshot::housed(bot, Some(&crate::snapshot::writable(record)));
+    }
+
+    /// Keep a task's worktree as a completed turn left it, for a task
+    /// forked from that turn (snapshot.rs); drop a deleted task's. Each
+    /// turn's start and end is noted however the stream stands, so a
+    /// snapshot knows of work in its checkout after its turn; snapshots
+    /// are taken only once `streaming`, so a replay never takes one of
+    /// files that changed since, but a deleted bot's are dropped either
+    /// way.
+    fn snapshot(&mut self, event: &Value, streaming: bool) {
+        let (Some(bot), Some(kind)) = (event["bot"].as_str(), event["event"].as_str()) else {
+            return;
+        };
+        let data = &event["data"];
+        let turn = event["turn"].as_i64();
+        let record = self.records.get(bot);
+        let (folder, ended) = match (kind, turn) {
+            ("accepted", Some(turn)) => {
+                if let Some(workspace) = data["workspace"].as_str() {
+                    let workspace = PathBuf::from(workspace);
+                    crate::snapshot::worked(&workspace);
+                    if let Some(record) = record {
+                        crate::snapshot::housed(bot, Some(&crate::snapshot::writable(record)));
+                    }
+                    crate::snapshot::running(bot, Some(&workspace));
+                    self.working.insert((bot.to_owned(), turn), workspace);
+                }
+                return;
+            }
+            ("turn_finished", Some(turn)) => {
+                // A turn begun before the lookout watched worked where its
+                // bot is.
+                let folder = (self.working.remove(&(bot.to_owned(), turn)))
+                    .or_else(|| record?["workspace"].as_str().map(PathBuf::from));
+                crate::snapshot::running(bot, None);
+                let Some(folder) = folder else { return };
+                let ended = crate::snapshot::worked(&folder);
+                (folder, ended)
+            }
+            ("deleted", _) => {
+                crate::snapshot::running(bot, None);
+                crate::snapshot::housed(bot, None);
+                self.working.retain(|(name, _), _| name != bot);
+                let Some(folder) = record.and_then(|r| r["workspace"].as_str()) else {
+                    return;
+                };
+                (PathBuf::from(folder), 0)
+            }
+            _ => return,
+        };
+        let Some(bot_id) = record.and_then(|r| r["bot_id"].as_i64()) else {
+            return;
+        };
+        // Only a task's own worktree: what forks from, and no one else's.
+        // A deletion replayed is still dropped, as no snapshot comes after.
+        if !(streaming || kind == "deleted") || !crate::task::in_worktree(&folder) {
+            return;
+        }
+        let refs = crate::snapshot::refs(&self.store);
+        match kind {
+            "turn_finished" if data["status"] == "completed" => {
+                let (Some(turn), Some(checkpoint)) = (turn, data["checkpoint"].as_i64()) else {
+                    return;
+                };
+                let done = crate::snapshot::Completed {
+                    refs,
+                    indexes: crate::snapshot::indexes(&self.store),
+                    workspace: folder,
+                    bot_id,
+                    turn,
+                    checkpoint,
+                    ended,
+                };
+                tokio::spawn(crate::snapshot::after_turn(done));
+            }
+            // A task's own folder may be gone, and `remove_task` drops its
+            // snapshots once it is.
+            "deleted" => {
+                tokio::spawn(crate::snapshot::deleted(refs, folder, bot_id));
+            }
+            _ => {}
         }
     }
 
@@ -1220,12 +1347,14 @@ fn cursor_path(store: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The events a lookout reads, of every bot: what bots there are, how
-/// their turns start, wait and end, the tools they call, and each model
-/// call's usage, which says a quiet turn still works. The text a model
-/// streams, most of all events, is no one's news here.
-const KINDS: [&str; 13] = [
+/// The events a lookout reads, of every bot: what bots there are and
+/// what each may write, how their turns start, wait and end, the tools
+/// they call, and each model call's usage, which says a quiet turn still
+/// works. The text a model streams, most of all events, is no one's news
+/// here.
+const KINDS: [&str; 14] = [
     "created",
+    "configured",
     "forked",
     "deleted",
     "accepted",
@@ -2656,6 +2785,7 @@ mod tests {
             records: (records.iter())
                 .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                 .collect(),
+            working: HashMap::new(),
             subscribers: HashMap::new(),
             socket: PathBuf::new(),
             lookouts: HashMap::new(),
@@ -3242,6 +3372,76 @@ mod tests {
             }
         });
         (Client::connect(&socket).await.unwrap().0, got)
+    }
+
+    /// A daemon that greets and answers each request with `answer`.
+    async fn answering(answer: Value) -> Arc<Client> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lookout-answering-{}-{}",
+            std::process::id(),
+            STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            let mut lines = BufReader::new(read).lines();
+            write
+                .write_all(format!("{ready}\n").as_bytes())
+                .await
+                .unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                let mut answer = answer.clone();
+                answer["id"] = asked["id"].clone();
+                write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        Client::connect(&socket).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn a_folder_a_bot_may_write_once_its_sandbox_changes_is_housed() {
+        let dir = std::env::temp_dir().join(format!("lookout-configured-{}", std::process::id()));
+        let (workspace, added) = (dir.join("work"), dir.join("added"));
+        for at in [&workspace, &added] {
+            std::fs::create_dir_all(at).unwrap();
+        }
+        let record = json!({"name": "c.wide", "bot_id": 3, "workspace": workspace});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        crate::snapshot::housed("c.wide", Some(&crate::snapshot::writable(&record)));
+        let inside = added.join("store.snapshot-indexes");
+        // Held, if at all, by the folder every sandbox may write.
+        let by_added = || crate::snapshot::housing(&inside) == std::fs::canonicalize(&added).ok();
+        assert!(!by_added());
+        let changed = |what: &str| json!({"event": "configured", "bot": "c.wide", "bot_id": 3, "changed": [what]});
+        let settings = json!({"result": {"settings": {"writable": [added]}}});
+        let client = answering(settings).await;
+        // Another change leaves what it may write as it was.
+        service.configured(&client, &changed("model")).await;
+        assert!(!by_added());
+        service.configured(&client, &changed("sandbox")).await;
+        assert!(by_added());
+        // Unread, it may write anything.
+        let elsewhere = Path::new("/nonexistent/lookout-configured");
+        let refused = answering(json!({"error": "bot_not_found"})).await;
+        service.configured(&refused, &changed("sandbox")).await;
+        assert_eq!(
+            crate::snapshot::housing(elsewhere),
+            Some(PathBuf::from("/"))
+        );
+        crate::snapshot::housed("c.wide", None);
+        assert_eq!(crate::snapshot::housing(elsewhere), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `wake_sources`, and what the daemon answered it, if it sent.

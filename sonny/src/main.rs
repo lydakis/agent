@@ -62,6 +62,7 @@ mod settings;
 mod setup;
 mod shell;
 mod skills;
+mod snapshot;
 mod sound;
 mod started;
 mod status;

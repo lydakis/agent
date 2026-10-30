@@ -607,6 +607,18 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   its full path. The `remove_task` tool (`task`, `discard`) removes a task
   that is done and its worktree, refusing while the worktree has
   uncommitted changes. Its branch is kept unless it is merged.
+- **Forking a task with its files:** after each turn a task completes, the
+  lookout keeps its worktree's files as a commit beside the repository's
+  history (`refs/agent/snapshots/STORE/BOT_ID/TURN`, through an index of its
+  own, so no one's staging is touched; files git ignores are left out).
+  `start_task` with `from` (a task) and optionally `turn` (the number in
+  one of its turn handles, else its newest kept turn) forks that task at
+  that turn into a new worktree holding those files, on a branch from the
+  commit it was on, so the two never edit the same files. The fork keeps
+  its source's instructions, role, model and sandbox; the brief is its
+  next message. A snapshot taken while an agent was already working in
+  that folder again is marked late, and the start says so. `remove_task`
+  drops a task's snapshots.
 - **Decisions:** when the lead reaches a fork in the road, an
   architectural choice or a step that cannot be undone, it calls its `ask`
   tool with the question, why it asks, two to four options each with what

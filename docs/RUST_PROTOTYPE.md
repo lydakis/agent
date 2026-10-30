@@ -1937,9 +1937,13 @@ no name holds `*`, `?` or `[`) searches every bot it matches at once, newest
 first. It merges the bots' walks by node ID, which only falls along a
 lineage, so a node two histories share, as a fork shares its source's, comes
 up in both walks at once and is searched once, under the oldest bot that has
-it, while a node only a later fork has is credited to it. It keeps only each
-walk's place and its matches, and each match adds its `bot` and turn
-`handle`; `next_before` is where the merge stopped, passed back as `before`.
+it, while a node only a later fork has is credited to it. Where walks meet,
+the rest of them is the same, so only the oldest bot's goes on: each node is
+read once however many bots share it, and the next node comes off a heap of
+the walks' places, so a step costs O(log k) for k walks. A walk is only its
+place, started when the merge reaches its head, so nothing is prepared per
+bot; each match adds its `bot` and turn `handle`; `next_before` is where the
+merge stopped, passed back as `before`.
 The note then lists,
 newest first, the ordinal and the first line (up to 120 bytes) of each
 omitted turn's prompt, at most `note_turns` of them (default 48, 0 lists
