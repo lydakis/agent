@@ -138,6 +138,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_pending_bytes = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
+    let mut shell_excludes = Vec::new();
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -147,6 +148,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--store" => store = Some(value.into()),
             "--socket" => socket = Some(value.into()),
             "--provider" => providers.push(server::ProviderSpec::parse(value)?),
+            "--shell-exclude" if value.trim().is_empty() => {
+                return fail_with("usage", "--shell-exclude needs a name or pattern");
+            }
+            "--shell-exclude" => shell_excludes.push(value.clone()),
             "--max-processes"
             | "--max-detached"
             | "--max-active"
@@ -189,5 +194,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_pending_bytes,
         stall_timeout,
         idle_exit,
+        shell_excludes,
     })
 }

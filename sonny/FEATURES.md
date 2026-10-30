@@ -68,7 +68,7 @@ per feature; group small things into the row they belong to.
 | One Markdown renderer for every surface; code coloured with Oniguruma; headings bold with dim `#` marks, no hue | shipped | renderer 10-29 #325; Oniguruma 10-29 #336; Markdown as prose 10-30 #405 | Same rendering everywhere, three times faster colouring | ? |
 | Pictures: SVG, Mermaid, math and HTML drawn in the terminal | shipped | added 10-26 #147; `\[ \]` math 10-29 #313; sent once 10-29 #338 | Agents can show, not only tell | ? |
 | Reactions, on the message they answer (`/react`) | shipped | added 10-27 #224; under the message 10-29 #326 | A light acknowledgement without a reply | ? |
-| Welcome and first run: sets itself up and says hello | shipped | added 10-28 #253; heads every lead's history 10-29 #320 | A new person gets going without docs | ? |
+| Welcome and first run: sets itself up and says hello | shipped | added 10-28 #253; heads every lead's history 10-29 #320; finds keys, ChatGPT and AWS profiles, ranks the models, `sonny setup` 10-30 #402 | A new person gets going without docs | ? |
 | `sonny view`: long writing beside the lead | removed | added 10-27 #197; reverted 10-27 #198 | Viewers are skills, not Sonny; long writing stays in a file | ? |
 
 ## Composer
@@ -87,15 +87,15 @@ per feature; group small things into the row they belong to.
 | The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384 | Look at something without losing the conversation | ? |
 | Pictures, HTML and diagrams in the pane; a folder as a tree | shipped | drawing 10-29 #303; tree 10-29 #319 | Read what agents made, in place | ? |
 | `/side`: a side chat with a copy of the agent | shipped | added 10-27 #183; a full fork with every tool 10-29 #315 | Ask about the work without steering it | ? |
-| Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384 | A place for state that outlives one reply | ? |
+| Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384; a note opens the agent that asks, ↗ 10-30 #395 | A place for state that outlives one reply | ? |
 
 ## What agents get from Sonny
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| `ask`: a question for the person, as a decision card with reasons | shipped | pinned questions above the composer 10-27 #192; declared tool 10-27 #225; decision card where it was asked 10-28 #245; options are buttons 10-29 #326 | Agents ask instead of guessing; the person answers in one click | ? |
+| `ask`: a question for the person, as a decision card with reasons | shipped | pinned questions above the composer 10-27 #192; declared tool 10-27 #225; decision card where it was asked 10-28 #245; options are buttons 10-29 #326; a task's question reaches its lead, a yellow ? and a muted bar, decisions and sends go through it 10-30 #395 | Agents ask instead of guessing; the person answers in one click | ? |
 | `plan`: the agent's plan, drawn in the conversation | shipped | added 10-27 #225 | See the steps an agent intends | ? |
-| Memory (`sonny memory`, the memory skills, nightly cleanup) | shipped | app memory 10-09 #82, 10-10 #104, #120; moved into Sonny 10-27 #189; a tool 10-28 #278; 16 KiB 10-28 #241; read tracking, 30-day unread check 10-29 #354; outside-content marks 10-29 #356; the cleanup reflects on habits, from the person's words and what they sent through their servers 10-30 #403 | Later agents start knowing what earlier ones learned | ? |
+| Memory (`sonny memory`, the memory skills, nightly cleanup) | shipped | app memory 10-09 #82, 10-10 #104, #120; moved into Sonny 10-27 #189; a tool 10-28 #278; 16 KiB 10-28 #241; read tracking, 30-day unread check 10-29 #354; outside-content marks 10-29 #356; the cleanup reflects on habits, from the person's words and what they sent through their servers 10-30 #403; a server it cannot read holds the night open 10-30 #411 | Later agents start knowing what earlier ones learned | ? |
 | Triggers (`sonny trigger`): wake an agent at a time, on a file, a commit, or by name | shipped | app triggers 10-10 #89-#92; moved into Sonny 10-27 #189; skipped checks, `--replace` 10-28 #241; a tool 10-28 #278; Linux via systemd 10-29 #344; `--start` agents get Sonny's tools 10-30 #403 | Work that starts while nobody is at the terminal | ? |
 | Turn-end triggers | removed | added 10-10 #89-#92; removed 10-27 #189 | Leads hear of task turns from task updates and the lookout | ? |
 | Goals: keep an agent working until a check command passes | experimental | added 10-29 #341; `/goal WHAT` asks the agent to set one, `/goal` shows, `/goal clear` clears 10-30 #397 | Autonomy with a check, not a model's say-so | ? |
@@ -107,7 +107,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Lookout: tells a lead what its tasks did | shipped | added 10-26 #154, #161; one per daemon 10-27 #180; subscriptions 10-27 #195; subscribers only, leads subscribed 10-27 #212; news within a minute 10-27 #228, #232; a companion of the daemon 10-29 #370; a turn's end carries its reply 10-30 #378; stays light with thousands of bots 10-30 #398 | A lead can rest while tasks work and hear the moment they need it | ? |
+| Lookout: tells a lead what its tasks did | shipped | added 10-26 #154, #161; one per daemon 10-27 #180; subscriptions 10-27 #195; subscribers only, leads subscribed 10-27 #212; news within a minute 10-27 #228, #232; a companion of the daemon 10-29 #370; a turn's end carries its reply 10-30 #378; stays light with thousands of bots 10-30 #398; a task's question is news 10-30 #395; follows only the event kinds it reads 10-30 #407 | A lead can rest while tasks work and hear the moment they need it | ? |
 | Lookout judge: a model decides what interrupts the lead (drift, interruptions, look-fors) | removed | added 10-26 #154; judge forks expire 10-27 #203; drift check 10-27 #204; interruptions only 10-27 #215; one judge with the approver 10-27 #217; picks 10-28 #239, #273; removed 10-29 #310 | Removed because the checks felt ad hoc and did not scale; the lookout now forwards everything and only picks the timing | ? |
 | Lookout sources: pollers the person sets up feed news to agents | experimental | added 10-29 #305 | Agents hear about the world, not only their tasks | ? |
 | `/background`: triggers and lookout subscriptions, fire or remove | shipped | added 10-28 #267; in the pane 10-28 #283 | See and control what runs while nobody watches | ? |
@@ -127,6 +127,7 @@ per feature; group small things into the row they belong to.
 | `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315 | One settings file, editable in Sonny | ? |
 | `/usage`: tokens spent over time, by agent and model | shipped | added 10-29 #302 | See where the tokens go | ? |
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
+| Opening Sonny after an upgrade replaces the older running daemon once its turns end, and says so | shipped | added 10-30 #413 | An upgrade left the old daemon running, and every command failed until it was restarted by hand | ? |
 
 ## Other clients
 

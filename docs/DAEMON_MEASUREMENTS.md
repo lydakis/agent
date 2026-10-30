@@ -5772,6 +5772,34 @@ gate's 15%. The RSS after a turn each moves by about this much between runs
 of one build (27.7 to 30.3 MiB across the head's own runs); the change keeps
 nothing between deltas.
 
+## A follow can name the event kinds it wants (#407)
+
+`fan_out` now checks each live follower's kinds before it queues an event,
+a set lookup that a follow naming none skips, and a replay filters its
+pages the same way. The Perf workflow's matched screen, base main c220be7
+against the PR head 9ef1e5d, on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.937 | 28.814 | -0.4% |
+| admission | burst submit p99, ms | 4.164 | 4.117 | -1.1% |
+| completion | release to terminal p99, ms | 9.213 | 8.815 | -4.3% |
+| footprint | idle RSS, MiB | 19.303 | 19.279 | -0.1% |
+| footprint | per idle bot, KiB | 1.34 | 1.478 | +10.3% |
+| footprint | RSS after a turn each, MiB | 28.34 | 28.639 | +1.1% |
+| footprint | CPU per turn, ms | 0.871 | 0.849 | -2.5% |
+| lifecycle | CPU, s | 0.685 | 0.7 | +2.2% |
+| lifecycle | p95 turn, ms | 579.55 | 574.058 | -0.9% |
+| lifecycle | peak RSS, MiB | 25.436 | 25.426 | -0.0% |
+
+Store jobs per turn did not change, and no change is a cost past the gate's
+15%. The per-idle-bot rise is the bench's noise, as before (#349): the
+change adds nothing to an idle bot. None of these benches names kinds, so
+they measure the unfiltered path. Filtering pays off in
+`bench/lookout_scale.py`: with 1,100 streaming bots, the lookout's follow
+of `*` no longer carries the deltas, and it hears all 6,000 task endings,
+where before the daemon dropped it.
+
 ## Approving each step of an exec script (#393)
 
 A client answering a declared call can ask the bot's gate about each step

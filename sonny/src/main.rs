@@ -41,6 +41,7 @@ mod mermaid;
 mod models;
 mod mux;
 mod pane;
+mod picker;
 mod place;
 mod plan;
 mod project;
@@ -208,6 +209,7 @@ fn usage() -> String {
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
+     sonny setup asks again for the provider and the default model, as the first run does.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
@@ -498,7 +500,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-            setup::provider(&bin)?;
+            setup::provider(&bin, false)?;
             start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,
@@ -510,6 +512,15 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         tokio::spawn(first_models(connected.0.clone(), path));
     }
     Ok(connected)
+}
+
+/// Whether `error` met a daemon on an older protocol than this Sonny's,
+/// one `agent start` replaces.
+fn older_daemon(error: &agent_client::Error) -> bool {
+    error.code == "daemon_protocol_mismatch"
+        && (error.facts.as_ref())
+            .and_then(|facts| facts.get("protocol")?.as_u64())
+            .is_some_and(|protocol| protocol < agent_client::PROTOCOL)
 }
 
 /// `~/.agent/models`, the list agents read with `agent models`, written
@@ -747,6 +758,18 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "setup" && rest.is_empty() => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let (store, socket) = daemon_paths(None, None)?;
+                        setup::again(&store, &socket).await
+                    })
+                })
+        }
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
@@ -780,7 +803,19 @@ async fn run() -> Result<(), String> {
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
-    let (client, mut events) = connect(&options).await?;
+    let (client, mut events) = match Client::connect(&options.socket).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Starting replaces an older daemon once its running turns end,
+            // which can take a while; the screen is not up yet to say so.
+            if older_daemon(&error) {
+                eprintln!(
+                    "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
+                );
+            }
+            connect(&options).await?
+        }
+    };
     trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
@@ -956,6 +991,9 @@ async fn run() -> Result<(), String> {
     // beside their edits; a side chat leaves it to its agent.
     if options.side.is_none() {
         app.upgrades = skills::upgraded();
+    }
+    if let Some(set) = setup::just_set() {
+        app.notice = Some(set);
     }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
@@ -10204,8 +10242,8 @@ mod tests {
             .iter()
             .position(|r| r == "? Tag 0.4.1?")
             .expect("asked");
-        assert_eq!(rows[at + 4], "     Brew gets it tonight.");
-        assert_eq!(rows[at + 8], "  Why 1: Nothing else is due.");
+        assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
+        assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
         assert!(app.asks.is_empty());

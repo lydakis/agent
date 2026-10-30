@@ -10,7 +10,7 @@ use agent_runtime::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -22,6 +22,9 @@ use tokio::sync::{mpsc, watch};
 pub struct Subscription {
     session: u64,
     output: Output,
+    /// The event kinds it asked for, when it asked for some: others pass
+    /// it by. Notices about the stream itself always reach it.
+    kinds: Option<Arc<HashSet<String>>>,
     live: bool,
     cancelled: bool,
     replay: Option<tokio::task::AbortHandle>,
@@ -42,6 +45,10 @@ impl Subscription {
     }
 }
 pub type Sub = Arc<Mutex<Subscription>>;
+/// Whether `event` is one of `kinds`, or any event when none were named.
+fn wanted(kinds: Option<&Arc<HashSet<String>>>, event: &Value) -> bool {
+    kinds.is_none_or(|kinds| (event["event"].as_str()).is_some_and(|kind| kinds.contains(kind)))
+}
 /// Keep `subs` other than `session`'s, cancelling that session's. The
 /// session is read without locking, since a replay holds its subscription's
 /// lock across a store page.
@@ -472,13 +479,21 @@ impl Hub {
     pub fn add_firehose(&self, session: u64, output: Output) {
         self.inner.lock().unwrap().firehose.push((session, output));
     }
-    pub fn subscribe(&self, bot: &str, session: u64, output: Output, after: i64) -> Sub {
+    pub fn subscribe(
+        &self,
+        bot: &str,
+        session: u64,
+        output: Output,
+        after: i64,
+        kinds: Option<HashSet<String>>,
+    ) -> Sub {
         let mut inner = self.inner.lock().unwrap();
         let subs = inner.subs.entry(bot.to_owned()).or_default();
         retain_other_session(subs, session);
         let sub = Arc::new(Mutex::new(Subscription {
             session,
             output,
+            kinds: kinds.map(Arc::new),
             live: false,
             cancelled: false,
             replay: None,
@@ -581,6 +596,9 @@ impl Hub {
                 if let Some(c) = cursor {
                     s.last_cursor = c;
                 }
+                if !wanted(s.kinds.as_ref(), event) {
+                    continue;
+                }
                 (s.session, s.output.clone())
             };
             if output.try_send(event.clone()).is_err() {
@@ -662,9 +680,9 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
         let Value::Array(events) = page["events"].take() else {
             return fail("invalid_event_page");
         };
-        let (session, output, cursor) = {
+        let (session, output, cursor, kinds) = {
             let s = sub.lock().unwrap();
-            (s.session, s.output.clone(), s.last_cursor)
+            (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
         };
         if let Some(before) = page.get("pruned_before").and_then(Value::as_i64) {
             // Retention removed events the follower asked for: say so once,
@@ -686,7 +704,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             }
             return Ok(());
         }
-        for event in events {
+        for event in (events.into_iter()).filter(|event| wanted(kinds.as_ref(), event)) {
             if output.send(event).await.is_err() {
                 hub.unsubscribe(&bot, session);
                 return Ok(());
@@ -703,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn counting_deliveries_waits_for_no_replay() {
         let hub = Hub::default();
-        let sub = hub.subscribe("B", 1, Output::writer(tokio::io::sink()), 0);
+        let sub = hub.subscribe("B", 1, Output::writer(tokio::io::sink()), 0, None);
         // A replay holds its subscription's lock across a store page.
         let (locked, inside) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
@@ -724,6 +742,28 @@ mod tests {
         release.send(()).unwrap();
         replaying.join().unwrap();
         assert_eq!(deliveries, Ok((1, 0)));
+    }
+
+    #[tokio::test]
+    async fn a_follow_that_names_kinds_gets_only_those() {
+        use tokio::io::AsyncBufReadExt;
+        let hub = Hub::default();
+        let (near, far) = tokio::io::duplex(4096);
+        let kinds = ["turn_finished".to_owned()].into_iter().collect();
+        let sub = hub.subscribe(ALL, 1, Output::writer(near), 0, Some(kinds));
+        sub.lock().unwrap().live = true;
+        let event = |cursor: i64, kind: &str| json!({"cursor": cursor, "bot": "B", "event": kind});
+        hub.live("B", json!({"bot": "B", "event": "text_delta"}))
+            .await
+            .unwrap();
+        hub.durable("B", event(1, "tool_started")).await.unwrap();
+        hub.durable("B", event(2, "turn_finished")).await.unwrap();
+        let mut lines = tokio::io::BufReader::new(far).lines();
+        let line = lines.next_line().await.unwrap().unwrap();
+        let got: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(got, event(2, "turn_finished"));
+        // What it passed by still counts as seen: no replay sends it later.
+        assert_eq!(sub.lock().unwrap().last_cursor, 2);
     }
 
     #[tokio::test]
