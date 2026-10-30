@@ -44,7 +44,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 15] = [
+pub const SETTINGS: [Setting; 16] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -135,6 +135,12 @@ pub const SETTINGS: [Setting; 15] = [
         values: SWITCH,
         default: "true",
     },
+    Setting {
+        key: "sonny.start_at_boot",
+        about: "the daemon starts when this machine does (at login on a Mac), so a box's agents keep working after a restart",
+        values: SWITCH,
+        default: "false",
+    },
 ];
 
 /// What the keys say: open in `/config`.
@@ -202,10 +208,18 @@ impl View {
         self.said = Some(match written {
             Ok(values) => {
                 self.values = values;
-                Ok(match value {
+                let said = match &value {
                     Some(value) => format!("{} = {value}", setting.key),
                     None => format!("{} is its default again", setting.key),
-                })
+                };
+                // The setting is the job: it is set up or taken away now.
+                match setting.key {
+                    "sonny.start_at_boot" => {
+                        let on = value.as_ref().and_then(toml::Value::as_bool) == Some(true);
+                        crate::boot::apply(on).map(|done| format!("{said}: {done}"))
+                    }
+                    _ => Ok(said),
+                }
             }
             Err(error) => Err(error),
         });

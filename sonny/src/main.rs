@@ -14,6 +14,7 @@ mod asks;
 mod attach;
 mod background;
 mod banner;
+mod boot;
 mod cache;
 mod calls;
 mod cmux;
@@ -783,6 +784,10 @@ fn main() -> std::process::ExitCode {
         Some((verb, rest)) if verb == "home" => {
             return std::process::ExitCode::from(home::cli(rest) as u8);
         }
+        // Unlisted: the job `sonny.start_at_boot` keeps.
+        Some((verb, [])) if verb == "boot" => {
+            return std::process::ExitCode::from(boot::run() as u8);
+        }
         Some((verb, rest))
             if verb == "setup" && rest.first().is_some_and(|step| step == "backup") =>
         {
@@ -835,6 +840,7 @@ async fn run() -> Result<(), String> {
     skills::install_own();
     trigger::at_start();
     home::at_start();
+    boot::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
