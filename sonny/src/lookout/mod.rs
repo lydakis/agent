@@ -628,6 +628,7 @@ fn updates_for(
     let mut updates = updates::Updates::new(subscriber, memory);
     updates.subscribed(others(subscriber, subscribers));
     updates.live = live;
+    updates.reads_prompts = true;
     updates
 }
 
@@ -685,7 +686,7 @@ impl Service {
         // cursor yet reads it all, once.
         self.resume = self.floor().or(self.resume);
         if self.started && self.resume.is_some() {
-            self.asked_before(&client, &bots).await;
+            self.waiting_before(&client).await;
         }
         self.started = false;
         let after = self.resume.unwrap_or(0);
@@ -929,44 +930,23 @@ impl Service {
         };
     }
 
-    /// Who asked for each turn its subscribers' bots were running before
-    /// this lookout started, as their `accepted` said before its cursor:
-    /// read once, beside each other, so an ending is told as any other.
-    async fn asked_before(&mut self, client: &Arc<Client>, bots: &[Value]) {
-        let running: HashSet<(String, i64)> = (bots.iter())
-            .filter_map(|bot| Some((bot["name"].as_str()?, bot["running_turn"].as_i64()?)))
-            .filter(|(name, _)| self.lookouts.values().any(|lookout| lookout.hears(name)))
-            .map(|(name, turn)| (name.to_owned(), turn))
-            .collect();
+    /// What each subscriber's own turn waits on as this lookout starts,
+    /// which its `turn_waiting` said before its cursor: no news. Read once,
+    /// beside each other.
+    async fn waiting_before(&mut self, client: &Arc<Client>) {
         let mut reads = tokio::task::JoinSet::new();
-        for (bot, turn) in running {
-            let client = client.clone();
-            reads.spawn(async move {
-                let read = client
-                    .request("prompts", json!({"bot": bot, "turn": turn, "bytes": 1}))
-                    .await;
-                (bot, turn, read.ok().map(|read| read["prompts"][0].clone()))
-            });
-        }
-        // What each subscriber's own turn waits on, which is no news.
         for lead in self.lookouts.keys().cloned().collect::<Vec<_>>() {
             let client = client.clone();
             reads.spawn(async move {
                 let newest = json!({"bot": lead, "newest": true, "limit": 1});
                 let turn = (client.request("turns", newest).await.ok())
                     .and_then(|page| page["turns"].get(0).cloned());
-                (lead, -1, turn)
+                (lead, turn)
             });
         }
-        while let Some(Ok((bot, turn, read))) = reads.join_next().await {
-            let Some(read) = read else { continue };
-            for lookout in self.lookouts.values_mut() {
-                match turn {
-                    -1 if lookout.lead == bot => lookout.waiting(&read),
-                    -1 => {}
-                    _ if lookout.hears(&bot) => lookout.updates.asked(&bot, turn, &read),
-                    _ => {}
-                }
+        while let Some(Ok((lead, turn))) = reads.join_next().await {
+            if let (Some(lookout), Some(turn)) = (self.lookouts.get_mut(&lead), turn) {
+                lookout.waiting(&turn);
             }
         }
     }
@@ -1400,8 +1380,12 @@ struct Lookout {
     sending: Option<(updates::Told, Vec<String>, &'static str)>,
     /// What sources said, on its way in a note, until the daemon answers.
     sourcing: Option<(Vec<sources::Heard>, Vec<String>, &'static str)>,
-    /// The daemon is asked whether the subscriber rests.
-    asking: bool,
+    /// The daemon is asked whether the subscriber rests: how many of its
+    /// own events had come when it was asked. An answer after more came
+    /// is older than what they said, and is let go.
+    asking: Option<u64>,
+    /// How many of the subscriber's own events it heard.
+    own: u64,
     log: Option<PathBuf>,
 }
 
@@ -1413,6 +1397,8 @@ enum Answer {
     Noted(Result<(), String>),
     /// A note from sources was submitted, or refused with this code.
     Sourced(Result<(), String>),
+    /// A turn's prompt, read for who asked for it, if the read succeeded.
+    Prompted(String, i64, Option<Value>),
 }
 
 impl Lookout {
@@ -1441,7 +1427,8 @@ impl Lookout {
             heard_since: None,
             sending: None,
             sourcing: None,
-            asking: false,
+            asking: None,
+            own: 0,
             log: None,
         }
     }
@@ -1565,6 +1552,9 @@ impl Lookout {
         // task made is watched from its `created`, one deleted until its
         // `deleted`.
         let heard = event["bot"].as_str().is_none_or(|bot| self.hears(bot));
+        if event["bot"] == self.lead.as_str() {
+            self.own += 1;
+        }
         self.lineage_of(event);
         if heard || event["bot"].as_str().is_some_and(|bot| self.hears(bot)) {
             self.updates.event(event, Instant::now());
@@ -1783,12 +1773,15 @@ impl Lookout {
     }
 
     /// Whether anything it heard is not told yet: messages to read or
-    /// being read, a turn waiting on its goal's check, or news.
+    /// being read, a turn waiting on its goal's check or who asked for it,
+    /// news, or a note the daemon has not answered.
     fn untold(&self) -> bool {
         !self.due.is_empty()
             || self.reading > 0
             || self.updates.goal_pending()
+            || self.updates.holding()
             || self.updates.news()
+            || self.sending.is_some()
     }
 
     /// Tell the subscriber what happened: at once, cutting into its turn,
@@ -1797,6 +1790,20 @@ impl Lookout {
     /// comes back to `answered`.
     fn wake(&mut self, client: &Arc<Client>, woken: &Woken) {
         let now = Instant::now();
+        for (bot, turn) in self.updates.unread() {
+            let (client, woken) = (client.clone(), woken.clone());
+            let (lead, id) = (self.lead.clone(), self.id);
+            tokio::spawn(async move {
+                let read = (client
+                    .request("prompts", json!({"bot": bot, "turn": turn, "bytes": 1})))
+                .await
+                .ok()
+                .map(|read| read["prompts"][0].clone());
+                let _ = woken
+                    .send((lead, id, Answer::Prompted(bot, turn, read)))
+                    .await;
+            });
+        }
         self.since = match self.updates.news() {
             true => Some(self.since.unwrap_or(now)),
             false => None,
@@ -1831,10 +1838,10 @@ impl Lookout {
     /// Ask the daemon whether the subscriber rests: a missed event would
     /// otherwise hold its news until its next turn.
     fn ask(&mut self, client: &Arc<Client>, woken: &Woken, now: Instant) {
-        if self.asking {
+        if self.asking.is_some() {
             return;
         }
-        self.asking = true;
+        self.asking = Some(self.own);
         self.updates.asking(now);
         let (client, woken) = (client.clone(), woken.clone());
         let (lead, id) = (self.lead.clone(), self.id);
@@ -1871,8 +1878,9 @@ impl Lookout {
         let now = Instant::now();
         match answer {
             Answer::Listed(listed) => {
-                self.asking = false;
-                if let Some(record) = listed
+                let asked = self.asking.take();
+                if asked == Some(self.own)
+                    && let Some(record) = listed
                     && let Some(was) = self.updates.rests(now, &record)
                 {
                     self.write(&json!({"at_ms": epoch_ms(), "lead": self.lead,
@@ -1932,13 +1940,17 @@ impl Lookout {
                 }
                 self.heard_since = (!self.heard.is_empty()).then_some(now);
             }
+            Answer::Prompted(bot, turn, prompt) => {
+                self.updates.asked_later(&bot, turn, prompt.as_ref());
+            }
         }
     }
 
     /// The connection dropped: answers under way are lost with it, so what
     /// their notes carried is news again, as when one is refused.
     fn reconnected(&mut self) {
-        self.asking = false;
+        self.asking = None;
+        self.updates.unread_again();
         if let Some((told, ..)) = self.sending.take() {
             self.updates.unsent(told);
         }
@@ -2884,6 +2896,8 @@ mod tests {
         let (woken, _woke) = tokio::sync::mpsc::channel(4);
         lookout.wake(&client, &woken);
         assert!(lookout.sending.is_some() && !lookout.updates.news());
+        // Until the daemon answers, its news holds the cursor back.
+        assert!(lookout.untold());
         // One note at a time: news meanwhile waits for the daemon's answer.
         ended(&mut lookout, 2);
         lookout.wake(&client, &woken);
@@ -2913,6 +2927,22 @@ mod tests {
             told.iter().any(|line| line.contains("turn:calc.fix/2")),
             "{told:?}"
         );
+    }
+
+    #[test]
+    fn a_status_answer_older_than_the_subscribers_own_events_is_let_go() {
+        let mut lookout = seated("running");
+        let idle =
+            json!({"name": "calc.lead", "bot_id": 1, "running_turn": null, "status": "idle"});
+        lookout.asking = Some(lookout.own);
+        // Its next turn starts before the answer comes back.
+        lookout.event(&ev("calc.lead", 9, "accepted", json!({})));
+        lookout.answered(Answer::Listed(Some(idle.clone())));
+        assert!(lookout.updates.busy() && lookout.asking.is_none());
+        // Nothing of its own since the question: the answer stands.
+        lookout.asking = Some(lookout.own);
+        lookout.answered(Answer::Listed(Some(idle)));
+        assert!(lookout.updates.idle());
     }
 
     #[test]

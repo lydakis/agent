@@ -44,11 +44,12 @@ starts again, after a crash or a lost connection, follows from that cursor
 and takes what happened after it as news, so a task that finished while no
 lookout ran, or whose news waited on a busy lead, still reaches its lead;
 news told already may be told again. It never reads the whole log again:
-what it needs from before the cursor it takes from the daemon's listings,
-which bots there are and who made them, and, once when it starts, who asked
-for each turn its subscribers' bots are running and what each subscriber's
-own turn waits on. Only a lookout with no cursor yet reads the whole log,
-once, as history rather than news.
+what it needs from before the cursor it takes from the daemon's listings:
+which bots there are and who made them, what each subscriber's own turn
+waits on, once when it starts, and who asked for a turn that ends without
+having begun since, read from its prompt before its end is told. Only a
+lookout with no cursor yet reads the whole log, once, as history rather
+than news.
 
 It is built to stay light with thousands of bots, as a Kubernetes
 controller is with a large cluster. Each event reaches only the
