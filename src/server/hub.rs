@@ -1061,8 +1061,9 @@ mod tests {
         let (lease, serving) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
         serving.lock().unwrap().go_live(0);
         hub.start("auto", 1, lease);
+        // Past the session's queue, then past the parts that wait for it.
         for cursor in 1..=400 {
-            hub.approval(&part(cursor, 16));
+            hub.approval(&part(cursor, 16 * 1024));
             tokio::task::yield_now().await;
         }
         assert!(*output.subscribe_closed().borrow());
