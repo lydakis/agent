@@ -323,7 +323,9 @@ class ServedToolTests(ModelFixture):
         prompts = self.daemon.request('prompts', bot='shop.b', turn=turns[-1]['turn'])['result']['prompts']
         self.assertEqual(prompts[0]['text'],
                          '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
-                         'which your turns touch on.]')
+                         'which your turns touch on. The invite pays for 1.0M tokens in the thread: while any '
+                         'are left, a reply there starts your turn.]')
+        self.assertEqual(turns[-1]['budget_tokens'], 1_000_000)
         listed = json.loads(self.call('calc.a', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'answered': 0, 'this_week': 1})
         # Its reply earns the commons another invite a day.
@@ -334,6 +336,15 @@ class ServedToolTests(ModelFixture):
         self.assertIsNone(started['invited'], started)
         listed = json.loads(self.call('mail.c', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'answered': 1, 'this_week': 1})
+        # mail.c's turn ran the script from its start, so it replied in the
+        # thread too: that wakes the invited shop.b while its invite has
+        # tokens left, its turn capped at what is left.
+        deadline = time.monotonic() + 5
+        while not (woken := [t for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
+                             if t['request_id'].endswith('.woken')]):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.assertLess(woken[0]['budget_tokens'], 1_000_000, woken)
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'

@@ -643,7 +643,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let mut said = crate::commons::call(&home, &caller, caller_id, arguments)
                 .map_err(|e| ("commons_refused", e))?;
             if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
-                said["told"] = json!(crate::commons::tell(&said, &caller, &tell).await);
+                said["told"] = json!(crate::commons::tell(&home, &said, &caller, &tell).await);
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
                 said["invited"] =

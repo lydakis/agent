@@ -27,6 +27,11 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// A switch, written as TOML's own true or false.
 const SWITCH: &[&str] = &["true", "false"];
 
+/// Whether a setting takes a whole number, typed: its default is one.
+fn number(setting: &Setting) -> bool {
+    setting.values.is_empty() && setting.default.parse::<u64>().is_ok()
+}
+
 /// The rows `/config` takes with room for all: the blank one, a heading
 /// for each table, and the settings.
 pub fn height() -> usize {
@@ -44,7 +49,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 17] = [
+pub const SETTINGS: [Setting; 19] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -147,6 +152,18 @@ pub const SETTINGS: [Setting; 17] = [
         values: SWITCH,
         default: "true",
     },
+    Setting {
+        key: "sonny.commons_invites",
+        about: "invites a day new commons threads send, 0 for none; each answered one adds one, up to as many again",
+        values: &[],
+        default: "3",
+    },
+    Setting {
+        key: "sonny.commons_invite_tokens",
+        about: "the tokens an invite pays for in its thread: its turn, and the turns replies there start while any are left",
+        values: &[],
+        default: "1000000",
+    },
 ];
 
 /// What the keys say: open in `/config`.
@@ -195,6 +212,7 @@ impl View {
                 };
                 value.and_then(|v| match v {
                     toml::Value::Boolean(on) => Some(on.to_string()),
+                    toml::Value::Integer(n) => Some(n.to_string()),
                     v => v.as_str().map(str::to_owned),
                 })
             })
@@ -205,9 +223,12 @@ impl View {
     /// reads the file again.
     fn write(&mut self, value: Option<String>) {
         let setting = &SETTINGS[self.pick];
-        let value = value.map(|value| match setting.values == SWITCH {
-            true => toml::Value::Boolean(value == "true"),
-            false => toml::Value::String(value),
+        let value = value.map(|value| match (setting.values == SWITCH, number(setting)) {
+            (true, _) => toml::Value::Boolean(value == "true"),
+            (_, true) => value
+                .parse()
+                .map_or(toml::Value::String(value), toml::Value::Integer),
+            _ => toml::Value::String(value),
         });
         let written = agent_client::config::write(&self.path, &[(setting.key, value.clone())])
             .and_then(|()| self.read());
@@ -423,7 +444,11 @@ mod tests {
         };
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
-            let value = setting.values.last().copied().unwrap_or("a/b");
+            let named = match number(setting) {
+                true => "7",
+                false => "a/b",
+            };
+            let value = setting.values.last().copied().unwrap_or(named);
             view.write(Some(value.to_owned()));
             assert!(matches!(view.said, Some(Ok(_))), "{:?}", view.said);
             assert_eq!(view.values[at].as_deref(), Some(value));
