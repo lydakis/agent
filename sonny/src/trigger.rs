@@ -3133,24 +3133,17 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
 /// up to date from then on. One that has any declared tools is left as it
 /// is, and a failure leaves it to the next fire.
 async fn adopt(client: &Client, name: &str, id: i64) {
-    let Ok(record) = client
+    let Ok(mut record) = client
         .request("inspect", json!({"bot": name, "bot_id": id}))
         .await
     else {
         return;
     };
-    if record["declared"]
-        .as_array()
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return;
+    record["name"] = json!(name);
+    record["bot_id"] = json!(id);
+    if let Some(fields) = crate::declared::adopt(&record) {
+        let _ = client.request("configure", Value::Object(fields)).await;
     }
-    let _ = client
-        .request(
-            "configure",
-            json!({"bot": name, "bot_id": id, "declare": crate::declared::tools(false)}),
-        )
-        .await;
 }
 
 /// What came of a fire whose agent could not be made. Pinned by id, an
@@ -3711,7 +3704,10 @@ fn ends(places: &Places, trigger: &Trigger, keep: bool) {
 /// The daemon, started the way Sonny starts one when none answers and
 /// the trigger names its store, on the socket the trigger was made with,
 /// with the login shell's environment, since launchd's has no provider keys.
-async fn connect(socket: &Path, daemon: &Daemon) -> Result<std::sync::Arc<Client>, String> {
+pub(crate) async fn connect(
+    socket: &Path,
+    daemon: &Daemon,
+) -> Result<std::sync::Arc<Client>, String> {
     match Client::connect(socket).await {
         Ok((client, _events)) => Ok(client),
         Err(error) if error.code == "daemon_unavailable" => {

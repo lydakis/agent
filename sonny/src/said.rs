@@ -254,12 +254,16 @@ pub async fn changed_on(
     }
 }
 
+/// The daemon this shell reaches, started as a trigger's fire starts it
+/// when it is not running: the cleanup's `--if` runs before its fire
+/// would start one, and a stopped daemon still holds what the person wrote.
 async fn connect() -> Result<std::sync::Arc<Client>, String> {
-    let (_, socket) = crate::daemon_paths(None, None).map_err(|e| format!("said_unread: {e}"))?;
-    Ok(Client::connect(&socket)
+    let failed = |e: String| format!("said_unread: {e}");
+    let daemon = crate::trigger::Daemon::current().map_err(failed)?;
+    let socket = daemon.socket().map_err(failed)?;
+    crate::trigger::connect(&socket, &daemon)
         .await
-        .map_err(|e| format!("said_unread: {e}"))?
-        .0)
+        .map_err(failed)
 }
 
 fn now_ms() -> i64 {
