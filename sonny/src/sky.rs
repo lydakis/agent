@@ -65,7 +65,8 @@ const FAILED: Color = Color::Red;
 
 /// What the follow brings the view.
 enum Feed {
-    Bots(Vec<Value>),
+    /// Every agent there is now: who is listed is here, who isn't is gone.
+    Roll(Vec<Value>),
     Past(Value),
     Live(Value),
     Down(String),
@@ -196,7 +197,12 @@ impl View {
         let now = Instant::now();
         while let Ok(feed) = self.feed.try_recv() {
             match feed {
-                Feed::Bots(bots) => {
+                Feed::Roll(bots) => {
+                    let listed: HashSet<&str> =
+                        bots.iter().filter_map(|bot| bot["name"].as_str()).collect();
+                    for agent in &mut self.agents {
+                        agent.gone = !listed.contains(agent.name.as_str());
+                    }
                     for bot in &bots {
                         self.seat(bot);
                     }
@@ -691,11 +697,13 @@ impl View {
                 Span::raw(text),
             ]));
         }
-        if self.ticker.is_empty() {
-            lines.push(match (&self.down, self.live) {
-                (Some(why), _) => Line::from(format!("Couldn't follow the agents: {why}")),
-                (None, true) => Line::from("Quiet. Messages light up here as they go.").dim(),
-                (None, false) => Line::from("Catching up with who talked to whom…").dim(),
+        if let Some(why) = &self.down {
+            lines.push(Line::from(format!("Couldn't follow the agents: {why}")));
+        } else if self.ticker.is_empty() {
+            lines.push(if self.live {
+                Line::from("Quiet. Messages light up here as they go.").dim()
+            } else {
+                Line::from("Catching up with who talked to whom…").dim()
             });
         }
         lines
@@ -748,10 +756,10 @@ fn weight(at: usize, children: &[Vec<usize>]) -> usize {
 fn posted(arguments: &Value) -> bool {
     let text = arguments.as_str().unwrap_or("");
     match serde_json::from_str::<Value>(text) {
-        Ok(call) => matches!(call["action"].as_str(), Some("post" | "reply")),
-        Err(_) => ["\"post\"", "\"reply\""]
+        Ok(call) => call.get("post").is_some() || call.get("reply").is_some(),
+        Err(_) => ["\"post\":", "\"reply\":"]
             .iter()
-            .any(|action| text.contains(action)),
+            .any(|key| text.contains(key)),
     }
 }
 
@@ -1014,26 +1022,8 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     };
-    let mut after: Option<String> = None;
-    loop {
-        let page = match client
-            .request("bots", json!({"after": after, "limit": 256}))
-            .await
-        {
-            Ok(page) => page,
-            Err(error) => {
-                let _ = send.send(Feed::Down(error.to_string()));
-                return;
-            }
-        };
-        let bots = page["bots"].as_array().cloned().unwrap_or_default();
-        if send.send(Feed::Bots(bots)).is_err() {
-            return;
-        }
-        match page["next_after"].as_str() {
-            Some(next) => after = Some(next.to_owned()),
-            None => break,
-        }
+    if !roll(&client, &send).await {
+        return;
     }
     if let Err(error) = client
         .request("follow", json!({"bot": "*", "after": 0, "kinds": PAST}))
@@ -1051,6 +1041,11 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         if send.send(Feed::Past(event)).is_err() {
             return;
         }
+    }
+    // Who is here and who works may have changed while the past was read:
+    // the roll again says so, and the live follow takes it from the cursor.
+    if !roll(&client, &send).await {
+        return;
     }
     // Asking again replaces the follow: from where the past ended, what
     // animates the sky. Its own replay repeats nothing already sent.
@@ -1080,6 +1075,30 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     let _ = send.send(Feed::Down("the daemon closed the connection".into()));
 }
 
+/// Every agent the daemon keeps, page after page, as one roll; false when
+/// the view is gone or the daemon couldn't say.
+async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
+    let mut bots = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = match client
+            .request("bots", json!({"after": after, "limit": 256}))
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = send.send(Feed::Down(error.to_string()));
+                return false;
+            }
+        };
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        match page["next_after"].as_str() {
+            Some(next) => after = Some(next.to_owned()),
+            None => return send.send(Feed::Roll(bots)).is_ok(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn a_lead_sits_inside_the_agents_it_made() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![
+        send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
             json!({"name": "shop.cart", "created_by": "shop.lead"}),
@@ -1127,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn a_message_between_agents_sparks_once_and_is_told() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![
+        send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
         ]))
@@ -1160,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn past_turns_draw_who_talked_without_sparks() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![json!({"name": "a"}), json!({"name": "b"})]))
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
             .unwrap();
         send.send(Feed::Past(
             json!({"event": "accepted", "bot": "b", "turn": 1, "data": {"from": {"bot": "a"}}}),
@@ -1176,10 +1195,10 @@ mod tests {
     #[tokio::test]
     async fn a_commons_post_ripples_and_an_origin_comes_from_the_rim() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![json!({"name": "a"})])).unwrap();
+        send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
         send.send(Feed::Live(
             json!({"event": "tool_started", "bot": "a", "turn": 1, "data": {
-            "name": "commons", "arguments": r#"{"action":"post","title":"Flaky tests"}"#}}),
+            "name": "commons", "arguments": r#"{"post":{"name":"flaky-tests","title":"Flaky tests","text":"Seen twice"}}"#}}),
         ))
         .unwrap();
         send.send(Feed::Live(
@@ -1197,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn an_absorbed_steer_finishing_leaves_the_agent_working() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![json!({"name": "a", "running_turn": 5})]))
+        send.send(Feed::Roll(vec![json!({"name": "a", "running_turn": 5})]))
             .unwrap();
         // The daemon finishes the steer's own turn, then reports it steered.
         send.send(Feed::Live(
@@ -1219,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn a_made_agent_is_seated_from_its_event_and_answers_fly_home() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![json!({"name": "shop.lead"})]))
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
             .unwrap();
         send.send(Feed::Live(
             json!({"event": "created", "bot": "shop.cart", "turn": null,
@@ -1244,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn a_view_put_aside_reads_its_agents_afresh_when_back() {
         let (mut view, send) = view();
-        send.send(Feed::Bots(vec![json!({"name": "gone"})]))
+        send.send(Feed::Roll(vec![json!({"name": "gone"})]))
             .unwrap();
         send.send(Feed::Past(
             json!({"event": "accepted", "bot": "gone", "turn": 1, "data": {}}),
@@ -1259,10 +1278,47 @@ mod tests {
 
     #[test]
     fn a_cut_commons_preview_still_reads_as_a_post() {
-        assert!(posted(&json!(
-            r#"{"action":"reply","thread":"x","text":"lo"#
-        )));
-        assert!(!posted(&json!(r#"{"action":"read","thread":"x"}"#)));
+        assert!(posted(&json!(r#"{"reply":{"thread":"x","text":"lo"#)));
+        assert!(!posted(&json!(r#"{"read":"x","from":40}"#)));
+        assert!(!posted(&json!("{}")));
+    }
+
+    #[tokio::test]
+    async fn a_second_roll_settles_who_is_here_and_who_works() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
+            .unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a", "running_turn": 3}),
+            json!({"name": "c"}),
+        ]))
+        .unwrap();
+        view.drain();
+        let at = |name: &str| &view.agents[view.index[name]];
+        assert_eq!(at("a").running, Some(3));
+        assert!(at("b").gone && !at("c").gone);
+    }
+
+    #[tokio::test]
+    async fn a_lost_follow_is_told_under_the_messages() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "a", "turn": 1,
+            "data": {}}),
+        ))
+        .unwrap();
+        send.send(Feed::Down("fell behind the daemon".into()))
+            .unwrap();
+        view.drain();
+        let text: Vec<String> = (view.card(60, 30).iter())
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|line| line.contains("you → a")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("fell behind the daemon"))
+        );
     }
 
     #[test]
