@@ -4844,8 +4844,16 @@ mod tests {
         let held = Lock::take(&w.places).unwrap();
         assert_eq!(forget_done(&w.places, "00ab", &ended("completed")), 0);
         drop(held);
-        // One that completed leaves nothing.
-        assert_eq!(forget_done(&w.places, "00ab", &ended("completed")), 1);
+        // One that completed leaves nothing. A process another test forks
+        // shares the lock's descriptor until it execs, so the lock can stay
+        // taken a moment after the drop; like the window, try again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut gone = forget_done(&w.places, "00ab", &ended("completed"));
+        while gone == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            gone = forget_done(&w.places, "00ab", &ended("completed"));
+        }
+        assert_eq!(gone, 1);
         assert_eq!(w.state(&one.name), (false, false, false));
         // Not delivered: it ends, and its row says why until it is removed.
         w.install(&one).unwrap();
