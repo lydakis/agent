@@ -188,7 +188,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "",
+        flags: "--shell-exclude",
         settings: "",
         startup: true,
     },
@@ -348,6 +348,10 @@ fn print_flags(flags: &str) {
                 "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
             ),
             "--idle-exit" => ("DURATION", "Exit after this long idle; 0 disables"),
+            "--shell-exclude" => (
+                "PATTERN",
+                "Leave variables named like this (* and ? wildcards, any case) out of tool shells; repeatable; clients pass [shell_environment_policy] from ~/.agent/config.toml",
+            ),
             "--port" => (
                 "N",
                 "Wait for the browser's sign-in on 127.0.0.1:N; default 1455",
@@ -576,7 +580,12 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if flags.iter().any(|f| f == flag)
             && !matches!(
                 flag,
-                "--provider" | "--image" | "--writable" | "--unsandboxed" | "--env"
+                "--provider"
+                    | "--image"
+                    | "--writable"
+                    | "--unsandboxed"
+                    | "--env"
+                    | "--shell-exclude"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));

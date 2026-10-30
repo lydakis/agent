@@ -709,6 +709,10 @@ pub struct Configuration {
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
+    /// Names, with `*` and `?` wildcards, of variables no tool shell gets
+    /// from the daemon's environment, as Codex's shell environment
+    /// excludes; none by default.
+    pub shell_excludes: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1130,6 +1134,16 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut providers = HashMap::new();
     let aws_start = agent_runtime::provider::aws::Start::new();
     let credentials = agent_runtime::tools::Credentials::default();
+    // Every tool shell inherits the environment the daemon started with,
+    // so the excludes are matched against it once.
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && (config.shell_excludes.iter())
+                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
+        {
+            credentials.withhold(name);
+        }
+    }
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
         let (key, login) = if spec.chatgpt_login {

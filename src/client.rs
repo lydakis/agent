@@ -790,6 +790,9 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
     }
+    for pattern in config()?.shell_environment_policy.excludes() {
+        command.arg("--shell-exclude").arg(pattern);
+    }
     agent_client::own_session(&mut command);
     let mut child = command
         .stdin(Stdio::null())

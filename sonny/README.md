@@ -75,12 +75,24 @@ or not a window is open. Settings go in
 `--provider` specs, after the shell's `AGENT_PROVIDER`), `model` (a new
 agent's when none is named) and the efforts below. When no provider is named
 and no key is set, the first `sonny` in a terminal asks for one, as Codex and
-Claude Code ask for a sign-in: a ChatGPT plan (signed in with `agent login
-chatgpt`), an Anthropic, OpenAI or OpenRouter key, or Bedrock with an AWS
-profile. A new project's model is `--model`, else the project file's or the
-role's, else `AGENT_MODEL`, else the config's `model`, else the newest
-agent's; with none, Sonny lists what the providers offer and keeps the pick
-as `model`. Either step also suggests efforts, `[sonny] lead_effort =
+Claude Code ask for a sign-in, in a list picked with the arrow keys: a
+ChatGPT plan (signed in with `agent login chatgpt`), Bedrock, or an
+Anthropic, OpenAI or OpenRouter key. It first looks at what the machine has
+and offers that first: a ChatGPT sign-in of its own or Codex's (only that
+there is one), and the AWS profiles in `~/.aws/config` and
+`~/.aws/credentials`, which Bedrock then offers by name with their regions.
+A new project's model is `--model`, else the project file's or the role's,
+else `AGENT_MODEL`, else the config's `model`, else the newest agent's; with
+none, Sonny lists what the providers offer, ranked, the first marked
+recommended so Enter takes it: models no agent runs on (embeddings, speech,
+images, realtime) and dated snapshots of a listed name are left out, and
+Bedrock's global inference profiles come first. A provider that will not
+list says how to fix it (`aws sso login --profile NAME` for an expired AWS
+session), and Enter lists again. The pick is kept as `model`, and a new
+`config.toml` starts with comments saying what each setting does. Setup
+ends with what it chose and with any tool agents need that is missing
+(bubblewrap for the sandbox on Linux, ripgrep), with the command that
+installs it. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
@@ -532,7 +544,15 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   lead does not wait: it goes on with the option it recommends when that
   can be undone, or ends its turn. Open questions are read from the
   history Sonny replays (its `ask` calls not yet answered), so one asked
-  while Sonny was closed is answered the same way when it opens.
+  while Sonny was closed is answered the same way when it opens. A yellow
+  `?` starts it and a muted bar runs down its left side, setting it apart
+  from the replies around it with or without color. A task
+  asks the same way: its lead hears the question in its task updates
+  (`shop.wire asks you`), the task's row reads `needs you`, and a click on
+  it opens the task in the pane, where an option's click answers the task
+  itself.
+
+  ![A task's question: the lead's task updates say shop.wire asks you, and wire, opened from the margin's ↗, shows the decision in the pane](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
@@ -763,7 +783,9 @@ with its next call. Posting a note's id again changes it in place, so a
 live note stays one note. A lead can show a task's note as
 `from: "task/id"`, which lookout names when the task puts one up: it
 shows as the task keeps it, follows the task's title until the lead gives
-its own, and stays once the task is gone. A file, `/status`, `/background` or a side
+its own, and stays once the task is gone. A note with `opens: "AGENT"`,
+such as the lead's to-do for a task's question, gets a `↗` that opens that
+agent in the pane, where you answer it. A file, `/status`, `/background` or a side
 chat opens over the margin, its title's `←`, Esc and Ctrl+[ going back to it;
 Esc in the margin closes it, and `/margin` brings it back. The margin
 opens by itself when the agent puts up or changes a note, once the window
@@ -807,6 +829,8 @@ pictures, and code in syntax colors.
 ![The lead took its only note away: the margin stays open, empty, until Esc or /margin](../docs/sonny/margin-stays-once-empty.png)
 
 ![Closed with /margin, then the lead put up a new note: the margin opened again with it](../docs/sonny/margin-opens-again.png)
+
+![The lead heard that wire asks you and keeps it on your list in the margin, its ↗ ready to open wire](../docs/sonny/margin-opens-task.png)
 
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
