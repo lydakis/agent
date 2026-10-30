@@ -5855,3 +5855,30 @@ quarter of a KiB. The change pays off in `bench/lookout_scale.py`: with
 1,100 streaming bots, the lookout's follow of `*` is no longer dropped by
 the count bound, and at 5,000 gated calls the approver's session stays
 open.
+
+## Waiting requests keep no task or timer (#434)
+
+A client's `wait` with a timeout, a parked turn's wait deadline, and an
+`approve_step` waiting for its step no longer spawn a task or timer each:
+every deadline is one entry in the handles' schedule, which the run loop
+sleeps on, and steps that come due together are checked in one storage
+job. An ordinary turn gains one more arm in the run loop's select. The Perf
+workflow's matched screen, base main 04fa687 against the PR head 93b93e1,
+on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.804 | 29.595 | -0.7% |
+| admission | burst submit p99, ms | 4.086 | 3.954 | -3.2% |
+| completion | release to terminal p99, ms | 9.299 | 8.836 | -5.0% |
+| footprint | idle RSS, MiB | 19.369 | 19.467 | +0.5% |
+| footprint | per idle bot, KiB | 1.508 | 1.356 | -10.1% |
+| footprint | RSS after a turn each, MiB | 30.625 | 29.203 | -4.6% |
+| footprint | CPU per turn, ms | 0.874 | 0.868 | -0.7% |
+| lifecycle | CPU, s | 0.875 | 0.885 | +1.1% |
+| lifecycle | p95 turn, ms | 665.672 | 585.85 | -12.0% |
+| lifecycle | peak RSS, MiB | 25.648 | 25.561 | -0.3% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The p95 turn and per-idle-bot drops are the bench's spread
+between runs, as the change adds nothing to an idle bot or a turn's work.
