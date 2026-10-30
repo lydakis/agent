@@ -5193,7 +5193,7 @@ mod tests {
             workspace: None,
             model: None,
             effort: None,
-            delivery: None,
+            delivery: Some("reject".into()),
             expected_turn: None,
             from: None,
             origin: None,

@@ -128,7 +128,7 @@ def run(binary, out, bots):
         row['burst_create'] = phase(client, process, model, together(
             [('create', dict(bot=f'burst{n}', workspace=workspace)) for n in range(bots)]))
         row['burst_submit'] = phase(client, process, model, together(
-            [('submit', dict(bot=f'burst{n}', request_id='first', prompt='hold:admission'))
+            [('submit', dict(bot=f'burst{n}', request_id='first', prompt='hold:admission', delivery='reject'))
              for n in range(bots)]), turns=bots)
         started = client.request('stats')['result']['active_turns']
         assert started == 2 * bots, started

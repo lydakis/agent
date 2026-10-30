@@ -295,7 +295,7 @@ class Bench:
             (folder / f'p{p}.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
         # One finished turn each lead's messages to its tasks come from: what
         # a lead writes in its tasks is no news to it, only how they end.
-        firsts = self.control.many([('submit', {'bot': lead, 'request_id': 'first', 'prompt': 'hi'})
+        firsts = self.control.many([('submit', {'bot': lead, 'request_id': 'first', 'prompt': 'hi', 'delivery': 'reject'})
                                     for lead in self.leads()])
         self.from_turn = {lead: r['result']['turn'] for lead, r in zip(self.leads(), firsts)}
         while self.busy_tasks():
@@ -357,7 +357,7 @@ class Bench:
         # all have ended.
         while time.monotonic() < stop:
             batch = [('submit', {'bot': task, 'request_id': f'{self.phase}r{n}-{task}',
-                                 'prompt': f'stream:{count}:{ms}',
+                                 'prompt': f'stream:{count}:{ms}', 'delivery': 'reject',
                                  'from': {'bot': task.split('.')[0] + '.lead',
                                           'turn': self.from_turn[task.split('.')[0] + '.lead']}})
                      for task in tasks]
@@ -450,7 +450,7 @@ class Bench:
                 raise RuntimeError('approver did not start')
         sampler = Sampler(process.pid)
         started = time.monotonic()
-        self.control.many([('submit', {'bot': name, 'request_id': 'gate', 'prompt': 'shell:true'})
+        self.control.many([('submit', {'bot': name, 'request_id': 'gate', 'prompt': 'shell:true', 'delivery': 'reject'})
                            for name in names])
         decided = lambda: [c for l in lines if l.get('event') == 'judged' for c in l['calls']]
         while len(decided()) < gated and time.monotonic() - started < 300:

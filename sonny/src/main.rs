@@ -11101,7 +11101,7 @@ mod tests {
         let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(shown, ["! echo hello", "  └ hello"]);
         let asked = sent.lock().unwrap()[0].clone();
-        assert_eq!(asked["delivery"], Value::Null);
+        assert_eq!(asked["delivery"], "reject");
         // Not the person's words: what it printed authorizes nothing.
         assert_eq!(asked["origin"], "shell");
         let prompt = asked["prompt"].as_str().unwrap();
@@ -11195,7 +11195,7 @@ mod tests {
         );
         assert_eq!(
             (&sent[2]["delivery"], &sent[3]["delivery"]),
-            (&Value::Null, &json!("steer"))
+            (&json!("reject"), &json!("steer"))
         );
         assert_eq!(sent[4]["prompt"], "and now?");
         assert_eq!(sent[4]["origin"], Value::Null);
@@ -11787,7 +11787,7 @@ mod tests {
         app.input.set("👍 ship it");
         app.submit().await;
         assert_eq!(sent.lock().unwrap()[3]["prompt"], "👍 ship it");
-        assert!(sent.lock().unwrap()[3]["delivery"].is_null());
+        assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
     }
 
     #[tokio::test]

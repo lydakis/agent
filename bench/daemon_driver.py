@@ -42,7 +42,7 @@ class DaemonDriver:
         turn = self.turn_of[agent]
         self.progress[agent] = [0, 0]
         self.request('submit', agent, bot=f'b{agent}', request_id=f'{agent}-{turn}',
-                     prompt=prompt(self.config, agent, turn))
+                     prompt=prompt(self.config, agent, turn), delivery='reject')
         return {'event': 'turn_start', 'agent': str(agent), 'turn': str(turn)}
 
     def handle(self, message):

@@ -1209,9 +1209,7 @@ mod tests {
         let sonny = "\"/opt/homebrew/opt/sonny/bin/sonny\" agent";
         let text = naming(PREAMBLE, sonny);
         assert!(!text.contains("AGENT_BIN"), "{text}");
-        assert!(text.contains(&format!(
-            "{sonny} run --detach --new --agents --bot NAME -- TASK"
-        )));
+        assert!(text.contains(&format!("{sonny} run --detach --new --bot NAME -- TASK")));
         assert!(text.contains(&format!("{sonny} run --detach --bot \"$AGENT_PARENT\"")));
         // Without one, the binary the daemon gives every shell.
         assert_eq!(naming(PREAMBLE, "\"$AGENT_BIN\""), PREAMBLE);
