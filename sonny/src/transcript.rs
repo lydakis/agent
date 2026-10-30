@@ -2190,12 +2190,17 @@ pub fn plan_lines(steps: &[String], full: bool, width: usize) -> Vec<Line<'stati
 }
 
 fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
-    let bullet = if said.failed {
-        Span::raw("• ").fg(Color::Red)
-    } else {
-        Span::raw("• ").fg(Color::Green)
+    // A call that failed did not do what its verb says: it is marked
+    // failed and said as what it tried, as Codex and Claude Code lead a
+    // failure with its mark.
+    let (bullet, verb) = match said.failed {
+        true => (
+            Span::raw("✗ ").fg(Color::Red),
+            crate::calls::attempted(&said.verb),
+        ),
+        false => (Span::raw("• ").fg(Color::Green), said.verb),
     };
-    let mut spans = vec![Span::raw(said.verb).bold()];
+    let mut spans = vec![Span::raw(verb).bold()];
     if !said.what.is_empty() {
         spans.extend([Span::raw(" "), Span::raw(said.what)]);
     }
@@ -3261,7 +3266,7 @@ mod tests {
             "Started calc.fix: {\"handle\":\"turn:calc.fix/3\"}",
         );
         assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
-        // One that failed says why first.
+        // One that failed says what it tried, and why first.
         let shown = text(&super::clean(
             "show_agent",
             &serde_json::json!({"agent": "calc.fix", "split": "right"}),
@@ -3273,7 +3278,7 @@ mod tests {
         assert_eq!(
             shown,
             [
-                "• Moved calc.fix to a split right of you",
+                "✗ Couldn't move calc.fix to a split right of you",
                 "  └ neither rex nor herdr was found"
             ]
         );
@@ -3300,7 +3305,7 @@ mod tests {
         assert_eq!(
             scheduled,
             [
-                "• Scheduled every 30m",
+                "✗ Couldn't schedule every 30m",
                 "  └ triggers_unsupported: only macOS",
                 "    Check the queue."
             ]

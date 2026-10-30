@@ -92,7 +92,9 @@ session), and Enter lists again. The pick is kept as `model`, and a new
 `config.toml` starts with comments saying what each setting does. Setup
 ends with what it chose and with any tool agents need that is missing
 (bubblewrap for the sandbox on Linux, ripgrep), with the command that
-installs it. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
+installs it. When Claude Code, Codex, OpenCode or Kiro have MCP servers set
+up (in your home or this folder), setup offers them too, all ticked, as
+`sonny mcp import` does. `sonny setup` asks both again. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them.
 Outside a terminal both fail, naming what to set. The first start also writes
 `~/.agent/models`, the list agents read with `agent models`, when there is
@@ -480,6 +482,18 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   day. `↑`/`↓` picks one, `f` fires a trigger now, and `d` pressed twice
   removes it; the subscription Sonny keeps for a lead's tasks stays. The
   footer says `↻ 2 in background` while the window's agent has any.
+  What failed is listed first, with a red `✗` and the error: a trigger
+  whose fire failed (one that ended on it stays listed until `d` removes
+  it), or whose fire went out and whose turn then failed (as
+  when the machine was offline or a login expired), and a server the
+  nightly memory cleanup could not read. Your own agents' failures, such as
+  the memory cleanup's, show in every window. The footer then says
+  `✗ 1 failed` in red, left of the `↻`, and a click on either opens
+  `/background`. An agent sees the same in its triggers tool, whose rows
+  say how the turn their last fire sent ended.
+
+  ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
+  ![The footer: ✗ 2 failed in red, left of ↻ 1 in background](../docs/sonny/footer-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/usage` shows, in the pane beside the conversation,
@@ -500,7 +514,7 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
 
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/mcp` lists your MCP servers (`[sonny.mcp_servers]` in
-  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|tool`), each with
+  `~/.agent/config.toml`, kept with `sonny mcp add|remove|list|import|tool`), each with
   its tools or why it did not start. Agents reach them through one `exec`
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
@@ -581,7 +595,7 @@ that runs as you. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
 person picks a mode in `/approvals`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
-and a call answered with an error says why under it. A task's own
+and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
 `resolve_task` is read from its history: its last turn resolved it. The
 lead's Sonny keeps each task the lead resolved beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a
@@ -770,8 +784,9 @@ the conversation, from the newest place back: ↑ or Enter steps older, ↓
 newer, and Esc stops where you are.
 
 The pane's place, when nothing else is open there, is the margin. Its
-first row is a glance at what runs for the agent: `↻` for its triggers
-and subscriptions (a click opens `/background`), and its context, each
+first row is a glance at what runs for the agent: a red `✗` for what
+failed in the background and `↻` for its triggers and subscriptions (a
+click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts the other agents at work
 (cyan `●`) and what needs you (yellow `●`), and a click on the count
