@@ -765,6 +765,10 @@ pictures, and code in syntax colors.
 
 ![The margin opened by itself with the lead's first notes, two tasks' tables shown as the tasks keep them](../docs/sonny/margin-opens-with-a-note.png)
 
+![The lead took its only note away: the margin stays open, empty, until Esc or /margin](../docs/sonny/margin-stays-once-empty.png)
+
+![Closed with /margin, then the lead put up a new note: the margin opened again with it](../docs/sonny/margin-opens-again.png)
+
 ![A drag selects two lines and copies them, a double click takes len(values), a triple click a whole line, and the wheel scrolls back](../docs/sonny/fullscreen-copy.gif)
 
 ![A click on calc.py:2 opens calc.py beside the chat at line 2, in syntax colors](../docs/sonny/pane-code.png)
