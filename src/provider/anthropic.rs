@@ -242,14 +242,16 @@ impl State {
                     "text_delta" | "thinking_delta" => encoded_len(&part),
                     _ => part.len(),
                 })?;
+                // Every block is kept in the one assistant message, the
+                // response's only output item.
                 match (kind.as_str(), self.block(&event["index"])?) {
                     ("text_delta", Block::Text { text, .. }) => {
                         text.push_str(&part);
-                        Ok(Frame::Delta(Delta::Text(part)))
+                        Ok(Frame::Delta(Delta::Text(0, part)))
                     }
                     ("thinking_delta", Block::Thinking { thinking, .. }) => {
                         thinking.push_str(&part);
-                        Ok(Frame::Delta(Delta::Thinking(part)))
+                        Ok(Frame::Delta(Delta::Thinking(0, part)))
                     }
                     ("signature_delta", Block::Thinking { signature, .. }) => {
                         signature.push_str(&part);
@@ -514,8 +516,8 @@ mod tests {
         for frame in frames {
             if let Frame::Delta(delta) = state.frame(frame.as_bytes()).unwrap() {
                 deltas.push(match delta {
-                    Delta::Text(t) => format!("text:{t}"),
-                    Delta::Thinking(t) => format!("think:{t}"),
+                    Delta::Text(_, t) => format!("text:{t}"),
+                    Delta::Thinking(_, t) => format!("think:{t}"),
                 });
             }
         }
