@@ -64,12 +64,8 @@ fn git(
     let mut command = Command::new("git");
     // The folder's own code never runs here, where the daemon's keys are:
     // no hook, no fsmonitor, no filter, and none of the keys in its
-    // environment. Its own attributes, which a task writes, pick nothing:
-    // they are read from an empty tree (git 2.40 on; older git reads them
-    // still, but every filter they could pick is off).
-    if let Some(empty) = empty_tree(dir) {
-        command.env("GIT_ATTR_SOURCE", empty);
-    }
+    // environment. Its attributes still convert line endings and
+    // encodings both ways, as git's own code does that.
     command
         .arg("-C")
         .arg(dir)
@@ -152,20 +148,6 @@ fn unfiltered(dir: &Path) -> Vec<String> {
         })
         .flatten()
         .collect()
-}
-
-/// The empty tree's ID in the repository `dir` is in, by its hash.
-fn empty_tree(dir: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["hash-object", "-t", "tree", "--stdin"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let id = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (output.status.success() && !id.is_empty()).then_some(id)
 }
 
 /// The top of the git checkout `dir` is in, if it is in one.
@@ -710,22 +692,33 @@ mod tests {
     }
 
     #[test]
-    fn the_folder_s_own_attributes_pick_nothing() {
+    fn a_file_git_converts_comes_back_as_it_was() {
         let (dir, top) = repo("attributes");
         std::fs::write(top.join(".gitattributes"), "*.a text eol=crlf\n").unwrap();
         std::fs::write(top.join("x.a"), "one\r\ntwo\r\n").unwrap();
+        // Older than the index, so git takes its entry as is.
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        (std::fs::File::options()
+            .write(true)
+            .open(top.join("x.a"))
+            .unwrap())
+        .set_modified(then)
+        .unwrap();
+        // Committed by the person's own git, which converts it.
+        for args in [&["add", "-A"][..], &["commit", "-q", "-m", "converted"]] {
+            let done = Command::new("git").arg("-C").arg(&top).args(args).status();
+            assert!(done.unwrap().success());
+        }
+        std::fs::write(top.join("y.a"), "three\r\n").unwrap();
         let staged = stage(&top, &top.with_extension("indexes"))
             .unwrap()
             .unwrap();
         commit(&staged, REFS, 7, 1, 10, false).unwrap();
         let snapshot = find(&top, REFS, 7, None).unwrap();
-        let kept = Command::new("git")
-            .arg("-C")
-            .arg(&top)
-            .args(["cat-file", "blob", &format!("{}:x.a", snapshot.commit)])
-            .output()
-            .unwrap();
-        assert_eq!(kept.stdout, b"one\r\ntwo\r\n");
+        let copy = dir.join("copy");
+        restore(&top, &snapshot, &copy, "agent/copy").unwrap();
+        assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
+        assert_eq!(std::fs::read(copy.join("y.a")).unwrap(), b"three\r\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 
