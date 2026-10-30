@@ -52,7 +52,8 @@ ends. It never reads the whole log again; only a lookout with no cursor yet
 reads it all, once, as history rather than news.
 
 It is built to stay light with thousands of bots, as a Kubernetes
-controller is with a large cluster. Each event reaches only the
+controller is with a large cluster. It follows only the event kinds it
+reads, so the text models stream never reaches it. Each event reaches only the
 subscribers that watch its bot, or every one for a bot made or deleted,
 and each checks that one bot alone. Each subscriber keeps only the bots it
 watches. Notes and status checks go to the daemon beside the stream, so no

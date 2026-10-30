@@ -711,7 +711,8 @@ impl Service {
             .flatten()
             .min()
             .unwrap_or(0);
-        if let Err(error) = (client.request("follow", json!({"bot": "*", "after": after}))).await {
+        let follow = json!({"bot": "*", "after": after, "kinds": KINDS});
+        if let Err(error) = client.request("follow", follow).await {
             println!(
                 "{}",
                 json!({"event": "follow_refused", "error": error.code, "after": after})
@@ -1218,6 +1219,26 @@ fn cursor_path(store: &Path) -> PathBuf {
     path.push(".lookout.cursor");
     PathBuf::from(path)
 }
+
+/// The events a lookout reads, of every bot: what bots there are, how
+/// their turns start, wait and end, the tools they call, and each model
+/// call's usage, which says a quiet turn still works. The text a model
+/// streams, most of all events, is no one's news here.
+const KINDS: [&str; 13] = [
+    "created",
+    "forked",
+    "deleted",
+    "accepted",
+    "queued",
+    "steered",
+    "turn_waiting",
+    "turn_paced",
+    "turn_resumed",
+    "turn_finished",
+    "tool_started",
+    "tool_completed",
+    "usage",
+];
 
 /// The most of the log `status` reads, from its end.
 const STATUS_BYTES: u64 = 1 << 20;

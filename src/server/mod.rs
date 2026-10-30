@@ -421,6 +421,9 @@ enum Command {
         bot: String,
         #[serde(default)]
         after: i64,
+        /// Only events of these kinds, when given; notices about the
+        /// stream itself (`follow_live`, `pruned`) always come.
+        kinds: Option<Vec<String>>,
     },
     /// Block this request until the handles resolve; the response carries
     /// the same result shape as the wait tool.
@@ -3480,16 +3483,27 @@ impl Service {
                     })
                     .await
             }
-            Command::Follow { bot, after } => {
+            Command::Follow { bot, after, kinds } => {
                 if after < 0 {
                     return fail_with("invalid_event_page", "after must be 0 or more");
+                }
+                if kinds.as_ref().is_some_and(|kinds| {
+                    kinds.is_empty() || kinds.iter().any(|kind| name("kind", kind).is_err())
+                }) {
+                    return fail_with(
+                        "invalid_follow_kinds",
+                        "kinds must name one or more event kinds",
+                    );
                 }
                 // `*` follows every bot from a store-wide cursor.
                 if bot != hub::ALL {
                     let check = bot.clone();
                     store.op("inspect", move |db| db.inspect(&check)).await?;
                 }
-                let sub = self.hub.subscribe(&bot, session, output.clone(), after);
+                let wanted = kinds.clone().map(|kinds| kinds.into_iter().collect());
+                let sub = self
+                    .hub
+                    .subscribe(&bot, session, output.clone(), after, wanted);
                 let (store, hub, replay_bot, output) =
                     (store.clone(), self.hub.clone(), bot.clone(), output.clone());
                 let replay_sub = sub.clone();
@@ -3499,7 +3513,7 @@ impl Service {
                     }
                 });
                 sub.lock().unwrap().set_replay(task);
-                Ok(json!({"following":bot,"after":after}))
+                Ok(json!({"following":bot,"after":after,"kinds":kinds}))
             }
             Command::Submit {
                 bot,
@@ -5784,7 +5798,7 @@ mod tests {
             lines
         });
         for name in std::iter::once(hub::ALL).chain(names.iter().map(String::as_str)) {
-            let sub = service.hub.subscribe(name, 1, output.clone(), 0);
+            let sub = service.hub.subscribe(name, 1, output.clone(), 0, None);
             replay(store.clone(), service.hub.clone(), name.to_owned(), sub)
                 .await
                 .unwrap();
@@ -5852,7 +5866,7 @@ mod tests {
             }
             lines
         });
-        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0, None);
         replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
             .await
             .unwrap();
@@ -5921,7 +5935,7 @@ mod tests {
         // The session follows every bot, but its replay has not caught up:
         // the publisher passes it by.
         let output = Output::writer(tokio::io::sink());
-        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0, None);
         let command = create("Bob", &dir);
         let bound = service.admission_sends(&command, &json!(0), 1);
         assert_eq!(bound.events.packets, 1);
@@ -5969,7 +5983,7 @@ mod tests {
             }
             lines
         });
-        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0, None);
         replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
             .await
             .unwrap();
