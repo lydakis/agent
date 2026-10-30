@@ -97,6 +97,15 @@ pub struct Pane {
 
 /// The button on an agent's title that opens it in the main view.
 const MAIN: &str = "↗ main view";
+/// What the keys do on an agent's Sonny in the pane.
+const AGENT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat";
+
+/// Ctrl+G, which opens the agent in the pane in the main view, as its
+/// title's button does: no Sonny key takes it.
+pub fn to_main(key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g')
+}
 
 impl Pane {
     /// A file's preview, from a `file://` address as a link holds it,
@@ -299,6 +308,13 @@ impl Pane {
         }
     }
 
+    /// The program is `agent`'s Sonny: its title's button and Ctrl+G open
+    /// it in the main view.
+    pub fn as_agent(&mut self, agent: &str) {
+        self.agent = Some(agent.to_owned());
+        self.keys = AGENT_KEYS;
+    }
+
     /// Where what the pane holds starts, under its title: the program's
     /// first cell.
     pub fn origin(&self) -> (u16, u16) {
@@ -490,7 +506,9 @@ impl Pane {
                 if !button.is_empty() {
                     self.main_at = Some((at, at + MAIN.width() as u16));
                     head.push(Span::raw("  "));
-                    head.push(Span::raw(MAIN).fg(ratatui::style::Color::Blue));
+                    // The visual system's opens mark, the words plain.
+                    head.push(Span::raw("↗").fg(ratatui::style::Color::Cyan));
+                    head.push(Span::raw(MAIN.trim_start_matches('↗')));
                 }
                 head.push(Span::raw(" ".repeat(gap)));
                 head.extend(key_spans);
@@ -743,7 +761,7 @@ mod tests {
     #[test]
     fn an_agents_title_opens_it_in_the_main_view_where_it_fits() {
         let mut pane = Pane::card("shop.fix", "esc close");
-        pane.agent = Some("shop.fix".into());
+        pane.as_agent("shop.fix");
         let head = rows(&mut pane, 60, 3).remove(0);
         assert!(head.starts_with(" shop.fix  ↗ main view"), "{head}");
         let column = " shop.fix  ".width() as u16;
@@ -754,7 +772,7 @@ mod tests {
         assert_eq!(pane.head_button(1), None);
         // Too narrow for both: the name stays, the button goes.
         let head = rows(&mut pane, 24, 3).remove(0);
-        assert!(!head.contains("main view"), "{head}");
+        assert!(!head.contains('↗'), "{head}");
         assert_eq!(pane.head_button(column), None);
     }
 

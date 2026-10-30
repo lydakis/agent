@@ -61,7 +61,7 @@ name). In a window, `/lead` lists the folder's leads, `/lead NAME` opens one
 and `/lead new [NAME]` makes one. `/switch NAME` opens any agent in the
 window instead, a task or any other the daemon keeps (a name in this project
 may leave out the project); `/switch` alone, or `↗ main view` on the title of
-an agent open in the pane, moves that agent into the window. `/goal WHAT` asks the agent to set a goal
+an agent open in the pane, or Ctrl+G, moves that agent into the window. `/goal WHAT` asks the agent to set a goal
 on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
 clears its own; see [Goals](../docs/SONNY.md#goals)). A lead hears of, shows and lists in
 `/status` only its own tasks. It is told to send work for another lead's task

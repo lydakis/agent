@@ -4078,7 +4078,7 @@ impl App {
             // Its title's button opens it in the main view.
             Ok(()) => {
                 if let Some(pane) = &mut self.pane {
-                    pane.agent = Some(bot.to_owned());
+                    pane.as_agent(bot);
                 }
             }
             Err(error) => self.notice = Some(format!("could not open {name}: {error}")),
@@ -7065,6 +7065,14 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return false,
         };
+        // Ctrl+G opens the agent in the pane in the main view, wherever
+        // the keys are, as its title's button does.
+        if pane::to_main(key)
+            && let Some(agent) = self.pane.as_ref().and_then(|p| p.agent.clone())
+        {
+            self.pressed.push(format!("main/{agent}"));
+            return true;
+        }
         // Ctrl+[ and Ctrl+] step the pane, but for a program that has them.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let program = self.pane_keys && self.pane.as_ref().is_some_and(|p| p.program.is_some());
@@ -7380,6 +7388,7 @@ impl App {
             ("tab", "with nothing typed, keys to the pane"),
             ("ctrl+\\", "keys to the pane and back"),
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
+            ("ctrl+g", "the agent in the pane to the main view"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
             ("ctrl+l", "draw the screen again"),
@@ -10605,10 +10614,15 @@ mod tests {
                 .is_some_and(|n| n.starts_with("/switch NAME"))
         );
         let mut pane = pane::Pane::card("shop.lead", STATUS_KEYS);
-        pane.agent = Some("shop.lead".into());
+        pane.as_agent("shop.lead");
         app.open_pane(pane);
         app.input.set("/switch");
         app.submit().await;
+        assert_eq!(app.switch_to.as_deref(), Some("shop.lead"));
+        // Ctrl+G too, wherever the keys are.
+        app.switch_to = None;
+        let ctrl_g = event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_g)).await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.lead"));
         // A window drawn beside another keeps to its agent.
         (app.switch_to, app.quit) = (None, false);
