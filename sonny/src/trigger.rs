@@ -1850,6 +1850,16 @@ struct Lock {
 
 impl Lock {
     fn take(places: &Places) -> Result<Self, String> {
+        Self::flock(places, libc::LOCK_EX)
+    }
+
+    /// The lock now, or an error when another holds it, for work that can
+    /// wait for a later turn rather than hold up who asked.
+    fn try_take(places: &Places) -> Result<Self, String> {
+        Self::flock(places, libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    fn flock(places: &Places, how: libc::c_int) -> Result<Self, String> {
         std::fs::create_dir_all(&places.state)
             .map_err(|e| format!("{}: {e}", places.state.display()))?;
         let path = places.state.join(".lock");
@@ -1861,7 +1871,7 @@ impl Lock {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         use std::os::fd::AsRawFd;
         // SAFETY: flock on a descriptor this struct owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), how) } != 0 {
             return Err(format!(
                 "{}: {}",
                 path.display(),
@@ -3523,7 +3533,9 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
     if names.is_empty() {
         return 0;
     }
-    let Ok(_lock) = Lock::take(places) else {
+    // Sonny's window asks every ten seconds, from its event loop: it never
+    // waits for the lock another holds, and tries again next time.
+    let Ok(_lock) = Lock::try_take(places) else {
         return 0;
     };
     // Under the lock, only while it is still that row: a trigger made since
@@ -4828,6 +4840,10 @@ mod tests {
         // Another daemon's turn of that handle is not its.
         forget_done(&w.places, "ffff", &ended("completed"));
         assert_eq!(w.state(&one.name), (false, false, true));
+        // Not while another holds the lock: it waits for a later turn.
+        let held = Lock::take(&w.places).unwrap();
+        assert_eq!(forget_done(&w.places, "00ab", &ended("completed")), 0);
+        drop(held);
         // One that completed leaves nothing.
         assert_eq!(forget_done(&w.places, "00ab", &ended("completed")), 1);
         assert_eq!(w.state(&one.name), (false, false, false));
