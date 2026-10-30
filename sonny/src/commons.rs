@@ -36,6 +36,9 @@ const INVITES: &str = ".invites";
 const INVITES_A_DAY: u64 = 3;
 /// How long an answered invite earns its extra one a day, in seconds.
 const EARNS_FOR: i64 = 7 * 86_400;
+/// How long an invite may take to reach an agent before it counts as
+/// given back, in seconds: one whose sender was stopped never settles.
+const SENDING_FOR: i64 = 5 * 60;
 /// Every this many invites, one is a golden ticket: to any agent at all.
 const GOLDEN_EVERY: u64 = 10;
 
@@ -258,7 +261,11 @@ fn load(dir: &Path) -> (Vec<Value>, u64) {
     let mut sent = (invites.remove("sent"))
         .and_then(|sent| sent.as_array().cloned())
         .unwrap_or_default();
-    sent.retain(|invite| invite["at"].as_i64().is_some_and(|at| at > since));
+    let stopped = now() - SENDING_FOR;
+    sent.retain(|invite| {
+        let at = invite["at"].as_i64().unwrap_or(0);
+        at > since && (at > stopped || !invite["bot"].is_null())
+    });
     (sent, count)
 }
 
@@ -1047,6 +1054,11 @@ mod tests {
         assert!(post("again"));
         settle(&dir, "again", Some("c.z"));
         assert!(!post("eleventh"));
+        // One whose sender was stopped before it settled is given back.
+        let (mut sent, count) = load(&dir);
+        sent.push(json!({"thread": "stopped", "at": now() - SENDING_FOR - 1}));
+        assert!(keep(&dir, &sent, count));
+        assert_eq!(super::sent(&dir).len(), sent.len() - 1);
         assert!(invited("new", "Flaky timers", "a.x", true).contains("golden ticket"));
         let _ = std::fs::remove_dir_all(&home);
     }
