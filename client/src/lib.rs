@@ -109,6 +109,25 @@ pub fn default_tools(
 /// together, so a client refuses a daemon of any other version.
 pub const PROTOCOL: u64 = 24;
 
+/// Variables naming the terminal a daemon was started in: a terminal
+/// multiplexer's place. A client starting the daemon leaves them out of its
+/// tool shells (`--shell-exclude`), as a command that used one would land
+/// in that terminal, not the bot's.
+pub const TERMINAL_PLACES: [&str; 12] = [
+    "REX_SESSION",
+    "REX_BLOCK",
+    "TMUX",
+    "TMUX_PANE",
+    "HERDR_ENV",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_PANE_ID",
+    "CMUX_WORKSPACE_ID",
+    "CMUX_SURFACE_ID",
+    "CMUX_TAB_ID",
+    "CMUX_PANEL_ID",
+];
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

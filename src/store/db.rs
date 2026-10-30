@@ -227,6 +227,10 @@ pub struct Settings {
     /// model without the line saying so after its words.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_senders: bool,
+    /// Model calls one of its turns may make, the last with no tool call
+    /// allowed; none bounds them only by the turn's token budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<usize>,
     /// Command prefixes, each of words, that run outside the sandbox
     /// without asking, as a Codex rule that allows a prefix runs it
     /// ([`crate::sandbox::unsandboxed`]).
@@ -280,6 +284,10 @@ impl Settings {
             Some(tokens) => Some(tokens),
             None => Some(compact_threshold(window)),
         }
+    }
+    /// Model calls a turn may make; unset, more than any turn reaches.
+    pub fn max_rounds(&self) -> usize {
+        self.max_rounds.unwrap_or(usize::MAX / 4)
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
@@ -352,6 +360,9 @@ impl Settings {
         {
             return refuse("compact_tokens is at least 1024; 0 leaves only compact_at");
         }
+        if self.max_rounds == Some(0) {
+            return refuse("max_rounds is at least 1");
+        }
         if self.keep_turns == Some(0) {
             return refuse("keep_turns is at least 1");
         }
@@ -406,7 +417,7 @@ impl Settings {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
             "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens,
-            "keep_turns":self.keep_turns,
+            "keep_turns":self.keep_turns,"max_rounds":self.max_rounds,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             // Null when never set (five minutes), so a client's default can
@@ -1256,7 +1267,7 @@ impl CompactionPlan {
             head.push(b',');
         }
         let mut tail = family.user_item(&format!(
-            "[compaction request] Write the summary of the conversation above now, following your instructions. Keep the summary within {summary_bytes} UTF-8 bytes; be shorter when possible."
+            "[compaction request] Write the summary of the conversation above now, following your instructions. Keep the summary within {summary_bytes} UTF-8 bytes."
         ))?;
         tail.insert(0, b',');
         Ok((head, tail))
@@ -1266,7 +1277,7 @@ impl CompactionPlan {
     /// in it, since the copy keeps the bot's own.
     pub fn request(family: Family, instructions: &str, summary_bytes: usize) -> Result<Vec<u8>> {
         let mut request = family.user_item(&format!(
-            "[compaction request] Write the summary of the conversation above now, following these instructions, without calling tools. Keep the summary within {summary_bytes} UTF-8 bytes; be shorter when possible.\n\n{instructions}"
+            "[compaction request] Write the summary of the conversation above now, following these instructions, without calling tools. Keep the summary within {summary_bytes} UTF-8 bytes.\n\n{instructions}"
         ))?;
         request.insert(0, b',');
         Ok(request)

@@ -8470,10 +8470,11 @@ impl App {
     ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
         let delivery = match queue {
-            true => Some("queue"),
-            false => (join || self.running.is_some()).then_some("steer"),
+            true => "queue",
+            false if join || self.running.is_some() => "steer",
+            false => "reject",
         };
-        let steer = delivery == Some("steer");
+        let steer = delivery == "steer";
         let model = (!steer).then(|| self.turn_model.clone()).flatten();
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
@@ -8820,7 +8821,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "model": self.turn_model,
+                        "prompt": question, "delivery": "reject", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await

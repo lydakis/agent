@@ -406,6 +406,7 @@ keep-warm when it sets any of them.
 | `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
 | `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
+| `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
@@ -1489,11 +1490,13 @@ Protocol 8 adds the turn view.
 ### Delivery modes
 
 `delivery` on `submit` says what happens when the bot is busy or the daemon
-is at `--max-active`. It is one field with four values; every mode returns
+is at `--max-active`. It is one required field with four values, since
+what a busy bot does with a message is the client's choice
+(`invalid_delivery` without it); every mode returns
 the turn's id and handle at once, and `wait`, `turns`, and
 `interrupt` work on the turn unchanged.
 
-- `reject` (default): `bot_busy` while a turn runs or is parked,
+- `reject`: `bot_busy` while a turn runs or is parked,
   `active_agent_limit` when no slot is free. Nothing is written. The
   `bot_busy` detail says what is in the way (`turn N is running`, or
   `earlier work is waiting`) and which requests get past it, in this
@@ -1623,7 +1626,7 @@ queued work as `bot_busy`. `stats` reports queued and ready turns together
 as `queued_turns`, a count the storage worker keeps at each transition
 and recounts at open, so admission and `stats` cost the store nothing.
 `agent run --delivery MODE` sets the field, defaulting
-to `AGENT_DELIVERY` in the client's environment, never in the daemon; with
+to `AGENT_DELIVERY` in the client's environment, then `reject`; with
 `--detach` a peer can hand a busy bot work or a mid-turn message without
 racing on `bot_busy`.
 
@@ -1864,8 +1867,10 @@ completion, failure, explicit interruption, or parking, and accumulate across
 resumption. A hard process kill can lose the current segment's unflushed
 counters. Retries are on by default because they cannot repeat an effect; what they can repeat is
 billing for a failed attempt, which is recorded as failed usage. Successful
-model responses and failures with reported usage share the durable limit of
-200 model rounds per turn, including across parking and restart. The last
+model responses and failures with reported usage share the bot's durable
+limit of model rounds per turn, its `max_rounds` setting (unset, none: the
+turn's token budget bounds a runaway instead), including across parking and
+restart. The last
 of them, a retry included when a billed failure made it the last, goes with the bot's tools shown but `tool_choice` `none` (both
 families), so the model must answer in words, and the turn ends on that reply
 instead of failing with its work done and unreported; a live
@@ -2188,13 +2193,8 @@ retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
-holds, wherever it appears; the value printed after a field name ending in
-`secret`, `secret_key`, `secret_access_key`, `session_token`, `access_token`,
-`refresh_token`, `id_token`, `auth_token`, `api_key`, `password`, `passwd` or
-`private_key` (any case, with or without `_` or `-`, as `NAME=`, `NAME:` or
-`"NAME":`), when it is at least 8 bytes of letters and digits both, so a
-credential tool's JSON or a credentials file never reaches the model or the
-store; and the body of a PEM private key block. Results include separate output, exit code, and
+holds, wherever it appears. What else counts as a secret is the client's
+judgement, not the daemon's: nothing else is rewritten. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. A command's return,
 timeout, or overflow kills its owned process group, so a process it started
 with `&` does not outlive it; the tool description tells the model so. A
@@ -2437,7 +2437,10 @@ Either way the call's `arguments` are `{"input": TEXT}` and its answer is
 the provider's custom tool output where it has one. The grammar counts
 toward the 64 KiB. A client's code-running tool is one.
 
-Protocol version 24 adds `item` to `text_delta` and `thinking_delta`, so a
+Protocol version 24 makes `delivery` a required `submit` field
+(`invalid_delivery` names the four), since the daemon has no opinion of
+its own on what a busy bot does with a message.
+It adds `item` to `text_delta` and `thinking_delta`, so a
 client draws each message a call streams apart, as it is kept (see
 `follow` above). It also reports an unset `cache_ttl` in `inspect`'s
 `settings` as `null` rather than `"5m"`, so a client tells a lifetime

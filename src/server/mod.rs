@@ -3911,8 +3911,18 @@ impl Service {
                 if prompt.len() > 256 * 1024 {
                     return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
                 }
+                // What a busy bot does with it is the client's to say.
                 let delivery = match delivery.as_deref() {
-                    None => Delivery::Reject,
+                    None => {
+                        return Err(Error::with(
+                            "invalid_delivery",
+                            format!(
+                                "delivery is required: one of {}",
+                                Delivery::NAMES.join(", ")
+                            ),
+                        )
+                        .facts(json!({"deliveries":Delivery::NAMES})));
+                    }
                     Some(mode) => Delivery::requested(mode)?,
                 };
                 if expected_turn.is_some() && delivery != Delivery::Steer {

@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
         startup: true,
     },
     Command {
@@ -374,6 +374,10 @@ fn print_flags(flags: &str) {
             ),
             "--context-bytes" => ("N", "A new bot's model context bytes; default 8 MiB"),
             "--context-items" => ("N", "A new bot's model context items; default 4096"),
+            "--max-rounds" => (
+                "N",
+                "Model calls each of a new bot's turns may make, the last with no tool call; default unbounded",
+            ),
             "--note-turns" => (
                 "N",
                 "Omitted turns a new bot's context note lists; 0 lists none; default 48",

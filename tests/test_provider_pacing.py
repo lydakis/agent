@@ -91,10 +91,10 @@ class ProviderPacingTests(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.binary = root/'.local/target/release/agent'
 
-    def client(self, suffix='', extra=()):
+    def client(self, suffix='', extra=(), settings=None):
         client = Client(self.binary, self.path/f'store{suffix}.sqlite',
                         f'http://127.0.0.1:{self.server.server_port}/v1',
-                        extra=extra, settings={'max_output_tokens': 800})
+                        extra=extra, settings={'max_output_tokens': 800, **(settings or {})})
         self.addCleanup(client.close, kill=True)
         return client
 
@@ -172,11 +172,12 @@ class ProviderPacingTests(unittest.TestCase):
     def test_billed_retries_share_the_durable_turn_round_limit(self):
         # Exercise the limit ending on a successful tool plan and on a billed
         # failure. Committed tools still run; no 201st request reaches the model.
+        # The bound is the bot's own: unset, a turn has none.
         for mode, retries in (('rounds', 100), ('rounds-failure', 99)):
             with self.subTest(mode=mode):
                 self.server.calls = 0
                 self.server.mode = mode
-                client = self.client(mode)
+                client = self.client(mode, settings={'max_rounds': 200})
                 turn = self.submit(client, 'A')
                 done = client.receive(lambda e: e.get('event') == 'turn_finished'
                                       and e.get('turn') == turn, timeout=30)

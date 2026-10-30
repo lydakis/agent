@@ -38,7 +38,6 @@ use std::{
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-pub const MAX_ROUNDS: usize = 200;
 /// The error a cancelled turn ends with, sent on its cancel channel: a
 /// client's interrupt, or the daemon shutting down around it.
 pub const INTERRUPTED: &str = "cancelled";
@@ -1096,7 +1095,8 @@ impl Turn {
         // Beside the call, a summary holds a copy's call and a request of
         // its own against the round limit. One a client asked for goes
         // before the call, as asked, and stays asked until it ends.
-        let beside = beside.filter(|_| !requested && fits && *model_rounds + 2 < MAX_ROUNDS);
+        let beside = beside
+            .filter(|_| !requested && fits && *model_rounds + 2 < self.settings().max_rounds());
         let mut spent = Accounting {
             route: accounting.route.clone(),
             ..Accounting::default()
@@ -1145,7 +1145,8 @@ impl Turn {
                         spent.beside = true;
                         accounting.summary_held = tokens;
                         *slot = Some(Box::pin(async move {
-                            let (before, start) = (record.tokens_used, MAX_ROUNDS - 2);
+                            let (before, start) =
+                                (record.tokens_used, self.settings().max_rounds() - 2);
                             let mut rounds = start;
                             let mut spent = Counted {
                                 spent,
@@ -1284,7 +1285,7 @@ impl Turn {
                     if let Some(context) = fits(self.fitted_context().await)? {
                         return Ok(Overflow::Fits(Box::new(context)));
                     }
-                    if *model_rounds >= MAX_ROUNDS {
+                    if *model_rounds >= self.settings().max_rounds() {
                         return Ok(Overflow::Stuck);
                     }
                 }
@@ -1598,7 +1599,7 @@ impl Turn {
             if !copied
                 || invalid.code == "compaction_summary_limit"
                 || record.exhausted().is_some()
-                || *model_rounds >= MAX_ROUNDS
+                || *model_rounds >= self.settings().max_rounds()
             {
                 self.compaction_failed(turn, &invalid).await?;
                 return Ok(Summary::Skipped);
@@ -2172,7 +2173,7 @@ impl Turn {
                             || *effort == record.effort)
                 })
         });
-        while model_rounds < MAX_ROUNDS {
+        while model_rounds < self.settings().max_rounds() {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
             self.settle_refresh(&mut record, accounting).await?;
@@ -2350,7 +2351,7 @@ impl Turn {
             if let Some(error) = record.exhausted() {
                 return Err(error);
             }
-            if model_rounds >= MAX_ROUNDS {
+            if model_rounds >= self.settings().max_rounds() {
                 return fail("tool_round_limit");
             }
             // The view fits the budget alone but not beside what goes ahead
@@ -2402,7 +2403,7 @@ impl Turn {
             // The round limit's last call goes with the tools shown but no
             // call allowed, so the turn ends on a reply rather than failing
             // with its work done and unreported.
-            let tool_calls = model_rounds + 1 < MAX_ROUNDS;
+            let tool_calls = model_rounds + 1 < self.settings().max_rounds();
             if !tool_calls {
                 self.hub
                     .live(
@@ -2859,7 +2860,10 @@ impl Turn {
             // A billed attempt that failed counts as a round: the retry that
             // is the turn's last allowed call goes without calls, as that
             // call would have.
-            if tool_calls && matches!(body, Body::Window(_)) && *model_rounds + 1 >= MAX_ROUNDS {
+            if tool_calls
+                && matches!(body, Body::Window(_))
+                && *model_rounds + 1 >= self.settings().max_rounds()
+            {
                 (tool_calls, warm_after) = (false, None);
                 self.hub
                     .live(
@@ -3110,9 +3114,10 @@ impl Turn {
             }
             // A retry is another billable call: none once failed usage has
             // spent the bot's or turn's budget, or the rounds are used up.
-            let capped = record
-                .exhausted()
-                .or_else(|| (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit")));
+            let capped = record.exhausted().or_else(|| {
+                (*model_rounds >= self.settings().max_rounds())
+                    .then(|| Error::new("tool_round_limit"))
+            });
             attempt += 1;
             let paced = agent_runtime::provider::paced(&error.code);
             let cap = if paced {
@@ -4672,7 +4677,7 @@ fn searches(record: &agent_runtime::store::Bot) -> bool {
 }
 
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
-    model_rounds < MAX_ROUNDS && record.exhausted().is_none()
+    model_rounds < record.settings.max_rounds() && record.exhausted().is_none()
 }
 
 /// Failures of the provider's pace, capacity, or transport, none of which say

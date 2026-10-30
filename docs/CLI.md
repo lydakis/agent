@@ -28,7 +28,10 @@ PATTERN`, repeatable, leaves out more: every variable whose name matches, with
 starts a daemon passes it Codex's `[shell_environment_policy]` from
 `~/.agent/config.toml`: each name in `exclude`, and `*KEY*`, `*SECRET*` and
 `*TOKEN*` too with `ignore_default_excludes = false`. As in Codex, those three
-are kept by default. A running daemon keeps the excludes it started with, and
+are kept by default. It also leaves out the variables that name the
+terminal it was started in (`TMUX`, `TMUX_PANE`, Rex's, Herdr's and cmux's
+places, `agent_client::TERMINAL_PLACES`), so a bot's command never lands in
+that terminal. A running daemon keeps the excludes it started with, and
 a variable a bot or caller sets with `--env` is still set.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.

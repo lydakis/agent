@@ -358,6 +358,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--compact-at"
                     | "--compact-keep"
                     | "--compact-tokens"
+                    | "--max-rounds"
                     | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -862,6 +863,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     }
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
+    }
+    for name in agent_client::TERMINAL_PLACES {
+        command.arg("--shell-exclude").arg(name);
     }
     for pattern in config()?.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
@@ -1563,7 +1567,7 @@ fn run(options: &Options) -> Result<i32> {
                 "workspace":options.workspace.as_ref().and(workspace.as_ref()),
                 "model":if created { Value::Null } else { json!(options.model) },
                 "effort":if created { Value::Null } else { json!(options.effort) },
-                "delivery":options.delivery,"expected_turn":options.turn,"from":from,
+                "delivery":options.delivery.as_deref().unwrap_or("reject"),"expected_turn":options.turn,"from":from,
                 "budget_tokens":options.turn_budget_tokens}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
