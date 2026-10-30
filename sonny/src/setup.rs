@@ -724,7 +724,7 @@ fn undated(id: &str) -> Option<&str> {
 }
 
 /// One line typed after `prompt`, trimmed.
-fn line(prompt: &str) -> Result<String, String> {
+pub(crate) fn line(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();

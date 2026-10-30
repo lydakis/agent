@@ -1010,7 +1010,7 @@ pub fn cron(expression: &str) -> Result<When, String> {
     })
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -1432,7 +1432,7 @@ fn on_calendar(entry: &Entry) -> String {
 /// One word of a unit's command or environment, as systemd reads it back:
 /// C escapes inside double quotes, `%` doubled for its specifiers and, in a
 /// command, `$` doubled for its variables.
-fn quoted(text: &str, command: bool) -> String {
+pub(crate) fn quoted(text: &str, command: bool) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {

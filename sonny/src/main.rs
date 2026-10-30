@@ -25,6 +25,7 @@ mod embed;
 mod exec;
 mod herdr;
 mod highlight;
+mod home;
 mod html;
 mod image;
 mod js;
@@ -749,6 +750,18 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "home" => {
+            return std::process::ExitCode::from(home::cli(rest) as u8);
+        }
+        Some((verb, rest))
+            if verb == "setup" && rest.first().is_some_and(|step| step == "backup") =>
+        {
+            match &rest[1..] {
+                [] => home::Places::home().and_then(|places| home::set_up(&places, None)),
+                [url] => home::Places::home().and_then(|places| home::set_up(&places, Some(url))),
+                _ => Err(format!("usage: {}", home::USAGE)),
+            }
+        }
         Some((verb, rest)) if verb == "setup" && rest.is_empty() => {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -790,6 +803,7 @@ async fn run() -> Result<(), String> {
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
     trigger::at_start();
+    home::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
