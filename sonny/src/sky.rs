@@ -49,6 +49,8 @@ const TWINKLE: Duration = Duration::from_millis(350);
 const HALF_LIFE: f32 = 0.9;
 /// Pairs that talked, the newest kept as faint curves.
 const TALKS: usize = 96;
+/// Queued prompts remembered so their start does not spark again.
+const SENT: usize = 1024;
 /// Lines of what happened under the sky.
 const TICKER: usize = 5;
 
@@ -168,8 +170,7 @@ impl View {
         self.task.abort();
     }
 
-    /// Follow again after a pause: the agents read afresh, who talked
-    /// to whom kept.
+    /// Follow again after a pause, from a fresh listing.
     pub fn resume(&mut self) {
         if !self.task.is_finished() && !self.paused {
             return;
@@ -178,6 +179,13 @@ impl View {
         let (send, feed) = mpsc::unbounded_channel();
         self.feed = feed;
         self.task = tokio::spawn(follow(self.socket.clone(), send));
+        // Read afresh: agents removed meanwhile go, and who talked to whom
+        // is read again from the turns kept.
+        self.agents.clear();
+        self.index.clear();
+        self.talks.clear();
+        self.sent.clear();
+        self.laid = false;
         self.sparks.clear();
         self.live = false;
         self.down = None;
@@ -299,8 +307,21 @@ impl View {
                     self.agents[at].running = Some(turn);
                     self.agents[at].sender = Some(from);
                 }
-                if !self.sent.insert((name.to_owned(), sent_turn)) {
-                    return;
+                // A queued prompt sparks when sent; its start, or the steer
+                // taking it, is the same message and ends the watch for it.
+                let key = (name.to_owned(), sent_turn);
+                if live {
+                    let again = match kind {
+                        "queued" => !self.sent.insert(key),
+                        _ => self.sent.remove(&key),
+                    };
+                    if again {
+                        return;
+                    }
+                    // Prompts queued and dropped unstarted are let go.
+                    if self.sent.len() > SENT {
+                        self.sent.clear();
+                    }
                 }
                 if let End::Agent(by) = from
                     && by != at
@@ -1218,6 +1239,22 @@ mod tests {
         let cart = view.index["shop.cart"];
         assert_eq!(view.agents[cart].made_by.as_deref(), Some("shop.lead"));
         assert_eq!(view.sparks.last().map(|s| s.to), Some(End::Person));
+    }
+
+    #[tokio::test]
+    async fn a_view_put_aside_reads_its_agents_afresh_when_back() {
+        let (mut view, send) = view();
+        send.send(Feed::Bots(vec![json!({"name": "gone"})]))
+            .unwrap();
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "gone", "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        view.pause();
+        view.resume();
+        view.drain();
+        assert!(view.agents.is_empty() && view.sent.is_empty());
     }
 
     #[test]
