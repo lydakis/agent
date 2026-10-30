@@ -242,7 +242,7 @@ fn is_inherited(inherit: &bool) -> bool {
     *inherit
 }
 /// The most tools a bot may have declared, and the most bytes they take.
-pub const MAX_DECLARED: usize = 16;
+pub const MAX_DECLARED: usize = 32;
 pub const DECLARED_BYTES: usize = 64 * 1024;
 /// How long an answered call waits by default, and at most.
 pub const ANSWER_EXPIRE_MS: u64 = 60_000;

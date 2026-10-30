@@ -1273,6 +1273,11 @@ a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.
 
+Protocol 24 lets a bot declare up to 32 tools, from 16, under the same 64 KiB
+of declarations: a Sonny lead with MCP servers already declared 15 of Sonny's
+and `exec`, so one more of Sonny's, the commons, or one of a client's own,
+went past the bound. The count is a sanity bound; the bytes are the real one.
+
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure
 cancel the old replay. Notifications already queued can precede the operation's
@@ -1287,8 +1292,13 @@ service created. Do not replace ownership-lock files while a service runs.
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
-delivered only to live followers and carry `durable:false`, as do the `pruned`
-and `deleted` retention notices. Durable event kinds
+delivered only to live followers and carry `durable:false`, and an `item`
+naming the output item they stream, a number that grows through the turn:
+deltas with the same `item` are one message (or one block of thinking) as
+its `message` event keeps it, and a larger `item` starts the next, as Codex
+streams a response's items apart. A call retried or resumed after a park
+streams its items again under the same numbers. The `pruned`
+and `deleted` retention notices carry `durable:false` too. Durable event kinds
 are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview, and `approvals` and the planning `node`
@@ -2389,6 +2399,10 @@ must take `input` as a required string (`invalid_declare` otherwise).
 Either way the call's `arguments` are `{"input": TEXT}` and its answer is
 the provider's custom tool output where it has one. The grammar counts
 toward the 64 KiB. A client's code-running tool is one.
+
+Protocol version 24 adds `item` to `text_delta` and `thinking_delta`, so a
+client draws each message a call streams apart, as it is kept (see
+`follow` above).
 
 ### Tool approval
 

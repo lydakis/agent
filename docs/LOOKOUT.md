@@ -43,7 +43,22 @@ just before the oldest one whose news it has not told yet. A lookout that
 starts again, after a crash or a lost connection, takes what happened after
 that cursor as news, so a task that finished while no lookout ran, or whose
 news waited on a busy lead, still reaches its lead; news told already may
-be told again.
+be told again. Beside it, the file keeps where the stream starts again:
+just before the oldest turn still under way among the bots its subscribers
+watch, as a consumer commits its offset only up to its oldest record still
+in work. What came between is replayed as history, so who asked for a turn,
+what a subscriber waits on and a task's resolving are known when the turn
+ends. It never reads the whole log again; only a lookout with no cursor yet
+reads it all, once, as history rather than news.
+
+It is built to stay light with thousands of bots, as a Kubernetes
+controller is with a large cluster. Each event reaches only the
+subscribers that watch its bot, or every one for a bot made or deleted,
+and each checks that one bot alone. Each subscriber keeps only the bots it
+watches. Notes and status checks go to the daemon beside the stream, so no
+call to it holds the events up. `bench/lookout_scale.py` measures it with
+up to thousands of streaming bots. When the daemon lets go of it
+(`disconnected` in its log), it connects again from its cursor.
 
 ## What it tells
 
