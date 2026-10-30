@@ -300,6 +300,7 @@ class AcpTests(ModelFixture):
             'openai/synthetic-model\nopenai/other-model # faster\nanthropic/claude-x\n')
         # The provider lists a model the file does not name yet.
         self.model.models = ('synthetic-model', 'other-model', 'newer-model')
+        self.model.model_names = {'newer-model': 'Newer Model'}
         self.model.context_window = 1_000_000
         thread, session = self.open(repo)
         option, effort = self.opened['result']['configOptions']
@@ -309,7 +310,13 @@ class AcpTests(ModelFixture):
         self.assertEqual([c['value'] for c in option['options']],
                          ['default', 'openai/synthetic-model', 'openai/other-model', 'openai/newer-model',
                           'anthropic/claude-x'])
-        self.assertEqual(option['options'][2]['description'], 'faster')
+        # Shown by the name the provider lists, else the model's own id,
+        # beside the provider; the full id is in the description.
+        self.assertEqual([c['name'] for c in option['options'][1:]],
+                         ['synthetic-model · openai', 'other-model · openai', 'Newer Model · openai',
+                          'claude-x · anthropic'])
+        self.assertEqual(option['options'][2]['description'], 'faster (openai/other-model)')
+        self.assertEqual(option['options'][3]['description'], 'openai/newer-model')
         self.assertEqual((effort['id'], effort['category'], effort['currentValue']),
                          ('effort', 'thought_level', 'default'))
         self.assertEqual([c['value'] for c in effort['options']],
