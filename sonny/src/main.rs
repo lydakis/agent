@@ -142,6 +142,10 @@ const REFERENCE_PAGES: usize = 25;
 /// tables too, which most style guides keep within 100 (rustfmt's own
 /// width), so they stay whole at 100 and prose stays near the measure.
 const PROSE: usize = 100;
+
+/// The blank columns between the conversation and the line beside it,
+/// matched on the pane's side, as the conversation's own rows open.
+const GUTTER: u16 = 2;
 /// How long a side chat's copy stays once idle.
 /// What follows a guess at the next message in the composer.
 const TAB: &str = "  tab";
@@ -7110,7 +7114,7 @@ impl App {
             .iter()
             .map(|(key, does)| {
                 Line::from(vec![
-                    Span::raw(format!("{key:width$}  ")),
+                    Span::raw(format!(" {key:width$}  ")),
                     Span::raw(*does).dim(),
                 ])
             })
@@ -7440,13 +7444,14 @@ impl App {
         };
         // The margin where the conversation leaves room for it, or while
         // the keys are in it; out of the way otherwise.
-        let margin = pane::margin_width(area.width, PROSE as u16);
+        let prose = PROSE as u16 + GUTTER;
+        let margin = pane::margin_width(area.width, prose);
         if open.is_margin() && margin.is_none() && !self.pane_keys {
             return (area, None);
         }
         let pane = match margin.filter(|_| open.is_margin()) {
             Some(margin) => margin,
-            None => pane::width(area.width, PROSE as u16),
+            None => pane::width(area.width, prose),
         };
         if pane == area.width {
             return match self.pane_keys {
@@ -7454,13 +7459,16 @@ impl App {
                 false => (area, None),
             };
         }
+        // A gutter each side of the line between them: the conversation
+        // stops short of it, and the pane, whose rows open with a space of
+        // their own, starts a column after it.
         let chat = Rect {
-            width: area.width - pane - 1,
+            width: (area.width - pane - 1).saturating_sub(GUTTER),
             ..area
         };
         let pane = Rect {
-            x: area.right() - pane,
-            width: pane,
+            x: area.right() - pane + 1,
+            width: pane - 1,
             ..area
         };
         (chat, Some(pane))
@@ -8977,7 +8985,7 @@ impl App {
                 // The line between them, as a split's.
                 if area.width > 0 {
                     let line = Rect {
-                        x: area.right(),
+                        x: area.right() + GUTTER,
                         width: 1,
                         ..at
                     };
@@ -13290,13 +13298,14 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
-        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(69)));
+        // The conversation's 100, a gutter each side of the line, the rest.
+        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, margin), (130, None));
         // Asked for with Tab, it takes its half as anything opened does.
         app.pane_keys = true;
         let (_, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(margin.map(|m| m.width), Some(64));
+        assert_eq!(margin.map(|m| m.width), Some(63));
         // A note's marker clicked shows it there too.
         app.pane_keys = false;
         app.follow("sonny:note/repro");
