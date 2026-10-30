@@ -572,13 +572,23 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   ring, the agents each one made fanned out behind it, you in the middle.
   Live, a message flies as a spark (yours from the middle, another agent's
   across, a follow's or an automation's in from the rim), a commons post
-  ripples out, a tool call twinkles, and whoever was lit fades. Faint lines
-  join who made whom and who talked to whom; the last messages are listed
-  under the sky. `sonny sky` draws the same sky on its own, in the whole
-  terminal, to keep in another one beside the work; `q` leaves it, and a
-  daemon that goes is followed again once it is back.
+  ripples out, a tool call twinkles in a shape for its kind (a shell's
+  streak across, a file's up and down, the web's corners, any other tool's
+  star), and whoever was lit fades. Dotted lines join who made whom and who
+  talked to whom; the last messages are listed under the sky. Each agent
+  shows the state table's mark and colour: working cyan `●`, needs you
+  yellow `?` (an ask, or an approval waiting), failed red `✗`; the footer
+  counts them the same way. Under 60 columns or 24 rows the sky becomes a
+  list, a firefly per agent and the last it said or was told.
+  `sonny sky` draws the same sky on its own, in the whole terminal, to keep
+  in another one beside the work; `q` leaves it, and a daemon that goes is
+  followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
+
+  ![/sky with states](../docs/sonny/sky-states.png)
+
+  ![/sky in a small pane](../docs/sonny/sky-list.png)
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns end and what arrives meanwhile waits, across restarts too.
   Every window says who paused and why. Agents pull the same cord with

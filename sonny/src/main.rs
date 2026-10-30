@@ -9329,7 +9329,7 @@ impl App {
                     })
                     .collect();
                 pane.set_card(lines, STATUS_KEYS);
-                pane.foot = Some(Line::from(format!("  {}", view.footer())).dim());
+                pane.foot = Some(view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
                 // kept in view under it.
