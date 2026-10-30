@@ -4625,9 +4625,13 @@ impl Database {
     /// are merged by node ID, which only falls along a lineage, so a node
     /// two histories share, as a fork shares its source's, comes up in
     /// both at once and is searched once, under the oldest bot that has it;
-    /// a node only one has is that one's. Nothing is kept but each walk's
-    /// place and the matches. `skip` is the turn the search runs in, left
-    /// out. With `before`, only older nodes are searched. Once
+    /// a node only one has is that one's. From a node two walks share on,
+    /// the rest of both is the same, so only the oldest bot's walk goes on:
+    /// each node is read once however many bots have it, and the next one
+    /// to read is taken from a heap of the walks, so a step costs the log
+    /// of how many there are. A walk is only the node it is at; it starts
+    /// once the merge reaches its head. `skip` is the turn the search runs
+    /// in, left out. With `before`, only older nodes are searched. Once
     /// `HISTORY_MATCHES` matches are listed or `HISTORY_SEARCH_BYTES` of
     /// items searched, `next_before` says where to go on from.
     pub fn history_search_bots(
@@ -4659,51 +4663,36 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         #[derive(Clone, Copy)]
         struct Node {
-            id: i64,
+            parent: Option<i64>,
             /// The turn a turn's first node starts, and its number in the
             /// lineage.
             starts: Option<(i64, i64)>,
             size: i64,
         }
-        fn next(rows: &mut rusqlite::Rows<'_>) -> Result<Option<Node>> {
-            Ok(match rows.next()? {
-                Some(r) => Some(Node {
-                    id: r.get(0)?,
+        // It reads no item.
+        let mut node = self.conn.prepare_cached(
+            "SELECT parent,turn,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?",
+        )?;
+        let mut read = |id: i64| -> Result<Node> {
+            Ok(node.query_row([id], |r| {
+                Ok(Node {
+                    parent: r.get(0)?,
                     starts: r.get::<_, Option<i64>>(1)?.zip(r.get::<_, Option<i64>>(2)?),
                     size: r.get(3)?,
-                }),
-                None => None,
-            })
-        }
-        // Each walk is its own cursor, read from the head down only while
-        // the merge needs it; it reads no item.
-        let mut statements = Vec::with_capacity(bots.len());
-        for _ in &bots {
-            statements.push(self.conn.prepare(
-                "WITH RECURSIVE chain(id,parent,depth,turn,turn_seq,size) AS (
-                    SELECT id,parent,depth,turn,turn_seq,COALESCE(length(item),0) FROM nodes WHERE id=?1
-                    UNION ALL SELECT n.id,n.parent,n.depth,n.turn,n.turn_seq,COALESCE(length(n.item),0)
-                    FROM nodes n JOIN chain c ON n.id=c.parent ORDER BY 3 DESC)
-                 SELECT id,turn,turn_seq,size FROM chain",
-            )?);
-        }
-        struct Walk<'s> {
-            rows: rusqlite::Rows<'s>,
-            at: Option<Node>,
-            /// Its matches whose turn its walk has not reached the start of
-            /// yet, with their node IDs.
-            found: Vec<(i64, Value)>,
-        }
-        let mut walks = Vec::with_capacity(bots.len());
-        for (statement, (_, head)) in statements.iter_mut().zip(&bots) {
-            let mut rows = statement.query([head])?;
-            let at = next(&mut rows)?;
-            walks.push(Walk {
-                rows,
-                at,
-                found: Vec::new(),
-            });
-        }
+                })
+            })?)
+        };
+        /// Its matches whose turn its walk has not reached the start of
+        /// yet, with their node IDs and the bots they are of.
+        type Found = Vec<(i64, usize, Value)>;
+        // The node each walk is at, newest first and, at one node, the
+        // oldest bot's first.
+        let mut heap: std::collections::BinaryHeap<(i64, std::cmp::Reverse<usize>)> = bots
+            .iter()
+            .enumerate()
+            .map(|(walk, (_, head))| (*head, std::cmp::Reverse(walk)))
+            .collect();
+        let mut found: Vec<Found> = vec![Vec::new(); bots.len()];
         let needle = query.to_ascii_lowercase();
         // As `history_search` reads: the view decides what matches.
         let mut contains = self.conn.prepare_cached(
@@ -4720,62 +4709,67 @@ impl Database {
         // since; those of the turn being searched are dropped.
         let mut listed = 0;
         let mut matches: Vec<(i64, Value)> = Vec::new();
-        let mut name = |walk: &mut Walk<'_>, name: &str, listed: &mut usize| {
-            let Some((turn, number)) = walk.at.and_then(|at| at.starts) else {
+        let mut name = |found: &mut Found, at: &Node, listed: &mut usize| {
+            let Some((turn, number)) = at.starts else {
                 return;
             };
-            for (node, mut found) in walk.found.drain(..) {
+            for (node, bot, mut found) in found.drain(..) {
                 if Some(turn) == skip {
                     *listed -= 1;
                     continue;
                 }
                 found["turn"] = json!(number);
-                found["handle"] = json!(format!("turn:{name}/{turn}"));
+                found["handle"] = json!(format!("turn:{}/{turn}", bots[bot].0));
                 matches.push((node, found));
             }
         };
         let mut searched = 0_u64;
         let mut next_before = None;
-        while let Some(top) = walks.iter().filter_map(|w| w.at.map(|at| at.id)).max() {
+        while let Some((top, std::cmp::Reverse(walk))) = heap.pop() {
             if listed >= HISTORY_MATCHES || searched >= HISTORY_SEARCH_BYTES {
+                heap.push((top, std::cmp::Reverse(walk)));
                 next_before = Some(top + 1);
                 break;
             }
-            let mut credited = false;
-            for (walk, (bot, _)) in walks.iter_mut().zip(&bots) {
-                let Some(at) = walk.at.filter(|at| at.id == top) else {
-                    continue;
-                };
-                if !credited && before.is_none_or(|before| top < before) {
-                    searched += at.size as u64;
-                    if contains.query_row(params![top, needle], |r| r.get::<_, bool>(0))? {
-                        let (text, kind): (String, Option<String>) =
-                            reading.query_row([top], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                        if let Some(at) = text.to_ascii_lowercase().find(&needle) {
-                            walk.found.push((
-                                top,
-                                json!({"bot":bot,"type":kind,"text":around(&text, at, needle.len())}),
-                            ));
-                            listed += 1;
-                        }
+            // The other walks here end in this one, the oldest bot's.
+            while let Some(&(id, std::cmp::Reverse(other))) = heap.peek()
+                && id == top
+            {
+                heap.pop();
+                let theirs = std::mem::take(&mut found[other]);
+                found[walk].extend(theirs);
+            }
+            let at = read(top)?;
+            if before.is_none_or(|before| top < before) {
+                searched += at.size as u64;
+                if contains.query_row(params![top, needle], |r| r.get::<_, bool>(0))? {
+                    let (text, kind): (String, Option<String>) =
+                        reading.query_row([top], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    if let Some(at) = text.to_ascii_lowercase().find(&needle) {
+                        let bot = &bots[walk].0;
+                        found[walk].push((
+                            top,
+                            walk,
+                            json!({"bot":bot,"type":kind,"text":around(&text, at, needle.len())}),
+                        ));
+                        listed += 1;
                     }
                 }
-                credited = true;
-                name(walk, bot, &mut listed);
-                walk.at = next(&mut walk.rows)?;
+            }
+            name(&mut found[walk], &at, &mut listed);
+            if let Some(parent) = at.parent {
+                heap.push((parent, std::cmp::Reverse(walk)));
             }
         }
         // Matches whose turn starts further down: read on to its start.
-        for (walk, (bot, _)) in walks.iter_mut().zip(&bots) {
-            loop {
-                name(walk, bot, &mut listed);
-                if walk.found.is_empty() {
-                    break;
-                }
-                walk.at = next(&mut walk.rows)?;
+        for (mut id, std::cmp::Reverse(walk)) in heap.into_vec() {
+            while !found[walk].is_empty() {
+                let at = read(id)?;
+                name(&mut found[walk], &at, &mut listed);
                 // A history's first nodes may start no turn.
-                if walk.at.is_none() {
-                    walk.found.clear();
+                match at.parent {
+                    Some(parent) => id = parent,
+                    None => found[walk].clear(),
                 }
             }
         }

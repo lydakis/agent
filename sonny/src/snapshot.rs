@@ -276,6 +276,13 @@ static CHECKOUTS: std::sync::LazyLock<
 static GONE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// How many snapshots run at once, across every checkout: each reads its
+/// whole checkout, so many turns ending together wait their turn rather
+/// than all read the disk at once.
+static AT_ONCE: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
+    tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()))
+});
+
 fn gone(bot_id: i64) -> bool {
     (GONE.lock().unwrap_or_else(|e| e.into_inner())).contains(&bot_id)
 }
@@ -307,6 +314,9 @@ pub async fn after_turn(
         return;
     };
     let _held = lock.lock().await;
+    let Ok(_running) = AT_ONCE.acquire().await else {
+        return;
+    };
     if gone(bot_id) {
         return;
     }
