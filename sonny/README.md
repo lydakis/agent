@@ -532,7 +532,14 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   lead does not wait: it goes on with the option it recommends when that
   can be undone, or ends its turn. Open questions are read from the
   history Sonny replays (its `ask` calls not yet answered), so one asked
-  while Sonny was closed is answered the same way when it opens.
+  while Sonny was closed is answered the same way when it opens. A yellow
+  bar down its left side sets it apart from the replies around it. A task
+  asks the same way: its lead hears the question in its task updates
+  (`shop.wire asks you`), the task's row reads `needs you`, and a click on
+  it opens the task in the pane, where an option's click answers the task
+  itself.
+
+  ![A task's question: the lead's task updates say the task asks, and the task opened in the pane shows the decision with a bar down its side](../docs/sonny/ask-from-task.png)
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`

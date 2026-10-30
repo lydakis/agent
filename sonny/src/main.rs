@@ -10194,10 +10194,10 @@ mod tests {
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         let at = rows
             .iter()
-            .position(|r| r == "? Tag 0.4.1?")
+            .position(|r| r == "┃ Tag 0.4.1?")
             .expect("asked");
-        assert_eq!(rows[at + 4], "     Brew gets it tonight.");
-        assert_eq!(rows[at + 8], "  Why 1: Nothing else is due.");
+        assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
+        assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
         assert!(app.asks.is_empty());

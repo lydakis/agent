@@ -115,7 +115,7 @@ fn note(told: &updates::Told, steer: bool) -> String {
         lines.push("A quoted message is the person's own words.".to_owned());
     }
     if told.items.iter().any(|line| line.text.contains("\n  > ")) {
-        lines.push("Lines marked > are a task's own reply, not the person's words.".to_owned());
+        lines.push("Lines marked > are a task's own words, not the person's.".to_owned());
     }
     lines.push(match steer {
         true => "This cuts into your turn because the person wrote in a task: act on their \
@@ -2323,7 +2323,7 @@ mod tests {
         let note = note(&told, false);
         assert!(note.contains(
             "- calc.fix: turn:calc.fix/4 completed, asked by you, and replied:\n  > Fixed avg.\n  > - skips empty lists\n\
-             Lines marked > are a task's own reply, not the person's words.\n"
+             Lines marked > are a task's own words, not the person's.\n"
         ), "{note}");
         assert!(!note.contains("early"));
     }
