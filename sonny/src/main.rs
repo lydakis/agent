@@ -17,6 +17,7 @@ mod banner;
 mod cache;
 mod calls;
 mod cmux;
+mod commons;
 mod config;
 mod declared;
 mod diff;
@@ -1474,7 +1475,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 19] = [
+const COMMANDS: [(&str, &str); 21] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1493,6 +1494,10 @@ const COMMANDS: [(&str, &str); 19] = [
     ("/status", "this project's agents"),
     ("/lead", "the folder's leads: open another, or make one"),
     (
+        "/goal",
+        "ask the agent to work until something is done; show or clear goals",
+    ),
+    (
         "/margin",
         "the agent's notes beside the conversation, shown or closed",
     ),
@@ -1500,6 +1505,7 @@ const COMMANDS: [(&str, &str); 19] = [
         "/background",
         "triggers and lookout subscriptions: fire or remove them",
     ),
+    ("/commons", "what the agents of every project share"),
     ("/usage", "the tokens the agents spent, over time"),
     ("/mcp", "the MCP servers agents' scripts call"),
     ("/config", "the settings in ~/.agent/config.toml"),
@@ -1570,6 +1576,8 @@ struct Watch {
     background: Option<background::View>,
     /// `/usage` holds it instead.
     usage: Option<usage::View>,
+    /// `/commons` holds it instead.
+    commons: Option<commons::View>,
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
@@ -5849,6 +5857,7 @@ impl App {
             resolved: false,
             background: None,
             usage: None,
+            commons: None,
             picked: None,
         });
         self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
@@ -5873,6 +5882,7 @@ impl App {
             resolved: false,
             background: Some(view),
             usage: None,
+            commons: None,
             picked: None,
         });
         self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
@@ -5893,9 +5903,31 @@ impl App {
             resolved: false,
             background: None,
             usage: Some(view),
+            commons: None,
             picked: None,
         });
         self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
+    }
+
+    /// What the agents of every project share: `/commons` in the pane,
+    /// as `/status` is, until Esc.
+    fn commons(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.notice = Some("no HOME, so no commons".into());
+            return;
+        };
+        self.watch = Some(Watch {
+            project: self.scope().project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            lookout: String::new(),
+            resolved: false,
+            background: None,
+            usage: None,
+            commons: Some(commons::View::open(&home)),
+            picked: None,
+        });
+        self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
     }
 
     /// `view` read from the daemon again.
@@ -5912,6 +5944,13 @@ impl App {
     async fn reread(&mut self) {
         if let Some(watch) = &mut self.watch
             && let Some(view) = &mut watch.background
+        {
+            view.reload();
+            watch.read = Instant::now();
+            return;
+        }
+        if let Some(watch) = &mut self.watch
+            && let Some(view) = &mut watch.commons
         {
             view.reload();
             watch.read = Instant::now();
@@ -6638,6 +6677,39 @@ impl App {
                     _ => {
                         if view.key(*key) == background::Key::Close {
                             self.close_pane(true);
+                        }
+                    }
+                }
+                return true;
+            }
+            // `/commons` takes its own keys: picking a thread, reading it.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.commons.as_mut())
+            {
+                let reading = view.reading();
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::Up if reading => pane.screen.scroll(1),
+                    KeyCode::Down if reading => pane.screen.scroll(-1),
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown => pane.screen.page(false),
+                    KeyCode::Char(' ') if reading => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => {
+                        if view.key(*key) == commons::Key::Close {
+                            self.close_pane(true);
+                        } else if view.reading() != reading {
+                            // A thread opened or left starts at its top.
+                            pane.screen.hold(usize::MAX);
+                            if let Some(watch) = &mut self.watch {
+                                watch.picked = None;
+                            }
                         }
                     }
                 }
@@ -7629,6 +7701,11 @@ impl App {
             }
             return;
         }
+        if matches!(prompt.as_str(), "/commons" | "/forum") {
+            self.input.clear();
+            self.commons();
+            return;
+        }
         if prompt == "/usage" {
             self.input.clear();
             if self.options.side.is_some() {
@@ -7809,6 +7886,16 @@ impl App {
         {
             self.input.clear();
             self.lead_command(rest.trim()).await;
+            return;
+        }
+        // `/goal WHAT` goes to the agent as typed, which sets its goal.
+        if let Some(rest) = prompt
+            .strip_prefix("/goal")
+            .map(str::trim)
+            .filter(|rest| matches!(*rest, "" | "clear"))
+        {
+            self.input.clear();
+            self.notice = Some(self.goal_command(rest == "clear").await);
             return;
         }
         if let Some(question) = prompt
@@ -8260,6 +8347,44 @@ impl App {
         }
     }
 
+    /// `/goal` shows the goals of this agent and its tasks, and `/goal
+    /// clear` clears its own, as its goal tool would.
+    async fn goal_command(&mut self, clear: bool) -> String {
+        let arguments = match clear {
+            true => json!({"clear": self.bot}),
+            false => json!({}),
+        };
+        let said =
+            lookout::goals::call(&self.options.store, &self.client, &self.bot, &arguments).await;
+        match said {
+            Err(error) => error,
+            Ok(said) if clear => match said["cleared"] == true {
+                true => "goal cleared".into(),
+                false => "no goal to clear".into(),
+            },
+            Ok(said) => {
+                let goals = said["goals"].as_array().cloned().unwrap_or_default();
+                if goals.is_empty() {
+                    return "no goal; /goal WHAT asks the agent to work until WHAT is done".into();
+                }
+                let shown: Vec<String> = goals
+                    .iter()
+                    .map(|goal| {
+                        format!(
+                            "{}: done when {}",
+                            goal["bot"].as_str().unwrap_or_default(),
+                            goal["done_when"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "goals: {}; /goal clear clears this agent's",
+                    shown.join("; ")
+                )
+            }
+        }
+    }
+
     /// `/lead`: the folder's leads; `/lead NAME` opens this window on one,
     /// and `/lead new [NAME]` makes one and opens it.
     async fn lead_command(&mut self, rest: &str) {
@@ -8456,6 +8581,29 @@ impl App {
                 pane.foot = Some(view.footer());
                 // A new pick is scrolled to, with the two rows under it.
                 if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    pane.screen.keep_in_view(at, 2);
+                }
+            } else if let Some(view) = &watch.commons {
+                let (card, at) = view.card(width);
+                let lines: Vec<Line<'static>> = card
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, STATUS_KEYS);
+                pane.foot = Some(view.footer());
+                if view.reading() {
+                    // A thread just opened starts at its top, after the
+                    // card's swap kept the list's scroll.
+                    if watch.picked != Some(usize::MAX) {
+                        watch.picked = Some(usize::MAX);
+                        pane.screen.show_row(0, 0);
+                    }
+                } else if watch.picked != Some(at) {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -9768,6 +9916,58 @@ mod tests {
             2,
             "the person's and the copy's"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_words_go_to_the_agent_as_typed_and_goal_alone_shows_or_clears() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |asked| {
+            seen.lock().unwrap().push(asked.clone());
+            match asked["op"].as_str() {
+                Some("inspect") => json!({"bot_id": 1, "workspace": "/"}),
+                Some("submit") => json!({"turn": 1}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        let store = std::env::temp_dir().join(format!("goal-window-{}", std::process::id()));
+        app.options.store = store.clone();
+        app.input.set("/goal");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("no goal; /goal WHAT asks the agent to work until WHAT is done")
+        );
+        // The words reach the agent as the person typed them.
+        app.input.set("/goal the tests pass");
+        app.submit().await;
+        let ops = asked.lock().unwrap().clone();
+        let submits: Vec<_> = ops.iter().filter(|op| op["op"] == "submit").collect();
+        assert_eq!(submits.len(), 1);
+        assert!(submits[0].to_string().contains("/goal the tests pass"));
+        // The agent sets one with its tool; /goal shows it and clears it.
+        let set = json!({"set": {"done_when": "the tests pass", "check": "true"}});
+        lookout::goals::call(&store, &app.client, "b", &set)
+            .await
+            .unwrap();
+        app.input.set("/goal");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("goals: b: done when the tests pass; /goal clear clears this agent's")
+        );
+        app.input.set("/goal clear");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("goal cleared"));
+        assert!(lookout::goals::read(&store, "b").is_none());
+        app.input.set("/goal clear");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("no goal to clear"));
+        let ops = asked.lock().unwrap().clone();
+        assert_eq!(ops.iter().filter(|op| op["op"] == "submit").count(), 1);
+        std::fs::remove_dir_all(lookout::subs::dir(&store)).unwrap();
     }
 
     #[tokio::test]
@@ -11953,6 +12153,7 @@ mod tests {
             resolved: false,
             background: None,
             usage: None,
+            commons: None,
             picked: None,
         };
         // A named lead's window: its own row opens nothing, and the

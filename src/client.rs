@@ -123,10 +123,9 @@ struct Options {
     request: Option<i64>,
     tag: Option<String>,
     reason: Option<String>,
-    /// `approver`: the environment note file, the judge, and the Decisions API's URL.
+    /// `approver`: the environment note file and the judge.
     note: Option<PathBuf>,
     judge: Option<String>,
-    judge_url: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     /// A new bot's settings, as `create` takes them, and the flags that set them.
@@ -200,7 +199,6 @@ fn parse(args: &[String]) -> Result<Options> {
         reason: None,
         note: std::env::var_os("AGENT_APPROVER_NOTE").map(PathBuf::from),
         judge: None,
-        judge_url: None,
         daemon_flags: Vec::new(),
         settings: serde_json::Map::new(),
         settings_flags: Vec::new(),
@@ -282,7 +280,6 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--reason" => options.reason = Some(value),
                     "--note" => options.note = Some(PathBuf::from(value)),
-                    "--judge-url" => options.judge_url = Some(value),
                     "--judge" => options.judge = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
@@ -1886,9 +1883,6 @@ fn whole_arguments(connection: &mut Connection, calls: &mut [Value]) -> Result<(
 /// Allow or deny one gated call. The request number is required, so a
 /// decision made on what a person saw cannot land on a call announced
 /// again since.
-/// The Decisions API's key, which only the approver holds.
-const DECISIONS_KEY: &str = agent_runtime::tools::DECISIONS_KEY;
-
 /// The approver's note: a regular file no larger than a judge's whole
 /// state, opened without blocking so a FIFO cannot hold startup.
 fn note(path: &Path) -> Result<String> {
@@ -1932,8 +1926,6 @@ fn approver(options: &Options) -> Result<i32> {
         judge: (options.judge.clone()).or(config.judge.model),
         caller: env("AGENT_MODEL"),
         effort: (options.effort.clone()).or(config.judge.effort),
-        url: options.judge_url.clone(),
-        key: env(DECISIONS_KEY),
         note,
     })
 }

@@ -1,45 +1,18 @@
 //! The judge that `agent approver` and Sonny's lookout ask yes/no questions
-//! of: which one, picked in one order, and its two ways of answering. A
-//! judge named `openai-decisions/MODEL` is OpenAI's Decisions API, asked
-//! over HTTP; any other `provider/model` runs in the daemon, as a fork of
-//! an idle base bot that takes one turn, so checks run at once and none
-//! sees another. Either answers with each question's probability of yes.
+//! of: which one, picked in one order, and how it answers. A judge is a
+//! `provider/model` the daemon runs, as a fork of an idle base bot that
+//! takes one turn, so checks run at once and none sees another.
 use crate::{Client, Error};
 use serde_json::{Map, Value, json};
 use std::{
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
-/// The key OpenAI's Decisions API takes.
-pub const DECISIONS_KEY: &str = "OPENAI_API_KEY";
-/// Where OpenAI's Decisions API is, unless the caller points elsewhere.
-pub const DECISIONS_URL: &str = "https://api.openai.com";
-const DECISIONS: &str = "openai-decisions/";
-
-/// How a judge's name says it answers.
-#[derive(Debug, PartialEq)]
-pub enum Spec<'a> {
-    /// OpenAI's Decisions API, with this model.
-    Decisions(&'a str),
-    /// A `provider/model` the daemon runs, with the providers and logins
-    /// bots use.
-    Model(&'a str),
-}
-
-/// What a judge's name says it is: `None` when it is not `provider/model`.
-pub fn spec(name: &str) -> Option<Spec<'_>> {
-    let (provider, model) = name.split_once('/')?;
-    if provider.is_empty() || model.is_empty() {
-        return None;
-    }
-    Some(match name.strip_prefix(DECISIONS) {
-        Some(model) => Spec::Decisions(model),
-        None => Spec::Model(name),
-    })
+/// Whether a judge's name is `provider/model`, a model the daemon may run.
+pub fn is_model(name: &str) -> bool {
+    name.split_once('/')
+        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
 }
 
 /// Who judges for a bot running `caller`: the judge `named` by the caller
@@ -63,78 +36,12 @@ pub struct Usage {
     pub output: u64,
 }
 
-/// Why a judge gave no answers.
+/// Why a judge gave no answers: what failed in this check.
 #[derive(Debug, PartialEq)]
-pub enum Failed {
-    /// Its rate limit lasted past the deadline.
-    Overloaded,
-    /// The account is out of credit, which no wait fixes.
-    Quota,
-    /// This check failed, and why.
-    Check(String),
-}
+pub struct Failed(pub String);
 
 fn failed(why: impl Into<String>) -> Failed {
-    Failed::Check(why.into())
-}
-
-/// A check as a `POST /v1/decisions` body: `instructions` as the developer
-/// message, `text` as the user's, and each question a predicate named by
-/// its id.
-pub fn decisions_body(
-    model: &str,
-    instructions: &str,
-    text: &str,
-    questions: &[(String, String)],
-) -> Value {
-    json!({
-        "model": model,
-        "input": [
-            {"role": "developer", "content": [{"type": "input_text", "text": instructions}]},
-            {"role": "user", "content": [{"type": "input_text", "text": text}]},
-        ],
-        "questions": questions.iter()
-            .map(|(id, text)| json!({"type": "predicate", "name": id, "instructions": text}))
-            .collect::<Vec<_>>(),
-    })
-}
-
-/// A Decisions reply's answers, or why it is not one: a refusal of any
-/// question, by its id and what the API said, or a question missing or out
-/// of range.
-pub fn decisions_answers(reply: &Value, questions: &[(String, String)]) -> Result<Answers, String> {
-    let given = reply["answers"]
-        .as_array()
-        .ok_or("the judge's answer had no answers")?;
-    let mut answers = Map::new();
-    for answer in given {
-        let Some(name) = answer["name"].as_str() else {
-            continue;
-        };
-        match answer["type"].as_str() {
-            Some("refusal") => {
-                let mut said = answer.clone();
-                if let Some(said) = said.as_object_mut() {
-                    said.remove("name");
-                    said.remove("type");
-                }
-                return Err(format!("the judge refused {name}: {said}"));
-            }
-            Some("predicate") => {
-                if let Some(p) = answer["probability"]
-                    .as_f64()
-                    .filter(|p| (0.0..=1.0).contains(p))
-                {
-                    answers.insert(name.to_owned(), json!(p));
-                }
-            }
-            _ => {}
-        }
-    }
-    match questions.iter().all(|(id, _)| answers.contains_key(id)) {
-        true => Ok(answers),
-        false => Err("the judge's answer missed a question".into()),
-    }
+    Failed(why.into())
 }
 
 /// A general model's reply as answers: its JSON object, found in the
@@ -153,154 +60,6 @@ pub fn model_answers<'a>(reply: &str, ids: impl IntoIterator<Item = &'a str>) ->
         answers.insert(id.to_owned(), json!(p));
     }
     Some(answers)
-}
-
-/// The largest answer the Decisions API may send; a larger one is a failed check.
-const REPLY_BYTES: usize = 64 * 1024;
-/// First wait after a 429 or 529 without Retry-After, doubled each time.
-const BACKOFF: Duration = Duration::from_millis(250);
-const BACKOFF_MAX: Duration = Duration::from_secs(4);
-/// The longest Retry-After honored, past any check's deadline anyway.
-const RETRY_MAX_SECS: f64 = 60.0;
-
-/// OpenAI's Decisions API, which answers a check's questions with
-/// probabilities and bills input only.
-pub struct Decisions {
-    http: reqwest::Client,
-    url: String,
-    model: String,
-    key: String,
-    /// Shared by every check: after a 429 or 529 nobody asks before this.
-    backoff: Mutex<(Option<Instant>, Duration)>,
-}
-
-impl Decisions {
-    /// `model` at `url`, `DECISIONS_URL` when `None`, with `key`.
-    pub fn new(model: &str, url: Option<&str>, key: String) -> crate::Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("agent-client/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|_| Error::new("http_client_init"))?;
-        Ok(Self {
-            http,
-            url: url
-                .unwrap_or(DECISIONS_URL)
-                .trim_end_matches('/')
-                .to_owned(),
-            model: model.to_owned(),
-            key,
-            backoff: Mutex::new((None, BACKOFF)),
-        })
-    }
-
-    /// The body this judge sends for a check.
-    pub fn body(&self, instructions: &str, text: &str, questions: &[(String, String)]) -> Value {
-        decisions_body(&self.model, instructions, text, questions)
-    }
-
-    /// Each question's probability, by `deadline`, waiting out the API's
-    /// rate limit within it.
-    pub async fn ask(
-        &self,
-        instructions: &str,
-        text: &str,
-        questions: &[(String, String)],
-        deadline: Instant,
-    ) -> Result<(Answers, Usage), Failed> {
-        let body = self.body(instructions, text, questions).to_string();
-        loop {
-            let until = self.backoff.lock().unwrap().0;
-            if let Some(until) = until.filter(|until| *until > Instant::now()) {
-                if until >= deadline {
-                    return Err(Failed::Overloaded);
-                }
-                tokio::time::sleep_until(until.into()).await;
-            }
-            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(Failed::Overloaded);
-            };
-            let sent = self
-                .http
-                .post(format!("{}/v1/decisions", self.url))
-                .bearer_auth(&self.key)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body.clone())
-                .timeout(left)
-                .send()
-                .await;
-            let response = match sent {
-                Ok(response) => response,
-                Err(error) if error.is_timeout() => return Err(failed("the check timed out")),
-                Err(_) => return Err(failed("the check failed")),
-            };
-            let status = response.status().as_u16();
-            if matches!(status, 429 | 529) {
-                let retry = response
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok()?.parse::<f64>().ok())
-                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                    .map(|seconds| Duration::from_secs_f64(seconds.min(RETRY_MAX_SECS)));
-                // A 429 also means the account is out of credit, which no
-                // wait fixes; its body names that by a published code.
-                let error: Value = read_reply(response)
-                    .await
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                    .unwrap_or_default();
-                if error["error"]["code"] == "insufficient_quota" {
-                    return Err(Failed::Quota);
-                }
-                let mut backoff = self.backoff.lock().unwrap();
-                // A server's shorter wait, zero included, still paces.
-                let wait = retry.map_or(backoff.1, |retry| retry.max(backoff.1));
-                backoff.1 = (backoff.1 * 2).min(BACKOFF_MAX);
-                backoff.0 = Some(Instant::now() + wait);
-                continue;
-            }
-            if !(200..300).contains(&status) {
-                return Err(failed(format!("the judge answered {status}")));
-            }
-            {
-                // An answer to a request sent before another was throttled
-                // leaves that newer wait in place.
-                let mut backoff = self.backoff.lock().unwrap();
-                if backoff.0.is_none_or(|until| until <= Instant::now()) {
-                    *backoff = (None, BACKOFF);
-                }
-            }
-            let bytes = read_reply(response).await.map_err(failed)?;
-            let reply: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| failed("the judge's answer was not JSON"))?;
-            let usage = Usage {
-                input: reply["usage"]["input_tokens"].as_u64().unwrap_or(0),
-                cached: reply["usage"]["input_tokens_details"]["cached_tokens"]
-                    .as_u64()
-                    .unwrap_or(0),
-                ..Usage::default()
-            };
-            return decisions_answers(&reply, questions)
-                .map(|answers| (answers, usage))
-                .map_err(Failed::Check);
-        }
-    }
-}
-
-/// A response's body, up to the largest answer the API may send.
-async fn read_reply(mut response: reqwest::Response) -> Result<Vec<u8>, &'static str> {
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(Some(_)) => return Err("the judge's answer was too large"),
-            Ok(None) => return Ok(bytes),
-            Err(_) => return Err("the check failed"),
-        }
-    }
 }
 
 /// How long a judge's fork may sit idle before the daemon deletes it. Each
@@ -590,73 +349,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_judge_is_named_by_how_it_answers() {
-        assert_eq!(
-            spec("openai-decisions/gpt-6-luna"),
-            Some(Spec::Decisions("gpt-6-luna"))
-        );
-        assert_eq!(
-            spec("bedrock/claude-haiku"),
-            Some(Spec::Model("bedrock/claude-haiku"))
-        );
-        assert_eq!(spec("claude"), None);
-        assert_eq!(spec("/claude"), None);
-        assert_eq!(spec("openai-decisions/"), None);
+    fn a_judge_is_named_provider_slash_model() {
+        assert!(is_model("bedrock/claude-haiku"));
+        assert!(!is_model("claude"));
+        assert!(!is_model("/claude"));
+        assert!(!is_model("openai/"));
     }
 
     #[test]
     fn with_no_judge_named_the_bot_s_own_model_judges() {
         assert_eq!(
-            pick(
-                Some("openai-decisions/gpt-6-luna"),
-                Some("chatgpt/gpt-6-sol")
-            )
-            .as_deref(),
-            Some("openai-decisions/gpt-6-luna")
+            pick(Some("openai/gpt-6-luna"), Some("chatgpt/gpt-6-sol")).as_deref(),
+            Some("openai/gpt-6-luna")
         );
         assert_eq!(
             pick(None, Some("chatgpt/gpt-6-sol")).as_deref(),
             Some("chatgpt/gpt-6-sol")
         );
         assert_eq!(pick(None, None), None);
-    }
-
-    #[test]
-    fn decisions_asks_each_question_as_a_predicate() {
-        let asked = vec![
-            ("a".to_owned(), "Is it a?".to_owned()),
-            ("b".to_owned(), "Is it b?".to_owned()),
-        ];
-        let body = decisions_body("gpt-6-luna", "Read it.", "{}", &asked);
-        assert_eq!(body["model"], "gpt-6-luna");
-        assert_eq!(body["input"][0]["role"], "developer");
-        assert_eq!(body["input"][0]["content"][0]["text"], "Read it.");
-        assert_eq!(body["input"][1]["content"][0]["text"], "{}");
-        assert_eq!(
-            body["questions"][1],
-            json!({"type": "predicate", "name": "b", "instructions": "Is it b?"})
-        );
-        let every = json!([
-            {"type": "predicate", "name": "a", "probability": 0.1},
-            {"type": "predicate", "name": "b", "probability": 0.9},
-        ]);
-        let answers = decisions_answers(&json!({"answers": every}), &asked).unwrap();
-        assert_eq!(answers["b"], json!(0.9));
-        let refused = json!([
-            {"type": "predicate", "name": "a", "probability": 0.1},
-            {"type": "refusal", "name": "b", "refusal": "I can't help with that."},
-        ]);
-        assert_eq!(
-            decisions_answers(&json!({"answers": refused}), &asked),
-            Err(r#"the judge refused b: {"refusal":"I can't help with that."}"#.into())
-        );
-        let wild = json!([
-            {"type": "predicate", "name": "a", "probability": 1.5},
-            {"type": "predicate", "name": "b", "probability": 0.9},
-        ]);
-        assert!(decisions_answers(&json!({"answers": wild}), &asked).is_err());
-        assert!(decisions_answers(&json!({"answers": [every[0]]}), &asked).is_err());
-        assert!(decisions_answers(&json!({}), &asked).is_err());
     }
 
     #[test]

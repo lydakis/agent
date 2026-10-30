@@ -22,10 +22,7 @@ A client's own declared tool in place of `shell`, every turn one call to it:
 Over a Unix socket instead of stdio, with the approver a process of its own:
 
 - `socket`: the `held` arm with this client answering over the socket, the
-  baseline for the two below.
-- `decisions`: `agent approver` answers with `openai-decisions/gpt-6-luna`,
-  asking a stand-in for OpenAI's Decisions API that judges every call low
-  at once.
+  baseline for the one below.
 - `judge`: `agent approver` answers with the synthetic model as a general
   judge through the daemon (a fork, a turn, and a deletion per round),
   judging every call low at once.
@@ -83,31 +80,6 @@ def start():
     server.lock, server.flaky_seen = threading.Lock(), set()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, f'http://127.0.0.1:{server.server_port}/v1'
-
-
-class Decisions(http.server.BaseHTTPRequestHandler):
-    """A stand-in for OpenAI's Decisions API that judges every predicate low
-    at once."""
-    protocol_version = 'HTTP/1.1'
-
-    def log_message(self, *_):
-        pass
-
-    def setup(self):
-        super().setup()
-        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        assert self.path == '/v1/decisions' and all(q['type'] == 'predicate' for q in body['questions'])
-        data = json.dumps({'answers': [{'type': 'predicate', 'name': q['name'], 'probability': 0.05}
-                                       for q in body['questions']],
-                           'usage': {'input_tokens': 0, 'input_tokens_details': {'cached_tokens': 0}}}).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
 
 def percentile(values, fraction):
@@ -269,9 +241,8 @@ def run(binary, arm, *, bots, turns, fsync=False):
 
 def run_socket(binary, arm, *, bots, turns):
     """The `held` workload over a Unix socket, answered by this client
-    (`socket`) or by `agent approver` (`decisions`, `judge`)."""
+    (`socket`) or by `agent approver` (`judge`)."""
     server, url = start()
-    stand_in = None
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / '.local') as temp, \
             tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp') as short:
         path, sock = Path(temp), Path(short) / 'daemon.sock'
@@ -295,19 +266,10 @@ def run_socket(binary, arm, *, bots, turns):
                                                    approve=['shell'], approver=tag,
                                                    settings={'approval_hold_ms': 2000})
             if arm != 'socket':
-                env, args = clean_env(), [str(binary), 'approver', '--store', str(path / 'state.sqlite'),
-                                         '--socket', str(sock)]
-                if arm == 'decisions':
-                    stand_in = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Decisions)
-                    stand_in.daemon_threads = True
-                    threading.Thread(target=stand_in.serve_forever, daemon=True).start()
-                    env['OPENAI_API_KEY'] = 'synthetic-judge-key'
-                    args += ['--judge', 'openai-decisions/gpt-6-luna',
-                             '--judge-url', f'http://127.0.0.1:{stand_in.server_port}']
-                else:
-                    args += ['--judge', 'openai/synthetic-model']
+                args = [str(binary), 'approver', '--store', str(path / 'state.sqlite'),
+                        '--socket', str(sock), '--judge', 'openai/synthetic-model']
                 approver = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                            text=True, env=env)
+                                            text=True, env=clean_env())
                 threading.Thread(target=lambda: [judged.put(json.loads(line)) for line in approver.stdout],
                                  daemon=True).start()
                 assert judged.get(timeout=10)['event'] == 'serving'
@@ -373,9 +335,6 @@ def run_socket(binary, arm, *, bots, turns):
             daemon.wait()
             server.shutdown()
             server.server_close()
-            if stand_in:
-                stand_in.shutdown()
-                stand_in.server_close()
     count = bots * turns
     lines = []
     while not judged.empty():
@@ -412,7 +371,7 @@ def main():
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     arms = [('after', arm) for arm in args.arms.split(',')]
-    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'decisions', 'judge',
+    assert arms and all(arm in ('ungated', 'held', 'parked', 'socket', 'judge',
                                 'declared', 'answered', 'answered_parked')
                         for _, arm in arms)
     if args.before:
@@ -425,13 +384,13 @@ def main():
     for index in range(args.rounds):
         # Rotate the order so no arm always runs first or last.
         for label, arm in arms[index % len(arms):] + arms[:index % len(arms)]:
-            measure = run_socket if arm in ('socket', 'decisions', 'judge') else run
+            measure = run_socket if arm in ('socket', 'judge') else run
             record = {'binary': label, **measure(binaries[label], arm, bots=args.bots, turns=args.turns)}
             report['runs'].append(record)
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
             print(json.dumps(record), flush=True)
     if args.fsync:
-        for label, arm in [(label, arm) for label, arm in arms if arm not in ('socket', 'decisions', 'judge')]:
+        for label, arm in [(label, arm) for label, arm in arms if arm not in ('socket', 'judge')]:
             record = {'binary': label, **run(binaries[label], arm, bots=args.bots, turns=args.turns, fsync=True)}
             report['fsync'].append(record)
             (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')

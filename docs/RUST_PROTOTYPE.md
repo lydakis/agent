@@ -1273,6 +1273,11 @@ a screen: the same statement in Python's SQLite over a synthetic store of 164k
 turns took about 0.3 s for every bot's month and 0.07 s for one project's day.
 Sonny's `/usage` draws it, reading again once a minute while it is open.
 
+Protocol 24 lets a bot declare up to 32 tools, from 16, under the same 64 KiB
+of declarations: a Sonny lead with MCP servers already declared 15 of Sonny's
+and `exec`, so one more of Sonny's, the commons, or one of a client's own,
+went past the bound. The count is a sanity bound; the bytes are the real one.
+
 Replay tasks are owned by their subscriptions and tracked by the service.
 Replacing a follow on the same bot/session and session closure
 cancel the old replay. Notifications already queued can precede the operation's
@@ -2574,7 +2579,7 @@ starts `agent approver` detached if no session serves `auto`, logging to
 `STORE.approver.log`; its judge is `[judge] model` in `~/.agent/config.toml`, else the bot's own model, and a judge that
 cannot start fails the command before any bot is made
 (`approver_start_failed`). `agent approver [--tag TAG] [--judge
-PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--judge-url URL]` serves
+PROVIDER/MODEL] [--effort LEVEL] [--note FILE]` serves
 a tag and has a judge decide every call waiting on it, printing one JSON
 line per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny

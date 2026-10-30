@@ -79,8 +79,7 @@ pub enum WebSearch {
 /// The judge `agent approver` and Sonny's lookout ask.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Judge {
-    /// `provider/model` or `openai-decisions/MODEL`; unset, the judged
-    /// bot's own model.
+    /// `provider/model`; unset, the judged bot's own model.
     pub model: Option<String>,
     pub effort: Option<String>,
 }
