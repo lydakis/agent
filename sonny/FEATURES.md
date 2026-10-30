@@ -146,7 +146,7 @@ per feature; group small things into the row they belong to.
 | Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |
 | Opening Sonny after an upgrade replaces the older running daemon once its turns end, and says so | shipped | added 10-30 #413 | An upgrade left the old daemon running, and every command failed until it was restarted by hand | ? |
 | `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #417; offered last in first-run setup and once after an upgrade, the lead picks where the repo lives 10-30 #428 | A disposable box loses at most ten minutes of what agents learned | ? |
-| `[sonny] start_at_boot`: the daemon started with the machine (LaunchAgent at login, systemd user service at boot with linger); off by default | experimental | added 10-30 #PR | A box's agents keep working after it restarts, with nobody opening Sonny | ? |
+| `[sonny] start_at_boot`: the daemon started with the machine (LaunchAgent at login, systemd user service at boot with linger); off by default | experimental | added 10-30 #441 | A box's agents keep working after it restarts, with nobody opening Sonny | ? |
 
 ## Other clients
 
