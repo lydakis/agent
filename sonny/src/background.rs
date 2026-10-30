@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(lines[8], "    chat server: auth_expired");
         assert_eq!(lines[9], "    memory fact unreadable-chat");
         assert_eq!(lines[11], "Triggers · 1");
-        assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc to close");
+        assert_eq!(view.footer().to_string(), "  ↑↓ pick · esc close");
         let press = |view: &mut View, code| view.key(KeyEvent::new(code, KeyModifiers::NONE));
         press(&mut view, KeyCode::Char('d'));
         assert_eq!(view.confirm, None);
