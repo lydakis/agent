@@ -91,7 +91,8 @@ per feature; group small things into the row they belong to.
 | Editing: wrap, arrow keys, shell keys, Shift-Enter, mouse selection | shipped | wrap 10-26 #157; arrows 10-27 #174; shell keys and pictures in messages 10-28 #242; Shift-Enter, selection 10-29 #297 | A composer that edits like a shell | ? |
 | `!COMMAND`: run your own shell command and tell the agent | shipped | added 10-27 #209 | Do it yourself without leaving the conversation | ? |
 | A guess at your next message, Tab takes it (`[sonny] suggest`) | experimental | added 10-29 #329 | As Claude Code and Codex do; cost per guess not yet measured | ? |
-| Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #PR3 | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
+| Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #PR3 |
+| One list over the composer (slash menu, `/model`, `/approvals`, `/approve`, `/react`): up to 8 rows, the pick reversed, `•` what is in effect | shipped | added 10-30 #PR3 | As Codex's one popup: every list reads and moves the same | ? | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
 | Messages to a busy agent: Enter steers, Tab queues for after the turn | shipped | Tab queues 10-30 #400 | As Codex does: the person knows whether it should wait, so no judge guesses | ? |
 
 ## Side pane
@@ -138,7 +139,7 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315 | One settings file, editable in Sonny | ? |
+| `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315; grouped by table, changed values plain and defaults muted 10-30 #PR3 | One settings file, editable in Sonny | ? |
 | `/usage`: tokens spent over time, by agent and model | shipped | added 10-29 #302 | See where the tokens go | ? |
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
 | Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |

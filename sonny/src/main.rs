@@ -31,6 +31,7 @@ mod html;
 mod image;
 mod js;
 mod links;
+mod list;
 mod login;
 mod look;
 mod lookout;
@@ -8994,7 +8995,7 @@ impl App {
             let rows = self.screen.height(column as usize).min(room as usize);
             // `/config` lists every setting over the rows above.
             let rows = match &self.config {
-                Some(_) => (rows + config::SETTINGS.len()).min(room as usize),
+                Some(_) => (rows + config::height()).min(room as usize),
                 None => rows,
             };
             let [history, view, _] = Layout::vertical([
@@ -9015,39 +9016,12 @@ impl App {
             frame.render_widget(Paragraph::new(self.status_line()), status);
             let menu = self.menu();
             if !menu.is_empty() {
-                // Up to three, around the pick, in the rows above the input.
                 let pick = self.pick.min(menu.len() - 1);
-                let first = pick.saturating_sub(2).min(menu.len().saturating_sub(3));
-                let wide = menu.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
-                let rows: Vec<Line> = menu
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take(3)
-                    .map(|(i, (name, about))| {
-                        let name = format!("{name:<wide$}");
-                        if i == pick {
-                            Line::from(vec![
-                                Span::raw("  "),
-                                Span::raw(format!(" {name}  {about} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw("   "),
-                                Span::raw(name),
-                                Span::raw(format!("  {about}")).dim(),
-                            ])
-                        }
-                    })
+                let items: Vec<list::Item> = (menu.iter())
+                    .map(|(name, about)| list::Item::new(*name, *about))
                     .collect();
                 let [_, _, _, composer_row, _] = areas(view, live_rows);
-                let area = ratatui::layout::Rect {
-                    y: composer_row.y.saturating_sub(rows.len() as u16),
-                    height: rows.len() as u16,
-                    ..composer_row
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, list::lines(&items, pick, width), composer_row);
             }
             if let Some(query) = &self.finding {
                 let line = Line::from(vec![Span::raw("find ").dim(), Span::raw(query.clone())]);
@@ -9066,35 +9040,17 @@ impl App {
                 return;
             }
             if let Some(pick) = self.reacting {
-                // Newest at the bottom, nearest the composer, as they read.
-                let first = pick.saturating_sub(2);
-                let mut rows: Vec<Line> = self
-                    .replies
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .skip(first)
-                    .take(3)
-                    .map(|(i, (node, said))| {
+                // Newest at the bottom, nearest the composer, as they read;
+                // the pick counts from the newest.
+                let items: Vec<list::Item> = (self.replies.iter())
+                    .map(|(node, said)| {
                         let on = self.reactions.on(*node).join(" ");
-                        let room = width.saturating_sub(8 + on.width());
-                        let said = transcript::cut(said, room);
-                        let row = if i == pick {
-                            Span::raw(format!(" {said} ")).reversed()
-                        } else {
-                            Span::raw(format!(" {said}"))
-                        };
-                        Line::from(vec![Span::raw("   "), row, Span::raw(format!("  {on}"))])
+                        let room = width.saturating_sub(10 + on.width());
+                        list::Item::new(transcript::cut(said, room), on)
                     })
                     .collect();
-                rows.reverse();
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(rows.len() as u16),
-                    height: rows.len() as u16,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                let pick = items.len().saturating_sub(pick + 1);
+                over(frame, list::lines(&items, pick, width), composer);
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("which reply to react to").dim(),
@@ -9107,15 +9063,9 @@ impl App {
             if let Some(pick) = self.approving {
                 // Newest last, as they happened; the reason stays in view
                 // before a retry is approved.
-                let shown = self.denials.len().min(5);
-                let first = pick
-                    .saturating_sub(shown - 1)
-                    .min(self.denials.len() - shown);
-                let room = (composer.width as usize).saturating_sub(6);
-                let rows: Vec<Line> = self.denials[first..first + shown]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, denied)| {
+                let room = (composer.width as usize).saturating_sub(8);
+                let items: Vec<list::Item> = (self.denials.iter())
+                    .map(|denied| {
                         let what =
                             transcript::action(&denied.name, &denied.arguments, &self.workspace);
                         let why = denied
@@ -9126,29 +9076,10 @@ impl App {
                             .unwrap_or("")
                             .trim()
                             .to_owned();
-                        let what = transcript::cut(&what, room / 2);
-                        let why =
-                            transcript::cut(&why, room.saturating_sub(what.chars().count() + 2));
-                        if first + i == pick {
-                            Line::from(vec![
-                                Span::raw("  "),
-                                Span::raw(format!(" {what}  {why} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw(format!("   {what}")),
-                                Span::raw(format!("  {why}")).dim(),
-                            ])
-                        }
+                        list::Item::new(transcript::cut(&what, room / 2), why)
                     })
                     .collect();
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(shown as u16),
-                    height: shown as u16,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, list::lines(&items, pick, width), composer);
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("auto-review denials: approve one retry").dim(),
@@ -9161,36 +9092,12 @@ impl App {
                 return;
             }
             if let Some(pick) = self.choosing {
-                let rows: Vec<Line> = approvals::MODES
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (mode, about))| {
-                        let mark = if Some(*mode) == self.mode {
-                            "• "
-                        } else {
-                            "  "
-                        };
-                        let name = format!("{mode:<4}");
-                        if i == pick {
-                            Line::from(vec![
-                                Span::raw(format!("  {mark}")),
-                                Span::raw(format!(" {name}  {about} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw(format!("  {mark} {name}")),
-                                Span::raw(format!("  {about}")).dim(),
-                            ])
-                        }
+                let items: Vec<list::Item> = (approvals::MODES.iter())
+                    .map(|(mode, about)| {
+                        list::Item::new(*mode, *about).current(Some(*mode) == self.mode)
                     })
                     .collect();
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(3),
-                    height: 3,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, list::lines(&items, pick, width), composer);
                 let line = Line::from(vec![
                     Span::raw("› ").bold(),
                     Span::raw("approvals for this agent and those it makes").dim(),
@@ -9221,35 +9128,17 @@ impl App {
             if let Some(picker) = &self.picker {
                 let shown = picker.shown();
                 let at = picker.at();
-                let first = at.saturating_sub(2).min(shown.len().saturating_sub(3));
-                let mut rows: Vec<Line> = shown
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take(3)
-                    .map(|(i, model)| {
-                        let mark = if *model == self.model { "• " } else { "  " };
-                        if i == at {
-                            Line::from(vec![
-                                Span::raw(format!("  {mark}")),
-                                Span::raw(format!(" {model} ")).reversed(),
-                            ])
-                        } else {
-                            Line::from(format!("  {mark} {model}"))
-                        }
-                    })
+                let items: Vec<list::Item> = (shown.iter())
+                    .map(|model| list::Item::new(*model, "").current(*model == self.model))
                     .collect();
+                let mut rows = list::lines(&items, at, width);
                 // Why the list is short, in the rows it leaves.
-                for refused in picker.refused.iter().take(3 - rows.len()) {
-                    rows.push(Line::from(format!("     {refused}")).dim());
+                for refused in
+                    (picker.refused.iter()).take((list::ROWS + 1).saturating_sub(rows.len()))
+                {
+                    rows.push(Line::from(format!("    {refused}")).dim());
                 }
-                let area = ratatui::layout::Rect {
-                    y: composer.y.saturating_sub(3),
-                    height: 3,
-                    ..composer
-                };
-                frame.render_widget(ratatui::widgets::Clear, area);
-                frame.render_widget(Paragraph::new(rows), area);
+                over(frame, rows, composer);
                 let effort = picker.effort().unwrap_or("default");
                 let line = if picker.filter.is_empty() {
                     Line::from(vec![
@@ -9642,6 +9531,17 @@ impl App {
         }
         (Line::from(spans).dim(), counter)
     }
+}
+
+/// `rows` drawn over what is right above `below`, cleared first.
+fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::layout::Rect) {
+    let area = ratatui::layout::Rect {
+        y: below.y.saturating_sub(rows.len() as u16),
+        height: (rows.len() as u16).min(below.y),
+        ..below
+    };
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 /// What the pane's title row says the keys do on `/status`.
