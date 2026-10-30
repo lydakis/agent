@@ -254,7 +254,10 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     let flags: Vec<&String> = flags.iter().collect();
     let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
     let flags: Vec<&String> = flags.iter().collect();
-    let mut flags = match told(&place.told, here, &info, &flags) {
+    // Roles are the lead's project's, which `info` names, even for a task
+    // told the rules of a folder inside it.
+    let roles = if at != here { here } else { &place.told };
+    let mut flags = match told(&place.told, roles, here, &info, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
@@ -409,8 +412,14 @@ fn with_cache(flags: &mut Vec<String>) {
 /// for a task in `dir` given as `--instructions`, with what every task is
 /// told (`task.md`, or the task profile the project `info` or the config
 /// names) after it, and the role's model and tools unless the flags name
-/// their own. Other flags pass as they are.
-fn told(dir: &Path, lead: &Path, info: &Value, flags: &[&String]) -> Result<Vec<String>, String> {
+/// their own. Roles are found from `roles`. Other flags pass as they are.
+fn told(
+    dir: &Path,
+    roles: &Path,
+    lead: &Path,
+    info: &Value,
+    flags: &[&String],
+) -> Result<Vec<String>, String> {
     let mut kept = Vec::new();
     let (mut agents, mut profile) = (false, None);
     let mut flags = flags.iter().map(|flag| flag.as_str());
@@ -438,14 +447,14 @@ fn told(dir: &Path, lead: &Path, info: &Value, flags: &[&String]) -> Result<Vec<
     // the role's too; its model and tools still apply when it is named.
     let task = crate::project::task_profile(info)?;
     let role = match profile {
-        Some(name) => Some(crate::project::profile(dir, name)?),
+        Some(name) => Some(crate::project::profile(roles, name)?),
         None => None,
     };
     // The same profile when it is the same file (a case-insensitive
     // filesystem gives `Worker` and `worker` one), or the same built-in.
     let told_after = |role: &&agent_client::policy::Profile| match &role.path {
         None => role.name == task,
-        Some(path) => crate::project::profile(dir, &task).is_ok_and(|task| {
+        Some(path) => crate::project::profile(roles, &task).is_ok_and(|task| {
             let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
             task.path.is_some_and(|other| real(&other) == real(path))
         }),
@@ -466,7 +475,7 @@ fn told(dir: &Path, lead: &Path, info: &Value, flags: &[&String]) -> Result<Vec<
     }
     added.extend([
         "--instructions".to_owned(),
-        crate::project::as_task(dir, info, &composed.text)?,
+        crate::project::as_task(roles, info, &composed.text)?,
     ]);
     kept.extend(added);
     Ok(kept)
@@ -1325,6 +1334,7 @@ mod tests {
         let told = |flags: &[&str]| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
             told(
+                &dir,
                 &dir,
                 &dir,
                 &project.borrow(),

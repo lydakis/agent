@@ -512,6 +512,28 @@ fn a_task_given_a_repository_in_the_lead_s_folder_gets_a_worktree_of_it() {
         ran.last().unwrap(),
         &format!("fix {}/src/lib.rs", worktree.display())
     );
+    // A role is the lead's project's, found from its folder, not the
+    // repository's.
+    std::fs::create_dir_all(ws.join(".agents/agents")).unwrap();
+    std::fs::write(
+        ws.join(".agents/agents/worker.md"),
+        "Work as the workspace's worker.\n",
+    )
+    .unwrap();
+    let role = serde_json::json!({"name": "role", "brief": "b", "folder": "src/api",
+        "profile": "worker"});
+    let (ok, said) = lab.tool(&ws, "start_task", role, false);
+    assert!(ok, "{said}");
+    let told = lab.ran().join("\n");
+    assert!(told.contains("Work as the workspace's worker."), "{told}");
+    assert!(told.contains("Build with the workspace tool."), "{told}");
+    let (ok, err) = lab.tool(
+        &ws,
+        "remove_task",
+        serde_json::json!({"task": "demo.role", "discard": true}),
+        false,
+    );
+    assert!(ok, "{err}");
     // A folder outside the lead's is refused.
     let away = serde_json::json!({"name": "away", "brief": "b", "folder": "../"});
     let (ok, said) = lab.tool(&ws, "start_task", away, false);
