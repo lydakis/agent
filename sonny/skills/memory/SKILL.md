@@ -6,8 +6,9 @@ description: Facts, decisions and preferences earlier agents saved for this pers
 # Memory
 
 Memory is what earlier agents learned that a later one needs: decisions and
-why, the person's preferences and corrections, traps that cost time, and
-where things live outside this folder. Each fact is one small Markdown file.
+why, the person's preferences, what they corrected and what they confirmed
+worked, traps that cost time, and where things live outside this folder.
+Each fact is one small Markdown file.
 Agents read memory at the start of work and save to it as they go.
 
 ## Where it is
@@ -80,7 +81,8 @@ EOF
   first and merge, rather than losing what it said.
 - TYPE is one of:
   - `user`: who the person is and what they know
-  - `feedback`: how they want work done, corrections included, with why
+  - `feedback`: how they want work done, what they corrected and what
+    they confirmed worked, with why
   - `project`: decisions, constraints and state that the code does not show
   - `reference`: where to find something outside this folder
 - DESCRIPTION is one line. It is all a later agent sees in the index, so
@@ -110,6 +112,14 @@ commands to that agent.
 
 Save what a later agent would otherwise have to ask the person again or
 spend real effort rediscovering, and what will still be true later.
+
+Save what the person confirmed as well as what they corrected: an
+approach they welcomed, praised or reacted to well is as worth keeping as
+a mistake they pointed out, since memory that holds only corrections
+steers later agents away from what already works. A reaction of theirs to
+one of your replies is feedback on that reply. Save the approach they
+confirmed, never that they liked being agreed with, and when the same
+feedback comes again, add the date to the fact that holds it.
 
 Do not save:
 

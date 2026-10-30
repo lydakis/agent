@@ -45,7 +45,7 @@ const FRESH: Duration = Duration::from_secs(1);
 /// what only a lead needs to hear is in its role, not here.
 const DESCRIPTION: &str = "Keep something beside the conversation, in the margin the person sees next to your \
          replies. Post a note whenever your answer has a part the person will look at more than \
-         once: a diagram of how code or a system fits together (draw it in Mermaid), a table of \
+         once: a diagram of how code or a system fits together (such as in Mermaid), a table of \
          results you measure or compare, or the file being discussed. Put that part in the note, \
          and keep the reply to what it means, with a line pointing to the note, without walking \
          the note's rows again. When the person asks you to walk through a file, show that file in \
