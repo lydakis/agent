@@ -243,7 +243,7 @@ impl Embedded {
                 }
                 let at = &mut buf[(area.x + col, area.y + row)];
                 let text = cell.contents();
-                at.set_symbol(if text.is_empty() { " " } else { &text });
+                at.set_symbol(if text.is_empty() { " " } else { text });
                 let mut style = Style::new()
                     .fg(color(cell.fgcolor()))
                     .bg(color(cell.bgcolor()));

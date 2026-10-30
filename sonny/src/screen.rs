@@ -16,7 +16,7 @@ use std::{
 use ratatui::{
     buffer::{Buffer, Cell},
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
