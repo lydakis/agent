@@ -2544,7 +2544,16 @@ mod tests {
         // Asking leaves it held.
         assert!(lock(&store).unwrap().is_none());
         drop(held);
-        assert!(!running(&store));
+        // A process another test starts at that instant may share the lock
+        // until it runs its command, which closes it.
+        let let_go = (0..100).any(|_| {
+            let gone = !running(&store);
+            if !gone {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        });
+        assert!(let_go);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
