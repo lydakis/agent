@@ -849,7 +849,7 @@ pub fn writable(record: &serde_json::Value) -> Vec<PathBuf> {
 
 /// The folder of a bot that holds `path`, which a sandbox would let it
 /// write: none of Sonny's own may be in one.
-fn housing(path: &Path) -> Option<PathBuf> {
+pub(crate) fn housing(path: &Path) -> Option<PathBuf> {
     let housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
     let shared = shared();
     holder(

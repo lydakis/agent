@@ -776,6 +776,10 @@ impl Service {
                         println!("{}", json!({"event": "lagged", "reason": event["reason"]}));
                     }
                     let event = whole_call(&client, event).await;
+                    if event["event"] == "configured" {
+                        self.configured(&client, &event).await;
+                        continue;
+                    }
                     served.event(&event);
                     streaming |= event["event"] == "follow_live";
                     self.snapshot(&event, streaming);
@@ -948,6 +952,27 @@ impl Service {
                 lookout.wake_sources(&client, &woken);
             }
         }
+    }
+
+    /// A bot whose sandbox changed is read again before any later event,
+    /// so a snapshot knows each folder it may now write; one that cannot
+    /// be read may write any.
+    async fn configured(&mut self, client: &Client, event: &Value) {
+        let Some(bot) = event["bot"].as_str() else {
+            return;
+        };
+        let sandbox =
+            (event["changed"].as_array()).is_some_and(|c| c.iter().any(|f| f == "sandbox"));
+        let Some(record) = self.records.get_mut(bot).filter(|_| sandbox) else {
+            return;
+        };
+        let read =
+            (client.request("inspect", json!({"bot": bot, "bot_id": event["bot_id"]}))).await;
+        record["settings"] = match read {
+            Ok(read) => read["settings"].clone(),
+            Err(_) => json!({"writable": ["/"]}),
+        };
+        crate::snapshot::housed(bot, Some(&crate::snapshot::writable(record)));
     }
 
     /// Keep a task's worktree as a completed turn left it, for a task
@@ -1322,12 +1347,14 @@ fn cursor_path(store: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The events a lookout reads, of every bot: what bots there are, how
-/// their turns start, wait and end, the tools they call, and each model
-/// call's usage, which says a quiet turn still works. The text a model
-/// streams, most of all events, is no one's news here.
-const KINDS: [&str; 13] = [
+/// The events a lookout reads, of every bot: what bots there are and
+/// what each may write, how their turns start, wait and end, the tools
+/// they call, and each model call's usage, which says a quiet turn still
+/// works. The text a model streams, most of all events, is no one's news
+/// here.
+const KINDS: [&str; 14] = [
     "created",
+    "configured",
     "forked",
     "deleted",
     "accepted",
@@ -3345,6 +3372,76 @@ mod tests {
             }
         });
         (Client::connect(&socket).await.unwrap().0, got)
+    }
+
+    /// A daemon that greets and answers each request with `answer`.
+    async fn answering(answer: Value) -> Arc<Client> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lookout-answering-{}-{}",
+            std::process::id(),
+            STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+            let mut lines = BufReader::new(read).lines();
+            write
+                .write_all(format!("{ready}\n").as_bytes())
+                .await
+                .unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                let mut answer = answer.clone();
+                answer["id"] = asked["id"].clone();
+                write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        Client::connect(&socket).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn a_folder_a_bot_may_write_once_its_sandbox_changes_is_housed() {
+        let dir = std::env::temp_dir().join(format!("lookout-configured-{}", std::process::id()));
+        let (workspace, added) = (dir.join("work"), dir.join("added"));
+        for at in [&workspace, &added] {
+            std::fs::create_dir_all(at).unwrap();
+        }
+        let record = json!({"name": "c.wide", "bot_id": 3, "workspace": workspace});
+        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
+        crate::snapshot::housed("c.wide", Some(&crate::snapshot::writable(&record)));
+        let inside = added.join("store.snapshot-indexes");
+        // Held, if at all, by the folder every sandbox may write.
+        let by_added = || crate::snapshot::housing(&inside) == std::fs::canonicalize(&added).ok();
+        assert!(!by_added());
+        let changed = |what: &str| json!({"event": "configured", "bot": "c.wide", "bot_id": 3, "changed": [what]});
+        let settings = json!({"result": {"settings": {"writable": [added]}}});
+        let client = answering(settings).await;
+        // Another change leaves what it may write as it was.
+        service.configured(&client, &changed("model")).await;
+        assert!(!by_added());
+        service.configured(&client, &changed("sandbox")).await;
+        assert!(by_added());
+        // Unread, it may write anything.
+        let elsewhere = Path::new("/nonexistent/lookout-configured");
+        let refused = answering(json!({"error": "bot_not_found"})).await;
+        service.configured(&refused, &changed("sandbox")).await;
+        assert_eq!(
+            crate::snapshot::housing(elsewhere),
+            Some(PathBuf::from("/"))
+        );
+        crate::snapshot::housed("c.wide", None);
+        assert_eq!(crate::snapshot::housing(elsewhere), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `wake_sources`, and what the daemon answered it, if it sent.
