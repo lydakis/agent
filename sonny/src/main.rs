@@ -11955,6 +11955,7 @@ mod tests {
             resolved: false,
             background: None,
             usage: None,
+            commons: None,
             picked: None,
         };
         // A named lead's window: its own row opens nothing, and the
