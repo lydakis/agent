@@ -432,6 +432,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         cursor: None,
         saved: None,
         goals: goals::Goals::new(&settings.store, &settings.socket),
+        fires: HashMap::new(),
         resume: marks(&settings.store).0,
         replay: marks(&settings.store).1,
         in_flight: HashMap::new(),
@@ -505,6 +506,9 @@ struct Service {
     saved: Option<(i64, i64)>,
     /// The agents' goals, whose turns it holds until their checks say.
     goals: goals::Goals,
+    /// Turns triggers' fires sent, by agent and turn, each with its
+    /// trigger's generation: one that fails is told (`trigger::tell_failed`).
+    fires: HashMap<(String, i64), String>,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
     /// Where the last lookout's stream starts again: before the oldest turn
@@ -826,6 +830,16 @@ impl Service {
                     let bot_id = (event["bot"].as_str())
                         .and_then(|bot| self.records.get(bot))
                         .and_then(|record| record["bot_id"].as_i64());
+                    if let Some(failed) = self.fired(&event, live) {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            let (generation, bot, turn, error) = failed;
+                            if let Some(store) = client.store() {
+                                crate::trigger::tell_failed(&client, store, &generation, (&bot, turn), &error)
+                                    .await;
+                            }
+                        });
+                    }
                     if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
@@ -951,6 +965,33 @@ impl Service {
                 lookout.wake(&client, &woken);
                 lookout.wake_sources(&client, &woken);
             }
+        }
+    }
+
+    /// A turn a trigger's fire sent, noted as it starts; once it ends
+    /// failed, while live, its trigger's generation, agent, turn and why,
+    /// for the agent to be told. A model that said nothing did not fail.
+    fn fired(&mut self, event: &Value, live: bool) -> Option<(String, String, i64, String)> {
+        let (bot, turn) = (event["bot"].as_str()?, event["turn"].as_i64()?);
+        let data = &event["data"];
+        match event["event"].as_str()? {
+            "accepted" | "queued" => {
+                let generation = crate::trigger::fire_generation(data["request_id"].as_str()?)?;
+                // Bounded: a turn whose end was never seen is let go.
+                if self.fires.len() >= FIRES {
+                    self.fires.clear();
+                }
+                self.fires
+                    .insert((bot.to_owned(), turn), generation.to_owned());
+                None
+            }
+            "turn_finished" => {
+                let generation = self.fires.remove(&(bot.to_owned(), turn))?;
+                let error = data["error"].as_str().unwrap_or("no reason given");
+                (live && data["status"] == "failed" && error != "empty_completion")
+                    .then(|| (generation, bot.to_owned(), turn, error.to_owned()))
+            }
+            _ => None,
         }
     }
 
@@ -1352,6 +1393,9 @@ fn cursor_path(store: &Path) -> PathBuf {
 /// they call, and each model call's usage, which says a quiet turn still
 /// works. The text a model streams, most of all events, is no one's news
 /// here.
+/// The most fires' turns noted at once.
+const FIRES: usize = 4096;
+
 const KINDS: [&str; 14] = [
     "created",
     "configured",
@@ -2778,6 +2822,62 @@ mod tests {
         assert!(lookout.watches("r.a") && lookout.watches("r.b"));
     }
 
+    #[tokio::test]
+    async fn a_fires_turn_that_failed_is_told_once_its_end_is_news() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let fire = |turn| json!({"request_id": format!("trigger_12-34_9.1.2.{turn}")});
+        let failed = json!({"status": "failed", "error": "provider_error"});
+        // Its own turn, then a failed end: told, once.
+        assert_eq!(
+            service.fired(&ev("calc.lead", 4, "accepted", fire(4)), true),
+            None
+        );
+        assert_eq!(
+            service.fired(&ev("calc.lead", 4, "turn_finished", failed.clone()), true),
+            Some((
+                "12-34".into(),
+                "calc.lead".into(),
+                4,
+                "provider_error".into()
+            ))
+        );
+        assert_eq!(
+            service.fired(&ev("calc.lead", 4, "turn_finished", failed.clone()), true),
+            None
+        );
+        // A completed one, one that said nothing, the replay's: not told.
+        for (turn, end, live) in [
+            (5, json!({"status": "completed"}), true),
+            (
+                6,
+                json!({"status": "failed", "error": "empty_completion"}),
+                true,
+            ),
+            (7, failed.clone(), false),
+        ] {
+            service.fired(&ev("calc.lead", turn, "queued", fire(turn)), live);
+            assert_eq!(
+                service.fired(&ev("calc.lead", turn, "turn_finished", end), live),
+                None
+            );
+        }
+        // Nor a turn no fire sent, nor the answer one passes on.
+        service.fired(
+            &ev("calc.lead", 8, "accepted", json!({"request_id": "tui-1"})),
+            true,
+        );
+        assert_eq!(
+            service.fired(&ev("calc.lead", 8, "turn_finished", failed.clone()), true),
+            None
+        );
+        let reply = json!({"request_id": "trigger_12-34_reply.3.9"});
+        service.fired(&ev("calc.lead", 9, "queued", reply), true);
+        assert_eq!(
+            service.fired(&ev("calc.lead", 9, "turn_finished", failed), true),
+            None
+        );
+    }
+
     fn service(store: PathBuf, records: &[Value]) -> Service {
         Service {
             runner: sources::Runner::new(store.join("sources"), tokio::sync::mpsc::channel(1).0),
@@ -2802,6 +2902,7 @@ mod tests {
             watchers: HashMap::new(),
             started: false,
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
+            fires: HashMap::new(),
         }
     }
 
