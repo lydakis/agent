@@ -115,7 +115,7 @@ fn note(told: &updates::Told, steer: bool) -> String {
         lines.push("A quoted message is the person's own words.".to_owned());
     }
     if told.items.iter().any(|line| line.text.contains("\n  > ")) {
-        lines.push("Lines marked > are a task's own reply, not the person's words.".to_owned());
+        lines.push("Lines marked > are a task's own words, not the person's.".to_owned());
     }
     lines.push(match steer {
         true => "This cuts into your turn because the person wrote in a task: act on their \
@@ -206,15 +206,17 @@ async fn reply_text(client: &Client, seen: &Seen) -> String {
 }
 
 /// `event`, a `margin` call's start whose arguments were cut before the
-/// note's id, with the call's arguments whole, as the bot's history keeps
-/// them; any other event as it is.
-async fn whole_margin_call(client: &Client, mut event: Value) -> Value {
+/// note's id, or an `ask` call's start whose arguments were cut, with the
+/// call's arguments whole, as the bot's history keeps them; any other event
+/// as it is.
+async fn whole_call(client: &Client, mut event: Value) -> Value {
     let data = &event["data"];
-    if event["event"] != "tool_started"
-        || data["name"] != crate::margin::TOOL
-        || data["arguments_truncated"] != true
-        || crate::margin::called(data).is_some()
-    {
+    let cut = match data["name"].as_str() {
+        Some(crate::margin::TOOL) => crate::margin::called(data).is_none(),
+        Some(crate::asks::TOOL) => true,
+        _ => false,
+    };
+    if event["event"] != "tool_started" || data["arguments_truncated"] != true || !cut {
         return event;
     }
     let (Some(bot), Some(call)) = (event["bot"].as_str(), data["call_id"].as_str()) else {
@@ -709,7 +711,8 @@ impl Service {
             .flatten()
             .min()
             .unwrap_or(0);
-        if let Err(error) = (client.request("follow", json!({"bot": "*", "after": after}))).await {
+        let follow = json!({"bot": "*", "after": after, "kinds": KINDS});
+        if let Err(error) = client.request("follow", follow).await {
             println!(
                 "{}",
                 json!({"event": "follow_refused", "error": error.code, "after": after})
@@ -754,7 +757,7 @@ impl Service {
                     if event["event"] == "follow_lagged" {
                         println!("{}", json!({"event": "lagged", "reason": event["reason"]}));
                     }
-                    let event = whole_margin_call(&client, event).await;
+                    let event = whole_call(&client, event).await;
                     served.event(&event);
                     // A `subscriptions` call this lookout answered counts
                     // from the next event on, not from the next tick.
@@ -1216,6 +1219,26 @@ fn cursor_path(store: &Path) -> PathBuf {
     path.push(".lookout.cursor");
     PathBuf::from(path)
 }
+
+/// The events a lookout reads, of every bot: what bots there are, how
+/// their turns start, wait and end, the tools they call, and each model
+/// call's usage, which says a quiet turn still works. The text a model
+/// streams, most of all events, is no one's news here.
+const KINDS: [&str; 13] = [
+    "created",
+    "forked",
+    "deleted",
+    "accepted",
+    "queued",
+    "steered",
+    "turn_waiting",
+    "turn_paced",
+    "turn_resumed",
+    "turn_finished",
+    "tool_started",
+    "tool_completed",
+    "usage",
+];
 
 /// The most of the log `status` reads, from its end.
 const STATUS_BYTES: u64 = 1 << 20;
@@ -2129,14 +2152,34 @@ mod tests {
             "name": crate::margin::TOOL, "call_id": "c9",
             "arguments": whole[..2048], "arguments_truncated": true}});
         assert_eq!(crate::margin::called(&started["data"]), None);
-        let event = whole_margin_call(&client, started).await;
+        let event = whole_call(&client, started).await;
         assert_eq!(
             crate::margin::called(&event["data"]),
             Some(("results".into(), false))
         );
         // Any other event is left as it is.
         let other = json!({"event": "tool_started", "data": {"name": "shell"}});
-        assert_eq!(whole_margin_call(&client, other.clone()).await, other);
+        assert_eq!(whole_call(&client, other.clone()).await, other);
+    }
+
+    #[tokio::test]
+    async fn a_long_ask_call_is_read_whole_for_its_lead() {
+        let whole = json!({"question": "Ship?", "why": "x".repeat(3000), "recommended": 1,
+            "reason": "r", "options": [{"label": "Yes", "explanation": "a"},
+                {"label": "No", "explanation": "b"}]})
+        .to_string();
+        let kept = whole.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 5}]}),
+            _ => json!({"items": [{"node": 5, "item": {"type": "function_call",
+                "call_id": "c9", "name": crate::asks::TOOL, "arguments": kept}}]}),
+        })
+        .await;
+        let started = json!({"event": "tool_started", "bot": "calc.quick", "data": {
+            "name": crate::asks::TOOL, "call_id": "c9",
+            "arguments": whole[..2048], "arguments_truncated": true}});
+        let event = whole_call(&client, started).await;
+        assert_eq!(event["data"]["arguments"], json!(whole));
     }
 
     fn lookout() -> Lookout {
@@ -2323,7 +2366,7 @@ mod tests {
         let note = note(&told, false);
         assert!(note.contains(
             "- calc.fix: turn:calc.fix/4 completed, asked by you, and replied:\n  > Fixed avg.\n  > - skips empty lists\n\
-             Lines marked > are a task's own reply, not the person's words.\n"
+             Lines marked > are a task's own words, not the person's.\n"
         ), "{note}");
         assert!(!note.contains("early"));
     }

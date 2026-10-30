@@ -5772,6 +5772,61 @@ gate's 15%. The RSS after a turn each moves by about this much between runs
 of one build (27.7 to 30.3 MiB across the head's own runs); the change keeps
 nothing between deltas.
 
+## A follow can name the event kinds it wants (#407)
+
+`fan_out` now checks each live follower's kinds before it queues an event,
+a set lookup that a follow naming none skips, and a replay filters its
+pages the same way. The Perf workflow's matched screen, base main c220be7
+against the PR head 9ef1e5d, on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.937 | 28.814 | -0.4% |
+| admission | burst submit p99, ms | 4.164 | 4.117 | -1.1% |
+| completion | release to terminal p99, ms | 9.213 | 8.815 | -4.3% |
+| footprint | idle RSS, MiB | 19.303 | 19.279 | -0.1% |
+| footprint | per idle bot, KiB | 1.34 | 1.478 | +10.3% |
+| footprint | RSS after a turn each, MiB | 28.34 | 28.639 | +1.1% |
+| footprint | CPU per turn, ms | 0.871 | 0.849 | -2.5% |
+| lifecycle | CPU, s | 0.685 | 0.7 | +2.2% |
+| lifecycle | p95 turn, ms | 579.55 | 574.058 | -0.9% |
+| lifecycle | peak RSS, MiB | 25.436 | 25.426 | -0.0% |
+
+Store jobs per turn did not change, and no change is a cost past the gate's
+15%. The per-idle-bot rise is the bench's noise, as before (#349): the
+change adds nothing to an idle bot. None of these benches names kinds, so
+they measure the unfiltered path. Filtering pays off in
+`bench/lookout_scale.py`: with 1,100 streaming bots, the lookout's follow
+of `*` no longer carries the deltas, and it hears all 6,000 task endings,
+where before the daemon dropped it.
+
+## Approving each step of an exec script (#393)
+
+A client answering a declared call can ask the bot's gate about each step
+inside it (`approve_step`) and record how an allowed step ended
+(`step_result`). Both run only for steps a client sends, so an ordinary turn
+gains one check of whether the bot has gates, and the judge's history
+queries read step events beside tool events. The Perf workflow's matched
+screen, base main 91d7150 against the PR head afa2a54, on the GitHub runner
+(2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 38.463 | 37.973 | -1.3% |
+| admission | burst submit p99, ms | 6.065 | 5.91 | -2.6% |
+| completion | release to terminal p99, ms | 13.072 | 13.291 | +1.7% |
+| footprint | idle RSS, MiB | 18.998 | 19.277 | +1.5% |
+| footprint | per idle bot, KiB | 1.568 | 1.49 | -5.0% |
+| footprint | RSS after a turn each, MiB | 27.676 | 27.77 | +0.3% |
+| footprint | CPU per turn, ms | 1.224 | 1.237 | +1.0% |
+| lifecycle | CPU, s | 1.1 | 1.12 | +1.8% |
+| lifecycle | p95 turn, ms | 580.302 | 581.017 | +0.1% |
+| lifecycle | peak RSS, MiB | 25.193 | 25.289 | +0.4% |
+
+Store jobs per turn did not change (7.5 on both), and nothing passed the
+gate's 15%. The steps path itself is not measured: it runs once per step a
+client asks about, one store job to decide it and one to record its end.
+
 ## The pull cord holds starts while paused (#408)
 
 Admission now asks whether the daemon is held, draining or paused, in

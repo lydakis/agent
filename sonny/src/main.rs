@@ -25,6 +25,7 @@ mod embed;
 mod exec;
 mod herdr;
 mod highlight;
+mod home;
 mod html;
 mod image;
 mod js;
@@ -37,10 +38,12 @@ mod mac;
 mod margin;
 mod math;
 mod mcp;
+mod mcp_import;
 mod mermaid;
 mod models;
 mod mux;
 mod pane;
+mod picker;
 mod place;
 mod plan;
 mod project;
@@ -78,12 +81,16 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
-            self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-            EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+            self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
+            EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent,
+            KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+            PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+        terminal::{
+            BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+            LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        },
     },
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -144,8 +151,18 @@ static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 fn own_screen(own: bool) {
     keys_apart(false);
     let _ = match own {
-        true => execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture),
-        false => execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen),
+        true => execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange
+        ),
+        false => execute!(
+            std::io::stdout(),
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        ),
     };
     keys_apart(true);
 }
@@ -208,6 +225,7 @@ fn usage() -> String {
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
+     sonny setup asks again for the provider and the default model, as the first run does.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
      for T3 Code: a thread is its folder's lead, and each task opens as a thread of its own."
         .into()
@@ -498,7 +516,7 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
             let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
-            setup::provider(&bin)?;
+            setup::provider(&bin, false)?;
             start_daemon(&options.store, &options.socket, false).map_err(|e| e.to_string())?;
         }
         started => started.map_err(|e| e.to_string())?,
@@ -510,6 +528,15 @@ async fn connect(options: &Options) -> Result<(Arc<Client>, agent_client::Events
         tokio::spawn(first_models(connected.0.clone(), path));
     }
     Ok(connected)
+}
+
+/// Whether `error` met a daemon on an older protocol than this Sonny's,
+/// one `agent start` replaces.
+fn older_daemon(error: &agent_client::Error) -> bool {
+    error.code == "daemon_protocol_mismatch"
+        && (error.facts.as_ref())
+            .and_then(|facts| facts.get("protocol")?.as_u64())
+            .is_some_and(|protocol| protocol < agent_client::PROTOCOL)
 }
 
 /// `~/.agent/models`, the list agents read with `agent models`, written
@@ -747,6 +774,30 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
+        Some((verb, rest)) if verb == "home" => {
+            return std::process::ExitCode::from(home::cli(rest) as u8);
+        }
+        Some((verb, rest))
+            if verb == "setup" && rest.first().is_some_and(|step| step == "backup") =>
+        {
+            match &rest[1..] {
+                [] => home::Places::home().and_then(|places| home::set_up(&places, None)),
+                [url] => home::Places::home().and_then(|places| home::set_up(&places, Some(url))),
+                _ => Err(format!("usage: {}", home::USAGE)),
+            }
+        }
+        Some((verb, rest)) if verb == "setup" && rest.is_empty() => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let (store, socket) = daemon_paths(None, None)?;
+                        setup::again(&store, &socket).await
+                    })
+                })
+        }
         Some((agent, rest)) if agent == "agent" => pass_to_agent(rest),
         // T3 Code runs this as a provider, a process for each thread.
         Some((verb, rest)) if verb == acp::VERB => acp::run(rest),
@@ -776,11 +827,24 @@ async fn run() -> Result<(), String> {
     // Before any lead is made, so its instructions list the skills.
     skills::install_own();
     trigger::at_start();
+    home::at_start();
     // Fonts are read before the first picture needs them.
     std::thread::spawn(image::preload);
     // So are the syntaxes, before the first code is colored.
     std::thread::spawn(highlight::preload);
-    let (client, mut events) = connect(&options).await?;
+    let (client, mut events) = match Client::connect(&options.socket).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Starting replaces an older daemon once its running turns end,
+            // which can take a while; the screen is not up yet to say so.
+            if older_daemon(&error) {
+                eprintln!(
+                    "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
+                );
+            }
+            connect(&options).await?
+        }
+    };
     trigger::restamp_at_start(client.identity(), client.store());
     // A lead made just now starts in the first approval mode.
     let mut fresh = false;
@@ -945,8 +1009,8 @@ async fn run() -> Result<(), String> {
     {
         app.gating = Some(mode);
     }
-    // A bot made before Sonny gave its model a prompt-cache lifetime takes
-    // it, so an idle gap of over five minutes no longer rereads it all.
+    // A bot made with no prompt-cache lifetime takes Sonny's, so an idle gap
+    // of over five minutes no longer rereads it all; a chosen one stays.
     if options.side.is_none() {
         app.cache = cache_to_take(&bot);
     }
@@ -957,6 +1021,9 @@ async fn run() -> Result<(), String> {
     // beside their edits; a side chat leaves it to its agent.
     if options.side.is_none() {
         app.upgrades = skills::upgraded();
+    }
+    if let Some(set) = setup::just_set() {
+        app.notice = Some(set);
     }
     if fresh {
         app.gating = Some(approvals::MODES[0].0);
@@ -1044,14 +1111,15 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
 }
 
 /// The prompt-cache lifetime Sonny gives the model of `bot`, as `inspect`
-/// gives it, when the bot has another.
+/// gives it, when the bot has none set. One someone chose, five minutes
+/// included, stays.
 fn cache_to_take(bot: &Value) -> Option<&'static str> {
     let model = format!(
         "{}/{}",
         bot["provider"].as_str().unwrap_or_default(),
         bot["model"].as_str().unwrap_or_default()
     );
-    agent_client::policy::cache_ttl(&model).filter(|ttl| bot["settings"]["cache_ttl"] != *ttl)
+    agent_client::policy::cache_ttl(&model).filter(|_| bot["settings"]["cache_ttl"].is_null())
 }
 
 /// A link, file or page, opened as the system opens it, by the first of
@@ -1616,6 +1684,9 @@ struct Watch {
     /// The row of `/background`'s picked item as the pane last drew it,
     /// so a new pick scrolls to it and scrolling otherwise stays put.
     picked: Option<usize>,
+    /// The agent `/status` has picked from the keys, by its place among
+    /// the agents it lists: ↑ and ↓ move it, Enter opens it.
+    pick: Option<usize>,
 }
 
 struct App {
@@ -1756,6 +1827,9 @@ struct App {
     /// The background switched, or the view did: the conversation is
     /// drawn again once idle.
     repaint: bool,
+    /// What the terminal shows may not be the frame last drawn, so the
+    /// next draw writes every cell again.
+    stale: bool,
     /// The oldest node this window drew, which a repaint draws back to.
     first_node: Option<i64>,
     /// The node before it, while the bot has older ones.
@@ -1951,6 +2025,12 @@ struct App {
     /// How many triggers and subscriptions run for this agent, as the
     /// footer's `↻` says, and when they were last counted.
     behind: (usize, Option<Instant>),
+    /// How many of what `/background` lists failed, as the footer's `✗`
+    /// says.
+    failed: usize,
+    /// How the turns triggers' last fires sent ended, by handle, as the
+    /// daemon said: asked once a turn is seen, and again while it runs.
+    turns: HashMap<String, Value>,
     /// The turn the person's words last went to from this window: only
     /// its end is followed by a guess at their next message.
     yours: Option<i64>,
@@ -2454,7 +2534,9 @@ impl Fleet {
                 }
                 // The judge handed a call to the person.
                 "approval_asked" => self.doing(bot, "needs you"),
-                "tool_completed" | "turn_resumed" if self.doing.get(bot) == Some(&"needs you") => {
+                "tool_completed" | "turn_resumed" | "step_decided"
+                    if self.doing.get(bot) == Some(&"needs you") =>
+                {
                     self.doing(bot, "working")
                 }
                 "turn_finished" => {
@@ -2580,6 +2662,8 @@ impl App {
             pick: 0,
             watch: None,
             behind: (0, None),
+            failed: 0,
+            turns: HashMap::new(),
             yours: None,
             suggesting: None,
             suggestion: None,
@@ -2608,6 +2692,7 @@ impl App {
             options,
             down: false,
             repaint: false,
+            stale: false,
             first_node: None,
             older: None,
             unpaired: Vec::new(),
@@ -2759,7 +2844,12 @@ impl App {
         loop {
             match self.draw(terminal) {
                 Ok(()) => failed_draws = 0,
-                Err(_) if failed_draws < DRAW_ATTEMPTS => failed_draws += 1,
+                // What it wrote before failing is on the screen, not in
+                // what the next draw compares with.
+                Err(_) if failed_draws < DRAW_ATTEMPTS => {
+                    failed_draws += 1;
+                    self.stale = true;
+                }
                 Err(error) => return Err(error.to_string()),
             }
             if self.quit {
@@ -2846,7 +2936,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
-            self.count_behind();
+            self.count_behind().await;
             self.read_tasks().await;
             self.read_running_tasks().await;
             self.read_references().await;
@@ -4341,6 +4431,35 @@ impl App {
         (lines, marks)
     }
 
+    /// Opens every fold and gathered row still in the conversation, or
+    /// folds them all again when none is left shut.
+    fn open_all(&mut self) {
+        let opens = |fold: &Fold| transcript::unfolds(&fold.whats, &fold.calls);
+        let open = self.folds.values().any(|fold| opens(fold) && !fold.open)
+            || self.clusters.values().any(|cluster| !cluster.open);
+        let folds: Vec<usize> = (self.folds.iter())
+            .filter(|(_, fold)| opens(fold))
+            .map(|(at, _)| *at)
+            .collect();
+        for at in folds {
+            if let Some(fold) = self.folds.get_mut(&at)
+                && fold.open != open
+            {
+                fold.open = open;
+                self.draw_fold(at);
+            }
+        }
+        let clusters: Vec<usize> = self.clusters.keys().copied().collect();
+        for at in clusters {
+            if let Some(cluster) = self.clusters.get_mut(&at)
+                && cluster.open != open
+            {
+                cluster.open = open;
+                self.draw_cluster(at);
+            }
+        }
+    }
+
     /// The cluster `at` drawn again where it is; whether it is still in
     /// the conversation.
     fn draw_cluster(&mut self, at: usize) -> bool {
@@ -5714,7 +5833,9 @@ impl App {
                     };
                 }
             }
-            "approval_requested" | "approval_asked" => self.approvals_for(turn).await,
+            "approval_requested" | "approval_asked" | "step_decided" => {
+                self.approvals_for(turn).await
+            }
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -5915,8 +6036,9 @@ impl App {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         });
-        self.open_pane(pane::Pane::card("/status", STATUS_KEYS));
+        self.open_pane(pane::Pane::card("/status", PICK_KEYS));
     }
 
     /// What runs for the project's agents with no one typing:
@@ -5929,6 +6051,7 @@ impl App {
             self.options.store.clone(),
             self.client.store().map(str::to_owned),
             self.bot.clone(),
+            self.turns.clone(),
         );
         self.watch = Some(Watch {
             project,
@@ -5940,6 +6063,7 @@ impl App {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/background", STATUS_KEYS));
     }
@@ -5961,6 +6085,7 @@ impl App {
             usage: Some(view),
             commons: None,
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/usage", STATUS_KEYS));
     }
@@ -5982,6 +6107,7 @@ impl App {
             usage: None,
             commons: Some(commons::View::open(&home)),
             picked: None,
+            pick: None,
         });
         self.open_pane(pane::Pane::card("/commons", STATUS_KEYS));
     }
@@ -6033,8 +6159,9 @@ impl App {
     }
 
     /// Count what runs for this agent in the background again, every ten
-    /// seconds: files read, no daemon call.
-    fn count_behind(&mut self) {
+    /// seconds, and what failed of what `/background` lists: files read,
+    /// and the daemon asked at once how the turns fires sent ended.
+    async fn count_behind(&mut self) {
         if self
             .behind
             .1
@@ -6043,10 +6170,28 @@ impl App {
         {
             return;
         }
-        let items = background::read(&self.options.store, self.client.store(), |bot| {
-            bot == self.bot
-        });
+        let scope = self.scope();
+        let read = |turns: &HashMap<String, Value>| {
+            background::read_around(&self.options.store, self.client.store(), turns, &scope)
+        };
+        let mut items = read(&self.turns);
+        let unended = background::unended(&items, &self.turns);
+        if !unended.is_empty() {
+            let ended = trigger::ended(&self.client, unended).await;
+            if !ended.is_empty() {
+                self.turns.extend(ended);
+                items = read(&self.turns);
+            }
+        }
+        let fired: std::collections::HashSet<&String> =
+            items.iter().filter_map(|i| i.handle.as_ref()).collect();
+        self.turns.retain(|handle, _| fired.contains(handle));
+        items.retain(|item| background::shown(&scope, item));
         self.behind = (background::count(&items, &self.bot), Some(Instant::now()));
+        self.failed = background::failed(&items);
+        if let Some(view) = (self.watch.as_mut()).and_then(|w| w.background.as_mut()) {
+            view.set_turns(&self.turns);
+        }
     }
 
     /// What the lookout does for this window's lead.
@@ -6086,9 +6231,12 @@ impl App {
             lead,
             glob: pattern,
         } = self.scope();
-        let behind = background::read(&self.options.store, self.client.store(), |bot| {
-            lookout::subs::matches(&pattern, bot)
-        });
+        let behind = background::read(
+            &self.options.store,
+            self.client.store(),
+            &self.turns,
+            |bot| lookout::subs::matches(&pattern, bot),
+        );
         let Ok(page) = self
             .client
             .request("bots", json!({"name": pattern, "limit": 256}))
@@ -6689,6 +6837,46 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let copy =
             key.code == KeyCode::Char('c') && (ctrl || key.modifiers.contains(KeyModifiers::SUPER));
+        // `/status` picks an agent from the keys and opens it, as a click
+        // on it does.
+        if self.finding.is_none()
+            && self.pane_keys
+            && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+            && self.pane.as_ref().is_some_and(|pane| pane.is_card())
+            && let Some(watch) = &self.watch
+            && watch.background.is_none()
+            && watch.usage.is_none()
+            && watch.commons.is_none()
+        {
+            let bots: Vec<String> = (watch_card(watch, self.width.max(40), &self.bot).2)
+                .into_iter()
+                .filter_map(|(_, mark)| match mark {
+                    screen::Mark::Link(link) => link
+                        .strip_prefix(&format!("{}task/", screen::BUTTON))
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            if !bots.is_empty() {
+                let last = bots.len() - 1;
+                let pick = watch.pick.map(|pick| pick.min(last));
+                let pick = match (key.code, pick) {
+                    (KeyCode::Up, Some(at)) => Some(at.saturating_sub(1)),
+                    (KeyCode::Up, None) => Some(last),
+                    (KeyCode::Down, Some(at)) => Some((at + 1).min(last)),
+                    (KeyCode::Down, None) => Some(0),
+                    (_, pick) => pick,
+                };
+                if key.code == KeyCode::Enter {
+                    if let Some(at) = pick {
+                        self.open_task(&bots[at]);
+                    }
+                } else if let Some(watch) = &mut self.watch {
+                    watch.pick = pick;
+                }
+                return true;
+            }
+        }
         if self.finding.is_none()
             && let Some(pane) = &mut self.pane
         {
@@ -6887,6 +7075,9 @@ impl App {
                 self.finding = Some(String::new());
                 self.screen.find("");
             }
+            // Every row a click opens, opened or folded from the keys, as
+            // Claude Code's Ctrl+O shows a turn's calls.
+            KeyCode::Char('o') if ctrl => self.open_all(),
             _ if copy && let Some(text) = self.screen.selected() => {
                 self.copied(&text);
                 self.screen.unselect();
@@ -7036,6 +7227,7 @@ impl App {
         margin::Glance {
             name: self.bot.clone(),
             behind: self.behind.0,
+            failed: self.failed,
             context: self.context,
         }
     }
@@ -7369,6 +7561,28 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
+        // The terminal may no longer show what was drawn: a multiplexer
+        // sizes a pane down and back to have its program draw it whole
+        // again (Herdr, tmux and screen do), a window can be resized and
+        // back between two draws, and a terminal regains focus after the
+        // display slept. Every cell is written again then, as vim and
+        // ncurses programs do on each resize, and on Ctrl-L as a shell does.
+        match &event {
+            Event::Resize(..) => self.stale = true,
+            Event::FocusGained => {
+                self.stale = true;
+                return;
+            }
+            Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && key.code == KeyCode::Char('l')
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.stale = true;
+                return;
+            }
+            _ => {}
+        }
         // Keys a shell reads as others: Ctrl-H is the backspace a terminal
         // sends as 0x08, which reads as Ctrl and `h` (with Alt, it deletes
         // a word, as Alt-Backspace does); Ctrl-P and Ctrl-N go up and down.
@@ -8583,6 +8797,10 @@ impl App {
             Span::raw(format!("Allow {name}?")).bold(),
         ])];
         lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        // A call an exec script makes, which waits while it is asked.
+        if call["step_of"].is_string() {
+            lines.push(Line::from("  a call in a running script").dim());
+        }
         if call["incomplete"] == true {
             lines.push(
                 Line::from("  … cut; the rest could not be read, so y is off: n denies it").dim(),
@@ -8596,7 +8814,20 @@ impl App {
         self.commit(lines);
     }
 
+    /// A frame drawn, the whole screen written again when it is stale:
+    /// cleared first, and shown at once with what replaces it where the
+    /// terminal holds a frame back until it is done.
     fn draw(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
+        if !std::mem::take(&mut self.stale) {
+            return self.frame(terminal);
+        }
+        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let drawn = terminal.clear().and_then(|()| self.frame(terminal));
+        execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+        drawn
+    }
+
+    fn frame(&mut self, terminal: &mut Tui) -> std::io::Result<()> {
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -8733,10 +8964,18 @@ impl App {
                 pane.set_card(lines, STATUS_KEYS);
                 pane.foot = Some(view.footer());
             } else {
-                let (lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, any_resolved, marks) = watch_card(watch, width, &self.bot);
+                // The agent picked from the keys leads with `›`, as a
+                // pick in Codex's lists does.
+                if let Some(&(row, _)) = watch.pick.and_then(|pick| marks.get(pick))
+                    && let Some(first) = lines.get_mut(row).and_then(|line| line.spans.first_mut())
+                {
+                    *first = Span::raw("›").bold();
+                    pane.screen.keep_in_view(row, 2);
+                }
                 let keys = match any_resolved && watch.resolved {
-                    true => "r hides resolved · esc closes",
-                    false => STATUS_KEYS,
+                    true => "↑↓ pick · enter open · r hide resolved · esc close",
+                    false => PICK_KEYS,
                 };
                 pane.set_card_marked(lines, marks, keys);
             }
@@ -8750,7 +8989,8 @@ impl App {
             Some(_) => "ctrl+\\",
             None => "tab",
         };
-        let paint = |frame: &mut ratatui::Frame| {
+        let paint = |frame: &mut ratatui::Frame,
+                     linked: &mut Vec<(u16, u16, ratatui::buffer::Cell)>| {
             // The conversation above the rows that move, which sit right
             // under it until it fills the screen.
             let (area, pane) = self.split(frame.area());
@@ -9082,7 +9322,10 @@ impl App {
         };
         let look = look::Look::now();
         terminal.draw(|frame| {
-            paint(frame);
+            paint(frame, &mut linked);
+            // A link something was drawn over since, as a list over the
+            // conversation, is left as the frame drew it.
+            screen::keep_shown(&mut linked, frame.buffer_mut());
             look.finish(frame.buffer_mut());
             // The pictures it shows, sent before it is written.
             image::send_shown(frame.buffer_mut());
@@ -9340,6 +9583,13 @@ impl App {
             _ if glancing => right,
             n => format!("↻ {n} in background · {right}"),
         };
+        // What failed of it, in red: /background lists it first.
+        let failed = format!("✗ {} failed", self.failed);
+        let right = match self.failed {
+            0 => right,
+            _ if glancing => right,
+            _ => format!("{failed} · {right}"),
+        };
         let right = match self.margin.notes().len() {
             n if n > 0 && !glancing => format!("✎ {n} · {right}"),
             _ => right,
@@ -9364,9 +9614,12 @@ impl App {
             folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
         }
         let place = format!(" · {}{folder}", if cut { "…" } else { "" });
-        let fill = width.saturating_sub(
-            left.width() + place.width() + branch.width() + right.width() + counted_width,
-        );
+        // A space at least, so a branch never runs into what follows it.
+        let fill = width
+            .saturating_sub(
+                left.width() + place.width() + branch.width() + right.width() + counted_width,
+            )
+            .max(1);
         // The branch in green, as shells show it; the agent's name in the
         // agents' color.
         let at = left.width() + place.width() + branch.width() + fill;
@@ -9383,7 +9636,16 @@ impl App {
         }
         match right.rfind(&self.bot) {
             Some(at) => {
-                spans.push(Span::raw(right[..at].to_owned()));
+                let before = &right[..at];
+                match before.find(&failed).filter(|_| self.failed > 0) {
+                    Some(from) => {
+                        let to = from + failed.len();
+                        spans.push(Span::raw(before[..from].to_owned()));
+                        spans.push(Span::raw(failed.clone()).fg(Color::Red).not_dim());
+                        spans.push(Span::raw(before[to..].to_owned()));
+                    }
+                    None => spans.push(Span::raw(before.to_owned())),
+                }
                 spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
                 let rest = &right[at + self.bot.len()..];
                 // How full the context is: green, then yellow, then red.
@@ -9414,6 +9676,9 @@ impl App {
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc closes";
+
+/// What the title row says the keys do on `/status` itself.
+const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; whether any task in it
@@ -10332,8 +10597,8 @@ mod tests {
             .iter()
             .position(|r| r == "? Tag 0.4.1?")
             .expect("asked");
-        assert_eq!(rows[at + 4], "     Brew gets it tonight.");
-        assert_eq!(rows[at + 8], "  Why 1: Nothing else is due.");
+        assert_eq!(rows[at + 4], "┃    Brew gets it tonight.");
+        assert_eq!(rows[at + 8], "┃ Why 1: Nothing else is due.");
         // Its answer landing, sent from here or another window, closes it.
         app.answered("You asked: Tag 0.4.1?\n\nYes");
         assert!(app.asks.is_empty());
@@ -11145,6 +11410,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_failed_in_the_background_is_red_left_of_what_runs() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.behind = (2, Some(Instant::now()));
+        app.failed = 1;
+        let line = app.footer_line(140);
+        let text = line.to_string();
+        assert!(text.contains("✗ 1 failed · ↻ 2 in background · "), "{text}");
+        let mark = line
+            .spans
+            .iter()
+            .find(|s| s.content == "✗ 1 failed")
+            .unwrap();
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        assert!(
+            mark.style.sub_modifier.contains(Modifier::DIM),
+            "red, not dimmed"
+        );
+        app.failed = 2;
+        assert!(app.footer_line(140).to_string().contains("✗ 2 failed · "));
+        app.failed = 0;
+        assert!(!app.footer_line(140).to_string().contains('✗'));
+    }
+
+    #[tokio::test]
     async fn an_emoji_reacts_to_a_reply_without_a_turn_and_again_takes_it_off() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
@@ -11555,12 +11845,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claude_bot_made_on_the_five_minute_cache_takes_the_hour() {
-        let bot = |provider: &str, ttl: &str| json!({"provider": provider, "model": "m", "settings": {"cache_ttl": ttl}});
-        assert_eq!(cache_to_take(&bot("anthropic", "5m")), Some("1h"));
-        assert_eq!(cache_to_take(&bot("bedrock", "5m")), Some("1h"));
-        assert_eq!(cache_to_take(&bot("anthropic", "1h")), None);
-        assert_eq!(cache_to_take(&bot("openai", "5m")), None);
+    async fn a_claude_bot_made_with_no_cache_lifetime_takes_the_hour() {
+        let bot = |provider: &str, ttl: Value| json!({"provider": provider, "model": "m", "settings": {"cache_ttl": ttl}});
+        assert_eq!(cache_to_take(&bot("anthropic", Value::Null)), Some("1h"));
+        assert_eq!(cache_to_take(&bot("bedrock", Value::Null)), Some("1h"));
+        assert_eq!(cache_to_take(&bot("anthropic", json!("1h"))), None);
+        // Five minutes someone chose stays five minutes.
+        assert_eq!(cache_to_take(&bot("anthropic", json!("5m"))), None);
+        assert_eq!(cache_to_take(&bot("openai", Value::Null)), None);
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let client = daemon_answering(move |request| {
@@ -12431,6 +12723,7 @@ mod tests {
             usage: None,
             commons: None,
             picked: None,
+            pick: None,
         };
         // A named lead's window: its own row opens nothing, and the
         // folder's other lead opens by its own name, not its label.
@@ -12595,6 +12888,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_o_opens_every_fold_and_folds_them_again() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.width = 80;
+        let start = |app: &mut App, name: &str| {
+            let command = format!("\"$AGENT_BIN\" run --bot {name} \"Fix {name}\"");
+            app.commit_call("c", "shell", &json!({"command": command}), "", false);
+        };
+        start(&mut app, "calc.add");
+        start(&mut app, "calc.neg");
+        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+        let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_o)).await;
+        let open = drawn(&mut app);
+        assert_eq!(open[0], "• Messaged calc.add and calc.neg ▾");
+        assert!(open.len() > 1, "{open:?}");
+        app.key(Event::Key(ctrl_o)).await;
+        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+    }
+
+    #[tokio::test]
+    async fn status_picks_an_agent_from_the_keys() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let row = |name: &str| status::Row {
+            name: name.into(),
+            bot: format!("calc.{name}"),
+            state: "working".into(),
+            group: status::Group::Working,
+            ..Default::default()
+        };
+        app.open_pane(pane::Pane::card("/status", PICK_KEYS));
+        app.watch = Some(Watch {
+            project: "calc".into(),
+            rows: vec![row("add"), row("neg")],
+            read: Instant::now(),
+            lookout: String::new(),
+            resolved: false,
+            background: None,
+            usage: None,
+            commons: None,
+            picked: None,
+            pick: None,
+        });
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let pick = |app: &App| app.watch.as_ref().unwrap().pick;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(0));
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(1), "the last stays picked");
+        app.key(key(KeyCode::Up)).await;
+        assert_eq!(pick(&app), Some(0));
+    }
+
+    #[tokio::test]
     async fn ctrl_h_deletes_as_backspace_does() {
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.input.set("helo");
@@ -12604,6 +12951,26 @@ mod tests {
         app.input.set("/mo");
         app.key(Event::Key(ctrl_h)).await;
         assert_eq!(&*app.input, "/m", "with the command menu open too");
+    }
+
+    #[tokio::test]
+    async fn a_resize_focus_or_ctrl_l_draws_the_whole_screen_again() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.input.set("hello");
+        // Sized down and back before a draw: still drawn whole.
+        app.key(Event::Resize(80, 23)).await;
+        app.key(Event::Resize(80, 24)).await;
+        assert!(std::mem::take(&mut app.stale));
+        assert_eq!(app.width, 80);
+        app.key(Event::FocusGained).await;
+        assert!(std::mem::take(&mut app.stale));
+        let ctrl_l = event::KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        app.key(Event::Key(ctrl_l)).await;
+        assert!(std::mem::take(&mut app.stale));
+        assert_eq!(&*app.input, "hello", "nothing typed");
+        app.key(Event::Key(KeyCode::Char('l').into())).await;
+        assert!(!app.stale);
+        assert_eq!(&*app.input, "hellol");
     }
 
     #[tokio::test]

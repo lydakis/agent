@@ -16,6 +16,10 @@
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
 //!
+//! [shell_environment_policy]    # what tool shells leave out, as in Codex
+//! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
+//! exclude = ["AWS_*"]           # names to leave out, * and ? wildcards, any case
+//!
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
@@ -63,7 +67,43 @@ pub struct Config {
     /// classifier declined to it, that request alone.
     pub fallbacks: BTreeMap<String, String>,
     pub judge: Judge,
+    pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
+}
+
+/// What Codex's default excludes leave out when they apply.
+pub const DEFAULT_EXCLUDES: [&str; 3] = ["*KEY*", "*SECRET*", "*TOKEN*"];
+
+/// Codex's `[shell_environment_policy]` excludes: variables of the daemon's
+/// environment that no tool shell gets, past the provider keys it always
+/// withholds. A daemon takes them when it starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShellEnvironmentPolicy {
+    /// False also leaves out `DEFAULT_EXCLUDES`; true, Codex's default,
+    /// keeps them.
+    pub ignore_default_excludes: bool,
+    /// Names to leave out, with `*` and `?` wildcards, in any case.
+    pub exclude: Vec<String>,
+}
+
+impl Default for ShellEnvironmentPolicy {
+    fn default() -> Self {
+        ShellEnvironmentPolicy {
+            ignore_default_excludes: true,
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl ShellEnvironmentPolicy {
+    /// Every pattern a daemon leaves out of tool shells.
+    pub fn excludes(&self) -> Vec<String> {
+        let defaults = DEFAULT_EXCLUDES
+            .iter()
+            .filter(|_| !self.ignore_default_excludes)
+            .map(|pattern| (*pattern).to_owned());
+        defaults.chain(self.exclude.iter().cloned()).collect()
+    }
 }
 
 /// Codex's `web_search` modes this runtime serves. Codex's `cached`, an
@@ -190,9 +230,61 @@ pub struct McpServer {
     pub tool_timeout_sec: Option<f64>,
     /// What it offers, in a sentence, for the agents told of it.
     pub description: Option<String>,
+    /// When a script's call of one of its tools asks the agent's gate
+    /// first, unless `tools` says otherwise for the tool.
+    pub default_tools_approval_mode: ApprovalMode,
+    /// Each tool's own `approval_mode`.
+    pub tools: BTreeMap<String, ApprovalMode>,
 }
 
-const MCP_KEYS: [&str; 13] = [
+impl McpServer {
+    /// The approval mode of a call of `tool`: its own, else the server's.
+    pub fn approval_mode(&self, tool: &str) -> ApprovalMode {
+        self.tools
+            .get(tool)
+            .copied()
+            .unwrap_or(self.default_tools_approval_mode)
+    }
+}
+
+/// When a script's call of an MCP tool asks the agent's gate first, under
+/// Codex's names: `auto` when the tool says it is destructive and not that
+/// it only reads, `writes` unless it says it only reads, `prompt` always,
+/// `approve` never. An agent under no gate never asks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApprovalMode {
+    #[default]
+    Auto,
+    Writes,
+    Prompt,
+    Approve,
+}
+
+impl ApprovalMode {
+    fn parse(at: &str, value: &toml::Value) -> Result<Self, String> {
+        match value.as_str() {
+            Some("auto") => Ok(Self::Auto),
+            Some("writes") => Ok(Self::Writes),
+            Some("prompt") => Ok(Self::Prompt),
+            Some("approve") => Ok(Self::Approve),
+            _ => Err(format!("{at} is auto, writes, prompt or approve")),
+        }
+    }
+
+    /// Whether a call of a tool with these MCP annotations asks first. A
+    /// read-only hint wins over a destructive one, as in Codex.
+    pub fn asks(self, annotations: &serde_json::Value) -> bool {
+        let reads = annotations["readOnlyHint"] == true;
+        match self {
+            Self::Auto => annotations["destructiveHint"] == true && !reads,
+            Self::Writes => !reads,
+            Self::Prompt => true,
+            Self::Approve => false,
+        }
+    }
+}
+
+const MCP_KEYS: [&str; 15] = [
     "command",
     "args",
     "env",
@@ -206,6 +298,8 @@ const MCP_KEYS: [&str; 13] = [
     "startup_timeout_sec",
     "tool_timeout_sec",
     "description",
+    "default_tools_approval_mode",
+    "tools",
 ];
 
 /// The server `[sonny.mcp_servers.NAME]` describes.
@@ -268,6 +362,28 @@ fn mcp_server(name: &str, value: &toml::Value) -> Result<McpServer, String> {
                     .ok_or_else(|| format!("{at}.enabled must be true or false"))?
             }
             "startup_timeout_sec" => server.startup_timeout_sec = Some(seconds(key, value)?),
+            "default_tools_approval_mode" => {
+                server.default_tools_approval_mode =
+                    ApprovalMode::parse(&format!("{at}.{key}"), value)?
+            }
+            "tools" => {
+                let tools = value
+                    .as_table()
+                    .ok_or_else(|| format!("{at}.tools must be a table of tools"))?;
+                for (tool, settings) in tools {
+                    let at = format!("{at}.tools.{tool}");
+                    let settings = settings
+                        .as_table()
+                        .ok_or_else(|| format!("{at} must be a table"))?;
+                    for (key, value) in settings {
+                        if key != "approval_mode" {
+                            return Err(format!("unknown key {at}.{key}"));
+                        }
+                        let mode = ApprovalMode::parse(&format!("{at}.{key}"), value)?;
+                        server.tools.insert(tool.clone(), mode);
+                    }
+                }
+            }
             "tool_timeout_sec" => server.tool_timeout_sec = Some(seconds(key, value)?),
             _ => {
                 let text = string(&format!("{at}.{key}"), value)?;
@@ -383,6 +499,7 @@ fn parse(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("unknown key {name}"))?;
         let keys: &[&str] = match name.as_str() {
             "judge" => &["model", "effort"],
+            "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
@@ -414,6 +531,25 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
+            }
+            if name == "shell_environment_policy" {
+                let policy = &mut config.shell_environment_policy;
+                if key == "ignore_default_excludes" {
+                    policy.ignore_default_excludes = value
+                        .as_bool()
+                        .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                    continue;
+                }
+                let invalid = || format!("{name}.{key} must be a list of names");
+                let patterns = value.as_array().ok_or_else(invalid)?;
+                policy.exclude = patterns
+                    .iter()
+                    .map(|pattern| match pattern.as_str() {
+                        Some(pattern) if !pattern.trim().is_empty() => Ok(pattern.to_owned()),
+                        _ => Err(invalid()),
+                    })
+                    .collect::<Result<_, _>>()?;
+                continue;
             }
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
@@ -799,6 +935,27 @@ mod tests {
             Some(&["read".to_owned()][..])
         );
         assert_eq!(files.tool_timeout_sec, Some(30.0));
+        assert_eq!(files.approval_mode("read"), ApprovalMode::Auto);
+        let modes = parse(
+            "[sonny.mcp_servers.chat]\ncommand = \"chat\"\ndefault_tools_approval_mode = \"writes\"\n\n[sonny.mcp_servers.chat.tools.post]\napproval_mode = \"prompt\"\n",
+        )
+        .unwrap();
+        let chat = &modes.sonny.mcp_servers["chat"];
+        assert_eq!(
+            (chat.approval_mode("post"), chat.approval_mode("search")),
+            (ApprovalMode::Prompt, ApprovalMode::Writes)
+        );
+        // Codex's rule: a read-only hint wins over a destructive one.
+        let hints = |read: bool, destructive: bool| serde_json::json!({"readOnlyHint": read, "destructiveHint": destructive});
+        let asks = |mode: ApprovalMode| {
+            [hints(false, false), hints(false, true), hints(true, true)]
+                .map(|annotations| mode.asks(&annotations))
+        };
+        assert_eq!(asks(ApprovalMode::Auto), [false, true, false]);
+        assert_eq!(asks(ApprovalMode::Writes), [true, true, false]);
+        assert_eq!(asks(ApprovalMode::Prompt), [true, true, true]);
+        assert_eq!(asks(ApprovalMode::Approve), [false, false, false]);
+        assert!(!ApprovalMode::Auto.asks(&serde_json::Value::Null));
         for (text, error) in [
             (
                 "[sonny.mcp_servers.x]\nenabled = true",
@@ -825,8 +982,56 @@ mod tests {
                 "unknown key sonny.mcp_servers.x.colour",
             ),
             (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\ndefault_tools_approval_mode = \"never\"",
+                "sonny.mcp_servers.x.default_tools_approval_mode is auto, writes, prompt or approve",
+            ),
+            (
+                "[sonny.mcp_servers.x]\ncommand = \"a\"\n[sonny.mcp_servers.x.tools.t]\nmode = \"auto\"",
+                "unknown key sonny.mcp_servers.x.tools.t.mode",
+            ),
+            (
                 "[sonny.mcp_servers.\"a b\"]\ncommand = \"a\"",
                 "sonny.mcp_servers.a b: a name is 1 to 64 letters, digits, _ or -",
+            ),
+        ] {
+            assert_eq!(parse(text).unwrap_err(), error, "{text}");
+        }
+    }
+
+    #[test]
+    fn shell_excludes_are_codex_s_and_off_by_default() {
+        assert!(
+            Config::default()
+                .shell_environment_policy
+                .excludes()
+                .is_empty()
+        );
+        let config = parse("[shell_environment_policy]\nexclude = [\"AWS_*\"]\n").unwrap();
+        assert_eq!(config.shell_environment_policy.excludes(), ["AWS_*"]);
+        let config = parse(
+            "[shell_environment_policy]\nignore_default_excludes = false\nexclude = [\"AWS_*\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.shell_environment_policy.excludes(),
+            ["*KEY*", "*SECRET*", "*TOKEN*", "AWS_*"]
+        );
+        for (text, error) in [
+            (
+                "[shell_environment_policy]\nexclude = \"AWS_*\"",
+                "shell_environment_policy.exclude must be a list of names",
+            ),
+            (
+                "[shell_environment_policy]\nexclude = [\" \"]",
+                "shell_environment_policy.exclude must be a list of names",
+            ),
+            (
+                "[shell_environment_policy]\nignore_default_excludes = \"no\"",
+                "shell_environment_policy.ignore_default_excludes must be true or false",
+            ),
+            (
+                "[shell_environment_policy]\ninherit = \"core\"",
+                "unknown key shell_environment_policy.inherit",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");

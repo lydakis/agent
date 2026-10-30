@@ -27,6 +27,18 @@ per feature; group small things into the row they belong to.
 - **Used?** Filled in by the person who uses Sonny, from use, not from the
   code: `yes`, `no`, `rarely`, or a note. `?` means nobody has said.
 
+## Principles
+
+- **Sonny is not another Claude Code; the clean view is mostly text.**
+  Agents are treated as people you talk to, not minds to peek inside. The
+  clean view shows what they say and what they do that reaches you: an
+  agent you should look at, a note in the margin, a lookout or task update
+  that changed what an agent does, a question for you. Commands, reads,
+  edits and the like stay in `/verbose`. What an agent does that has not
+  earned trust yet, such as a memory it saved about you, stays in view so
+  it can be checked, and leaves the clean view as trust builds. (George,
+  10-30)
+
 ## Leads and tasks
 
 | Feature | Status | History | Why | Used? |
@@ -56,19 +68,20 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326 | Room for the pane, folds, buttons and drag-to-copy | ? |
+| Full screen, Codex-like | shipped | added 10-28 #235 behind `/fullscreen`; default 10-28 #255; 100-column conversation 10-28 #264; only mode 10-29 #326; drawn whole again on resize, focus and Ctrl+L 10-30 #424 | Room for the pane, folds, buttons and drag-to-copy | ? |
 | Inline mode (Sonny drawn into the terminal's scrollback) | removed | added 10-26 #146; removed 10-29 #326 | The first view; full screen became the experience, and one view is less to keep | ? |
-| Clean view; `/verbose` shows every tool call | shipped | quiet steps 10-27 #188; clean view 10-27 #221 | Show what moves the work on, hide ordinary calls | ? |
-| Folds: an agent call is one row, agent messages and task updates are quiet rows, started tasks a live roster | shipped | task updates as one row 10-26 #177; rows, roster 10-29 #326; one row per call 10-29 #369; updates gather into one row 10-30 #384 | Less noise between the person's words and the replies | ? |
+| Clean view; `/verbose` shows every tool call | shipped | quiet steps 10-27 #188; clean view 10-27 #221; Ctrl+O opens every fold 10-30 #421 | Agents are people you talk to: show what they say and what reaches you, not their tool calls | ? |
+| Folds: an agent call is one row, agent messages and task updates are quiet rows, started tasks a live roster | shipped | task updates as one row 10-26 #177; rows, roster 10-29 #326; one row per call 10-29 #369; updates gather into one row 10-30 #384; a failed call says what it tried 10-30 #416 | Less noise between the person's words and the replies | ? |
 | Staged messages, the open line while a reply streams, turn timers | shipped | streaming 10-26 #172; staged 10-27 #175; timers 10-28 #266; each message a call streams drawn apart 10-30 #396 | Show what is in flight | ? |
 | Footer: context size, branch, ↻ background count, agents at work | shipped | context 10-26 #163; branch 10-27 #182; ↻ 10-28 #267; agents at work 10-29 #367 | One line of state under the composer | ? |
 | Colour: 16 terminal colours, one meaning each; marks say it first, muted gray and diff tints from the theme's own colours, `NO_COLOR` honoured | shipped | added 10-29 #326; one visual system 10-30 #405 | Colour that carries meaning, in any theme, and reads with low contrast, colour blindness or no colour | ? |
-| Links and file paths clickable | shipped | a path opens from the folder that named it 10-10 #98; web addresses 10-27 #179; link text, paths 10-27 #230 | Open what an agent names | ? |
+| Links and file paths clickable | shipped | a path opens from the folder that named it 10-10 #98; web addresses 10-27 #179; link text, paths 10-27 #230; never drawn over a list 10-30 #416 | Open what an agent names | ? |
 | Find (Ctrl+F) and long histories (older pages on scroll, Home to the first turn) | shipped | Ctrl+F 10-28 #258, 10-29 #343; pages 10-29 #331; lay out near the view 10-29 #353; Home 10-29 #364 | Long conversations stay fast and searchable | ? |
 | One Markdown renderer for every surface; code coloured with Oniguruma; headings bold with dim `#` marks, no hue | shipped | renderer 10-29 #325; Oniguruma 10-29 #336; Markdown as prose 10-30 #405 | Same rendering everywhere, three times faster colouring | ? |
 | Pictures: SVG, Mermaid, math and HTML drawn in the terminal | shipped | added 10-26 #147; `\[ \]` math 10-29 #313; sent once 10-29 #338 | Agents can show, not only tell | ? |
 | Reactions, on the message they answer (`/react`) | shipped | added 10-27 #224; under the message 10-29 #326 | A light acknowledgement without a reply | ? |
-| Welcome and first run: sets itself up and says hello | shipped | added 10-28 #253; heads every lead's history 10-29 #320 | A new person gets going without docs | ? |
+| Welcome and first run: sets itself up and says hello | shipped | added 10-28 #253; heads every lead's history 10-29 #320; finds keys, ChatGPT and AWS profiles, ranks the models, `sonny setup` 10-30 #402 | A new person gets going without docs | ? |
+| After an upgrade: the first lead tells what's new from this register and offers new setup once | experimental | added 10-30 #420 | The person hears of what changed and sets up what is new without reading release notes | ? |
 | `sonny view`: long writing beside the lead | removed | added 10-27 #197; reverted 10-27 #198 | Viewers are skills, not Sonny; long writing stays in a file | ? |
 
 ## Composer
@@ -84,22 +97,22 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384 | Look at something without losing the conversation | ? |
+| The pane beside the conversation: files, `/status`, `/background`, tasks; back and forward | shipped | added 10-28 #264; `/background` 10-28 #283; tasks in the pane 10-29 #326; `/status` opens the agent clicked 10-30 #384; ↑↓ Enter pick one 10-30 #421 | Look at something without losing the conversation | ? |
 | Pictures, HTML and diagrams in the pane; a folder as a tree | shipped | drawing 10-29 #303; tree 10-29 #319 | Read what agents made, in place | ? |
 | `/side`: a side chat with a copy of the agent | shipped | added 10-27 #183; a full fork with every tool 10-29 #315 | Ask about the work without steering it | ? |
-| Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384 | A place for state that outlives one reply | ? |
+| Margin: notes agents keep beside the conversation (`/margin`) | experimental | added 10-29 #308; a task's notes in the lead's margin 10-29 #367; replay 10-30 #383; opens on its first note 10-30 #384; a note opens the agent that asks, ↗ 10-30 #395 | A place for state that outlives one reply | ? |
 
 ## What agents get from Sonny
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| `ask`: a question for the person, as a decision card with reasons | shipped | pinned questions above the composer 10-27 #192; declared tool 10-27 #225; decision card where it was asked 10-28 #245; options are buttons 10-29 #326 | Agents ask instead of guessing; the person answers in one click | ? |
+| `ask`: a question for the person, as a decision card with reasons | shipped | pinned questions above the composer 10-27 #192; declared tool 10-27 #225; decision card where it was asked 10-28 #245; options are buttons 10-29 #326; a task's question reaches its lead, a yellow ? and a muted bar, decisions and sends go through it 10-30 #395 | Agents ask instead of guessing; the person answers in one click | ? |
 | `plan`: the agent's plan, drawn in the conversation | shipped | added 10-27 #225 | See the steps an agent intends | ? |
-| Memory (`sonny memory`, the memory skills, nightly cleanup) | shipped | app memory 10-09 #82, 10-10 #104, #120; moved into Sonny 10-27 #189; a tool 10-28 #278; 16 KiB 10-28 #241; read tracking, 30-day unread check 10-29 #354; outside-content marks 10-29 #356; the cleanup reflects on habits, from the person's words and what they sent through their servers 10-30 #403 | Later agents start knowing what earlier ones learned | ? |
+| Memory (`sonny memory`, the memory skills, nightly cleanup) | shipped | app memory 10-09 #82, 10-10 #104, #120; moved into Sonny 10-27 #189; a tool 10-28 #278; 16 KiB 10-28 #241; read tracking, 30-day unread check 10-29 #354; outside-content marks 10-29 #356; the cleanup reflects on habits, from the person's words and what they sent through their servers 10-30 #403; a server it cannot read holds the night open 10-30 #411 | Later agents start knowing what earlier ones learned | ? |
 | Triggers (`sonny trigger`): wake an agent at a time, on a file, a commit, or by name | shipped | app triggers 10-10 #89-#92; moved into Sonny 10-27 #189; skipped checks, `--replace` 10-28 #241; a tool 10-28 #278; Linux via systemd 10-29 #344; `--start` agents get Sonny's tools 10-30 #403 | Work that starts while nobody is at the terminal | ? |
 | Turn-end triggers | removed | added 10-10 #89-#92; removed 10-27 #189 | Leads hear of task turns from task updates and the lookout | ? |
 | Goals: keep an agent working until a check command passes | experimental | added 10-29 #341; `/goal WHAT` asks the agent to set one, `/goal` shows, `/goal clear` clears 10-30 #397 | Autonomy with a check, not a model's say-so | ? |
-| MCP servers through one `exec` script tool (`/mcp`, `sonny mcp tool`) | experimental | added 10-29 #321; saved files kept a week 10-29 #327; four scripts at once 10-29 #334 | The person's MCP servers without loading every tool's schema | ? |
+| MCP servers through one `exec` script tool (`/mcp`, `sonny mcp tool`) | experimental | added 10-29 #321; saved files kept a week 10-29 #327; four scripts at once 10-29 #334; brought in from Claude Code, Codex, OpenCode and Kiro (`sonny mcp import`, offered by setup) 10-30 #415; each call approved on its own by Codex's `approval_mode` (default `auto`), not the script, 10-30 #393 | The person's MCP servers without loading every tool's schema; per-call approval as Codex does, so reads run and only risky calls ask | ? |
 | Commons: threads every agent of every project reads and writes (`commons` tool, `/commons`) | experimental | added 10-30 #392 | A pull-only place for agents to work together across projects, even when it isn't immediately productive; reads are counted so later we can see what mattered | ? |
 | Skills Sonny installs (automation, memory, plan, pictures, multiplexer skills) | shipped | moved into Sonny 10-27 #189; monitors 10-27 #206; an edited skill is never overwritten 10-29 #357 | Teach agents Sonny's features as normal skills | ? |
 
@@ -107,10 +120,10 @@ per feature; group small things into the row they belong to.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Lookout: tells a lead what its tasks did | shipped | added 10-26 #154, #161; one per daemon 10-27 #180; subscriptions 10-27 #195; subscribers only, leads subscribed 10-27 #212; news within a minute 10-27 #228, #232; a companion of the daemon 10-29 #370; a turn's end carries its reply 10-30 #378; stays light with thousands of bots 10-30 #398 | A lead can rest while tasks work and hear the moment they need it | ? |
+| Lookout: tells a lead what its tasks did | shipped | added 10-26 #154, #161; one per daemon 10-27 #180; subscriptions 10-27 #195; subscribers only, leads subscribed 10-27 #212; news within a minute 10-27 #228, #232; a companion of the daemon 10-29 #370; a turn's end carries its reply 10-30 #378; stays light with thousands of bots 10-30 #398; a task's question is news 10-30 #395; follows only the event kinds it reads 10-30 #407 | A lead can rest while tasks work and hear the moment they need it | ? |
 | Lookout judge: a model decides what interrupts the lead (drift, interruptions, look-fors) | removed | added 10-26 #154; judge forks expire 10-27 #203; drift check 10-27 #204; interruptions only 10-27 #215; one judge with the approver 10-27 #217; picks 10-28 #239, #273; removed 10-29 #310 | Removed because the checks felt ad hoc and did not scale; the lookout now forwards everything and only picks the timing | ? |
 | Lookout sources: pollers the person sets up feed news to agents | experimental | added 10-29 #305 | Agents hear about the world, not only their tasks | ? |
-| `/background`: triggers and lookout subscriptions, fire or remove | shipped | added 10-28 #267; in the pane 10-28 #283 | See and control what runs while nobody watches | ? |
+| `/background`: triggers and lookout subscriptions, fire or remove | shipped | added 10-28 #267; in the pane 10-28 #283; what failed first, `✗ N failed` in the footer and the glance, turn failures in the triggers tool 10-30 | See and control what runs while nobody watches; a nightly run that failed while the laptop was offline or a login expired otherwise fails unseen | ? |
 
 ## Approvals
 
@@ -128,6 +141,9 @@ per feature; group small things into the row they belong to.
 | `/config`: the settings in `~/.agent/config.toml`; `/sound` chime | shipped | never overwrite the person's settings 10-26 #149; effort defaults 10-28 #251; `/config`, chime 10-29 #315 | One settings file, editable in Sonny | ? |
 | `/usage`: tokens spent over time, by agent and model | shipped | added 10-29 #302 | See where the tokens go | ? |
 | Homebrew and Linux installs | shipped | formula 10-26 #148; Linux builds 10-27 #191; source formulas 10-27 #196; install script 10-28 #253 | Install with one command | ? |
+| Claude agents get the hour-long prompt cache unless someone set a lifetime; an explicit `5m` stays | shipped | hour default 10-29 #318; explicit lifetime kept 10-30 | The hour cache raised hit rates; the default must not override a person's choice | ? |
+| Opening Sonny after an upgrade replaces the older running daemon once its turns end, and says so | shipped | added 10-30 #413 | An upgrade left the old daemon running, and every command failed until it was restarted by hand | ? |
+| `sonny setup backup`: memory, skills, profiles and config pushed to a private git repo every 10 minutes; restores a new machine | experimental | added 10-30 #417 | A disposable box loses at most ten minutes of what agents learned | ? |
 
 ## Other clients
 
