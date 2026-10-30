@@ -40,16 +40,16 @@ to `STORE.lookout.jsonl`.
 
 It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
 just before the oldest one whose news it has not told yet. A lookout that
-starts again, after a crash or a lost connection, follows from that cursor
-and takes what happened after it as news, so a task that finished while no
-lookout ran, or whose news waited on a busy lead, still reaches its lead;
-news told already may be told again. It never reads the whole log again:
-what it needs from before the cursor it takes from the daemon's listings:
-which bots there are and who made them, what each subscriber's own turn
-waits on, once when it starts, and who asked for a turn that ends without
-having begun since, read from its prompt before its end is told. Only a
-lookout with no cursor yet reads the whole log, once, as history rather
-than news.
+starts again, after a crash or a lost connection, takes what happened after
+that cursor as news, so a task that finished while no lookout ran, or whose
+news waited on a busy lead, still reaches its lead; news told already may
+be told again. Beside it, the file keeps where the stream starts again:
+just before the oldest turn still under way among the bots its subscribers
+watch, as a consumer commits its offset only up to its oldest record still
+in work. What came between is replayed as history, so who asked for a turn,
+what a subscriber waits on and a task's resolving are known when the turn
+ends. It never reads the whole log again; only a lookout with no cursor yet
+reads it all, once, as history rather than news.
 
 It is built to stay light with thousands of bots, as a Kubernetes
 controller is with a large cluster. Each event reaches only the

@@ -212,16 +212,6 @@ pub struct Updates {
     forwarding: HashMap<Key, Forward>,
     /// Turns whose end waits for their goal's check, until it says.
     goaled: HashSet<Key>,
-    /// Turns whose `accepted` or `queued` it heard, until they end.
-    begun: HashSet<Key>,
-    /// Whether a turn that ends without having begun in what it heard,
-    /// as one begun before the stream started or before its bot was
-    /// watched, is held while its prompt is read for who asked. The
-    /// service's lookouts do; tests that end turns bare do not.
-    pub reads_prompts: bool,
-    /// Turns whose end waits for that read, and those not asked yet.
-    unknown: HashSet<Key>,
-    unread: Vec<Key>,
     /// Approvals not yet answered: when they become news, and the call.
     approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Tasks' `margin` calls started, by task and call: the note's id and
@@ -293,10 +283,6 @@ impl Updates {
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
             goaled: HashSet::new(),
-            begun: HashSet::new(),
-            reads_prompts: false,
-            unknown: HashSet::new(),
-            unread: Vec::new(),
             approvals: HashMap::new(),
             margin_calls: HashMap::new(),
             tasks: Vec::new(),
@@ -400,7 +386,6 @@ impl Updates {
             }
             "accepted" | "queued" => {
                 let Some(turn) = turn else { return };
-                self.begun.insert(key(turn));
                 if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-")) {
                     self.noted.insert(key(turn));
                 }
@@ -530,7 +515,6 @@ impl Updates {
                 let origin = self.origin.remove(&key(turn));
                 let answered = self.answer_to.remove(&key(turn));
                 let noted = self.noted.remove(&key(turn));
-                let begun = self.begun.remove(&key(turn));
                 if let Some(bot) = self.bots.get_mut(name)
                     && bot.running.is_none_or(|running| running == turn)
                 {
@@ -549,24 +533,12 @@ impl Updates {
                     return;
                 }
                 let creator = self.creator(name);
-                let mut hold = match self.goaled.contains(&key(turn)) {
+                let hold = match self.goaled.contains(&key(turn)) {
                     // News once its goal's check says, or once a check
                     // could have run its longest.
                     true => Some(GOAL_HOLD),
                     false => (answered.is_some() && answered == creator).then_some(FORWARD),
                 };
-                // Begun before it heard: news once its prompt
-                // says who asked, or once the read had long enough.
-                if self.reads_prompts
-                    && !begun
-                    && from.is_none()
-                    && origin.is_none()
-                    && self.task(name)
-                {
-                    hold = hold.or(Some(FORWARD));
-                    self.unknown.insert(key(turn));
-                    self.unread.push(key(turn));
-                }
                 if let Some(hold) = hold {
                     self.forwarding.insert(
                         key(turn),
@@ -782,7 +754,19 @@ impl Updates {
             .collect();
         for key in late {
             self.goaled.remove(&key);
-            self.release(&key);
+            if let Some(forward) = self.forwarding.remove(&key) {
+                let Forward {
+                    status,
+                    from,
+                    origin,
+                    reply,
+                    ..
+                } = forward;
+                self.tell(&key.0, key.1, &status, from, None, origin);
+                if let Some(reply) = reply {
+                    self.replied(&key.0, key.1, &reply);
+                }
+            }
         }
         let waited: Vec<Key> = (self.approvals.iter())
             .filter(|(_, (at, _))| *at <= now)
@@ -793,62 +777,6 @@ impl Updates {
                 self.tell(&key.0, key.1, APPROVAL, None, call, None);
             }
         }
-    }
-
-    /// A held turn's end, told now.
-    fn release(&mut self, key: &Key) {
-        self.unknown.remove(key);
-        if let Some(forward) = self.forwarding.remove(key) {
-            let Forward {
-                status,
-                from,
-                origin,
-                reply,
-                ..
-            } = forward;
-            self.tell(&key.0, key.1, &status, from, None, origin);
-            if let Some(reply) = reply {
-                self.replied(&key.0, key.1, &reply);
-            }
-        }
-    }
-
-    /// The ended turns whose prompts are to be read for who asked, taken.
-    pub fn unread(&mut self) -> Vec<Key> {
-        std::mem::take(&mut self.unread)
-    }
-
-    /// Reads under way were cut off: those turns are read again.
-    pub fn unread_again(&mut self) {
-        self.unread = self.unknown.iter().cloned().collect();
-    }
-
-    /// Who asked for a held turn, as its prompt says (`None` when the read
-    /// failed, and nothing says): its end is news now, unless its goal's
-    /// check still holds it.
-    pub fn asked_later(&mut self, name: &str, turn: i64, prompt: Option<&Value>) {
-        let key = (name.to_owned(), turn);
-        if !self.unknown.remove(&key) {
-            return;
-        }
-        let Some(forward) = self.forwarding.get_mut(&key) else {
-            return;
-        };
-        if let Some(prompt) = prompt {
-            forward.from = prompt["from"]["bot"].as_str().map(str::to_owned);
-            forward.origin = (forward.from.is_none())
-                .then(|| prompt["origin"].as_str().map(str::to_owned))
-                .flatten();
-        }
-        if !self.goaled.contains(&key) {
-            self.release(&key);
-        }
-    }
-
-    /// Whether ended turns wait to be told: on a trigger, a goal's check,
-    /// or who asked for them.
-    pub fn holding(&self) -> bool {
-        !self.forwarding.is_empty()
     }
 
     /// A turn about to end whose goal's check runs once it does: its end
@@ -912,6 +840,11 @@ impl Updates {
         self.forwarding.retain(|key, _| {
             self.goaled.contains(key) || !handles.contains(&format!("turn:{}/{}", key.0, key.1))
         });
+    }
+
+    /// Whether ended turns wait to be told, on a trigger or a goal's check.
+    pub fn holding(&self) -> bool {
+        !self.forwarding.is_empty()
     }
 
     /// Whether there is news for the lead.
@@ -1134,7 +1067,6 @@ impl Updates {
         self.tasks.clear();
         self.forwarding.clear();
         self.goaled.clear();
-        self.unknown.clear();
         self.approvals.clear();
     }
 
@@ -1165,8 +1097,6 @@ impl Updates {
         self.tasks.retain(|(task, _)| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.goaled.retain(|(task, _)| task != name);
-        self.unknown.retain(|(task, _)| task != name);
-        self.begun.retain(|(task, _)| task != name);
         self.approvals.retain(|(task, _), _| task != name);
         self.noted.retain(|(task, _)| task != name);
     }
@@ -1441,50 +1371,6 @@ mod tests {
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
         );
-    }
-
-    #[test]
-    fn a_turn_begun_before_the_stream_is_told_once_its_prompt_says_who_asked() {
-        let mut updates = fleet();
-        updates.reads_prompts = true;
-        let now = Instant::now();
-        let ended = json!({"status": "completed"});
-        // One begun in the stream says who asked itself.
-        updates.event(&ev("shop.fix", Some(6), "accepted", json!({})), now);
-        updates.event(
-            &ev("shop.fix", Some(6), "turn_finished", ended.clone()),
-            now,
-        );
-        updates.event(
-            &ev("shop.fix", Some(7), "turn_finished", ended.clone()),
-            now,
-        );
-        updates.event(&ev("shop.docs", Some(8), "turn_finished", ended), now);
-        let mut unread = updates.unread();
-        unread.sort();
-        assert_eq!(unread, [("shop.docs".into(), 8), ("shop.fix".into(), 7)]);
-        assert!(updates.holding());
-        let told = text(&updates.take());
-        assert!(told.contains("turn:shop.fix/6 completed"), "{told}");
-        assert!(!told.contains("shop.fix/7"), "{told}");
-        let asked = json!({"turn": 7, "text": "", "from": {"bot": "shop.lead", "turn": 1}});
-        updates.asked_later("shop.fix", 7, Some(&asked));
-        updates.asked_later(
-            "shop.docs",
-            8,
-            Some(&json!({"turn": 8, "text": "", "origin": "cron"})),
-        );
-        assert!(!updates.holding());
-        let told = text(&updates.take());
-        assert!(
-            told.contains("turn:shop.fix/7 completed, asked by you"),
-            "{told}"
-        );
-        assert!(
-            told.contains("turn:shop.docs/8 completed, asked by cron"),
-            "{told}"
-        );
-        assert!(!told.contains("the person"), "{told}");
     }
 
     #[test]

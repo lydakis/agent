@@ -429,9 +429,9 @@ async fn serve(settings: Settings) -> Result<(), String> {
         cursor: None,
         saved: None,
         goals: goals::Goals::new(&settings.store, &settings.socket),
-        resume: std::fs::read_to_string(cursor_path(&settings.store))
-            .ok()
-            .and_then(|text| text.trim().parse().ok()),
+        resume: marks(&settings.store).0,
+        replay: marks(&settings.store).1,
+        in_flight: HashMap::new(),
         reacting: HashMap::new(),
         taken: HashMap::new(),
         watchers: HashMap::new(),
@@ -496,11 +496,20 @@ struct Service {
     /// The newest event seen live, and the newest saved beside the store:
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
-    saved: Option<i64>,
+    saved: Option<(i64, i64)>,
     /// The agents' goals, whose turns it holds until their checks say.
     goals: goals::Goals,
     /// Where the last lookout left off: events after it are news.
     resume: Option<i64>,
+    /// Where the last lookout's stream starts again: before the oldest turn
+    /// still under way then, so what each said before it ends is known.
+    replay: Option<i64>,
+    /// Turns of bots a lookout hears that began and have not ended, by bot
+    /// and turn: the event each began at. The stream starts again before
+    /// the oldest, as a consumer commits its offset only up to its oldest
+    /// record still in work: who asked, what the subscriber waits on and a
+    /// task's resolving are replayed rather than lost.
+    in_flight: HashMap<(String, i64), i64>,
     /// Lead `react` calls naming another agent, by bot, turn and call,
     /// until they end: the agent named, the emoji, whether it comes off,
     /// and the newest message that agent had taken when the call began.
@@ -511,8 +520,8 @@ struct Service {
     /// Which lookouts hear each bot's events, by bot: its own, and those
     /// that watch it.
     watchers: HashMap<String, Vec<String>>,
-    /// Not connected yet since it started: what came before its cursor is
-    /// known only from the daemon's listings.
+    /// Not connected yet since it started: its stream starts again where
+    /// the last lookout's would.
     started: bool,
 }
 
@@ -628,7 +637,6 @@ fn updates_for(
     let mut updates = updates::Updates::new(subscriber, memory);
     updates.subscribed(others(subscriber, subscribers));
     updates.live = live;
-    updates.reads_prompts = true;
     updates
 }
 
@@ -678,18 +686,29 @@ impl Service {
         }
         let mut live = false;
         self.live = false;
-        // From before the oldest news not told yet, as a restart would:
-        // a message whose read the dropped connection cut short is read
+        // News from before the oldest not told yet, as a restart would: a
+        // message whose read the dropped connection cut short is read
         // again. What came before was told, or seen live by this lookout,
-        // so the stream starts after it, as a watch resumes from its
-        // version: never the whole log again. Only a lookout with no
-        // cursor yet reads it all, once.
+        // so the stream starts after it, or before the oldest turn still
+        // under way, whose events are history: never the whole log again.
+        // Only a lookout with no cursor yet reads it all, once.
         self.resume = self.floor().or(self.resume);
-        if self.started && self.resume.is_some() {
-            self.waiting_before(&client).await;
-        }
+        // A turn the listing shows ended, or never running, ended unseen.
+        let running: HashMap<&str, i64> = (bots.iter())
+            .filter_map(|bot| Some((bot["name"].as_str()?, bot["running_turn"].as_i64()?)))
+            .collect();
+        self.in_flight
+            .retain(|(bot, turn), _| running.get(bot.as_str()).is_some_and(|at| turn >= at));
+        let replay = match self.started {
+            true => self.replay,
+            false => self.replay_floor(),
+        };
         self.started = false;
-        let after = self.resume.unwrap_or(0);
+        let after = [self.resume, replay]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(0);
         if let Err(error) = (client.request("follow", json!({"bot": "*", "after": after}))).await {
             println!(
                 "{}",
@@ -769,6 +788,7 @@ impl Service {
                     if event["event"] == "deleted"
                         && let Some(name) = event["bot"].as_str()
                     {
+                        self.in_flight.retain(|(bot, _), _| bot != name);
                         self.records.remove(name);
                         if self.lookouts.remove(name).is_some() {
                             self.index();
@@ -788,6 +808,19 @@ impl Service {
                     // as an informer hands a change to the handlers that
                     // asked for its object; a bot made or deleted, to all.
                     let hearing = self.hearing(&event);
+                    if let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) {
+                        match event["event"].as_str() {
+                            Some("accepted" | "queued") if !hearing.is_empty() => {
+                                if let Some(at) = cursor {
+                                    self.in_flight.entry((bot.to_owned(), turn)).or_insert(at);
+                                }
+                            }
+                            Some("turn_finished") => {
+                                self.in_flight.remove(&(bot.to_owned(), turn));
+                            }
+                            _ => {}
+                        }
+                    }
                     for name in &hearing {
                         let Some(lookout) = self.lookouts.get_mut(name) else { continue };
                         lookout.event(&event);
@@ -928,27 +961,6 @@ impl Service {
             true => self.watchers.remove(bot),
             false => self.watchers.insert(bot.to_owned(), hear),
         };
-    }
-
-    /// What each subscriber's own turn waits on as this lookout starts,
-    /// which its `turn_waiting` said before its cursor: no news. Read once,
-    /// beside each other.
-    async fn waiting_before(&mut self, client: &Arc<Client>) {
-        let mut reads = tokio::task::JoinSet::new();
-        for lead in self.lookouts.keys().cloned().collect::<Vec<_>>() {
-            let client = client.clone();
-            reads.spawn(async move {
-                let newest = json!({"bot": lead, "newest": true, "limit": 1});
-                let turn = (client.request("turns", newest).await.ok())
-                    .and_then(|page| page["turns"].get(0).cloned());
-                (lead, turn)
-            });
-        }
-        while let Some(Ok((lead, turn))) = reads.join_next().await {
-            if let (Some(lookout), Some(turn)) = (self.lookouts.get_mut(&lead), turn) {
-                lookout.waiting(&turn);
-            }
-        }
     }
 
     /// The subscription files as they are now: a bot that subscribed is
@@ -1167,17 +1179,35 @@ impl Service {
     /// The newest event seen live, kept beside the store for the next
     /// lookout, written whole and moved in.
     fn save_cursor(&mut self) {
-        let Some(cursor) = self.floor().filter(|at| Some(*at) != self.saved) else {
+        let Some(cursor) = self.floor() else {
             return;
         };
+        let replay = self.replay_floor().map_or(cursor, |at| at.min(cursor));
+        if self.saved == Some((cursor, replay)) {
+            return;
+        }
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
-        if std::fs::write(&partial, cursor.to_string()).is_ok()
+        if std::fs::write(&partial, format!("{cursor} {replay}")).is_ok()
             && std::fs::rename(&partial, &path).is_ok()
         {
-            self.saved = Some(cursor);
+            self.saved = Some((cursor, replay));
         }
     }
+
+    /// Just before the oldest turn under way that a lookout hears.
+    fn replay_floor(&self) -> Option<i64> {
+        self.in_flight.values().min().map(|at| at - 1)
+    }
+}
+
+/// What the last lookout kept: where its news ended, and where its stream
+/// starts again, the same when it kept one.
+fn marks(store: &Path) -> (Option<i64>, Option<i64>) {
+    let text = std::fs::read_to_string(cursor_path(store)).unwrap_or_default();
+    let mut marks = text.split_whitespace().map(|mark| mark.parse().ok());
+    let news = marks.next().flatten();
+    (news, marks.next().flatten().or(news))
 }
 
 /// Where the newest event a lookout saw live is kept: beside the store.
@@ -1397,8 +1427,6 @@ enum Answer {
     Noted(Result<(), String>),
     /// A note from sources was submitted, or refused with this code.
     Sourced(Result<(), String>),
-    /// A turn's prompt, read for who asked for it, if the read succeeded.
-    Prompted(String, i64, Option<Value>),
 }
 
 impl Lookout {
@@ -1773,8 +1801,8 @@ impl Lookout {
     }
 
     /// Whether anything it heard is not told yet: messages to read or
-    /// being read, a turn waiting on its goal's check or who asked for it,
-    /// news, or a note the daemon has not answered.
+    /// being read, a turn held on a trigger or its goal's check, news, or
+    /// a note the daemon has not answered.
     fn untold(&self) -> bool {
         !self.due.is_empty()
             || self.reading > 0
@@ -1790,20 +1818,6 @@ impl Lookout {
     /// comes back to `answered`.
     fn wake(&mut self, client: &Arc<Client>, woken: &Woken) {
         let now = Instant::now();
-        for (bot, turn) in self.updates.unread() {
-            let (client, woken) = (client.clone(), woken.clone());
-            let (lead, id) = (self.lead.clone(), self.id);
-            tokio::spawn(async move {
-                let read = (client
-                    .request("prompts", json!({"bot": bot, "turn": turn, "bytes": 1})))
-                .await
-                .ok()
-                .map(|read| read["prompts"][0].clone());
-                let _ = woken
-                    .send((lead, id, Answer::Prompted(bot, turn, read)))
-                    .await;
-            });
-        }
         self.since = match self.updates.news() {
             true => Some(self.since.unwrap_or(now)),
             false => None,
@@ -1940,9 +1954,6 @@ impl Lookout {
                 }
                 self.heard_since = (!self.heard.is_empty()).then_some(now);
             }
-            Answer::Prompted(bot, turn, prompt) => {
-                self.updates.asked_later(&bot, turn, prompt.as_ref());
-            }
         }
     }
 
@@ -1950,7 +1961,6 @@ impl Lookout {
     /// their notes carried is news again, as when one is refused.
     fn reconnected(&mut self) {
         self.asking = None;
-        self.updates.unread_again();
         if let Some((told, ..)) = self.sending.take() {
             self.updates.unsent(told);
         }
@@ -2612,6 +2622,8 @@ mod tests {
             cursor: None,
             saved: None,
             resume: None,
+            replay: None,
+            in_flight: HashMap::new(),
             reacting: HashMap::new(),
             taken: HashMap::new(),
             watchers: HashMap::new(),
@@ -2927,6 +2939,26 @@ mod tests {
             told.iter().any(|line| line.contains("turn:calc.fix/2")),
             "{told:?}"
         );
+    }
+
+    #[test]
+    fn the_stream_starts_again_before_the_oldest_turn_still_under_way() {
+        let dir = std::env::temp_dir().join(format!("lookout-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let mut service = service(store.clone(), &[]);
+        service.cursor = Some(90);
+        service.in_flight.insert(("calc.fix".into(), 7), 40);
+        service.in_flight.insert(("calc.docs".into(), 9), 60);
+        service.save_cursor();
+        assert_eq!(marks(&store), (Some(90), Some(39)));
+        // Nothing under way: it starts again where its news ended.
+        service.in_flight.clear();
+        service.save_cursor();
+        assert_eq!(marks(&store), (Some(90), Some(90)));
+        std::fs::write(cursor_path(&store), "12").unwrap();
+        assert_eq!(marks(&store), (Some(12), Some(12)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
