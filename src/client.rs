@@ -1031,7 +1031,7 @@ fn require_approver(connection: &mut Connection) -> Result<()> {
     }
     Err(Error::with(
         "approver_not_serving",
-        "no approver serves auto; one must, such as `sonny approver`, which Sonny keeps running",
+        "no approver serves auto; a client must serve it with serve_approvals",
     )
     .facts(json!({"tag":"auto"})))
 }
