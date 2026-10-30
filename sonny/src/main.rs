@@ -1651,6 +1651,9 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// The staged turns sent with Tab to run after the running one, which
+    /// they do not join.
+    queued: Vec<i64>,
     /// Pictures given with the message being written, each behind its
     /// placeholder in the composer: [`attach::placeholder`] of its place
     /// here, from 1.
@@ -2529,6 +2532,7 @@ impl App {
             sounds: sound::Sounds::new(false),
             said: String::new(),
             staged: Vec::new(),
+            queued: Vec::new(),
             pictures: Vec::new(),
             reactions: reactions::Reactions::default(),
             replies: Vec::new(),
@@ -2856,7 +2860,10 @@ impl App {
             self.shown.extend(user_shell::lines(&ran, self.prose()));
             let record = user_shell::record(&ran);
             // Refused, it is kept, to go with the next message.
-            match self.send(record.clone(), Some(SHELL), false, &[]).await {
+            match self
+                .send(record.clone(), Some(SHELL), false, false, &[])
+                .await
+            {
                 Ok(()) => self.ran_here.extend(user_shell::read(&record)),
                 Err(error) => {
                     self.notice = Some(format!("{error}; it goes with your next message"));
@@ -3935,7 +3942,7 @@ impl App {
                 return;
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
-            match self.send(answer, None, false, &[]).await {
+            match self.send(answer, None, false, false, &[]).await {
                 Ok(()) => {
                     self.notice = None;
                     self.asks.retain(|open| open.id != ask.id);
@@ -5005,8 +5012,8 @@ impl App {
         let mut rows: Vec<Line<'static>> = self
             .staged
             .iter()
-            .flat_map(|(_, prompt)| {
-                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
+            .flat_map(|(turn, prompt)| {
+                let mut shown: Vec<Line<'static>> = match user_shell::read(prompt) {
                     Some(ran) => user_shell::header(&ran.command, width, true),
                     None => {
                         // An answer shows as itself, under the question it answers.
@@ -5030,6 +5037,9 @@ impl App {
                             .collect()
                     }
                 };
+                if self.queued.contains(turn) {
+                    shown.push(Line::from("  queued for after this turn").dim().italic());
+                }
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -7263,8 +7273,8 @@ impl App {
                         self.approve_shown = None;
                         if at < self.denials.len() {
                             let denied = self.denials.remove(at);
-                            self.notice =
-                                Some(match self.send(approval(&denied), None, false, &[]).await {
+                            self.notice = Some(
+                                match self.send(approval(&denied), None, false, false, &[]).await {
                                     Ok(()) => {
                                         "approved one retry; the retry is still reviewed".into()
                                     }
@@ -7272,7 +7282,8 @@ impl App {
                                         self.denials.insert(at, denied);
                                         error
                                     }
-                                });
+                                },
+                            );
                         }
                     }
                     KeyCode::Esc => {
@@ -7494,6 +7505,9 @@ impl App {
                         self.input.insert("\n")
                     }
                     KeyCode::Enter => self.submit().await,
+                    // Tab sends it to run once the running turn ends, as
+                    // Codex queues; Enter steers.
+                    KeyCode::Tab if self.running.is_some() => self.submit_as(true).await,
                     KeyCode::Esc if self.react_to.is_some() => self.react_to = None,
                     KeyCode::Esc => {
                         if let Some(shell) = &self.shell {
@@ -7523,6 +7537,12 @@ impl App {
     }
 
     async fn submit(&mut self) {
+        self.submit_as(false).await
+    }
+
+    /// Send what is written: a message to a busy bot joins its running
+    /// turn, or with `queue` runs after it.
+    async fn submit_as(&mut self, queue: bool) {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
             return;
@@ -7771,10 +7791,13 @@ impl App {
         // Words are a message, whatever reply `/react` picked.
         self.react_to = None;
         // What the person ran and the agent could not be given yet goes
-        // first, each on its own, and this message joins the turn they start.
+        // first, each on its own, and this message joins the turn they start;
+        // queued, each waits its turn too.
         let mut join = false;
         while let Some(record) = self.unsent.first().cloned() {
-            if let Err(error) = self.send(record.clone(), Some(SHELL), join, &[]).await {
+            if let Err(error) =
+                (self.send(record.clone(), Some(SHELL), join && !queue, queue, &[])).await
+            {
                 self.notice = Some(error);
                 return;
             }
@@ -7783,7 +7806,10 @@ impl App {
             join = true;
         }
         let pictures = self.placed(&prompt);
-        match self.send(prompt, None, join, &pictures).await {
+        match self
+            .send(prompt, None, join && !queue, queue, &pictures)
+            .await
+        {
             Ok(()) => {
                 self.input.clear();
                 self.notice = None;
@@ -7816,24 +7842,27 @@ impl App {
     }
 
     /// Send `prompt`: a turn of its own, or a steer of the running one (or
-    /// of the one just started, `join`); staged until it lands. `origin`
-    /// names what sent it when the person's words did not.
+    /// of the one just started, `join`), or with `queue` a turn after
+    /// whatever runs; staged until it lands. `origin` names what sent it
+    /// when the person's words did not.
     async fn send(
         &mut self,
         prompt: String,
         origin: Option<&str>,
         join: bool,
+        queue: bool,
         pictures: &[attach::Picture],
     ) -> Result<(), String> {
         // A message to a busy bot joins its running turn, on that turn's model.
-        let delivery = (join || self.running.is_some()).then_some("steer");
-        let model = delivery
-            .is_none()
-            .then(|| self.turn_model.clone())
-            .flatten();
+        let delivery = match queue {
+            true => Some("queue"),
+            false => (join || self.running.is_some()).then_some("steer"),
+        };
+        let steer = delivery == Some("steer");
+        let model = (!steer).then(|| self.turn_model.clone()).flatten();
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
-        let workspace = delivery.is_none().then(|| self.move_to.clone()).flatten();
+        let workspace = (!steer).then(|| self.move_to.clone()).flatten();
         let reply = self
             .client
             .request(
@@ -7853,13 +7882,19 @@ impl App {
             // person's is the turn it joins: the running one, or the one the
             // message before it started.
             if origin.is_none() {
-                self.yours = match delivery {
-                    None => Some(turn),
-                    Some(_) => (self.running.as_ref().map(|r| r.turn))
+                self.yours = match steer {
+                    false => Some(turn),
+                    true => (self.running.as_ref().map(|r| r.turn))
                         .or_else(|| self.staged.last().map(|(started, _)| *started)),
                 };
             }
             self.staged.push((turn, prompt));
+            let staged = &self.staged;
+            self.queued
+                .retain(|queued| staged.iter().any(|(turn, _)| turn == queued));
+            if queue {
+                self.queued.push(turn);
+            }
         }
         if workspace.is_some() {
             self.move_to = None;
@@ -8895,9 +8930,14 @@ impl App {
         if let Some(running) = &self.running {
             let mut spans = vec![Span::raw("• ").dim()];
             spans.extend(shimmer(&running.phase, self.started.elapsed()));
+            // What is written steers it on Enter; Tab keeps it for after.
+            let queues = match self.input.trim().is_empty() {
+                true => "",
+                false => " • tab to queue",
+            };
             spans.push(
                 Span::raw(format!(
-                    " ({} • esc to interrupt)",
+                    " ({} • esc to interrupt{queues})",
                     transcript::elapsed(running.started.elapsed().as_secs())
                 ))
                 .dim(),
@@ -10885,6 +10925,64 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(false)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn tab_queues_a_message_for_after_the_running_turn() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let client = daemon_answering(move |asked| {
+            let mut sent = seen.lock().unwrap();
+            sent.push(asked.clone());
+            json!({"turn": 1 + sent.len()})
+        })
+        .await;
+        let mut app = app(client);
+        app.move_to = Some("/moved".into());
+        let tab = || Event::Key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let enter = || Event::Key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Idle, Tab sends nothing: Enter starts a turn.
+        app.input.set("first");
+        app.key(tab()).await;
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.input.trim(), "first");
+        app.input.clear();
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+        });
+        app.yours = Some(1);
+        assert!(!app.status_line().to_string().contains("tab to queue"));
+        app.input.set("after this");
+        assert!(app.status_line().to_string().contains("tab to queue"));
+        app.key(tab()).await;
+        assert!(app.input.is_empty());
+        // A turn of its own, once the running one ends: it may move the
+        // lead, and it is the person's.
+        let queued = sent.lock().unwrap()[0].clone();
+        assert_eq!(queued["delivery"], "queue");
+        assert_eq!(queued["prompt"], "after this");
+        assert_eq!(queued["workspace"], "/moved");
+        assert!(app.move_to.is_none());
+        assert_eq!(app.yours, Some(2));
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            staged,
+            ["", "› after this", "  queued for after this turn", ""]
+        );
+        // Enter still steers.
+        app.input.set("now");
+        app.key(enter()).await;
+        let steer = sent.lock().unwrap()[1].clone();
+        assert_eq!(steer["delivery"], "steer");
+        let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
+        assert_eq!(staged[3..], ["", "› now", ""]);
+        // Once its turn starts it is no longer waiting.
+        app.daemon(turn_event("turn_finished", 3, json!({}))).await;
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        assert!(app.staged.is_empty());
     }
 
     #[tokio::test]
