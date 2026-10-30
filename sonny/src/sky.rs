@@ -286,6 +286,15 @@ impl View {
 
     fn seat(&mut self, bot: &Value) -> Option<usize> {
         let name = bot["name"].as_str()?;
+        // A removed agent's name, or one now someone else's: let the old
+        // one go with what pointed at it, and seat this one afresh.
+        if let Some(&at) = self.index.get(name) {
+            let (was, now) = (self.agents[at].id, bot["bot_id"].as_i64());
+            if self.agents[at].gone || was.is_some() && now.is_some() && was != now {
+                self.agents[at].gone = true;
+                self.sweep();
+            }
+        }
         let at = match self.index.get(name) {
             Some(&at) => at,
             None => {
@@ -1500,6 +1509,35 @@ mod tests {
         let from = |id: i64| json!({"from": {"bot": "a", "bot_id": id, "turn": 1}});
         assert_eq!(view.sender(&from(1), b), End::Rim(b));
         assert_eq!(view.sender(&from(7), b), End::Agent(a));
+    }
+
+    #[tokio::test]
+    async fn a_name_taken_again_starts_afresh() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a", "bot_id": 1}),
+            json!({"name": "b", "bot_id": 2}),
+        ]))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "b", "turn": 1,
+            "data": {"from": {"bot": "a", "bot_id": 1, "turn": 1}}}),
+        ))
+        .unwrap();
+        send.send(Feed::Roll(vec![
+            json!({"name": "a", "bot_id": 9}),
+            json!({"name": "b", "bot_id": 2}),
+        ]))
+        .unwrap();
+        view.drain();
+        let b = view.index["b"];
+        assert!(view.talks.is_empty());
+        assert_eq!(view.agents[b].sender, None);
+        assert!(
+            view.sparks
+                .iter()
+                .all(|spark| spark.from != End::Agent(view.index["a"]))
+        );
     }
 
     #[tokio::test]
