@@ -745,7 +745,7 @@ async fn serve(
                         let job = tokio::spawn(async move {
                             let answer = match call["name"] == EXEC {
                                 // In the lookout, where the servers stay up.
-                                true => script(&hub, &call).await,
+                                true => script(&hub, &client, &call).await,
                                 false => answer(&client, &call, &me, &store, &socket).await,
                             };
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
@@ -821,9 +821,16 @@ fn cut(mut text: String) -> String {
 
 /// An `exec` call answered here, with its script's time bounded by the
 /// call's.
-async fn script(hub: &crate::mcp::Hub, call: &Value) -> Answer {
+async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> Answer {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
-    crate::exec::answer(hub, &str_of(&call["bot"]), input, left(call))
+    let bot = str_of(&call["bot"]);
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot.clone(),
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
 }

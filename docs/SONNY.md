@@ -599,12 +599,17 @@ description = "Issues and projects in Linear"
 command = "npx"
 args = ["@playwright/mcp@latest"]
 enabled_tools = ["browser_navigate", "browser_snapshot", "browser_click"]
+default_tools_approval_mode = "writes"     # ask before every call but reads
+
+[sonny.mcp_servers.playwright.tools.browser_snapshot]
+approval_mode = "approve"                  # never ask for this one
 ```
 
 A server takes `command`, `args`, `env` and `cwd` (stdio), or `url`,
 `bearer_token_env_var` and `http_headers` (streamable HTTP), and either way
 `enabled`, `enabled_tools`, `disabled_tools`, `startup_timeout_sec`,
-`tool_timeout_sec` and `description`. `sonny mcp add NAME -- COMMAND ARGS`
+`tool_timeout_sec`, `description`, `default_tools_approval_mode` and
+`tools.TOOL.approval_mode` (next section). `sonny mcp add NAME -- COMMAND ARGS`
 (or `--url URL`) writes one and lists its tools, `sonny mcp remove NAME`
 drops it, and `sonny mcp list` starts each and says what it offers or why
 it did not start. `/mcp` in Sonny shows the same from the last listings,
@@ -643,7 +648,8 @@ later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, four at once in the lookout (more wait their turn), and returns
+10 minutes, four at once in the lookout and sixteen alive (more wait
+their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
 the whole to a file; saved outputs and images are kept a week. A first
 line such as
@@ -655,9 +661,25 @@ started by the first call and stopped after ten idle minutes, with each
 server's tool list kept in `~/.agent/sonny/mcp` so agents are told of its
 tools without starting it. Servers run as the person, beside the lookout and
 outside every agent's sandbox, as Codex starts its own: a sandboxed task
-reaches them only through `exec`, which waits for a verdict as Sonny's other
-gated tools do, one per script. A turn that ends, as one the person
+reaches them only through `exec`. A turn that ends, as one the person
 interrupts, stops its script and the calls it has in flight.
+
+As in Codex, a script is not approved as a whole: each call it makes is
+checked on its own, by its server's `approval_mode`, Codex's names and
+rule. `auto`, the default, asks first for a call of a tool the server marks
+destructive (`destructiveHint`) unless it also marks it read-only
+(`readOnlyHint`, which wins), and runs the rest; `writes` asks for every
+call but a read-only tool's; `prompt` asks for every call; `approve` never
+asks. Asking puts the call to the agent's own gate, through the daemon's
+`approve_step`: in `full` nothing waits, in `auto` the judge decides it, in
+`ask` the person does, the call drawn with `a call in a running script`.
+The script waits for the verdict with its 10 minutes stopped and its place
+among the four running given to another, though it stays among the sixteen
+alive; JavaScript it runs meanwhile, beside the waiting call, still spends
+its time. A denied call rejects with the reason, which the script can catch.
+Once a call a gate allowed has run, Sonny tells the daemon how it ended
+(`step_result`), so the judge of the agent's next call counts it among those
+the turn already ran.
 
 ## Checks
 

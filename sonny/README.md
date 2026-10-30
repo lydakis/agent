@@ -539,7 +539,10 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   its tools or why it did not start. Agents reach them through one `exec`
   tool: a script that calls many tools at once and returns only what it
   prints, drawn as `Ran a script: 12 MCP calls (github 10, linear 2)`
-  ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)).
+  ([docs/SONNY.md](../docs/SONNY.md#mcp-servers)). As in Codex, each call
+  a script makes is approved on its own: a tool its server marks
+  destructive, and not read-only, waits for the agent's verdict
+  (`/approvals`), unless the server's `approval_mode` says otherwise.
 
   ![An exec call drawn as one line with what its script printed](../docs/sonny/exec-script.png)
 

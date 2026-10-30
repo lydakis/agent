@@ -2251,7 +2251,7 @@ it:
 
 | Request | On a bot's own socket |
 |---|---|
-| `configure`, `answer`, `tool_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `configure`, `answer`, `tool_result`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
 | `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
@@ -2260,8 +2260,9 @@ it:
 The folder of these sockets stays read-only in every root, so no bot can
 put its own listener in another's place. A tool a client answers, declared
 for a bot the caller makes or callable by a fork it makes, must be one the
-caller has, may call and passes on, answered by the same client; another is
-`not_permitted`, and one it may not call isn't inherited. A root reached
+caller has, may call and passes on, answered by the same client, and taking
+`steps` only if the caller's does, since a call that takes steps skips the
+gates of the call as a whole; another is `not_permitted`, and one it may not call isn't inherited. A root reached
 through a link, which something swapped in since, is `sandbox_unavailable`.
 A socket inside a writable folder
 stays read-only too. On macOS the folders between a writable folder and
@@ -2410,6 +2411,48 @@ client draws each message a call streams apart, as it is kept (see
 `follow` above). It also reports an unset `cache_ttl` in `inspect`'s
 `settings` as `null` rather than `"5m"`, so a client tells a lifetime
 nobody set from five minutes someone chose.
+It also lets the client answering a call put each step of it to the
+bot's gates, as Codex approves each nested call of a code-mode
+script rather than the script. A tool declared with `"steps": true` (only
+with `answered_by`; `invalid_declare` otherwise) is never gated as a
+whole: its call starts at once, and the gates that name the tool judge its
+steps instead. The client asks with
+`{"op":"approve_step","bot","turn","call_id","step","name","arguments"}`:
+`step` its own id for the step within the call (1 to 128 of `A-Z a-z 0-9
+. _ -`, never reused for the call), `name` the step's tool (1 to 512 bytes,
+no control characters), and
+`arguments` an object of at most 64 KiB (`invalid_step`,
+`step_arguments_limit`). The call must be the bot's and still waiting for
+its answer (`turn_not_found`, `stale_turn`, `no_pending_call`,
+`call_already_answered`), of a tool that takes steps (`invalid_step`).
+Under no gate the reply comes at once:
+`{call_id: CALL/STEP, decision: "allow", approvals: []}`. Otherwise the
+step is announced in its own `approval_requested`, listed, served and
+answered exactly as a gated call is, under the call id `CALL/STEP`, with
+`step_of` naming its call, `node` 0 (a step has no item of its own) and
+its arguments whole. The reply waits for the decision, off the service's
+loop: `{call_id, decision, approvals}`, with the deny's `reason`, and
+`expired` when a gate lapsed without a verdict, which denies the step
+(`not reviewed: no verdict`) and nothing more: the turn never waits on a
+step. Each decided step is recorded in a `step_decided` event with
+`call_id`, `step_of`, `name`, `arguments` (previewed as `tool_started`
+previews a call's), `decision`, `reason` and `approvals`, and `denied`
+when its gates refused it, which a judge of a later call sees among the
+turn's refused calls; it counts toward the bot's denial counts as a call
+does. A step its gates allowed is among the turn's calls a judge of a
+later call sees, as running until its client reports how it ended:
+`{"op":"step_result","bot","turn","call_id","step","failed"}` records
+`step_completed` (`call_id`, `step_of`, and `failed` when it did), so the
+step counts as done; told twice it keeps the first, and a step no gate
+allowed is `no_allowed_step`. While any step of a
+call waits, the call's time stops: it cannot run out, its parked turn has
+no deadline, and once the last step is decided it gets back what was left.
+A step lives only as long as the request waiting on it: asking for one
+already waiting is `step_waiting`; a client that closes its session takes
+its waiting steps with it (`step_decided` with `its client stopped
+waiting`), an answer to the call ends them (the waiting request gets
+`no_pending_step`), as does the turn's end (`stale_turn`), and a restart
+drops them all. Schema 63 adds the steps' and paused calls' columns.
 
 ### Tool approval
 
