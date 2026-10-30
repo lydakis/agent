@@ -915,7 +915,7 @@ async fn run() -> Result<(), String> {
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = terminal.clear();
     let mut app = App::new(client, &name, &bot, options.clone());
-    app.context = context;
+    (app.context, app.window) = context;
     app.turn_began().await;
     if options.side.is_some() {
         let source = name.rsplit_once(".side-").map_or(name.as_str(), |(s, _)| s);
@@ -1255,8 +1255,8 @@ fn status_report(state: &str, bot: &str) {
 /// the client's queue and cut the stream before it goes live.
 /// Skip the replay of a follow up to its live events; returns how big the
 /// context was after the last model round it held, when it held one.
-async fn caught_up(events: &mut Events) -> Option<u64> {
-    let mut context = None;
+async fn caught_up(events: &mut Events) -> (Option<u64>, Option<u64>) {
+    let (mut context, mut window) = (None, None);
     let replay = async {
         while let Some(event) = events.recv().await {
             if event["event"] == "follow_live" {
@@ -1264,11 +1264,20 @@ async fn caught_up(events: &mut Events) -> Option<u64> {
             }
             if let Some(size) = context_after(&event) {
                 context = Some(size);
+                window = window_of(&event).or(window);
             }
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(30), replay).await;
-    context
+    (context, window)
+}
+
+/// The model's context window a `usage` event says, when the daemon knew
+/// it.
+fn window_of(event: &Value) -> Option<u64> {
+    event["data"]["context_window"]
+        .as_u64()
+        .filter(|tokens| *tokens > 0)
 }
 
 /// What the next model round reads after a `usage` event's round: that
@@ -1686,6 +1695,8 @@ struct App {
     /// How big the conversation was after its last model round, as the
     /// next round reads it, once known.
     context: Option<u64>,
+    /// The model's context window, as the daemon says it with each round.
+    window: Option<u64>,
     input: prompt::Prompt,
     /// Lines waiting to be written into the conversation, and what marks
     /// the rows of some, by their place among them.
@@ -2598,6 +2609,7 @@ impl App {
             model,
             effort: record["effort"].as_str().map(str::to_owned),
             context: None,
+            window: None,
             input: prompt::Prompt::default(),
             pending: Vec::new(),
             marks: Vec::new(),
@@ -3533,7 +3545,8 @@ impl App {
             *events = fresh;
             self.down = false;
             self.notice = None;
-            self.context = context.or(self.context);
+            self.context = context.0.or(self.context);
+            self.window = context.1.or(self.window);
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
             self.unstage_landed().await;
@@ -5258,7 +5271,10 @@ impl App {
         if !open.partial.is_empty()
             && let Some(line) = markdown.line(&open.partial)
         {
-            let lead = if open.lines == 0 { "• " } else { "  " };
+            let lead = match open.lines == 0 && !transcript::heading(&open.partial) {
+                true => "• ",
+                false => "  ",
+            };
             rows.extend(transcript::wrap(
                 line,
                 width,
@@ -5825,6 +5841,7 @@ impl App {
             "usage" => {
                 if let Some(size) = context_after(&event) {
                     self.context = Some(size);
+                    self.window = window_of(&event).or(self.window);
                 }
             }
             "turn_finished" => {
@@ -7234,6 +7251,7 @@ impl App {
             behind: self.behind.0,
             failed: self.failed,
             context: self.context,
+            window: self.window,
         }
     }
 
@@ -9443,7 +9461,10 @@ impl App {
                     .rsplit_once(".side-")
                     .map_or(self.bot.as_str(), |(s, _)| s)
             ),
-            (None, Some(size)) => format!("{} · {} context  ", self.bot, transcript::tokens(size)),
+            (None, Some(size)) => {
+                let (amount, words, _) = transcript::fullness(size, self.window);
+                format!("{} · {amount}{words}  ", self.bot)
+            }
             (None, None) => format!("{}  ", self.bot),
         };
         // The margin's glance says these while it is in view; the notes
@@ -9524,19 +9545,16 @@ impl App {
                 }
                 spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
                 let rest = &right[at + self.bot.len()..];
-                // How full the context is: green, then yellow, then red.
-                let tokens = self.context.map(transcript::tokens);
-                match (
-                    tokens.as_ref().and_then(|t| rest.find(t.as_str())),
-                    self.context,
-                ) {
-                    (Some(from), Some(size)) => {
-                        let color = match size {
-                            0..100_000 => Color::Green,
-                            100_000..200_000 => Color::Yellow,
-                            _ => Color::Red,
-                        };
-                        let to = from + tokens.as_ref().map_or(0, String::len);
+                // How full the context is, by its window: green, then
+                // yellow, then red.
+                let full = self
+                    .context
+                    .map(|size| transcript::fullness(size, self.window));
+                match full
+                    .and_then(|(amount, _, color)| Some((rest.find(&amount)?, amount, color?)))
+                {
+                    Some((from, amount, color)) => {
+                        let to = from + amount.len();
                         spans.push(Span::raw(rest[..from].to_owned()));
                         spans.push(Span::raw(rest[from..to].to_owned()).fg(color));
                         spans.push(Span::raw(rest[to..].to_owned()));
@@ -12984,6 +13002,22 @@ mod tests {
             {"model": "claude-opus-4-8", "input_tokens": 13, "output_tokens": 7},
         ]);
         assert_eq!(context_after(&fell_back), Some(20));
+        // The window, when the daemon says it, is how full that is.
+        let mut windowed = usage(380_000, 0, None);
+        windowed["data"]["context_window"] = json!(1_000_000);
+        assert_eq!(window_of(&windowed), Some(1_000_000));
+        assert_eq!(window_of(&fell_back), None);
+        let full = |size| transcript::fullness(size, Some(1_000_000));
+        assert_eq!(
+            full(380_000),
+            ("62%".into(), " context left", Some(Color::Green))
+        );
+        assert_eq!(full(600_000).2, Some(Color::Yellow));
+        assert_eq!(full(850_000).2, Some(Color::Red));
+        assert_eq!(
+            transcript::fullness(48_500, None),
+            ("48.5k".into(), " context", None)
+        );
     }
 
     #[test]

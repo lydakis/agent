@@ -98,6 +98,23 @@ fn muted(foreground: Rgb, background: Rgb) -> Rgb {
     }
 }
 
+/// The band the person's own messages sit on, as Codex and Claude Code
+/// tint the user's cell: the theme's foreground a little over its
+/// background, so it reads in every theme; a fixed gray when the terminal
+/// did not say its colors.
+pub fn band() -> Color {
+    let theme = crate::term::theme();
+    let light = crate::term::light();
+    match (theme.foreground, theme.background) {
+        (Some(foreground), Some(background)) => {
+            let (r, g, b) = blend(foreground, background, if light { 0.06 } else { 0.09 });
+            Color::Rgb(r, g, b)
+        }
+        _ if light => Color::Rgb(238, 238, 240),
+        _ => Color::Rgb(40, 40, 48),
+    }
+}
+
 /// `weight` of `a` over `b`.
 pub fn blend(a: Rgb, b: Rgb, weight: f32) -> Rgb {
     let mix = |a: u8, b: u8| (f32::from(a) * weight + f32::from(b) * (1.0 - weight)).round() as u8;

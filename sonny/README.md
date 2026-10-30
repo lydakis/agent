@@ -758,8 +758,16 @@ the theme's own foreground and background, as the terminal reports them
 at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
 the theme allows; a terminal that does not say keeps its own dim. Diffs
 tint from the same background and the theme's own red and green. The
-context in the footer turns from green to yellow at 100k tokens and to
-red at 200k.
+footer says how much of the model's context window is left (`62% context
+left`, as Codex says it), from the window the daemon sends with each
+round: green, yellow from half used, red from four fifths. Before the
+daemon has said it, the footer gives the conversation's size uncoloured.
+Your own messages sit on a band tinted from the theme's foreground over
+its background, as Codex and Claude Code tint the user's cell, so your
+turns are easy to find when you scroll back; a reply that opens with a
+heading takes no `•` before it.
+
+![Your message on its band, and the footer saying 76% context left](../docs/sonny/message-band.png)
 
 ![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
 ![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
