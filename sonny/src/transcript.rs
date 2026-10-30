@@ -1936,14 +1936,6 @@ pub fn folded(
     open: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
-    // One call open is its own rows, its first marked open.
-    if let ([_], [call], true) = (whats, calls, open)
-        && let Some((first, rest)) = call.split_first()
-    {
-        let mut first = first.clone();
-        first.spans.push(Span::raw(" ▾").dim());
-        return [vec![first], rest.to_vec()].concat();
-    }
     if verb == WORK {
         let (mut spans, failed) = work_row(whats);
         spans.push(Span::raw(if open { " ▾" } else { " ▸" }).dim());
@@ -1956,6 +1948,14 @@ pub fn folded(
             out.extend(calls.iter().flatten().cloned());
         }
         return out;
+    }
+    // One call open is its own rows, its first marked open.
+    if let ([_], [call], true) = (whats, calls, open)
+        && let Some((first, rest)) = call.split_first()
+    {
+        let mut first = first.clone();
+        first.spans.push(Span::raw(" ▾").dim());
+        return [vec![first], rest.to_vec()].concat();
     }
     let mut names = crate::calls::once(whats.iter().cloned()).join(", ");
     if let Some(at) = names.rfind(", ") {
