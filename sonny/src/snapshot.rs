@@ -61,7 +61,14 @@ fn git(
     index: Option<&Path>,
     input: Option<&str>,
 ) -> Result<String, String> {
+    let unfiltered = unfiltered(dir)?;
     let mut command = Command::new("git");
+    command.env("GIT_CONFIG_COUNT", unfiltered.len().to_string());
+    for (at, (key, value)) in unfiltered.into_iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{at}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{at}"), value);
+    }
     // The folder's own code never runs here, where the daemon's keys are:
     // no hook, no fsmonitor, no filter, and none of the keys in its
     // environment. Its attributes still convert line endings and
@@ -75,7 +82,6 @@ fn git(
             "-c",
             "core.fsmonitor=false",
         ])
-        .args(unfiltered(dir))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(if input.is_some() {
@@ -117,37 +123,51 @@ fn git(
 /// Settings that turn off each filter the folder's config names, as a
 /// filter may run a script of the folder's when git reads or writes its
 /// files: a file is kept, and given back, as its bytes are. An LFS file
-/// unchanged since the commit it is on comes back as its pointer.
-fn unfiltered(dir: &Path) -> Vec<String> {
+/// unchanged since the commit it is on comes back as its pointer. Names
+/// are taken as bytes, whatever they hold, and given to git as config of
+/// the environment's, which nothing in a name can break; a config that
+/// cannot be read stops the snapshot.
+fn unfiltered(dir: &Path) -> Result<Vec<(std::ffi::OsString, &'static str)>, String> {
+    use std::os::unix::ffi::OsStrExt;
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(dir)
-        .args(["config", "--name-only", "--get-regexp", r"^filter\."])
+        .args(["config", "--name-only", "-z", "--get-regexp", r"^filter\."])
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     for key in crate::task::kept_keys() {
         command.env_remove(key);
     }
-    let Ok(output) = command.output() else {
-        return Vec::new();
-    };
-    let mut names: Vec<&str> = (std::str::from_utf8(&output.stdout)
-        .unwrap_or_default()
-        .lines())
-    .filter_map(|key| key.strip_prefix("filter.")?.rsplit_once('.'))
-    .map(|(name, _)| name)
-    .collect();
+    let output = command.output().map_err(|e| format!("running git: {e}"))?;
+    // 1 is none found.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err("git config: the folder's filters could not be read".into());
+    }
+    let mut names: Vec<&[u8]> = (output.stdout.split(|byte| *byte == 0))
+        .filter_map(|key| key.strip_prefix(b"filter."))
+        .filter_map(|rest| Some(&rest[..rest.iter().rposition(|byte| *byte == b'.')?]))
+        .collect();
     names.sort_unstable();
     names.dedup();
-    names
+    Ok(names
         .iter()
         .flat_map(|name| {
-            ["clean=", "smudge=", "process=", "required=false"]
-                .map(|setting| ["-c".to_owned(), format!("filter.{name}.{setting}")])
+            [
+                ("clean", ""),
+                ("smudge", ""),
+                ("process", ""),
+                ("required", "false"),
+            ]
+            .map(|(setting, value)| {
+                let mut key = b"filter.".to_vec();
+                key.extend_from_slice(name);
+                key.push(b'.');
+                key.extend_from_slice(setting.as_bytes());
+                (std::ffi::OsStr::from_bytes(&key).to_owned(), value)
+            })
         })
-        .flatten()
-        .collect()
+        .collect())
 }
 
 /// The top of the git checkout `dir` is in, if it is in one.
@@ -298,6 +318,15 @@ pub fn restore(here: &Path, snapshot: &Snapshot, path: &Path, branch: &str) -> R
         .base
         .as_deref()
         .ok_or("the folder had no commit yet, so there is nothing to branch from")?;
+    // A submodule is kept as the commit it is on, not its files, so a
+    // fork would get an empty folder where they were.
+    let listed = git(here, &["ls-tree", "-r", "-z", &snapshot.commit], None, None)?;
+    if let Some(module) = (listed.split('\0')).find(|entry| entry.starts_with("160000 ")) {
+        let path = module.split_once('\t').map_or(module, |(_, path)| path);
+        return Err(format!(
+            "its files hold a submodule, {path}, whose own files a snapshot does not keep"
+        ));
+    }
     let target = path.to_string_lossy();
     // Checked out from inside the new worktree, on its branch, as the
     // config that holds may depend on the branch: no file is written
@@ -720,6 +749,51 @@ mod tests {
         assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
         assert_eq!(std::fs::read(copy.join("y.a")).unwrap(), b"three\r\n");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_filter_whose_name_is_not_text_is_off_too() {
+        let (dir, top) = repo("bytes");
+        let ran = dir.join("ran");
+        let mut config = std::fs::read(top.join(".git/config")).unwrap();
+        config.extend_from_slice(b"[filter \"odd\xffname\"]\n\tclean = \"sh -c 'touch ");
+        config.extend_from_slice(ran.as_os_str().as_encoded_bytes());
+        config.extend_from_slice(b"; cat'\"\n");
+        std::fs::write(top.join(".git/config"), config).unwrap();
+        std::fs::write(top.join(".gitattributes"), b"*.a filter=odd\xffname\n").unwrap();
+        std::fs::write(top.join("x.a"), "raw\n").unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        assert!(!ran.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_holding_a_submodule_are_not_restored() {
+        let (dir, top) = repo("submodule");
+        let (_, other) = repo("submodule-dep");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&top)
+            .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q"])
+            .arg(&other)
+            .arg("dep")
+            .status()
+            .unwrap();
+        assert!(added.success());
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let copy = dir.join("copy");
+        let error = restore(&top, &snapshot, &copy, "agent/copy").unwrap_err();
+        assert!(error.contains("submodule, dep"), "{error}");
+        assert!(!copy.exists());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(other.parent().unwrap());
     }
 
     #[test]
