@@ -397,7 +397,12 @@ def run(arm, n, bins, model, spec=None):
             if heard:
                 (root / 'step').write_text(str(step))
             if s.get('say'):
-                acp.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': s['say']}]})
+                answer = acp.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': s['say']}]})
+                # A failed turn (a provider refusal, a missing sandbox) is the
+                # run's failure, not the role's: stop before it is scored.
+                failure = answer.get('error') or (answer.get('result') or {}).get('error')
+                if failure:
+                    raise RuntimeError(f'step {step}: {failure}')
             if not heard:
                 heard = until_subscribed(home)
                 (root / 'step').write_text(str(step))
