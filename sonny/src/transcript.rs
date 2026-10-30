@@ -1186,6 +1186,32 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
     from.is_some() || news(text).is_some()
 }
 
+/// What sent a prompt from outside, in the words the person reads.
+pub fn from_outside(origin: Option<&str>) -> &'static str {
+    match origin.unwrap_or("").split('.').next() {
+        Some("lookout") => "a follow",
+        Some("trigger") => "an automation",
+        Some("commons") => "the commons",
+        Some("goal") => "a goal",
+        Some("margin") => "a margin note",
+        Some("tasks") => "a task",
+        _ => "outside",
+    }
+}
+
+/// Who sent a prompt, as the conversation names it: another bot, or what
+/// sent it from outside (the commons, an automation) when a client named
+/// itself; none when the person typed it, a `!` command of theirs too.
+/// Sent from outside, it is drawn [`relayed`], as words between agents
+/// are: nothing the person wrote reads as theirs.
+pub fn sender(bot: Option<&str>, origin: Option<&str>) -> Option<String> {
+    match (bot, origin) {
+        (Some(bot), _) => Some(bot.to_owned()),
+        (None, None | Some("shell")) => None,
+        (None, origin) => Some(from_outside(origin).to_owned()),
+    }
+}
+
 /// Words between agents, kept quiet: one dim row, who sent it and its
 /// first words (or the news it brings), `▸` to open it; open, the same
 /// row with `▾` and the whole message under it.
@@ -1234,7 +1260,9 @@ pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'s
     // Who said it in the agents' color.
     let mut spans = vec![Span::raw("↳ ")];
     let rest = head.as_str();
-    match from.filter(|from| rest == format!("From {from}")) {
+    // Only a bot's name takes the agents' color: what sent words from
+    // outside ("the commons") is named in words, with spaces.
+    match from.filter(|from| rest == format!("From {from}") && !from.contains(' ')) {
         Some(from) => {
             spans.push(Span::raw("From "));
             spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
@@ -1559,12 +1587,15 @@ pub fn reply(text: &str, width: usize, folder: &std::path::Path) -> Vec<Line<'st
 /// by `markdown` (the folder its pictures are in, whether a document),
 /// its first row after the first of `leads` and the rest after the
 /// other, in place of the two columns every row of it starts with.
+/// Prose reads at most [`crate::PROSE`] wide on any surface, however
+/// wide the surface is; code and files shown as themselves go wider.
 pub fn markdown(
     markdown: &mut Markdown,
     text: &str,
     width: usize,
     (first, rest): (Line<'static>, Line<'static>),
 ) -> Vec<Line<'static>> {
+    let width = width.min(crate::PROSE);
     let wide = first.width().max(rest.width());
     let inner = (width + 2).saturating_sub(wide).max(10);
     let mut rows = Vec::new();
@@ -3007,6 +3038,16 @@ mod tests {
         assert_eq!(text(&rows), ["• Here:", "    -a", "    +b"]);
         let rows = reply("$$\nx^2", 40, std::path::Path::new("."));
         assert_eq!(text(&rows), ["•   x^2"]);
+    }
+
+    #[test]
+    fn prose_reads_at_most_the_prose_width_on_any_surface() {
+        let folder = std::path::Path::new(".");
+        let said = "word ".repeat(80);
+        let leads = (Line::from("  "), Line::from("  "));
+        let rows = markdown(&mut Markdown::in_folder(folder), &said, 180, leads);
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| row.width() <= crate::PROSE));
     }
 
     #[test]

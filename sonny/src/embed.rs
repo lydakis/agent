@@ -55,7 +55,11 @@ impl Embedded {
         let writer = Arc::new(Mutex::new(
             pty.master.take_writer().map_err(|e| e.to_string())?,
         ));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            nonzero(rows),
+            nonzero(cols),
+            0,
+        )));
         let copied = Arc::new(Mutex::new(Vec::new()));
         let (screen, replies, copies) = (parser.clone(), writer.clone(), copied.clone());
         std::thread::spawn(move || {
@@ -224,7 +228,7 @@ impl Embedded {
                 pixel_height: 0,
             });
             if let Ok(mut parser) = self.parser.lock() {
-                parser.set_size(size.0, size.1);
+                parser.set_size(nonzero(size.0), nonzero(size.1));
             }
         }
         let parser = self.parser.lock().ok()?;
@@ -239,12 +243,16 @@ impl Embedded {
                 }
                 let at = &mut buf[(area.x + col, area.y + row)];
                 let text = cell.contents();
-                at.set_symbol(if text.is_empty() { " " } else { &text });
+                at.set_symbol(if text.is_empty() { " " } else { text });
                 let mut style = Style::new()
                     .fg(color(cell.fgcolor()))
                     .bg(color(cell.bgcolor()));
                 if cell.bold() {
                     style = style.add_modifier(Modifier::BOLD);
+                }
+                // Quiet text stays quiet in the pane, as in the window.
+                if cell.dim() {
+                    style = style.add_modifier(Modifier::DIM);
                 }
                 if cell.italic() {
                     style = style.add_modifier(Modifier::ITALIC);
@@ -273,6 +281,11 @@ impl Drop for Embedded {
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// A size the parser takes, one row or column at least.
+fn nonzero(n: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(n).unwrap_or(std::num::NonZeroU16::MIN)
 }
 
 fn color(color: vt100::Color) -> Color {
@@ -534,7 +547,7 @@ mod tests {
 
     #[test]
     fn the_cursor_is_where_the_output_left_it() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut parser = vt100::Parser::new(nonzero(10), nonzero(20), 0);
         parser.process(b"\x1b[3;5H");
         assert_eq!(answer(Query::Cursor, &parser, true), b"\x1b[3;5R");
     }

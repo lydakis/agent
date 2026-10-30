@@ -629,8 +629,7 @@ fn preview(
         let mut markdown = crate::transcript::Markdown::document(folder);
         let leads = (Line::from("  "), Line::from("  "));
         let text = lines[..shown].join("\n");
-        let rows =
-            crate::transcript::markdown(&mut markdown, &text, width.min(crate::PROSE), leads);
+        let rows = crate::transcript::markdown(&mut markdown, &text, width, leads);
         screen.push(rows);
     } else {
         let mut code = crate::highlight::Code::file(path, lines.first().unwrap_or(&""));

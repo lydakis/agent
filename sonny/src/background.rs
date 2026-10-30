@@ -54,6 +54,9 @@ pub struct Item {
     pub failed: Option<String>,
     /// The turn a trigger's last fire sent, whose end `turns` tells.
     pub handle: Option<String>,
+    /// When a trigger last fired, in ms: a fire that sent no turn is still
+    /// a fire of its own.
+    pub fired_ms: Option<u64>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -101,6 +104,7 @@ pub fn read(
                 own,
                 failed: None,
                 handle: None,
+                fired_ms: None,
             });
         }
     }
@@ -191,15 +195,26 @@ fn servers(root: &Path, project: &str) -> Vec<Item> {
                     false => first_line(why),
                 }),
                 handle: None,
+                fired_ms: None,
             });
         }
     }
     items
 }
 
-/// How many of `items` failed.
-pub fn failed(items: &[Item]) -> usize {
-    items.iter().filter(|item| item.failed.is_some()).count()
+/// Each failure among `items`, as a key that stays the same while the
+/// failure does: what failed, the fire that did (when it fired, the turn
+/// it sent), and why. A later fire that fails again is a failure of its
+/// own, also one that never sent a turn.
+pub fn failures(items: &[Item]) -> Vec<String> {
+    (items.iter())
+        .filter_map(|item| {
+            let why = item.failed.as_ref()?;
+            let turn = item.handle.as_deref().unwrap_or("");
+            let at = item.fired_ms.unwrap_or(0);
+            Some(format!("{:?}/{}/{at}/{turn}/{why}", item.kind, item.name))
+        })
+        .collect()
 }
 
 /// The turns `items`' last fires sent whose end `turns` does not have yet.
@@ -281,6 +296,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         own: false,
         failed,
         handle: trigger::sent(row),
+        fired_ms: last["fired_ms"].as_u64(),
     }
 }
 
@@ -701,6 +717,7 @@ mod tests {
             own,
             failed: None,
             handle: None,
+            fired_ms: None,
         }
     }
 
@@ -737,6 +754,11 @@ mod tests {
         assert_eq!(item.facts, ["sent 4 of 10", "last failed 3h ago"]);
         assert_eq!(item.failed.as_deref(), Some("bot_busy: it works"));
         assert_eq!(item.reply_to.as_deref(), Some("calc.lead"));
+        // A later fire that failed the same way, sending no turn, is news.
+        let mut later = row.clone();
+        later["last"]["fired_ms"] = json!(fired + 86_400_000);
+        let later = trigger_item(&later, vec!["calc.lead".into()]);
+        assert_ne!(failures(std::slice::from_ref(&item)), failures(&[later]));
         let fresh = trigger_item(
             &json!({"name": "new", "when": "fire", "bot": "calc.lead", "sent": 0, "last": null}),
             vec!["calc.lead".into()],
@@ -857,7 +879,7 @@ mod tests {
                 .all(|i| i.kind == Kind::Server && i.bots.is_empty())
         );
         assert_eq!(count(&found, "calc.lead"), 0);
-        assert_eq!(failed(&found), 2);
+        assert_eq!(failures(&found).len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

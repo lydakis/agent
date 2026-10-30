@@ -734,7 +734,7 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
 fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(json!({"dir": dir, "threads": []}));
+            return Ok(json!({"dir": dir, "threads": [], "invites": budget(&[])}));
         }
         entries => entries.map_err(|e| format!("commons_failed: {}: {e}", dir.display()))?,
     };
@@ -987,15 +987,17 @@ impl View {
 
     fn list_lines(&self, width: usize) -> (Vec<Line<'static>>, usize) {
         let count = self.threads.len();
+        // Numbers, read as numbers: a listing short of one says 0, never null.
+        let invites = |key: &str| self.invites[key].as_u64().unwrap_or(0);
         let mut out = vec![Line::from(vec![
             Span::raw("The commons").bold(),
             Span::raw(format!(
                 " · {count} thread{} · {} of {} invites today · {} of {} answered this week",
                 if count == 1 { "" } else { "s" },
-                self.invites["today"],
-                self.invites["a_day"],
-                self.invites["answered"],
-                self.invites["this_week"],
+                invites("today"),
+                invites("a_day"),
+                invites("answered"),
+                invites("this_week"),
             ))
             .dim(),
         ])];
@@ -1077,7 +1079,7 @@ impl View {
             out.extend(crate::transcript::markdown(
                 &mut markdown,
                 post["text"].as_str().unwrap_or_default(),
-                width.min(crate::PROSE),
+                width,
                 (Line::from("  "), Line::from("  ")),
             ));
         }
@@ -1305,7 +1307,14 @@ mod tests {
                 .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect()
         };
-        assert!(text(view.card(60).0).iter().any(|l| l == "No thread yet."));
+        let empty = text(view.card(60).0);
+        assert!(empty.iter().any(|l| l == "No thread yet."));
+        // An empty commons counts its invites as 0, never null.
+        let counts = format!(
+            "0 of {} invites today · 0 of 0 answered this week",
+            invites_a_day()
+        );
+        assert!(empty[0].ends_with(&counts), "{}", empty[0]);
         call(
             home,
             "a.x",
