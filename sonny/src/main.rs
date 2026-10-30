@@ -481,6 +481,9 @@ async fn start_lookout(client: &Client) -> Result<(), String> {
     .await
 }
 
+/// How long a word waits on the daemon to say whether it names an agent.
+const NAME_LOOKUP: Duration = Duration::from_secs(2);
+
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
 const APPROVER: &str = "approver-auto";
@@ -1931,6 +1934,8 @@ struct App {
     /// The agents named in what is drawn, as the daemon answered: a
     /// click on one's name opens it in the pane.
     names: std::cell::RefCell<links::Names>,
+    /// The words being asked about, and what the daemon said of each.
+    naming: Option<tokio::task::JoinHandle<Vec<(String, bool)>>>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2739,6 +2744,7 @@ impl App {
             jump: None,
             pressed: Vec::new(),
             names: Default::default(),
+            naming: None,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -4603,28 +4609,47 @@ impl App {
             .collect()
     }
 
-    /// The words drawn that may name agents, asked about: once one does,
-    /// the links on screen are found again, so its name opens it.
+    /// The words drawn that may name agents, asked about off the loop
+    /// that draws and reads keys, a batch at a time: once one does, the
+    /// links on screen are found again, so its name opens it.
     async fn read_names(&mut self) {
-        let wanted = self.names.borrow_mut().wanted();
-        let mut found = false;
-        for word in wanted {
-            let page = self
-                .client
-                .request("bots", json!({"name": word, "limit": 1}))
-                .await;
-            // Unanswered, it is not taken for a name for a while, not asked each tick.
-            let agent =
-                page.is_ok_and(|page| page["bots"][0]["name"] == word.as_str()) && word != self.bot;
-            found |= agent;
-            self.names.borrow_mut().learn(word, agent);
-        }
-        if found {
-            self.screen.relink();
-            if let Some(pane) = &mut self.pane {
-                pane.screen.relink();
+        if self.naming.as_ref().is_some_and(|job| job.is_finished()) {
+            let job = self.naming.take().expect("a lookup");
+            let mut found = false;
+            for (word, agent) in job.await.unwrap_or_default() {
+                let agent = agent && word != self.bot;
+                found |= agent;
+                self.names.get_mut().learn(word, agent);
+            }
+            if found {
+                self.screen.relink();
+                if let Some(pane) = &mut self.pane {
+                    pane.screen.relink();
+                }
             }
         }
+        if self.naming.is_some() {
+            return;
+        }
+        let wanted = self.names.get_mut().wanted();
+        if wanted.is_empty() {
+            return;
+        }
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        self.naming = Some(tokio::spawn(async move {
+            let mut known = Vec::new();
+            for word in wanted {
+                let asked = client.request("bots", json!({"name": word, "limit": 1}));
+                // Unanswered, it is not taken for a name for a while.
+                let agent = match tokio::time::timeout(NAME_LOOKUP, asked).await {
+                    Ok(Ok(page)) => page["bots"][0]["name"] == word.as_str(),
+                    _ => false,
+                };
+                known.push((word, agent));
+            }
+            woken.notify_one();
+            known
+        }));
     }
 
     /// The other bots' notes the margin shows, read again every few
