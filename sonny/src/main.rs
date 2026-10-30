@@ -7379,7 +7379,11 @@ impl App {
             }
             // Put aside, with its card, for Ctrl+] to open again.
             Some(open) => {
-                self.closed = Some((open, self.watch.take()));
+                let mut watch = self.watch.take();
+                if let Some(view) = watch.as_mut().and_then(|w| w.sky.as_mut()) {
+                    view.pause();
+                }
+                self.closed = Some((open, watch));
                 self.pane = self.under.take();
                 self.pane_keys &= keep && self.pane.is_some();
             }
@@ -7644,7 +7648,10 @@ impl App {
                 && self.closed.is_some()
                 && self.pane.as_ref().is_none_or(pane::Pane::is_margin) =>
             {
-                let (pane, watch) = self.closed.take().expect("a closed pane");
+                let (pane, mut watch) = self.closed.take().expect("a closed pane");
+                if let Some(view) = watch.as_mut().and_then(|w| w.sky.as_mut()) {
+                    view.resume();
+                }
                 self.open_pane(pane);
                 self.watch = watch;
             }

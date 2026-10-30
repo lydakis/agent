@@ -105,6 +105,8 @@ struct Agent {
 }
 
 pub struct View {
+    /// The daemon's socket, to follow it again after a pause.
+    socket: PathBuf,
     feed: mpsc::UnboundedReceiver<Feed>,
     task: tokio::task::JoinHandle<()>,
     agents: Vec<Agent>,
@@ -119,6 +121,7 @@ pub struct View {
     recent: VecDeque<Instant>,
     laid: bool,
     live: bool,
+    paused: bool,
     down: Option<String>,
 }
 
@@ -131,12 +134,17 @@ impl Drop for View {
 impl View {
     pub fn open(socket: PathBuf) -> Self {
         let (send, feed) = mpsc::unbounded_channel();
-        let task = tokio::spawn(follow(socket, send));
-        Self::with(feed, task)
+        let task = tokio::spawn(follow(socket.clone(), send));
+        Self::with(socket, feed, task)
     }
 
-    fn with(feed: mpsc::UnboundedReceiver<Feed>, task: tokio::task::JoinHandle<()>) -> Self {
+    fn with(
+        socket: PathBuf,
+        feed: mpsc::UnboundedReceiver<Feed>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self {
+            socket,
             feed,
             task,
             agents: Vec::new(),
@@ -148,8 +156,31 @@ impl View {
             recent: VecDeque::new(),
             laid: false,
             live: false,
+            paused: false,
             down: None,
         }
+    }
+
+    /// Stop following while the view is put aside, so nothing piles up
+    /// unread.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        self.task.abort();
+    }
+
+    /// Follow again after a pause: the agents read afresh, who talked
+    /// to whom kept.
+    pub fn resume(&mut self) {
+        if !self.task.is_finished() && !self.paused {
+            return;
+        }
+        self.paused = false;
+        let (send, feed) = mpsc::unbounded_channel();
+        self.feed = feed;
+        self.task = tokio::spawn(follow(self.socket.clone(), send));
+        self.sparks.clear();
+        self.live = false;
+        self.down = None;
     }
 
     /// Take what the follow brought, and let what landed light up.
@@ -1017,7 +1048,7 @@ mod tests {
     fn view() -> (View, mpsc::UnboundedSender<Feed>) {
         let (send, feed) = mpsc::unbounded_channel();
         let task = tokio::spawn(async {});
-        (View::with(feed, task), send)
+        (View::with(PathBuf::new(), feed, task), send)
     }
 
     fn text(lines: &[Line]) -> String {
