@@ -339,12 +339,23 @@ impl Updates {
         }
     }
 
-    /// Who made the bot, when the bot holding that name now is the one
-    /// that did.
-    fn creator(&self, name: &str) -> Option<&str> {
+    /// The ID of the bot that made this one: the bot holding its maker's
+    /// name now, when that is the one that did; else, when the maker is no
+    /// bot seated here, the ID the record names.
+    fn creator(&self, name: &str) -> Option<i64> {
         let bot = self.bots.get(name)?;
         let parent = bot.parent.as_deref()?;
-        (bot.parent_id.is_some() && self.bots.get(parent)?.id == bot.parent_id).then_some(parent)
+        match self.bots.get(parent) {
+            Some(seated) => (bot.parent_id.is_some() && seated.id == bot.parent_id)
+                .then_some(bot.parent_id)
+                .flatten(),
+            None => bot.parent_id,
+        }
+    }
+
+    /// Whether a bot is seated.
+    pub fn has(&self, name: &str) -> bool {
+        self.bots.contains_key(name)
     }
 
     pub fn event(&mut self, event: &Value, now: Instant) {
@@ -521,10 +532,7 @@ impl Updates {
                 if !self.live || status == "steered" || noted {
                     return;
                 }
-                let creator = self
-                    .creator(name)
-                    .and_then(|c| self.bots.get(c))
-                    .and_then(|c| c.id);
+                let creator = self.creator(name);
                 let hold = match self.goaled.contains(&key(turn)) {
                     // News once its goal's check says, or once a check
                     // could have run its longest.
@@ -878,6 +886,23 @@ impl Updates {
                 .is_some_and(|lead| lead.id.is_some() && ACTIVE.contains(&lead.status.as_str()))
     }
 
+    /// The daemon is being asked whether the lead rests: not again for a
+    /// while.
+    pub fn asking(&mut self, now: Instant) {
+        self.asked = Some(now);
+    }
+
+    /// Who asked for a turn already running before the lookout watched,
+    /// as its prompt says: as its `accepted` would have.
+    pub fn asked(&mut self, name: &str, turn: i64, prompt: &Value) {
+        let key = (name.to_owned(), turn);
+        if let Some(by) = prompt["from"]["bot"].as_str() {
+            self.from.insert(key, by.to_owned());
+        } else if let Some(origin) = prompt["origin"].as_str() {
+            self.origin.insert(key, origin.to_owned());
+        }
+    }
+
     /// The lead as the daemon lists it now: if it rests there, it rests
     /// here. What the events said it was doing comes back, to log.
     pub fn rests(&mut self, now: Instant, record: &Value) -> Option<String> {
@@ -1033,6 +1058,7 @@ impl Updates {
 
     /// The lead's ID, to send it the note and no later bot of its name.
     /// Every bot seated, by name.
+    #[cfg(test)]
     pub fn listed(&self) -> Vec<String> {
         self.bots.keys().cloned().collect()
     }
@@ -1351,6 +1377,35 @@ mod tests {
             &ev(bot, Some(turn), "turn_finished", json!({"status": status})),
             now,
         );
+    }
+
+    #[test]
+    fn a_turn_running_before_the_lookout_started_is_told_as_whoever_asked() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let ended = json!({"status": "completed"});
+        let asked = json!({"turn": 7, "text": "", "from": {"bot": "shop.lead", "turn": 1}});
+        updates.asked("shop.fix", 7, &asked);
+        updates.event(
+            &ev("shop.fix", Some(7), "turn_finished", ended.clone()),
+            now,
+        );
+        updates.asked(
+            "shop.docs",
+            8,
+            &json!({"turn": 8, "text": "", "origin": "cron"}),
+        );
+        updates.event(&ev("shop.docs", Some(8), "turn_finished", ended), now);
+        let told = text(&updates.take());
+        assert!(
+            told.contains("turn:shop.fix/7 completed, asked by you"),
+            "{told}"
+        );
+        assert!(
+            told.contains("turn:shop.docs/8 completed, asked by cron"),
+            "{told}"
+        );
+        assert!(!told.contains("the person"), "{told}");
     }
 
     #[test]
