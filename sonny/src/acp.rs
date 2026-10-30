@@ -288,20 +288,20 @@ impl Agent {
         let providers = bound.map_or(&offer.providers, |(_, providers)| providers);
         let mut models = vec![json!({"value": DEFAULT, "name": "Default",
             "description": "The model the lead or task runs, or the one Sonny gives a new lead"})];
-        for (id, note) in offer.models {
+        for listed in offer.models {
             if let Some((current, _)) = bound
-                && family(providers, &id) != family(providers, current)
+                && family(providers, &listed.id) != family(providers, current)
             {
                 continue;
             }
-            let mut choice = json!({"value": id, "name": id});
-            if let Some(note) = note {
-                choice["description"] = json!(note);
-            }
-            models.push(choice);
+            models.push(choice(
+                &listed.id,
+                listed.name.as_deref(),
+                listed.note.as_deref(),
+            ));
         }
         if !models.iter().any(|choice| choice["value"] == model) {
-            models.push(json!({"value": model, "name": model}));
+            models.push(choice(model, None, None));
         }
         // A bot's family's efforts; before there is one, the picked
         // model's, or every family's.
@@ -344,7 +344,11 @@ impl Agent {
                 for name in names {
                     for model in providers[name]["models"].as_array().into_iter().flatten() {
                         if let Some(id) = model["id"].as_str() {
-                            offer.models.push((format!("{name}/{id}"), None));
+                            offer.models.push(Listed {
+                                id: format!("{name}/{id}"),
+                                name: model["name"].as_str().map(str::to_owned),
+                                note: None,
+                            });
                         }
                     }
                 }
@@ -352,9 +356,13 @@ impl Agent {
             client.close().await;
         }
         for model in file {
-            match offer.models.iter_mut().find(|(id, _)| *id == model.id) {
-                Some((_, note)) => *note = model.note,
-                None => offer.models.push((model.id, model.note)),
+            match offer.models.iter_mut().find(|listed| listed.id == model.id) {
+                Some(listed) => listed.note = model.note,
+                None => offer.models.push(Listed {
+                    id: model.id,
+                    name: None,
+                    note: model.note,
+                }),
             }
         }
         if let Ok(mut kept) = self.offer.lock() {
@@ -502,12 +510,37 @@ struct Bound {
     effort: Option<String>,
 }
 
-/// What a thread may pick from: `provider/model` with its note, and the
-/// daemon's providers, whose families and efforts they are.
+/// What a thread may pick from: the models listed, and the daemon's
+/// providers, whose families and efforts they are.
 #[derive(Clone, Default)]
 struct Offer {
-    models: Vec<(String, Option<String>)>,
+    models: Vec<Listed>,
     providers: Value,
+}
+
+/// A model a thread may pick: `provider/model`, the name its provider's
+/// listing gives it, and `~/.agent/models`' note.
+#[derive(Clone)]
+struct Listed {
+    id: String,
+    name: Option<String>,
+    note: Option<String>,
+}
+
+/// A model picker's choice for `provider/model`: shown by the name its
+/// provider lists, else the model's own id, beside its provider, since an
+/// id such as Bedrock's `global.anthropic.…` is too long to read in the
+/// picker. The full id is in its description, after the file's note.
+fn choice(id: &str, name: Option<&str>, note: Option<&str>) -> Value {
+    let label = match id.split_once('/') {
+        Some((provider, model)) => format!("{} · {provider}", name.unwrap_or(model)),
+        None => name.unwrap_or(id).to_owned(),
+    };
+    let description = match note {
+        Some(note) => format!("{note} ({id})"),
+        None => id.to_owned(),
+    };
+    json!({"value": id, "name": label, "description": description})
 }
 
 impl Session {
@@ -1900,6 +1933,21 @@ async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_shows_by_the_name_its_provider_lists() {
+        let id = "bedrock/global.anthropic.claude-opus-5-5";
+        assert_eq!(
+            choice(id, Some("Global Claude Opus 5.5"), None),
+            json!({"value": id, "name": "Global Claude Opus 5.5 · bedrock", "description": id})
+        );
+        // Unnamed, by its own id; the file's note comes before the full id.
+        assert_eq!(
+            choice("openai/gpt-6-sol", None, Some("faster")),
+            json!({"value": "openai/gpt-6-sol", "name": "gpt-6-sol · openai",
+                "description": "faster (openai/gpt-6-sol)"})
+        );
+    }
 
     #[test]
     fn a_prompt_is_words_paths_and_pictures() {
