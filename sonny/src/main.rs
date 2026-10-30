@@ -8527,7 +8527,14 @@ impl App {
                     .collect();
                 pane.set_card(lines, STATUS_KEYS);
                 pane.foot = Some(view.footer());
-                if !view.reading() && watch.picked != Some(at) {
+                if view.reading() {
+                    // A thread just opened starts at its top, after the
+                    // card's swap kept the list's scroll.
+                    if watch.picked != Some(usize::MAX) {
+                        watch.picked = Some(usize::MAX);
+                        pane.screen.show_row(0, 0);
+                    }
+                } else if watch.picked != Some(at) {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
