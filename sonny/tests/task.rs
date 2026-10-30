@@ -407,6 +407,11 @@ fn a_task_outside_git_is_removed_with_no_snapshots_to_drop() {
 /// Keep the worktree's files as the lookout does after a completed turn
 /// (snapshot.rs): bot 5's turn `turn`, at history node `checkpoint`.
 fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
+    snapshot_in(lab, worktree, turn, checkpoint, None);
+}
+
+/// As `snapshot`, naming `folder` as the one its turn worked in.
+fn snapshot_in(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64, folder: Option<&str>) {
     let index = lab.scratch.join("snapshot.index");
     let add = |args: &[&str]| {
         let output = Command::new("git")
@@ -426,7 +431,10 @@ fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
     add(&["read-tree", "HEAD"]);
     add(&["add", "-A"]);
     let tree = add(&["write-tree"]);
-    let message = format!("Files after turn {turn}\n\nAgent-Checkpoint: {checkpoint}");
+    let mut message = format!("Files after turn {turn}\n\nAgent-Checkpoint: {checkpoint}");
+    if let Some(folder) = folder {
+        message.push_str(&format!("\nAgent-Folder: {folder}"));
+    }
     let commit = add(&["commit-tree", &tree, "-p", "HEAD", "-m", &message]);
     lab.git(
         worktree,
@@ -494,11 +502,56 @@ fn a_fork_whose_files_lead_out_of_its_worktree_starts_nothing() {
         false,
     );
     assert!(
-        !ok && err.contains("leads out of the task's worktree"),
+        !ok && err.contains("the task's folder in its worktree"),
         "{err}"
     );
     assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
     assert!(!lab.scratch.join("run.log.fork").exists());
+}
+
+#[test]
+fn a_fork_whose_snapshot_names_a_folder_above_its_worktree_starts_nothing() {
+    let lab = Lab::new("fork-up");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let source = lab.home.join(".agent/worktrees/demo.fix");
+    snapshot_in(&lab, &source, 12, 77, Some("../.."));
+    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
+        "workspace": source.join("src")}]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    let (ok, err) = lab.tool(
+        &lab.repo.join("src"),
+        "start_task",
+        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
+        false,
+    );
+    assert!(!ok && err.contains("not a folder inside it"), "{err}");
+    assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
+    assert!(!lab.scratch.join("run.log.fork").exists());
+}
+
+#[test]
+fn a_fork_from_a_turn_that_emptied_its_folder_starts_in_that_folder_made_anew() {
+    let lab = Lab::new("fork-empty");
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let source = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::remove_dir_all(source.join("src")).unwrap();
+    std::fs::create_dir(source.join("src")).unwrap();
+    snapshot(&lab, &source, 12, 77);
+    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
+        "workspace": source.join("src")}]);
+    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
+    let (ok, said) = lab.tool(
+        &lab.repo.join("src"),
+        "start_task",
+        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
+        false,
+    );
+    assert!(ok, "{said}");
+    let copy = lab.home.join(".agent/worktrees/demo.try");
+    assert!(copy.join("src").is_dir());
+    assert_eq!(lab.ran()[5], copy.join("src").to_string_lossy());
 }
 
 #[test]

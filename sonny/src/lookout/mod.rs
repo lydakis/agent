@@ -673,6 +673,12 @@ impl Service {
                 .filter(|b| b["status"] == "running")
                 .filter_map(|b| Some((b["name"].as_str()?, Path::new(b["workspace"].as_str()?)))),
         );
+        for bot in &bots {
+            if let (Some(name), Some(workspace)) = (bot["name"].as_str(), bot["workspace"].as_str())
+            {
+                crate::snapshot::housed(name, Some(Path::new(workspace)));
+            }
+        }
         self.subscribers = subs::all(&self.store).into_iter().collect();
         for bot in &bots {
             self.seat(&client, bot).await;
@@ -981,6 +987,7 @@ impl Service {
             }
             ("deleted", _) => {
                 crate::snapshot::running(bot, None);
+                crate::snapshot::housed(bot, None);
                 self.working.retain(|(name, _), _| name != bot);
                 let Some(folder) = record.and_then(|r| r["workspace"].as_str()) else {
                     return;

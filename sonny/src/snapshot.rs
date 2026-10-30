@@ -86,6 +86,8 @@ struct Sealed {
     /// folder of them a link out of its sandbox. What git writes goes to
     /// the sealed folder's own, which `publish` then moves in.
     objects: PathBuf,
+    /// The repository's shared git folder, where its refs are.
+    common: PathBuf,
     /// The checkout's own index.
     index: PathBuf,
     settings: Vec<(std::ffi::OsString, std::ffi::OsString)>,
@@ -189,9 +191,85 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
         dir: at.to_owned(),
         work: work.to_owned(),
         objects,
+        common: common.to_owned(),
         index,
         settings,
     })
+}
+
+/// `name` as C takes it.
+fn c(name: &[u8]) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+/// The folder `name` in the folder `at`, opened without following a link.
+fn folder(at: std::os::fd::RawFd, name: &std::ffi::CStr) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    let fd = unsafe { libc::openat(at, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened, and nothing else owns it.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// The folder `parts` names below `root`, each opened without following a
+/// link, so none can lead out of what a task may write; one missing is
+/// made where `make`.
+pub(crate) fn folders(
+    root: &Path,
+    parts: &[&std::ffi::OsStr],
+    make: bool,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut at = folder(libc::AT_FDCWD, &c(root.as_os_str().as_bytes())?)?;
+    for part in parts {
+        let name = c(part.as_bytes())?;
+        if make {
+            // SAFETY: as above. One already there is opened as it is.
+            unsafe { libc::mkdirat(at.as_raw_fd(), name.as_ptr(), 0o755) };
+        }
+        at = folder(at.as_raw_fd(), &name)?;
+    }
+    Ok(at)
+}
+
+/// Write `bytes` as the file `name` of the folder `at`, whole or not at
+/// all: through `NAME.lock`, made anew without following a link, as git
+/// itself writes a ref.
+fn put(at: &std::os::fd::OwnedFd, name: &std::ffi::OsStr, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let mut lock = name.as_bytes().to_vec();
+    lock.extend_from_slice(b".lock");
+    let (name, lock) = (c(name.as_bytes())?, c(&lock)?);
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: as above.
+    let fd = unsafe { libc::openat(at.as_raw_fd(), lock.as_ptr(), flags, 0o644) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened, and nothing else owns it.
+    let mut made = unsafe { std::fs::File::from_raw_fd(fd) };
+    let written = made.write_all(bytes).and_then(|()| made.sync_all());
+    let at = at.as_raw_fd();
+    let moved = written.and_then(|()| {
+        // SAFETY: both names are NUL-terminated, in the folder opened.
+        match unsafe { libc::renameat(at, lock.as_ptr(), at, name.as_ptr()) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    });
+    if moved.is_err() {
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(at, lock.as_ptr(), 0) };
+    }
+    moved
 }
 
 /// Move the objects git wrote to `from` into the repository's `to`,
@@ -199,20 +277,9 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
 /// lead a write out of what a task may write: a folder of `to` that is a
 /// link stops the snapshot. A pack goes in before its index.
 fn publish(from: &Path, to: &Path) -> Result<(), String> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    let c = |name: &[u8]| std::ffi::CString::new(name).map_err(|e| e.to_string());
     let failed = |what: &Path| format!("{}: {}", what.display(), std::io::Error::last_os_error());
-    let folder = |at: libc::c_int, name: &std::ffi::CStr, what: &Path| {
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        // SAFETY: `name` is NUL-terminated and outlives the call.
-        let fd = unsafe { libc::openat(at, name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(failed(what));
-        }
-        // SAFETY: `fd` was just opened, and nothing else owns it.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    };
     let listed = |dir: &Path| -> Result<Vec<std::ffi::OsString>, String> {
         let mut names: Vec<_> = (std::fs::read_dir(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?)
@@ -222,22 +289,19 @@ fn publish(from: &Path, to: &Path) -> Result<(), String> {
         names.sort_by_key(|name| (name.as_bytes().ends_with(b".idx"), name.clone()));
         Ok(names)
     };
-    let root = folder(libc::AT_FDCWD, &c(to.as_os_str().as_bytes())?, to)?;
     for name in listed(from)? {
         let (source, what) = (from.join(&name), to.join(&name));
         if !source.is_dir() {
             continue;
         }
-        let name = c(name.as_bytes())?;
-        // SAFETY: as above. One already there is opened as it is.
-        unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o755) };
-        let dir = folder(root.as_raw_fd(), &name, &what)?;
+        let dir = folders(to, &[name.as_os_str()], true)
+            .map_err(|e| format!("{}: {e}", what.display()))?;
         for file in listed(&source)? {
             let what = what.join(&file);
-            let name = c(file.as_bytes())?;
+            let name = c(file.as_bytes()).map_err(|e| e.to_string())?;
             let mut temporary = format!(".sonny-{}-", std::process::id()).into_bytes();
             temporary.extend_from_slice(file.as_bytes());
-            let temporary = c(&temporary)?;
+            let temporary = c(&temporary).map_err(|e| e.to_string())?;
             let flags =
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
             // SAFETY: as above.
@@ -263,6 +327,24 @@ fn publish(from: &Path, to: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Point the ref `name` of the repository whose shared git folder is
+/// `common` at `commit`, written as a loose ref through folders opened
+/// without following a link, as `publish` writes objects: git's own
+/// `update-ref` would follow a folder of `refs` a task made a link out.
+fn write_ref(common: &Path, name: &str, commit: &str) -> Result<(), String> {
+    let failed = |e: std::io::Error| format!("{}: {e}", common.join(name).display());
+    if std::fs::symlink_metadata(common.join("reftable")).is_ok() {
+        return Err(format!(
+            "{}: refs kept as reftable, which snapshots are not written to",
+            common.display()
+        ));
+    }
+    let mut parts: Vec<&std::ffi::OsStr> = name.split('/').map(std::ffi::OsStr::new).collect();
+    let last = parts.pop().ok_or("an empty ref name")?;
+    let at = folders(common, &parts, true).map_err(failed)?;
+    put(&at, last, format!("{commit}\n").as_bytes()).map_err(failed)
 }
 
 /// Copy the file `from`, in a git folder a task may write, to `to`, made
@@ -469,7 +551,7 @@ pub fn commit(
     let commit = sealed(&staged.sealed, &args, &staged.sealed.index, None)?;
     publish(&staged.sealed.dir.join("objects"), &staged.sealed.objects)?;
     let name = format!("{refs}/{bot_id}/{turn}");
-    git(&staged.top, &["update-ref", &name, &commit], None, None)?;
+    write_ref(&staged.sealed.common, &name, &commit)?;
     Ok(commit)
 }
 
@@ -603,17 +685,58 @@ pub fn restore(
 }
 
 /// Drop bot `bot_id`'s snapshots in the repository `dir` is in; git's own
-/// clean-up then frees what nothing else holds.
+/// clean-up then frees what nothing else holds. Loose ones go through
+/// folders opened without following a link, as `write_ref` makes them;
+/// only what is left, packed by git, is git's to drop.
 pub fn forget(dir: &Path, refs: &str, bot_id: i64) -> Result<usize, String> {
-    let turns = turns(dir, refs, bot_id)?;
-    if turns.is_empty() {
+    use std::os::fd::AsRawFd;
+    let found = turns(dir, refs, bot_id)?;
+    if found.is_empty() {
         return Ok(0);
     }
-    let input: String = (turns.iter())
-        .map(|turn| format!("delete {refs}/{bot_id}/{turn}\n"))
+    let common = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        None,
+        None,
+    )?;
+    let common = Path::new(common.trim_end());
+    let bot = bot_id.to_string();
+    let parts: Vec<&std::ffi::OsStr> = (refs.split('/').chain([bot.as_str()]))
+        .map(std::ffi::OsStr::new)
         .collect();
-    git(dir, &["update-ref", "--stdin"], None, Some(&input))?;
-    Ok(turns.len())
+    let failed = |e: std::io::Error| format!("{}/{refs}/{bot}: {e}", common.display());
+    match folders(common, &parts, false) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(failed(e)),
+        Ok(at) => {
+            for turn in &found {
+                let name = c(turn.to_string().as_bytes()).map_err(failed)?;
+                // SAFETY: `name` is NUL-terminated, in the folder opened.
+                if unsafe { libc::unlinkat(at.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(failed(error));
+                    }
+                }
+            }
+            drop(at);
+            if let Ok(up) = folders(common, &parts[..parts.len() - 1], false)
+                && let Ok(name) = c(bot.as_bytes())
+            {
+                // SAFETY: as above; a folder still holding something stays.
+                unsafe { libc::unlinkat(up.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            }
+        }
+    }
+    let packed = turns(dir, refs, bot_id)?;
+    if !packed.is_empty() {
+        let input: String = (packed.iter())
+            .map(|turn| format!("delete {refs}/{bot_id}/{turn}\n"))
+            .collect();
+        git(dir, &["update-ref", "--stdin"], None, Some(&input))?;
+    }
+    Ok(found.len())
 }
 
 /// The lock each checkout's snapshots and their removal take in turn:
@@ -645,18 +768,52 @@ static WORKED: std::sync::LazyLock<
 static RUNNING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// The folder of every bot the lookout knows of, working or not: one a
+/// turn has ended in may still run what that turn left going.
+static HOUSED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// Note that `bot` works in `workspace` now, or, with `None`, no longer.
 pub fn running(bot: &str, workspace: Option<&Path>) {
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     match workspace {
         Some(workspace) => {
             let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
+            housed(bot, Some(&real));
             running.insert(bot.to_owned(), real);
         }
         None => {
             running.remove(bot);
         }
     }
+}
+
+/// Note that `bot` has its folder at `workspace`, or, with `None`, is gone.
+pub fn housed(bot: &str, workspace: Option<&Path>) {
+    let mut housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
+    match workspace {
+        Some(workspace) => {
+            let real = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
+            housed.insert(bot.to_owned(), real);
+        }
+        None => {
+            housed.remove(bot);
+        }
+    }
+}
+
+/// The folder of a bot that holds `path`, which a sandbox would let it
+/// write: none of Sonny's own may be in one.
+fn housing(path: &Path) -> Option<PathBuf> {
+    let real = (path.parent())
+        .and_then(|up| std::fs::canonicalize(up).ok())
+        .zip(path.file_name())
+        .map_or_else(|| path.to_owned(), |(up, name)| up.join(name));
+    let housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
+    housed
+        .values()
+        .find(|folder| real.starts_with(folder))
+        .cloned()
 }
 
 /// Start over from the bots `listed` as running, each in its folder.
@@ -751,6 +908,16 @@ pub async fn after_turn(done: Completed) {
     };
     if gone(bot_id) {
         return;
+    }
+    // A bot that can write the sealed folder could change it between its
+    // making and git's reading of it.
+    if let Some(folder) = housing(&indexes) {
+        let error = format!(
+            "{} is inside {}, where a bot works, so no snapshot is kept",
+            indexes.display(),
+            folder.display()
+        );
+        return failed(bot_id, turn, &error);
     }
     let staged = match tokio::task::spawn_blocking(move || stage(&top, &indexes)).await {
         Ok(Ok(Some(staged))) => staged,
@@ -1107,6 +1274,49 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_of_refs_that_links_out_takes_no_write() {
+        let (dir, top) = repo("refs");
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, top.join(".git/refs/agent")).unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        assert!(commit(&staged, REFS, 7, 1, 10, false, None).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshots_are_forgotten_loose_or_packed_and_never_through_a_link() {
+        let (dir, top) = repo("forget");
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false, None).unwrap();
+        let packed = Command::new("git")
+            .arg("-C")
+            .arg(&top)
+            .args(["pack-refs", "--all"])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        commit(&staged, REFS, 7, 2, 20, false, None).unwrap();
+        assert_eq!(forget(&top, REFS, 7).unwrap(), 2);
+        assert!(find(&top, REFS, 7, None).is_err());
+        assert!(!top.join(".git").join(REFS).join("7").exists());
+
+        commit(&staged, REFS, 8, 1, 10, false, None).unwrap();
+        let bot = top.join(".git").join(REFS).join("8");
+        let outside = dir.join("outside");
+        std::fs::rename(&bot, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &bot).unwrap();
+        assert!(forget(&top, REFS, 8).is_err());
+        assert!(outside.join("1").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_snapshot_names_the_folder_its_turn_worked_in() {
         let (dir, top) = repo("folder");
         let staged = stage(&top, &top.with_extension("indexes"))
@@ -1300,6 +1510,24 @@ mod tests {
         assert!(!busy(&one) && busy(&two));
         running("busy.b", None);
         assert!(!busy(&two));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_inside_a_bot_s_is_housed_until_the_bot_is_gone() {
+        let dir = scratch("housed");
+        let (lead, task) = (dir.join("lead"), dir.join("lead/task"));
+        std::fs::create_dir_all(&task).unwrap();
+        // The sealed folder is made later, so it need not be there yet.
+        let indexes = lead.join("state.sqlite.snapshot-indexes");
+        housed("housed.task", Some(&task));
+        assert_eq!(housing(&indexes), None);
+        running("housed.lead", Some(&lead));
+        running("housed.lead", None);
+        assert_eq!(housing(&indexes), Some(lead.clone()));
+        housed("housed.lead", None);
+        assert_eq!(housing(&indexes), None);
+        housed("housed.task", None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

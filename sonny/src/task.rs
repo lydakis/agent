@@ -113,20 +113,30 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
     };
     // A worktree's files come from commits a task can write, which may
     // make the lead's subfolder a link out of it: the task would then work
-    // wherever it leads, with the sandbox's leave to write there.
-    if let Undo::Worktree { path, .. } = &place.undo
-        && let (Ok(dir), Ok(top)) = (
-            std::fs::canonicalize(&place.dir),
-            std::fs::canonicalize(path),
-        )
-        && !dir.starts_with(&top)
-    {
-        let error = format!(
-            "{} leads out of the task's worktree, to {}",
-            place.dir.display(),
-            dir.display()
-        );
-        return failed(&place, false, error);
+    // wherever it leads, with the sandbox's leave to write there. So each
+    // folder down to the task's is opened without following a link, and
+    // made when the commit has none, as when its last file was removed.
+    if let Undo::Worktree { path, .. } = &place.undo {
+        let below = place.dir.strip_prefix(path).ok().and_then(|below| {
+            (below.components())
+                .map(|part| match part {
+                    std::path::Component::Normal(part) => Some(part),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        let made = match below {
+            Some(parts) => crate::snapshot::folders(path, &parts, true).map_err(|e| e.to_string()),
+            None => Err("not a folder inside it".to_owned()),
+        };
+        if let Err(e) = made {
+            let error = format!(
+                "{}: the task's folder in its worktree {}: {e}",
+                place.dir.display(),
+                path.display()
+            );
+            return failed(&place, false, error);
+        }
     }
     // The folder's setup script, run in the task's own folder, as for a
     // worktree; a task in the lead's folder has nothing to set up. A fork's
