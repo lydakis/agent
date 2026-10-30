@@ -1157,6 +1157,7 @@ fn forked(agent: &Path, name: &str, source: &Source) -> Result<Place, String> {
         .map_err(|e| format!("{} ls: {e}", agent.display()))?;
     let folders: Vec<PathBuf> = (bots.iter())
         .filter_map(|bot| bot["workspace"].as_str().map(PathBuf::from))
+        .chain(crate::snapshot::shared())
         .collect();
     if let Some(folder) = crate::snapshot::holder(&indexes, folders.iter().map(PathBuf::as_path)) {
         return Err(format!(

@@ -828,7 +828,18 @@ pub fn housed(bot: &str, workspace: Option<&Path>) {
 /// write: none of Sonny's own may be in one.
 fn housing(path: &Path) -> Option<PathBuf> {
     let housed = HOUSED.lock().unwrap_or_else(|e| e.into_inner());
-    holder(path, housed.values().map(PathBuf::as_path))
+    let shared = shared();
+    holder(path, (housed.values().chain(&shared)).map(PathBuf::as_path))
+}
+
+/// The folders every sandbox lets its bot write, whatever its folder:
+/// `$TMPDIR` and `/tmp`, as the daemon's sandbox has them.
+pub(crate) fn shared() -> Vec<PathBuf> {
+    (std::env::var_os("TMPDIR").map(PathBuf::from))
+        .filter(|path| path.is_absolute())
+        .into_iter()
+        .chain([PathBuf::from("/tmp")])
+        .collect()
 }
 
 /// The first of `folders` that holds `path`, both by their real paths:
@@ -1586,14 +1597,21 @@ mod tests {
         std::fs::create_dir_all(&task).unwrap();
         // The sealed folder is made later, so it need not be there yet.
         let indexes = lead.join("state.sqlite.snapshot-indexes");
+        let real = |path: &Path| std::fs::canonicalize(path).unwrap();
+        let temporary = |path: Option<PathBuf>| {
+            path.is_some_and(|path| shared().iter().any(|tmp| real(tmp) == path))
+        };
         housed("housed.task", Some(&task));
-        assert_eq!(housing(&indexes), None);
+        assert!(temporary(housing(&indexes)));
         running("housed.lead", Some(&lead));
         running("housed.lead", None);
         assert_eq!(housing(&indexes), Some(lead.clone()));
         housed("housed.lead", None);
-        assert_eq!(housing(&indexes), None);
+        // Every sandbox writes the temporary folders this one is in.
+        assert!(temporary(housing(&indexes)));
         housed("housed.task", None);
+        let away = Path::new("/nonexistent/state.sqlite.snapshot-indexes");
+        assert_eq!(holder(away, [task.as_path()]), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

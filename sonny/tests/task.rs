@@ -17,7 +17,10 @@ impl Lab {
     /// A repository with a commit and an uncommitted edit under `src`,
     /// and an `agent` that logs what `run` was given.
     fn new(test: &str) -> Lab {
-        let scratch = Path::new("/tmp").join(format!("sonny-task-{test}-{}", std::process::id()));
+        // Outside the temporary folders, which every sandbox writes and so
+        // no snapshot's sealed folder may be in.
+        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("sonny-task-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         for dir in ["home", "repo/src"] {
             std::fs::create_dir_all(scratch.join(dir)).unwrap();
@@ -71,6 +74,9 @@ impl Lab {
             .args(args)
             .current_dir(dir)
             .env("PWD", dir)
+            // The lab's folders are in this repository's build folder:
+            // git finds no repository above them.
+            .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
             .env("AGENT_BOT", "demo.lead")
             .env("AGENT_BOT_ID", "1")
             .env("HOME", &self.home)
@@ -340,6 +346,7 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
     let mut child = Command::new(&sonny)
         .args(["tool", "start_task"])
         .current_dir(&lab.repo)
+        .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
         .env("HOME", &lab.home)
         .env("AGENT_BOT", "demo.lead")
         .env_remove("AGENT_BIN")
