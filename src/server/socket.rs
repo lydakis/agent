@@ -19,7 +19,7 @@ const SOCKET_PATH: usize = 103;
 /// folder's sockets wouldn't fit a socket path.
 pub fn capabilities(
     socket: &Path,
-    sender: tokio::sync::mpsc::Sender<super::session::Inbound>,
+    sender: super::session::Sender,
     next: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Option<agent_runtime::sandbox::Capabilities> {
     let mut folder = socket.as_os_str().to_owned();

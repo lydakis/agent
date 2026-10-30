@@ -5936,3 +5936,42 @@ on the GitHub runner (2026-10-30):
 Store jobs per turn did not change (7.5 on both), and nothing passed the
 gate's 15%. The p95 turn and per-idle-bot drops are the bench's spread
 between runs, as the change adds nothing to an idle bot or a turn's work.
+
+## Sessions take turns at the service loop (#450)
+
+The service loop's input is now one queue per session, taken one request
+per session in turn, under the same 64-request bound for all of them. A
+request now costs a mutex and a hash map lookup where it cost a channel
+send. The Perf workflow's matched screen, base main 0f8e0e9 against the PR
+head 1d8e800, on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 24.109 | 24.303 | +0.8% |
+| admission | burst submit p99, ms | 3.105 | 3.059 | -1.5% |
+| completion | release to terminal p99, ms | 7.118 | 6.768 | -4.9% |
+| footprint | idle RSS, MiB | 19.471 | 19.447 | -0.1% |
+| footprint | per idle bot, KiB | 1.44 | 1.474 | +2.4% |
+| footprint | RSS after a turn each, MiB | 30.592 | 30.48 | -0.4% |
+| footprint | CPU per turn, ms | 0.69 | 0.671 | -2.7% |
+| lifecycle | CPU, s | 0.655 | 0.64 | -2.3% |
+| lifecycle | p95 turn, ms | 573.9 | 573.133 | -0.1% |
+| lifecycle | peak RSS, MiB | 25.715 | 25.705 | -0.0% |
+
+Nothing moved past the gate's 15%. Each of these benches drives the daemon
+from one session, so the turn-taking itself never comes into play there.
+It shows in `bench/fair_queuing.py`, where one session times an `inspect`
+every 5 ms while another pipelines a flood (4-core container, 210 bots,
+probe p50 / max in ms):
+
+| Flood | Base | Head | Flood rate, base / head |
+| --- | ---: | ---: | ---: |
+| none | 0.8 / 3.8 | 0.8 / 3.8 | |
+| 5,000 `inspect` | 10.5 / 13.6 | 1.1 / 14.6 | 6,158 / 6,411 per s |
+| 5,000 `events` | 11.0 / 22.4 | 0.9 / 7.4 | 5,776 / 6,639 per s |
+| 1,000 `bots` | 0.8 / 91.9 (p95 86.2) | 4.9 / 10.2 (p95 6.3) | 805 / 827 per s |
+| 2,500 `create` + `delete` | 44.9 / 96.4 | 3.6 / 9.0 | 1,359 / 1,439 per s |
+
+The probe used to wait behind the whole 64-request queue, mostly the
+flood's. Now it waits behind one of the flood's requests, and the flood's
+own rate holds.

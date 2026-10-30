@@ -1338,7 +1338,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ));
     }
     agent_runtime::sandbox::warm();
-    let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
+    let (sender, mut inbound) = session::channel(64);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut daemon = agent_runtime::sandbox::Daemon {
         store: Some(std::fs::canonicalize(&config.store)?),

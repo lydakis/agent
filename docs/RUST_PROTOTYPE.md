@@ -970,7 +970,12 @@ their last received durable cursor, or
 inspect the bot and turn through the protocol. The submitted turn continues
 independently. This signal does not depend on free queue capacity.
 The input channel holds at most 64 bounded
-requests; storage queues at most 32 operations. HTTP client internal buffers,
+requests from all sessions together, each session's in its own queue, and
+the service takes the sessions with one queued in turn, one request each, as
+Redis and NATS serve their clients: a client that pipelines thousands of
+requests holds every other session up by one of them, not by all it sent
+first. A session's own requests keep their order. Storage queues at most 32
+operations. HTTP client internal buffers,
 active histories, allocator retention, and filesystem cache remain part of the
 memory accounting.
 
