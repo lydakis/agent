@@ -101,10 +101,13 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
         "index",
         "--git-path",
         "info/exclude",
+        "--git-path",
+        "info/attributes",
         "--show-object-format",
     ];
     let listed = git(work, &args, None, None)?;
-    let [objects, index, exclude, format] = listed.lines().collect::<Vec<_>>()[..] else {
+    let [objects, index, exclude, attributes, format] = listed.lines().collect::<Vec<_>>()[..]
+    else {
         return Err("git rev-parse: an answer of another shape".into());
     };
     let repository = match format {
@@ -168,10 +171,16 @@ fn seal(work: &Path, at: &Path, head: Option<&str>) -> Result<Sealed, String> {
         let head = head.map_or("ref: refs/heads/none".to_owned(), str::to_owned);
         std::fs::write(at.join("HEAD"), format!("{head}\n"))?;
         std::fs::write(at.join("config"), repository)?;
-        match std::fs::copy(exclude, at.join("info/exclude")) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        // The repository's own ignores and attributes: what to leave out,
+        // and how to convert what is kept. An attribute naming a filter
+        // names none the sealed folder has.
+        for (from, to) in [(exclude, "info/exclude"), (attributes, "info/attributes")] {
+            match std::fs::copy(from, at.join(to)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
         }
+        Ok(())
     })();
     made.map_err(|e| format!("{}: {e}", at.display()))?;
     Ok(Sealed {
@@ -911,6 +920,31 @@ mod tests {
         restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
         assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
         assert_eq!(std::fs::read(copy.join("y.a")).unwrap(), b"three\r\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_the_repository_s_own_attributes_convert_comes_back_as_it_was() {
+        let (dir, top) = repo("info-attributes");
+        std::fs::write(top.join(".git/info/attributes"), "*.a text eol=crlf\n").unwrap();
+        std::fs::write(top.join("x.a"), "one\r\ntwo\r\n").unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        (std::fs::File::options()
+            .write(true)
+            .open(top.join("x.a"))
+            .unwrap())
+        .set_modified(then)
+        .unwrap();
+        git(&top, &["add", "-A"], None, None).unwrap();
+        git(&top, &["commit", "-q", "-m", "converted"], None, None).unwrap();
+        let staged = stage(&top, &top.with_extension("indexes"))
+            .unwrap()
+            .unwrap();
+        commit(&staged, REFS, 7, 1, 10, false).unwrap();
+        let snapshot = find(&top, REFS, 7, None).unwrap();
+        let copy = dir.join("copy");
+        restore(&top, &snapshot, &copy, "agent/copy", &dir).unwrap();
+        assert_eq!(std::fs::read(copy.join("x.a")).unwrap(), b"one\r\ntwo\r\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 
