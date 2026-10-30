@@ -43,8 +43,11 @@ pub const STEPS: [Step; 2] = [
     },
     Step {
         id: "backup",
-        what: "memory, skills, profiles and config.toml backed up to a private git repository every 10 minutes, so a new machine starts where this one left off",
-        how: "sonny setup backup",
+        what: "memory, skills, profiles and config pushed every ten minutes to a private git \
+               repository, so a lost machine loses little. Sonny names no host: find where \
+               this machine keeps repositories (its checkouts' remotes, the tools signed in, \
+               what the person's other agents made) and make a private one there",
+        how: "sonny setup backup URL",
         done: || crate::home::Places::home().is_ok_and(|places| crate::home::done(&places)),
     },
 ];
