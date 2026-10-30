@@ -482,6 +482,9 @@ async fn start_lookout(client: &Client) -> Result<(), String> {
     .await
 }
 
+/// How long a word waits on the daemon to say whether it names an agent.
+const NAME_LOOKUP: Duration = Duration::from_secs(2);
+
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
 const APPROVER: &str = "approver-auto";
@@ -1934,6 +1937,11 @@ struct App {
     /// Buttons pressed whose work waits for the loop: a note the person
     /// took away, to tell the agent; a view to open.
     pressed: Vec<String>,
+    /// The agents named in what is drawn, as the daemon answered: a
+    /// click on one's name opens it in the pane.
+    names: std::cell::RefCell<links::Names>,
+    /// The words being asked about, and what the daemon said of each.
+    naming: Option<tokio::task::JoinHandle<Vec<(String, bool)>>>,
     /// A program in the pane drew something: the screen is drawn again.
     woken: Arc<tokio::sync::Notify>,
     /// Every call drawn, rather than the clean view of the bot's words and
@@ -2741,6 +2749,8 @@ impl App {
             plan_full: None,
             jump: None,
             pressed: Vec::new(),
+            names: Default::default(),
+            naming: None,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
             instruct: None,
@@ -2951,6 +2961,7 @@ impl App {
             self.read_tasks().await;
             self.read_running_tasks().await;
             self.read_references().await;
+            self.read_names().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
@@ -3785,6 +3796,9 @@ impl App {
             brief: started::first(arguments["brief"].as_str().unwrap_or("")),
             state: "starting".into(),
         };
+        // Its name opens it at once, where it was drawn before it was made.
+        self.names.get_mut().learn(task.bot.clone(), true);
+        self.screen.relink();
         self.tasks_read = None;
         if let Some((at, drawn)) = self.starting
             && drawn == self.rows_drawn
@@ -4050,8 +4064,8 @@ impl App {
 
     /// What a button clicked in the conversation does: `fold/N` opens or
     /// folds the calls folded as N; `said/NODE` opens or shuts the message
-    /// between agents at NODE; `task/BOT` opens the task BOT in the pane;
-    /// `answer/N/ID` answers the question
+    /// between agents at NODE; `task/BOT`, and `agent/BOT` on BOT's name
+    /// in the conversation, opens BOT in the pane; `answer/N/ID` answers the question
     /// call ID asked with its option N, while it is open.
     async fn press_row(&mut self, button: &str) {
         if let Some(at) = button
@@ -4066,7 +4080,7 @@ impl App {
                 self.draw_cluster(at);
             }
         }
-        if let Some(bot) = button.strip_prefix("task/") {
+        if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
             self.open_task(bot);
         }
         if let Some(node) = button
@@ -4599,6 +4613,49 @@ impl App {
             .into_iter()
             .map(|(_, item)| item)
             .collect()
+    }
+
+    /// The words drawn that may name agents, asked about off the loop
+    /// that draws and reads keys, a batch at a time: once one does, the
+    /// links on screen are found again, so its name opens it.
+    async fn read_names(&mut self) {
+        if self.naming.as_ref().is_some_and(|job| job.is_finished()) {
+            let job = self.naming.take().expect("a lookup");
+            let mut found = false;
+            for (word, agent) in job.await.unwrap_or_default() {
+                let agent = agent && word != self.bot;
+                found |= agent;
+                self.names.get_mut().learn(word, agent);
+            }
+            if found {
+                self.screen.relink();
+                if let Some(pane) = &mut self.pane {
+                    pane.screen.relink();
+                }
+            }
+        }
+        if self.naming.is_some() {
+            return;
+        }
+        let wanted = self.names.get_mut().wanted();
+        if wanted.is_empty() {
+            return;
+        }
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        self.naming = Some(tokio::spawn(async move {
+            let mut known = Vec::new();
+            for word in wanted {
+                let asked = client.request("bots", json!({"name": word, "limit": 1}));
+                // Unanswered, it is not taken for a name for a while.
+                let agent = match tokio::time::timeout(NAME_LOOKUP, asked).await {
+                    Ok(Ok(page)) => page["bots"][0]["name"] == word.as_str(),
+                    _ => false,
+                };
+                known.push((word, agent));
+            }
+            woken.notify_one();
+            known
+        }));
     }
 
     /// The other bots' notes the margin shows, read again every few
@@ -6047,6 +6104,15 @@ impl App {
             picked: None,
             pick: None,
         });
+        // Picked already, the agent named last in what shows: Enter opens
+        // the one the conversation just pointed to.
+        if let Some(named) = self.screen.last_agent()
+            && let Some(watch) = &mut self.watch
+        {
+            watch.pick = card_bots(watch, self.width.max(40), &self.bot)
+                .iter()
+                .position(|bot| *bot == named);
+        }
         self.open_pane(pane::Pane::card("/status", PICK_KEYS));
     }
 
@@ -6857,15 +6923,7 @@ impl App {
             && watch.usage.is_none()
             && watch.commons.is_none()
         {
-            let bots: Vec<String> = (watch_card(watch, self.width.max(40), &self.bot).2)
-                .into_iter()
-                .filter_map(|(_, mark)| match mark {
-                    screen::Mark::Link(link) => link
-                        .strip_prefix(&format!("{}task/", screen::BUTTON))
-                        .map(str::to_owned),
-                    _ => None,
-                })
-                .collect();
+            let bots = card_bots(watch, self.width.max(40), &self.bot);
             if !bots.is_empty() {
                 let last = bots.len() - 1;
                 let pick = watch.pick.map(|pick| pick.min(last));
@@ -9027,7 +9085,9 @@ impl App {
                 // Paths in a file are read from its folder first.
                 let base = open.folder().unwrap_or(&workspace).to_owned();
                 let file = |word: &str| {
-                    links::file_line(&base, word).or_else(|| links::file_line(&workspace, word))
+                    (links::file_line(&base, word))
+                        .or_else(|| links::file_line(&workspace, word))
+                        .or_else(|| self.names.borrow_mut().link(word))
                 };
                 pane_cursor = open.render(at, frame.buffer_mut(), self.pane_keys, switch, file);
                 linked.extend(open.screen.link_cells(frame.buffer_mut()));
@@ -9062,7 +9122,9 @@ impl App {
                 Constraint::Min(0),
             ])
             .areas(area);
-            let file = |word: &str| links::file_line(&workspace, word);
+            let file = |word: &str| {
+                links::file_line(&workspace, word).or_else(|| self.names.borrow_mut().link(word))
+            };
             let history = ratatui::layout::Rect {
                 width: column,
                 ..history
@@ -9607,6 +9669,19 @@ const STATUS_KEYS: &str = "esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
+
+/// The agents `/status` lists, in its order: what its keys pick from.
+fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
+    (watch_card(watch, width, me).2)
+        .into_iter()
+        .filter_map(|(_, mark)| match mark {
+            screen::Mark::Link(link) => link
+                .strip_prefix(&format!("{}task/", screen::BUTTON))
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; whether any task in it
