@@ -10161,7 +10161,8 @@ mod tests {
                 ("turns", _) => json!({"turns": [{"turn": 3, "finished_ms": 100}]}),
                 ("history_nodes", Some("shop.lead")) => json!({"nodes": [
                     {"node": 30, "turn": 8}, {"node": 29, "turn": 8}, {"node": 28, "turn": 6},
-                    {"node": 27, "turn": 6}, {"node": 20, "turn": 4}], "next_from": 19}),
+                    {"node": 27, "turn": 6}, {"node": 26, "turn": 6}, {"node": 20, "turn": 4}],
+                    "next_from": 19}),
                 ("history_items", Some("shop.lead")) => {
                     let items: Vec<Value> = (args["nodes"].as_array().into_iter().flatten())
                         .filter_map(|node| {
@@ -10177,6 +10178,9 @@ mod tests {
                                 27 => {
                                     json!({"node": 27, "item": said_("Squash-merge from now on.")})
                                 }
+                                // What started turn 6, before the last
+                                // cleanup; the line above came while it ran.
+                                26 => json!({"node": 26, "item": said_("Start the migration.")}),
                                 _ => return None,
                             };
                             Some(item)
