@@ -446,14 +446,23 @@ fn a_task_forked_from_another_s_turn_gets_its_files_then_in_a_worktree_of_its_ow
     assert!(!ok && err.contains("turn 11 has no snapshot"), "{err}");
     assert!(!lab.home.join(".agent/worktrees/demo.other").exists());
 
-    let (ok, said) =
-        start(serde_json::json!({"name": "try", "brief": "try another way", "from": "fix"}));
+    // Setup, which runs outside any sandbox, never runs on a task's files.
+    let setup = lab.repo.join("src/.agents/setup");
+    std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
+    std::fs::write(&setup, "#!/bin/sh\ntouch ran\n").unwrap();
+    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, said) = start(
+        serde_json::json!({"name": "try", "brief": "try another way",
+        "from": "fix", "setup": true}),
+    );
     assert!(ok, "{said}");
     assert!(
         said.contains("demo.fix's files as they were after its turn 12"),
         "{said}"
     );
+    assert!(said.contains(".agents/setup did not run"), "{said}");
     let copy = lab.home.join(".agent/worktrees/demo.try");
+    assert!(!copy.join("src/ran").exists());
     let workspace = copy.join("src").to_string_lossy().into_owned();
     let forked = std::fs::read_to_string(lab.scratch.join("run.log.fork")).unwrap();
     let forked: Vec<&str> = forked.lines().collect();

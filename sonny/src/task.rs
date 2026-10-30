@@ -110,9 +110,21 @@ pub fn start(here: &Path, lead: &str, start: &Start) -> Result<String, String> {
         Err(error)
     };
     // The folder's setup script, run in the task's own folder, as for a
-    // worktree; a task in the lead's folder has nothing to set up.
+    // worktree; a task in the lead's folder has nothing to set up. A fork's
+    // files are what a task wrote, so setup, which runs outside any
+    // sandbox, never runs on them: the fork runs it in its own.
     let script = here.join(".agents/setup");
-    if start.setup && place.dir != here && script.exists() {
+    if start.setup
+        && source.is_some()
+        && script.exists()
+        && let Some(note) = place.note.as_mut()
+    {
+        note.push_str(
+            "; .agents/setup did not run on these files, which a task wrote: the task can \
+             run it there if the work needs it",
+        );
+    }
+    if start.setup && source.is_none() && place.dir != here && script.exists() {
         // Its output is not kept, however long a build runs: only the last
         // lines of its errors, which a failure shows.
         let mut setup = Command::new(&script);
