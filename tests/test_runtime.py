@@ -1699,7 +1699,7 @@ class RuntimeTests(ModelFixture):
             db.executemany('INSERT INTO burn VALUES (?)', [(n,) for n in range(6000)])
             db.execute("CREATE TRIGGER slow_admission AFTER INSERT ON turns WHEN NEW.bot='Slow' "
                        "BEGIN SELECT count(*) FROM burn a, burn b WHERE a.x+b.x>=0; END")
-        return [{'id': f'submit-{bot}', 'op': 'submit', 'bot': bot, 'request_id': 'held', 'prompt': 'wait'}
+        return [{'id': f'submit-{bot}', 'op': 'submit', 'bot': bot, 'request_id': 'held', 'prompt': 'wait', 'delivery': 'reject'}
                 for bot in bots]
 
     def answered(self, client):

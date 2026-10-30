@@ -84,6 +84,9 @@ class Client:
             self.saved.append(message)
 
     def request(self, op, **params):
+        if op == 'submit':
+            # What a busy bot does with it; the daemon supplies none.
+            params.setdefault('delivery', 'reject')
         if op == 'create':
             params.setdefault('model', self.model)
             params.setdefault('instructions', self.instructions)

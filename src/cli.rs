@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --sandbox --writable --network --hide-senders --unsandboxed",
         startup: true,
     },
     Command {
@@ -204,7 +204,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude",
+        flags: "--shell-exclude --redact-field --redact-block",
         settings: "",
         startup: true,
     },
@@ -368,12 +368,24 @@ fn print_flags(flags: &str) {
                 "PATTERN",
                 "Leave variables named like this (* and ? wildcards, any case) out of tool shells; repeatable; clients pass [shell_environment_policy] from ~/.agent/config.toml",
             ),
+            "--redact-field" => (
+                "NAME",
+                "Redact the value printed after a field named like this (its end, any case, _ and - ignored) from tool output; repeatable",
+            ),
+            "--redact-block" => (
+                "LABEL",
+                "Redact the body of each PEM block whose header names LABEL, such as PRIVATE KEY, from tool output; repeatable",
+            ),
             "--port" => (
                 "N",
                 "Wait for the browser's sign-in on 127.0.0.1:N; default 1455",
             ),
             "--context-bytes" => ("N", "A new bot's model context bytes; default 8 MiB"),
             "--context-items" => ("N", "A new bot's model context items; default 4096"),
+            "--max-rounds" => (
+                "N",
+                "Model calls each of a new bot's turns may make, the last with no tool call; default unbounded",
+            ),
             "--note-turns" => (
                 "N",
                 "Omitted turns a new bot's context note lists; 0 lists none; default 48",
@@ -605,6 +617,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--unsandboxed"
                     | "--env"
                     | "--shell-exclude"
+                    | "--redact-field"
+                    | "--redact-block"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));

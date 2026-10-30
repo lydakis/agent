@@ -262,8 +262,8 @@ class DaemonTests(ModelFixture):
         bots = [f'b{n}' for n in range(8)]
         requests = [dict(op='create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
                          instructions='Test agent.', tools=['echo']) for bot in bots]
-        requests += [dict(op='submit', bot=bot, request_id='r1', prompt='hi') for bot in bots]
-        requests += [dict(op='submit', bot='b0', request_id='r1', prompt='hi'), dict(op='stats')]
+        requests += [dict(op='submit', bot=bot, request_id='r1', prompt='hi', delivery='reject') for bot in bots]
+        requests += [dict(op='submit', bot='b0', request_id='r1', prompt='hi', delivery='reject'), dict(op='stats')]
         # One write carries every request: each submission sees the creation
         # queued before it, and the replies keep request order.
         together = Connection(client.socket_path)
@@ -305,7 +305,7 @@ class DaemonTests(ModelFixture):
                         instructions=text, compaction_instructions=text, tools=['echo']) for n in range(32)]
         lines = [dict(id=n, **r) for n, r in enumerate(creates)] + [dict(id=len(creates), op='stats')]
         # A bad id is refused after the admission queued before it.
-        lines.insert(1, dict(id=dict(bad=True), op='submit', bot='big0', request_id='r1', prompt='hi'))
+        lines.insert(1, dict(id=dict(bad=True), op='submit', bot='big0', request_id='r1', prompt='hi', delivery='reject'))
         together = Connection(client.socket_path)
         self.addCleanup(together.close)
         together.socket.sendall(''.join(json.dumps(line) + '\n' for line in lines).encode())

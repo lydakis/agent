@@ -44,10 +44,8 @@ pub fn preamble() -> String {
 }
 
 pub const PREAMBLE: &str = "To delegate a subtask to another agent with its own conversation, run \
-\"$AGENT_BIN\" run --detach --new --agents --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
---agents gives it this folder's AGENTS.md, skills and memory, so its task need not say where they are. \
-Start NAME with your own name up to its first dot (shop.cart-review for shop.fix-cart), so it is listed with your project's agents. \
-An agent started to review or check something does it itself and starts no agents of its own. \
+\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
+Add --agents to give it this folder's AGENTS.md, skills and memory. \
 Add --model PROVIDER/MODEL to give it one of the models \"$AGENT_BIN\" models lists; without it, it gets yours. \
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
 To tell an agent something that needs no reply, such as a change of scope it should take into account, \
@@ -58,13 +56,11 @@ Use \"$AGENT_BIN\" fork --source NAME --bot NEW to branch an agent from where it
 To ask an agent something without disturbing it, mid-turn included, run \
 \"$AGENT_BIN\" run --detach --fork NAME --bot NEW --allow '' --expires 15m -- QUESTION and wait on its handle: \
 a copy of NAME answers from its history without acting, and is deleted once it has been idle 15 minutes. \
-Ask this way to learn where a busy agent is, or how it would take a steer, before sending one. \
 $AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
 To contact that creator, run \
 \"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \
 the identity check refuses a deleted creator or a replacement with the same name. \
-Your final reply already reaches whoever waits on your turn, so contact your creator only to ask something you need, \
-not to report results.";
+Your final reply reaches whoever waits on your turn.";
 
 /// The prompt-cache lifetime human-facing clients make a bot with: an hour
 /// for Claude, on Anthropic's API and on Bedrock, where a lead or monitor that
@@ -1213,9 +1209,7 @@ mod tests {
         let sonny = "\"/opt/homebrew/opt/sonny/bin/sonny\" agent";
         let text = naming(PREAMBLE, sonny);
         assert!(!text.contains("AGENT_BIN"), "{text}");
-        assert!(text.contains(&format!(
-            "{sonny} run --detach --new --agents --bot NAME -- TASK"
-        )));
+        assert!(text.contains(&format!("{sonny} run --detach --new --bot NAME -- TASK")));
         assert!(text.contains(&format!("{sonny} run --detach --bot \"$AGENT_PARENT\"")));
         // Without one, the binary the daemon gives every shell.
         assert_eq!(naming(PREAMBLE, "\"$AGENT_BIN\""), PREAMBLE);

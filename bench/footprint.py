@@ -66,7 +66,7 @@ def run(binary, out, bots):
         began, cpu = time.monotonic(), cpu_ms(process)
         turns = []
         for first in range(0, bots, BATCH):
-            for reply in pipelined(client, [('submit', dict(bot=f'b{n}', request_id='one', prompt='hi'))
+            for reply in pipelined(client, [('submit', dict(bot=f'b{n}', request_id='one', prompt='hi', delivery='reject'))
                                             for n in range(first, min(bots, first + BATCH))]):
                 assert 'result' in reply, reply
                 turns.append(reply['result']['turn'])

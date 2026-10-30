@@ -149,7 +149,7 @@ class TurnCompactionTests(ModelFixture):
         # beside that boundary's call is counted among the turn's rounds,
         # which end at the limit.
         self.model.timeline, self.model.summary_delay = [], 1.0
-        client = self.client(tools='shell', settings={'context_bytes': 65536})
+        client = self.client(tools='shell', settings={'context_bytes': 65536, 'max_rounds': 200})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
@@ -168,7 +168,7 @@ class TurnCompactionTests(ModelFixture):
         # The 199th call is billed and fails; its retry is the 200th round,
         # so it goes without calls and the turn ends on its reply.
         self.model.fail_billed_at = 199
-        client = self.client(tools='shell')
+        client = self.client(tools='shell', settings={'max_rounds': 200})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
         ended = client.finished(turn, timeout=90)

@@ -109,6 +109,47 @@ pub fn default_tools(
 /// together, so a client refuses a daemon of any other version.
 pub const PROTOCOL: u64 = 24;
 
+/// Variables naming the terminal a daemon was started in: a terminal
+/// multiplexer's place. A client starting the daemon leaves them out of its
+/// tool shells (`--shell-exclude`), as a command that used one would land
+/// in that terminal, not the bot's.
+pub const TERMINAL_PLACES: [&str; 12] = [
+    "REX_SESSION",
+    "REX_BLOCK",
+    "TMUX",
+    "TMUX_PANE",
+    "HERDR_ENV",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_PANE_ID",
+    "CMUX_WORKSPACE_ID",
+    "CMUX_SURFACE_ID",
+    "CMUX_TAB_ID",
+    "CMUX_PANEL_ID",
+];
+
+/// Field names whose printed values are secrets: a client starting the
+/// daemon has their values redacted from tool output (`--redact-field`). A
+/// name matches a field's end, so `aws_secret_access_key` matches
+/// `secret_access_key` and `AccessKeyId` or `NextToken` match nothing.
+pub const SECRET_FIELDS: [&str; 12] = [
+    "secret",
+    "secret_key",
+    "secret_access_key",
+    "session_token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "api_key",
+    "password",
+    "passwd",
+    "private_key",
+];
+
+/// PEM blocks whose bodies are secrets (`--redact-block`).
+pub const SECRET_BLOCKS: [&str; 1] = ["PRIVATE KEY"];
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

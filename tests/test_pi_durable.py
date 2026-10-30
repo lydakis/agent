@@ -121,7 +121,7 @@ class AdapterTests(unittest.TestCase):
             client.request('create', bot='bob', workspace=directory)
             for id in (101, 102):
                 client.process.stdin.write(json.dumps({'id': id, 'op': 'submit', 'bot': 'bob',
-                                                       'request_id': 'r1', 'prompt': 'hi'}) + '\n')
+                                                       'request_id': 'r1', 'prompt': 'hi', 'delivery': 'reject'}) + '\n')
             client.process.stdin.flush()
             replies = [client.receive(lambda m, id=id: m.get('id') == id)['result'] for id in (101, 102)]
             self.assertEqual(replies[0]['turn'], replies[1]['turn'])

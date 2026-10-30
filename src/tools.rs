@@ -113,7 +113,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
@@ -173,7 +173,7 @@ impl Tool {
                 "required":["handle"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting. To wait for a condition, start a shell with background=true running a loop such as `until CHECK; do sleep 5; done` and wait on its proc handle, rather than checking in repeated calls.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
@@ -484,6 +484,12 @@ struct CredentialSet {
     /// of a new token. Refreshes pay for insertion; tool output stays sorted.
     values: Vec<Credential>,
     names: Vec<String>,
+    /// Field names, lowercased without `_` or `-`, whose values a client
+    /// had redacted wherever they are printed (`--redact-field`).
+    fields: Vec<String>,
+    /// What the header of a PEM block a client had redacted names
+    /// (`--redact-block`), such as `PRIVATE KEY`.
+    blocks: Vec<String>,
 }
 
 /// Whether a variable's `name` matches `pattern`: `*` any run of
@@ -558,16 +564,27 @@ impl Credentials {
             .names
             .clone()
     }
+    /// Also redact the values after these field names, matched as a name's
+    /// end, and the bodies of PEM blocks whose header names one of `blocks`.
+    pub fn redact_also(&self, fields: &[String], blocks: &[String]) {
+        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        set.fields = fields.iter().map(|field| field_key(field)).collect();
+        set.blocks = blocks.to_vec();
+    }
     pub fn redact(&self, mut text: String) -> String {
-        {
-            let set = self.0.read().unwrap_or_else(|e| e.into_inner());
-            for credential in &set.values {
-                if text.contains(&credential.value) {
-                    text = text.replace(&credential.value, REDACTED);
-                }
+        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        for credential in &set.values {
+            if text.contains(&credential.value) {
+                text = text.replace(&credential.value, REDACTED);
             }
         }
-        redact_secret_fields(redact_private_keys(text))
+        if !set.blocks.is_empty() {
+            text = redact_blocks(text, &set.blocks);
+        }
+        if !set.fields.is_empty() {
+            text = redact_fields(text, &set.fields);
+        }
+        text
     }
     /// How many of `text`'s last bytes could begin a credential that more
     /// output would finish: what a stream holds back until it can redact.
@@ -607,30 +624,23 @@ impl Credentials {
 }
 
 const REDACTED: &str = "[REDACTED]";
-/// Field names, lowercased without `_` or `-`, whose values are secrets
-/// wherever they are printed: `NAME=VALUE`, `NAME: VALUE`, `"NAME": "VALUE"`.
-/// A name matches when it ends with one of these, so `aws_secret_access_key`
-/// and `SecretAccessKey` match and `AccessKeyId` or `NextToken` do not.
-const SECRET_FIELDS: [&str; 12] = [
-    "secret",
-    "secretkey",
-    "secretaccesskey",
-    "sessiontoken",
-    "accesstoken",
-    "refreshtoken",
-    "idtoken",
-    "authtoken",
-    "apikey",
-    "password",
-    "passwd",
-    "privatekey",
-];
 /// Shorter values are flags, placeholders and counts, not secrets; so are
 /// values without both letters and digits.
 const SECRET_MIN: usize = 8;
 
-/// Replace the value after each secret field name in `text`.
-fn redact_secret_fields(text: String) -> String {
+/// A field name as it is matched: lowercased, without `_` or `-`.
+fn field_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Replace the value after each of `fields` in `text`, printed as
+/// `NAME=VALUE`, `NAME: VALUE` or `"NAME": "VALUE"`. A name matches when it
+/// ends with a field, so `aws_secret_access_key` matches `secretaccesskey`.
+fn redact_fields(text: String, fields: &[String]) -> String {
+    let shortest = fields.iter().map(String::len).min().unwrap_or(0);
     let bytes = text.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
     let mut spans = Vec::new();
@@ -644,16 +654,12 @@ fn redact_secret_fields(text: String) -> String {
         while i < bytes.len() && word(bytes[i]) {
             i += 1;
         }
-        // The shortest field is six letters; most words are shorter.
-        if i - start < 6 {
+        // A word shorter than every field cannot end with one.
+        if i - start < shortest {
             continue;
         }
-        let name: String = text[start..i]
-            .chars()
-            .filter(|c| *c != '_' && *c != '-')
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        if !SECRET_FIELDS.iter().any(|field| name.ends_with(field)) {
+        let name = field_key(&text[start..i]);
+        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
             continue;
         }
         // The name's closing quote, the separator, and the value's quote.
@@ -716,8 +722,9 @@ fn redact_secret_fields(text: String) -> String {
     out
 }
 
-/// Replace the body of each PEM private key block in `text`.
-fn redact_private_keys(mut text: String) -> String {
+/// Replace the body of each PEM block in `text` whose header names one of
+/// `blocks`.
+fn redact_blocks(mut text: String, blocks: &[String]) -> String {
     const BEGIN: &str = "-----BEGIN ";
     const END: &str = "-----END ";
     let mut from = 0;
@@ -735,7 +742,10 @@ fn redact_private_keys(mut text: String) -> String {
             [b'\n', ..] => dashes + 1,
             _ => dashes,
         };
-        if !text[begin..header].contains("PRIVATE KEY") {
+        if !blocks
+            .iter()
+            .any(|block| text[begin..header].contains(block.as_str()))
+        {
             from = header;
             continue;
         }
@@ -2122,24 +2132,6 @@ fn sh(
     process.env_remove("AGENT_PARENT_ID");
     // Likewise a set AGENT_EFFORT is this bot's own level.
     process.env_remove("AGENT_EFFORT");
-    // A terminal multiplexer's place names the terminal the daemon was
-    // started in, not the bot's: a command that used it would land there.
-    for name in [
-        "REX_SESSION",
-        "REX_BLOCK",
-        "TMUX",
-        "TMUX_PANE",
-        "HERDR_ENV",
-        "HERDR_WORKSPACE_ID",
-        "HERDR_TAB_ID",
-        "HERDR_PANE_ID",
-        "CMUX_WORKSPACE_ID",
-        "CMUX_SURFACE_ID",
-        "CMUX_TAB_ID",
-        "CMUX_PANEL_ID",
-    ] {
-        process.env_remove(name);
-    }
     // No command has a terminal: plain output and no pager, as other
     // harnesses run commands. AI_AGENT tells tools an agent runs them, as
     // fx sets it. What the caller or bot sets still wins.
@@ -2455,8 +2447,12 @@ mod tests {
         assert_eq!(Registry::new("read").unwrap().names(), ["read"]);
     }
     #[test]
-    fn secrets_are_redacted_by_field_name_and_key_block() {
+    fn the_fields_and_blocks_a_client_names_are_redacted() {
         let credentials = Credentials::default();
+        let unnamed = "password: fake8fake8fake8\n-----BEGIN RSA PRIVATE KEY-----\nMIIE";
+        assert_eq!(credentials.redact(unnamed.to_owned()), unnamed);
+        let fields = ["secret_access_key", "SessionToken", "api-key", "password"];
+        credentials.redact_also(&fields.map(String::from), &["PRIVATE KEY".to_owned()]);
         let redact = |text: &str| credentials.redact(text.to_owned());
         assert_eq!(
             redact(

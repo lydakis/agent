@@ -5975,3 +5975,31 @@ probe p50 / max in ms):
 The probe used to wait behind the whole 64-request queue, mostly the
 flood's. Now it waits behind one of the flood's requests, and the flood's
 own rate holds.
+
+## Opinions move out to clients (#447)
+
+The daemon no longer strips terminal variables by name, requires `delivery`
+on submit, reads a turn's round bound from the bot's `max_rounds`, and runs
+its field-name and PEM redaction on the names a client passes at start
+(`--redact-field`, `--redact-block`) instead of a constant list. The Perf
+workflow's matched screen, base main 96228b5 against the PR head eb96cf9,
+on the GitHub runner (2026-10-30):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 40.231 | 40.158 | -0.2% |
+| admission | burst submit p99, ms | 6.308 | 6.049 | -4.1% |
+| completion | release to terminal p99, ms | 13.545 | 13.622 | +0.6% |
+| footprint | idle RSS, MiB | 19.293 | 19.355 | +0.3% |
+| footprint | per idle bot, KiB | 1.402 | 1.452 | +3.6% |
+| footprint | RSS after a turn each, MiB | 27.102 | 27.365 | +1.0% |
+| footprint | CPU per turn, ms | 1.252 | 1.274 | +1.8% |
+| lifecycle | CPU, s | 1.15 | 1.15 | +0.0% |
+| lifecycle | p95 turn, ms | 579.367 | 583.056 | +0.6% |
+| lifecycle | peak RSS, MiB | 25.621 | 25.662 | +0.2% |
+
+Store jobs per turn did not change (about 7.5 on both), and nothing passed
+the gate's 15%. The benches start the daemon with `serve` and no redact
+flags, so the head runs no field scan where the base does. With the flags
+the CLI passes, the scan is the base's code over the same twelve names, so
+a CLI-started daemon does the base's work per tool result.

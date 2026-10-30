@@ -30,7 +30,7 @@ class ContextEvalTests(unittest.TestCase):
     def test_bots_get_the_clients_current_policy_text(self):
         # Read from client/src/policy.rs, so an edit there reaches the bench.
         self.assertTrue(INSTRUCTIONS.startswith('To delegate a subtask'))
-        self.assertIn('contact your creator only to ask something you need', INSTRUCTIONS)
+        self.assertIn('Your final reply reaches whoever waits on your turn.', INSTRUCTIONS)
         self.assertIn('"$AGENT_BIN" run --detach', INSTRUCTIONS)
         self.assertTrue(COMPACTION.endswith('Reply with the summary only.'))
         self.assertFalse(any('\\' in text or '\n' in text or '  ' in text for text in (INSTRUCTIONS, COMPACTION)))

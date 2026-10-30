@@ -911,7 +911,7 @@ impl Session {
         };
         let steer = state.running.is_some();
         let mut asked = json!({"bot": bound.bot, "request_id": crate::unique("acp"), "prompt": text,
-            "delivery": if steer { json!("steer") } else { Value::Null },
+            "delivery": if steer { "steer" } else { "reject" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
         if !steer && let Some(dir) = &bound.moving {
             asked["workspace"] = json!(dir);

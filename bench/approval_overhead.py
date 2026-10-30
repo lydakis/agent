@@ -141,7 +141,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
             def submit(name):
                 remaining[name] -= 1
                 pending_submits[send('submit', bot=name, request_id=f'{name}-{remaining[name]}',
-                                     prompt=prompt)] = (name, time.monotonic())
+                                     prompt=prompt, delivery='reject')] = (name, time.monotonic())
 
             def answer(message, calls):
                 for call in calls:
@@ -291,7 +291,7 @@ def run_socket(binary, arm, *, bots, turns):
             def submit(name):
                 remaining[name] -= 1
                 pending_submits[send('submit', bot=name, request_id=f'{name}-{remaining[name]}',
-                                     prompt='shell:true')] = (name, time.monotonic())
+                                     prompt='shell:true', delivery='reject')] = (name, time.monotonic())
 
             wall0 = time.monotonic()
             for name in names:

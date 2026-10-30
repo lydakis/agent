@@ -139,6 +139,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut idle_exit = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
+    let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -152,6 +153,11 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 return fail_with("usage", "--shell-exclude needs a name or pattern");
             }
             "--shell-exclude" => shell_excludes.push(value.clone()),
+            "--redact-field" | "--redact-block" if value.trim().is_empty() => {
+                return fail_with("usage", format!("{flag} needs a name"));
+            }
+            "--redact-field" => redact_fields.push(value.clone()),
+            "--redact-block" => redact_blocks.push(value.clone()),
             "--max-processes"
             | "--max-detached"
             | "--max-active"
@@ -195,5 +201,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         stall_timeout,
         idle_exit,
         shell_excludes,
+        redact_fields,
+        redact_blocks,
     })
 }

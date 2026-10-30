@@ -54,6 +54,9 @@ class Connection:
         self.queue.put(event)
 
     def request(self, op, **params):
+        if op == 'submit':
+            # What a busy bot does with it; the daemon supplies none.
+            params.setdefault('delivery', 'reject')
         if op == 'create':
             # This client's choice for a new bot; the daemon supplies none.
             params.setdefault('model', 'openai/synthetic-model')

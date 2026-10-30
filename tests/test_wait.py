@@ -701,8 +701,9 @@ class WaitTests(ModelFixture):
         self.model.all_streaming.set()
         self.addCleanup(self.model.release_headers.set)
         client = self.client('wait')
-        for bot in ('Anchor', 'Loop'):
-            client.request('create', bot=bot, workspace=str(self.path))
+        # The bound is the bot's own setting.
+        client.request('create', bot='Anchor', workspace=str(self.path))
+        client.request('create', bot='Loop', workspace=str(self.path), settings={'max_rounds': 200})
         anchor = client.request('submit', bot='Anchor', request_id='a', prompt='gate')['result']
         prompt = 'budget:' + anchor['handle']
         turn = client.request('submit', bot='Loop', request_id='loop', prompt=prompt)['result']['turn']
@@ -819,7 +820,7 @@ class WaitTests(ModelFixture):
             lines = [{'id': f'create-{n}', 'op': 'create', 'bot': f'New{n}', 'workspace': str(self.path),
                       'model': client.model, 'instructions': client.instructions, 'tools': client.tools}
                      for n in range(8)]
-            lines.append({'id': 'submit', 'op': 'submit', 'bot': 'Carol', 'request_id': 'late', 'prompt': 'hi'})
+            lines.append({'id': 'submit', 'op': 'submit', 'bot': 'Carol', 'request_id': 'late', 'prompt': 'hi', 'delivery': 'reject'})
             client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
             client.process.stdin.flush()
             time.sleep(1)
