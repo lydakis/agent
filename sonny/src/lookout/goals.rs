@@ -53,8 +53,8 @@ pub struct Goal {
     /// Why the agent gave up, told once its turn ends.
     pub blocked: Option<String>,
     /// Set by the person on an agent with no turn running: the lookout
-    /// checks it at once, as if this turn, the agent's last, had just
-    /// completed, rather than waiting for the next one.
+    /// checks it at once, as if this turn, the agent's last (0 when it has
+    /// none), had just completed, rather than waiting for the next one.
     pub check_after: Option<i64>,
 }
 
@@ -449,6 +449,10 @@ impl Goals {
         {
             self.checking.remove(bot);
         }
+        // A goal checked at once was: what follows is the agent's turns.
+        if let Some(goal) = read(&self.store, bot).filter(|goal| goal.check_after == Some(turn)) {
+            checked_now(&self.store, &goal);
+        }
     }
 
     /// Checks under way answer a connection since dropped, never the next:
@@ -598,7 +602,8 @@ impl Goals {
             let Some(turn) = goal.check_after else {
                 continue;
             };
-            checked_now(&self.store, &goal);
+            // The mark stays until the check says, so a lookout that
+            // reconnects or restarts meanwhile runs it again.
             match self.checking.get(&bot) {
                 Some(check) if check.set_ms == goal.set_ms => continue,
                 // A check of the goal it replaces: its turn is plain news.

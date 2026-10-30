@@ -8231,17 +8231,20 @@ impl App {
                     Ok(record) => record,
                     Err(error) => return error.to_string(),
                 };
-                // Its last turn, when none runs: the check runs as if it
-                // had just completed.
+                // Its last turn, 0 for an agent with none, when none runs:
+                // the check runs as if it had just completed.
                 let last = match record["running_turn"].is_null() {
-                    true => (self.client)
-                        .request(
-                            "turns",
-                            json!({"bot": self.bot, "limit": 1, "newest": true}),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|turns| turns["turns"][0]["turn"].as_i64()),
+                    true => Some(
+                        (self.client)
+                            .request(
+                                "turns",
+                                json!({"bot": self.bot, "limit": 1, "newest": true}),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|turns| turns["turns"][0]["turn"].as_i64())
+                            .unwrap_or(0),
+                    ),
                     false => None,
                 };
                 match lookout::goals::set_by_person(store, &record, check, last) {

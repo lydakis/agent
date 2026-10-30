@@ -377,6 +377,23 @@ class ServedToolTests(ModelFixture):
         self.assertIn(f'- calc.fix: turn:calc.fix/{turn + 1} completed, asked by goal, and met its goal:', note)
         self.assertFalse((goals / 'calc.fix.json').exists())
 
+    def test_a_goal_the_person_sets_on_an_agent_with_no_turn_yet_is_checked_at_once(self):
+        self.goal_watch()
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        goal = {'bot': 'calc.fix', 'bot_id': fix['bot_id'], 'done_when': '`true` exits 0', 'check': 'true',
+                'workspace': str(self.path), 'set_by': 'the person', 'set_ms': int(time.time() * 1000),
+                'tokens_at_set': 0, 'timeout_s': 600, 'check_after': 0}
+        goals = self.path / 'state.sqlite.lookout/goals'
+        goals.mkdir(parents=True, exist_ok=True)
+        (goals / 'calc.fix.json').write_text(json.dumps(goal))
+        met = goals / 'met/calc.fix.json'
+        deadline = time.monotonic() + 30
+        while not met.exists():
+            self.assertLess(time.monotonic(), deadline, 'the goal was never checked')
+            time.sleep(.1)
+        self.assertEqual(json.loads(met.read_text())['turn'], 0)
+        self.assertFalse((goals / 'calc.fix.json').exists())
+
     def test_a_goal_whose_agent_only_answers_stops(self):
         note, prompts = self.goal_run('false')
         # The turn that set it called the tool; two that only answered end it.
