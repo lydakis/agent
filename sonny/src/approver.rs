@@ -7,6 +7,7 @@
 //! As in Codex, a denial goes back to the model at once, and a round the
 //! judge never assessed is denied as a review failure; only a call too long
 //! to show is handed to a person, where one can be asked.
+use agent_client::Error;
 use agent_client::{
     Client,
     approver::{
@@ -15,7 +16,6 @@ use agent_client::{
     },
     judge::{self, Failed, Usage},
 };
-use agent_client::Error;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -80,8 +80,7 @@ fn epoch_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-const USAGE: &str =
-    "usage: sonny approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--store PATH] [--socket PATH]";
+const USAGE: &str = "usage: sonny approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--store PATH] [--socket PATH]";
 
 /// `sonny approver`: the flags over the person's `[judge]` in
 /// ~/.agent/config.toml, then `AGENT_MODEL` for the judge, and
@@ -228,9 +227,7 @@ struct Shared {
 
 async fn serve(settings: Settings) -> Result<i32> {
     let tag = settings.tag.clone();
-    let (client, mut events) = Client::connect(&settings.socket)
-        .await
-        .map_err(Error::from)?;
+    let (client, mut events) = Client::connect(&settings.socket).await?;
     client.bound(IN_FLIGHT);
     let named =
         judge::pick(settings.judge.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
@@ -242,11 +239,15 @@ async fn serve(settings: Settings) -> Result<i32> {
     // An approver the daemon refuses the tag never replaces the base of
     // the one serving it.
     if !judge::is_model(&named) {
-        return Err(Error::with("invalid_judge", &format!("{named} is not PROVIDER/MODEL"),
+        return Err(Error::with(
+            "invalid_judge",
+            &format!("{named} is not PROVIDER/MODEL"),
         ));
     }
     if tag.len() > JUDGE_NAME_ROOM {
-        return Err(Error::with("invalid_tag", &format!("a judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
+        return Err(Error::with(
+            "invalid_tag",
+            &format!("a judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
         ));
     }
     let served = client
@@ -254,8 +255,7 @@ async fn serve(settings: Settings) -> Result<i32> {
             "serve_approvals",
             json!({"tag":tag,"lease_ms":LEASE_MS,"limit":256}),
         )
-        .await
-        .map_err(Error::from)?;
+        .await?;
     let (Some(lease), Some(through)) = (served["lease"].as_u64(), served["through"].as_i64())
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
@@ -263,10 +263,11 @@ async fn serve(settings: Settings) -> Result<i32> {
     // It looks before it answers only where a sandbox keeps it read-only,
     // as Codex's guardian does: the daemon refuses the sandbox where none
     // runs.
+    let name = format!("approver.{tag}");
     let make = |tools: &'static [&'static str]| {
         judge::Base::make(
             &client,
-            &format!("approver.{tag}"),
+            &name,
             &named,
             settings.effort.as_deref(),
             policy::JUDGE_INSTRUCTIONS,
@@ -316,8 +317,7 @@ async fn serve(settings: Settings) -> Result<i32> {
                 "approvals",
                 json!({"tag":tag,"after":after,"through":through,"limit":256}),
             )
-            .await
-            .map_err(Error::from)?;
+            .await?;
     }
     for (bot, turn, calls) in group(waiting) {
         rounds.spawn(round(shared.clone(), bot, turn, calls));
@@ -670,10 +670,7 @@ fn mentions(text: &str, path: &str) -> bool {
 fn prompt_bytes(prompts: &[Value]) -> usize {
     prompts
         .iter()
-        .map(|prompt| {
-            prompt["text"].as_str().map_or(0, str::len)
-                + PROMPTS_ENTRY
-        })
+        .map(|prompt| prompt["text"].as_str().map_or(0, str::len) + PROMPTS_ENTRY)
         .sum()
 }
 
