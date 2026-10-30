@@ -34,7 +34,7 @@ pub const BUILTINS: [(&str, &str); 3] = [("lead", LEAD), ("task", TASK), ("super
 /// owner's say.
 #[cfg(test)]
 const BUDGETS: [(&str, usize); 3] = [
-    ("lead", 20 * 1024),
+    ("lead", 16 * 1024),
     ("task", 4 * 1024),
     ("superlead", 3 * 1024),
 ];
