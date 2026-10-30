@@ -1627,10 +1627,15 @@ pub async fn run(config: Configuration) -> Result<()> {
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
-                            // What every session hears of it, such as a pause.
+                            // What every session hears of it, such as a pause. One
+                            // too far behind to hear it is closed, as a lagging
+                            // follower is, and hears it in its next greeting.
                             for notice in std::mem::take(&mut service.notices) {
-                                for session in sessions.values() {
-                                    let _ = session.try_send(notice.clone());
+                                for (session, output) in &sessions {
+                                    if output.try_send(notice.clone()).is_err() {
+                                        service.hub.close_session(*session);
+                                        output.close();
+                                    }
                                 }
                             }
                             // Start serving, or release an answer's hold, after its reply.
