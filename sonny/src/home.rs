@@ -386,7 +386,7 @@ fn mirror(from: &Path, to: &Path, delete: bool) -> Result<(), String> {
             if !file || !same(&source, &target) {
                 std::fs::copy(&source, &target).map_err(|e| fail(&target, e))?;
             }
-            private(&target).map_err(|e| fail(&target, e))?;
+            own_bits(&source, &target).map_err(|e| fail(&target, e))?;
         }
         kept.insert(name);
     }
@@ -409,6 +409,17 @@ fn private(path: &Path) -> std::io::Result<()> {
     let mode = std::fs::metadata(path)?.permissions().mode();
     if mode & 0o077 != 0 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))?;
+    }
+    Ok(())
+}
+
+/// `target` with `source`'s owner bits and no others, whether or not its
+/// bytes changed: a script made executable is executable in the copy.
+fn own_bits(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(source)?.permissions().mode() & 0o700;
+    if std::fs::metadata(target)?.permissions().mode() & 0o777 != mode {
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -489,7 +500,22 @@ pub fn at_start() {
     let Ok(text) = std::fs::read_to_string(&places.job) else {
         return;
     };
-    if text != definition(crate::trigger::Scheduler::here(), &sonny) {
+    // Only the program decides: the environment is the shell's that set it up.
+    let program = match crate::trigger::Scheduler::here() {
+        crate::trigger::Scheduler::Launchd => {
+            format!(
+                "<string>{}</string>",
+                crate::trigger::escape(&sonny.to_string_lossy())
+            )
+        }
+        crate::trigger::Scheduler::Systemd => {
+            format!(
+                "ExecStart={} ",
+                crate::trigger::quoted(&sonny.to_string_lossy(), true)
+            )
+        }
+    };
+    if !text.contains(&program) {
         std::thread::spawn(move || {
             let _ = install_job(&places);
         });
@@ -500,7 +526,7 @@ pub fn at_start() {
 fn install_job(places: &Places) -> Result<(), String> {
     let sonny = crate::skills::sonny_path().ok_or("backup_failed: Sonny's own path is unknown")?;
     let scheduler = crate::trigger::Scheduler::here();
-    let text = definition(scheduler, &sonny);
+    let text = definition(scheduler, &sonny, &crate::trigger::environment(scheduler));
     if let Some(dir) = places.job.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -518,17 +544,25 @@ fn install_job(places: &Places) -> Result<(), String> {
 }
 
 /// The job: `sonny home sync --job` every ten minutes, a LaunchAgent on a
-/// Mac, a user service whose timer catches up after sleep elsewhere.
-fn definition(scheduler: crate::trigger::Scheduler, sonny: &Path) -> String {
+/// Mac, a user service whose timer catches up after sleep elsewhere. It
+/// runs with `environment` (HOME, SHELL, PATH as triggers keep them), so
+/// the sync finds the login shell whose credentials git pushes with.
+fn definition(
+    scheduler: crate::trigger::Scheduler,
+    sonny: &Path,
+    environment: &[(&str, String)],
+) -> String {
     let sonny = sonny.to_string_lossy();
     match scheduler {
         crate::trigger::Scheduler::Launchd => format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{LABEL}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>home</string>\n    <string>sync</string>\n    <string>--job</string>\n  </array>\n  <key>StartInterval</key>\n  <integer>{EVERY_SECONDS}</integer>\n  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n",
-            crate::trigger::escape(&sonny)
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{LABEL}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{}</string>\n    <string>home</string>\n    <string>sync</string>\n    <string>--job</string>\n  </array>\n  <key>StartInterval</key>\n  <integer>{EVERY_SECONDS}</integer>\n{}  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n",
+            crate::trigger::escape(&sonny),
+            crate::trigger::environment_section(environment)
         ),
         crate::trigger::Scheduler::Systemd => format!(
-            "# Sonny's backup of ~/.agents and config.toml to ~/agent-home.\n[Unit]\nDescription=Sonny home backup\n\n[Service]\nType=oneshot\nExecStart={} home sync --job\n\n[X-Timer]\nOnCalendar=*:0/{}\nPersistent=true\n",
+            "# Sonny's backup of ~/.agents and config.toml to ~/agent-home.\n[Unit]\nDescription=Sonny home backup\n\n[Service]\nType=oneshot\nExecStart={} home sync --job\n{}\n[X-Timer]\nOnCalendar=*:0/{}\nPersistent=true\n",
             crate::trigger::quoted(&sonny, true),
+            crate::trigger::unit_environment(environment),
             EVERY_SECONDS / 60
         ),
     }
@@ -595,6 +629,18 @@ mod tests {
             std::fs::read_link(to.join("skills/link")).unwrap(),
             Path::new("plan")
         );
+        // A script made executable, its bytes unchanged, is executable in the copy.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = from.join("skills/plan/SKILL.md");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            mirror(&from, &to, true).unwrap();
+            let mode = std::fs::metadata(to.join("skills/plan/SKILL.md"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
         // A link that became a file with the same bytes is a file in the copy.
         std::fs::remove_file(from.join("skills/link")).unwrap();
         write(&from.join("skills/link"), "plan");
@@ -774,15 +820,22 @@ mod tests {
     #[test]
     fn the_job_runs_the_sync_every_ten_minutes() {
         let sonny = Path::new("/opt/homebrew/opt/sonny/bin/sonny");
-        let plist = definition(crate::trigger::Scheduler::Launchd, sonny);
+        let environment = [
+            ("HOME", "/Users/me".to_owned()),
+            ("SHELL", "/bin/zsh".to_owned()),
+        ];
+        let plist = definition(crate::trigger::Scheduler::Launchd, sonny, &environment);
         assert!(plist.contains("<string>me.lydakis.agent.backup</string>"));
         assert!(plist.contains("<string>/opt/homebrew/opt/sonny/bin/sonny</string>\n    <string>home</string>\n    <string>sync</string>\n    <string>--job</string>"));
         assert!(plist.contains("<key>StartInterval</key>\n  <integer>600</integer>"));
+        assert!(plist.contains("<key>SHELL</key><string>/bin/zsh</string>"));
         let unit = definition(
             crate::trigger::Scheduler::Systemd,
             Path::new("/home/me/.local/bin/sonny"),
+            &environment,
         );
         assert!(unit.contains("ExecStart=\"/home/me/.local/bin/sonny\" home sync --job\n"));
         assert!(unit.contains("[X-Timer]\nOnCalendar=*:0/10\nPersistent=true\n"));
+        assert!(unit.contains("Environment=\"SHELL=/bin/zsh\"\n"));
     }
 }
