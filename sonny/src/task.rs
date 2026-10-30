@@ -930,9 +930,9 @@ fn shell_quote(path: &Path) -> String {
 }
 
 /// A `remove_task` call: remove the task and the worktree Sonny made it,
-/// once its changes are committed, its branch kept unless merged; or the
-/// folder of its own, once every repository in it has its changes
-/// committed and pushed. `discard` removes them anyway. An agent still working is not removed,
+/// once its changes are committed, its branch kept unless merged; a folder
+/// of its own only with `discard`, once the task says its work is pushed.
+/// `discard` removes them anyway. An agent still working is not removed,
 /// and then neither is anything else. Says what was removed and what was
 /// kept.
 pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> {
@@ -976,15 +976,15 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
                  removed anyway"
             ));
         }
-        if !discard && let Some(path) = &folder {
-            let unsaved = unsaved(path)?;
-            if !unsaved.is_empty() {
-                return Err(format!(
-                    "{name}'s folder has work not committed or not pushed in {}; commit and push \
-                     it, or with discard, it is removed anyway",
-                    unsaved.join(", ")
-                ));
-            }
+        // What the task made there, Sonny cannot check without running it:
+        // a repository's own settings name programs git runs as the person,
+        // outside the task's sandbox. So the task says, not Sonny.
+        if !discard && folder.is_some() {
+            return Err(format!(
+                "{name}'s folder holds what it made, which Sonny cannot check for work not \
+                 committed or pushed without running it; ask {name} whether its work is pushed, \
+                 then remove it with discard"
+            ));
         }
         Ok(())
     };
@@ -1036,77 +1036,6 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         }
     }
     Ok(format!("Removed {name}."))
-}
-
-/// The repositories in the task's folder `dir` with work that would be
-/// lost with it, by their paths in it: changes not committed, or commits
-/// on a branch that no remote has.
-fn unsaved(dir: &Path) -> Result<Vec<String>, String> {
-    let repos = repositories(dir);
-    let mut unsaved = Vec::new();
-    for repo in &repos {
-        // A repository inside this one is its own.
-        let inner: Vec<String> = (repos.iter())
-            .filter_map(|other| other.strip_prefix(repo).ok())
-            .filter(|inner| !inner.as_os_str().is_empty())
-            .map(|inner| format!(":(exclude){}", inner.display()))
-            .collect();
-        let path = within(dir, repo);
-        let mut status = vec!["status", "--porcelain", "--untracked-files=all", "--", "."];
-        status.extend(inner.iter().map(String::as_str));
-        let changed = !git(&path, &status)?.is_empty();
-        // A detached checkout's commits are on no branch.
-        let mut log = vec![
-            "log",
-            "--branches",
-            "--not",
-            "--remotes",
-            "--format=%h",
-            "-n",
-            "1",
-        ];
-        if git(&path, &["rev-parse", "-q", "--verify", "HEAD"]).is_ok() {
-            log.insert(2, "HEAD");
-        }
-        let unpushed = !git(&path, &log)?.is_empty();
-        if changed || unpushed {
-            unsaved.push(match repo.as_os_str().is_empty() {
-                true => ".".to_owned(),
-                false => repo.display().to_string(),
-            });
-        }
-    }
-    Ok(unsaved)
-}
-
-/// The git repositories in `dir`, by their paths in it, as a task's tooling
-/// lays them out: no deeper than a workspace keeps them, past no link, and
-/// never into a git folder, a node_modules or a folder a cache tags.
-fn repositories(dir: &Path) -> Vec<PathBuf> {
-    const DEPTH: usize = 8;
-    let mut found = Vec::new();
-    let mut folders = vec![PathBuf::new()];
-    while let Some(at) = folders.pop() {
-        let path = within(dir, &at);
-        if path.join(".git").symlink_metadata().is_ok() {
-            found.push(at.clone());
-        }
-        if at.components().count() >= DEPTH || path.join("CACHEDIR.TAG").is_file() {
-            continue;
-        }
-        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            if name == ".git"
-                || name == "node_modules"
-                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
-            {
-                continue;
-            }
-            folders.push(at.join(name));
-        }
-    }
-    found.sort();
-    found
 }
 
 #[cfg(test)]

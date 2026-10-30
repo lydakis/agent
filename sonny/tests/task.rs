@@ -420,74 +420,36 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
 }
 
 #[test]
-fn a_task_s_own_folder_is_removed_once_its_repositories_hold_nothing_unsaved() {
+fn a_task_s_own_folder_is_removed_only_with_discard() {
     let lab = Lab::new("rm-folder");
     let ws = lab.scratch.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     let start = serde_json::json!({"name": "fix", "brief": "fix it", "own_folder": true});
-    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    let (ok, said) = lab.tool(&ws, "start_task", start.clone(), false);
     assert!(ok, "{said}");
     let folder = lab.home.join(".agent/worktrees/demo.fix");
-    // The task makes a workspace: a clone of the repository, as a
-    // workspace's tooling would, and one nested in it with no remote.
-    let api = folder.join("ws2/src/api");
-    let (ok, _, err) = lab.run(
-        &lab.scratch,
-        "git",
-        &[
-            "clone",
-            "-q",
-            lab.repo.to_str().unwrap(),
-            api.to_str().unwrap(),
-        ],
-        false,
-    );
-    assert!(ok, "{err}");
-    std::fs::write(api.join(".git/info/exclude"), "/deps/\n").unwrap();
-    let deps = api.join("deps/lib");
-    std::fs::create_dir_all(&deps).unwrap();
-    lab.git(&deps, &["init", "-q", "-b", "main"]);
-    std::fs::write(folder.join("ws2/build.log"), "x\n").unwrap();
-    // Uncommitted work in the nested repository keeps it.
-    std::fs::write(deps.join("new.txt"), "x\n").unwrap();
+    // The task makes a repository there, whose settings name a program
+    // git would run: Sonny runs nothing in it, and asks for discard.
+    let repo = folder.join("ws2/src/api");
+    std::fs::create_dir_all(&repo).unwrap();
+    lab.git(&repo, &["init", "-q", "-b", "main"]);
+    let ran = lab.scratch.join("fsmonitor-ran");
+    let hook = lab.scratch.join("fsmonitor");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", ran.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lab.git(&repo, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    std::fs::write(lab.scratch.join("run.log.ls"), r#"[{"name":"demo.fix"}]"#).unwrap();
     let (ok, err) = lab.remove(&ws, false);
-    assert!(!ok && err.contains("ws2/src/api/deps/lib"), "{err}");
-    assert!(!err.contains("ws2/src/api,"), "{err}");
-    // So do commits no remote has.
-    lab.git(&deps, &["add", "."]);
-    lab.git(&deps, &["commit", "-qm", "dep"]);
-    lab.git(&api, &["commit", "-q", "--allow-empty", "-m", "api"]);
-    let (ok, err) = lab.remove(&ws, false);
-    assert!(
-        !ok && err.contains("not committed or not pushed in ws2/src/api, ws2/src/api/deps/lib"),
-        "{err}"
-    );
-    assert!(folder.exists());
-    // Pushed, the folder goes with all it holds, but not while a detached
-    // checkout holds a commit no remote has.
-    lab.git(&api, &["push", "-q", "origin", "HEAD:refs/heads/done"]);
-    std::fs::remove_dir_all(&deps).unwrap();
-    lab.git(&api, &["checkout", "-q", "--detach"]);
-    lab.git(&api, &["commit", "-q", "--allow-empty", "-m", "detached"]);
-    let (ok, err) = lab.remove(&ws, false);
-    assert!(!ok && err.contains("ws2/src/api"), "{err}");
-    lab.git(&api, &["push", "-q", "origin", "HEAD:refs/heads/detached"]);
-    let (ok, err) = lab.remove(&ws, false);
-    assert!(ok, "{err}");
-    assert!(!folder.exists());
-    assert!(!lab.home.join(".agent/worktrees/.folders/demo.fix").exists());
-    // Removed from another folder, a task's own folder is refused.
-    let (ok, said) = lab.tool(
-        &ws,
-        "start_task",
-        serde_json::json!({"name": "fix", "brief": "b", "own_folder": true}),
-        false,
-    );
-    assert!(ok, "{said}");
-    let (ok, err) = lab.remove(&lab.repo, false);
+    assert!(!ok && err.contains("with discard"), "{err}");
+    assert!(folder.exists() && !lab.scratch.join("run.log.rm").exists());
+    // Removed from another folder, it is refused.
+    let (ok, err) = lab.remove(&lab.repo, true);
     assert!(!ok && err.contains("run this there"), "{err}");
     let (ok, err) = lab.remove(&ws, true);
     assert!(ok, "{err}");
+    assert!(!folder.exists());
+    assert!(!lab.home.join(".agent/worktrees/.folders/demo.fix").exists());
+    assert!(!ran.exists());
 }
 
 #[test]

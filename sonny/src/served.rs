@@ -141,16 +141,17 @@ fn remove() -> Value {
         "name": REMOVE,
         "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
             it. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
-            own is deleted with all it holds. It refuses, before removing anything, while the task is working, \
-            its worktree has uncommitted changes, or a repository in its own folder has changes not committed \
-            or commits not pushed, and says what. With discard, that work is dropped: only \
+            own is deleted with all it holds, only with discard, since Sonny cannot check what the task made \
+            there: ask the task first whether its work is pushed. It refuses, before removing anything, while \
+            the task is working or its worktree has uncommitted changes, and says what. With discard, that work is dropped: only \
             when the person says to drop it.",
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {"type": "string", "minLength": 1, "description": "The task's name, as you started it."},
                 "discard": {"type": "boolean",
-                    "description": "Remove it even with work that is not here, which is lost."}
+                    "description": "Remove it even with work that is not here, which is lost; for a \
+                        task in a folder of its own, once it says its work is pushed."}
             },
             "required": ["task"],
             "additionalProperties": false
