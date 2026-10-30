@@ -2015,10 +2015,6 @@ pub enum Exit {
     TimedOut,
 }
 
-/// The key the approver's Decisions judge reads: OpenAI's own variable, so
-/// it is withheld from tools even when no daemon provider holds it.
-pub const DECISIONS_KEY: &str = "OPENAI_API_KEY";
-
 /// bash, as other harnesses run commands, where it is installed; else sh.
 #[cfg(unix)]
 fn shell_path() -> &'static str {
@@ -2057,9 +2053,6 @@ fn sh(
     process.env_remove("AGENT_PARENT_ID");
     // Likewise a set AGENT_EFFORT is this bot's own level.
     process.env_remove("AGENT_EFFORT");
-    // The automatic approver's key is for the approver alone, however the
-    // daemon was started.
-    process.env_remove(DECISIONS_KEY);
     // A terminal multiplexer's place names the terminal the daemon was
     // started in, not the bot's: a command that used it would land there.
     for name in [

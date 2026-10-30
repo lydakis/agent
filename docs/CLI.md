@@ -114,13 +114,11 @@ identity is `bot_not_found`.
   creator's ([APPROVALS.md](APPROVALS.md)); `fork` takes no approval flags, and a
   program that wants a fork gated further passes `approve` on the protocol's `fork`.
 - `approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
-  [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
+  [--note FILE]` serves a gate tag (default `auto`) and
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
-  `[judge] model` in `~/.agent/config.toml`, else `AGENT_MODEL`. OpenAI's Decisions
-  API (`openai-decisions/MODEL`, key `OPENAI_API_KEY`) is called on its
-  own API, at `--judge-url` when given; any other model runs through the
-  daemon, with a tag of at most 67 bytes, and `--effort` (default
+  `[judge] model` in `~/.agent/config.toml`, else `AGENT_MODEL`. It runs
+  through the daemon, with a tag of at most 67 bytes, and `--effort` (default
   `[judge] effort`) sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is a regular file of at most 96,000 bytes the judge always sees, such as
   trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).

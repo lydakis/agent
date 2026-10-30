@@ -469,8 +469,7 @@ this replaced:
   `user_authorization` (unknown, low, medium, high), `outcome`, and a
   one-sentence `rationale`. Low and medium risk are allowed; high only
   with at least medium authorization on a narrow action; critical never.
-  The Decisions API gets the same policy and one predicate a call (is the
-  outcome deny?), read at even odds. When the person's latest words or
+  When the person's latest words or
   the calls already run do not fit the state, it carries
   `authorization_unreadable` and the judge scores authorization unknown.
 - **A denial goes back to the model at once.** Its reason is Codex's:
@@ -566,9 +565,8 @@ so only one instance runs at a time, and answers in layers:
    to keep a resolved path honest) are dropped from `auto`; they are in
    this note as merged in #26, the starting point for rules in manual
    mode.
-3. **A judge model, one request per round.** The judge is OpenAI's
-   Decisions API or any model the daemon serves ([Which model
-   judges](#which-model-judges)). The state is the context below plus the
+3. **A judge model, one request per round.** The judge is any model the
+   daemon serves ([Which model judges](#which-model-judges)). The state is the context below plus the
    round's calls, and each call gets yes-or-no questions, each naming one
    judgment and returning a probability. Five name a risk:
    - Does it destroy data that cannot be got back: delete or overwrite
@@ -740,22 +738,12 @@ decision-model setting; its `effort` sets a model judge's effort
 (`agent approver --effort` over it), and unset it is the model's own. Jev
 was dropped on 2026-10-27 (George's call): nobody ran it, and on the
 lookout's old judge it woke the lead correctly 0.47 of the time against
-`gpt-6-luna`'s 0.92.
+`gpt-6-luna`'s 0.92. OpenAI's Decisions API, an opt-in judge since
+2026-10-25 (Measure item 5), was dropped on 2026-10-30 (George's call):
+nobody used it, and it was little different from a model judge in
+practice. It may come back once that API matures.
 
-- **OpenAI's Decisions API** (`openai-decisions/gpt-6-luna`, key
-  `OPENAI_API_KEY`) is called from the approver on `POST /v1/decisions`: the
-  state goes in as the user's text (the same JSON a general model reads),
-  a developer message carries the general judge's reading rules without
-  its reply format, and each question is a `predicate` named by its id,
-  with a consent question's criteria inlined. Its probabilities are read
-  as a general model's, so one verdict rule reads both. A refused,
-  missing, or out-of-range answer is a failed check (a refusal is logged
-  with the question's id and what the API said), and a 429 whose error
-  code is `insufficient_quota` fails at once instead of waiting. It takes an API
-  key only; a ChatGPT plan cannot call it. It is never picked without
-  `--judge` or `[judge] model`, since `OPENAI_API_KEY` is often set
-  for the daemon's own provider.
-- **Any other model** runs through the daemon, with the providers and
+- **The model** runs through the daemon, with the providers and
   logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
   approver keeps an idle bot, `approver.TAG`, with the judge's
   instructions and no tools, kept when it already runs the judge's model
@@ -893,16 +881,13 @@ conversation can be lost to compaction. Anthropic reports that most of
 its classifier's misses come from misjudging consent, and a delegation
 chain is where consent is easiest to fake.
 
-**Where the key lives.** The Decisions judge's `OPENAI_API_KEY` is
-stripped from tool environments, as provider keys are, whether or not a
-daemon provider uses it; the daemon keeps it, since its own OpenAI
-provider may need it. That is
-all it gets. A
-tool running as the same OS user can still read it: on Linux through
-`/proc/PID/environ` of the approver, or from wherever the key is stored.
-The daemon's provider keys are exposed the same way today. Protecting
-either from tools needs a separate OS user or a credential broker, which
-this design does not provide.
+**Where the keys live.** The judge runs in the daemon, with its
+providers' keys; the approver holds none. Every key a daemon provider
+uses is stripped from tool environments and redacted from tool output.
+A tool running as the same OS user can still read them, from the
+daemon's environment or wherever they are stored. Protecting them from
+tools needs a separate OS user or a credential broker, which this design
+does not provide.
 
 **Jev's limits bound a fleet.** The published limits for `jev-1.13.0` are
 1,200 requests a minute and 250k tokens a second, "adjusting dynamically",
@@ -1366,12 +1351,10 @@ Built on 2026-09-27, the automatic approver:
   8 turns to the person's words (past a deeper chain, more than 64
   delegating turns, or more prompt text across them than one 128 KiB read
   holds, the words are cut and consent is not counted), redacts, and asks one judge request per
-  round: the Decisions API over HTTP or any model through the daemon ([Which model
+  round to a model through the daemon ([Which model
   judges](#which-model-judges)). A round takes one of 32 judge slots
   before it reads anything, so rounds past those wait holding only their
-  calls. It answers under its lease, backs off on 429 and 529 (an answer
-  to an earlier request leaves a newer wait in place), fails a Decisions answer
-  past 64 KiB, denies as not reviewed past the round's deadline, and trips
+  calls. It answers under its lease, denies as not reviewed past the round's deadline, and trips
   the breaker. Each round prints one JSON line with the verdicts, the
   judge's time, and its tokens.
 - `from` on `submit`, `AGENT_TURN` in tool shells, and the `prompts` read

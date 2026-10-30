@@ -35,9 +35,6 @@ pub struct Settings {
     pub caller: Option<String>,
     /// A model judge's effort.
     pub effort: Option<String>,
-    /// For the Decisions API: where, and its key.
-    pub url: Option<String>,
-    pub key: Option<String>,
     /// The environment note the judge always sees.
     pub note: Option<String>,
 }
@@ -89,30 +86,16 @@ enum Judged {
         answers: Value,
         usage: Usage,
     },
-    /// No slot, or the judge's rate limit, before the round's deadline.
-    Overloaded,
     Failed(String),
 }
 
 struct Judge {
-    via: Via,
+    base: judge::Base,
     /// Taken before a round reads anything, so rounds past these wait
     /// holding only their calls.
     slots: Semaphore,
     /// How long a round may wait for its verdict, from its announcement.
     deadline_ms: u64,
-}
-
-enum Via {
-    Decisions(judge::Decisions),
-    Model(judge::Base),
-}
-
-/// The judge picked, before the tag's lease is held: a model judge's base
-/// bot is made only after.
-enum Picked<'a> {
-    Decisions(judge::Decisions),
-    Model(&'a str),
 }
 
 impl Judge {
@@ -126,43 +109,24 @@ impl Judge {
         workspace: Option<&str>,
         deadline: Instant,
     ) -> Judged {
-        let answered = match &self.via {
-            // One predicate a call, its probability read as an outcome.
-            Via::Decisions(decisions) => {
-                let text = policy::state_text(state);
-                let questions = policy::questions(ids);
-                decisions
-                    .ask(policy::DECISIONS_INSTRUCTIONS, &text, &questions, deadline)
-                    .await
-                    .map(|(answers, usage)| {
-                        let assessed = answers
-                            .into_iter()
-                            .map(|(id, p)| (id, policy::decided(p.as_f64().unwrap_or(1.0))))
-                            .collect();
-                        (assessed, usage)
-                    })
-            }
-            Via::Model(base) => {
-                let prompt = policy::model_prompt(state, ids);
-                base.ask_with(
-                    client,
-                    &prompt,
-                    ids,
-                    policy::assessments,
-                    workspace,
-                    deadline,
-                )
-                .await
-            }
-        };
+        let prompt = policy::model_prompt(state, ids);
+        let answered = self
+            .base
+            .ask_with(
+                client,
+                &prompt,
+                ids,
+                policy::assessments,
+                workspace,
+                deadline,
+            )
+            .await;
         match answered {
             Ok((answers, usage)) => Judged::Answers {
                 answers: Value::Object(answers),
                 usage,
             },
-            Err(Failed::Overloaded) => Judged::Overloaded,
-            Err(Failed::Quota) => Judged::Failed("the judge's account is out of quota".into()),
-            Err(Failed::Check(why)) => Judged::Failed(why),
+            Err(Failed(why)) => Judged::Failed(why),
         }
     }
 }
@@ -200,32 +164,18 @@ async fn serve(settings: Settings) -> Result<i32> {
         })?;
     // An approver the daemon refuses the tag never replaces the base of
     // the one serving it.
-    let picked = match judge::spec(&named) {
-        None => {
-            return Err(Error::with(
-                "invalid_judge",
-                format!("{named} is not PROVIDER/MODEL or openai-decisions/MODEL"),
-            ));
-        }
-        Some(judge::Spec::Decisions(model)) => {
-            let key = settings.key.ok_or_else(|| {
-                Error::with(
-                    "judge_key_required",
-                    format!("set {} for the Decisions API", judge::DECISIONS_KEY),
-                )
-            })?;
-            Picked::Decisions(judge::Decisions::new(model, settings.url.as_deref(), key)?)
-        }
-        Some(judge::Spec::Model(_)) if tag.len() > JUDGE_NAME_ROOM => {
-            return Err(Error::with(
-                "invalid_tag",
-                format!(
-                    "a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"
-                ),
-            ));
-        }
-        Some(judge::Spec::Model(model)) => Picked::Model(model),
-    };
+    if !judge::is_model(&named) {
+        return Err(Error::with(
+            "invalid_judge",
+            format!("{named} is not PROVIDER/MODEL"),
+        ));
+    }
+    if tag.len() > JUDGE_NAME_ROOM {
+        return Err(Error::with(
+            "invalid_tag",
+            format!("a judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
+        ));
+    }
     let served = client
         .request(
             "serve_approvals",
@@ -237,29 +187,24 @@ async fn serve(settings: Settings) -> Result<i32> {
     else {
         return Err(Error::new("daemon_protocol_mismatch"));
     };
-    let via = match picked {
-        Picked::Decisions(decisions) => Via::Decisions(decisions),
-        Picked::Model(model) => Via::Model(
-            judge::Base::make(
-                &client,
-                &format!("approver.{tag}"),
-                model,
-                settings.effort.as_deref(),
-                policy::JUDGE_INSTRUCTIONS,
-                // It looks before it answers only where a sandbox keeps it
-                // read-only, as Codex's guardian does.
-                match agent_runtime::sandbox::available() {
-                    Ok(()) => &judge::LOOKING,
-                    Err(_) => &[],
-                },
-            )
-            .await?,
-        ),
-    };
+    let base = judge::Base::make(
+        &client,
+        &format!("approver.{tag}"),
+        &named,
+        settings.effort.as_deref(),
+        policy::JUDGE_INSTRUCTIONS,
+        // It looks before it answers only where a sandbox keeps it
+        // read-only, as Codex's guardian does.
+        match agent_runtime::sandbox::available() {
+            Ok(()) => &judge::LOOKING,
+            Err(_) => &[],
+        },
+    )
+    .await?;
     let shared = Arc::new(Shared {
         client,
         judge: Judge {
-            via,
+            base,
             slots: Semaphore::new(IN_FLIGHT),
             deadline_ms: policy::DEADLINE_MS,
         },
@@ -606,7 +551,6 @@ async fn judge(
         )
         .await
     {
-        Judged::Overloaded => Err(late()),
         Judged::Failed(detail) => {
             report(json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":detail}));
             Err(Unreviewed::Failed(detail))

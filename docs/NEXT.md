@@ -942,7 +942,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     median (APPROVALS Measure item 4). Built (2026-10-25): OpenAI's
     Decisions API as an opt-in judge, `openai-decisions/gpt-6-luna`, which
     refused fewer benign calls than Jev at about 0.18 s median (Measure
-    item 5). Next: a labeled set of calls that
+    item 5); dropped 2026-10-30, unused. Next: a labeled set of calls that
     should not run, to measure false allows before thresholds are fixed. Later, not a
     priority (George, 2026-09-27): rules as an option for manual mode, a
     program answering a `manual` gate from a rule list, starting from the
