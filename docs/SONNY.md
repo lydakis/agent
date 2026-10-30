@@ -301,6 +301,14 @@ agent's other calls do (`/approvals`). Each goal is
 `STORE.lookout/goals/BOT.json`; setting the same goal again changes
 nothing.
 
+The person sets one in a window with `/goal CHECK` on the agent it shows:
+done once `CHECK` exits 0, with no budget. With no turn running, the
+lookout checks it at once, as if the agent's last turn had just completed
+(the file's `check_after`), so the agent starts on it without a message;
+otherwise the running turn's end is checked. `/goal` shows the agent's
+goal, and `/goal clear` clears it. Being the person's, it waits for no
+verdict.
+
 Each time a turn of that agent completes, the lookout runs the check, for
 up to `timeout_s` (600 when left out, at most 3,600), killing its process
 group past that. While it fails, it queues the agent a turn (origin

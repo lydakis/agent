@@ -1474,7 +1474,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 19] = [
+const COMMANDS: [(&str, &str); 20] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1492,6 +1492,10 @@ const COMMANDS: [(&str, &str); 19] = [
     ("/instructions", "the lead's, from its folder again"),
     ("/status", "this project's agents"),
     ("/lead", "the folder's leads: open another, or make one"),
+    (
+        "/goal",
+        "keep the agent working until a command exits 0, or clear it",
+    ),
     (
         "/margin",
         "the agent's notes beside the conversation, shown or closed",
@@ -7742,6 +7746,14 @@ impl App {
             self.lead_command(rest.trim()).await;
             return;
         }
+        if let Some(rest) = prompt
+            .strip_prefix("/goal")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.notice = Some(self.goal_command(rest.trim()).await);
+            return;
+        }
         if let Some(question) = prompt
             .strip_prefix("/side")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
@@ -8193,6 +8205,58 @@ impl App {
 
     /// `/lead`: the folder's leads; `/lead NAME` opens this window on one,
     /// and `/lead new [NAME]` makes one and opens it.
+    /// `/goal` shows this agent's goal, `/goal clear` clears it, and
+    /// `/goal CHECK` sets one: the agent works until `CHECK`, run in its
+    /// folder, exits 0. With no turn running, the lookout checks it now.
+    async fn goal_command(&mut self, rest: &str) -> String {
+        let store = &self.options.store;
+        match rest {
+            "" => match lookout::goals::shown(store, &self.bot) {
+                Some(goal) => format!(
+                    "goal: done when {}; /goal clear clears it",
+                    goal["done_when"].as_str().unwrap_or_default()
+                ),
+                None => "no goal; /goal CHECK keeps the agent working until CHECK exits 0".into(),
+            },
+            "clear" => match lookout::goals::clear(store, &self.bot) {
+                true => "goal cleared".into(),
+                false => "no goal to clear".into(),
+            },
+            check => {
+                let record = match self
+                    .client
+                    .request("inspect", json!({"bot": self.bot}))
+                    .await
+                {
+                    Ok(record) => record,
+                    Err(error) => return error.to_string(),
+                };
+                // Its last turn, when none runs: the check runs as if it
+                // had just completed.
+                let last = match record["running_turn"].is_null() {
+                    true => (self.client)
+                        .request(
+                            "turns",
+                            json!({"bot": self.bot, "limit": 1, "newest": true}),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|turns| turns["turns"][0]["turn"].as_i64()),
+                    false => None,
+                };
+                match lookout::goals::set_by_person(store, &record, check, last) {
+                    Ok(_) if last.is_some() => {
+                        format!("goal set: checking `{check}` now, and working until it exits 0")
+                    }
+                    Ok(_) => format!(
+                        "goal set: `{check}` is checked when the agent's turn ends, and it works until it exits 0"
+                    ),
+                    Err(error) => error,
+                }
+            }
+        }
+    }
+
     async fn lead_command(&mut self, rest: &str) {
         let Some(project) = self.project.clone().filter(|_| self.options.side.is_none()) else {
             self.notice = Some("/lead is for a folder's lead, not this agent".into());

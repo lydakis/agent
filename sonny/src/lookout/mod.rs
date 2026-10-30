@@ -791,6 +791,11 @@ impl Service {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     self.save_cursor();
+                    // A goal the person just set, on an agent with no turn
+                    // running, is checked at once.
+                    if live {
+                        self.goals.check_now(&client, &checked);
+                    }
                     // What `subscriptions` calls wrote since: at once for
                     // one this lookout answered, else now and then.
                     if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {

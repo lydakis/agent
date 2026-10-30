@@ -355,6 +355,28 @@ class ServedToolTests(ModelFixture):
         self.assertNotIn('calc.fix/1', note)
         self.assertFalse((self.path / 'state.sqlite.lookout/goals/calc.fix.json').exists())
 
+    def test_a_goal_the_person_sets_on_an_idle_agent_is_checked_at_once(self):
+        self.goal_watch()
+        turn = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        # As Sonny's `/goal CHECK` writes it, with no turn running.
+        check = 'test -f flag || { touch flag; echo not yet; exit 1; }'
+        goal = {'bot': 'calc.fix', 'bot_id': fix['bot_id'], 'done_when': f'`{check}` exits 0', 'check': check,
+                'workspace': str(self.path), 'set_by': 'the person', 'set_ms': int(time.time() * 1000),
+                'tokens_at_set': fix['tokens_used'], 'timeout_s': 600, 'check_after': turn}
+        goals = self.path / 'state.sqlite.lookout/goals'
+        goals.mkdir(parents=True, exist_ok=True)
+        (goals / 'calc.fix.json').write_text(json.dumps(goal))
+        # It fails now, with no turn to wait for, and the agent works again.
+        note = self.note_for('calc.lead', 'its goal')
+        prompts = [self.daemon.request('prompts', bot='calc.fix', turn=t['turn'])['result']['prompts'][0]['text']
+                   for t in self.daemon.request('turns', bot='calc.fix')['result']['turns']]
+        self.assertEqual(len(prompts), 2, prompts)
+        self.assertTrue(prompts[1].startswith('Your goal is not met yet: `test -f flag'), prompts[1])
+        self.assertIn(f'- calc.fix: turn:calc.fix/{turn + 1} completed, asked by goal, and met its goal:', note)
+        self.assertFalse((goals / 'calc.fix.json').exists())
+
     def test_a_goal_whose_agent_only_answers_stops(self):
         note, prompts = self.goal_run('false')
         # The turn that set it called the tool; two that only answered end it.
