@@ -28,8 +28,8 @@ const READ_BYTES: usize = 40 * 1024;
 /// `from`.
 const LIST_BYTES: usize = 40 * 1024;
 const READS: &str = ".reads";
-/// The invites of the last week: `{"sent": [{"thread", "at", "bot",
-/// "golden", "answered"}]}`.
+/// The invites of the last week, and how many were ever sent: `{"sent":
+/// [{"thread", "at", "bot", "golden", "answered"}], "count"}`.
 const INVITES: &str = ".invites";
 /// The invites a day the commons has whatever came of earlier ones; each
 /// invite of the last week that drew a reply adds one.
@@ -37,7 +37,7 @@ const INVITES_A_DAY: u64 = 3;
 /// How long an answered invite earns its extra one a day, in seconds.
 const EARNS_FOR: i64 = 7 * 86_400;
 /// Every this many invites, one is a golden ticket: to any agent at all.
-const GOLDEN_EVERY: usize = 10;
+const GOLDEN_EVERY: u64 = 10;
 
 /// Whether agents have the commons: its tool, its skill and the roles'
 /// lines about it. `[sonny] commons = false` turns it off, read once in
@@ -249,19 +249,25 @@ fn today() -> i64 {
     now() / 86_400
 }
 
-/// The invites of the last week, oldest first.
-fn sent(dir: &Path) -> Vec<Value> {
+/// The invites of the last week, oldest first, and how many were ever
+/// sent, which a week's pruning leaves as it is.
+fn load(dir: &Path) -> (Vec<Value>, u64) {
     let since = now() - EARNS_FOR;
-    let mut sent = json_file(&dir.join(INVITES))
-        .remove("sent")
+    let mut invites = json_file(&dir.join(INVITES));
+    let count = invites.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let mut sent = (invites.remove("sent"))
         .and_then(|sent| sent.as_array().cloned())
         .unwrap_or_default();
     sent.retain(|invite| invite["at"].as_i64().is_some_and(|at| at > since));
-    sent
+    (sent, count)
 }
 
-fn keep(dir: &Path, sent: &[Value]) -> bool {
-    let invites = json!({"sent": sent});
+fn sent(dir: &Path) -> Vec<Value> {
+    load(dir).0
+}
+
+fn keep(dir: &Path, sent: &[Value], count: u64) -> bool {
+    let invites = json!({"sent": sent, "count": count});
     agent_client::files::replace_mode(&dir.join(INVITES), invites.to_string().as_bytes(), 0o600)
         .is_ok()
 }
@@ -283,14 +289,14 @@ fn budget(sent: &[Value]) -> Value {
 /// Takes one of the day's invites for `thread`, under the lock, if one is
 /// left: whether it is a golden ticket, or None.
 fn reserve(dir: &Path, thread: &str) -> Option<bool> {
-    let mut sent = sent(dir);
+    let (mut sent, count) = load(dir);
     let budget = budget(&sent);
     if budget["today"].as_u64() >= budget["a_day"].as_u64() {
         return None;
     }
-    let golden = sent.len() % GOLDEN_EVERY == GOLDEN_EVERY - 1;
+    let golden = count % GOLDEN_EVERY == GOLDEN_EVERY - 1;
     sent.push(json!({"thread": thread, "at": now(), "golden": golden}));
-    keep(dir, &sent).then_some(golden)
+    keep(dir, &sent, count).then_some(golden)
 }
 
 /// Settles the invite reserved for `thread`: to `bot`, or given back when
@@ -299,30 +305,33 @@ fn settle(dir: &Path, thread: &str, bot: Option<&str>) {
     let Ok(_lock) = lock(dir) else {
         return;
     };
-    let mut sent = sent(dir);
+    let (mut sent, mut count) = load(dir);
     let Some(at) =
         (sent.iter()).rposition(|invite| invite["thread"] == thread && invite["bot"].is_null())
     else {
         return;
     };
     match bot {
-        Some(bot) => sent[at]["bot"] = json!(bot),
+        Some(bot) => {
+            sent[at]["bot"] = json!(bot);
+            count += 1;
+        }
         None => {
             sent.remove(at);
         }
     }
-    keep(dir, &sent);
+    keep(dir, &sent, count);
 }
 
 /// Marks the invite of `bot` to `thread` answered, under the lock: its
 /// reply earns the commons another invite a day for a week.
 fn answered(dir: &Path, thread: &str, bot: &str) {
-    let mut sent = sent(dir);
+    let (mut sent, count) = load(dir);
     if let Some(invite) = (sent.iter_mut()).find(|invite| {
         invite["thread"] == thread && invite["bot"] == bot && invite["answered"] != true
     }) {
         invite["answered"] = json!(true);
-        keep(dir, &sent);
+        keep(dir, &sent, count);
     }
 }
 
@@ -1008,24 +1017,30 @@ mod tests {
     }
 
     #[test]
-    fn every_tenth_invite_is_a_golden_ticket_and_a_week_old_one_is_gone() {
+    fn every_tenth_invite_sent_is_a_golden_ticket_however_long_ago_the_rest() {
         let home = home("golden");
         let dir = dir(&home);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut sent: Vec<Value> = (0..GOLDEN_EVERY - 1)
-            .map(|n| json!({"thread": format!("old{n}"), "at": now() - 86_400, "bot": "b.y"}))
-            .collect();
-        sent.push(
+        // Nine sent before, of which only one is still in the week.
+        let sent = [
             json!({"thread": "gone", "at": now() - EARNS_FOR - 1, "bot": "b.y", "answered": true}),
-        );
-        assert!(keep(&dir, &sent));
+            json!({"thread": "old", "at": now() - 86_400, "bot": "b.y"}),
+        ];
+        assert!(keep(&dir, &sent, GOLDEN_EVERY - 1));
         assert_eq!(
             budget(&super::sent(&dir)),
-            json!({"today": 0, "a_day": INVITES_A_DAY, "answered": 0, "this_week": GOLDEN_EVERY - 1})
+            json!({"today": 0, "a_day": INVITES_A_DAY, "answered": 0, "this_week": 1})
         );
-        let post = json!({"post": {"name": "new", "title": "Flaky timers", "text": "?"}});
-        let started = call(&home, "a.x", None, &post).unwrap();
-        assert_eq!(started["invite"]["golden"], true);
+        let post = |name: &str| {
+            let post = json!({"post": {"name": name, "title": "Flaky timers", "text": "?"}});
+            call(&home, "a.x", None, &post).unwrap()["invite"]["golden"] == true
+        };
+        assert!(post("tenth"));
+        // Given back, it is still the tenth to send; sent, the next is not.
+        settle(&dir, "tenth", None);
+        assert!(post("again"));
+        settle(&dir, "again", Some("c.z"));
+        assert!(!post("eleventh"));
         assert!(invited("new", "Flaky timers", "a.x", true).contains("golden ticket"));
         let _ = std::fs::remove_dir_all(&home);
     }
