@@ -1571,7 +1571,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 62;
+    pub const SCHEMA: i32 = 63;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1754,6 +1754,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS companions(name TEXT PRIMARY KEY, spec TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS pause(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
@@ -4146,6 +4148,42 @@ impl Database {
             .conn
             .execute("DELETE FROM companions WHERE name=?", [name])?
             == 1)
+    }
+    /// The pause that holds the daemon, if one does: why, who pulled it,
+    /// and when.
+    pub fn pause(&self) -> Result<Option<Value>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT reason,pulled_by,at_ms FROM pause WHERE singleton=1",
+                [],
+                |r| {
+                    Ok(json!({"reason": r.get::<_, String>(0)?,
+                        "by": r.get::<_, Option<String>>(1)?, "at_ms": r.get::<_, i64>(2)?}))
+                },
+            )
+            .optional()?)
+    }
+    /// Hold the daemon paused, unless a pause already does: the pause that
+    /// holds, and whether it is this one.
+    pub fn put_pause(
+        &mut self,
+        reason: &str,
+        by: Option<&str>,
+        at_ms: i64,
+    ) -> Result<(Value, bool)> {
+        let new = self.conn.execute(
+            "INSERT OR IGNORE INTO pause(singleton,reason,pulled_by,at_ms) VALUES(1,?1,?2,?3)",
+            params![reason, by, at_ms],
+        )? == 1;
+        let held = self.pause()?.ok_or(Error::new("storage_error"))?;
+        Ok((held, new))
+    }
+    /// Lift the pause: the one lifted, if one held.
+    pub fn remove_pause(&mut self) -> Result<Option<Value>> {
+        let held = self.pause()?;
+        self.conn.execute("DELETE FROM pause", [])?;
+        Ok(held)
     }
     pub fn store_identity(&self) -> Result<i64> {
         Ok(self
@@ -7215,11 +7253,17 @@ impl Database {
         }
         let code = error.map(|e| e.code.as_str());
         // Interrupted, by cause: a client's interrupt, the daemon shutting
-        // down around the turn, a daemon that died with it running, or a
-        // gate that lapsed without a verdict.
+        // down or paused around the turn, a daemon that died with it
+        // running, or a gate that lapsed without a verdict.
         let status = if matches!(
             code,
-            Some("cancelled" | "daemon_shutdown" | "process_interrupted" | "approval_expired")
+            Some(
+                "cancelled"
+                    | "daemon_shutdown"
+                    | "daemon_paused"
+                    | "process_interrupted"
+                    | "approval_expired"
+            )
         ) || (pending && code.is_none())
         {
             "interrupted"
@@ -10629,6 +10673,7 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     )?;
     // 61 -> 62: the daemon's companions, in a table the schema creates;
     // there were none.
+    // 62 -> 63: the daemon's pause, in a table the schema creates; none held.
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided

@@ -1001,6 +1001,24 @@ closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
 cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
 
+Protocol 24 also adds the pull cord: `pause` stops every agent until
+`resume`, and holds across restarts, since the store keeps it (schema 63, a
+one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
+reason of 1 to 4096 bytes. `by` is who pulled it; on a bot's own socket it is
+that bot, whatever the request says. It ends every running turn as
+`interrupted` with `daemon_paused`, and from then no turn starts: a `reject`
+submission answers `daemon_paused`, `queue` and `steer` submissions are
+recorded and wait, triggers and notes with them, and parked and paced turns
+stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
+interrupted}`, where `pause` is `{reason, by, at_ms}`. While a pause holds,
+another changes nothing and answers the first with `changed: false`.
+`{"op":"resume"}` lifts it and answers `{pause, changed}` with the pause it
+lifted, or null when none held; what waited starts as capacity allows. Each
+change is told to every session as a `paused` or `resumed` event, `{event,
+pause, durable: false}`. `ready` and `stats` carry `paused`, the pause or null.
+`agent pause --reason TEXT` sends it as `AGENT_BOT` when run in a bot's shell,
+and `agent resume` lifts it.
+
 On shutdown, committed turn events get up to five seconds to drain through
 the publisher. Background commands can keep the storage stream open; when
 that deadline expires, the service cancels and awaits the publisher before

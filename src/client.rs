@@ -1163,6 +1163,24 @@ pub fn main(args: Vec<String>) -> Result<i32> {
             Ok(0)
         }
         "ls" => list(&options),
+        // The cord: an agent's shell pulls it as that agent.
+        "pause" => {
+            let reason = options
+                .reason
+                .clone()
+                .ok_or(Error::with("usage", "pause needs --reason"))?;
+            let by = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
+            let mut connection = ensure_daemon(&options)?;
+            let paused = connection.request("pause", json!({"reason": reason, "by": by}))?;
+            print_json(&paused, options.pretty)?;
+            Ok(0)
+        }
+        "resume" => {
+            let mut connection = ensure_daemon(&options)?;
+            let resumed = connection.request("resume", json!({}))?;
+            print_json(&resumed, options.pretty)?;
+            Ok(0)
+        }
         "shutdown" => {
             let mut connection = match Connection::connect(&options.socket) {
                 Ok(connection) => connection,

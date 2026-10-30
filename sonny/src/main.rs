@@ -1475,7 +1475,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/triggers` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 21] = [
+const COMMANDS: [(&str, &str); 23] = [
     (
         "/side",
         "a side chat with a copy of this agent, which carries on",
@@ -1507,6 +1507,8 @@ const COMMANDS: [(&str, &str); 21] = [
     ),
     ("/commons", "what the agents of every project share"),
     ("/usage", "the tokens the agents spent, over time"),
+    ("/pause", "stop every agent until /resume, saying why"),
+    ("/resume", "let the agents go on after a pause"),
     ("/mcp", "the MCP servers agents' scripts call"),
     ("/config", "the settings in ~/.agent/config.toml"),
     ("/sound", "the chime when work ends, on or off"),
@@ -1634,6 +1636,8 @@ struct App {
     asked: Option<Value>,
     following: bool,
     notice: Option<String>,
+    /// The pause that holds every agent, if one does, as the daemon told.
+    paused: Option<Value>,
     quit: bool,
     /// Another lead of the folder, which this window opens on instead once
     /// it quits: `/lead NAME`.
@@ -2476,6 +2480,7 @@ impl Fleet {
 
 impl App {
     fn new(client: Arc<Client>, bot: &str, record: &Value, options: Options) -> Self {
+        let paused = Some(client.paused().clone()).filter(|pause| pause.is_object());
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or("?"),
@@ -2520,6 +2525,7 @@ impl App {
             asked: None,
             following: true,
             notice: None,
+            paused,
             quit: false,
             switch_to: None,
             started: Instant::now(),
@@ -3407,6 +3413,7 @@ impl App {
                 self.retry = Some(Instant::now() + Duration::from_secs(2));
                 return;
             };
+            self.paused = Some(client.paused().clone()).filter(|pause| pause.is_object());
             self.client = client;
             *events = fresh;
             self.down = false;
@@ -5192,6 +5199,11 @@ impl App {
 
     async fn daemon(&mut self, event: Value) {
         let kind = event["event"].as_str().unwrap_or("");
+        // Every agent's, not this one's: told to every client.
+        if matches!(kind, "paused" | "resumed") {
+            self.paused = (kind == "paused").then(|| event["pause"].clone());
+            return;
+        }
         if !self.following {
             if kind == "follow_live" {
                 self.following = true;
@@ -7716,6 +7728,34 @@ impl App {
             }
             return;
         }
+        if prompt == "/resume" {
+            self.input.clear();
+            self.notice = Some(match self.client.request("resume", json!({})).await {
+                Ok(said) if said["changed"] == true => "the agents go on".into(),
+                Ok(_) => "nothing was paused".into(),
+                Err(error) => format!("resume: {error}"),
+            });
+            return;
+        }
+        if prompt == "/pause" || prompt.starts_with("/pause ") {
+            self.input.clear();
+            let reason = prompt["/pause".len()..].trim();
+            self.notice = Some(match reason {
+                "" => "/pause takes why: /pause REASON".into(),
+                reason => match (self.client)
+                    .request("pause", json!({"reason": reason}))
+                    .await
+                {
+                    Ok(said) if said["changed"] == true => format!(
+                        "every agent is paused; {} running stopped",
+                        said["interrupted"]
+                    ),
+                    Ok(_) => "already paused".into(),
+                    Err(error) => format!("pause: {error}"),
+                },
+            });
+            return;
+        }
         if prompt == "/compact" {
             self.input.clear();
             self.notice = Some(
@@ -9040,6 +9080,16 @@ impl App {
                 Span::raw(what),
             ]);
         }
+        if let Some(pause) = &self.paused {
+            let by = pause["by"].as_str().unwrap_or("you");
+            return Line::from(vec![
+                Span::raw("⏸ ").fg(Color::Red),
+                Span::raw("Every agent is paused").bold(),
+                Span::raw(format!(" by {by}: ")).dim(),
+                Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
+                Span::raw(" · /resume").dim(),
+            ]);
+        }
         if let Some(running) = &self.running {
             let mut spans = vec![Span::raw("• ").dim()];
             spans.extend(shimmer(&running.phase, self.started.elapsed()));
@@ -9706,6 +9756,49 @@ mod tests {
 
     fn turn_event(event: &str, turn: i64, data: Value) -> Value {
         json!({"event": event, "bot": "b", "turn": turn, "data": data})
+    }
+
+    #[tokio::test]
+    async fn a_pause_shows_who_pulled_it_until_resume() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("pause") => json!({"pause": {"reason": asked["reason"], "by": null, "at_ms": 1},
+                "changed": true, "interrupted": 2}),
+            Some("resume") => json!({"pause": {"reason": "rows", "by": null}, "changed": true}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        let shown = |app: &App| -> String {
+            (app.status_line().spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        app.input.set("/pause");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("/pause takes why: /pause REASON")
+        );
+        app.input.set("/pause the migration deletes rows");
+        app.submit().await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("every agent is paused; 2 running stopped")
+        );
+        // Every window hears of it, whoever pulled it.
+        let pause = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1});
+        app.daemon(json!({"event": "paused", "pause": pause, "durable": false}))
+            .await;
+        assert_eq!(
+            shown(&app),
+            "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume"
+        );
+        app.input.set("/resume");
+        app.submit().await;
+        assert_eq!(app.notice.as_deref(), Some("the agents go on"));
+        app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
+            .await;
+        assert!(app.paused.is_none());
     }
 
     #[tokio::test]

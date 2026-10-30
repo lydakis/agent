@@ -199,6 +199,7 @@ pub struct Client {
     identity: Option<String>,
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
+    paused: Value,
 }
 
 impl Client {
@@ -257,6 +258,7 @@ impl Client {
         let store = ready["store"]["lineage"].as_str().map(str::to_owned);
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
+        let paused = ready["paused"].clone();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
@@ -325,6 +327,7 @@ impl Client {
                 store,
                 identity,
                 providers,
+                paused,
             }),
             Events(receiver),
         ))
@@ -351,6 +354,12 @@ impl Client {
     /// The daemon's provider bindings as `ready` announced them.
     pub fn providers(&self) -> &Value {
         &self.providers
+    }
+
+    /// The pause that held the daemon as this client connected, or null;
+    /// `paused` and `resumed` events tell of later ones.
+    pub fn paused(&self) -> &Value {
+        &self.paused
     }
 
     pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {
@@ -476,6 +485,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
         });
         let mut lines = BufReader::new(peer).lines();
         for _ in 0..20 {
@@ -507,6 +517,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
         });
         let mut lines = BufReader::new(peer).lines();
         let request = tokio::spawn({
@@ -546,6 +557,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            paused: Value::Null,
         });
         let request = tokio::spawn({
             let client = client.clone();

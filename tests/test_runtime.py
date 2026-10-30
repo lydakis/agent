@@ -1542,6 +1542,53 @@ class RuntimeTests(ModelFixture):
         replay = restarted.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual(next(e for e in replay if e['event'] == 'turn_finished')['data'], terminal['data'])
 
+    def test_a_pause_stops_every_agent_until_resume_across_restarts(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        client.request('create', bot='Alice', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='running', prompt='gate')['result']['turn']
+        self.model.requests.get(timeout=3)
+        self.assertEqual(client.request('pause', reason=' ')['error'], 'usage')
+        paused = client.request('pause', reason='the migration is deleting rows', by='calc.a')['result']
+        self.assertEqual((paused['changed'], paused['interrupted']), (True, 1))
+        self.assertEqual(paused['pause']['reason'], 'the migration is deleting rows')
+        self.assertEqual(paused['pause']['by'], 'calc.a')
+        heard = client.receive(lambda e: e.get('event') == 'paused')
+        self.assertEqual(heard['pause'], paused['pause'])
+        # The running turn ends now, as interrupted by the pause.
+        ended = client.finished(turn)['data']
+        self.assertEqual((ended['status'], ended['error']), ('interrupted', 'daemon_paused'))
+        # A second pull changes nothing: the first pause holds.
+        again = client.request('pause', reason='another', by='shop.b')['result']
+        self.assertEqual((again['changed'], again['pause']), (False, paused['pause']))
+        self.assertEqual(client.request('stats')['result']['paused'], paused['pause'])
+        # Nothing starts: work that would start now is refused, and queued
+        # work waits, across a restart too.
+        refused = client.request('submit', bot='Alice', request_id='refused', prompt='hello')
+        self.assertEqual(refused['error'], 'daemon_paused')
+        held = client.request('submit', bot='Alice', request_id='held', prompt='hello', delivery='queue')['result']
+        self.assertEqual(held['status'], 'ready')
+        self.assertTrue(client.request('shutdown')['result']['shutting_down'])
+        self.assertEqual(client.process.wait(timeout=3), 0)
+        restarted = self.client()
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.request('stats')['result']['paused'], paused['pause'])
+        time.sleep(.3)
+        self.assertTrue(self.model.requests.empty())
+        handle = f"turn:Alice/{held['turn']}"
+        # Resume lifts it, says so, and what waited runs.
+        self.model.release_headers.set()
+        resumed = restarted.request('resume')['result']
+        self.assertEqual((resumed['changed'], resumed['pause']), (True, paused['pause']))
+        restarted.receive(lambda e: e.get('event') == 'resumed')
+        waited = restarted.request('wait', handles=[handle], timeout_ms=5000)['result']
+        self.assertEqual(waited['results'][handle]['status'], 'completed')
+        self.assertEqual(restarted.request('resume')['result'], {'pause': None, 'changed': False})
+        self.assertIsNone(restarted.request('stats')['result']['paused'])
+
     def test_shutdown_grace_lets_running_turns_finish_and_holds_new_ones(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
