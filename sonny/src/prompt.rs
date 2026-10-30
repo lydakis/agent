@@ -6,6 +6,10 @@
 //!
 //! The full screen selects text with the mouse, as Codex's composer does:
 //! typing replaces the selection, and the deletions take it out.
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::Span,
+};
 use std::ops::{Deref, Range};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -451,9 +455,210 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// How the composer draws what is typed: Markdown's marks kept and dim,
+/// what they mark styled as the conversation draws it (bold, italic,
+/// struck, `code` in code's colour, a `#` line as a heading), so the
+/// person sees what they will send and sends the plain text they typed.
+/// Each styled piece as a byte range; the rest is plain. A slash command
+/// and a `!` command are not Markdown.
+pub fn marks(text: &str) -> Vec<(Range<usize>, Style)> {
+    let mut marked = Vec::new();
+    if text.starts_with('/') || text.starts_with('!') {
+        return marked;
+    }
+    let mut start = 0;
+    for line in text.split('\n') {
+        let hashes = line.len() - line.trim_start_matches('#').len();
+        match (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+            true => {
+                let heading = Style::new().add_modifier(Modifier::BOLD);
+                marked.push((start..start + hashes + 1, dim()));
+                inline(line, hashes + 1, start, heading, &mut marked);
+            }
+            false => inline(line, 0, start, Style::new(), &mut marked),
+        }
+        start += line.len() + 1;
+    }
+    marked
+}
+
+fn dim() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+/// The inline marks of `line` from `from`, at `offset` in the text, over
+/// `base`: as `transcript::inline` reads them, a mark closed on its line.
+fn inline(
+    line: &str,
+    from: usize,
+    offset: usize,
+    base: Style,
+    marked: &mut Vec<(Range<usize>, Style)>,
+) {
+    let pairs: [(&str, Style, bool); 6] = [
+        ("`", base.fg(Color::Cyan), false),
+        ("**", base.add_modifier(Modifier::BOLD), true),
+        ("__", base.add_modifier(Modifier::BOLD), true),
+        ("~~", base.add_modifier(Modifier::CROSSED_OUT), true),
+        ("*", base.add_modifier(Modifier::ITALIC), true),
+        ("_", base.add_modifier(Modifier::ITALIC), true),
+    ];
+    let mut at = from;
+    let mut plain = from;
+    while at < line.len() {
+        let rest = &line[at..];
+        let found = pairs.iter().find_map(|(mark, style, nested)| {
+            let after = rest.strip_prefix(mark)?;
+            // `_` and `*` mark emphasis only around a word, not in
+            // snake_case or 2*3*4.
+            if matches!(*mark, "*" | "_")
+                && (after.starts_with(' ')
+                    || line[..at].chars().last().is_some_and(char::is_alphanumeric))
+            {
+                return None;
+            }
+            let end = after.find(mark)?;
+            (end > 0).then_some((mark.len(), end, *style, *nested))
+        });
+        let Some((mark, end, style, nested)) = found else {
+            at += rest.chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        if plain < at && base != Style::new() {
+            marked.push((offset + plain..offset + at, base));
+        }
+        let (inner, close) = (at + mark, at + mark + end);
+        marked.push((offset + at..offset + inner, dim()));
+        match nested {
+            true => inline(&line[..close], inner, offset, style, marked),
+            false => marked.push((offset + inner..offset + close, style)),
+        }
+        marked.push((offset + close..offset + close + mark, dim()));
+        at = close + mark;
+        plain = at;
+    }
+    if plain < line.len() && base != Style::new() {
+        marked.push((offset + plain..offset + line.len(), base));
+    }
+}
+
+/// The text `range` of `text` as spans, styled where `marked` says, and
+/// reversed where it is `selected`.
+pub fn spans(
+    text: &str,
+    range: Range<usize>,
+    marked: &[(Range<usize>, Style)],
+    selected: Option<&Range<usize>>,
+) -> Vec<Span<'static>> {
+    let mut cuts = vec![range.start, range.end];
+    for (piece, _) in marked {
+        cuts.extend([piece.start, piece.end]);
+    }
+    if let Some(selected) = selected {
+        cuts.extend([selected.start, selected.end]);
+    }
+    cuts.retain(|cut| range.contains(cut) || *cut == range.end);
+    cuts.sort_unstable();
+    cuts.dedup();
+    (cuts.windows(2))
+        .map(|cut| {
+            let (from, to) = (cut[0], cut[1]);
+            let mut style = (marked.iter())
+                .filter(|(piece, _)| piece.start <= from && to <= piece.end)
+                .map(|(_, style)| *style)
+                .next_back()
+                .unwrap_or_default();
+            if selected.is_some_and(|s| s.start <= from && to <= s.end) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Span::styled(text[from..to].to_owned(), style)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each styled piece of `text` as (its text, bold, italic, dim, cyan).
+    fn styled(text: &str) -> Vec<(&str, bool, bool, bool, bool)> {
+        marks(text)
+            .into_iter()
+            .map(|(range, style)| {
+                let has = |m| style.add_modifier.contains(m);
+                (
+                    &text[range],
+                    has(Modifier::BOLD),
+                    has(Modifier::ITALIC),
+                    has(Modifier::DIM),
+                    style.fg == Some(Color::Cyan),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn markdown_marks_stay_dim_and_what_they_mark_is_styled() {
+        assert_eq!(
+            styled("a **b** `c`"),
+            [
+                ("**", false, false, true, false),
+                ("b", true, false, false, false),
+                ("**", false, false, true, false),
+                ("`", false, false, true, false),
+                ("c", false, false, false, true),
+                ("`", false, false, true, false),
+            ]
+        );
+        // A heading: its marks dim, the rest bold, emphasis inside it too.
+        assert_eq!(
+            styled("## Hi *there*"),
+            [
+                ("## ", false, false, true, false),
+                ("Hi ", true, false, false, false),
+                ("*", false, false, true, false),
+                ("there", true, true, false, false),
+                ("*", false, false, true, false),
+            ]
+        );
+        // Not yet closed, snake_case, 2*3*4, code's insides, a command.
+        assert!(styled("**bold so far").is_empty());
+        assert!(styled("snake_case_name and 2*3*4").is_empty());
+        assert_eq!(styled("`a*b*c`")[1], ("a*b*c", false, false, false, true));
+        assert!(styled("/model **x**").is_empty());
+        assert!(styled("!ls `x`").is_empty());
+        // Each line on its own: a mark never closes on the next.
+        assert!(styled("a *b\nc* d").is_empty());
+    }
+
+    #[test]
+    fn a_row_is_cut_where_its_styles_and_the_selection_change() {
+        let text = "a **b** c";
+        let marked = marks(text);
+        let spans = spans(text, 0..text.len(), &marked, Some(&(5..9)));
+        let shown: Vec<(&str, bool)> = (spans.iter())
+            .map(|s| {
+                (
+                    s.content.as_ref(),
+                    s.style.add_modifier.contains(Modifier::REVERSED),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("a ", false),
+                ("**", false),
+                ("b", false),
+                ("**", true),
+                (" c", true)
+            ]
+        );
+        // A row that starts inside a marked word keeps its style.
+        let spans = super::spans(text, 5..9, &marked, None);
+        assert_eq!(spans[0].content, "**");
+        assert!(spans[0].style.add_modifier.contains(Modifier::DIM));
+    }
 
     fn typed(text: &str) -> Prompt {
         let mut prompt = Prompt::default();

@@ -363,7 +363,16 @@ Ctrl-U and Ctrl-K to the line's start and end, and Ctrl-Y puts back what the
 last of those took. Shift-Enter needs a terminal that speaks the kitty
 keyboard protocol, which Sonny asks for as Codex does (Kitty, Ghostty,
 WezTerm, iTerm2, Herdr and others); elsewhere it reads as Enter, and Alt-Enter
-or Ctrl-J still start a line.
+or Ctrl-J still start a line. Markdown shows in the composer as it will
+read, its marks kept and dim: `**bold**` bold, `` `code` `` in code's colour,
+a `#` line as a heading; what is sent is the text as typed.
+
+Alt-T boosts the next message: the turn it starts runs at a higher effort
+(`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
+where the model takes it, and again back to the agent's own. The footer
+shows `↑xhigh` beside the effort until a message takes it; a message that
+steers a running turn leaves it for the next. The agent's own effort never
+changes, as `/model` changes it.
 
 ![A message queued with Tab waits under the running turn](../docs/sonny/tab-queues.png)
 

@@ -92,6 +92,8 @@ per feature; group small things into the row they belong to.
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
 | Editing: wrap, arrow keys, shell keys, Shift-Enter, mouse selection | shipped | wrap 10-26 #157; arrows 10-27 #174; shell keys and pictures in messages 10-28 #242; Shift-Enter, selection 10-29 #297 | A composer that edits like a shell | ? |
+| Markdown in the composer: marks stay, dim, and what they mark shows as it will read (bold, italic, struck, `code`, a `#` line as a heading); the text sent is what was typed | experimental | added 10-30 | George saw his Markdown only once sent; the composer now draws it as the conversation will, without hiding what he typed | ? |
+| Boost: Alt+T runs the next message that starts a turn at a higher effort (`xhigh`, else `high`), again at `max` where the model has it, again back; `↑xhigh` beside the effort in the footer until it goes | experimental | added 10-30 | More thought for one hard message without the several steps of `/model` and back; per message, as Claude Code's `ultrathink`, so nothing stays raised by mistake | ? |
 | `!COMMAND`: run your own shell command and tell the agent | shipped | added 10-27 #209 | Do it yourself without leaving the conversation | ? |
 | A guess at your next message, Tab takes it (`[sonny] suggest`) | experimental | added 10-29 #329 | As Claude Code and Codex do; cost per guess not yet measured | ? |
 | Key hints in one grammar (key, then what it does, muted); `?` with nothing typed shows every key | shipped | added 10-30 #427 | As Codex's `key_hint` and both peers' `?` sheet: keys only the README taught are on screen | ? |
