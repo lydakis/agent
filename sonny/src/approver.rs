@@ -1064,7 +1064,7 @@ async fn intent(
         .into_iter()
         .flatten()
         .flat_map(|prompt| {
-            let quotes = quoted(prompt["quotes"].clone(), by_person(prompt));
+            let quotes = quoted(prompt["quotes"].clone(), prompt);
             std::iter::once(prompt.clone()).chain(quotes)
         })
         .map(|prompt| Words {
@@ -1198,20 +1198,22 @@ fn with_replies(prompts: Vec<Value>) -> Vec<Value> {
             words.push(json!({"text":text,"origin":"reply"}));
         }
         let quotes = prompt.as_object_mut().and_then(|p| p.remove("quotes"));
-        let chosen = by_person(&prompt);
+        let parent = prompt.clone();
         words.push(prompt);
-        words.extend((quotes.into_iter()).flat_map(|quotes| quoted(quotes, chosen)));
+        words.extend((quotes.into_iter()).flat_map(|quotes| quoted(quotes, &parent)));
     }
     words
 }
 
-/// A prompt's quotes as words of their own: the person's own words as
+/// `parent`'s quotes as words of their own: the person's own words as
 /// theirs, the daemon having copied them from the person's turn, when the
-/// person quoted them (`chosen`); any other's, an agent's or a client's,
+/// person sent `parent`, so chose them; any other's, an agent's or a client's,
 /// as asking for nothing, with no turn above them to read, since quoting
 /// is not delegating. The person's words another picked are theirs but
 /// not their word on this: an agent could pick an old "yes" for a new ask.
-fn quoted(quotes: Value, chosen: bool) -> Vec<Value> {
+/// Quotes of a steer are a steer's words: cut, they may be a later word.
+fn quoted(quotes: Value, parent: &Value) -> Vec<Value> {
+    let chosen = by_person(parent);
     let Value::Array(quotes) = quotes else {
         return Vec::new();
     };
@@ -1224,6 +1226,9 @@ fn quoted(quotes: Value, chosen: bool) -> Vec<Value> {
             }
             if !(chosen && by_person(&quote)) {
                 words["origin"] = json!("quote");
+            }
+            if parent["steer"] == true {
+                words["steer"] = json!(true);
             }
             words
         })
@@ -1435,6 +1440,12 @@ mod tests {
         assert_eq!(words.len(), 12);
         assert!(words.iter().all(|w| w.get("quotes").is_none()));
         assert_eq!(words[2]["truncated"], true);
+        // A steer's quote cut short may hold a later word.
+        let steered = with_replies(vec![json!({"turn":7,"text":"ok","steer":true,
+            "quotes":[{"bot":"lead","turn":2,"text":"no","truncated":true}]})]);
+        let mut left = Left::default();
+        steered.iter().for_each(|w| left.cut(w));
+        assert!(left.newest);
         let by: Vec<(By, &str)> = (words.iter())
             .filter(|w| w.get("from").is_none())
             .map(|w| (by_origin(w), w["text"].as_str().unwrap()))
