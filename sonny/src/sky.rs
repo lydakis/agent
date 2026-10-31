@@ -1526,8 +1526,9 @@ impl View {
     /// Where one who pulled or resumed is: their star, or the person's
     /// place for the person or an agent not on the sky.
     fn cord_end(&self, by: &Option<String>) -> End {
+        // A throwaway copy pulls it as the agent it is drawn on.
         (by.as_deref())
-            .and_then(|name| self.agent(name))
+            .and_then(|name| self.agent(name).or_else(|| self.copied(name)))
             .map_or(End::Person, End::Agent)
     }
 
