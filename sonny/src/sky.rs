@@ -146,6 +146,10 @@ fn made(name: &str, data: &Value) -> Value {
 
 /// The most events a replay keeps to step back through.
 const TAPE: usize = 100_000;
+/// Who told whom before a replay's tape starts, a message for each pair:
+/// as many as the web keeps, and room for copies, which fold into their
+/// agents' pairs.
+const PRIOR: usize = TALKS * 8;
 
 /// A tool call: code's colour, for its moment.
 const TOOL: Color = Color::Cyan;
@@ -187,6 +191,8 @@ enum Feed {
     /// An event a replay plays when its time comes, with when it was
     /// written.
     Tape(Value),
+    /// Who told whom before a replay's tape starts.
+    Prior(Prior),
     /// Caught up: from here on, what happens.
     Ready,
     Down(String),
@@ -459,6 +465,8 @@ enum Heard {
     Poem(String, i64, Vec<String>),
     /// The file as read, and the rule when it was read again too.
     Read(haiku::Kept, Option<haiku::Rule>),
+    /// The day's haikus, for a replay to show each when it was up.
+    Poems(Vec<haiku::Poem>),
 }
 
 /// A haiku on the sky: who wrote it, its lines, when it starts to show,
@@ -471,6 +479,9 @@ struct Verse {
     written: Instant,
     since: Instant,
     until: Option<Instant>,
+    /// In a replay, when it was written, in Unix ms: it streams in on the
+    /// replay's clock, at its speed, and holds still while it is paused.
+    story: Option<i64>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -501,6 +512,57 @@ struct Replay {
     /// apart too, so the listing read once the past is in, which names
     /// only who is here now, does not lose one deleted later on the tape.
     folded: Vec<Value>,
+    /// Who told whom before the tape starts, so the web of who has
+    /// talked is whole from the first frame, as live; what goes off the
+    /// tape's start joins it.
+    prior: Prior,
+    /// The day's haikus, and when the one shown was written: the one up
+    /// at the replay's time shows, as it did then.
+    poems: Vec<haiku::Poem>,
+    poem: Option<i64>,
+}
+
+/// Who told whom, agent to agent: the last message of each pair, oldest
+/// first, at most [`PRIOR`].
+#[derive(Debug, Default)]
+struct Prior {
+    next: u64,
+    /// Each pair's message, by who was told and who told, as its place.
+    pairs: HashMap<(String, String), u64>,
+    told: BTreeMap<u64, Value>,
+}
+
+impl Prior {
+    /// Keeps `event` if it is one agent telling another: only what the
+    /// web reads of it, in place of the pair's message before.
+    fn keep(&mut self, event: &Value) {
+        let data = &event["data"];
+        let (Some(to), Some(by)) = (event["bot"].as_str(), data["from"]["bot"].as_str()) else {
+            return;
+        };
+        if !matches!(event["event"].as_str(), Some("accepted" | "steered")) {
+            return;
+        }
+        if let Some(old) = self.pairs.insert((to.to_owned(), by.to_owned()), self.next) {
+            self.told.remove(&old);
+        }
+        let slim = json!({"event": event["event"], "bot": to, "turn": event["turn"],
+            "written_ms": event["written_ms"],
+            "data": {"from": data["from"], "steer": data["steer"]}});
+        self.told.insert(self.next, slim);
+        self.next += 1;
+        while self.told.len() > PRIOR {
+            let Some((_, oldest)) = self.told.pop_first() else {
+                break;
+            };
+            if let (Some(to), Some(by)) = (
+                oldest["bot"].as_str(),
+                oldest["data"]["from"]["bot"].as_str(),
+            ) {
+                self.pairs.remove(&(to.to_owned(), by.to_owned()));
+            }
+        }
+    }
 }
 
 impl Replay {
@@ -521,6 +583,7 @@ impl Replay {
         }
         self.cut |= self.played < gone;
         for event in self.tape.drain(..gone) {
+            self.prior.keep(&event);
             let Some(name) = event["bot"].as_str() else {
                 continue;
             };
@@ -577,6 +640,9 @@ impl Replay {
             ready: false,
             cut: false,
             folded: Vec::new(),
+            prior: Prior::default(),
+            poems: Vec::new(),
+            poem: None,
         }
     }
 }
@@ -680,6 +746,7 @@ impl View {
             written: ago(kept.at_ms),
             since: ago(kept.since_ms),
             until: None,
+            story: None,
         });
         let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
         Self {
@@ -754,6 +821,7 @@ impl View {
             Some(replay) => {
                 replay.cast.clear();
                 replay.tape.clear();
+                replay.prior = Prior::default();
                 replay.played = 0;
                 replay.ready = false;
                 tokio::spawn(tape(self.socket.clone(), replay.from, send))
@@ -788,6 +856,12 @@ impl View {
         self.ticker.clear();
         self.recent.clear();
         self.calls.clear();
+        // A replay shows the haikus that were up then; live again, the
+        // file's shows anew.
+        (self.verse, self.fading) = (None, None);
+        self.shown = (String::new(), 0);
+        // Read at once, the day's haikus or the file's.
+        self.weighed = None;
         self.restart();
     }
 
@@ -850,6 +924,11 @@ impl View {
                 Feed::Tape(event) => {
                     if let Some(replay) = &mut self.replay {
                         replay.keep(event);
+                    }
+                }
+                Feed::Prior(prior) => {
+                    if let Some(replay) = &mut self.replay {
+                        replay.prior = prior;
                     }
                 }
                 Feed::Ready if self.replay.as_ref().is_some_and(|r| !r.ready) => {
@@ -920,9 +999,17 @@ impl View {
     fn reign(&mut self, now: Instant) {
         while let Ok(heard) = self.heard.1.try_recv() {
             match heard {
+                // A replay shows the past's; live again, the file has it.
+                Heard::Poem(..) if self.replay.is_some() => {}
                 Heard::Poem(by, at, lines) => {
                     self.shown = (by.clone(), at);
                     self.recite(by, lines, at, now);
+                }
+                Heard::Poems(poems) => {
+                    self.reading = false;
+                    if let Some(replay) = &mut self.replay {
+                        replay.poems = poems;
+                    }
                 }
                 Heard::Read(kept, rule) => {
                     self.reading = false;
@@ -933,7 +1020,9 @@ impl View {
                 }
             }
         }
-        if (self.verse.as_ref())
+        if self.replay.is_some() {
+            self.replayed_verse(now);
+        } else if (self.verse.as_ref())
             .is_some_and(|verse| now.saturating_duration_since(verse.written) > HOUR)
         {
             self.fading = self.verse.take().map(|verse| (verse, now));
@@ -941,7 +1030,7 @@ impl View {
         if (self.fading.as_ref()).is_some_and(|(_, at)| now.duration_since(*at) > FADE) {
             self.fading = None;
         }
-        if !self.live || self.replay.is_some() {
+        if !self.live {
             return;
         }
         if self
@@ -954,7 +1043,16 @@ impl View {
         // The file read again, for what other skies wrote, and the rule as
         // /config says now and then: haikus turned on or off, or the cap
         // moved, since the sky opened.
-        if !self.reading {
+        if !self.reading && self.replay.is_some() {
+            // A replay reads the day's haikus again as it goes: one another
+            // sky writes while it plays shows when the replay reaches it.
+            self.reading = true;
+            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let _ = send.send(Heard::Poems(haiku::Kept::load(&store, &socket).past));
+            });
+        } else if !self.reading {
             self.reading = true;
             let rule = self
                 .ruled
@@ -969,7 +1067,7 @@ impl View {
                 let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
             });
         }
-        if self.title.rule.daily == 0 {
+        if self.replay.is_some() || self.title.rule.daily == 0 {
             return;
         }
         if let Some((name, since)) = self.heir.take()
@@ -1039,6 +1137,44 @@ impl View {
         self.recite(kept.by, kept.lines, kept.at_ms, now);
     }
 
+    /// In a replay, the haiku up at its time, as it was then: written
+    /// within the hour before, the last of them; none, and the one shown
+    /// fades.
+    fn replayed_verse(&mut self, now: Instant) {
+        let Some(replay) = self.replay.as_mut().filter(|replay| replay.ready) else {
+            return;
+        };
+        let at = replay.at as i64;
+        let hour = HOUR.as_millis() as i64;
+        let up = (replay.poems.iter().rev())
+            .find(|poem| poem.at_ms <= at && at - poem.at_ms < hour)
+            .cloned();
+        let poem = up.as_ref().map(|poem| poem.at_ms);
+        if poem == replay.poem {
+            return;
+        }
+        replay.poem = poem;
+        let old = self.verse.take();
+        let Some(up) = up else {
+            self.fading = old.map(|old| (old, now));
+            return;
+        };
+        // Its time is the replay's: it takes over from the one before at
+        // once, hours apart as they were written.
+        self.fading = old.map(|old| (old, now));
+        // Signed for as long as its writer had held the title then.
+        let held = Duration::from_millis((up.at_ms - up.since_ms).max(0) as u64);
+        self.verse = Some(Verse {
+            by: up.by,
+            lines: up.lines,
+            from: now,
+            written: now,
+            since: now.checked_sub(held).unwrap_or(now),
+            until: Some(now),
+            story: Some(up.at_ms),
+        });
+    }
+
     /// Show `lines` by `by`, written at `at_ms`, once the haiku before has
     /// faded: an hour from when it was written, however late it came.
     fn recite(&mut self, by: String, lines: Vec<String>, at_ms: i64, now: Instant) {
@@ -1064,23 +1200,24 @@ impl View {
             written,
             since,
             until: None,
+            story: None,
         });
     }
 
     /// The haiku's rows: its three lines streaming in a word at a time,
     /// muted, each word up from faint, then its writer signed in faint;
-    /// the one before all faint as it fades. None in a replay.
+    /// the one before all faint as it fades; in a replay, the one up then.
     fn haiku(&self, now: Instant) -> Vec<Line<'static>> {
-        if self.replay.is_some() {
-            return Vec::new();
-        }
         let showing = self.verse.as_ref().filter(|verse| now >= verse.from);
         let (verse, faded) = match (showing, &self.fading) {
             (Some(verse), _) => (verse, false),
             (None, Some((old, _))) => (old, true),
             (None, None) => return Vec::new(),
         };
-        let t = now.saturating_duration_since(verse.from).as_secs_f32();
+        let t = match (verse.story, &self.replay) {
+            (Some(at), Some(replay)) => ((replay.at - at as f64) / 1000.0).max(0.0) as f32,
+            _ => now.saturating_duration_since(verse.from).as_secs_f32(),
+        };
         let mut lines = Vec::new();
         let mut word = 0;
         let mut last = 0.0;
@@ -1205,6 +1342,7 @@ impl View {
                 .cloned()
                 .collect();
             replay.at = at;
+            let prior: Vec<Value> = replay.prior.told.values().cloned().collect();
             self.forget();
             self.ticker.clear();
             self.recent.clear();
@@ -1214,6 +1352,11 @@ impl View {
                 if let Some(at) = self.seat(bot) {
                     self.agents[at].running = None;
                 }
+            }
+            // Who had talked before, as live reads past turns: the whole
+            // web from the first frame, not only the window's.
+            for event in &prior {
+                self.event(event, now, false);
             }
         }
         if let Some(replay) = &mut self.replay {
@@ -1513,9 +1656,11 @@ impl View {
                     }
                     // A past turn of the last hour counts toward its pair's
                     // weight, at the time the daemon wrote it.
+                    // In a replay, the hour before the replay's time.
+                    let clock = self.replay.as_ref().map_or(wall_ms(), |r| r.at as i64);
                     if !live
                         && let Some(written) = event["written_ms"].as_i64()
-                        && let Some(ago) = wall_ms().checked_sub(written)
+                        && let Some(ago) = clock.checked_sub(written)
                         && let Some(when) =
                             now.checked_sub(Duration::from_millis(ago.max(0) as u64))
                         && now.duration_since(when) <= HOUR
@@ -4283,6 +4428,17 @@ async fn taped(client: &Client, event: Value, send: &mpsc::UnboundedSender<Feed>
 /// A replay's connection: every agent here now, then every event written
 /// since `from` (Unix ms), the past as one tape, then what follows live.
 async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
+    match prior(&socket, from).await {
+        Ok(prior) => {
+            if send.send(Feed::Prior(prior)).is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = send.send(Feed::Down(error));
+            return;
+        }
+    }
     let (client, mut events) = match Client::connect(&socket).await {
         Ok(connected) => connected,
         Err(error) => {
@@ -4328,6 +4484,30 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
         }
     }
     let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+}
+
+/// Who told whom before `from` (Unix ms), from the turns kept, as live
+/// reads them: on a connection of its own, closed once read, so nothing
+/// it brings mixes into the tape's.
+async fn prior(socket: &std::path::Path, from: i64) -> Result<Prior, String> {
+    let (client, mut events) = Client::connect(socket).await.map_err(|e| e.to_string())?;
+    client
+        .request(
+            "follow",
+            json!({"bot": "*", "after": 0, "kinds": ["accepted", "steered"]}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut prior = Prior::default();
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            Some("follow_live") => return Ok(prior),
+            Some("lagged" | "follow_lagged") => return Err("fell behind the daemon".into()),
+            _ if event["written_ms"].as_i64().is_some_and(|at| at < from) => prior.keep(&event),
+            _ => {}
+        }
+    }
+    Err("the daemon closed the connection".into())
 }
 
 /// Every agent the daemon keeps, page after page, as one roll; false when
@@ -4861,6 +5041,136 @@ mod tests {
         // Esc watches live again.
         assert!(view.press(KeyCode::Esc));
         assert!(!view.replaying());
+    }
+
+    #[tokio::test]
+    async fn a_replay_draws_who_had_talked_before_it_and_the_haiku_up_then() {
+        let (mut view, send) = view();
+        let from = wall_ms() - 2 * 3_600_000;
+        view.replay = Some(Replay::new(from));
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        let said = |ago: i64, to: &str| {
+            json!({"event": "accepted", "bot": to, "turn": 1, "written_ms": from - ago,
+                "data": {"from": {"bot": "shop.lead", "turn": 1}, "prompt": "go"}})
+        };
+        let mut prior = Prior::default();
+        prior.keep(&said(3 * 3_600_000, "shop.cart"));
+        prior.keep(&said(2 * 3_600_000, "shop.login"));
+        // The person's own prompt draws no pair; the cart's later word is
+        // its pair's one message, and within the hour before, it weighs.
+        prior.keep(
+            &json!({"event": "accepted", "bot": "shop.login", "written_ms": from,
+            "data": {}}),
+        );
+        prior.keep(&said(600_000, "shop.cart"));
+        assert_eq!(prior.told.len(), 2);
+        assert!(prior.told.values().all(|e| e["data"]["prompt"].is_null()));
+        send.send(Feed::Prior(prior)).unwrap();
+        // The day's haikus as the file keeps them.
+        let lines = |first: &str| vec![first.to_owned(), "b".into(), "c".into()];
+        let poem = |by: &str, at: i64, first: &str| haiku::Poem {
+            by: by.into(),
+            lines: lines(first),
+            at_ms: at,
+            since_ms: at - 300_000,
+        };
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.past = vec![
+                poem("shop.cart", from - 2 * 3_600_000, "old"),
+                poem("shop.lead", from + 1_800_000, "dawn"),
+            ];
+        });
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        // The web of who had talked is there from the first frame, as live.
+        let (lead, login, cart) = (
+            view.index["shop.lead"],
+            view.index["shop.login"],
+            view.index["shop.cart"],
+        );
+        assert_eq!(view.talks, [(lead, login), (lead, cart)]);
+        assert_eq!(view.pairs, HashMap::from([(pair(lead, cart), 1)]));
+        assert!(view.ticker.is_empty());
+        // The haiku up at the replay's time shows, as it did then; none
+        // before it was written, nor an hour after. Read off the drawing
+        // thread, and heard back.
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 2);
+        assert!(view.verse.is_none());
+        view.seek(from as f64 + 1_860_000.0, Instant::now());
+        view.drain();
+        let verse = view.verse.as_mut().expect("the haiku up then");
+        assert_eq!(
+            (verse.by.as_str(), &verse.lines),
+            ("shop.lead", &lines("dawn"))
+        );
+        let shown = text(&view.haiku(Instant::now()));
+        assert!(shown.contains("busiest for 5m"), "{shown}");
+        view.seek(from as f64 + 5_500_000.0, Instant::now());
+        view.drain();
+        assert!(view.verse.is_none() && view.fading.is_some());
+        // Back to before it: it shows again when its time comes.
+        view.seek(from as f64 + 1_900_000.0, Instant::now());
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines("dawn"));
+        // It streams in on the replay's clock: just begun as the replay
+        // reaches it, held still while paused, signed seconds of the
+        // replay's time on, however fast it plays.
+        view.seek(from as f64 + 1_800_001.0, Instant::now());
+        view.drain();
+        let begun = text(&view.haiku(Instant::now()));
+        assert!(
+            begun.contains("dawn") && !begun.contains("busiest"),
+            "{begun}"
+        );
+        view.replay.as_mut().unwrap().playing = false;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        view.drain();
+        assert_eq!(text(&view.haiku(Instant::now())), begun);
+        view.seek(from as f64 + 1_815_000.0, Instant::now());
+        view.drain();
+        assert!(text(&view.haiku(Instant::now())).contains("busiest for 5m"));
+        // One another sky writes while the replay plays is read as it goes,
+        // and shows when the replay reaches it.
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            kept.past.push(poem("shop.cart", from + 5_700_000, "late"));
+        });
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        view.seek(from as f64 + 5_800_000.0, Instant::now());
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines("late"));
+    }
+
+    #[test]
+    fn a_replay_keeps_a_message_for_each_pair_before_it_and_no_more_than_its_bound() {
+        let mut prior = Prior::default();
+        for n in 0..PRIOR + 5 {
+            prior.keep(&json!({"event": "steered", "bot": format!("a{n}"),
+                "written_ms": n, "data": {"from": {"bot": "lead"}}}));
+        }
+        assert_eq!((prior.told.len(), prior.pairs.len()), (PRIOR, PRIOR));
+        assert_eq!(prior.told.values().next().unwrap()["bot"], "a5");
+        // What goes off the tape's start joins it.
+        let mut replay = Replay::new(0);
+        replay.keep(json!({"event": "accepted", "bot": "b", "written_ms": 0,
+            "data": {"from": {"bot": "lead"}}}));
+        for at in 1..=TAPE as i64 {
+            replay.keep(json!({"event": "queued", "written_ms": at}));
+        }
+        assert_eq!(replay.prior.told.len(), 1);
     }
 
     #[test]
@@ -5736,7 +6046,12 @@ mod tests {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
-                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) | Feed::Model(..) | Feed::Tape(_) => {
+                Feed::Past(_)
+                | Feed::Held(_)
+                | Feed::Down(_)
+                | Feed::Model(..)
+                | Feed::Tape(_)
+                | Feed::Prior(_) => {
                     continue;
                 }
             });

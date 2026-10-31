@@ -9,7 +9,8 @@
 //! Sonny not get to, and the sky draws no copy the daemon will throw
 //! away. The last one, and how many were written today, are kept in
 //! `~/.agent/sonny/haiku.json`, so every sky shows the same one and the
-//! daily cap holds across them.
+//! daily cap holds across them; the day's before it too, so a replay
+//! shows the one that was up then.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 const WAIT: Duration = Duration::from_secs(60);
 /// A copy left behind is deleted once idle this long.
 const EXPIRE: Duration = Duration::from_secs(120);
+/// How long a haiku is kept for replays: as far back as one reaches.
+pub const KEPT: Duration = Duration::from_secs(24 * 3600);
 /// The longest line kept: the chat log's column, less a margin.
 pub const WIDTH: usize = 34;
 
@@ -157,6 +160,37 @@ pub struct Kept {
     /// When it was written, and since when its writer held the title.
     pub at_ms: i64,
     pub since_ms: i64,
+    /// The haikus written over the last [`KEPT`], the last one among
+    /// them, oldest first.
+    pub past: Vec<Poem>,
+}
+
+/// A haiku as kept: who wrote it, its lines, when, and since when its
+/// writer held the title.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Poem {
+    pub by: String,
+    pub lines: Vec<String>,
+    pub at_ms: i64,
+    pub since_ms: i64,
+}
+
+impl Poem {
+    fn read(kept: &Value) -> Poem {
+        Poem {
+            by: kept["by"].as_str().unwrap_or("").to_owned(),
+            lines: (kept["lines"].as_array().into_iter().flatten())
+                .filter_map(|line| line.as_str().map(str::to_owned))
+                .collect(),
+            at_ms: kept["at_ms"].as_i64().unwrap_or(0),
+            since_ms: kept["since_ms"].as_i64().unwrap_or(0),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({"by": self.by, "lines": self.lines, "at_ms": self.at_ms,
+            "since_ms": self.since_ms})
+    }
 }
 
 /// Where every sky keeps its haikus: `~/.agent/sonny/haiku.json`.
@@ -211,16 +245,23 @@ impl Kept {
                 ..Kept::default()
             };
         };
-        let text = |key: &str| kept[key].as_str().unwrap_or("").to_owned();
+        let Poem {
+            by,
+            lines,
+            at_ms,
+            since_ms,
+        } = Poem::read(&kept);
         Kept {
-            day: text("day"),
+            day: kept["day"].as_str().unwrap_or("").to_owned(),
             written: kept["written"].as_u64().unwrap_or(0),
-            by: text("by"),
-            lines: (kept["lines"].as_array().into_iter().flatten())
-                .filter_map(|line| line.as_str().map(str::to_owned))
+            by,
+            lines,
+            at_ms,
+            since_ms,
+            past: (kept["past"].as_array().into_iter().flatten())
+                .map(Poem::read)
+                .filter(|poem| poem.lines.len() == 3)
                 .collect(),
-            at_ms: kept["at_ms"].as_i64().unwrap_or(0),
-            since_ms: kept["since_ms"].as_i64().unwrap_or(0),
             socket,
         }
     }
@@ -264,6 +305,14 @@ impl Kept {
             if current {
                 kept.lines = lines.to_vec();
                 kept.at_ms = now_ms;
+                let day = KEPT.as_millis() as i64;
+                kept.past.retain(|poem| now_ms - poem.at_ms < day);
+                kept.past.push(Poem {
+                    by: by.to_owned(),
+                    lines: lines.to_vec(),
+                    at_ms: now_ms,
+                    since_ms,
+                });
             }
             current
         })
@@ -277,7 +326,8 @@ impl Kept {
         all.insert(
             self.socket.clone(),
             json!({"day": self.day, "written": self.written, "by": self.by,
-                "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms}),
+                "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms,
+                "past": self.past.iter().map(Poem::json).collect::<Vec<_>>()}),
         );
         let kept = Value::Object(all);
         if let Some(dir) = file.parent() {
@@ -497,6 +547,30 @@ mod tests {
         assert!(Kept::publish(&store, socket, "a", ms, &lines, ms + 3));
         let kept = Kept::load(&store, socket);
         assert_eq!((kept.lines, kept.at_ms), (lines, ms + 3));
+        let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn a_day_of_haikus_is_kept_for_replays() {
+        let store = Store::new();
+        let rule = Rule { daily: 8, ..rule() };
+        let socket = Path::new("/tmp/agent-past.sock");
+        let hour = 3_600_000;
+        let ms = 1_793_400_000_000;
+        let lines = |n: i64| vec![format!("line {n}"), "y".into(), "z".into()];
+        for (n, by) in [(0, "a"), (1, "b"), (24, "c")] {
+            let at = ms + n * hour;
+            Kept::update(&store, socket, |kept| kept.claim(&rule, by, at, at)).unwrap();
+            assert!(Kept::publish(&store, socket, by, at, &lines(n), at + 1));
+        }
+        // The first went a day after it was written; the last is among them.
+        let past = Kept::load(&store, socket).past;
+        let kept: Vec<(&str, i64)> = (past.iter())
+            .map(|poem| (poem.by.as_str(), poem.at_ms))
+            .collect();
+        assert_eq!(kept, [("b", ms + hour + 1), ("c", ms + 24 * hour + 1)]);
+        assert_eq!(past[1].lines, lines(24));
+        assert_eq!(past[1].since_ms, ms + 24 * hour);
         let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
     }
 
