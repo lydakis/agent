@@ -180,6 +180,26 @@ pub fn read(store: &Path, subscriber: &str) -> Vec<Sub> {
         .collect()
 }
 
+/// The subscriber's file as it is, none when it has none: one it cannot
+/// read, or that holds what is not a subscription, is refused, so a
+/// change never writes over what it could not read.
+fn read_whole(store: &Path, subscriber: &str) -> Result<Vec<Sub>, String> {
+    let path = file(store, subscriber);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let unreadable = || format!("{}: not a subscriptions file", path.display());
+    let value: Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
+    (value["subscriptions"]
+        .as_array()
+        .ok_or_else(unreadable)?
+        .iter())
+    .map(|sub| Sub::from_json(sub).ok_or_else(unreadable))
+    .collect()
+}
+
 /// Every subscriber with a file, and what it holds.
 pub fn all(store: &Path) -> Vec<(String, Vec<Sub>)> {
     let Ok(entries) = std::fs::read_dir(dir(store)) else {
@@ -202,7 +222,7 @@ pub fn all(store: &Path) -> Vec<(String, Vec<Sub>)> {
 /// which is kept as it is: whether it was added.
 pub fn ensure(store: &Path, subscriber: &str, sub: Sub) -> Result<bool, String> {
     let _held = held(store)?;
-    let mut subs = read(store, subscriber);
+    let mut subs = read_whole(store, subscriber)?;
     if subs.iter().any(|s| s.name == sub.name) {
         return Ok(false);
     }
@@ -323,7 +343,7 @@ pub fn change(
     }
     // One change at a time, so two at once both land.
     let _held = held(store)?;
-    let mut subs = read(store, subscriber);
+    let mut subs = read_whole(store, subscriber)?;
     let mut said = json!({});
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
@@ -420,6 +440,20 @@ fn parse(value: &Value) -> Result<Sub, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_it_cannot_read_is_never_written_over() {
+        let store = std::env::temp_dir().join(format!("subs-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        std::fs::create_dir_all(dir(&store)).unwrap();
+        let path = file(&store, "calc.lead");
+        std::fs::write(&path, "{torn").unwrap();
+        assert!(ensure(&store, "calc.lead", Sub::commons("t")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{torn");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(ensure(&store, "calc.lead", Sub::commons("t")), Ok(true));
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
 
     #[test]
     fn another_lead_of_a_folder_hears_its_own_tasks_only() {

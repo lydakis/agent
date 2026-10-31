@@ -1289,8 +1289,11 @@ fn subscribe_all(home: &Path, store: &Path, bots: &HashMap<String, Option<i64>>)
                 (Some(_), _) => true,
                 (None, _) => false,
             };
-            if let Some(by) = post["by"].as_str().filter(ours) {
-                all &= subscribe(store, by, thread).is_ok();
+            if let Some(by) = post["by"].as_str().filter(ours)
+                && let Err(error) = subscribe(store, by, thread)
+            {
+                eprintln!("sonny: {POSTERS} waits on {by}'s subscriptions: {error}");
+                all = false;
             }
         }
     }
