@@ -301,5 +301,32 @@ class LookoutTests(ModelFixture):
         self.assertEqual(sum(p['text'].count('deploy failed on prod') for p in told), 1)
         self.assertEqual((self.path / 'state.sqlite.sources' / 'chat' / 'ran').read_text(), 'chat\n')
 
+    def test_a_filtered_subscription_hears_only_the_events_it_matches(self):
+        # A change poller prints two changes; the subscriber cares about
+        # billing only.
+        poller = self.path / 'crs.sh'
+        poller.write_text(
+            'echo \'{"text": "CR-1 search", "id": "1", "paths": ["src/search/index.rs"], "lines": 40}\'\n'
+            'echo \'{"text": "CR-2 billing", "id": "2", "paths": ["src/billing/tax.rs", "README.md"], "lines": 7}\'\n')
+        (self.path / '.agent').mkdir(exist_ok=True)
+        (self.path / '.agent' / 'config.toml').write_text(
+            f'[sonny.sources.cr]\ncommand = "sh {poller}"\nevery = "1h"\n')
+        self.make('reviewer')
+        folder = self.path / 'state.sqlite.lookout'
+        folder.mkdir(exist_ok=True)
+        subs = [{'name': 'billing', 'sources': ['cr'], 'filter': {'paths': [{'prefix': 'src/billing/'}]}}]
+        (folder / 'reviewer.json').write_text(json.dumps({'subscriptions': subs}))
+        self.start()
+        prompt = self.prompt_for('reviewer', starting='From your sources: ', having='CR-2')
+        self.assertIsNotNone(prompt, 'the subscriber never heard the change it filtered for')
+        self.assertIn('- cr (for your billing): "CR-2 billing" {"lines":7,"paths":["src/billing/tax.rs","README.md"]}',
+                      prompt['text'])
+        self.assertNotIn('CR-1', prompt['text'])
+        # The lookout kept the source's shape, for agents to filter on.
+        shape = json.loads((self.path / 'state.sqlite.sources' / '.shapes' / 'cr.json').read_text())
+        self.assertEqual(shape['events'], 2)
+        self.assertEqual(shape['fields']['paths']['kinds'], ['list of strings'])
+        self.assertEqual(shape['fields']['lines']['kinds'], ['number'])
+
 if __name__ == '__main__':
     unittest.main()
