@@ -597,10 +597,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 folder: text("folder"),
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
-                // A task's own helper starts from its work, on its branch.
-                base: (!line.role.lead)
-                    .then(|| crate::task::branch_of(&line.folder, &caller))
-                    .flatten(),
+                // A task's own helper builds on its work.
+                builds_on: (!line.role.lead).then(|| caller.clone()),
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;

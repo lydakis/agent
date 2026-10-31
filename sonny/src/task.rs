@@ -59,9 +59,10 @@ pub struct Start {
     /// else its newest that has them.
     pub from: Option<String>,
     pub turn: Option<i64>,
-    /// The revision a new worktree starts at: the branch of the task that
-    /// starts this one, which builds on its work, else `HEAD`.
-    pub base: Option<String>,
+    /// The task starting this one as its own helper, which builds on its
+    /// work: in the repository it works in, unless `folder` or
+    /// `own_folder` says otherwise, from the last commit on its branch.
+    pub builds_on: Option<String>,
 }
 
 /// The task a fork copies, and its files after the turn it copies.
@@ -115,7 +116,19 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     if let Some(effort) = start.effort.clone().filter(|e| !e.is_empty()) {
         flags.extend(["--effort".to_owned(), effort]);
     }
-    let folder = start.folder.as_deref().filter(|f| !f.trim().is_empty());
+    // A helper works in the repository inside the lead's folder that its
+    // task works in, unless told another.
+    let theirs = match (&start.builds_on, start.own_folder) {
+        (Some(task), false) if start.folder.is_none() => match recorded(task) {
+            Some((source, Made::Worktree(repo))) if same(&source, here) => Some(repo),
+            _ => None,
+        },
+        _ => None,
+    };
+    let theirs = theirs.map(|repo| repo.to_string_lossy().into_owned());
+    let folder = (start.folder.as_deref())
+        .or(theirs.as_deref())
+        .filter(|f| !f.trim().is_empty());
     if folder.is_some() && (start.own_folder || info["threads_in"] == "project") {
         return Err(match start.own_folder {
             true => "folder and own_folder each give the task its folder; give one".into(),
@@ -153,7 +166,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
         None if start.own_folder => own_folder(here, name)?,
-        None => worktree(&at, name, start.base.as_deref().unwrap_or("HEAD"))?,
+        None => {
+            // On the last commit of the branch of the task it helps, in
+            // the repository the helper is made of, when it has one there.
+            let base = (start.builds_on.as_deref()).and_then(|task| branch_of(&at, task));
+            worktree(&at, name, base.as_deref().unwrap_or("HEAD"))?
+        }
     };
     // A worktree's files come from commits a task can write, which may
     // make the lead's subfolder a link out of it: the task would then work
@@ -465,10 +483,16 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     Ok(said.join("\n"))
 }
 
+/// Whether two paths name one folder, links followed.
+fn same(one: &Path, other: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    real(one) == real(other)
+}
+
 /// The branch Sonny made the task `name` in the repository at `here`, on
 /// which a task it starts begins, so it builds on its work; `None` for a
 /// task Sonny made none there.
-pub fn branch_of(here: &Path, name: &str) -> Option<String> {
+fn branch_of(here: &Path, name: &str) -> Option<String> {
     let branch = format!("agent/{name}");
     git(
         here,

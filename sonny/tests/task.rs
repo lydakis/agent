@@ -1134,3 +1134,48 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     assert!(ok, "{said}");
     assert!(!review.exists());
 }
+
+#[test]
+fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_branch_there() {
+    let lab = Lab::new("nested-helper");
+    let ws = lab.scratch.join("ws");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    let api = ws.join("src/api");
+    std::fs::rename(&lab.repo, &api).unwrap();
+    let start = serde_json::json!({"name": "fix", "brief": "b", "folder": "src/api"});
+    let (ok, said) = lab.tool(&ws, "start_task", start, false);
+    assert!(ok, "{said}");
+    let fix = lab.home.join(".agent/worktrees/demo.fix");
+    std::fs::write(fix.join("src/lib.rs"), "fixed\n").unwrap();
+    lab.git(&fix, &["commit", "-qam", "fixed"]);
+    let lead = serde_json::json!({"name": "demo.lead", "workspace": ws});
+    let task = serde_json::json!({"name": "demo.fix", "created_by": "demo.lead",
+        "workspace": fix});
+    std::fs::write(
+        lab.scratch.join("run.log.ls"),
+        serde_json::json!([lead, task]).to_string(),
+    )
+    .unwrap();
+    // Named no folder, the helper works in the task's repository, from
+    // its branch.
+    *lab.bot.borrow_mut() = "demo.fix".into();
+    let call = serde_json::json!({"name": "review", "brief": "review it"});
+    let (ok, said) = lab.tool(&fix, "start_task", call, false);
+    assert!(ok, "{said}");
+    let review = lab.home.join(".agent/worktrees/demo.review");
+    assert_eq!(
+        std::fs::read_to_string(review.join("src/lib.rs")).unwrap(),
+        "fixed\n"
+    );
+    // And the task removes it from there.
+    let helper = serde_json::json!({"name": "demo.review", "created_by": "demo.fix"});
+    std::fs::write(
+        lab.scratch.join("run.log.ls"),
+        serde_json::json!([lead, task, helper]).to_string(),
+    )
+    .unwrap();
+    let call = serde_json::json!({"task": "review"});
+    let (ok, said) = lab.tool(&fix, "remove_task", call, false);
+    assert!(ok, "{said}");
+    assert!(!review.exists());
+}
