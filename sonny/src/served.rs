@@ -952,14 +952,23 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         None => record.clone(),
     };
     let name = call["name"].as_str().unwrap_or_default();
-    if !crate::approvals::may_run(record, name) {
-        return Err((
-            "escalation_refused",
-            format!(
-                "{name} acts outside your sandbox, and no one reviews calls for you; \
-                 do without it"
-            ),
-        ));
+    // A tool that acts outside the sandbox is weighed against the bot's
+    // sandbox, which `inspect` gives and a `bots` listing does not: that
+    // bot, by its id, not one given its name since.
+    if GATED.contains(&name) {
+        let inspected = client
+            .request("inspect", json!({"bot": bot, "bot_id": record["bot_id"]}))
+            .await
+            .map_err(|e| ("caller_unknown", e.to_string()))?;
+        if !crate::approvals::may_run(&inspected, name) {
+            return Err((
+                "escalation_refused",
+                format!(
+                    "{name} acts outside your sandbox, and no one reviews calls for you; \
+                     do without it"
+                ),
+            ));
+        }
     }
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
@@ -1141,6 +1150,23 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_confined_agent_no_one_reviews_is_refused_a_pane() {
+        // The listing leaves the sandbox out; the bot's own record says it.
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc", "bot_id": 7, "gates": []}]}),
+            Some("inspect") if asked["bot_id"] == 7 => json!({"name": "calc",
+                "bot_id": 7, "gates": [], "settings": {"sandbox": "read-only"}}),
+            _ => json!({"error": {"code": "unexpected"}}),
+        })
+        .await;
+        let call = json!({"bot": "calc", "turn": 1, "name": RUN,
+            "arguments": {"command": "touch /tmp/x"}});
+        let none = Path::new("/nowhere");
+        let refused = answer(&client, &call, none, none, none).await;
+        assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
+    }
 
     #[test]
     fn outside_content_is_a_search_a_fetched_page_or_an_mcp_server() {
