@@ -48,6 +48,7 @@ const LIVE: &[&str] = &[
     "step_decided",
     "turn_resumed",
     "turn_finished",
+    "configured",
 ];
 /// How long a spark takes to cross.
 const FLIGHT: Duration = Duration::from_millis(1100);
@@ -115,6 +116,8 @@ enum Feed {
     /// its agent: what is answered after, live events let go.
     Held(Vec<(String, String)>),
     Live(Value),
+    /// An agent's model, read again after it was configured.
+    Model(String, String),
     /// Caught up: from here on, what happens.
     Ready,
     Down(String),
@@ -480,6 +483,14 @@ impl View {
                 Feed::Live(event) => {
                     self.live = true;
                     self.event(&event, now, true);
+                }
+                Feed::Model(name, model) => {
+                    if let Some(at) = self.agent(&name)
+                        && self.agents[at].model != model
+                    {
+                        self.agents[at].model = model;
+                        self.laid = self.laid && self.lens != Lens::Models;
+                    }
                 }
                 Feed::Ready => self.live = true,
                 Feed::Down(why) => self.down = Some(why),
@@ -2668,6 +2679,23 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             }
             _ => {}
         }
+        // A configured agent is read again: the event says only what
+        // changed, and the models lens needs its model.
+        if event["event"] == "configured" {
+            let model = event["changed"]
+                .as_array()
+                .is_some_and(|changed| changed.iter().any(|c| c == "model"));
+            if let (true, Some(name)) = (model, event["bot"].as_str())
+                && let Ok(bot) = client.request("inspect", json!({"bot": name})).await
+                && let Some(model) = bot["model"].as_str()
+                && send
+                    .send(Feed::Model(name.to_owned(), model.to_owned()))
+                    .is_err()
+            {
+                return;
+            }
+            continue;
+        }
         if let (Some(waiting), Some(at)) = (&mut handoff, event["cursor"].as_i64()) {
             waiting.insert(at, event);
             continue;
@@ -2997,6 +3025,11 @@ mod tests {
         .unwrap();
         view.drain();
         assert_eq!(view.agents[view.index["shop.new"]].model, "m3");
+        // One configured to another model moves to its group.
+        send.send(Feed::Model("shop.new".into(), "m4".into()))
+            .unwrap();
+        view.drain();
+        assert_eq!(view.agents[view.index["shop.new"]].model, "m4");
         // Too small for the sky, the arrows walk the list, which keeps
         // the pick in view.
         view.centre_on(None);
@@ -3335,7 +3368,7 @@ mod tests {
                 Feed::Live(event) => event["cursor"].to_string(),
                 Feed::Roll(_) => "roll".into(),
                 Feed::Ready => "ready".into(),
-                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) => continue,
+                Feed::Past(_) | Feed::Held(_) | Feed::Down(_) | Feed::Model(..) => continue,
             });
         }
         // Made, then started, once each in the store's order; then the roll
