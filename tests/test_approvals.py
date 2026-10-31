@@ -349,15 +349,18 @@ class ApprovalTests(ModelFixture):
         self.addCleanup(shutil.rmtree, outside)
         client = self.client('shell', settings={'sandbox': 'workspace-write'})
         client.request('create', bot='Bob', workspace=str(self.path))
-        calls = [['shell', {'command': 'sleep .6; touch a'}],
-                 ['shell', {'command': f'sleep .6; touch b; touch {outside}/x'}],
+        # Each command marks that it runs, then finishes only if it sees the
+        # other's mark within 10 s: run one after the other, neither would.
+        def meets(mine, theirs):
+            return (f'touch {mine}.on; i=0; until [ -e {theirs}.on ] || [ $i -ge 200 ]; do sleep .05; i=$((i+1)); done; '
+                    f'[ -e {theirs}.on ] && touch {mine}')
+        calls = [['shell', {'command': meets('a', 'b')}],
+                 ['shell', {'command': f'{meets("b", "a")}; touch {outside}/x'}],
                  ['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}]]
-        started = time.monotonic()
         turn = client.request('submit', bot='Bob', request_id='t',
                               prompt='calls:' + json.dumps(calls))['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # The two confined commands ran at once, each in the sandbox.
-        self.assertLess(time.monotonic() - started, 1.1)
         self.assertTrue((self.path / 'a').exists() and (self.path / 'b').exists())
         self.assertNotEqual(self.tool_output(client, 'shell-2')[1]['exit_code'], 0)
         # The one that asks to leave it still runs alone, and is refused.

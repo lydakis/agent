@@ -892,7 +892,7 @@ pub fn unserved(detail: String) -> Outcome {
     Outcome {
         output: json!({"error":"tool_unserved","detail":detail}).to_string(),
         artifacts: Vec::new(),
-        files: Vec::new(),
+        files: Default::default(),
         parts: Vec::new(),
         note: None,
         failed: true,
@@ -6314,7 +6314,7 @@ impl Database {
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
         }
-        for (stream, file) in &outcome.files {
+        for (stream, file) in outcome.files.iter() {
             artifact::put_file(&tx, turn, call_id, stream, file)?;
         }
         // A parked answer's pictures were kept for the result, which now
@@ -6384,6 +6384,7 @@ impl Database {
             false => None,
         };
         tx.commit()?;
+        outcome.files.recorded();
         if let Some(served) = served {
             self.served.push(served);
             if let Some(live) = self.live_changed(turn) {
@@ -6697,7 +6698,7 @@ impl Database {
             Some(output) => CallAnswer::Given(Outcome {
                 output,
                 artifacts: Vec::new(),
-                files: Vec::new(),
+                files: Default::default(),
                 parts: parts
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?

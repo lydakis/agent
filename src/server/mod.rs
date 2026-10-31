@@ -3621,7 +3621,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
-                            files: Vec::new(),
+                            files: Default::default(),
                             parts: Vec::new(),
                             note: None,
                             failed: true,

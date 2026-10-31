@@ -218,10 +218,14 @@ class AnsweredToolTests(ModelFixture):
 
     def test_a_later_calls_gate_that_lapses_ends_the_wait_for_an_answer(self):
         client = self.client('echo,shell')
+        # The gate's lapse has to come after the answered call starts, which
+        # a busy runner can take well over 100 ms to do: the test waits for
+        # the start, and the lapse leaves it two seconds.
         self.lead(client=client, tool=dict(START, expire_ms=30_000), approve=['shell'],
-                  approver='manual', approve_expire_ms=100)
+                  approver='manual', approve_expire_ms=2000)
         self.model.call_script = [[('start_task', {'name': 'fix'}), ('shell', {'command': 'true'})]]
         turn = self.submit(client)
+        self.assertEqual(self.started(client, turn)['call_id'], 'script-0')
         # Ended by the lapse, as a turn waiting on a verdict is, long before
         # the answered call's own time runs out.
         finished = client.finished(turn)['data']

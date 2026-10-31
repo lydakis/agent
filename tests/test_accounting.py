@@ -331,6 +331,44 @@ class AccountingTests(ModelFixture):
         self.assertFalse(file.exists())
         self.assertNotEqual(ann, kid)
 
+    def test_a_batch_stopped_before_its_results_are_recorded_leaves_no_output_file(self):
+        (ROOT / '.local').mkdir(exist_ok=True)
+        parent = Path(tempfile.mkdtemp(dir=ROOT / '.local'))
+        self.addCleanup(shutil.rmtree, parent)
+        outputs = parent / 'outputs'
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path), settings={'outputs': str(outputs)})
+        big = 'i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done'
+
+        def batch(request_id, first):
+            calls = [['shell', {'command': first}], ['shell', {'command': big}]]
+            return client.request('submit', bot='Bob', request_id=request_id,
+                                  prompt='calls:' + json.dumps(calls))['result']['turn']
+
+        def until(done, what):
+            deadline = time.monotonic() + 30
+            while not done():
+                self.assertLess(time.monotonic(), deadline, what)
+                time.sleep(0.02)
+
+        # A result recorded in its batch keeps its file.
+        kept = batch('kept', 'sleep .2')
+        self.assertEqual(client.finished(kept)['data']['status'], 'completed')
+        self.assertEqual(os.listdir(outputs), [f'{kept}-shell-2-stdout'])
+        # The second call's file is written while its result waits behind
+        # the first, still running; the turn stops before either is
+        # recorded, so no record names the file and it goes with the turn.
+        stopped = batch('stopped', 'sleep 30')
+        written = outputs / f'{stopped}-shell-2-stdout'
+        until(written.exists, 'the second call wrote its output')
+        time.sleep(0.2)  # its result reaches the queue behind the first
+        self.assertIn('result', client.request('interrupt', bot='Bob', turn=stopped))
+        self.assertEqual(client.finished(stopped)['data']['status'], 'interrupted')
+        until(lambda: not written.exists(), 'the stopped batch removed its output file')
+        self.assertEqual(os.listdir(outputs), [f'{kept}-shell-2-stdout'])
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM artifacts WHERE turn=?', (stopped,)).fetchone(), (0,))
+
     def test_unversioned_and_newer_stores_are_refused_with_clear_codes(self):
         path = self.path / 'old.sqlite'
         with sqlite3.connect(path) as db:

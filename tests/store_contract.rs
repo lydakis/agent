@@ -88,7 +88,7 @@ fn result(output: &str) -> Outcome {
         parts: Vec::new(),
         note: None,
         failed: false,
-        files: Vec::new(),
+        files: Default::default(),
     }
 }
 
@@ -1115,7 +1115,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     std::thread::sleep(std::time::Duration::from_millis(60));
     let failed = Outcome {
         failed: true,
-        files: Vec::new(),
+        files: Default::default(),
         ..result("{}")
     };
     db.tool_finish(turn, "r1", &failed).unwrap();
@@ -1415,7 +1415,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     ));
     let failed = Outcome {
         failed: true,
-        files: Vec::new(),
+        files: Default::default(),
         ..result("{}")
     };
     db.tool_finish(turn, "s1", &failed).unwrap();
@@ -2919,7 +2919,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     db.tool_start(turn, &round[0]).unwrap();
     let failed = Outcome {
         failed: true,
-        files: Vec::new(),
+        files: Default::default(),
         ..result("exit 1")
     };
     let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
@@ -4159,7 +4159,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         parts: Vec::new(),
         note: None,
         failed: false,
-        files: Vec::new(),
+        files: Default::default(),
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -9692,7 +9692,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
-            files: Vec::new(),
+            files: Default::default(),
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();
