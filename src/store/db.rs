@@ -11465,12 +11465,15 @@ const READING_ITEM: &str = "CASE
     THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
     WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
     ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
+/// Each subquery's array is passed through `json()`: a value's JSON subtype
+/// does not reliably survive a subquery (SQLite 3.54 drops it), and without
+/// it `json_set` stores the array as a string.
 const PICTURELESS: &str = "CASE WHEN instr(CAST(item AS TEXT),'image')>0
 THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CAST(item AS TEXT),'$.content')='array'
-    THEN CAST(json_set(CAST(item AS TEXT),'$.content',(SELECT json_group_array(
+    THEN CAST(json_set(CAST(item AS TEXT),'$.content',json((SELECT json_group_array(
         CASE WHEN json_extract(b.value,'$.type')='tool_result'
             AND json_type(b.value,'$.content')='array'
-        THEN json_set(b.value,'$.content',(SELECT json_group_array(CASE
+        THEN json_set(b.value,'$.content',json((SELECT json_group_array(CASE
             WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
             THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
                 '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
@@ -11478,7 +11481,7 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
             THEN json_set(p.value,'$.source.data','',
                 '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
             ELSE json(p.value) END)
-            FROM json_each(b.value,'$.content') AS p))
+            FROM json_each(b.value,'$.content') AS p)))
         ELSE CASE
             WHEN json_extract(b.value,'$.type')='input_image' AND json_extract(b.value,'$.image_url') LIKE 'data:%'
             THEN json_set(b.value,'$.image_url',substr(json_extract(b.value,'$.image_url'),1,instr(json_extract(b.value,'$.image_url'),',')),
@@ -11487,9 +11490,9 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
             THEN json_set(b.value,'$.source.data','',
                 '$.omitted_bytes',length(json_extract(b.value,'$.source.data')))
             ELSE json(b.value) END END)
-        FROM json_each(CAST(item AS TEXT),'$.content') AS b)) AS BLOB)
+        FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN json_extract(CAST(item AS TEXT),'$.type') IN ('function_call_output','custom_tool_call_output') AND json_type(CAST(item AS TEXT),'$.output')='array'
-    THEN CAST(json_set(CAST(item AS TEXT),'$.output',(SELECT json_group_array(CASE
+    THEN CAST(json_set(CAST(item AS TEXT),'$.output',json((SELECT json_group_array(CASE
         WHEN json_extract(p.value,'$.type')='input_image' AND json_extract(p.value,'$.image_url') LIKE 'data:%'
         THEN json_set(p.value,'$.image_url',substr(json_extract(p.value,'$.image_url'),1,instr(json_extract(p.value,'$.image_url'),',')),
             '$.omitted_bytes',length(json_extract(p.value,'$.image_url'))-instr(json_extract(p.value,'$.image_url'),','))
@@ -11497,7 +11500,7 @@ THEN CASE WHEN json_extract(CAST(item AS TEXT),'$.role')='user' AND json_type(CA
         THEN json_set(p.value,'$.source.data','',
             '$.omitted_bytes',length(json_extract(p.value,'$.source.data')))
         ELSE json(p.value) END)
-        FROM json_each(CAST(item AS TEXT),'$.output') AS p)) AS BLOB)
+        FROM json_each(CAST(item AS TEXT),'$.output') AS p))) AS BLOB)
     ELSE item END
 ELSE item END";
 /// The bot's oldest queued turn now waits only for a slot. True when that
