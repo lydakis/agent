@@ -1,8 +1,10 @@
 # Approving tool calls: a manual approver and a fast automatic one
 
 Status: design note, 2026-09-26, revised 2026-09-27. The daemon mechanism,
-manual answering, and serving a tag to one approver are built; the automatic
-approver is not (see [Built so far](#built-so-far)). On 2026-09-27 George
+manual answering, serving a tag to one approver, and the automatic approver
+(`agent approver`, which Sonny keeps running as `sonny approver`) are built;
+[Built so far](#built-so-far) lists where the build differs from the design
+below. On 2026-09-27 George
 decided that `auto` means a model decides every gated call, with no rules
 in front of it: an approver that answers by rules alone is manual mode with
 a program in the person's place, and rules for manual mode are a later
@@ -103,7 +105,11 @@ Code facts at b07080c:
 - **A bot's shell can reach the daemon.** Delegation depends on it: a bot
   runs `agent run --new` from its shell. The creator of a new bot is
   whatever `AGENT_BOT` and `AGENT_BOT_ID` say in that shell
-  (src/client.rs:618), so it is declared, not verified.
+  (src/client.rs:618), so it is declared, not verified. That holds for an
+  unsandboxed bot and for a call allowed to escalate; a sandboxed bot's
+  commands reach only its own socket, which answers as that bot and
+  refuses what would undo its confinement
+  ([sandbox](RUST_PROTOTYPE.md#sandbox)).
 - **Planned but not built:** an allowed-tools list that a fork inherits and
   can only narrow ([FORK_MID_TURN.md](FORK_MID_TURN.md#2-an-optional-allowed-tools-list)).
   Approval sits next to it: that list says which tools may run at all, this
@@ -1018,15 +1024,20 @@ as one.
   approved after the model wrote `script.py` has approved arbitrary code. A
   multi-step chain in which each step looks benign passes any per-call judge
   that cannot see results; that is Rehberger's attack on Claude Code.
-- **A bot can reach the approval channel.** Its shell can call `answer` on
-  its own pending calls, create a bot without the gate, hand its task to
-  an existing bot that has none, submit a message that looks like its
-  caller's consent, or edit the store.
+- **An unsandboxed bot can reach the approval channel.** Its shell can
+  call `answer` on its own pending calls, create a bot without the gate,
+  hand its task to an existing bot that has none, submit a message that
+  looks like its caller's consent, or edit the store. So can a call
+  allowed to escalate out of a sandbox, which runs unconfined.
   The model may catch the obvious forms; a determined command can hide
   them from any text-based judge. Making this a boundary means running the
-  tools where the socket and the store are out of reach, in a container or
-  VM the caller provides. The daemon has no such isolation and the roadmap
-  keeps sandboxing out of scope (NEXT.md).
+  tools where the socket and the store are out of reach. A sandboxed bot
+  ([sandbox](RUST_PROTOTYPE.md#sandbox)) has that: its commands reach the
+  daemon only through its own socket, which refuses `answer`, `configure`
+  and the other requests that would undo its confinement, makes bots that
+  inherit its sandbox and its gates, submits only as itself, and cannot
+  write the store. The roadmap still leaves process isolation beyond
+  that, a container or VM, to the host (NEXT.md).
 - **What it is good for.** Catching the overeager or mistaken action a
   person would have stopped: the deleted branch, the force push, the token
   pasted into a request. Anthropic reports its pipeline let 17% of real
