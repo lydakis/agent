@@ -1079,17 +1079,24 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     let listed = |bots: serde_json::Value| {
         std::fs::write(lab.scratch.join("run.log.ls"), bots.to_string()).unwrap();
     };
-    let lead = serde_json::json!({"name": "demo.lead", "workspace": src});
-    let task = serde_json::json!({"name": "demo.fix", "created_by": "demo.lead",
-        "workspace": fix.join("src")});
+    let lead = serde_json::json!({"name": "demo.lead", "bot_id": 1, "workspace": src});
+    let task = serde_json::json!({"name": "demo.fix", "bot_id": 2, "created_by": "demo.lead",
+        "created_by_id": 1, "workspace": fix.join("src")});
     listed(serde_json::json!([lead, task]));
+    // The lead's setup, which runs outside any sandbox, never runs on the
+    // files a task wrote.
+    let setup = src.join(".agents/setup");
+    std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
+    std::fs::write(&setup, "#!/bin/sh\ntouch ran\n").unwrap();
+    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
     // The lead's task starts a helper from where it works, in its lead's
     // project and repository, on its own branch's last commit.
     *lab.bot.borrow_mut() = "demo.fix".into();
     let brief = format!("review {}", fix.join("src/lib.rs").display());
-    let call = serde_json::json!({"name": "review", "brief": brief});
+    let call = serde_json::json!({"name": "review", "brief": brief, "setup": true});
     let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
+    assert!(said.contains(".agents/setup did not run"), "{said}");
     let review = lab.home.join(".agent/worktrees/demo.review");
     assert_eq!(
         std::fs::read_to_string(review.join("src/lib.rs")).unwrap(),
@@ -1101,6 +1108,7 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
         told,
         format!("review {}", review.join("src/lib.rs").display())
     );
+    assert!(!review.join("src/ran").exists());
     assert_eq!(
         lab.git(&review, &["branch", "--show-current"]),
         "agent/demo.review"
@@ -1108,8 +1116,8 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     let ran = lab.ran();
     assert_eq!(ran[3..5], ["--bot", "demo.review"]);
     // Its helper, two below the lead, starts none of its own.
-    let helper = serde_json::json!({"name": "demo.review", "created_by": "demo.fix",
-        "workspace": review.join("src")});
+    let helper = serde_json::json!({"name": "demo.review", "bot_id": 3, "created_by": "demo.fix",
+        "created_by_id": 2, "workspace": review.join("src")});
     listed(serde_json::json!([lead, task, helper]));
     *lab.bot.borrow_mut() = "demo.review".into();
     let call = serde_json::json!({"name": "deeper", "brief": "b"});
@@ -1134,6 +1142,29 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
     assert!(lab.home.join(".agent/worktrees/demo.deeper").exists());
+    // A side chat of the task starts one on the task's branch too.
+    let side = serde_json::json!({"name": "demo.fix.side-a1", "bot_id": 4,
+        "created_by": "demo.fix", "created_by_id": 2, "expire_ms": 1,
+        "workspace": fix.join("src")});
+    listed(serde_json::json!([lead, task, helper, side]));
+    *lab.bot.borrow_mut() = "demo.fix.side-a1".into();
+    let call = serde_json::json!({"name": "peek", "brief": "b"});
+    let (ok, said) = lab.tool(&fix.join("src"), "start_task", call, false);
+    assert!(ok, "{said}");
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".agent/worktrees/demo.peek/src/lib.rs")).unwrap(),
+        "fixed\n"
+    );
+    // A task that took the name of a removed one owns nothing it made.
+    let renamed = serde_json::json!({"name": "demo.fix", "bot_id": 9,
+        "created_by": "demo.lead", "created_by_id": 1, "workspace": fix.join("src")});
+    listed(serde_json::json!([lead, renamed, helper]));
+    *lab.bot.borrow_mut() = "demo.fix".into();
+    let call = serde_json::json!({"task": "review"});
+    let (ok, said) = lab.tool(&fix.join("src"), "remove_task", call, false);
+    assert!(!ok);
+    assert!(said.contains("not a task you or yours started"), "{said}");
+    listed(serde_json::json!([lead, task, helper]));
     // The task removes the helper it started, from its lead's repository.
     *lab.bot.borrow_mut() = "demo.fix".into();
     let call = serde_json::json!({"task": "review"});
@@ -1155,9 +1186,9 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
     let fix = lab.home.join(".agent/worktrees/demo.fix");
     std::fs::write(fix.join("src/lib.rs"), "fixed\n").unwrap();
     lab.git(&fix, &["commit", "-qam", "fixed"]);
-    let lead = serde_json::json!({"name": "demo.lead", "workspace": ws});
-    let task = serde_json::json!({"name": "demo.fix", "created_by": "demo.lead",
-        "workspace": fix});
+    let lead = serde_json::json!({"name": "demo.lead", "bot_id": 1, "workspace": ws});
+    let task = serde_json::json!({"name": "demo.fix", "bot_id": 5, "created_by": "demo.lead",
+        "created_by_id": 1, "workspace": fix});
     std::fs::write(
         lab.scratch.join("run.log.ls"),
         serde_json::json!([lead, task]).to_string(),
@@ -1188,7 +1219,8 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
     assert!(ok, "{said}");
     assert!(lab.home.join(".agent/worktrees/demo.try").exists());
     // And the task removes its helper from there.
-    let helper = serde_json::json!({"name": "demo.review", "created_by": "demo.fix"});
+    let helper = serde_json::json!({"name": "demo.review", "bot_id": 6, "created_by": "demo.fix",
+        "created_by_id": 5});
     std::fs::write(
         lab.scratch.join("run.log.ls"),
         serde_json::json!([lead, task, helper]).to_string(),

@@ -597,8 +597,9 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 folder: text("folder"),
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
-                // A task's own helper builds on its work.
-                builds_on: (!line.role.lead).then(|| caller.clone()),
+                // A task's own helper builds on its work, a side chat's
+                // on its agent's.
+                builds_on: (!line.role.lead).then(|| line.own.clone()),
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
@@ -629,7 +630,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
             // A lead removes any of its project's; another agent only one
             // of its own line, so no task removes its lead's others.
-            if !line.role.lead && !Line::made(&task, &caller) {
+            if !line.role.lead && !Line::made(&task, &caller) && !Line::made(&task, &line.own) {
                 return Err((
                     "task_not_removed",
                     format!("{task} is not a task you or yours started; ask your lead"),
@@ -788,6 +789,9 @@ struct Line {
     limit: u64,
     folder: PathBuf,
     project: String,
+    /// The agent whose work the caller's is: a side chat's own agent,
+    /// else the caller.
+    own: String,
 }
 
 impl Line {
@@ -796,11 +800,15 @@ impl Line {
     /// daemon's CLI, as the start itself is made.
     fn of(caller: &str, here: &Path) -> Line {
         let limit = depth_limit();
+        let mut own = caller.to_owned();
         let (depth, lead) = match crate::project::is_lead(caller) {
             true => (0, None),
             false => {
                 let record =
                     crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
+                if let Some(source) = crate::side_copy(&record) {
+                    own = source.to_owned();
+                }
                 crate::declared::line_by(&record, limit, |at| {
                     crate::task::record_of_bot(at["created_by"].as_str()?)
                 })
@@ -821,19 +829,35 @@ impl Line {
             limit,
             folder,
             project,
+            own,
         }
     }
 
-    /// Whether `caller` made the agent `task`, or made one that made it.
+    /// Whether `caller` made the agent `task`, or made one that made it:
+    /// by the ids each was made by, so an agent that took the name of a
+    /// removed one owns nothing that one made.
     fn made(task: &str, caller: &str) -> bool {
-        let mut at = task.to_owned();
+        let Some(me) = crate::task::record_of_bot(caller).and_then(|r| r["bot_id"].as_i64()) else {
+            return false;
+        };
+        let Some(mut record) = crate::task::record_of_bot(task) else {
+            return false;
+        };
         for _ in 0..256 {
-            let Some(record) = crate::task::record_of_bot(&at) else {
+            let (Some(by), Some(by_id)) = (
+                record["created_by"].as_str(),
+                record["created_by_id"].as_i64(),
+            ) else {
                 return false;
             };
-            match record["created_by"].as_str() {
-                Some(by) if by == caller => return true,
-                Some(by) if !crate::project::is_lead(by) => at = by.to_owned(),
+            if by_id == me {
+                return true;
+            }
+            if crate::project::is_lead(by) {
+                return false;
+            }
+            match crate::task::record_of_bot(by) {
+                Some(maker) if maker["bot_id"].as_i64() == Some(by_id) => record = maker,
                 _ => return false,
             }
         }

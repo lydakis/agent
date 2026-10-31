@@ -165,8 +165,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         None => None,
     };
     // The worktree of the task a helper builds on, whose files it starts
-    // with as they were at its last commit.
+    // with as they were at its last commit; files a task wrote, as a
+    // fork's are.
     let mut helped = None;
+    let mut written = source.is_some();
     let mut place = match &source {
         Some(source) => forked(&agent, name, source)?,
         None if info["threads_in"] == "project" => in_place(here, name),
@@ -177,6 +179,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             let base = (start.builds_on.as_deref()).and_then(|task| branch_of(&at, task));
             if let (Some(task), Some(_)) = (&start.builds_on, &base) {
                 helped = worktree_of(&at, task);
+                written = true;
             }
             worktree(&at, name, base.as_deref().unwrap_or("HEAD"))?
         }
@@ -296,11 +299,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // Never a repository's inside it: its `.agents`, unlike the lead's, is
     // no more kept from the lead's sandbox than the rest of it, and the
     // script runs outside any.
-    // A fork's files are what a task wrote, so setup never runs on them:
-    // the fork runs it in its own.
+    // A fork's files, and a helper's on its task's branch, are what a
+    // task wrote, so setup never runs on them: the agent runs it in its
+    // own.
     let script = here.join(".agents/setup");
     if start.setup
-        && source.is_some()
+        && written
         && script.exists()
         && let Some(note) = place.note.as_mut()
     {
@@ -309,7 +313,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
              run it there if the work needs it",
         );
     }
-    if start.setup && source.is_none() && place.dir != at && script.exists() {
+    if start.setup && !written && place.dir != at && script.exists() {
         // Its output is not kept, however long a build runs: only the last
         // lines of its errors, which a failure shows.
         let mut setup = Command::new(&script);
@@ -340,9 +344,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     }
     // A new worktree takes clones of the lead's build folders only once
     // setup has run: setup runs outside any sandbox and must not run what
-    // the lead's folders hold. A fork takes none: Sonny writes nothing of
-    // its own among files a task wrote, whose links could lead it out.
-    if let (Undo::Worktree { path, .. }, Some((top, _)), None) = (&place.undo, &place.copy, &source)
+    // the lead's folders hold. A fork or a task's helper takes none: Sonny
+    // writes nothing of its own among files a task wrote, whose links
+    // could lead it out.
+    if let (Undo::Worktree { path, .. }, Some((top, _)), false) =
+        (&place.undo, &place.copy, written)
     {
         let seeded = crate::seed::seed(top, path);
         // Named so the person knows why the first build is quicker.
