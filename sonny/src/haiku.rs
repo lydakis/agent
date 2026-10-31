@@ -89,9 +89,22 @@ impl Title {
         }
     }
 
-    /// `at` sent or was told a message, or called a tool.
+    /// `at` sent or was told a message, or called a tool. Nothing is kept
+    /// when no haiku is written, nor past the window.
     pub fn note(&mut self, now: Instant, name: &str) {
+        if self.rule.daily == 0 {
+            return;
+        }
+        self.forget(now);
         self.busy.push_back((now, name.to_owned()));
+    }
+
+    /// Let go of what is older than the window.
+    fn forget(&mut self, now: Instant) {
+        let window = self.rule.window;
+        while (self.busy.front()).is_some_and(|(at, _)| now.duration_since(*at) > window) {
+            self.busy.pop_front();
+        }
     }
 
     /// Who the title passes to now, if it passes: the busiest, when it is
@@ -99,9 +112,7 @@ impl Title {
     /// `gone` says who is no longer here, whose title is free.
     pub fn crown(&mut self, now: Instant, gone: impl Fn(&str) -> bool) -> Option<String> {
         let window = self.rule.window;
-        while (self.busy.front()).is_some_and(|(at, _)| now.duration_since(*at) > window) {
-            self.busy.pop_front();
-        }
+        self.forget(now);
         if self.holder.as_ref().is_some_and(|(name, _)| gone(name)) {
             self.holder = None;
         }
@@ -176,7 +187,28 @@ impl Kept {
         }
     }
 
-    pub fn save(&self) {
+    /// Read, change and write the file for `socket` as one step, no other
+    /// sky reading or writing it between: what `change` returns, and the
+    /// file as it then is.
+    pub fn update<T>(socket: &Path, change: impl FnOnce(&mut Kept) -> T) -> (T, Kept) {
+        // Held until the end of the step, and let go as the file closes.
+        let _lock = home().and_then(|home| {
+            let lock = file(&home).with_extension("json.lock");
+            std::fs::create_dir_all(lock.parent()?).ok()?;
+            let lock = (std::fs::OpenOptions::new().create(true).truncate(false))
+                .write(true)
+                .open(lock)
+                .ok()?;
+            lock.lock().ok()?;
+            Some(lock)
+        });
+        let mut kept = Kept::load(socket);
+        let changed = change(&mut kept);
+        kept.save();
+        (changed, kept)
+    }
+
+    fn save(&self) {
         let Some(home) = home() else {
             return;
         };
@@ -357,6 +389,35 @@ mod tests {
             title.crown(at(1803), |name| name == "a"),
             Some("b".to_owned())
         );
+    }
+
+    #[test]
+    fn the_title_keeps_no_more_than_its_window_and_nothing_when_off() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut title = Title::new(rule(), start);
+        for s in 0..100 {
+            title.note(at(s * 60), "a");
+        }
+        assert!(title.busy.len() <= 11, "{}", title.busy.len());
+        let mut off = Title::new(Rule { daily: 0, ..rule() }, start);
+        off.note(at(1), "a");
+        assert!(off.busy.is_empty());
+    }
+
+    #[test]
+    fn a_claim_is_read_counted_and_written_as_one_step() {
+        let rule = Rule { daily: 1, ..rule() };
+        let socket = Path::new("/tmp/agent-claim.sock");
+        let ms = 1_793_400_000_000;
+        let (first, kept) = Kept::update(socket, |kept| kept.claim(&rule, "a", ms, ms));
+        assert!(first);
+        assert_eq!(kept.written, 1);
+        // Another sky, after: the file already counts the first.
+        let (second, _) = Kept::update(socket, |kept| kept.claim(&rule, "b", ms + 1, ms + 1));
+        assert!(!second);
+        assert_eq!(Kept::load(socket).by, "a");
+        let _ = std::fs::remove_dir_all(home().unwrap());
     }
 
     #[test]
