@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-readers --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -346,7 +346,10 @@ fn print_flags(flags: &str) {
                 "The tools a fork may call, within its source's; '' allows none; default: the source's",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
-            "--max-detached" => ("N", "Detached commands still running; 0 is unbounded"),
+            "--max-lasting" => (
+                "N",
+                "Terminals and detached commands still running; 0 is unbounded",
+            ),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),

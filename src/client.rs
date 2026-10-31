@@ -334,7 +334,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.timeout_ms = Some(crate::cli::duration_ms(flag, &value)?)
                     }
                     "--max-processes"
-                    | "--max-detached"
+                    | "--max-lasting"
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-pending"
@@ -742,7 +742,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
     for (flag, value) in &options.daemon_flags {
         let key = match flag.as_str() {
             "--max-processes" => "processes",
-            "--max-detached" => "detached",
+            "--max-lasting" => "lasting",
             "--max-active" => "active",
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",

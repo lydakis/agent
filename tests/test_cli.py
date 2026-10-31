@@ -499,7 +499,7 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
-                             (('--max-detached', '2'), '--max-detached'),
+                             (('--max-lasting', '2'), '--max-lasting'),
                              (('--max-pending', '5'), '--max-pending')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
