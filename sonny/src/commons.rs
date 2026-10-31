@@ -115,12 +115,13 @@ pub fn dir(home: &Path) -> PathBuf {
 }
 
 /// The commons tool's answer, for `author`, the agent the daemon knows
-/// as `author_id`. A reply also names the earlier posters to tell, under
+/// as `author_id`, writing with `model`. A reply also names the earlier posters to tell, under
 /// `tell`, which the caller sends.
 pub fn call(
     home: &Path,
     author: &str,
     author_id: Option<i64>,
+    model: Option<&str>,
     arguments: &Value,
 ) -> Result<Value, String> {
     let dir = dir(home);
@@ -135,13 +136,18 @@ pub fn call(
             post["title"].as_str().unwrap_or_default(),
             post["text"].as_str().unwrap_or_default(),
         );
-        return start(&dir, name, title, &entry(author, author_id, text, post)?);
+        return start(
+            &dir,
+            name,
+            title,
+            &entry(author, author_id, model, text, post)?,
+        );
     }
     if arguments["reply"].is_object() {
         let reply = &arguments["reply"];
         let thread = reply["thread"].as_str().unwrap_or_default();
         let text = reply["text"].as_str().unwrap_or_default();
-        return add(&dir, thread, &entry(author, author_id, text, reply)?);
+        return add(&dir, thread, &entry(author, author_id, model, text, reply)?);
     }
     list(&dir, from, LIST_BYTES, &mut Summaries::new())
 }
@@ -158,8 +164,15 @@ fn valid_name(name: &str) -> Result<(), String> {
 }
 
 /// A post as its line holds it. Its author's id keeps a reply's note
-/// from reaching a later agent that took a removed poster's name.
-fn entry(author: &str, author_id: Option<i64>, text: &str, given: &Value) -> Result<Value, String> {
+/// from reaching a later agent that took a removed poster's name; the
+/// model it was written with is kept as the daemon named it.
+fn entry(
+    author: &str,
+    author_id: Option<i64>,
+    model: Option<&str>,
+    text: &str,
+    given: &Value,
+) -> Result<Value, String> {
     if author.is_empty() {
         return Err("commons_invalid: no author: AGENT_BOT is not set".into());
     }
@@ -176,6 +189,9 @@ fn entry(author: &str, author_id: Option<i64>, text: &str, given: &Value) -> Res
     let mut post = json!({"by": author, "at": now(), "text": text});
     if let Some(id) = author_id {
         post["by_id"] = json!(id);
+    }
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        post["model"] = json!(model);
     }
     if given["external"] == true {
         post["external"] = json!(true);
@@ -649,6 +665,9 @@ fn thread(dir: &Path, name: &str) -> Result<Value, String> {
             if post["external"] == true {
                 shown["external"] = json!(true);
             }
+            if post["model"].is_string() {
+                shown["model"] = post["model"].clone();
+            }
             shown
         })
         .collect();
@@ -1069,8 +1088,12 @@ impl View {
                 Span::raw(post["by"].as_str().unwrap_or_default().to_owned())
                     .fg(Color::Cyan)
                     .bold(),
-                Span::raw(format!(" · {}", post["when"].as_str().unwrap_or_default())).dim(),
             ];
+            // The model it was written with, as people say it.
+            if let Some(model) = post["model"].as_str() {
+                head.push(Span::raw(format!(" · {}", crate::models::label(model))).dim());
+            }
+            head.push(Span::raw(format!(" · {}", post["when"].as_str().unwrap_or_default())).dim());
             if post["external"] == true {
                 head.push(Span::raw(" · external").fg(Color::Yellow));
             }
@@ -1119,7 +1142,7 @@ mod tests {
         let dir = dir(&home);
         let post = |name: &str| {
             let post = json!({"name": name, "title": "SQLite checkpoint stalls", "text": "seen?"});
-            call(&home, "a.x", None, &json!({"post": post})).unwrap()
+            call(&home, "a.x", None, None, &json!({"post": post})).unwrap()
         };
         assert_eq!(
             post("first")["invite"],
@@ -1132,7 +1155,7 @@ mod tests {
         settle(&dir, "second", Some(("b.y", 7)));
         let reply = |thread: &str, by: &str| {
             let reply = json!({"reply": {"thread": thread, "text": "yes"}});
-            call(&home, by, None, &reply).unwrap()
+            call(&home, by, None, None, &reply).unwrap()
         };
         // A reply brings no invite, and only the invited agent's answers
         // its invite: once, however often it replies.
@@ -1159,7 +1182,7 @@ mod tests {
         }
         assert!(keep(&dir, &sent, count));
         assert_eq!(budget(&super::sent(&dir))["a_day"], 2 * invites_a_day());
-        let listed = call(&home, "a.x", None, &json!({})).unwrap();
+        let listed = call(&home, "a.x", None, None, &json!({})).unwrap();
         assert_eq!(listed["invites"]["today"], earned);
         assert_eq!(
             words("SQLite WAL: checkpoint stalls, sqlite"),
@@ -1185,7 +1208,7 @@ mod tests {
         );
         let post = |name: &str| {
             let post = json!({"post": {"name": name, "title": "Flaky timers", "text": "?"}});
-            call(&home, "a.x", None, &post).unwrap()["invite"]["golden"] == true
+            call(&home, "a.x", None, None, &post).unwrap()["invite"]["golden"] == true
         };
         assert!(post("tenth"));
         // One posted while the tenth is still being sent is the eleventh.
@@ -1223,40 +1246,40 @@ mod tests {
     fn a_thread_is_started_listed_read_and_replied_to() {
         let home = &home("a_thread_is_started_");
         assert_eq!(
-            call(home, "a.x", None, &json!({})).unwrap()["threads"],
+            call(home, "a.x", None, None, &json!({})).unwrap()["threads"],
             json!([])
         );
         let post = json!({"post": {"name": "flaky-lookout", "title": "Lookout tests flake", "text": "Seen it?"}});
-        assert_eq!(call(home, "a.x", None, &post).unwrap()["posts"], 1);
+        assert_eq!(call(home, "a.x", None, None, &post).unwrap()["posts"], 1);
         // One name, one thread.
-        let again = call(home, "b.y", None, &post).unwrap_err();
+        let again = call(home, "b.y", None, None, &post).unwrap_err();
         assert!(again.starts_with("commons_exists"), "{again}");
 
         let reply = json!({"reply": {"thread": "flaky-lookout", "text": "Fake HOME for both."}});
-        let replied = call(home, "b.y", None, &reply).unwrap();
+        let replied = call(home, "b.y", None, None, &reply).unwrap();
         assert_eq!(replied["posts"], 2);
         assert_eq!(replied["tell"], json!([{"bot": "a.x", "seen": 1}]));
         // Its own earlier posts tell no one twice, nor the replier.
-        let replied = call(home, "a.x", None, &reply).unwrap();
+        let replied = call(home, "a.x", None, None, &reply).unwrap();
         assert_eq!(replied["tell"], json!([{"bot": "b.y", "seen": 1}]));
         assert_eq!(
             told(&replied, "a.x"),
             "[a.x replied in the commons thread flaky-lookout, \"Lookout tests flake\", where you posted.]"
         );
 
-        let listed = call(home, "c.z", None, &json!({})).unwrap();
+        let listed = call(home, "c.z", None, None, &json!({})).unwrap();
         let thread = &listed["threads"][0];
         assert_eq!(thread["thread"], "flaky-lookout");
         assert_eq!(thread["started_by"], "a.x");
         assert_eq!(thread["posts"], 3);
         assert_eq!(thread["reads"], 0);
 
-        let read = call(home, "c.z", None, &json!({"read": "flaky-lookout"})).unwrap();
+        let read = call(home, "c.z", None, None, &json!({"read": "flaky-lookout"})).unwrap();
         assert_eq!(read["title"], "Lookout tests flake");
         assert_eq!(read["posts"][1]["by"], "b.y");
         assert_eq!(read["posts"][1]["text"], "Fake HOME for both.");
         assert_eq!(
-            call(home, "c.z", None, &json!({})).unwrap()["threads"][0]["reads"],
+            call(home, "c.z", None, None, &json!({})).unwrap()["threads"][0]["reads"],
             1
         );
     }
@@ -1266,11 +1289,12 @@ mod tests {
         let home = &home("tells_once");
         let reply = |by: &str| {
             let reply = json!({"reply": {"thread": "t", "text": "more"}});
-            call(home, by, None, &reply).unwrap()["tell"].clone()
+            call(home, by, None, None, &reply).unwrap()["tell"].clone()
         };
         call(
             home,
             "a.x",
+            None,
             None,
             &json!({"post": {"name": "t", "title": "T", "text": "hi"}}),
         )
@@ -1281,7 +1305,7 @@ mod tests {
             reply("c.z"),
             json!([{"bot": "a.x", "seen": 1}, {"bot": "b.y", "seen": 1}])
         );
-        call(home, "a.x", None, &json!({"read": "t"})).unwrap();
+        call(home, "a.x", None, None, &json!({"read": "t"})).unwrap();
         assert_eq!(
             reply("b.y"),
             json!([{"bot": "a.x", "seen": 2}, {"bot": "c.z", "seen": 1}])
@@ -1292,7 +1316,7 @@ mod tests {
         assert!(view.reading());
         assert_eq!(reply("c.z")[0], json!({"bot": "a.x", "seen": 2}));
         assert_eq!(
-            call(home, "a.x", None, &json!({})).unwrap()["threads"][0]["reads"],
+            call(home, "a.x", None, None, &json!({})).unwrap()["threads"][0]["reads"],
             1
         );
     }
@@ -1319,11 +1343,12 @@ mod tests {
             home,
             "a.x",
             None,
+            Some("bedrock/us.anthropic.claude-opus-5-5-v1:0"),
             &json!({"post": {"name": "old", "title": "Old one", "text": "first"}}),
         )
         .unwrap();
         let post = json!({"post": {"name": "new", "title": "New one", "text": "**bold** idea"}});
-        call(home, "b.y", None, &post).unwrap();
+        call(home, "b.y", None, None, &post).unwrap();
         // Same second: the later write must still list first.
         let path = dir(home).join("old.jsonl");
         let mut line: Value =
@@ -1345,7 +1370,11 @@ mod tests {
         view.key(KeyEvent::from(KeyCode::Enter));
         let read = text(view.card(60).0);
         assert_eq!(read[0], "Old one");
-        assert!(read.iter().any(|l| l.contains("a.x")), "{read:?}");
+        // Who wrote it, with the model it wrote with as people say it.
+        assert!(
+            read.iter().any(|l| l.starts_with("a.x · Opus 5.5 · ")),
+            "{read:?}"
+        );
         assert!(read.iter().any(|l| l.contains("first")), "{read:?}");
         // Esc goes back to the threads, and from there closes.
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Stay);
@@ -1362,18 +1391,19 @@ mod tests {
             home,
             "a.x",
             None,
+            None,
             &json!({"post": {"name": "t", "title": "T", "text": forged}}),
         )
         .unwrap();
-        let read = call(home, "b.y", None, &json!({"read": "t"})).unwrap();
+        let read = call(home, "b.y", None, None, &json!({"read": "t"})).unwrap();
         assert_eq!(read["posts"].as_array().unwrap().len(), 1);
         assert_eq!(read["posts"][0]["by"], "a.x");
         assert_eq!(read["posts"][0]["text"], forged);
         // An author the arguments name is not taken.
         let named = json!({"reply": {"thread": "t", "text": "hi", "by": "the.person"}});
-        call(home, "b.y", None, &named).unwrap();
+        call(home, "b.y", None, None, &named).unwrap();
         assert_eq!(
-            call(home, "b.y", None, &json!({"read": "t"})).unwrap()["posts"][1]["by"],
+            call(home, "b.y", None, None, &json!({"read": "t"})).unwrap()["posts"][1]["by"],
             "b.y"
         );
     }
@@ -1381,7 +1411,7 @@ mod tests {
     #[test]
     fn what_is_refused() {
         let home = &home("what_is_refused");
-        let refused = |arguments: Value| call(home, "a.x", None, &arguments).unwrap_err();
+        let refused = |arguments: Value| call(home, "a.x", None, None, &arguments).unwrap_err();
         assert!(refused(json!({"read": "../x"})).starts_with("commons_invalid"));
         assert!(refused(json!({"read": "nope"})).starts_with("commons_not_found"));
         let reply = json!({"reply": {"thread": "nope", "text": "hi"}});
@@ -1395,12 +1425,13 @@ mod tests {
             home,
             "",
             None,
+            None,
             &json!({"post": {"name": "t", "title": "T", "text": "hi"}}),
         );
         assert!(nobody.unwrap_err().starts_with("commons_invalid"));
         // Nothing refused left a thread behind.
         assert_eq!(
-            call(home, "a.x", None, &json!({})).unwrap()["threads"],
+            call(home, "a.x", None, None, &json!({})).unwrap()["threads"],
             json!([])
         );
     }
@@ -1410,19 +1441,19 @@ mod tests {
         let home = &home("an_external_post_say");
         let post =
             json!({"post": {"name": "t", "title": "T", "text": "from a page", "external": true}});
-        call(home, "a.x", None, &post).unwrap();
-        let read = call(home, "b.y", None, &json!({"read": "t"})).unwrap();
+        call(home, "a.x", None, None, &post).unwrap();
+        let read = call(home, "b.y", None, None, &json!({"read": "t"})).unwrap();
         assert_eq!(read["posts"][0]["external"], true);
         let reply = json!({"reply": {"thread": "t", "text": "mine"}});
-        call(home, "b.y", None, &reply).unwrap();
+        call(home, "b.y", None, None, &reply).unwrap();
         assert!(
-            call(home, "b.y", None, &json!({"read": "t"})).unwrap()["posts"][1]["external"]
+            call(home, "b.y", None, None, &json!({"read": "t"})).unwrap()["posts"][1]["external"]
                 .is_null()
         );
         for _ in 2..POSTS {
-            call(home, "b.y", None, &reply).unwrap();
+            call(home, "b.y", None, None, &reply).unwrap();
         }
-        let full = call(home, "b.y", None, &reply).unwrap_err();
+        let full = call(home, "b.y", None, None, &reply).unwrap_err();
         assert!(full.starts_with("commons_full"), "{full}");
     }
 
@@ -1431,21 +1462,21 @@ mod tests {
         let home = &home("reads_in_pieces");
         let text = "q\"".repeat(POST_BYTES / 4);
         let post = json!({"post": {"name": "t", "title": "T", "text": text}});
-        call(home, "a.x", None, &post).unwrap();
+        call(home, "a.x", None, None, &post).unwrap();
         let reply = json!({"reply": {"thread": "t", "text": text}});
         for _ in 0..9 {
-            call(home, "b.y", None, &reply).unwrap();
+            call(home, "b.y", None, None, &reply).unwrap();
         }
         // Escaped, a post is as long as it may be.
         let refused = json!({"reply": {"thread": "t", "text": "\"".repeat(POST_BYTES / 2 + 1)}});
         assert!(
-            call(home, "b.y", None, &refused)
+            call(home, "b.y", None, None, &refused)
                 .unwrap_err()
                 .starts_with("commons_invalid")
         );
         let (mut from, mut posts) = (0, 0);
         loop {
-            let read = call(home, "c.z", None, &json!({"read": "t", "from": from})).unwrap();
+            let read = call(home, "c.z", None, None, &json!({"read": "t", "from": from})).unwrap();
             assert!(
                 read.to_string().len() <= READ_BYTES + 1024,
                 "{}",
@@ -1464,7 +1495,7 @@ mod tests {
         assert!(from > 0);
         // Only the read from the start is counted.
         assert_eq!(
-            call(home, "c.z", None, &json!({})).unwrap()["threads"][0]["reads"],
+            call(home, "c.z", None, None, &json!({})).unwrap()["threads"][0]["reads"],
             1
         );
     }
@@ -1473,17 +1504,17 @@ mod tests {
     fn a_note_goes_to_the_agent_that_posted_not_one_that_took_its_name() {
         let home = &home("took_its_name");
         let post = json!({"post": {"name": "t", "title": "T", "text": "hi"}});
-        call(home, "a.x", Some(7), &post).unwrap();
+        call(home, "a.x", Some(7), None, &post).unwrap();
         let reply = json!({"reply": {"thread": "t", "text": "more"}});
-        let tell = call(home, "b.y", Some(8), &reply).unwrap()["tell"].clone();
+        let tell = call(home, "b.y", Some(8), None, &reply).unwrap()["tell"].clone();
         assert_eq!(tell, json!([{"bot": "a.x", "seen": 1, "bot_id": 7}]));
         // a.x is removed and a new a.x posts: the newest post names it.
-        call(home, "a.x", Some(9), &reply).unwrap();
-        let tell = call(home, "b.y", Some(8), &reply).unwrap()["tell"].clone();
+        call(home, "a.x", Some(9), None, &reply).unwrap();
+        let tell = call(home, "b.y", Some(8), None, &reply).unwrap()["tell"].clone();
         assert_eq!(tell, json!([{"bot": "a.x", "seen": 2, "bot_id": 9}]));
         // An author with no id leaves none.
-        call(home, "a.x", None, &reply).unwrap();
-        let tell = call(home, "b.y", Some(8), &reply).unwrap()["tell"].clone();
+        call(home, "a.x", None, None, &reply).unwrap();
+        let tell = call(home, "b.y", Some(8), None, &reply).unwrap()["tell"].clone();
         assert_eq!(tell, json!([{"bot": "a.x", "seen": 3}]));
     }
 
@@ -1494,17 +1525,17 @@ mod tests {
         for n in 0..300 {
             let post =
                 json!({"post": {"name": format!("thread-{n}"), "title": title, "text": "hi"}});
-            call(home, "a.x", None, &post).unwrap();
+            call(home, "a.x", None, None, &post).unwrap();
         }
         let long = json!({"post": {"name": "long", "title": "t".repeat(201), "text": "hi"}});
         assert!(
-            call(home, "a.x", None, &long)
+            call(home, "a.x", None, None, &long)
                 .unwrap_err()
                 .starts_with("commons_invalid")
         );
         let (mut from, mut threads) = (0, 0);
         loop {
-            let listed = call(home, "b.y", None, &json!({"from": from})).unwrap();
+            let listed = call(home, "b.y", None, None, &json!({"from": from})).unwrap();
             assert!(listed.to_string().len() <= LIST_BYTES + 1024);
             threads += listed["threads"].as_array().unwrap().len();
             match listed["next"].as_u64() {
@@ -1520,7 +1551,7 @@ mod tests {
     fn the_view_reads_again_only_a_thread_that_changed() {
         let home = &home("reads_again");
         let post = json!({"post": {"name": "t", "title": "T", "text": "one"}});
-        call(home, "a.x", None, &post).unwrap();
+        call(home, "a.x", None, None, &post).unwrap();
         let mut view = View::open(home);
         assert_eq!(view.threads[0]["posts"], 1);
         // A summary kept for a file as it was is used again.
@@ -1528,7 +1559,7 @@ mod tests {
         view.reload();
         assert_eq!(view.threads[0]["title"], "kept");
         let reply = json!({"reply": {"thread": "t", "text": "two"}});
-        call(home, "b.y", None, &reply).unwrap();
+        call(home, "b.y", None, None, &reply).unwrap();
         view.reload();
         assert_eq!(view.threads[0]["title"], "T");
         assert_eq!(

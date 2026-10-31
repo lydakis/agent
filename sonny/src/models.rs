@@ -129,9 +129,128 @@ impl Picker {
     }
 }
 
+/// A model as people say it, from the id a daemon or provider gives:
+/// `bedrock/us.anthropic.claude-opus-5-5-v1:0` is `Opus 5.5` and
+/// `openai/gpt-6.1-sol` is `GPT 6.1 Sol`, as Claude Code's and Codex's
+/// pickers show names, not ids. The provider, a region and the vendor go,
+/// with `claude-`, a date, a version suffix (`-v1:0`) and a window
+/// (`[1m]`); version numbers join with dots and words take capitals.
+pub fn label(model: &str) -> String {
+    const PREFIXES: [&str; 17] = [
+        "us",
+        "eu",
+        "apac",
+        "global",
+        "jp",
+        "au",
+        "ca",
+        "anthropic",
+        "openai",
+        "meta",
+        "amazon",
+        "mistral",
+        "cohere",
+        "ai21",
+        "deepseek",
+        "qwen",
+        "google",
+    ];
+    let mut id = model.rsplit_once('/').map_or(model, |(_, id)| id);
+    id = id.split('[').next().unwrap_or(id);
+    while let Some((first, rest)) = id.split_once('.')
+        && PREFIXES.contains(&first)
+    {
+        id = rest;
+    }
+    // A Bedrock version, `-v1:0` or `-1:0`.
+    if let Some((rest, version)) = id.rsplit_once('-')
+        && version.contains(':')
+    {
+        id = rest;
+    }
+    let claude = id.strip_prefix("claude-");
+    let mut words: Vec<&str> = claude
+        .unwrap_or(id)
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .collect();
+    // A date: `20250929`, or `2025-09-29`; or `latest`.
+    let digits = |w: &str, n: usize| w.len() == n && w.bytes().all(|b| b.is_ascii_digit());
+    if words.last().is_some_and(|w| digits(w, 8) || *w == "latest") {
+        words.pop();
+    }
+    if let [.., y, m, d] = words[..]
+        && digits(y, 4)
+        && digits(m, 2)
+        && digits(d, 2)
+    {
+        words.truncate(words.len() - 3);
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut joining = false;
+    for word in words {
+        let number = (1..=2).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_digit());
+        if number
+            && joining
+            && let Some(last) = out.last_mut()
+        {
+            last.push('.');
+            last.push_str(word);
+            continue;
+        }
+        joining = number;
+        out.push(match word {
+            "gpt" | "oss" => word.to_uppercase(),
+            // `o3`, `4o`, `120b` stay as they are written.
+            _ if word.bytes().any(|b| b.is_ascii_digit()) => word.to_owned(),
+            _ => {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(chars).collect()
+                })
+            }
+        });
+    }
+    // An old Claude id names its version before its kind.
+    if claude.is_some()
+        && out
+            .first()
+            .is_some_and(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        out.insert(0, "Claude".into());
+    }
+    match out.is_empty() {
+        true => model.to_owned(),
+        false => out.join(" "),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_is_named_as_people_say_it() {
+        for (id, said) in [
+            ("bedrock/us.anthropic.claude-opus-5-5-v1:0", "Opus 5.5"),
+            ("anthropic/claude-opus-5-5", "Opus 5.5"),
+            ("claude-opus-4-8[1m]", "Opus 4.8"),
+            (
+                "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "Sonnet 4.5",
+            ),
+            ("anthropic/claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+            ("openai/gpt-6.1-sol", "GPT 6.1 Sol"),
+            ("chatgpt/gpt-5.1-codex-max", "GPT 5.1 Codex Max"),
+            ("bedrock/openai.gpt-oss-120b-1:0", "GPT OSS 120b"),
+            ("openai/o3", "o3"),
+            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+            ("demo/scripted", "Scripted"),
+            ("gpt-4o-2024-08-06", "GPT 4o"),
+        ] {
+            assert_eq!(label(id), said, "{id}");
+        }
+    }
     use serde_json::json;
 
     #[test]
