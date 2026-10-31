@@ -144,13 +144,16 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
                     }
             }),
             output::encoded_len(&(bot, created_by)),
-            // The workspace and the writable folders, canonical, which the
-            // reply's settings repeat; a bot a sandboxed bot makes can take
-            // its creator's.
+            // The workspace, the writable folders and the Unix sockets,
+            // canonical, which the reply's settings repeat; a bot a
+            // sandboxed bot makes can take its creator's.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => FOLDERS_JSON,
-                    None => (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON),
+                    Some(_) => 2 * FOLDERS_JSON,
+                    None => {
+                        (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
+                            + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
+                    }
                 },
             // Both the bot and its event carry its gates, most of them
             // inherited from its creator, so the command does not show
@@ -975,11 +978,10 @@ fn confine(settings: &mut Settings) -> Result<()> {
     }
     settings.writable.sort();
     settings.writable.dedup();
-    // By its real path, as Seatbelt matches it, while it is there: a
-    // socket comes and goes with its program.
+    // By its real path, as Seatbelt matches it: a socket comes and goes
+    // with its program, so what of it is there, and the rest as written.
     for path in &mut settings.unix_sockets {
-        if let Some(real) = std::fs::canonicalize(&*path)
-            .ok()
+        if let Some(real) = agent_runtime::sandbox::real(std::path::Path::new(&*path))
             .and_then(|real| real.to_str().map(str::to_owned))
         {
             *path = real;
@@ -6693,6 +6695,16 @@ mod tests {
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
         }
+        // Its sockets as many as it may name, each escaped in JSON, where a
+        // sandbox can run.
+        if agent_runtime::sandbox::available().is_ok()
+            && let Command::Create { settings, .. } = &mut create
+        {
+            settings.sandbox = Some(agent_runtime::sandbox::Mode::ReadOnly);
+            settings.unix_sockets = (0..64)
+                .map(|i| format!("/{i}{}", "\u{1}".repeat(80)))
+                .collect();
+        }
         // A creator carrying every gate a bot may, each at its limits, which
         // the command creating its child does not show.
         let tools = ["echo".to_owned()];
@@ -6760,6 +6772,10 @@ mod tests {
             assert_eq!(deferred.unwrap_err().code, "deferred");
             let (_, _, _, result) = service.settle().await;
             let reply = json!({"id": id, "result": result.unwrap()});
+            if reply["result"]["name"] == "Bot" && agent_runtime::sandbox::available().is_ok() {
+                let sockets = &reply["result"]["settings"]["unix_sockets"];
+                assert_eq!(sockets.as_array().map(Vec::len), Some(64));
+            }
             let event = loop {
                 // The gated creators' own events come first.
                 if let Publication::Event(entry) = publications.recv().await.unwrap()

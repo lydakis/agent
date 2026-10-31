@@ -420,15 +420,24 @@ fn confined(fields: Value) -> Map<String, Value> {
     }
 }
 
-/// `paths` as the daemon keeps a bot's Unix sockets: by their real paths
-/// while they are there, as written while they aren't, since a socket
+/// `paths` as the daemon keeps a bot's Unix sockets: by their real paths,
+/// what of each is there resolved and the rest as written, since a socket
 /// comes and goes with its program, sorted, and each once.
 fn sockets(paths: &[String]) -> Vec<String> {
     let mut paths: Vec<String> = (paths.iter())
         .map(|path| {
-            (std::fs::canonicalize(path).ok())
+            let path = std::path::Path::new(path);
+            (path.ancestors())
+                .find_map(|there| {
+                    let real = std::fs::canonicalize(there).ok()?;
+                    let rest = path.strip_prefix(there).ok()?;
+                    Some(match rest.as_os_str().is_empty() {
+                        true => real,
+                        false => real.join(rest),
+                    })
+                })
                 .and_then(|real| real.to_str().map(str::to_owned))
-                .unwrap_or_else(|| path.clone())
+                .unwrap_or_else(|| path.display().to_string())
         })
         .collect();
     paths.sort();
@@ -989,6 +998,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("run")).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         let run = dir.join("run").display().to_string();
+        // A socket not made yet, behind a link, as macOS's /tmp is.
+        std::os::unix::fs::symlink(&run, dir.join("link")).unwrap();
         let sonny = agent_client::config::Sonny {
             permissions: std::collections::BTreeMap::from([(
                 "docker".to_owned(),
@@ -1002,6 +1013,7 @@ mod tests {
                     // wherever Sonny runs is never taken.
                     unix_sockets: vec![
                         "/not/there.sock".into(),
+                        format!("{}/later/x.sock", dir.join("link").display()),
                         format!("{run}/../run"),
                         "docker.sock".into(),
                     ],
@@ -1013,7 +1025,10 @@ mod tests {
         let modes = modes_of(&sonny);
         let docker = modes.iter().find(|mode| mode.name == "docker").unwrap();
         let fields = fields(docker, &dir, &[]);
-        assert_eq!(fields["unix_sockets"], json!(["/not/there.sock", run]));
+        assert_eq!(
+            fields["unix_sockets"],
+            json!(["/not/there.sock", run, format!("{run}/later/x.sock")])
+        );
         let gates = json!([{"tag": "auto", "tools": ["shell"]}]);
         let record = json!({"gates": gates, "workspace": dir, "settings": fields});
         assert_eq!(mode_in(&record, &modes), Some("docker"));

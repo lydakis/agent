@@ -647,7 +647,7 @@ fn depth(path: &Path) -> usize {
 /// appended; `None` when the rest climbs out with `..`, which can't be
 /// known without making it. A symlink whose target is missing is followed
 /// to that target, as a write through it would be.
-fn real(path: &Path) -> Option<PathBuf> {
+pub fn real(path: &Path) -> Option<PathBuf> {
     real_within(path, 40)
 }
 
