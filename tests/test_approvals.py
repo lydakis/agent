@@ -243,9 +243,10 @@ class ApprovalTests(ModelFixture):
         daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell',
                               settings={'sandbox': 'workspace-write'})
         self.addCleanup(daemon.close)
-        # Bob's own tool a client answers, gated as a whole, which it passes on.
+        # Bob's own tool a client answers, gated as a whole, which it passes on
+        # two generations down.
         run = {'name': 'run', 'description': 'Run.', 'parameters': {'type': 'object'}, 'answered_by': 'client'}
-        daemon.request('create', bot='Bob', workspace=str(self.path), declare=[run])
+        daemon.request('create', bot='Bob', workspace=str(self.path), declare=[dict(run, inherit=2)])
         daemon.request('create', bot='Alice', workspace=str(outside), settings={})
         # Another sandboxed bot, whose own socket is open once it has run a
         # command.
@@ -278,7 +279,9 @@ class ApprovalTests(ModelFixture):
             dict(op='fork', source='Src', bot='Twin', request_id='twin'),
             dict(op='delete', bot='Src'),
             dict(op='fork', source='Src', bot='Twin', request_id='twin'),
-            dict(child, bot='Runner', workspace=str(self.path / 'kid'), declare=[run]),
+            dict(child, bot='Runner', workspace=str(self.path / 'kid'), declare=[dict(run, inherit=1)]),
+            dict(child, bot='Deeper', workspace=str(self.path / 'kid'), declare=[dict(run, inherit=2)]),
+            dict(child, bot='Endless', workspace=str(self.path / 'kid'), declare=[run]),
             dict(child, bot='Stepper', workspace=str(self.path / 'kid'), declare=[dict(run, steps=True)]),
             dict(op='resume'),
         ]
@@ -316,11 +319,14 @@ class ApprovalTests(ModelFixture):
         # Nor reach another bot's, which would answer as that bot.
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
-         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, stepper, resume) = probed['answers']
+         ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, deeper, endless, stepper,
+         resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
-        # Passed on as it has it, not as a tool whose steps alone are gated.
+        # Passed on as it has it, not as a tool whose steps alone are gated,
+        # and no further down than it goes.
         self.assertIn('result', runner)
-        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, stepper, resume):
+        for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, deeper,
+                        endless, stepper, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),

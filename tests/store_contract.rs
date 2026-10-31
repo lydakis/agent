@@ -7,7 +7,7 @@ use agent_runtime::{
         Delivery, Fork, Gate, Gated, Planning, QuoteRef, Settings, Strip, TurnBudget, TurnOptions,
         Wake,
     },
-    tools::{Declared, Outcome},
+    tools::{Declared, Inherit, Outcome},
 };
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -4008,7 +4008,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "React to a message.".into(),
         parameters: json!({"type":"object","properties":{"emoji":{"type":"string"}}}),
         result: "ok".into(),
-        inherit: true,
+        inherit: Inherit::All,
         answered_by: None,
         expire_ms: None,
         grammar: None,
@@ -4020,7 +4020,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         description: "Resolve a task.".into(),
         parameters: json!({"type":"object"}),
         result: "ok".into(),
-        inherit: false,
+        inherit: Inherit::Generations(0),
         answered_by: None,
         expire_ms: None,
         grammar: None,
@@ -4112,6 +4112,71 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
 }
 
 #[test]
+fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start a task.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        inherit: Inherit::Generations(2),
+        answered_by: None,
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+    };
+    let (lead, _) = db
+        .create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&lead).unwrap()["declared"][0]["inherit"],
+        2
+    );
+    let made = |db: &mut Database, name: &str, by: &str, by_id: i64| {
+        let mut b = binding();
+        b.created_by = Some(by);
+        b.created_by_id = Some(by_id);
+        db.create(name, Some("/synthetic"), b).unwrap().0
+    };
+    // Each generation passes it on one fewer, the last as its own.
+    let task = made(&mut db, "Task", "Lead", lead.bot_id);
+    assert_eq!(task.declared[0].inherit, Inherit::Generations(1));
+    let helper = made(&mut db, "Helper", "Task", task.bot_id);
+    assert_eq!(helper.declared[0].inherit, Inherit::Generations(0));
+    assert_eq!(
+        serde_json::to_value(&helper).unwrap()["declared"][0]["inherit"],
+        false
+    );
+    assert!(
+        made(&mut db, "Deeper", "Helper", helper.bot_id)
+            .declared
+            .is_empty()
+    );
+    // A fork is a copy, not a generation: it keeps what its source has.
+    converse(&mut db, "Task", 1);
+    let copy = db.fork("Task", "Copy", Fork::default()).unwrap().0;
+    assert_eq!(copy.declared[0].inherit, Inherit::Generations(1));
+    // On the wire it is true, false or a count, and nothing else.
+    let read = |inherit: Value| {
+        serde_json::from_value::<Declared>(json!({"name":"t","description":"d",
+            "parameters":{"type":"object"},"inherit":inherit}))
+        .map(|tool| tool.inherit)
+    };
+    assert_eq!(read(json!(true)).unwrap(), Inherit::All);
+    assert_eq!(read(json!(false)).unwrap(), Inherit::Generations(0));
+    assert_eq!(read(json!(0)).unwrap(), Inherit::Generations(0));
+    assert_eq!(read(json!(3)).unwrap(), Inherit::Generations(3));
+    assert!(read(json!(-1)).is_err() && read(json!("all")).is_err());
+}
+
+#[test]
 fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
     let mut db = db();
     let start = Declared {
@@ -4123,7 +4188,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         expire_ms: None,
         grammar: None,
         steps: false,
-        inherit: true,
+        inherit: Inherit::All,
     };
     db.create(
         "Lead",
@@ -4197,7 +4262,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         expire_ms: None,
         grammar: None,
         steps: false,
-        inherit: true,
+        inherit: Inherit::All,
     };
     db.create(
         "Lead",
@@ -14233,7 +14298,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         expire_ms: None,
         grammar: None,
         steps: true,
-        inherit: true,
+        inherit: Inherit::All,
     };
     let gate = Gate {
         tag: "manual".into(),
