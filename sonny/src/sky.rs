@@ -719,18 +719,14 @@ impl View {
                             now.checked_sub(Duration::from_millis(ago.max(0) as u64))
                         && now.duration_since(when) <= HOUR
                     {
-                        self.said.push_back((when, by, at));
+                        self.hear(when, by, at);
                     }
                 }
                 if live {
                     if let End::Agent(by) = from
                         && by != at
                     {
-                        // A new pair moves the rings of a centred sky.
-                        let new = !(self.said.iter())
-                            .any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
-                        self.laid = self.laid && !(new && self.centre.is_some());
-                        self.said.push_back((now, by, at));
+                        self.hear(now, by, at);
                     }
                     self.send(from, End::Agent(at), now);
                     let by = match from {
@@ -877,7 +873,15 @@ impl View {
         }
     }
 
-    /// A spark has no hue: its motion is what is seen, and where it starts
+    /// Remembers that `by` talked to `at` for the hour's weights. A pair new
+    /// to the hour moves the rings of a centred sky, past turns as live ones.
+    fn hear(&mut self, when: Instant, by: usize, at: usize) {
+        let new = !(self.said.iter()).any(|&(_, a, b)| (a, b) == (by, at) || (a, b) == (at, by));
+        self.laid = self.laid && !(new && self.centre.is_some());
+        self.said.push_back((when, by, at));
+    }
+
+    /// A spark takes the hue of who is talking (see [`hue`]); where it starts
     /// and lands says who.
     fn send(&mut self, from: End, to: End, now: Instant) {
         // The sender bursts as the receiver will, in the message's colour.
@@ -3289,6 +3293,16 @@ mod tests {
         );
         let ago = view.said[0].0.elapsed().as_secs();
         assert!((595..=605).contains(&ago), "{ago}");
+        // On a centred sky, a past pair new to the hour lays the rings again.
+        view.centre = Some("a".to_owned());
+        view.laid = true;
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "c", "turn": 2,
+            "written_ms": minutes(5), "data": {"from": {"bot": "a"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(!view.laid);
     }
 
     #[tokio::test]
