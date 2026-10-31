@@ -812,11 +812,9 @@ fn summary(model: &str, file: &Path, brought: &[String], backed: bool) {
         effort(lead),
         effort(task)
     );
-    println!(
-        "  Approvals   {}: {}",
-        crate::approvals::MODES[0].0,
-        crate::approvals::MODES[0].1
-    );
+    if let Some(row) = crate::approvals::find(crate::approvals::default()) {
+        println!("  Permissions {}: {}", row.label, row.about);
+    }
     if !brought.is_empty() {
         println!("  MCP         {}", brought.join(", "));
     }
