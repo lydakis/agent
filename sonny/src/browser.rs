@@ -1330,9 +1330,11 @@ mod tests {
             "open file:/etc/passwd",
             "open FILE:///etc/passwd",
         ] {
+            // By its real path: /private/etc on macOS.
+            let passwd = std::fs::canonicalize("/etc/passwd").unwrap();
             assert_eq!(
                 args(line, &real).unwrap()[1],
-                "file:///etc/passwd",
+                format!("file://{}", passwd.display()),
                 "{line}"
             );
         }
