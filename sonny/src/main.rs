@@ -8009,7 +8009,6 @@ impl App {
         let rows = [
             ("enter", "send, or steer the running turn"),
             ("tab", "queue for after the running turn"),
-            ("↑↓", "earlier prompts, past the first or last row"),
             ("shift+enter", "new line (alt+enter, ctrl+j)"),
             ("esc", "interrupt, or stop a ! command"),
             ("/", "commands"),
