@@ -7712,7 +7712,7 @@ impl Database {
                 copied.push(quote);
                 // What it quotes comes along, marked so a retry still names
                 // only the turns the request named.
-                for mut inner in quoted(&self.conn, nested.as_deref())? {
+                for mut inner in quoted(&self.conn, nested.as_deref(), Self::QUOTED_BYTES + 1)? {
                     bytes += inner["text"].as_str().map_or(0, str::len) + Self::QUOTE_BYTES;
                     inner["nested"] = json!(true);
                     copied.push(inner);
@@ -7976,7 +7976,7 @@ impl Database {
             entry["truncated"] = json!(true);
         }
         authored(&mut entry, from, origin, person);
-        let mut quotes = quoted(&self.conn, quotes.as_deref())?;
+        let mut quotes = quoted(&self.conn, quotes.as_deref(), *left)?;
         // Each quote's record counts like an entry's; those past the
         // budget are left out, and the entry says its words were cut.
         let mut kept = 0;
@@ -10962,35 +10962,45 @@ fn after_words(
     Ok((parts, Some(serde_json::to_string(&quotes).map_err(bad)?)))
 }
 /// A turn's quotes with their words, which the turn keeps until its item
-/// holds them and the item keeps after.
-fn quoted(conn: &Connection, quotes: Option<&str>) -> Result<Vec<Value>> {
+/// holds them and the item keeps after: at most `cap` characters of each,
+/// read in SQL from the parts quoted, so a picture beside them is never
+/// copied or parsed here.
+fn quoted(conn: &Connection, quotes: Option<&str>, cap: usize) -> Result<Vec<Value>> {
     let Some(quotes) = quotes else {
         return Ok(Vec::new());
     };
     let mut quotes: Vec<Value> = serde_json::from_str(quotes)?;
-    let mut item: Option<(i64, Value)> = None;
-    for quote in &mut quotes {
-        let Some(quote) = quote.as_object_mut() else {
-            continue;
-        };
-        let (Some(at), Some(node)) = (quote.remove("at"), quote.remove("node")) else {
-            continue;
-        };
-        let node = node.as_i64().unwrap_or_default();
-        if item.as_ref().is_none_or(|(read, _)| *read != node) {
-            let raw: String = conn
-                .prepare_cached(
-                    "SELECT CAST(COALESCE(d.item,n.item) AS TEXT) FROM nodes n
-                     LEFT JOIN declined d ON d.node=n.id WHERE n.id=?",
-                )?
-                .query_row([node], |r| r.get(0))?;
-            item = Some((node, serde_json::from_str(&raw)?));
+    // Where each quote's words are: its item's node and the part.
+    let at = |quote: &Value| Some((quote["node"].as_i64()?, quote["at"].as_u64()?));
+    let mut parts: HashMap<i64, Vec<u64>> = HashMap::new();
+    for (node, part) in quotes.iter().filter_map(at) {
+        parts.entry(node).or_default().push(part);
+    }
+    let mut texts = HashMap::new();
+    let mut read = conn.prepare_cached(
+        "SELECT c.key, substr(json_extract(c.value,'$.text'),1,?2) FROM nodes n
+         LEFT JOIN declined d ON d.node=n.id,
+         json_each(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content') c
+         WHERE n.id=?1 AND c.key IN (SELECT value FROM json_each(?3))",
+    )?;
+    for (node, wanted) in &parts {
+        let mut rows = read.query(params![node, cap as i64, json!(wanted).to_string()])?;
+        while let Some(r) = rows.next()? {
+            if let Some(text) = r.get::<_, Option<String>>(1)? {
+                texts.insert((*node, r.get::<_, i64>(0)? as u64), text);
+            }
         }
-        let text = (item.as_ref())
-            .and_then(|(_, item)| {
-                item["content"][at.as_u64().unwrap_or(0) as usize]["text"].as_str()
-            })
-            .unwrap_or_default();
+    }
+    for quote in &mut quotes {
+        let Some(place) = at(quote) else {
+            continue;
+        };
+        let text = texts.get(&place).cloned().unwrap_or_default();
+        let quote = quote
+            .as_object_mut()
+            .expect("a quote with a place is an object");
+        quote.remove("at");
+        quote.remove("node");
         quote.insert("text".into(), json!(text));
     }
     Ok(quotes)

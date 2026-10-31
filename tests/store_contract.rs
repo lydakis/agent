@@ -2454,6 +2454,43 @@ fn a_quote_copies_a_turns_words_with_who_wrote_them() {
 }
 
 #[test]
+fn a_prompt_s_quotes_read_back_beside_its_picture_each_where_it_is() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let asked = db
+        .begin(
+            "Bob",
+            "p1",
+            "ship it",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(asked, None).unwrap();
+    // The same words quoted twice, beside a picture the read never needs.
+    let shown = TurnOptions {
+        quotes: vec![quote("Bob", asked, false), quote("Bob", asked, false)],
+        images: vec![noise(256)],
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Carol", "c1", "see", true, &shown, allow_provider)
+        .unwrap()
+        .turn;
+    let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    let texts: Vec<_> = read["prompts"][0]["quotes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|quote| quote["text"].clone())
+        .collect();
+    assert_eq!(texts, [json!("ship it"), json!("ship it")]);
+}
+
+#[test]
 fn a_quoted_prompt_brings_its_own_quotes_with_their_first_writers() {
     let mut db = db();
     for name in ["Bob", "Carol", "Dave"] {
