@@ -862,7 +862,7 @@ pub fn unserved(detail: String) -> Outcome {
     Outcome {
         output: json!({"error":"tool_unserved","detail":detail}).to_string(),
         artifacts: Vec::new(),
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: true,
     }
@@ -1634,7 +1634,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 64;
+    pub const SCHEMA: i32 = 65;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -1835,7 +1835,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval,turn);
             CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
-                expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER);
+                expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER,
+                parts TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
@@ -5997,7 +5998,7 @@ impl Database {
             .optional()?
             .unwrap_or(false);
         let item =
-            family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.images)?;
+            family.tool_result_item_with(call_id, custom, &outcome.output, &outcome.parts)?;
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
         // Unless one of them lapsed while this call ran: a new request would
@@ -6024,10 +6025,10 @@ impl Database {
         // Pictures count at their weight, so a stub saves only what the
         // result weighs over it.
         let next = next_node(&tx)?;
-        let pictured = Pictured::of(&outcome.images);
+        let pictured = Pictured::of_all(outcome.images());
         let weight = (item.len() as i64 - pictured.extra) as usize;
-        let stub = if !outcome.images.is_empty() {
-            super::context::picture_stub(family, call_id, &outcome.output, weight)?
+        let stub = if pictured.count > 0 {
+            super::context::picture_stub(family, call_id, &outcome.words(), weight)?
         } else if bot.tools.iter().any(|tool| tool == "read") {
             super::context::stub(family, call_id, custom, &outcome.output, next, weight)?
         } else {
@@ -6353,24 +6354,42 @@ impl Database {
         {
             return Ok(CallAnswer::Given(given));
         }
-        let (tag, expires_ms, output, failed, paused): (String, i64, Option<String>, bool, bool) =
-            self.conn
-                .prepare_cached(
-                    "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL FROM answers
-                     WHERE turn=? AND call_id=?",
-                )?
-                .query_row(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .optional()?
-                .ok_or(Error::new("invalid_tool_state"))?;
+        #[allow(clippy::type_complexity)]
+        let (tag, expires_ms, output, failed, paused, parts): (
+            String,
+            i64,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+        ) = self
+            .conn
+            .prepare_cached(
+                "SELECT tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts FROM answers
+                 WHERE turn=? AND call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .optional()?
+            .ok_or(Error::new("invalid_tool_state"))?;
         // A step waiting on a gate stops the call's time.
         let expires_ms = (!paused).then_some(expires_ms.max(0) as u64);
         Ok(match output {
             Some(output) => CallAnswer::Given(Outcome {
                 output,
                 artifacts: Vec::new(),
-                images: Vec::new(),
+                parts: parts
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?
+                    .unwrap_or_default(),
                 note: None,
                 failed,
             }),
@@ -6541,9 +6560,15 @@ impl Database {
             "waiting" => {
                 self.conn
                     .prepare_cached(
-                        "UPDATE answers SET output=?,failed=? WHERE turn=? AND call_id=?",
+                        "UPDATE answers SET output=?,failed=?,parts=? WHERE turn=? AND call_id=?",
                     )?
-                    .execute(params![outcome.output, outcome.failed, turn, call_id])?;
+                    .execute(params![
+                        outcome.output,
+                        outcome.failed,
+                        stored_parts(&outcome.parts)?,
+                        turn,
+                        call_id
+                    ])?;
                 let resume = self
                     .waiting(turn)?
                     .is_some_and(|w| w.answer.is_some() && w.call_id == call_id);
@@ -10419,6 +10444,12 @@ fn images_from(json: Option<&str>) -> rusqlite::Result<Vec<crate::codec::Image>>
 }
 /// The `images` column for a turn's pictures: their JSON, or nothing for
 /// none.
+/// An answer's parts as the answers table keeps them: JSON, or null for none.
+fn stored_parts(parts: &[crate::codec::Part]) -> Result<Option<String>> {
+    Ok((!parts.is_empty())
+        .then(|| serde_json::to_string(parts))
+        .transpose()?)
+}
 fn stored_images(images: &[crate::codec::Image]) -> Result<Option<String>> {
     Ok((!images.is_empty())
         .then(|| serde_json::to_string(images))
@@ -11298,6 +11329,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
     // 63 -> 64: the daemon's pause, in a table the schema creates; none held.
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers')
+         AND NOT EXISTS(SELECT 1 FROM pragma_table_info('answers') WHERE name='parts')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 64 -> 65: a client's answer may come with pictures, in parts after
+        // its output. None did.
+        conn.execute_batch("ALTER TABLE answers ADD COLUMN parts TEXT;")?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -11616,6 +11657,12 @@ impl Pictured {
             count: images.len() as i64,
             extra: crate::codec::pictured(images),
         }
+    }
+    fn of_all<'a>(images: impl Iterator<Item = &'a crate::codec::Image>) -> Self {
+        images.fold(Self { count: 0, extra: 0 }, |sum, image| Self {
+            count: sum.count + 1,
+            extra: sum.extra + crate::codec::pictured(std::slice::from_ref(image)),
+        })
     }
 }
 /// A prompt's user item, its pictures, and, when it has any, the stub it

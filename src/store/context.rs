@@ -390,7 +390,7 @@ pub fn picture_stub(
     weight: usize,
 ) -> Result<Option<Vec<u8>>> {
     let text = format!(
-        "[tool result's picture elided from this request; read the file again to see it. Its text:]\n{output}"
+        "[tool result's pictures elided from this request; call the tool again to see them. Its text:]\n{output}"
     );
     let stub = family.tool_result_item(call_id, false, &text)?;
     Ok((stub.len() < weight).then_some(stub))
@@ -425,8 +425,8 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         call_id: String,
         output: Text,
     }
-    /// A result's text: the text alone, or the text part of a list of
-    /// parts that also holds pictures.
+    /// A result's text: the text alone, or the text parts of a list of
+    /// parts that also holds pictures, a line each.
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum Text {
@@ -441,7 +441,11 @@ pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
         fn text(self) -> String {
             match self {
                 Text::Alone(text) => text,
-                Text::Parts(parts) => parts.into_iter().filter_map(|p| p.text).collect(),
+                Text::Parts(parts) => parts
+                    .into_iter()
+                    .filter_map(|p| p.text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             }
         }
     }
@@ -687,10 +691,10 @@ mod tests {
 
     #[test]
     fn a_result_with_a_picture_reads_as_its_text_and_elides_to_it() {
-        let images = [crate::codec::Image {
+        let images = [crate::codec::Part::Image(crate::codec::Image {
             media_type: "image/png".into(),
             data: "A".repeat(4096),
-        }];
+        })];
         for family in [Family::Responses, Family::Anthropic] {
             let item = family
                 .tool_result_item_with("c1", false, "a.png: a PNG image", &images)
@@ -704,7 +708,7 @@ mod tests {
                 .unwrap();
             let (_, _, stubbed) = tool_result(&stub).unwrap();
             assert!(
-                stubbed.starts_with("[tool result's picture elided"),
+                stubbed.starts_with("[tool result's pictures elided"),
                 "{stubbed}"
             );
             assert!(stubbed.ends_with("a.png: a PNG image"));

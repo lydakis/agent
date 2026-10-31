@@ -3812,7 +3812,7 @@ impl Turn {
                     let outcome = Outcome {
                         output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
                         artifacts: Vec::new(),
-                        images: Vec::new(),
+                        parts: Vec::new(),
                         note: Some(text),
                         failed: false,
                     };
@@ -5235,7 +5235,7 @@ fn failure(error: Error) -> Outcome {
     Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: true,
     }

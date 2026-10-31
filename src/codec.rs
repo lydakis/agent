@@ -32,6 +32,24 @@ pub struct Image {
     pub data: String,
 }
 
+/// A part of a tool result after its leading text, in the order the model
+/// reads it: a picture, or words that follow one. A client's answer gives
+/// them as `{"type":"text","text"}` and `{"type":"image","media_type","data"}`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Part {
+    Text { text: String },
+    Image(Image),
+}
+impl Part {
+    pub fn image(&self) -> Option<&Image> {
+        match self {
+            Part::Image(image) => Some(image),
+            Part::Text { .. } => None,
+        }
+    }
+}
+
 /// The media types an [`Image`] may have: those both families take.
 pub const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -195,18 +213,25 @@ impl Family {
         call_id: &str,
         custom: bool,
         output: &str,
-        images: &[Image],
+        parts: &[Part],
     ) -> Result<Vec<u8>> {
-        let output = match images {
+        let text = |text: &str| match self {
+            Family::Responses => json!({"type":"input_text","text":text}),
+            Family::Anthropic => json!({"type":"text","text":text}),
+        };
+        let output = match parts {
             [] => json!(output),
-            _ => {
-                let mut parts = vec![match self {
-                    Family::Responses => json!({"type":"input_text","text":output}),
-                    Family::Anthropic => json!({"type":"text","text":output}),
-                }];
-                parts.extend(images.iter().map(|image| self.image(image)));
-                Value::Array(parts)
-            }
+            _ => Value::Array(
+                // Words before the first picture lead, when there are any.
+                (!output.is_empty())
+                    .then(|| text(output))
+                    .into_iter()
+                    .chain(parts.iter().map(|part| match part {
+                        Part::Text { text: words } => text(words),
+                        Part::Image(image) => self.image(image),
+                    }))
+                    .collect(),
+            ),
         };
         let item = match self {
             Family::Responses if custom => {
@@ -470,7 +495,12 @@ mod tests {
         let result = |family: Family| -> Value {
             serde_json::from_slice(
                 &family
-                    .tool_result_item_with("c1", false, "a.png", &images)
+                    .tool_result_item_with(
+                        "c1",
+                        false,
+                        "a.png",
+                        &images.iter().cloned().map(Part::Image).collect::<Vec<_>>(),
+                    )
                     .unwrap(),
             )
             .unwrap()
@@ -484,6 +514,26 @@ mod tests {
             result(Family::Anthropic)["content"][0]["content"][1]["source"]["data"],
             "iVBO"
         );
+        // A client's parts keep their order; a result that opens with a
+        // picture has no empty text before it.
+        let parts = [
+            Part::Image(images[0].clone()),
+            Part::Text {
+                text: "then".into(),
+            },
+        ];
+        let item: Value = serde_json::from_slice(
+            &Family::Anthropic
+                .tool_result_item_with("c1", false, "", &parts)
+                .unwrap(),
+        )
+        .unwrap();
+        let content = &item["content"][0]["content"];
+        assert_eq!(
+            (content[0]["type"].as_str(), &content[1]),
+            (Some("image"), &json!({"type":"text","text":"then"}))
+        );
+        assert_eq!(content.as_array().map(Vec::len), Some(2));
     }
     #[test]
     fn previews_cut_each_field_so_a_long_one_hides_no_other() {

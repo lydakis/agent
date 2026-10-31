@@ -84,7 +84,7 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: false,
     }
@@ -3642,7 +3642,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
-        images: Vec::new(),
+        parts: Vec::new(),
         note: None,
         failed: false,
     };
@@ -9004,7 +9004,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
-            images: Vec::new(),
+            parts: Vec::new(),
             note: Some(text.to_owned()),
             failed: false,
         };
@@ -10166,7 +10166,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
     .unwrap();
     db.tool_start(turn, &call).unwrap();
     let read = Outcome {
-        images: vec![photo.clone()],
+        parts: vec![agent_runtime::codec::Part::Image(photo.clone())],
         ..result("photo.png: a PNG image, 600×600; it follows")
     };
     db.tool_finish(turn, "c1", &read).unwrap();
@@ -10213,7 +10213,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         items[2]["output"]
             .as_str()
             .unwrap()
-            .starts_with("[tool result's picture elided")
+            .starts_with("[tool result's pictures elided")
     );
 }
 

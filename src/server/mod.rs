@@ -195,6 +195,14 @@ pub struct Request {
 }
 /// A client's refusal of an answered call, which the model reads as the
 /// call's error.
+/// A declared call's answer: text, or parts in the order the model reads
+/// them, text and pictures, as a provider's own tool results take them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolOutput {
+    Text(String),
+    Parts(Vec<agent_runtime::codec::Part>),
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolError {
@@ -478,7 +486,7 @@ enum Command {
         bot: String,
         turn: i64,
         call_id: String,
-        output: Option<String>,
+        output: Option<ToolOutput>,
         error: Option<ToolError>,
     },
     /// Put one step of a declared call this client answers to the bot's
@@ -859,17 +867,18 @@ fn settle_step(handles: &Handles, bot: &str, turn: i64, stepped: Stepped) -> Opt
 /// The most bytes a prompt's pictures may have together, decoded: what
 /// Anthropic takes for one image, so one alone always fits.
 const IMAGES_BYTES: usize = 5 << 20;
-/// The most pictures one prompt may carry.
+/// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
 
 /// Pictures a provider takes: a media type both families know, base64 of
 /// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
-fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
+/// `carrier` names what carries them, a prompt or a tool result.
+fn check_images(images: &[&agent_runtime::codec::Image], carrier: &str) -> Result<()> {
     use base64::Engine;
     if images.len() > IMAGES {
         return fail_with(
             "image_limit",
-            format!("a prompt may carry up to {IMAGES} images"),
+            format!("{carrier} may carry up to {IMAGES} images"),
         );
     }
     let mut bytes = 0;
@@ -901,7 +910,7 @@ fn check_images(images: &[agent_runtime::codec::Image]) -> Result<()> {
     if bytes > IMAGES_BYTES {
         return fail_with(
             "image_limit",
-            format!("a prompt's images may be up to {IMAGES_BYTES} bytes together, decoded"),
+            format!("{carrier}'s images may be up to {IMAGES_BYTES} bytes together, decoded"),
         );
     }
     Ok(())
@@ -3507,14 +3516,58 @@ impl Service {
                 output,
                 error,
             } => {
+                use agent_runtime::codec::Part;
                 let outcome = match (output, error) {
-                    (Some(output), None) if output.len() > ANSWER_BYTES => {
+                    (Some(ToolOutput::Text(output)), None) if output.len() > ANSWER_BYTES => {
                         return fail_with(
                             "tool_output_limit",
                             format!("output may be up to {ANSWER_BYTES} bytes"),
                         );
                     }
-                    (Some(output), None) => Outcome::text(self.registry.redact_text(output)),
+                    (Some(ToolOutput::Text(output)), None) => {
+                        Outcome::text(self.registry.redact_text(output))
+                    }
+                    (Some(ToolOutput::Parts(parts)), None) => {
+                        let words: usize = parts
+                            .iter()
+                            .map(|part| match part {
+                                Part::Text { text } => text.len(),
+                                Part::Image(_) => 0,
+                            })
+                            .sum();
+                        if words > ANSWER_BYTES {
+                            return fail_with(
+                                "tool_output_limit",
+                                format!("output's text may be up to {ANSWER_BYTES} bytes"),
+                            );
+                        }
+                        check_images(
+                            &parts.iter().filter_map(Part::image).collect::<Vec<_>>(),
+                            "a tool result",
+                        )?;
+                        let mut parts: Vec<Part> = parts
+                            .into_iter()
+                            .map(|part| match part {
+                                Part::Text { text } => Part::Text {
+                                    text: self.registry.redact_text(text),
+                                },
+                                image => image,
+                            })
+                            .collect();
+                        // Words before the first picture are the output.
+                        let output = match parts.first_mut() {
+                            Some(Part::Text { text }) => {
+                                let text = std::mem::take(text);
+                                parts.remove(0);
+                                text
+                            }
+                            _ => String::new(),
+                        };
+                        Outcome {
+                            parts,
+                            ..Outcome::text(output)
+                        }
+                    }
                     (None, Some(ToolError { code, detail })) => {
                         let coded = !code.is_empty()
                             && code.len() <= 64
@@ -3537,7 +3590,7 @@ impl Service {
                         Outcome {
                             output: json!({"error":code,"detail":detail}).to_string(),
                             artifacts: Vec::new(),
-                            images: Vec::new(),
+                            parts: Vec::new(),
                             note: None,
                             failed: true,
                         }
@@ -3963,7 +4016,7 @@ impl Service {
             } => {
                 name("request_id", &request_id)?;
                 let images = images.unwrap_or_default();
-                check_images(&images)?;
+                check_images(&images.iter().collect::<Vec<_>>(), "a prompt")?;
                 if origin.is_some() && from.is_some() {
                     return fail_with("invalid_origin", "from and origin are mutually exclusive");
                 }
