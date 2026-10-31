@@ -16,6 +16,7 @@ mod attach;
 mod background;
 mod banner;
 mod boot;
+mod browser;
 mod cache;
 mod calls;
 mod cmux;

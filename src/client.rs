@@ -427,6 +427,22 @@ fn parse(args: &[String]) -> Result<Options> {
                             options.settings_flags.push(flag.to_owned());
                         }
                     }
+                    "--unix-socket" => {
+                        let path = std::path::absolute(&value)?;
+                        let path = path
+                            .to_str()
+                            .ok_or(Error::with("usage", "--unix-socket needs a UTF-8 path"))?;
+                        let sockets = options
+                            .settings
+                            .entry("unix_sockets".to_owned())
+                            .or_insert_with(|| json!([]));
+                        if let Value::Array(sockets) = sockets {
+                            sockets.push(json!(path));
+                        }
+                        if !options.settings_flags.iter().any(|f| f == flag) {
+                            options.settings_flags.push(flag.to_owned());
+                        }
+                    }
                     "--cache-ttl" => {
                         if !matches!(value.as_str(), "5m" | "1h") {
                             return fail_with("usage", "--cache-ttl needs 5m or 1h");
@@ -570,6 +586,13 @@ impl Connection {
             .enable_time()
             .build()?
             .block_on(async {
+                // In a Linux sandbox, the connection the daemon hands this
+                // command.
+                if let Some(stream) = agent_client::socket::handed(socket)
+                    .map_err(|e| Error::with("daemon_unavailable", e.to_string()))?
+                {
+                    return Ok(stream);
+                }
                 tokio::time::timeout_at(deadline.into(), tokio::net::UnixStream::connect(socket))
                     .await
                     .map_err(|_| Error::new("daemon_start_timeout"))?

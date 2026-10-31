@@ -288,8 +288,13 @@ class ApprovalTests(ModelFixture):
         (self.path / 'requests.json').write_text(json.dumps(requests))
         (self.path / 'probe.py').write_text(
             'import json, os, socket, sys\n'
+            'def connect(path):\n'
+            '    if path == os.environ["AGENT_SOCKET"] and "AGENT_SOCKET_FD" in os.environ:\n'
+            '        asked = socket.socket(fileno=int(os.environ["AGENT_SOCKET_FD"])); asked.send(b"?")\n'
+            '        return socket.socket(fileno=socket.recv_fds(asked, 1, 1)[1][0])\n'
+            '    s = socket.socket(socket.AF_UNIX); s.connect(path); return s\n'
             'def ask(path, requests):\n'
-            '    s = socket.socket(socket.AF_UNIX); s.connect(path); f = s.makefile("rw")\n'
+            '    s = connect(path); f = s.makefile("rw")\n'
             '    f.readline()\n'
             '    out = []\n'
             '    for i, request in enumerate(requests):\n'
@@ -311,7 +316,8 @@ class ApprovalTests(ModelFixture):
                               prompt=f'shell:python3 probe.py {daemon.socket_path} {carl}')['result']['turn']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
-        # On Linux its own socket is in the daemon's socket's place.
+        # On Linux its own socket is in the daemon's socket's place, reached
+        # by the connections the daemon hands it, as it makes no socket.
         if sys.platform == 'linux':
             self.assertEqual(probed['own'], str(daemon.socket_path))
         # No bot can put its own listener in place of another's.

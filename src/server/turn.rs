@@ -4162,7 +4162,7 @@ impl Turn {
             )?;
             Ok(policy.map(|policy| Policy {
                 capability,
-                ..policy
+                ..policy.with_sockets(&settings.unix_sockets)
             }))
         })
         .await
