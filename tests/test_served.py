@@ -3,6 +3,7 @@ the tool host runs it in the agent's folder, and its result or error is the
 call's output."""
 import json
 import os
+import queue
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from bench.runtime_client import node_item
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
+from tests.test_images import image
 from tests.test_runtime import ModelFixture
 
 
@@ -272,6 +274,29 @@ class ServedToolTests(ModelFixture):
         refused = json.loads(self.call('calc.lead', 'exec', '// @exec: {"wait": 1}\ntext(1);'))
         self.assertEqual(refused['error'], 'exec_refused')
         self.assertIn('`wait`', refused['detail'])
+
+    def test_a_script_s_pictures_reach_the_model_in_order_with_its_text(self):
+        server = Path(__file__).with_name('mcp_server.py')
+        (self.path / '.agent').mkdir(exist_ok=True)
+        (self.path / '.agent/config.toml').write_text(
+            f'[sonny.mcp_servers.test]\ncommand = {json.dumps(sys.executable)}\nargs = [{json.dumps(str(server))}]\n')
+        script = json.loads(subprocess.run([str(self.sonny), 'mcp', 'tool'], env={**clean_env(), 'HOME': str(self.path)},
+                                           check=True, capture_output=True, text=True).stdout)
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[script])
+        self.host()
+        shot = image()
+        self.model.requests = queue.Queue()
+        self.call('calc.lead', 'exec', f"text('before'); image('data:image/png;base64,{shot['data']}'); text('after');")
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
+        kinds = [part['type'] for part in answered['output']]
+        self.assertEqual(kinds, ['input_text', 'input_image', 'input_text'], answered)
+        self.assertTrue(answered['output'][0]['text'].endswith('Output:\nbefore'), answered)
+        self.assertEqual(answered['output'][1]['image_url'], f"data:image/png;base64,{shot['data']}")
+        self.assertEqual(answered['output'][2]['text'], 'after')
 
     def test_an_agent_saves_memory_through_the_host(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
