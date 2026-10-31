@@ -27,6 +27,10 @@ const WRITE_YIELD_MS: u64 = 250;
 const POLL_YIELD_MS: u64 = 5_000;
 /// How long typed input may wait for a program that reads none.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
+/// How long a start waits for a terminal it pruned to give up its slot,
+/// when no other is free: a killed session is normally gone in
+/// milliseconds; one stuck in the kernel is not waited for longer.
+const PRUNE_WAIT: Duration = Duration::from_secs(2);
 /// The terminal's size: wide enough that few programs wrap their lines.
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 40;
@@ -48,6 +52,9 @@ pub struct Terminal {
 struct State {
     /// Output not yet read: at most its last `PREVIEW_BYTES`.
     unread: Vec<u8>,
+    /// A secret field's name and separator the last read showed, with no
+    /// value yet: the next read is redacted as read after it.
+    opening: Vec<u8>,
     dropped: u64,
     /// How the command ended, with what it wrote that no write read.
     end: Option<(Value, String)>,
@@ -55,15 +62,24 @@ struct State {
 }
 
 impl Terminal {
+    /// End the command's whole session: its own group, the job in the
+    /// terminal's foreground, and, looked up off the runtime thread, every
+    /// other group a shell with job control made in it.
     fn kill(&self) {
         // Only while the command runs: after its end the group's number
         // may be another's.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.end.is_none() {
-            // SAFETY: kill takes no pointers; the group is this command's own.
+            // SAFETY: kill and tcgetpgrp take no pointers; the group and
+            // the terminal are this command's own.
             unsafe {
                 libc::kill(-self.group, libc::SIGKILL);
+                let foreground = libc::tcgetpgrp(self.master.get_ref().as_raw_fd());
+                if foreground > 0 {
+                    libc::kill(-foreground, libc::SIGKILL);
+                }
             }
+            end_session(self.group);
         }
     }
 
@@ -97,15 +113,20 @@ impl Terminal {
     /// What the command wrote since the last read, and how it ended once
     /// it has.
     fn take(&self, registry: &Registry, handle: i64) -> Outcome {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
         state.used = Instant::now();
         let dropped = std::mem::take(&mut state.dropped);
         let (text, end) = match &mut state.end {
             Some((end, rest)) => (std::mem::take(rest), Some(end.clone())),
-            None => (text(&mut state.unread, Some(&registry.credentials)), None),
+            None => {
+                let credentials = &registry.credentials;
+                let (read, before) = text(&mut state.unread, &mut state.opening, Some(credentials));
+                (credentials.redact_after(&before, read), None)
+            }
         };
-        drop(state);
-        report(registry, Some(handle), text, dropped, end)
+        drop(guard);
+        report(Some(handle), text, dropped, end)
     }
 
     /// Wait up to `yield_ms` for the command to end.
@@ -119,16 +140,25 @@ impl Terminal {
     }
 }
 
-/// A start's, a write's, or an end's result: the output, and how the
-/// command ended once it has, or that it runs.
-fn report(
-    registry: &Registry,
-    handle: Option<i64>,
-    text: String,
-    dropped: u64,
-    end: Option<Value>,
-) -> Outcome {
-    let mut output = json!({"output":registry.redact(text)});
+/// `owner`'s least recently used terminal, when it has `share` or more.
+/// The scan is bounded: every terminal holds a lasting permit.
+fn least_used(
+    terminals: &HashMap<i64, Arc<Terminal>>,
+    owner: i64,
+    share: usize,
+) -> Option<Arc<Terminal>> {
+    let own = terminals.values().filter(|t| t.owner == owner);
+    if own.clone().count() < share {
+        return None;
+    }
+    own.min_by_key(|t| t.state.lock().unwrap_or_else(|e| e.into_inner()).used)
+        .cloned()
+}
+
+/// A start's, a write's, or an end's result: the output, redacted, and how
+/// the command ended once it has, or that it runs.
+fn report(handle: Option<i64>, text: String, dropped: u64, end: Option<Value>) -> Outcome {
+    let mut output = json!({"output":text});
     if let Some(handle) = handle {
         output["handle"] = format!("proc:{handle}").into();
     }
@@ -154,22 +184,38 @@ fn report(
 
 /// Decode what was read, keeping for the next read a character split
 /// across reads and, while the command runs, the carriage returns and the
-/// start of a credential that more output may finish; a terminal's line
-/// ends read as plain newlines.
-fn text(unread: &mut Vec<u8>, running: Option<&Credentials>) -> String {
+/// start of a credential or a secret field's value that more output may
+/// finish; a terminal's line ends read as plain newlines. Returns the text
+/// with the field opening shown before it, which `opening` now holds the
+/// next of: the text is redacted as read after it.
+fn text(
+    unread: &mut Vec<u8>,
+    opening: &mut Vec<u8>,
+    running: Option<&Credentials>,
+) -> (String, String) {
     let mut whole = match std::str::from_utf8(unread) {
         Err(error) if error.error_len().is_none() => error.valid_up_to(),
         _ => unread.len(),
     };
+    let before = std::mem::take(opening);
     if let Some(credentials) = running {
         while whole > 0 && unread[whole - 1] == b'\r' {
             whole -= 1;
         }
-        whole -= credentials.unfinished(&unread[..whole]);
+        // Read after the opening shown, so a value begun after a name the
+        // last read showed is held too.
+        let mut joined = before.clone();
+        joined.extend_from_slice(&unread[..whole]);
+        let held = credentials.unfinished(&joined).min(whole);
+        whole -= held;
+        joined.truncate(joined.len() - held);
+        let open = credentials.opening(&joined);
+        *opening = joined.split_off(joined.len() - open);
     }
     let rest = unread.split_off(whole);
     let read = std::mem::replace(unread, rest);
-    lines(&String::from_utf8_lossy(&read))
+    let before = String::from_utf8_lossy(&before).into_owned();
+    (lines(&String::from_utf8_lossy(&read)), before)
 }
 
 /// `text` with each run of carriage returns before a newline dropped: a
@@ -193,6 +239,102 @@ fn lines(text: &str) -> String {
     }
     lines.push_str(&"\r".repeat(returns));
     lines
+}
+
+/// Kill every process group in session `session` but its leader's, which
+/// the caller ends: the jobs a shell with job control starts each get a
+/// group of their own, and one that ignores SIGHUP would outlive its
+/// terminal. A session's number stays its own while any member lives, so
+/// only a session already empty could find its number reused. The listing
+/// reads files, so it runs off the runtime thread when there is one.
+fn end_session(session: i32) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(move || sweep(session))),
+        Err(_) => sweep(session),
+    }
+}
+
+fn sweep(session: i32) {
+    for group in session_groups(session) {
+        if group != session {
+            // SAFETY: kill takes no pointers.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The process groups with a member in `session`.
+#[cfg(target_os = "linux")]
+fn session_groups(session: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // After the command's name, which may hold spaces: state, parent,
+        // group, session.
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace().skip(2);
+        if let (Some(Ok(group)), Some(Ok(sid))) = (
+            fields.next().map(str::parse::<i32>),
+            fields.next().map(str::parse::<i32>),
+        ) && sid == session
+            && !groups.contains(&group)
+        {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// The process groups with a member in `session`.
+#[cfg(target_os = "macos")]
+fn session_groups(session: i32) -> Vec<i32> {
+    // SAFETY: a null buffer asks only for the count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Room for processes started since the count.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+    // SAFETY: the pointer and size are the buffer's own.
+    let listed = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    pids.truncate(listed.max(0) as usize);
+    let mut groups = Vec::new();
+    for pid in pids {
+        // SAFETY: getsid and getpgid take no pointers.
+        let (sid, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        if sid == session && group > 0 && !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// Elsewhere only the leader's group and the foreground job are ended.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn session_groups(_session: i32) -> Vec<i32> {
+    Vec::new()
 }
 
 /// A pseudo-terminal's two ends, each closed on exec.
@@ -251,6 +393,18 @@ impl Registry {
         done: oneshot::Sender<Result<Outcome>>,
     ) -> Result<Outcome> {
         let started = async {
+            // The bot's least recently used terminal past its share ends
+            // first. Only when every lasting slot is taken does the start
+            // wait for that one's to free, a moment after its kill.
+            let pruned = self.prune(owner);
+            let permit = match (self.lasting(), pruned) {
+                (Ok(permit), _) => permit,
+                (Err(_), Some(mut exited)) => {
+                    let _ = tokio::time::timeout(PRUNE_WAIT, exited.wait_for(|e| *e)).await;
+                    self.lasting()?
+                }
+                (Err(error), None) => return Err(error),
+            };
             let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
             let (master, slave) = open()?;
             let mut process = sh(
@@ -284,7 +438,7 @@ impl Registry {
             // SAFETY: the OwnedFd is open, and it keeps the one descriptor
             // until the AsyncFd that owns it drops.
             let master = unsafe { AsyncFd::register(master) }.map_err(std::io::Error::from)?;
-            Ok::<_, Error>((child, master, group, held))
+            Ok::<_, Error>((child, master, group, (held, permit)))
         };
         let (mut child, master, group, held) = match started.await {
             Ok(started) => started,
@@ -301,21 +455,18 @@ impl Registry {
             group,
             state: Mutex::new(State {
                 unread: Vec::new(),
+                opening: Vec::new(),
                 dropped: 0,
                 end: None,
                 used: Instant::now(),
             }),
             exited,
         });
+        // Two starts at once can both find room: the later one's insert
+        // ends the bot's least recently used, as before.
         let pruned = {
             let mut terminals = self.terminals.lock().unwrap_or_else(|e| e.into_inner());
-            let own = terminals.values().filter(|t| t.owner == owner);
-            let pruned = (own.clone().count() >= MAX_TERMINALS)
-                .then(|| {
-                    own.min_by_key(|t| t.state.lock().unwrap_or_else(|e| e.into_inner()).used)
-                        .cloned()
-                })
-                .flatten();
+            let pruned = least_used(&terminals, owner, MAX_TERMINALS);
             terminals.insert(handle, terminal.clone());
             pruned
         };
@@ -388,6 +539,9 @@ impl Registry {
                 unsafe {
                     libc::kill(-group, libc::SIGKILL);
                 }
+                // The jobs it started in groups of their own go too, before
+                // its permit does.
+                let _ = tokio::task::spawn_blocking(move || sweep(group)).await;
                 drop(held);
                 let end = match status {
                     Ok(status) => {
@@ -403,14 +557,10 @@ impl Registry {
                 // read; a write that sees the end reports that too.
                 let last = {
                     let mut state = terminal.state.lock().unwrap_or_else(|e| e.into_inner());
-                    let rest = text(&mut state.unread, None);
-                    let last = report(
-                        &registry,
-                        None,
-                        rest.clone(),
-                        state.dropped,
-                        Some(end.clone()),
-                    );
+                    let state = &mut *state;
+                    let (rest, before) = text(&mut state.unread, &mut state.opening, None);
+                    let rest = registry.credentials.redact_after(&before, rest);
+                    let last = report(None, rest.clone(), state.dropped, Some(end.clone()));
                     state.end = Some((end, rest));
                     last
                 };
@@ -425,6 +575,18 @@ impl Registry {
         }
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
+    }
+
+    /// End `owner`'s least recently used terminal when it already runs its
+    /// share, returning what says when it has gone.
+    fn prune(&self, owner: i64) -> Option<watch::Receiver<bool>> {
+        let pruned = least_used(
+            &self.terminals.lock().unwrap_or_else(|e| e.into_inner()),
+            owner,
+            MAX_TERMINALS,
+        )?;
+        pruned.kill();
+        Some(pruned.exited.clone())
     }
 
     /// End every terminal, as the daemon stops; each reports its end on
@@ -496,14 +658,26 @@ impl Registry {
 mod tests {
     use super::{Credentials, lines, text};
 
+    /// Read `more` as a running terminal's next output, redacted.
+    fn read(
+        credentials: &Credentials,
+        unread: &mut Vec<u8>,
+        opening: &mut Vec<u8>,
+        more: &[u8],
+    ) -> String {
+        unread.extend_from_slice(more);
+        let (read, before) = text(unread, opening, Some(credentials));
+        credentials.redact_after(&before, read)
+    }
+
     #[test]
     fn a_character_split_across_reads_waits_for_its_end() {
         let none = Credentials::default();
-        let mut unread = "a\r\r\né".as_bytes().to_vec();
-        let last = unread.pop().unwrap();
-        assert_eq!(text(&mut unread, Some(&none)), "a\n");
-        unread.push(last);
-        assert_eq!(text(&mut unread, Some(&none)), "é");
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        let typed = "a\r\r\né".as_bytes();
+        let (head, last) = typed.split_at(typed.len() - 1);
+        assert_eq!(read(&none, &mut unread, &mut opening, head), "a\n");
+        assert_eq!(read(&none, &mut unread, &mut opening, last), "é");
         assert!(unread.is_empty());
     }
 
@@ -511,22 +685,59 @@ mod tests {
     fn a_credential_split_across_reads_is_redacted_whole() {
         let credentials = Credentials::default();
         credentials.set("KEY", "sk-secret-1234");
-        let mut unread = b"key: sk-sec".to_vec();
-        assert_eq!(text(&mut unread, Some(&credentials)), "key: ");
-        unread.extend_from_slice(b"ret-1234\r\n> ");
-        let read = text(&mut unread, Some(&credentials));
-        assert_eq!(credentials.redact(read), "[REDACTED]\n> ");
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        let mut read = |more: &[u8]| read(&credentials, &mut unread, &mut opening, more);
+        assert_eq!(read(b"key: sk-sec"), "key: ");
+        assert_eq!(read(b"ret-1234\r\n> "), "[REDACTED]\n> ");
         // A whole credential that ends with its own start is not split.
         credentials.set("OTHER", "sk-example-s");
-        unread.extend_from_slice(b"sk-example-s");
-        assert_eq!(
-            credentials.redact(text(&mut unread, Some(&credentials))),
-            "[REDACTED]"
-        );
+        let mut read =
+            |more: &[u8]| super::tests::read(&credentials, &mut unread, &mut opening, more);
+        assert_eq!(read(b"sk-example-s"), "[REDACTED]");
         assert!(unread.is_empty());
         // A command's end holds nothing back.
         unread.extend_from_slice(b"sk-");
-        assert_eq!(text(&mut unread, None), "sk-");
+        assert_eq!(text(&mut unread, &mut opening, None).0, "sk-");
+    }
+
+    #[test]
+    fn a_secret_field_split_across_reads_is_redacted_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned(), "api_key".to_owned()], &[]);
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        let mut read = |more: &[u8]| read(&credentials, &mut unread, &mut opening, more);
+        // The name and separator are shown at once, as a prompt to answer
+        // is; the value waits for its end, and is redacted after them.
+        assert_eq!(read(b"login ok\nPassword: "), "login ok\nPassword: ");
+        assert_eq!(read(b"fake9fake9"), "");
+        assert_eq!(read(b"fake9\n> "), "[REDACTED]\n> ");
+        assert_eq!(read(b"password="), "password=");
+        assert_eq!(read(b"fake9fake9fake9\n"), "[REDACTED]\n");
+        // So is a name cut inside, from four bytes of a field's start.
+        assert_eq!(read(b"export MY_PASS"), "export MY_PASS");
+        assert_eq!(read(b"WORD=abcd1234efgh\n"), "WORD=[REDACTED]\n");
+        // Other words, and fields whose values ended, go out as typed.
+        assert_eq!(read(b"ls -la\n> "), "ls -la\n> ");
+        assert_eq!(read(b"api_key: set\n"), "api_key: set\n");
+        assert_eq!(read(b"password: "), "password: ");
+        assert!(unread.is_empty());
+        // A command's end holds nothing back, and still redacts after what
+        // the last read showed.
+        unread.extend_from_slice(b"abcd1234efgh");
+        let (rest, before) = text(&mut unread, &mut opening, None);
+        assert_eq!(credentials.redact_after(&before, rest), "[REDACTED]");
+        assert!(opening.is_empty());
+    }
+
+    #[test]
+    fn a_field_name_in_any_script_is_matched_without_a_panic() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["密码".to_owned()], &[]);
+        let (mut unread, mut opening) = (Vec::new(), Vec::new());
+        assert_eq!(
+            read(&credentials, &mut unread, &mut opening, b"pass"),
+            "pass"
+        );
     }
 
     #[test]

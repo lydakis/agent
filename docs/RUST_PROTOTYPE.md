@@ -390,7 +390,7 @@ bound; the operating system is then the only limit.
 | Flag | Bounds | Default |
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
-| `--max-detached` | Detached shell commands still running, daemon-wide; exited ones are reaped and stop counting. Zero is unbounded. | 16 |
+| `--max-lasting` | Processes that outlive their call, still running, daemon-wide: terminals and detached shell commands together. A terminal holds its slot until its whole session is gone, a detached command until it is reaped. Zero is unbounded. | 4 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
@@ -2369,9 +2369,11 @@ for it, since such a file would hold output that never passed credential
 redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
 handle applies to it, so it outlives the turn and the daemon and is outside
 `--max-processes`; stopping it is the bot's job. What does bound it is
-`--max-detached`: each detached child retains a slot until its async waiter
-reaps it on exit, and a new detach refuses with `detached_limit` while all
-slots are held. It exists because Terminal-Bench
+`--max-lasting`, shared with terminals as a systemd slice holds a
+service's processes: each detached child retains a slot until its async
+waiter reaps it on exit, and a new detach or terminal refuses with
+`lasting_limit`, naming how many terminals and detached commands hold the
+slots, while all are held. Nothing waits in line for one. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
 command. `tty: true` runs the command in a terminal instead, for a REPL or a
 program that prompts, as Codex's `exec_command` does: the command gets a
@@ -2383,10 +2385,20 @@ and returns what the command wrote since the last read, after waiting
 `yield_time_ms` (250 ms after typing, 5 s when only reading); `kill: true` ends
 the command's process group. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other. A terminal takes no process slot and no timeout: it runs until
+like any other; a secret field's value, cut off at the end of a read, waits
+for the next one so it is redacted whole, while its name and separator are
+shown at once, so a prompt such as `Password: ` reaches the bot, and the
+next read is redacted as read after them. A
+terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
-ended, with what no write read. Each bot keeps at most 16; starting another
-kills the one it used least recently, as Codex prunes its sessions. Only the
+ended, with what no write read. It takes a `--max-lasting` slot before it
+starts and keeps it until its whole session is gone: a kill ends the
+command's group, the job in the terminal's foreground, and every other
+group in its session (found under `/proc` on Linux and from the process
+list on macOS), so a job a shell with job control started, ignoring
+SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
+first kills the one it used least recently, as Codex prunes its sessions,
+so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
 other, and for one that ended), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
