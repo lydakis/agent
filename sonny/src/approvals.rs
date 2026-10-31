@@ -230,31 +230,46 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
             .any(|dir| dir.join(".git").exists())
     });
     let network = settings["network"].as_bool().unwrap_or(false);
-    let fit = |mode: &Mode| -> Option<usize> {
+    // Its own folders, past its repositories' git folders.
+    let folders: Vec<&str> = (writable.iter().copied())
+        .filter(|path| !path.ends_with(".git"))
+        .collect();
+    // How well a row fits: whether its folders there now are the bot's,
+    // then how many there are.
+    let fit = |mode: &Mode| -> Option<(bool, usize)> {
         if mode.reviewer != reviewer {
             return None;
         }
         match &mode.sandbox {
             Sandbox::Full => {
-                (!matches!(sandbox, Some("workspace-write" | "read-only"))).then_some(0)
+                (!matches!(sandbox, Some("workspace-write" | "read-only"))).then_some((true, 0))
             }
-            Sandbox::ReadOnly => (sandbox == Some("read-only")).then_some(0),
+            Sandbox::ReadOnly => (sandbox == Some("read-only")).then_some((true, 0)),
             Sandbox::Workspace {
                 network: reaches,
                 git,
                 writable: own,
             } => {
-                let own = real(own);
+                // Every folder the bot writes is one of the row's, as
+                // written or by its real path. A row folder that is not
+                // there yet was left out, and one made since still fits,
+                // so a row is never lost, and widened, because a cache
+                // folder appeared.
+                let there = real(own);
                 let fits = sandbox == Some("workspace-write")
                     && network == *reaches
                     && (*git || !committing)
                     && (!repository || *git == committing)
-                    && own.iter().all(|folder| writable.contains(&folder.as_str()));
-                fits.then_some(own.len())
+                    && (folders.iter())
+                        .all(|folder| own.iter().chain(&there).any(|mine| mine == folder));
+                let exact = there
+                    .iter()
+                    .all(|folder| folders.contains(&folder.as_str()));
+                fits.then_some((exact, there.len()))
             }
         }
     };
-    let mut best: Option<(usize, &'static str)> = None;
+    let mut best: Option<((bool, usize), &'static str)> = None;
     for mode in modes {
         if let Some(score) = fit(mode)
             && best.is_none_or(|(most, _)| score > most)
@@ -813,6 +828,7 @@ mod tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
         crate::task::git(&dir, &["init", "-q"]).unwrap();
         let cache = dir.join("cache").display().to_string();
+        let later = dir.join("later").display().to_string();
         let row = |extends: &str| Permissions {
             description: None,
             extends: extends.into(),
@@ -829,6 +845,7 @@ mod tests {
                         description: Some("Offline, commits ask".into()),
                         network: Some(false),
                         git: Some(false),
+                        writable: vec![later.clone()],
                         ..row("auto")
                     },
                 ),
@@ -862,6 +879,9 @@ mod tests {
             strict["settings"],
             json!({"sandbox": "workspace-write", "writable": [], "network": false})
         );
+        assert_eq!(mode_in(&strict, &modes), Some("strict"));
+        // Its folder made since, it is still strict, not widened to auto.
+        std::fs::create_dir(&later).unwrap();
         assert_eq!(mode_in(&strict, &modes), Some("strict"));
         // Auto in the same folder is still auto.
         assert_eq!(
