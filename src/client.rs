@@ -407,6 +407,14 @@ fn parse(args: &[String]) -> Result<Options> {
                             options.settings_flags.push(flag.to_owned());
                         }
                     }
+                    "--outputs" => {
+                        let path = std::path::absolute(&value)?;
+                        let path = path
+                            .to_str()
+                            .ok_or(Error::with("usage", "--outputs needs a UTF-8 path"))?;
+                        options.settings.insert("outputs".to_owned(), json!(path));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--unsandboxed" => {
                         let unsandboxed = options
                             .settings
@@ -1487,6 +1495,11 @@ fn run(options: &Options) -> Result<i32> {
         let mut settings = options.settings.clone();
         if config()?.hide_senders {
             settings.entry("hide_senders").or_insert(json!(true));
+        }
+        // Cut outputs go whole to a folder beside the store, as the
+        // summary prompt goes by default; --outputs names another.
+        if let Some(outputs) = agent_client::policy::outputs_beside(&options.store) {
+            settings.entry("outputs").or_insert(json!(outputs));
         }
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
             "instructions":instructions,"effort":effort,

@@ -649,6 +649,18 @@ fn start_daemon(
 }
 
 /// The store and socket given, else the environment's, else Agent's own.
+/// The store this Sonny reaches, once [`daemon_paths`] chose it.
+static STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The outputs folder a new agent's cut tool outputs go to: beside the
+/// store this Sonny reaches.
+pub(crate) fn outputs() -> Option<String> {
+    match STORE.get() {
+        Some(store) => agent_client::policy::outputs_beside(store),
+        None => agent_client::policy::default_outputs(),
+    }
+}
+
 fn daemon_paths(
     store: Option<PathBuf>,
     socket: Option<PathBuf>,
@@ -660,6 +672,7 @@ fn daemon_paths(
     };
     // One store under two names is one lookout's.
     let store = agent_client::socket::canonical_store(&store).map_err(|e| e.to_string())?;
+    let _ = STORE.set(store.clone());
     let socket = match socket.or_else(|| std::env::var_os("AGENT_SOCKET").map(PathBuf::from)) {
         Some(socket) => socket,
         None => agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?,
@@ -1171,6 +1184,9 @@ pub(crate) fn made(
     let mut settings = approvals::sandbox(mode, workspace);
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
+    }
+    if let Some(outputs) = outputs() {
+        settings.insert("outputs".into(), json!(outputs));
     }
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
