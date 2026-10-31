@@ -201,9 +201,11 @@ vulnerability, whether or not the code's own documentation agrees.
   makes it `0600` before SQLite first opens it, so the `-wal` and `-shm`
   SQLite makes beside it take that mode too, and tightens a store or
   sidecar an earlier daemon left looser. The daemon's log, the
-  companions' folder and logs, and the lookout's log beside it are made
-  `0600` and `0700` the same way. There is no encryption at rest. Tool
-  output spilled to files goes in folders made `0700`, as `0600` files.
+  companions' folder and logs, and what the lookout keeps beside the
+  store (its log, cursor, lock and marker, the sources', subscriptions'
+  and goals' folders) are made `0600` and `0700` the same way. There is
+  no encryption at rest. Tool output spilled to files goes in folders
+  made `0700`, as `0600` files.
 - `rm`, `prune` and `--keep-turns` delete rows; SQLite's free pages and
   WAL are not scrubbed. Compaction keeps the original history.
 - A resume never silently makes a fresh bot. A fork is a new identity; a

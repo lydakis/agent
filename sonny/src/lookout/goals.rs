@@ -116,15 +116,11 @@ pub fn all(store: &Path) -> HashMap<String, Goal> {
 /// Written whole and moved in, so the lookout never reads half of one.
 fn write(store: &Path, goal: &Goal) -> Result<(), String> {
     let dir = dir(store);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    super::make_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = file(store, &goal.bot);
     let partial = dir.join(format!(".{}.{}.partial", goal.bot, std::process::id()));
-    std::fs::write(&partial, goal.to_json().to_string())
-        .and_then(|()| std::fs::rename(&partial, &path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&partial);
-            format!("{}: {e}", path.display())
-        })
+    super::write_moved(&partial, &path, &goal.to_json().to_string())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Where how a goal ended is noted, by the turn that ended it:
@@ -142,14 +138,12 @@ fn ended_file(store: &Path, bot: &str) -> PathBuf {
 fn ended(store: &Path, goal: &Goal, turn: i64, outcome: &str, met: bool) {
     let path = ended_file(store, &goal.bot);
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = super::make_dir(dir);
         let partial = dir.join(format!(".{}.{}.partial", goal.bot, std::process::id()));
         let text = json!({"turn": turn, "bot_id": goal.bot_id, "check": goal.check, "met": met,
             "outcome": outcome})
         .to_string();
-        if std::fs::write(&partial, text).is_err() || std::fs::rename(&partial, &path).is_err() {
-            let _ = std::fs::remove_file(&partial);
-        }
+        let _ = super::write_moved(&partial, &path, &text);
     }
     end(store, goal);
 }
@@ -965,6 +959,12 @@ mod tests {
         let set = goal(&store, "p.fix");
         assert_eq!(standing(&store, "p.fix", Some(4)), None);
         write(&store, &set).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&super::dir(&store)), 0o700);
+            assert_eq!(mode(&file(&store, "p.fix")), 0o600);
+        }
         assert_eq!(standing(&store, "p.fix", Some(4)), Some("checking"));
         ended(
             &store,

@@ -326,7 +326,11 @@ pub fn main(settings: Settings) -> Result<(), String> {
         return Ok(());
     };
     // Which Sonny this is, for the next one to start to tell.
-    let _ = std::fs::write(beside(&settings.store, ".lookout.sonny"), identity());
+    let _ = write_moved(
+        &beside(&settings.store, ".lookout.sonny.partial"),
+        &beside(&settings.store, ".lookout.sonny"),
+        &identity(),
+    );
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -339,6 +343,40 @@ pub(crate) fn beside(store: &Path, suffix: &str) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+/// A folder the lookout makes beside the store, its owner's alone as the
+/// store is; one that exists keeps the mode its maker gave it.
+pub(crate) fn make_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// `text` written whole at `partial`, owner-only from its making, then
+/// moved to `path`: a reader never sees half a file, and the name never
+/// a looser mode. A stale partial of the name goes first; a failed write
+/// leaves none.
+pub(crate) fn write_moved(partial: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(partial) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(partial)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(partial, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    written
 }
 
 /// This Sonny, told apart from another build of it: its version and when
@@ -395,10 +433,12 @@ fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
 /// written in: `None` when another process holds it.
 pub(crate) fn hold(path: &Path) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
@@ -1472,9 +1512,7 @@ impl Service {
         }
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
-        if std::fs::write(&partial, format!("{cursor} {replay}")).is_ok()
-            && std::fs::rename(&partial, &path).is_ok()
-        {
+        if write_moved(&partial, &path, &format!("{cursor} {replay}")).is_ok() {
             self.saved = Some((cursor, replay));
         }
     }
@@ -3442,6 +3480,34 @@ mod tests {
             gone
         });
         assert!(let_go);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_the_lookout_writes_beside_the_store_is_its_owner_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = std::env::temp_dir().join(format!("lookout-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A folder it makes is owner-only; the one it was given keeps its mode.
+        let made = dir.join("state.sqlite.sources").join("deep");
+        make_dir(&made).unwrap();
+        assert_eq!(mode(&made), 0o700);
+        assert_eq!(mode(made.parent().unwrap()), 0o700);
+        make_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o755);
+        // A file is owner-only from its making, and the partial is gone.
+        let (partial, path) = (dir.join(".cursor.partial"), dir.join("cursor"));
+        std::fs::write(&partial, "stale").unwrap();
+        write_moved(&partial, &path, "12 10").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "12 10");
+        assert_eq!(mode(&path), 0o600);
+        assert!(!partial.exists());
+        let held = hold(&dir.join("state.sqlite.lookout.lock")).unwrap();
+        assert!(held.is_some());
+        assert_eq!(mode(&dir.join("state.sqlite.lookout.lock")), 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
