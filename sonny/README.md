@@ -394,7 +394,8 @@ what is sent is the text as typed.
 Alt-T boosts the next message: the turn it starts runs at a higher effort
 (`xhigh`, or `high` where the model has no `xhigh`), Alt-T again at `max`
 where the model takes it, and again back to the agent's own. The footer
-shows `↑xhigh` beside the effort until a message takes it; a message that
+shows `↑xhigh` beside the effort until a message takes it (in zen, quieter, an
+arrow a step after the focus: `↑`, then `↑↑`); a message that
 steers a running turn leaves it for the next. The agent's own effort never
 changes, as `/model` changes it.
 
