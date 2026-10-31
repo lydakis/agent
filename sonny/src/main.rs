@@ -1952,6 +1952,9 @@ struct App {
     /// The read under way, of the workspace named, and when the last one
     /// began: the branch can change under a running turn.
     place_job: Option<(String, tokio::task::JoinHandle<place::Place>)>,
+    /// The agent whose tab is being looked for, from a window with no
+    /// layout of its own, and the look.
+    tab_job: Option<(String, tokio::task::JoinHandle<Result<(), String>>)>,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -3019,6 +3022,7 @@ impl App {
             workspace: record["workspace"].as_str().unwrap_or("").to_owned(),
             place: place::Place::default(),
             place_job: None,
+            tab_job: None,
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -3375,6 +3379,7 @@ impl App {
             self.shell_ran().await;
             self.listed();
             self.follow_place().await;
+            self.follow_tab().await;
             self.count_behind().await;
             self.read_tasks().await;
             self.read_running_tasks().await;
@@ -4482,7 +4487,47 @@ impl App {
         let tab = (self.agent_opens == AgentOpens::Tab) != other;
         match &self.fleet {
             Some(fleet) if tab && fleet.layout.places().contains_key(bot) => fleet.go_to(bot),
+            // A task's window, or one in the pane, lays nothing out
+            // itself: its project's layout is found off the screen, and
+            // with no tab there the agent opens in the pane after all.
+            None if tab && self.tab_job.is_none() => {
+                let (client, socket, me) = (
+                    self.client.clone(),
+                    self.options.socket.clone(),
+                    self.bot.clone(),
+                );
+                let lead = self.project.clone();
+                let bot = bot.to_owned();
+                let job = tokio::spawn({
+                    let bot = bot.clone();
+                    async move {
+                        let project = match lead {
+                            Some(project) => project,
+                            None => project_of(&client, &me).await,
+                        };
+                        tokio::task::spawn_blocking(move || {
+                            mux::for_agent(&socket, &project, None)?.focus(&bot)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    }
+                });
+                self.tab_job = Some((bot, job));
+            }
             _ => self.open_task(bot),
+        }
+    }
+
+    /// The tab looked for off the screen: with none, the agent opens in
+    /// the pane, as a click on it does where nothing is laid out.
+    async fn follow_tab(&mut self) {
+        if let Some((_, job)) = &self.tab_job
+            && job.is_finished()
+        {
+            let (bot, job) = self.tab_job.take().unwrap();
+            if !matches!(job.await, Ok(Ok(()))) {
+                self.open_task(&bot);
+            }
         }
     }
 
