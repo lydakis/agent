@@ -1058,32 +1058,46 @@ cancelled like any others at shutdown. `agent shutdown --grace DURATION` sends
 it and waits that much longer than 30 seconds.
 
 Protocol 24 also adds the pull cord: `pause` stops every agent until
-`resume`, and holds across restarts, since the store keeps it (schema 64, a
-one-row `pause` table). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
+`resume`, and holds across restarts, since the store keeps it (schema 64;
+since schema 72 the `pauses` table keeps every pause, held or lifted). `{"op":"pause","reason":TEXT,"by":NAME}` needs a
 reason of 1 to 4096 bytes. `by` is who pulled it, 1 to 128 bytes, or the
 request answers `invalid_by`; on a bot's own socket it is that bot, whatever
 the request says. It parks every running turn at once,
 as a closed pool parks it (`turn_paced` with `paused: true`; status `paced`),
 to continue on `resume`. The reply it was writing is dropped and asked for
 again then. Each call the turn had not answered gets a result, `{error:
-"daemon_paused", detail, pause}`, saying the pause stopped it before its result
+"daemon_paused", detail, pause}` (`pause` is `{reason, by, at_ms}`), saying the pause stopped it before its result
 was recorded (it may have had effects) or came before it ran, and none is run
 again: the model decides what to redo, as Codex answers the calls an interrupt
 cut off. The pause ends every background command (whose handle then answers
-`daemon_paused`, saying the same) and terminal, though not a detached
-command, which no one tracks, and from then no turn starts: a `reject`
+`daemon_paused`, saying the same), terminal, and detached command this
+daemon started (the process group each leads, with what it left running
+there after it exited, and on Linux a sandboxed one's whole pid namespace;
+one started before a restart, or an unsandboxed process that left that
+group, is no longer the daemon's to find), and from
+then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, triggers and notes with them, and parked and paced turns
 stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
-parked}`, where `pause` is `{reason, by, at_ms}` and `parked` counts the
-running turns it parked. While a pause holds,
+parked}`, where `pause` is `{id, reason, by, at_ms, parked}` and the
+reply's `parked` counts the running turns it parked. The pause's own `parked`
+is `{bots, total}`: the agents whose running turns it parked, the first 64 by
+name, and how many in all, so whoever looks can stop one before letting the
+line go on. While a pause holds,
 another changes nothing and answers the first with `changed: false`.
 `{"op":"resume","by":NAME?}` lifts it and answers `{pause, by, changed}` with
 the pause it lifted, or null when none held, and who lifted it (`by`, 1 to
-128 bytes, as `pause` takes it); what waited,
+128 bytes, as `pause` takes it). A lifted pause adds `resumed_by` and
+`resumed_ms`; what waited,
 and the turns the pause parked, start as capacity allows. Time parked by a
 pause is not counted in `paced_ms`. Protocol 33 parks running turns on a
-pull; before it, they ended `interrupted`. A
+pull; before it, they ended `interrupted`. Protocol 34 keeps every pause:
+`{"op":"pauses","after":ID?,"before":ID?,"limit":N?,"newest":BOOL?}` reads
+them, held and lifted, oldest first (`newest` turns it), at most `limit` (1
+to 256, default 64, and no more than half a reply's bytes) after the pause
+`after` and before `before`, answering `{pauses, more}`; a bad page is `invalid_pause_page`. `agent pauses` prints
+them. A store migrated from schema 71 keeps the pause that held, with no
+agents named as parked. A
 sandboxed bot's own socket refuses it with `not_permitted`, so a command
 left running in a sandbox cannot let the line go on. Each
 change is told to every session as a `paused` or `resumed` event, `{event,
@@ -1193,12 +1207,20 @@ have none.
 `{"folder", "turns"}`, so a client resolves a path a message names where it was
 written even after the bot moved; a turn whose rows went with a deleted fork
 source is absent. One query reads them for the whole page.
-Membership validation walks the lineage, as `history_items` does. Both operations run
-on the read worker in a consistent snapshot, avoiding the serialized writer.
+A page sends at most 256 KiB: one whose turns ran in many long folders holds
+fewer nodes than `limit`, and `next_from` (or `next_newer`, oldest first)
+continues from where it stopped. Its first node is always listed.
+Each node keeps its place in the history tree in a narrow row beside it
+(`lineage`: its parent, depth, a skip pointer chosen as Bitcoin Core's block
+index chooses one, and the start of its turn), so checking that `from` is in
+the lineage, finding where an oldest-first page starts, and naming a page's
+turn each take O(log n) steps however deep the history is, rather than a walk
+over it. Stores from before schema 73 place every node when they open. Both operations run
+on a reader connection in a consistent snapshot, avoiding the serialized writer.
 The fork can read its shared prefix after its source is deleted.
 
 `history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
-against that bot's lineage with one ancestry walk and returns a prefix as
+against that bot's lineage through the same skip pointers and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. A prompt a bot's turn
 wrote also carries `from: {bot, turn, bot_id}`, with `bot_id` the identity the bot's name
 held when it wrote it, and one a client sent with an `origin` carries that, so a

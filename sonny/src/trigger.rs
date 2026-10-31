@@ -3386,19 +3386,36 @@ fn request_id(trigger: &Trigger, id: i64, ask: Option<&Asked>) -> String {
 }
 
 /// Whether a fire of `trigger` already waits behind `bot`'s work; `None`
-/// when the agent's turns could not be read.
+/// when the agent's turns could not be read. Work waiting (queued, ready,
+/// or a note attached to the next turn) is always an agent's newest, since
+/// queued work starts in order: the turns are read newest first, a page at
+/// a time, until one that started or ended.
 async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str) -> Option<bool> {
-    let read = client
-        .request("turns", json!({"bot": bot, "newest": true, "limit": 64}))
-        .await
-        .ok()?;
     let ours = sent_by(trigger);
-    Some((read["turns"].as_array()?.iter()).any(|turn| {
-        matches!(turn["status"].as_str(), Some("queued" | "ready"))
-            && turn["request_id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with(&ours))
-    }))
+    let mut before: Option<i64> = None;
+    loop {
+        let mut page = json!({"bot": bot, "newest": true, "limit": 256});
+        if let Some(before) = before {
+            page["before"] = json!(before);
+        }
+        let read = client.request("turns", page).await.ok()?;
+        let turns = read["turns"].as_array()?;
+        for turn in turns {
+            let status = turn["status"].as_str()?;
+            if !matches!(status, "queued" | "ready" | "attached") {
+                return Some(false);
+            }
+            if status != "attached"
+                && (turn["request_id"].as_str()).is_some_and(|id| id.starts_with(&ours))
+            {
+                return Some(true);
+            }
+        }
+        match turns.last().and_then(|turn| turn["turn"].as_i64()) {
+            Some(oldest) if turns.len() == 256 => before = Some(oldest),
+            _ => return Some(false),
+        }
+    }
 }
 
 /// With `--reply-to`, wait for the turn a fire sent and queue its answer

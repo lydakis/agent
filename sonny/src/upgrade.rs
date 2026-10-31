@@ -70,6 +70,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "scheduler-job",
         retire: "0.10.0",
     },
+    // Agents that posted in the commons are subscribed to its threads
+    // (0.8.0).
+    Migration {
+        id: crate::commons::POSTERS,
+        retire: "0.10.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

@@ -849,6 +849,7 @@ impl Updates {
     /// A trigger's run that went well and replied nothing is no news, as
     /// cron mails a job's output only when it printed some: one that
     /// failed, was stopped, resolved its task or ended a goal still is.
+    /// The trigger's words that started the run go with it.
     fn said_nothing(&mut self, name: &str, turn: i64) {
         let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
             return;
@@ -863,6 +864,7 @@ impl Updates {
                 && t.goal.is_none()
         }) {
             news.act = None;
+            (news.said).retain(|said| !(said.turn == turn && said.from == "trigger"));
             if news.empty() {
                 self.tasks.remove(at);
             }
@@ -1784,13 +1786,16 @@ mod tests {
     fn a_trigger_s_run_that_went_well_and_said_nothing_is_no_news() {
         let mut updates = fleet();
         let trigger = || json!({"origin": "trigger"});
+        // Its words are heard first, as the lookout reads them.
+        assert!(updates.said("shop.fix", 4, "trigger", None));
         turn(&mut updates, "shop.fix", 4, trigger(), "completed");
         updates.reading_reply("shop.fix", 4);
         turn(&mut updates, "shop.docs", 2, trigger(), "failed");
         updates.reading_reply("shop.docs", 2);
         updates.replied("shop.fix", 4, "  \n");
         updates.replied("shop.docs", 2, "");
-        // One that went wrong is told, words or none.
+        // One that went wrong is told, words or none; the quiet one, and
+        // the trigger's words that started it, are not.
         assert_eq!(
             text(&updates.take()),
             "- shop.docs: turn:shop.docs/2 failed, asked by trigger"

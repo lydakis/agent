@@ -474,12 +474,18 @@ fn ignored(
             if !std::fs::symlink_metadata(&there).is_ok_and(|m| m.is_dir()) {
                 let _ = std::fs::remove_file(&there);
             }
-            let rules = here.join(".gitignore");
-            if std::fs::symlink_metadata(&rules).is_ok_and(|m| m.is_file()) {
+            // A copy that is not a plain file (a link, say) goes first, so
+            // the rules never land wherever it points.
+            let (rules, kept) = (here.join(".gitignore"), there.join(".gitignore"));
+            let plain = std::fs::symlink_metadata(&rules).is_ok_and(|m| m.is_file());
+            match std::fs::symlink_metadata(&kept) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&kept).map_err(fail)?,
+                Ok(m) if !(plain && m.is_file()) => std::fs::remove_file(&kept).map_err(fail)?,
+                _ => {}
+            }
+            if plain {
                 std::fs::create_dir_all(&there).map_err(fail)?;
-                std::fs::copy(&rules, there.join(".gitignore")).map_err(fail)?;
-            } else if std::fs::symlink_metadata(there.join(".gitignore")).is_ok() {
-                let _ = std::fs::remove_file(there.join(".gitignore"));
+                std::fs::copy(&rules, &kept).map_err(fail)?;
             }
         }
         for dir in &level {
@@ -1150,6 +1156,33 @@ mod tests {
                 "agents/skills/plan/SKILL.md"
             ]
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_rules_link_that_became_a_file_never_writes_where_it_pointed() {
+        let root = scratch("rules-link");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let at = places(&root.join("one"));
+        let outside = root.join("outside.txt");
+        write(&outside, "untouched");
+        write(&at.agents.join("memory/fact.md"), "fact");
+        std::os::unix::fs::symlink(&outside, at.agents.join("memory/.gitignore")).unwrap();
+        adopt(&at, &root.join("remote.git").to_string_lossy(), None).unwrap();
+        sh(&at.repo, &["config", "user.email", "t@example.com"]);
+        sh(&at.repo, &["config", "user.name", "T"]);
+        sync(&at, None).unwrap();
+        assert!(
+            std::fs::symlink_metadata(at.repo.join("agents/memory/.gitignore"))
+                .unwrap()
+                .is_symlink()
+        );
+        // The home's link becomes rules of its own.
+        std::fs::remove_file(at.agents.join("memory/.gitignore")).unwrap();
+        write(&at.agents.join("memory/.gitignore"), "fact.md\n");
+        sync(&at, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        assert!(!at.repo.join("agents/memory/fact.md").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

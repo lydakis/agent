@@ -364,8 +364,8 @@ which bot, by its identity and its store, is kept in `~/.agent/sonny/t3`, so
 a thread T3 Code resumes is the same bot or none: one removed and made again
 under its name, or a bot of another store, is refused, and each prompt names
 the bot's identity, so one sent after such a swap reaches neither. T3 Code's model picker lists what the providers list, as `/model`
-does, each by the name its provider lists (else its id) beside the provider,
-as "Global Claude Opus 5.5 · bedrock", with the full id and
+does, each by the name its provider lists (else the name Sonny gives it, as
+people say it) beside the provider, as "Global Claude Opus 5.5 · bedrock", with the full id and
 `~/.agent/models`' notes, and the models only that file names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
@@ -504,7 +504,8 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/config over the composer, side_chat set to fork](../docs/sonny/config.png)
 - `/model` picks the lead's model, from every model its provider family
-  lists, and its effort (←/→), and writes them to the project's
+  lists, each by its name and provider (`Opus 5.5 · bedrock`) with its id
+  muted after them, found by either, and its effort (←/→), and writes them to the project's
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
@@ -662,7 +663,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   the tokens the project's agents spent in the last 24 hours, as their
   retained history records them: in all, as
   stacked bars over time (output, input read fresh, and input read from the
-  provider's cache), by agent and by model. `d`, `w` and `m` show the last
+  provider's cache), by agent and by model: each model by its name, its
+  provider in a muted column beside it, and one model's ids from one
+  provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
   A turn counts where it started. It reads again every minute.
@@ -770,7 +773,10 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/pause REASON` stops every agent, in every project, until `/resume`:
   running turns stop where they are and continue on `/resume`, and what
   arrives meanwhile waits, across restarts too.
-  Every window says who paused and why. Agents pull the same cord with
+  Every window says who paused and why, and which agents it parked; Esc in
+  one of their windows ends that agent's turn before you resume.
+  `agent pauses` lists every pause, who pulled it and who let it go.
+  Agents pull the same cord with
   `agent pause --reason` from their shell
   ([docs/SONNY.md](../docs/SONNY.md#pause)). In `/sky` a pull is the one
   loud moment: a yellow cord drops from the top to whoever pulled it, an
@@ -859,8 +865,21 @@ way `/react` does, and each note in the margin has its own `↩`.
   Esc sets them aside for a message of your own, and Esc again goes back.
   Once you send words of your own, the conversation has moved on: the open
   questions leave the composer and the `needs you` count, and their cards'
-  options still answer them. The lead does not wait: it goes on with the
-  option it recommends when that can be undone, or ends its turn. Open
+  options still answer them. The lead does not wait on you blindly: each
+  ask says what it does until you answer, and the card's last row says
+  so. It goes on with the option it recommends at once when that can be
+  undone (`Going with 2 meanwhile; another pick undoes it.`), goes on with
+  it at a deadline when it can be undone but you should see it first
+  (`Goes with 2 at 21:30 unless you pick.`), or waits for anything that
+  goes out in your name or to other people, approves, merges, deletes or
+  cannot be undone (`Waits for your pick; a reminder at 21:30.`). The
+  deadline is a one-off automation (`/background`) the tool host sets,
+  `[sonny] ask_wait_minutes` from the ask (60 by default, 0 for none,
+  which makes every ask wait) unless the agent sets its own for work on a
+  clock. It runs nothing once you answer or write to that agent, since the
+  conversation moved on; when it runs, it is Sonny's words, never yours,
+  so it allows nothing that needs your own. Pick another option later and
+  the agent undoes what it did. Open
   questions are read from the history Sonny replays (its `ask` calls not
   yet answered or moved on from), so one asked while Sonny was closed is
   answered the same way when it opens. A yellow `?` starts it and a muted
@@ -872,6 +891,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   itself.
 
   ![Two open decisions, their bars whole after the window narrowed, and the composer answering the first of two](../docs/sonny/ask-several.png)
+
+  ![Three decisions: one the lead goes ahead with meanwhile, one that goes ahead at 21:17 unless you pick, and one that waits for you with a reminder](../docs/sonny/ask-meanwhile.png)
 
   ![Typing an answer: the composer's band names the question over the words, as the sent answer will show it](../docs/sonny/ask-answering.png)
 
@@ -892,7 +913,7 @@ line's `task_depth` leaves room below, and its tasks take them only while
 they have room too, from their first turn, as the daemon counts the
 generations down (`inherit` as a count); a lead's own, which its tasks never take, is
 `new_project`. The daemon shows them to
-the model and records each call: `react`, `ask`, `plan`, `margin` and
+the model and records each call: `react`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as

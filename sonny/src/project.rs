@@ -23,11 +23,17 @@ pub const TASK: &str = include_str!("../agents/task.md");
 /// runs as it unless set to (`profile = "superlead"`).
 pub const SUPERLEAD: &str = include_str!("../agents/superlead.md");
 
+/// How a lead moves work and words between agents, the skill [`LEAD`]
+/// loads whole (`skills: [coordination]`), kept apart so coordination has
+/// one place to change.
+pub const COORDINATION: &str = include_str!("../skills/coordination/SKILL.md");
+
 /// The roles Sonny ships, which the person's files of the same names
 /// replace, or build on with `extends`.
 pub const BUILTINS: [(&str, &str); 3] = [("lead", LEAD), ("task", TASK), ("superlead", SUPERLEAD)];
 
-/// The most bytes each shipped role may hold. Every agent reads its role
+/// The most bytes each shipped role may hold, with the skills it loads
+/// whole. Every agent reads its role
 /// on every call, so a role only grows by cutting elsewhere: merge or drop
 /// a sentence, or leave to memory what the person can teach. Budgets come
 /// down as evals show shorter text does as well, and go up only with the
@@ -49,7 +55,9 @@ pub fn builtins() -> [(&'static str, std::borrow::Cow<'static, str>); 3] {
 pub fn profile(dir: &Path, name: &str) -> Result<agent_client::policy::Profile, String> {
     let roles = builtins();
     let roles = roles.each_ref().map(|(name, text)| (*name, text.as_ref()));
-    agent_client::policy::profile_with(dir, name, &roles)
+    let coordination = crate::commons::role(COORDINATION);
+    let skills = [("coordination", coordination.as_ref())];
+    agent_client::policy::profile_with(dir, name, &roles, &skills)
         .map_err(|e| format!("{}: {e}", e.code()))?
         .ok_or_else(|| {
             let missing = agent_client::policy::Failure::Missing {
@@ -1026,10 +1034,23 @@ mod tests {
                 .iter()
                 .find(|(n, _)| *n == name)
                 .expect("a budget per role");
+            // As the profile is read: each loaded skill's body under its
+            // header.
+            let loaded: usize = agent_client::policy::front_matter(text)
+                .0
+                .skills
+                .iter()
+                .flatten()
+                .map(|skill| {
+                    assert_eq!(skill, "coordination", "a shipped skill {name} loads");
+                    let body = agent_client::policy::front_matter(COORDINATION).1.trim();
+                    format!("\n\n## Skill: {skill}\n\n{body}").len()
+                })
+                .sum();
             assert!(
-                text.len() <= *budget,
-                "sonny/agents/{name}.md is {} bytes, over its {budget}: cut as much as you add",
-                text.len()
+                text.len() + loaded <= *budget,
+                "sonny/agents/{name}.md and the skills it loads are {} bytes, over its {budget}: cut as much as you add",
+                text.len() + loaded
             );
         }
     }
@@ -1132,10 +1153,17 @@ mod tests {
         .unwrap();
         let lead = role(&dir).unwrap();
         assert_eq!(lead.name, "my-lead");
-        assert!(lead.body.ends_with("Review each change before it lands."));
-        // The lead's text, the person's or Sonny's, comes first.
+        // The lead's text, the person's or Sonny's, comes first, and the
+        // skills it loads come last.
+        let skill = "\n\n## Skill: coordination\n\n";
+        assert!(
+            lead.body
+                .contains(&format!("Review each change before it lands.{skill}"))
+        );
         let base = profile(&dir, "lead").unwrap().body;
-        assert!(lead.body.starts_with(&base));
+        let (base, coordination) = base.split_once(skill).unwrap();
+        assert!(lead.body.starts_with(base));
+        assert!(lead.body.ends_with(coordination));
         let text = instructions(&dir).unwrap();
         assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
@@ -1147,8 +1175,9 @@ mod tests {
         )
         .unwrap();
         let lead = role(&dir).unwrap();
-        assert!(lead.body.starts_with(&base));
+        assert!(lead.body.starts_with(base));
         assert!(lead.body.contains("you lead their leads"));
+        assert!(lead.body.ends_with(coordination));
         assert!(!instructions(&dir).unwrap().contains("- superlead:"));
         let _ = std::fs::remove_dir_all(&dir);
     }

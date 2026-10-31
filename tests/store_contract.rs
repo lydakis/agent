@@ -9433,6 +9433,142 @@ fn lineage_pages_preserve_turns_and_visit_every_node_in_both_directions() {
 }
 
 #[test]
+fn history_pages_stop_at_their_byte_budget_and_continue() {
+    // 120 turns, each in its own 3 KB folder: a page of all 240 nodes would
+    // list 360 KB of folders.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let mut expected = Vec::new();
+    for n in 0..120 {
+        let options = TurnOptions {
+            workspace: Some(format!("/synthetic/{n:03}/{}", "f".repeat(3000))),
+            ..TurnOptions::default()
+        };
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("r{n}"),
+                "go",
+                true,
+                &options,
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        expected.push(db.inspect("Bob").unwrap().head.unwrap());
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
+        expected.push(db.inspect("Bob").unwrap().head.unwrap());
+        db.finish(turn, None).unwrap();
+    }
+    let check = |page: &Value| -> Vec<i64> {
+        assert!(
+            page.to_string().len() <= 256 * 1024 + 256,
+            "{}",
+            page.to_string().len()
+        );
+        let nodes: Vec<&Value> = page["nodes"].as_array().unwrap().iter().collect();
+        let mut turns: Vec<i64> = nodes.iter().map(|n| n["turn"].as_i64().unwrap()).collect();
+        turns.dedup();
+        turns.reverse();
+        // Each turn on the page, and only those, with its own folder.
+        let listed: Vec<i64> = page["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| {
+                w["turns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.as_i64().unwrap())
+            })
+            .collect();
+        assert_eq!(listed, turns);
+        nodes.iter().map(|n| n["node"].as_i64().unwrap()).collect()
+    };
+    let mut backward = Vec::new();
+    let mut from = None;
+    let mut pages = 0;
+    loop {
+        let page = db.history_nodes("Bob", from, 400, None, false).unwrap();
+        let nodes = check(&page);
+        assert!(nodes.len() < 240);
+        backward.extend(nodes);
+        pages += 1;
+        from = page["next_from"].as_i64();
+        if from.is_none() {
+            break;
+        }
+    }
+    assert!(pages > 1);
+    backward.reverse();
+    assert_eq!(backward, expected);
+    let mut forward = Vec::new();
+    let mut min = None;
+    loop {
+        let page = db.history_nodes("Bob", None, 400, min, true).unwrap();
+        forward.extend(check(&page).into_iter().rev());
+        min = page["next_newer"].as_i64();
+        if min.is_none() {
+            break;
+        }
+    }
+    assert_eq!(forward, expected);
+}
+
+#[test]
+fn a_store_from_before_skip_pointers_places_every_node() {
+    let path = std::env::temp_dir().join(format!("agent-lineage-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("source", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=40 {
+        converse(&mut db, "source", n);
+    }
+    db.fork("source", "branch", Fork::default()).unwrap();
+    for n in 41..=50 {
+        converse(&mut db, "source", n);
+        converse(&mut db, "branch", n + 100);
+    }
+    let pages = |db: &Database| -> Vec<Value> {
+        ["source", "branch"]
+            .iter()
+            .flat_map(|bot| {
+                [
+                    db.history_nodes(bot, None, 7, None, false).unwrap(),
+                    db.history_nodes(bot, None, 7, Some(30), true).unwrap(),
+                ]
+            })
+            .collect()
+    };
+    // node, parent, depth, skip, start
+    type Place = (i64, Option<i64>, i64, Option<i64>, Option<i64>);
+    let lineage = || -> Vec<Place> {
+        Connection::open(&path)
+            .unwrap()
+            .prepare("SELECT node,parent,depth,skip,start FROM lineage ORDER BY node")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let before = (lineage(), pages(&db));
+    assert_eq!(before.0.len(), 120);
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE lineage; PRAGMA user_version=72;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!((lineage(), pages(&db)), before);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
     // Bytes: a 4 KiB context keeps three quarters, 3,072 bytes, for the
     // running turn; its prompt item takes some, and two of three 1,000-byte
@@ -14552,4 +14688,74 @@ fn each_item_says_when_it_joined_the_history() {
         assert!(written >= before, "{listed}");
         assert_eq!(read["written_ms"], written);
     }
+}
+
+#[test]
+fn schema_71_held_one_pause_and_forgot_it_when_lifted() {
+    let path = std::env::temp_dir().join(format!("agent-schema71-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE pauses;
+             CREATE TABLE pause(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL);
+             INSERT INTO pause VALUES(1,'the migration deletes rows','calc.a',5);
+             PRAGMA user_version=71;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // The pause that held goes on holding; whose turns it parked was not kept.
+    let held = db.pause().unwrap().unwrap();
+    assert_eq!(
+        held,
+        json!({"id": 1, "reason": "the migration deletes rows", "by": "calc.a", "at_ms": 5,
+            "parked": {"bots": [], "total": 0}})
+    );
+    let (again, new) = db.put_pause("another", None, 6, &[], 0).unwrap();
+    assert_eq!((again, new), (held, false));
+    let lifted = db.remove_pause(Some("shop.b"), 7).unwrap().unwrap();
+    assert_eq!(
+        (&lifted["resumed_by"], &lifted["resumed_ms"]),
+        (&json!("shop.b"), &json!(7))
+    );
+    assert!(db.pause().unwrap().is_none());
+    // A new pause is the next in the history.
+    let (next, new) = db
+        .put_pause("again", None, 8, &["calc.a".to_owned()], 3)
+        .unwrap();
+    assert!(new);
+    assert_eq!(
+        (&next["id"], &next["parked"]),
+        (&json!(2), &json!({"bots": ["calc.a"], "total": 3}))
+    );
+    let history = db.pauses(0, None, 64, false).unwrap();
+    assert_eq!(history, json!({"pauses": [lifted, next], "more": false}));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_page_of_pauses_fits_one_reply() {
+    let mut db = db();
+    for n in 0..256 {
+        db.put_pause(&"r".repeat(4096), Some(&"b".repeat(128)), n, &[], 0)
+            .unwrap();
+        db.remove_pause(None, n).unwrap();
+    }
+    let page = db.pauses(0, None, 256, false).unwrap();
+    let shown = page["pauses"].as_array().unwrap().len();
+    assert!((1..256).contains(&shown), "{shown}");
+    assert_eq!(page["more"], true);
+    assert!(serde_json::to_vec(&page).unwrap().len() <= agent_runtime::output::MAX_EVENT / 2);
+    let rest = db
+        .pauses(
+            page["pauses"][shown - 1]["id"].as_i64().unwrap(),
+            None,
+            256,
+            false,
+        )
+        .unwrap();
+    assert_eq!(rest["pauses"][0]["id"], shown as i64 + 1);
 }

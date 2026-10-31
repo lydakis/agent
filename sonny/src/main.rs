@@ -810,6 +810,10 @@ fn main() -> std::process::ExitCode {
             }
             return std::process::ExitCode::from(agent_client::memory::cli(rest) as u8);
         }
+        // An ask's deadline trigger runs this as its `--if`.
+        Some((verb, rest)) if verb == asks::TOOL => {
+            return std::process::ExitCode::from(asks::cli(rest) as u8);
+        }
         Some((verb, rest)) if verb == trigger::VERB => {
             return std::process::ExitCode::from(trigger::cli(rest) as u8);
         }
@@ -4180,6 +4184,7 @@ impl App {
             && !failed
             && let Some(ask) = asks::call(id, arguments)
         {
+            let ask = asks::settled(ask, output);
             let card = asks::card(&ask, self.width);
             let from = self.pending.len() + usize::from(self.any_history);
             self.commit(card.rows);
@@ -10719,8 +10724,12 @@ impl App {
             if let Some(picker) = &self.picker {
                 let at = picker.at();
                 let items: Vec<list::Item> = (picker.found().into_iter())
+                    // Each model by its name and provider, its id muted
+                    // after them, as one region's Bedrock id differs from
+                    // another's only there.
                     .map(|(model, found)| {
-                        list::Item::new(model, "")
+                        let id = model.split_once('/').map_or(model, |(_, id)| id);
+                        list::Item::new(models::named(model), id)
                             .current(model == self.model)
                             .found(&found)
                     })
@@ -10962,8 +10971,33 @@ impl App {
                 Span::raw("Every agent is paused").bold(),
                 Span::raw(format!(" by {by}: ")).dim(),
                 Span::raw(first_line(pause["reason"].as_str().unwrap_or_default())),
-                Span::raw(" · /resume").dim(),
             ];
+            // Whose turns it parked, so the one doing harm can be stopped
+            // before the line goes on: Esc in its window ends its turn.
+            let parked: Vec<&str> = (pause["parked"]["bots"].as_array())
+                .map(|bots| bots.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if !parked.is_empty() {
+                let total = pause["parked"]["total"]
+                    .as_u64()
+                    .unwrap_or(parked.len() as u64);
+                let shown = parked
+                    .iter()
+                    .take(3)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = total.saturating_sub(parked.len().min(3) as u64);
+                line.push(Span::raw(" · parked ").dim());
+                line.push(Span::raw(shown));
+                if more > 0 {
+                    line.push(Span::raw(format!(" +{more}")).dim());
+                }
+                if self.running.is_some() && parked.contains(&self.bot.as_str()) {
+                    line.push(Span::raw(" · Esc ends this one").dim());
+                }
+            }
+            line.push(Span::raw(" · /resume").dim());
             if !self.approvals.is_empty() {
                 line.push(Span::raw(" · an approval waits").dim());
             }
@@ -12058,6 +12092,37 @@ mod tests {
             shown(&app),
             "⏸ Every agent is paused by calc.a: the migration deletes rows · /resume"
         );
+        // It names whose turns it parked, so one can be stopped first.
+        let parked = json!({"reason": "the migration deletes rows", "by": "calc.a", "at_ms": 1,
+            "parked": {"bots": ["calc.a", "shop.b", "web.c", "x.d"], "total": 6}});
+        app.daemon(json!({"event": "paused", "pause": parked, "durable": false}))
+            .await;
+        assert_eq!(
+            shown(&app),
+            "⏸ Every agent is paused by calc.a: the migration deletes rows · parked calc.a, shop.b, web.c +3 · /resume"
+        );
+        // In the window of one it parked, Esc ends that one's turn.
+        let bot = app.bot.clone();
+        let mine = json!({"reason": "rows", "by": "calc.a", "at_ms": 1,
+            "parked": {"bots": [bot], "total": 1}});
+        app.daemon(json!({"event": "paused", "pause": mine, "durable": false}))
+            .await;
+        app.running = Some(Running {
+            turn: 1,
+            started: Instant::now(),
+            phase: "Paused".into(),
+            note: false,
+            effort: None,
+        });
+        assert_eq!(
+            shown(&app),
+            format!(
+                "⏸ Every agent is paused by calc.a: rows · parked {bot} · Esc ends this one · /resume"
+            )
+        );
+        app.running = None;
+        app.daemon(json!({"event": "paused", "pause": pause, "durable": false}))
+            .await;
         app.input.set("/resume");
         app.submit().await;
         assert_eq!(app.notice.as_deref(), Some("the agents go on"));
