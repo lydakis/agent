@@ -2341,6 +2341,13 @@ struct App {
     suggestion: Option<String>,
 }
 
+/// What a job of the lead's layout has to say: a line in the lead's view,
+/// or, for something the person asked of it, a notice.
+enum Told {
+    Line(String),
+    Notice(String),
+}
+
 /// The lead's tasks, laid out in the project's home in a multiplexer: a window for
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
@@ -2349,8 +2356,8 @@ struct Fleet {
     /// the screen.
     layout: mux::Worker,
     /// What its jobs have to say in the lead's view, as they finish.
-    said: tokio::sync::mpsc::UnboundedReceiver<String>,
-    tell: tokio::sync::mpsc::UnboundedSender<String>,
+    said: tokio::sync::mpsc::UnboundedReceiver<Told>,
+    tell: tokio::sync::mpsc::UnboundedSender<Told>,
     client: Arc<Client>,
     events: Events,
     socket: PathBuf,
@@ -2706,10 +2713,21 @@ impl Fleet {
                 Err(error) => Some(error),
             };
             if let Some(said) = said.filter(|_| tell) {
-                let _ = told.send(said);
+                let _ = told.send(Told::Line(said));
             }
         });
         self.doing(bot, "working");
+    }
+
+    /// Bring the task's own tab into view in the multiplexer, as the
+    /// person asked.
+    fn go_to(&self, bot: &str) {
+        let (bot, told) = (bot.to_owned(), self.tell.clone());
+        self.layout.send(move |layout| {
+            if let Err(error) = layout.focus(&bot) {
+                let _ = told.send(Told::Notice(error));
+            }
+        });
     }
 
     /// Close the task's window, and every block it asked for.
@@ -3276,8 +3294,12 @@ impl App {
                     // What the layout's worker said, between the daemon's events.
                     let event = match news {
                         Ok(event) => event,
-                        Err(said) => {
+                        Err(Told::Line(said)) => {
                             self.fleet_said(said);
+                            continue;
+                        }
+                        Err(Told::Notice(notice)) => {
+                            self.notice = Some(notice);
                             continue;
                         }
                     };
@@ -4455,8 +4477,9 @@ impl App {
         match self.embed(&name, &args) {
             // Its title's button opens it in the main view.
             Ok(()) => {
+                let tab = self.fleet.is_some();
                 if let Some(pane) = &mut self.pane {
-                    pane.as_agent(bot);
+                    pane.as_agent(bot, tab);
                 }
             }
             Err(error) => self.notice = Some(format!("could not open {name}: {error}")),
@@ -7677,6 +7700,14 @@ impl App {
             self.pressed.push(format!("main/{agent}"));
             return true;
         }
+        // Ctrl+T goes to its own tab in the multiplexer, as its name does.
+        if pane::to_tab(key)
+            && let Some(pane) = self.pane.as_ref().filter(|p| p.has_tab())
+            && let Some(agent) = pane.agent.clone()
+        {
+            self.pressed.push(format!("tab/{agent}"));
+            return true;
+        }
         // Ctrl+[ and Ctrl+] step the pane, but for a program that has them.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let program = self.pane_keys && self.pane.as_ref().is_some_and(|p| p.program.is_some());
@@ -8010,6 +8041,7 @@ impl App {
             ("ctrl+\\", "keys to the pane and back"),
             ("ctrl+[ ctrl+]", "hide the pane, show it again"),
             ("ctrl+g", "open the pane's agent in the main view"),
+            ("ctrl+t", "go to the pane's agent's own tab"),
             ("alt+t", "boost the next message; again for more"),
             ("ctrl+v", "paste a picture"),
             ("ctrl+c", "copy the selection, clear, or quit"),
@@ -8276,6 +8308,15 @@ impl App {
             "status" if self.options.side.is_none() => self.status().await,
             // An agent's title button: this window becomes its Sonny.
             "main" => self.switch_command(id).await,
+            // Its name: its own tab, where the lead's tasks are laid out.
+            "tab" => match &self.fleet {
+                Some(fleet) => fleet.go_to(id),
+                None => {
+                    self.notice = Some(format!(
+                        "{id} has no tab: this Sonny is not in Rex, Herdr or cmux"
+                    ))
+                }
+            },
             "background" if self.options.side.is_none() => self.background(),
             "status" | "background" => {}
             _ => self.press_row(what).await,
@@ -11805,7 +11846,7 @@ mod tests {
                 .is_some_and(|n| n.starts_with("/switch NAME"))
         );
         let mut pane = pane::Pane::card("shop.lead", STATUS_KEYS);
-        pane.as_agent("shop.lead");
+        pane.as_agent("shop.lead", false);
         app.open_pane(pane);
         app.input.set("/switch");
         app.submit().await;

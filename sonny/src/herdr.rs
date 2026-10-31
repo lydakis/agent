@@ -563,6 +563,10 @@ impl Backend for Herdr {
         }
     }
 
+    fn focus(&self, block: &Block) -> Result<(), String> {
+        self.call(&["tab", "focus", &block.window]).map(|_| ())
+    }
+
     /// Herdr's CLI has no stream; its socket does, and Herdr names it in
     /// every pane it runs, as in the one Sonny runs in.
     fn watch(&self) -> Option<Watch> {

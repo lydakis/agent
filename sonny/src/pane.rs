@@ -93,6 +93,10 @@ pub struct Pane {
     /// opens in the main view; and that button's columns as last drawn.
     pub agent: Option<String>,
     main_at: Option<(u16, u16)>,
+    /// Where its name was last drawn, when a click on it goes to the
+    /// agent's own tab in the multiplexer.
+    name_at: Option<(u16, u16)>,
+    tab: bool,
 }
 
 /// The button beside an agent's name that opens it in the main view: the
@@ -101,12 +105,22 @@ pub struct Pane {
 const MAIN: &str = " ↗";
 /// What the keys do on an agent's Sonny in the pane.
 const AGENT_KEYS: &str = "ctrl+g main view · ctrl+\\ chat";
+/// The same, for one laid out in a multiplexer, whose tab its name and
+/// Ctrl+T go to.
+const LAID_OUT_KEYS: &str = "ctrl+g main view · ctrl+t its tab · ctrl+\\ chat";
 
 /// Ctrl+G, which opens the agent in the pane in the main view, as its
 /// title's button does: no Sonny key takes it.
 pub fn to_main(key: &ratatui::crossterm::event::KeyEvent) -> bool {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g')
+}
+
+/// Ctrl+T, which goes to the agent's own tab in the multiplexer, as a
+/// click on its name does.
+pub fn to_tab(key: &ratatui::crossterm::event::KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t')
 }
 
 impl Pane {
@@ -174,6 +188,8 @@ impl Pane {
             over: false,
             agent: None,
             main_at: None,
+            name_at: None,
+            tab: false,
         })
     }
 
@@ -280,6 +296,8 @@ impl Pane {
             over: false,
             agent: None,
             main_at: None,
+            name_at: None,
+            tab: false,
         }
     }
 
@@ -307,14 +325,26 @@ impl Pane {
             over: false,
             agent: None,
             main_at: None,
+            name_at: None,
+            tab: false,
         }
     }
 
     /// The program is `agent`'s Sonny: its title's button and Ctrl+G open
-    /// it in the main view.
-    pub fn as_agent(&mut self, agent: &str) {
+    /// it in the main view, and, when it is laid out in a multiplexer
+    /// (`tab`), its name and Ctrl+T go to its own tab there.
+    pub fn as_agent(&mut self, agent: &str, tab: bool) {
         self.agent = Some(agent.to_owned());
-        self.keys = AGENT_KEYS;
+        self.tab = tab;
+        self.keys = match tab {
+            true => LAID_OUT_KEYS,
+            false => AGENT_KEYS,
+        };
+    }
+
+    /// Whether Ctrl+T goes to the agent's tab.
+    pub fn has_tab(&self) -> bool {
+        self.tab && self.agent.is_some()
     }
 
     /// Where what the pane holds starts, under its title: the program's
@@ -374,6 +404,11 @@ impl Pane {
             && (from..to).contains(&column)
         {
             return Some(format!("{}main/{agent}", crate::screen::BUTTON));
+        }
+        if let (Some(agent), Some((from, to))) = (&self.agent, self.name_at)
+            && (from..to).contains(&column)
+        {
+            return Some(format!("{}tab/{agent}", crate::screen::BUTTON));
         }
         let (_, buttons) = self.head.as_ref()?;
         (buttons.iter())
@@ -503,6 +538,8 @@ impl Pane {
                 let gap = (area.width as usize)
                     .saturating_sub(used + title.width() + button.width() + keys.width());
                 let at = area.x + (used + title.width() + 1) as u16;
+                let name = area.x + used as u16;
+                self.name_at = self.tab.then_some((name, name + title.width() as u16));
                 head.push(Span::styled(title, style));
                 self.main_at = None;
                 if !button.is_empty() {
@@ -760,7 +797,7 @@ mod tests {
     #[test]
     fn an_agents_title_opens_it_in_the_main_view_where_it_fits() {
         let mut pane = Pane::card("shop.fix", "esc close");
-        pane.as_agent("shop.fix");
+        pane.as_agent("shop.fix", false);
         let head = rows(&mut pane, 60, 3).remove(0);
         assert!(head.starts_with(" shop.fix ↗ "), "{head}");
         assert!(head.ends_with("ctrl+g main view · ctrl+\\ chat"), "{head}");
@@ -775,6 +812,35 @@ mod tests {
         let head = rows(&mut pane, 24, 3).remove(0);
         assert!(!head.contains('↗'), "{head}");
         assert_eq!(pane.head_button(column), None);
+    }
+
+    #[test]
+    fn a_laid_out_agents_name_goes_to_its_tab() {
+        let mut pane = Pane::card("shop.fix", "esc close");
+        pane.as_agent("shop.fix", true);
+        assert!(pane.has_tab());
+        let head = rows(&mut pane, 72, 3).remove(0);
+        assert!(head.starts_with(" shop.fix ↗ "), "{head}");
+        assert!(
+            head.ends_with("ctrl+g main view · ctrl+t its tab · ctrl+\\ chat"),
+            "{head}"
+        );
+        let name = " shop.fix".width() as u16;
+        assert_eq!(pane.head_button(1).as_deref(), Some("sonny:tab/shop.fix"));
+        assert_eq!(
+            pane.head_button(name - 1).as_deref(),
+            Some("sonny:tab/shop.fix")
+        );
+        assert_eq!(pane.head_button(name), None);
+        assert_eq!(
+            pane.head_button(name + 1).as_deref(),
+            Some("sonny:main/shop.fix")
+        );
+        // Not laid out: the name is only a name.
+        pane.as_agent("shop.fix", false);
+        rows(&mut pane, 72, 3);
+        assert!(!pane.has_tab());
+        assert_eq!(pane.head_button(1), None);
     }
 
     #[test]
