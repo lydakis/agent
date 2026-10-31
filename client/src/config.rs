@@ -43,6 +43,7 @@
 //! network = false               # whether commands reach the network
 //! git = "read-only"             # "write" lets commits run without asking
 //! writable = ["~/.cargo"]       # folders it writes besides its own
+//! unix_sockets = ["~/.colima"]  # sockets, or their folders, its commands reach besides its own
 //! reviewer = "model"            # who approves anything more: model, you or none
 //!
 //! [sonny.mcp_servers.linear]    # an MCP server Sonny's agents reach
@@ -252,6 +253,9 @@ pub struct Permissions {
     pub git: Option<bool>,
     /// Folders, `~` for home, it writes besides its own.
     pub writable: Vec<String>,
+    /// Unix sockets, or folders of them, `~` for home, its commands reach
+    /// besides those in its own folders.
+    pub unix_sockets: Vec<String>,
     /// Who approves what leaves the sandbox.
     pub reviewer: Option<Reviewer>,
 }
@@ -738,6 +742,7 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
             network: None,
             git: None,
             writable: Vec::new(),
+            unix_sockets: Vec::new(),
             reviewer: None,
         };
         for (field, value) in fields {
@@ -771,14 +776,18 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
                         }
                     })
                 }
-                "writable" => {
-                    let invalid = || format!("{} must be a list of folders", key(field));
-                    parsed.writable = (value.as_array().ok_or_else(invalid)?.iter())
-                        .map(|folder| match folder.as_str() {
-                            Some(folder) if !folder.trim().is_empty() => Ok(folder.to_owned()),
+                "writable" | "unix_sockets" => {
+                    let invalid = || format!("{} must be a list of paths", key(field));
+                    let paths = (value.as_array().ok_or_else(invalid)?.iter())
+                        .map(|path| match path.as_str() {
+                            Some(path) if !path.trim().is_empty() => Ok(path.to_owned()),
                             _ => Err(invalid()),
                         })
                         .collect::<Result<_, _>>()?;
+                    match field.as_str() {
+                        "writable" => parsed.writable = paths,
+                        _ => parsed.unix_sockets = paths,
+                    }
                 }
                 "reviewer" => {
                     parsed.reviewer = Some(match string(&key(field), value)?.as_str() {
@@ -796,11 +805,13 @@ fn permissions(value: &toml::Value) -> Result<BTreeMap<String, Permissions>, Str
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
-        // A read-only sandbox has nothing to write and no network to reach.
+        // A read-only sandbox has nothing to write and no network or socket to
+        // reach.
         if parsed.extends == "read-only"
             && (parsed.network == Some(true)
                 || parsed.git == Some(true)
-                || !parsed.writable.is_empty())
+                || !parsed.writable.is_empty()
+                || !parsed.unix_sockets.is_empty())
         {
             return Err(format!(
                 "sonny.permissions.{name}: a read-only row writes nothing and reaches no network"
@@ -1138,7 +1149,7 @@ mod tests {
     #[test]
     fn permissions_rows_extend_sonny_s_own() {
         let config = parse(
-            "[sonny]\ndefault_permissions = \"strict\"\n\n[sonny.permissions.strict]\ndescription = \"Offline\"\nnetwork = false\ngit = \"read-only\"\nwritable = [\"~/.cargo\"]\n\n[sonny.permissions.night]\nextends = \"ask\"\nreviewer = \"none\"\n",
+            "[sonny]\ndefault_permissions = \"strict\"\n\n[sonny.permissions.strict]\ndescription = \"Offline\"\nnetwork = false\ngit = \"read-only\"\nwritable = [\"~/.cargo\"]\nunix_sockets = [\"~/.docker/run\"]\n\n[sonny.permissions.night]\nextends = \"ask\"\nreviewer = \"none\"\n",
         )
         .unwrap();
         assert_eq!(config.sonny.default_permissions.as_deref(), Some("strict"));
@@ -1148,6 +1159,7 @@ mod tests {
             ("auto", Some(false), Some(false))
         );
         assert_eq!(strict.writable, ["~/.cargo"]);
+        assert_eq!(strict.unix_sockets, ["~/.docker/run"]);
         assert_eq!(strict.reviewer, None);
         let night = &config.sonny.permissions["night"];
         assert_eq!(

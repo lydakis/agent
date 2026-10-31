@@ -246,6 +246,11 @@ pub struct Settings {
     /// ([`crate::sandbox::unsandboxed`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsandboxed: Vec<String>,
+    /// Unix sockets, or folders of them, a sandbox's commands reach
+    /// besides those in the bot's own folders, each an absolute path
+    /// ([`crate::sandbox::Policy::sockets`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_sockets: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -331,9 +336,12 @@ impl Settings {
             self.writable = creator.writable.clone();
             self.network = creator.network;
             self.unsandboxed = creator.unsandboxed.clone();
+            self.unix_sockets = creator.unix_sockets.clone();
         }
         self.unsandboxed
             .retain(|prefix| creator.unsandboxed.contains(prefix));
+        self.unix_sockets
+            .retain(|path| creator.unix_sockets.contains(path));
         self.sandbox = Mode::stricter(self.sandbox, creator.sandbox);
         if self.sandbox != Some(Mode::WorkspaceWrite) {
             self.writable.clear();
@@ -404,6 +412,15 @@ impl Settings {
         if !sandboxed && !self.unsandboxed.is_empty() {
             return refuse("unsandboxed goes with sandbox read-only or workspace-write");
         }
+        if !sandboxed && !self.unix_sockets.is_empty() {
+            return refuse("unix_sockets goes with sandbox read-only or workspace-write");
+        }
+        if self.unix_sockets.len() > 64
+            || (self.unix_sockets.iter())
+                .any(|path| !std::path::Path::new(path).is_absolute() || path.len() > 4096)
+        {
+            return refuse("unix_sockets names at most 64 absolute paths");
+        }
         if self.unsandboxed.len() > 64
             || self
                 .unsandboxed
@@ -448,7 +465,8 @@ impl Settings {
             "speed":self.speed().map_or("standard", crate::provider::Speed::name),
             "sandbox":self.sandbox,"writable":self.writable,"network":self.network,
             "outputs":self.outputs,
-            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed})
+            "hide_senders":self.hide_senders,"unsandboxed":self.unsandboxed,
+            "unix_sockets":self.unix_sockets})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -2556,6 +2574,7 @@ impl Database {
             writable: sandbox.writable,
             network: sandbox.network,
             unsandboxed: sandbox.unsandboxed,
+            unix_sockets: sandbox.unix_sockets,
             ..bot.settings
         };
         let creator = match bot.created_by_id {

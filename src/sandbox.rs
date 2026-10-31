@@ -67,6 +67,13 @@ pub struct Policy {
     pub capability: Option<PathBuf>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,
+    /// The folders, or sockets, whose Unix sockets its commands reach: its
+    /// own folder and those its client named, writable or for sockets. No
+    /// other, as Claude Code's sandbox and Codex's managed network keep
+    /// them: one elsewhere may be a program's that runs as the person,
+    /// Docker's or a browser's, which runs what a command asks of it
+    /// outside the sandbox.
+    pub sockets: Vec<PathBuf>,
 }
 
 impl Policy {
@@ -97,6 +104,12 @@ impl Policy {
             None | Some(Mode::DangerFullAccess) => return Ok(None),
             Some(mode) => mode,
         };
+        let sockets = match mode {
+            Mode::WorkspaceWrite => (workspace.map(Path::to_owned).into_iter())
+                .chain(writable.iter().map(PathBuf::from))
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut paths = writable_paths(mode, workspace, writable);
         paths.sort_by_key(|path| (depth(path), path.clone()));
         paths.dedup();
@@ -110,7 +123,15 @@ impl Policy {
             socket: daemon.socket.clone(),
             capability: None,
             helper: daemon.helper.clone(),
+            sockets,
         }))
+    }
+
+    /// This policy, its commands also reaching the Unix sockets at or under
+    /// `paths`, absolute paths its settings name.
+    pub fn with_sockets(mut self, paths: &[String]) -> Policy {
+        self.sockets.extend(paths.iter().map(PathBuf::from));
+        self
     }
 
     /// Whether a command in this sandbox may write `path`, an absolute
@@ -1133,6 +1154,21 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
             "(allow network-outbound)\n(allow network-inbound)\n{SEATBELT_NETWORK}{SEATBELT_TLS_TRUST}"
         ));
     }
+    // Unix sockets only in its own folders and those its settings name.
+    if policy.network {
+        sections.push("(deny network-outbound (remote unix-socket))".to_owned());
+    }
+    if !policy.sockets.is_empty() {
+        let mut rules = vec!["(allow system-socket (socket-domain AF_UNIX))".to_owned()];
+        for path in &policy.sockets {
+            let key = param(path);
+            rules.push(format!(
+                "(allow network-bind (local unix-socket (subpath (param \"{key}\"))))\n\
+                 (allow network-outbound (remote unix-socket (subpath (param \"{key}\"))))"
+            ));
+        }
+        sections.push(rules.join("\n"));
+    }
     // Never the daemon's socket itself: the bot's own instead, which
     // answers as that bot and only as far as a sandboxed bot may go.
     if let Some(socket) = &policy.socket {
@@ -1504,6 +1540,70 @@ mod tests {
     }
 
     #[test]
+    fn unix_sockets_are_reached_only_in_the_bot_s_folders_and_those_named() {
+        let base =
+            std::env::temp_dir().join(format!("agent-sandbox-sockets-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("cache")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let cache = base.join("cache");
+        let policy = |network| {
+            Policy::new(
+                Some(Mode::WorkspaceWrite),
+                Some(&base),
+                &[cache.to_str().unwrap().to_owned()],
+                network,
+                &protecting(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let networked = policy(true).with_sockets(&["/tmp/ssh-agent.sock".to_owned()]);
+        assert_eq!(
+            networked.sockets,
+            [base.clone(), cache.clone(), "/tmp/ssh-agent.sock".into()]
+        );
+        let (profile, params) = seatbelt(&networked);
+        let key = |path: &Path| {
+            params
+                .iter()
+                .find(|(_, p)| p == path)
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+        // The network on, every other socket stays out of reach, Docker's
+        // and those of what runs as the person.
+        let denied = profile
+            .find("(deny network-outbound (remote unix-socket))")
+            .unwrap();
+        for path in [&base, &cache, &PathBuf::from("/tmp/ssh-agent.sock")] {
+            let allowed = format!(
+                "(allow network-outbound (remote unix-socket (subpath (param \"{}\"))))",
+                key(path)
+            );
+            assert!(profile.find(&allowed).unwrap() > denied, "{allowed}");
+        }
+        assert!(profile.find("(allow network-outbound)\n").unwrap() < denied);
+        // The network off, none but those either.
+        let (profile, params) = seatbelt(&policy(false));
+        assert!(!profile.contains("(deny network-outbound (remote unix-socket))"));
+        let own = params
+            .iter()
+            .find(|(_, p)| p == &base)
+            .map(|(k, _)| k.clone())
+            .unwrap();
+        assert!(profile.contains(&format!(
+            "(allow network-bind (local unix-socket (subpath (param \"{own}\"))))"
+        )));
+        // Read-only, it reaches only those it names.
+        let read_only = Policy::new(Some(Mode::ReadOnly), Some(&base), &[], false, &protecting())
+            .unwrap()
+            .unwrap();
+        assert!(read_only.sockets.is_empty());
+        assert!(!seatbelt(&read_only).0.contains("(local unix-socket"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn many_nested_roots_still_fit_one_invocation() {
         // 64 nested roots with long names, about the settings' limit: each
         // rule names only its own, so the profile and its parameters grow
@@ -1529,6 +1629,7 @@ mod tests {
             socket: Some(path.join("agent.sock")),
             capability: None,
             helper: None,
+            sockets: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()

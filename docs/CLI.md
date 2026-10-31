@@ -184,7 +184,8 @@ identity is `bot_not_found`.
   `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
   folder), `--network`, `--hide-senders`, `--unsandboxed` (repeatable: a
-  command's first words, such as `mcpx`) and `--outputs` (made absolute; a new
+  command's first words, such as `mcpx`), `--unix-socket` (repeatable: an
+  absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
   bot gets `outputs` beside the store without it); they are not daemon options,
   and an existing bot keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 

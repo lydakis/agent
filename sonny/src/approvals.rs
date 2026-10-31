@@ -26,11 +26,13 @@ pub struct Mode {
 pub enum Sandbox {
     /// Its folder, temp and `writable` written; the network reached when
     /// `network`, and its repositories committed to when `git`, their
-    /// hooks and config kept read-only.
+    /// hooks and config kept read-only; the Unix sockets in its folders
+    /// and `unix_sockets` reached.
     Workspace {
         network: bool,
         git: bool,
         writable: Vec<String>,
+        unix_sockets: Vec<String>,
     },
     /// Everything read, nothing written, no network.
     ReadOnly,
@@ -49,6 +51,7 @@ fn builtin(name: &str) -> Option<Mode> {
         network: true,
         git: true,
         writable: Vec::new(),
+        unix_sockets: Vec::new(),
     };
     let (name, label, about, sandbox, reviewer) = match name {
         "auto" => (
@@ -106,6 +109,7 @@ fn own(name: &str, row: &Permissions) -> Option<Mode> {
         network,
         git,
         writable,
+        unix_sockets,
     } = &mut mode.sandbox
     {
         *network = row.network.unwrap_or(*network);
@@ -115,6 +119,9 @@ fn own(name: &str, row: &Permissions) -> Option<Mode> {
         // anywhere.
         *writable = (row.writable.iter().map(|folder| home(folder)))
             .filter(|folder| std::path::Path::new(folder).is_absolute())
+            .collect();
+        *unix_sockets = (row.unix_sockets.iter().map(|path| home(path)))
+            .filter(|path| std::path::Path::new(path).is_absolute())
             .collect();
     }
     mode.reviewer = row.reviewer.unwrap_or(mode.reviewer);
@@ -235,6 +242,7 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
             .any(|dir| dir.join(".git").exists())
     });
     let network = settings["network"].as_bool().unwrap_or(false);
+    let reached = list(settings, "unix_sockets");
     // Its own folders, past its repositories' git folders.
     let folders: Vec<&str> = (writable.iter().copied())
         .filter(|path| !path.ends_with(".git"))
@@ -254,6 +262,7 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
                 network: reaches,
                 git,
                 writable: own,
+                unix_sockets,
             } => {
                 // Every folder the bot writes is one of the row's, as
                 // written or by its real path. A row folder that is not
@@ -264,6 +273,7 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
                 let fits = sandbox == Some("workspace-write")
                     && network == *reaches
                     && (*git || !committing)
+                    && reached == sockets(unix_sockets)
                     && (folders.iter())
                         .all(|folder| own.iter().chain(&there).any(|mine| mine == folder));
                 // A repository made since the row was set leaves a row that
@@ -374,6 +384,7 @@ fn fields(mode: &Mode, workspace: &std::path::Path, unsandboxed: &[String]) -> M
             network,
             git,
             writable: own,
+            unix_sockets,
         } => {
             let mut writable: Vec<String> = Vec::new();
             if *git {
@@ -387,7 +398,13 @@ fn fields(mode: &Mode, workspace: &std::path::Path, unsandboxed: &[String]) -> M
             {
                 writable.pop();
             }
-            json!({"sandbox": "workspace-write", "writable": writable, "network": network})
+            let mut fields =
+                json!({"sandbox": "workspace-write", "writable": writable, "network": network});
+            let unix_sockets = sockets(unix_sockets);
+            if !unix_sockets.is_empty() {
+                fields["unix_sockets"] = json!(unix_sockets);
+            }
+            fields
         }
     };
     if !unsandboxed.is_empty() {
@@ -401,6 +418,30 @@ fn confined(fields: Value) -> Map<String, Value> {
         Value::Object(fields) => fields,
         _ => Map::new(),
     }
+}
+
+/// `paths` as the daemon keeps a bot's Unix sockets: by their real paths
+/// while they are there, as written while they aren't, since a socket
+/// comes and goes with its program, sorted, and each once.
+fn sockets(paths: &[String]) -> Vec<String> {
+    let mut paths: Vec<String> = (paths.iter())
+        .map(|path| {
+            (std::fs::canonicalize(path).ok())
+                .and_then(|real| real.to_str().map(str::to_owned))
+                .unwrap_or_else(|| path.clone())
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The strings of `value`'s list `key`, none when it has none.
+fn list(value: &Value, key: &str) -> Vec<String> {
+    (value[key].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `folders` as the daemon keeps them, by their real paths, leaving out
@@ -575,10 +616,10 @@ fn repositories(dir: &std::path::Path) -> Vec<String> {
 pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
     let fields = Value::Object(fields.clone());
     let settings = &record["settings"];
-    let list = |value: &Value, key: &str| value[key].as_array().cloned().unwrap_or_default();
     settings["sandbox"] == fields["sandbox"]
         && list(settings, "writable") == list(&fields, "writable")
         && list(settings, "unsandboxed") == list(&fields, "unsandboxed")
+        && list(settings, "unix_sockets") == list(&fields, "unix_sockets")
         && settings["network"].as_bool().unwrap_or(false)
             == fields["network"].as_bool().unwrap_or(false)
 }
@@ -873,6 +914,7 @@ mod tests {
             network: None,
             git: None,
             writable: Vec::new(),
+            unix_sockets: Vec::new(),
             reviewer: None,
         };
         let sonny = agent_client::config::Sonny {
@@ -941,6 +983,50 @@ mod tests {
     }
 
     #[test]
+    fn a_row_s_sockets_are_the_daemon_s_and_tell_it_from_auto() {
+        let dir = std::env::temp_dir().join(format!("sonny-sockets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let run = dir.join("run").display().to_string();
+        let sonny = agent_client::config::Sonny {
+            permissions: std::collections::BTreeMap::from([(
+                "docker".to_owned(),
+                Permissions {
+                    description: None,
+                    extends: "auto".into(),
+                    network: None,
+                    git: None,
+                    writable: Vec::new(),
+                    // One not there yet is kept as written; one named from
+                    // wherever Sonny runs is never taken.
+                    unix_sockets: vec![
+                        "/not/there.sock".into(),
+                        format!("{run}/../run"),
+                        "docker.sock".into(),
+                    ],
+                    reviewer: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let modes = modes_of(&sonny);
+        let docker = modes.iter().find(|mode| mode.name == "docker").unwrap();
+        let fields = fields(docker, &dir, &[]);
+        assert_eq!(fields["unix_sockets"], json!(["/not/there.sock", run]));
+        let gates = json!([{"tag": "auto", "tools": ["shell"]}]);
+        let record = json!({"gates": gates, "workspace": dir, "settings": fields});
+        assert_eq!(mode_in(&record, &modes), Some("docker"));
+        assert!(sandboxed_as(&record, &fields));
+        let auto = super::fields(&modes[0], &dir, &[]);
+        assert!(auto.get("unix_sockets").is_none());
+        assert!(!sandboxed_as(&record, &auto));
+        let record = json!({"gates": gates, "workspace": dir, "settings": auto});
+        assert_eq!(mode_in(&record, &modes), Some("auto"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_row_stays_the_bot_s_when_its_folder_becomes_a_repository() {
         let dir = std::env::temp_dir().join(format!("sonny-later-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -955,6 +1041,7 @@ mod tests {
                     network: Some(false),
                     git: None,
                     writable: Vec::new(),
+                    unix_sockets: Vec::new(),
                     reviewer: None,
                 },
             )]),

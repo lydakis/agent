@@ -559,6 +559,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   network = false
   git = "read-only"       # "write" lets commits run without asking
   writable = ["~/.cargo"] # folders it writes besides its own, whole paths
+  unix_sockets = ["~/.colima/default/docker.sock"]  # sockets it reaches besides its own
   reviewer = "model"      # model, you, or none: refused, and told to do without
   ```
 
@@ -577,6 +578,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   `cargo test`) adds its first words to the list, and the lead and its
   agents take it at once. The list holds for every folder, so a program
   named from the folder it runs in (`./build.sh`) is never offered.
+
+  A program listening on a Unix socket runs what it is asked outside the
+  sandbox, as Docker's does, so on macOS a sandboxed agent reaches only the
+  sockets in its own folders. A row's `unix_sockets` names others it may
+  reach, each a socket or a folder of them, as Claude Code's
+  `allowUnixSockets` does.
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 

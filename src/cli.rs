@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --fork --allow --expires --detach --delivery --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --unsandboxed --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -446,6 +446,10 @@ fn print_flags(flags: &str) {
                 "COMMAND",
                 "A command, by its first words, a sandboxed bot runs outside its sandbox without asking; repeat for more",
             ),
+            "--unix-socket" => (
+                "PATH",
+                "A Unix socket, or a folder of them, a sandboxed bot's commands reach besides those in its own folders; repeat for more",
+            ),
             "--fallback" => (
                 "PROVIDER/MODEL",
                 "A new bot's model for a request a safety classifier declined, that request alone; default none",
@@ -620,6 +624,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--quote"
                     | "--writable"
                     | "--unsandboxed"
+                    | "--unix-socket"
                     | "--env"
                     | "--shell-exclude"
                     | "--redact-field"
@@ -778,6 +783,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--network",
             "--hide-senders",
             "--unsandboxed",
+            "--unix-socket",
             "--approval",
             "--approve",
         ]

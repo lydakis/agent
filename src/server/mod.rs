@@ -283,14 +283,16 @@ enum Command {
         /// removes them.
         declare: Option<Vec<Declared>>,
         /// Its command sandbox, replacing the one it has, as `create`'s
-        /// settings name it: with `writable`, `network` and `unsandboxed`,
-        /// which otherwise go back to none, off and none.
+        /// settings name it: with `writable`, `network`, `unsandboxed` and
+        /// `unix_sockets`, which otherwise go back to none, off, none and
+        /// none.
         sandbox: Option<agent_runtime::sandbox::Mode>,
         writable: Option<Vec<String>>,
         network: Option<bool>,
         /// Its prompt-cache lifetime, as `create`'s settings name it.
         cache_ttl: Option<agent_runtime::store::CacheTtl>,
         unsandboxed: Option<Vec<String>>,
+        unix_sockets: Option<Vec<String>>,
         /// The tier its calls are served at, as `create`'s settings name
         /// it; `standard` goes back to none.
         speed: Option<agent_runtime::provider::Speed>,
@@ -973,6 +975,18 @@ fn confine(settings: &mut Settings) -> Result<()> {
     }
     settings.writable.sort();
     settings.writable.dedup();
+    // By its real path, as Seatbelt matches it, while it is there: a
+    // socket comes and goes with its program.
+    for path in &mut settings.unix_sockets {
+        if let Some(real) = std::fs::canonicalize(&*path)
+            .ok()
+            .and_then(|real| real.to_str().map(str::to_owned))
+        {
+            *path = real;
+        }
+    }
+    settings.unix_sockets.sort();
+    settings.unix_sockets.dedup();
     Ok(())
 }
 /// A field given as `null` deserializes to `Some(None)`, apart from one
@@ -3111,6 +3125,7 @@ impl Service {
                 network,
                 cache_ttl,
                 unsandboxed,
+                unix_sockets,
                 speed,
             } => {
                 if effort.is_some() && model.is_none() {
@@ -3123,6 +3138,7 @@ impl Service {
                             writable: writable.unwrap_or_default(),
                             network: network.unwrap_or(false),
                             unsandboxed: unsandboxed.unwrap_or_default(),
+                            unix_sockets: unix_sockets.unwrap_or_default(),
                             ..Settings::default()
                         };
                         settings.validate()?;
@@ -3135,10 +3151,14 @@ impl Service {
                         .map_err(|_| Error::new("sandbox_unavailable"))??;
                         Some(settings)
                     }
-                    None if writable.is_some() || network.is_some() || unsandboxed.is_some() => {
+                    None if writable.is_some()
+                        || network.is_some()
+                        || unsandboxed.is_some()
+                        || unix_sockets.is_some() =>
+                    {
                         return fail_with(
                             "invalid_setting",
-                            "writable, network and unsandboxed go with sandbox",
+                            "writable, network, unsandboxed and unix_sockets go with sandbox",
                         );
                     }
                     None => None,
