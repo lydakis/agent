@@ -999,7 +999,10 @@ mod linux {
             let flags = libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL);
             libc::fcntl(theirs.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
         }
-        let ours = tokio::io::unix::AsyncFd::new(ours)?;
+        // SAFETY: the OwnedFd is open, and it keeps the one descriptor
+        // until the AsyncFd that owns it drops.
+        let ours =
+            unsafe { tokio::io::unix::AsyncFd::register(ours) }.map_err(std::io::Error::from)?;
         let own = own.to_owned();
         runtime.spawn(async move {
             let mut byte = [0u8; 1];
