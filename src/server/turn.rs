@@ -2500,6 +2500,11 @@ impl Turn {
                 },
                 Err(error) => return Err(error),
             };
+            // Nor after this boundary's own steps: a summary that ran
+            // while the stop began is kept, and its call does not start.
+            if self.stopping.load(Relaxed) {
+                return Ok(Round::Drained);
+            }
             self.bind_thinking(&mut record, &mut context, (provider, model))
                 .await?;
             // This call's view replaces the last one's, which goes before
@@ -4136,6 +4141,15 @@ impl Turn {
         environment: &[(String, String)],
         sandbox: Result<Option<Arc<Policy>>>,
     ) -> (String, Result<Outcome>) {
+        // A batch wider than its width starts its later calls as earlier
+        // ones finish; once the daemon is stopping, those do not run.
+        if self.stopping.load(Relaxed) {
+            let stopped = Error::with(
+                SHUTDOWN,
+                "the daemon stopped before this call ran; it did not run",
+            );
+            return (call_id, Ok(failure(stopped)));
+        }
         let sandbox = match sandbox {
             Ok(sandbox) => sandbox,
             Err(error) => return (call_id, Ok(failure(error))),

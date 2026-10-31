@@ -1642,6 +1642,36 @@ class RuntimeTests(ModelFixture):
         self.assertIn('finished', json.dumps(output))
         self.assertEqual(marker.read_text(), 'x\n')
 
+    def test_a_drain_starts_no_more_of_a_wide_batch_and_keeps_what_ran(self):
+        # Five commands run together, four at a time: the fifth would start
+        # as the first finishes, but the drain began, so it does not run.
+        slow = f'sleep 1; echo x >> {self.path / "ran"}'
+        self.model.call_script = [[('shell', {'command': slow}) for _ in range(4)]
+                                  + [('shell', {'command': f'echo y > {self.path / "late"}'})]]
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='wide', prompt='script')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        self.model.requests.get(timeout=3)
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertEqual((self.path / 'ran').read_text(), 'x\n' * 4)
+        self.assertFalse((self.path / 'late').exists())
+        restarted = self.client('shell')
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+        request = self.model.requests.get(timeout=3)
+        outputs = {i['call_id']: json.loads(i['output']) for i in request['input']
+                   if i.get('type') == 'function_call_output'}
+        self.assertEqual(len(outputs), 5)
+        stopped = [o for o in outputs.values() if o.get('error') == 'daemon_shutdown']
+        self.assertEqual(len(stopped), 1)
+        self.assertIn('did not run', stopped[0]['detail'])
+        self.assertFalse((self.path / 'late').exists())
+
     def test_a_pause_stops_every_agent_until_resume_across_restarts(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
