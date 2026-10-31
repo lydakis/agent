@@ -884,6 +884,9 @@ impl View {
         {
             verse.until.get_or_insert(now);
         }
+        // The rule as /config says now: one turned off or lowered since
+        // the sky opened spends no more.
+        self.title.rule = haiku::Rule::load();
         let since = wall_ms();
         let rule = self.title.rule;
         // Counted in the file before it is spent, or not written at all.
@@ -2551,8 +2554,9 @@ impl View {
                 sky.label(middle, None, &format!("+{n}"), Ink::Muted.style());
             }
         }
-        // Zen keeps the haiku, at the sky's top right.
-        if self.zen {
+        // Zen keeps the haiku at the sky's top right, as does a sky over
+        // its log, whose log has no blank to spare.
+        if self.zen || !beside {
             for (row, line) in self.haiku(now).iter().enumerate() {
                 let start = sky_cols.saturating_sub(haiku::WIDTH + 1);
                 sky.inscribe(row, start, line);
@@ -5178,6 +5182,9 @@ mod tests {
             assert!(shown.contains(line), "{shown}");
         }
         assert!(shown.contains("— shop lead, busiest for 1m"), "{shown}");
+        // A sky stacked over its log keeps it at its top right, as zen.
+        let stacked = text(&view.card(80, 40));
+        assert!(stacked.contains("morning merges in"), "{stacked}");
         // The next fades the last out first.
         let poem = (
             "shop.lead".to_owned(),
