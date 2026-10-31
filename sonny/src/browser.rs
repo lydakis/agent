@@ -758,6 +758,8 @@ const CATEGORIES: [(&str, &[&str]); 9] = [
         &[
             "evaluate",
             "evalhandle",
+            // `wait --fn`, whose predicate is the agent's script.
+            "waitforfunction",
             "addscript",
             "addinitscript",
             "addstyle",
@@ -1159,13 +1161,20 @@ pub async fn answer(
         let (mut said, ok) = (ran.said, ran.ok);
         // The file the host named is gone once read: the picture is shown,
         // as many as one result holds.
-        let picture = (command.picture.as_ref())
-            .filter(|_| ok)
-            .and_then(|file| std::fs::read(file).ok())
-            .and_then(|bytes| crate::exec::picture(&bytes).ok());
-        if let Some(file) = &command.picture {
-            let _ = std::fs::remove_file(file);
-        }
+        // Read and fitted off the tool host's one thread: a tall page's
+        // picture takes a while to scale.
+        let picture = match command.picture.clone() {
+            Some(file) => tokio::task::spawn_blocking(move || {
+                let picture = (std::fs::read(&file).ok().filter(|_| ok))
+                    .and_then(|bytes| crate::exec::picture(&bytes).ok());
+                let _ = std::fs::remove_file(&file);
+                picture
+            })
+            .await
+            .ok()
+            .flatten(),
+            None => None,
+        };
         let picture = picture.filter(|picture| {
             let bytes = |picture: &Value| picture["data"].as_str().map_or(0, |data| data.len() / 4 * 3);
             let held: usize = parts.iter().filter(|part| part["type"] == "image").map(bytes).sum();
@@ -1551,7 +1560,10 @@ mod tests {
             "cookies_get".to_owned(),
         ];
         let actions = confirmed(&confirm);
-        assert!(actions.starts_with("evaluate,evalhandle,"), "{actions}");
+        assert!(
+            actions.starts_with("evaluate,evalhandle,waitforfunction,"),
+            "{actions}"
+        );
         assert!(actions.ends_with(",upload,cookies_get"), "{actions}");
     }
 }
