@@ -3419,7 +3419,7 @@ pub async fn tell_failed(
     generation: &str,
     (bot, bot_id, turn): (&str, Option<i64>, i64),
     error: &str,
-) {
+) -> agent_client::Result<()> {
     let places = Places::home().ok();
     let (to, to_id, prompt) = failed_note(
         places.as_ref(),
@@ -3436,7 +3436,7 @@ pub async fn tell_failed(
     if let Some(id) = to_id {
         submit["bot_id"] = json!(id);
     }
-    let _ = client.request("submit", submit).await;
+    client.request("submit", submit).await.map(drop)
 }
 
 /// Who is told of a fire's failed turn, by name and id when known, and the
@@ -3966,7 +3966,8 @@ mod tests {
             ("calc.lead", Some(5), 4),
             "provider_error",
         )
-        .await;
+        .await
+        .unwrap();
         let submit = asked.lock().unwrap()[0].clone();
         assert_eq!(submit["bot"], "calc.lead");
         assert_eq!(submit["bot_id"], 5);
