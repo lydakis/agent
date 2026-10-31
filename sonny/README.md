@@ -536,13 +536,15 @@ way `/react` does, and each note in the margin has its own `↩`.
   reason, in either view; one you allow is drawn as `✓ Request allowed
   for …`, as Codex records each decision. The status row above the
   composer shows only the keys, since the call is written out whole right
-  above it. The footer names the row unless it is the one new leads start
-  in, full access in the text's own weight rather than muted (no hue:
-  yellow is for what needs you).
+  above it. The footer leads with the row unless it is the one new leads
+  start in, each with its mark as Claude Code marks its modes: `⏵⏵ full
+  access`, `⏸ ask me`, `⊘ read only`. Full access's mark is in the text's
+  own weight rather than muted (no hue: yellow is for what needs you),
+  and on a narrow window the mark stays when the word goes.
 
   ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
 
-  ![The footer naming full access](../docs/sonny/permissions-full-footer.png)
+  ![The footer leading with ⏵⏵ full access, ? 1 needs you and 37% left in yellow on the right](../docs/sonny/permissions-full-footer.png)
 
   Rows of your own follow Sonny's, as Codex's permission profiles do, from
   `~/.agent/config.toml`:
@@ -624,13 +626,13 @@ way `/react` does, and each note in the margin has its own `↩`.
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says
-  `✗ 1 failed` in red, left of the `↻`, and a click on either opens
+  `✗ 1 failed` with a red `✗`, left of the `↻`, and a click on either opens
   `/background`. An agent sees the same in its `triggers` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `triggers` and `subscriptions` tools make.
 
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
-  ![The footer: ✗ 2 failed in red, left of ↻ 1 in background](../docs/sonny/footer-failed.png)
+  ![The footer: ✗ 1 failed with a red ✗, left of ↻ 3](../docs/sonny/footer-failed.png)
 
   ![/background in the pane](../docs/sonny/pane-background.png)
 - `/usage` shows, in the pane beside the conversation,
@@ -970,8 +972,8 @@ that helps you act.
 
 Sonny keeps to the terminal's own 16 colors, so a theme sets their
 shades, and each means one thing: magenta is you (your `›`), blue the
-agents (task names, who sent a message, the lead in the footer), green
-what worked (a call's dot, `+` lines, the git branch), yellow what needs
+agents (task names, who sent a message), green
+what worked (a call's dot, `+` lines), yellow what needs
 you (a question's `?`, an approval's `⏸`), red what failed (`✗`, `-`
 lines), and cyan code and work under way. Color only repeats what a
 mark already says: each state has its own shape (`✓ ✗ ● ◌ ?`) and a
@@ -984,13 +986,13 @@ of lists, quotes and rules dim. Dim text is a gray Sonny works out from
 the theme's own foreground and background, as the terminal reports them
 at start (OSC 10 and 11), dark enough to step back and still 4.5:1 where
 the theme allows; a terminal that does not say keeps its own dim. A hue
-on a dim row (the footer's branch, an agent's name in a quiet row) is
+on a dim row (a mark in the footer, an agent's name in a quiet row) is
 drawn at its full strength, as dim over a hue falls under 3:1 in many
 themes; the words round it stay dim. Diffs
 tint from the same background and the theme's own red and green. The
-footer says how much of the model's context window is left (`62% context
-left`, as Codex says it), from the window the daemon sends with each
-round: green, yellow from half used, red from four fifths. Before the
+footer says how much of the model's context window is left (`62% left`),
+from the window the daemon sends with each round: muted while there is
+room, yellow from half used, red from four fifths. Before the
 daemon has said it, the footer gives the conversation's size uncoloured.
 Your own messages sit on a band tinted from the theme's foreground over
 its background, as Codex and Claude Code tint the user's cell, with a
@@ -998,7 +1000,7 @@ row of the band above and below the words, so your turns are easy to
 find when you scroll back; a reply that opens with a
 heading takes no `•` before it.
 
-![Your message on its band, and the footer saying 76% context left](../docs/sonny/message-band.png)
+![Your message on its band, and the footer, all muted at rest, saying 76% left](../docs/sonny/message-band.png)
 
 ![Solarized Dark before and after: dim text that reads, diffs tinted from the theme with - and + beside the bar](../docs/sonny/visual-solarized-dark.png)
 ![With NO_COLOR set: no color, and every state, sign and question still reads](../docs/sonny/visual-no-color.png)
@@ -1094,11 +1096,24 @@ failed in the background and `↻` for its automations and follows (a
 click on either opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts what needs you and the
-other agents at work, each with its word (`? 1 needs you · ● 2 working`),
-and next to the model the agent's profile when it runs one that isn't its
-seat's own (`lead` for a lead, `task` for a task),
+other agents at work, each with its word (`? 1 needs you  ● 2 working`),
 marked as the roster and `/status` mark them, and a click on the count
-opens `/status`. Under the glance are the notes the agent keeps there with its `margin`
+opens `/status`; and next to the model the agent's profile when it runs one
+that isn't its seat's own (`lead` for a lead, `task` for a task). The left
+of the footer says what you talk to and where (the permissions mark, the
+model as pickers name it, its effort, the folder and its branch), and the
+right what wants you (needs you, failed, working, `↻`, `✎`, `📎`, the
+context). The agent's name is left to the composer, which says it. When
+the window is too narrow for all of it, items give way in one order, as
+Powerline drops its lowest segments first: words before marks, marks
+before whole items, and what needs you never. `↻ 3 in background` goes to
+`↻ 3`, `⏵⏵ full access` to `⏵⏵`, the folder to `~/D/agent` as fish
+shortens it and then to `agent`, until at 44 columns a busy lead reads
+`⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%`. The hues on it are only for
+what asks something of you: the `?`, the `✗`, the `●` and a context half
+used.
+
+![The footer at 100, 80, 60 and 44 columns: words go first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the

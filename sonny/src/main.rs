@@ -25,6 +25,7 @@ mod declared;
 mod diff;
 mod embed;
 mod exec;
+mod footer;
 mod fuzzy;
 mod herdr;
 mod highlight;
@@ -2130,7 +2131,7 @@ struct App {
     /// out at; none while something else is drawn over it.
     composer_at: Option<(Rect, usize, usize)>,
     /// Where the footer counts the agents at work: its row and columns.
-    counter_at: Option<(u16, std::ops::Range<u16>)>,
+    counter_at: Vec<(u16, std::ops::Range<u16>, &'static str)>,
     /// The mouse button went down on the composer's text, on what: a
     /// spot, word or line a drag selects from, and where the text was
     /// drawn then, kept while the button is down so a redraw that scrolls
@@ -3078,7 +3079,7 @@ impl App {
             pane_mouse: false,
             closed: None,
             composer_at: None,
-            counter_at: None,
+            counter_at: Vec::new(),
             composing: None,
             composer_click: None,
             margin: margin::Margin::default(),
@@ -7551,13 +7552,14 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
-                // The agents counted under the composer: /status.
+                // A count under the composer: what it counts.
                 if down
-                    && let Some((row, columns)) = &self.counter_at
-                    && mouse.row == *row
-                    && columns.contains(&mouse.column)
+                    && let Some((_, _, opens)) =
+                        (self.counter_at.iter()).find(|(row, columns, _)| {
+                            mouse.row == *row && columns.contains(&mouse.column)
+                        })
                 {
-                    self.follow(&format!("{}status", screen::BUTTON));
+                    self.follow(&format!("{}{opens}", screen::BUTTON));
                     return true;
                 }
                 if !in_pane && self.composer_mouse(mouse) {
@@ -10065,7 +10067,7 @@ impl App {
             }),
         };
         let mut composer_at = None;
-        let mut counter_at = None;
+        let mut counter_at = Vec::new();
         // The reply's open line, wrapped as it will be written: it grows
         // here row by row until its newline writes it into the history.
         let mut open_rows = self.open_rows(width.min(PROSE));
@@ -10501,12 +10503,14 @@ impl App {
             // right edge where the band's is.
             // The menu's keys while it is open, as every list over the
             // composer has them, saying what Enter does with the pick.
-            let (line, counter) = match menu_keys(&menu, self.pick, &self.input) {
-                Some(keys) => (Line::from(hint::spans(keys)), None),
+            let (line, opens) = match menu_keys(&menu, self.pick, &self.input) {
+                Some(keys) => (Line::from(hint::spans(keys)), Vec::new()),
                 None => self.footer(width.min(PROSE)),
             };
             frame.render_widget(Paragraph::new(line), footer);
-            counter_at = counter.map(|at| (footer.y, footer.x + at.start..footer.x + at.end));
+            counter_at = (opens.into_iter())
+                .map(|(at, link)| (footer.y, footer.x + at.start..footer.x + at.end, link))
+                .collect();
         };
         let look = look::Look::now();
         terminal.draw(|frame| {
@@ -10757,236 +10761,198 @@ impl App {
         self.footer(width).0
     }
 
-    /// The footer, and where on it the agents at work are counted, as
-    /// they are in a roster: a click opens `/status`.
-    fn footer(&self, width: usize) -> (Line<'static>, Option<std::ops::Range<u16>>) {
-        let (working, waiting) = match self.options.side {
-            Some(_) => (0, 0),
-            None => self.agents(),
+    /// The footer, and what each count on it opens on a click: what needs
+    /// the person and the agents at work `/status`, as a roster's rows
+    /// do; what failed in the background `/background`.
+    fn footer(&self, width: usize) -> (Line<'static>, Vec<(std::ops::Range<u16>, &'static str)>) {
+        use footer::{Item, Slot};
+        let mut items = Vec::new();
+        // The row it runs in, unless it is the one new leads start in:
+        // full access's mark in the text's own weight, as nothing holds
+        // it back; no hue, as yellow is for what needs the person.
+        let mode = match self.gating {
+            Some(_) => None,
+            None => self.mode,
         };
-        // In zen, the focus, and only what needs the person besides.
-        if let Some(focus) = &self.zen {
-            let needs = match waiting {
-                0 => String::new(),
-                n => format!("{n} needs you  "),
-            };
-            let room = width.saturating_sub(needs.width() + 4 + "  zen · ".len());
-            let mut spans = vec![Span::raw(format!(
-                "  zen · {}",
-                transcript::cut(&first_line(focus), room)
-            ))];
-            let used = spans[0].content.width();
-            if waiting == 0 {
-                return (Line::from(spans).dim(), None);
-            }
-            let at = width.saturating_sub(needs.width() + 2).max(used + 1);
-            spans.push(Span::raw(" ".repeat(at - used)));
-            spans.push(Span::raw("?").fg(Color::Yellow).not_dim());
-            spans.push(Span::raw(format!(" {needs}")));
-            let counter = at as u16..(at + 2 + needs.trim_end().width()) as u16;
-            return (Line::from(spans).dim(), Some(counter));
-        }
-        let mut counted = Vec::new();
-        // Marks as the roster and /status draw them, each with its word,
-        // so the counts read without colour; what needs you first.
-        for (n, sign, color, word) in [
-            (waiting, "?", Color::Yellow, "needs you"),
-            (working, "●", Color::Cyan, "working"),
-        ] {
-            if n > 0 {
-                if !counted.is_empty() {
-                    counted.push(Span::raw("· ").dim());
+        if let Some(mode) = mode
+            && let Some(row) = approvals::footer(mode)
+        {
+            let forms = match approvals::mark(mode) {
+                Some(mark) => {
+                    let mark = match mode {
+                        "full" => Span::raw(mark),
+                        _ => Span::raw(mark).dim(),
+                    };
+                    vec![
+                        vec![mark.clone(), Span::raw(format!(" {row}")).dim()],
+                        vec![mark],
+                    ]
                 }
-                counted.push(Span::raw(sign).fg(color));
-                counted.push(Span::raw(format!(" {n} {word} ")));
-            }
+                None => vec![vec![Span::raw(row).dim()]],
+            };
+            items.push(Item::new(Slot::Access, forms));
         }
-        let counted_width = (counted.iter())
-            .map(|span| span.content.width())
-            .sum::<usize>();
-        let counted_width = match counted_width {
-            0 => 0,
-            n => n + 2,
-        };
-        let folder = tilde(&self.workspace);
-        let mut left = format!("  {}", self.model);
-        // What the running turn runs at, as a boost has it; else the bot's.
+        // The model as pickers name it; what the running turn runs at, as
+        // a boost has it, else the bot's effort.
+        let model = Span::raw(models::label(&self.model)).dim();
+        let mut long = vec![model.clone()];
         let effort = (self.running.as_ref()).and_then(|running| running.effort.as_ref());
         if let Some(effort) = effort.or(self.effort.as_ref()) {
-            left.push_str(&format!(" {effort}"));
+            long.push(Span::raw(format!(" {effort}")).dim());
         }
+        // An armed boost in the text's own weight: what the next message
+        // will take, said without a hue.
         if let Some(boost) = &self.boost {
-            left.push_str(&format!(" ↑{boost}"));
+            long.push(Span::raw(format!(" ↑{boost}")));
         }
         if let Some(speed) = &self.speed {
-            left.push_str(&format!(" {speed}"));
+            long.push(Span::raw(format!(" {speed}")).dim());
+        }
+        items.push(Item::new(Slot::Model, vec![long, vec![model]]));
+        // What waits for the turn to end, so a pick is not taken as lost.
+        let mut waits = Vec::new();
+        if let Some((model, effort)) = &self.switch {
+            let effort = effort.as_ref().map(|e| format!(" {e}")).unwrap_or_default();
+            waits.push(format!("→ {}{effort}", models::label(model)));
+        }
+        if let Some(mode) = self.gating {
+            let row = approvals::footer(mode).unwrap_or_else(|| mode.to_owned());
+            waits.push(match approvals::mark(mode) {
+                Some(mark) => format!("{mark} {row}"),
+                None => row,
+            });
+        }
+        if let Some(speed) = self.pace {
+            waits.push(format!("{speed} speed"));
+        }
+        if !waits.is_empty() {
+            let waits = waits.join(" · ");
+            items.push(Item::new(
+                Slot::Pending,
+                vec![
+                    vec![Span::raw(format!("{waits} when idle")).dim()],
+                    vec![Span::raw(waits).dim()],
+                ],
+            ));
         }
         // A lead or task told more than its seat's own role says so.
         if let Some(profile) = self.profile() {
-            left.push_str(&format!(" · {profile}"));
+            items.push(Item::new(
+                Slot::Profile,
+                vec![vec![Span::raw(profile).dim()], Vec::new()],
+            ));
         }
-        // What waits for the turn to end, so a pick is not taken as lost.
-        if let Some((model, effort)) = &self.switch {
-            left.push_str(&format!(" → {model}"));
-            if let Some(effort) = effort {
-                left.push_str(&format!(" {effort}"));
-            }
-            left.push_str(" when idle");
-        }
-        // A permissions row picked shows from when it applies.
-        if let Some(mode) = self.gating {
-            let row = approvals::footer(mode).unwrap_or_else(|| mode.to_owned());
-            left.push_str(&format!(" · {row} when idle"));
-        }
-        if let Some(speed) = self.pace {
-            left.push_str(&format!(" · {speed} speed when idle"));
-        }
-        // The row it runs in, last, unless it is the one new leads start
-        // in: full access in the text's own weight, not muted, as nothing
-        // holds it back; no hue, as yellow is for what needs the person.
-        let row = match self.gating {
-            Some(_) => None,
-            None => self.mode.and_then(approvals::footer),
-        };
-        if let Some(row) = &row {
-            left.push_str(&format!(" · {row}"));
-        }
-        // The context, not what the bot ever spent: how full the next
-        // round is.
-        let right = match (self.options.side, self.context) {
-            // Said for as long as the side chat is open.
-            (Some(_), _) => format!(
-                "side chat with {} · esc back  ",
-                self.bot
-                    .rsplit_once(".side-")
-                    .map_or(self.bot.as_str(), |(s, _)| s)
-            ),
-            (None, Some(size)) => {
-                let (amount, words, _) = transcript::fullness(size, self.window);
-                format!("{} · {amount}{words}  ", self.bot)
-            }
-            (None, None) => format!("{}  ", self.bot),
-        };
-        // The margin's glance says these while it is in view; the notes
-        // are counted while it is not.
-        let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
-        let right = match (glancing, self.context) {
-            (true, Some(_)) if self.options.side.is_none() => format!("{}  ", self.bot),
-            _ => right,
-        };
-        // Something runs for it with no one typing: /background lists it.
-        let right = match self.behind.0 {
-            0 => right,
-            _ if glancing => right,
-            n => format!("↻ {n} in background · {right}"),
-        };
-        // What failed of it, in red: /background lists it first.
-        let failed = format!("✗ {} failed", self.failed);
-        let right = match self.failed {
-            0 => right,
-            _ if glancing => right,
-            _ => format!("{failed} · {right}"),
-        };
-        let right = match self.margin.notes().len() {
-            n if n > 0 && !glancing => format!("✎ {n} · {right}"),
-            _ => right,
-        };
-        // Messages its next call takes in, which need nothing of the person.
-        let right = match self.attached.len() {
-            0 => right,
-            1 => format!("📎 · {right}"),
-            n => format!("📎 {n} · {right}"),
-        };
-        // The folder, and its branch, which is kept whole.
+        // The folder by whole parts, its end kept, as fish and Starship
+        // cut it; and its branch, kept whole.
+        let folder = tilde(&self.workspace);
         let branch = match &self.place.branch {
             Some(branch) => format!(" on {branch}"),
             None => String::new(),
         };
-        // A long folder keeps its end, the part that tells folders apart.
-        let room =
-            width.saturating_sub(left.width() + branch.width() + right.width() + counted_width + 4);
-        let mut folder = folder.as_str();
-        let cut = folder.width() > room;
-        while folder.width() > room.saturating_sub(1) && !folder.is_empty() {
-            folder = &folder[folder.chars().next().map_or(1, char::len_utf8)..];
+        let place = [
+            folder.clone(),
+            footer::fish(&folder),
+            footer::base(&folder).to_owned(),
+        ]
+        .into_iter()
+        .map(|folder| vec![Span::raw(format!("{folder}{branch}")).dim()])
+        .chain([Vec::new()])
+        .collect();
+        items.push(Item::new(Slot::Place, place));
+        if self.options.side.is_some() {
+            let with = (self.bot.rsplit_once(".side-")).map_or(self.bot.as_str(), |(s, _)| s);
+            items.push(Item::new(
+                Slot::Side,
+                vec![vec![
+                    Span::raw(format!("side chat with {with} · esc back")).dim(),
+                ]],
+            ));
+            return footer::lay(items, width);
         }
-        let place = format!(" · {}{folder}", if cut { "…" } else { "" });
-        // A space at least, so a branch never runs into what follows it.
-        let fill = width
-            .saturating_sub(
-                left.width() + place.width() + branch.width() + right.width() + counted_width,
-            )
-            .max(1);
-        // The branch in green, as shells show it; the agent's name in the
-        // agents' color.
-        let at = left.width() + place.width() + branch.width() + fill;
-        let warned = (row.as_deref() == Some("full access")).then(|| {
-            let tail = " · full access";
-            left.truncate(left.len() - tail.len());
-            tail
-        });
-        // An armed boost in the text's own weight, not muted: what the
-        // next message will take, said without a hue.
-        let mut spans = match (self.boost.as_ref()).and_then(|boost| {
-            let armed = format!(" ↑{boost}");
-            Some((left.find(&armed)?, armed.len()))
-        }) {
-            Some((from, len)) => vec![
-                Span::raw(left[..from].to_owned()),
-                Span::raw(left[from..from + len].to_owned()).not_dim(),
-                Span::raw(left[from + len..].to_owned()),
-            ],
-            None => vec![Span::raw(left)],
+        let (working, waiting) = self.agents();
+        // Marks as the roster and /status draw them, each with its word,
+        // so the counts read without colour.
+        if waiting > 0 {
+            let forms = footer::count("?", Color::Yellow, waiting, "needs you", false);
+            items.push(Item::new(Slot::Needs, forms).opens("status"));
+        }
+        // In zen, the focus, and only what needs the person besides.
+        if let Some(focus) = &self.zen {
+            let needs = match waiting {
+                0 => 0,
+                n => format!("  ? {n} needs you").width(),
+            };
+            let room = width.saturating_sub(4 + needs + "zen · ".len());
+            let focus = format!("zen · {}", transcript::cut(&first_line(focus), room));
+            items.retain(|item| item.slot == Slot::Needs);
+            items.push(Item::new(Slot::Place, vec![vec![Span::raw(focus).dim()]]));
+            return footer::lay(items, width);
+        }
+        // The margin's glance says these while it is in view.
+        let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
+        if self.failed > 0 && !glancing {
+            let forms = footer::count("✗", Color::Red, self.failed, "failed", false);
+            items.push(Item::new(Slot::Failed, forms).opens("background"));
+        }
+        if working > 0 {
+            let forms = footer::count("●", Color::Cyan, working, "working", true);
+            items.push(Item::new(Slot::Working, forms).opens("status"));
+        }
+        // Something runs for it with no one typing: /background lists it.
+        if self.behind.0 > 0 && !glancing {
+            let n = self.behind.0;
+            let forms = [format!("↻ {n} in background"), format!("↻ {n}")]
+                .map(|text| vec![Span::raw(text).dim()]);
+            let forms = forms.into_iter().chain([Vec::new()]).collect();
+            items.push(Item::new(Slot::Background, forms).opens("background"));
+        }
+        let notes = self.margin.notes().len();
+        if notes > 0 && !glancing {
+            let forms = vec![vec![Span::raw(format!("✎ {notes}")).dim()], Vec::new()];
+            items.push(Item::new(Slot::Notes, forms));
+        }
+        // Messages its next call takes in, which need nothing of the person.
+        let clip = match self.attached.len() {
+            0 => None,
+            1 => Some("📎".to_owned()),
+            n => Some(format!("📎 {n}")),
         };
-        if let Some(tail) = warned {
-            spans.push(Span::raw(" · "));
-            spans.push(Span::raw(&tail[" · ".len()..]).not_dim());
+        if let Some(clip) = clip {
+            items.push(Item::new(
+                Slot::Attached,
+                vec![vec![Span::raw(clip).dim()], Vec::new()],
+            ));
         }
-        spans.push(Span::raw(place));
-        if let Some(name) = branch.strip_prefix(" on ") {
-            spans.push(Span::raw(" on "));
-            spans.push(Span::raw(name.to_owned()).fg(Color::Green));
+        // How full the next round is, as what is left of its window: no
+        // hue while there is room, then yellow, then red, and it never
+        // goes once half is used.
+        if let Some(size) = self.context
+            && !glancing
+        {
+            let (amount, _, color) = transcript::fullness(size, self.window);
+            let words = match self.window.is_some_and(|window| window > 0) {
+                true => " left",
+                false => " context",
+            };
+            let item = match color.filter(|color| *color != Color::Green) {
+                Some(color) => Item::new(
+                    Slot::LowContext,
+                    vec![
+                        vec![Span::raw(amount.clone()).fg(color), Span::raw(words).dim()],
+                        vec![Span::raw(amount).fg(color)],
+                    ],
+                ),
+                None => Item::new(
+                    Slot::RoomyContext,
+                    vec![
+                        vec![Span::raw(format!("{amount}{words}")).dim()],
+                        Vec::new(),
+                    ],
+                ),
+            };
+            items.push(item);
         }
-        spans.push(Span::raw(" ".repeat(fill)));
-        let counter = (counted_width > 0).then(|| at as u16..(at + counted_width - 3) as u16);
-        if !counted.is_empty() {
-            spans.extend(counted);
-            spans.push(Span::raw("· ").dim());
-        }
-        match right.rfind(&self.bot) {
-            Some(at) => {
-                let before = &right[..at];
-                match before.find(&failed).filter(|_| self.failed > 0) {
-                    Some(from) => {
-                        let to = from + failed.len();
-                        spans.push(Span::raw(before[..from].to_owned()));
-                        spans.push(Span::raw(failed.clone()).fg(Color::Red).not_dim());
-                        spans.push(Span::raw(before[to..].to_owned()));
-                    }
-                    None => spans.push(Span::raw(before.to_owned())),
-                }
-                spans.push(Span::raw(self.bot.clone()).fg(Color::Blue));
-                let rest = &right[at + self.bot.len()..];
-                // How full the context is, by its window: green, then
-                // yellow, then red.
-                let full = self
-                    .context
-                    .map(|size| transcript::fullness(size, self.window));
-                match full
-                    .and_then(|(amount, _, color)| Some((rest.find(&amount)?, amount, color?)))
-                {
-                    Some((from, amount, color)) => {
-                        let to = from + amount.len();
-                        spans.push(Span::raw(rest[..from].to_owned()));
-                        spans.push(Span::raw(rest[from..to].to_owned()).fg(color));
-                        spans.push(Span::raw(rest[to..].to_owned()));
-                    }
-                    _ => spans.push(Span::raw(rest.to_owned())),
-                }
-            }
-            None => spans.push(Span::raw(right)),
-        }
-        (Line::from(spans).dim(), counter)
+        footer::lay(items, width)
     }
 }
 
@@ -12630,7 +12596,9 @@ mod tests {
         assert!(footer.starts_with("  zen · the rounding"), "{footer}");
         assert!(footer.ends_with("? 1 needs you  "), "{footer}");
         assert_eq!(footer.width(), 60);
-        let counter = counter.unwrap();
+        let [(counter, "status")] = &counter[..] else {
+            panic!("{counter:?}")
+        };
         let columns: Vec<char> = footer.chars().collect();
         let counted: String = columns[counter.start as usize..counter.end as usize]
             .iter()
@@ -13510,10 +13478,14 @@ mod tests {
         app.daemon(turn_event("attached", 5, json!({"status": "attached"})))
             .await;
         assert_eq!(app.notice, None, "nothing for the person to do");
-        assert!(app.footer_line(120).to_string().contains("📎 ·"));
+        let footer = app.footer_line(120).to_string();
+        assert!(
+            footer.contains("📎") && !footer.contains("📎 2"),
+            "{footer}"
+        );
         app.daemon(turn_event("attached", 6, json!({"status": "attached"})))
             .await;
-        assert!(app.footer_line(120).to_string().contains("📎 2 ·"));
+        assert!(app.footer_line(120).to_string().contains("📎 2"));
         // Taken in by the running turn's next call.
         for turn in [5, 6] {
             app.daemon(turn_event(
@@ -13534,19 +13506,22 @@ mod tests {
         app.failed = 1;
         let line = app.footer_line(140);
         let text = line.to_string();
-        assert!(text.contains("✗ 1 failed · ↻ 2 in background · "), "{text}");
-        let mark = line
-            .spans
-            .iter()
-            .find(|s| s.content == "✗ 1 failed")
-            .unwrap();
+        assert!(text.contains("✗ 1 failed  ↻ 2 in background"), "{text}");
+        // The mark red at full strength, the words muted.
+        let mark = line.spans.iter().find(|s| s.content == "✗").unwrap();
         assert_eq!(mark.style.fg, Some(Color::Red));
         assert!(
-            mark.style.sub_modifier.contains(Modifier::DIM),
+            !mark.style.add_modifier.contains(Modifier::DIM),
             "red, not dimmed"
         );
+        let words = line
+            .spans
+            .iter()
+            .find(|s| s.content == " 1 failed")
+            .unwrap();
+        assert!(words.style.add_modifier.contains(Modifier::DIM));
         app.failed = 2;
-        assert!(app.footer_line(140).to_string().contains("✗ 2 failed · "));
+        assert!(app.footer_line(140).to_string().contains("✗ 2 failed"));
         app.failed = 0;
         assert!(!app.footer_line(140).to_string().contains('✗'));
     }
@@ -13584,7 +13559,7 @@ mod tests {
         app.bot = "top.lead".into();
         let text = app.footer_line(140).to_string();
         assert!(
-            text.starts_with(&format!("  {} · superlead · ", app.model)),
+            text.contains(&format!(" {} · superlead · ", models::label(&app.model))),
             "{text}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -14157,12 +14132,8 @@ mod tests {
             Some("fast from the next call, at a higher price per token")
         );
         assert_eq!(app.speed.as_deref(), Some("fast"));
-        assert!(
-            app.footer_line(200)
-                .spans
-                .iter()
-                .any(|s| s.content.contains("claude-opus-5-5 fast"))
-        );
+        let footer = app.footer_line(200).to_string();
+        assert!(footer.contains("Opus 5.5 fast"), "{footer}");
         // It opens again on what is in effect.
         app.input.set("/fast");
         app.submit().await;
@@ -15019,8 +14990,8 @@ mod tests {
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.model = "opus".into();
         // Nothing counted while nothing runs or waits.
-        let (line, counter) = app.footer(100);
-        assert!(counter.is_none() && !line.to_string().contains('●'));
+        let (line, opens) = app.footer(100);
+        assert!(opens.is_empty() && !line.to_string().contains('●'));
         let ask = |id: &str| {
             asks::call(
                 id,
@@ -15041,16 +15012,29 @@ mod tests {
             .insert(0, vec![task("add", "working"), task("neg", "done")]);
         app.tasks
             .insert(1, vec![task("add", "working"), task("div", "working")]);
-        let (line, counter) = app.footer(100);
+        let (line, opens) = app.footer(100);
         let text = line.to_string();
-        let counter = counter.unwrap();
-        let shown: String = (text.chars())
-            .skip(counter.start as usize)
-            .take(counter.len())
+        let shown: Vec<(String, &str)> = (opens.iter())
+            .map(|(at, link)| {
+                let cells: String = (text.chars())
+                    .skip(at.start as usize)
+                    .take(at.len())
+                    .collect();
+                (cells, *link)
+            })
             .collect();
-        assert_eq!(shown, "? 2 needs you · ● 2 working");
-        assert!(text.contains("? 2 needs you · ● 2 working · b"), "{text}");
+        assert_eq!(
+            shown,
+            [
+                ("? 2 needs you".to_owned(), "status"),
+                ("● 2 working".to_owned(), "status")
+            ]
+        );
+        // The agent's name is the composer's to say, not the footer's.
+        assert!(text.contains("? 2 needs you  ● 2 working"), "{text}");
+        assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
+        let counter = opens[0].0.clone();
         // Its marks and colors as a roster's: yellow ? for what needs the
         // person, cyan ● at work.
         let marks: Vec<_> = (line.spans.iter())
@@ -15058,7 +15042,7 @@ mod tests {
             .map(|span| span.style.fg)
             .collect();
         assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
-        app.counter_at = Some((20, 10 + counter.start..10 + counter.end));
+        app.counter_at = vec![(20, 10 + counter.start..10 + counter.end, "status")];
         let click = |column| {
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -15172,30 +15156,107 @@ mod tests {
         app.place = place::Place {
             branch: Some("agent/fix-cart".into()),
         };
-        // The row new leads start in goes unsaid; another is named, last.
+        // The row new leads start in goes unsaid; another leads the row,
+        // full access's mark in the text's own weight and its word muted.
         app.mode = Some("full");
         let full = app.footer(100).0;
         assert!(
-            full.to_string().contains("opus · full access · /work"),
+            full.to_string()
+                .starts_with("  ⏵⏵ full access · Opus · /work"),
             "{full}"
         );
-        let warned = full.spans.iter().find(|span| span.content == "full access");
-        let warned = warned.map(|span| span.style);
-        assert_eq!(warned.and_then(|style| style.fg), None);
-        assert!(warned.is_some_and(|style| style.sub_modifier.contains(Modifier::DIM)));
+        let mark = full.spans.iter().find(|span| span.content == "⏵⏵").unwrap();
+        assert_eq!(mark.style.fg, None);
+        assert!(!mark.style.add_modifier.contains(Modifier::DIM));
+        let word = full
+            .spans
+            .iter()
+            .find(|span| span.content == " full access")
+            .unwrap();
+        assert!(word.style.add_modifier.contains(Modifier::DIM));
         app.mode = Some("auto");
         let wide = app.footer_line(100).to_string();
         assert!(
-            wide.contains("opus · /work/.agent/worktrees/fix-cart/packages/shop on agent/fix-cart"),
+            wide.contains("Opus · /work/.agent/worktrees/fix-cart/packages/shop on agent/fix-cart"),
             "{wide}"
         );
-        // A narrow footer cuts the folder from its start, never the branch.
+        // A narrow footer shortens the folder by whole parts, as fish
+        // does, never the branch.
         let narrow = app.footer_line(56).to_string();
         assert!(
-            narrow.contains("…") && narrow.contains("packages/shop on agent/fix-cart"),
+            narrow.contains("Opus · /w/.a/w/f/p/shop on agent/fix-cart"),
             "{narrow}"
         );
-        assert_eq!(narrow.trim_end().width(), 56 - 2);
+        assert_eq!(narrow.width(), 56);
+    }
+
+    /// The footer of a busy lead at the widths the README shows, as the
+    /// terminal would draw it, muted text in the gray Sonny measures for
+    /// Flexoki Dark: `FOOTER_SHOTS=out.ans cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn footer_shots() {
+        let Ok(out) = std::env::var("FOOTER_SHOTS") else {
+            return;
+        };
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.model = "openai/gpt-6.1-sol".into();
+        app.effort = Some("high".into());
+        app.mode = Some("full");
+        app.workspace = format!("{}/Developer/agent", std::env::var("HOME").unwrap());
+        app.place = place::Place {
+            branch: Some("main".into()),
+        };
+        let ask = asks::call(
+            "c1",
+            &json!({"question": "Merge?", "options": [
+            {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
+        );
+        app.asks = vec![ask.unwrap()];
+        let task = |name: &str| started::Task {
+            bot: format!("agent.{name}"),
+            name: name.into(),
+            brief: "b".into(),
+            state: "working".into(),
+        };
+        app.tasks.insert(0, vec![task("cart"), task("docs")]);
+        app.failed = 1;
+        app.behind = (3, Some(Instant::now()));
+        for id in ["findings", "repro"] {
+            let post = json!({"id": id, "title": id, "markdown": "x"});
+            app.margin.apply(id, &post, None, None);
+        }
+        app.attached = vec![1, 2];
+        app.context = Some(126_000);
+        app.window = Some(200_000);
+        let sgr = |span: &Span| {
+            let style = span.style;
+            let mut codes = Vec::new();
+            if style.add_modifier.contains(Modifier::BOLD) {
+                codes.push("1".to_owned());
+            }
+            match style.fg {
+                Some(Color::Red) => codes.push("31".into()),
+                Some(Color::Green) => codes.push("32".into()),
+                Some(Color::Yellow) => codes.push("33".into()),
+                Some(Color::Blue) => codes.push("34".into()),
+                Some(Color::Magenta) => codes.push("35".into()),
+                Some(Color::Cyan) => codes.push("36".into()),
+                // Muted: the measured gray, as Look draws a dim cell.
+                _ if style.add_modifier.contains(Modifier::DIM) => {
+                    codes.push("38;2;130;129;123".into())
+                }
+                _ => {}
+            }
+            format!("\x1b[0;{}m{}\x1b[0m", codes.join(";"), span.content)
+        };
+        let mut ansi = String::new();
+        for width in [100, 80, 60, 44] {
+            let line = app.footer_line(width);
+            ansi.push_str(&line.spans.iter().map(sgr).collect::<String>());
+            ansi.push_str("\r\n\r\n");
+        }
+        std::fs::write(out, ansi).unwrap();
     }
 
     #[tokio::test]
