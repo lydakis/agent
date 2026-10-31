@@ -159,11 +159,52 @@ pub struct Kept {
     pub since_ms: i64,
 }
 
+/// Where every sky keeps its haikus: `~/.agent/sonny/haiku.json`.
+#[derive(Clone, Debug)]
+pub struct Store {
+    file: Option<PathBuf>,
+}
+
+impl Store {
+    #[cfg(not(test))]
+    pub fn new() -> Store {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Store {
+            file: home.map(|home| home.join(".agent/sonny/haiku.json")),
+        }
+    }
+
+    /// Tests keep their haikus apart from the person's, and from each
+    /// other's.
+    #[cfg(test)]
+    pub fn new() -> Store {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sonny-haiku-{}-{n}", std::process::id()));
+        Store {
+            file: Some(dir.join("haiku.json")),
+        }
+    }
+
+    /// Every daemon's haiku, by socket, as the file keeps them.
+    fn all(&self) -> serde_json::Map<String, Value> {
+        (self.file.as_ref())
+            .and_then(|file| std::fs::read(file).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|all| match all {
+                Value::Object(all) => Some(all),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
 impl Kept {
     /// What the file says for `socket`, or nothing kept.
-    pub fn load(socket: &Path) -> Kept {
+    pub fn load(store: &Store, socket: &Path) -> Kept {
         let socket = socket.display().to_string();
-        let kept = all().remove(&socket).filter(Value::is_object);
+        let kept = store.all().remove(&socket).filter(Value::is_object);
         let Some(kept) = kept else {
             return Kept {
                 socket,
@@ -188,8 +229,12 @@ impl Kept {
     /// sky reading or writing it between: what `change` returns, and the
     /// file as it then is. `None` when the file can't be locked or written,
     /// so nothing counted is spent.
-    pub fn update<T>(socket: &Path, change: impl FnOnce(&mut Kept) -> T) -> Option<(T, Kept)> {
-        let lock = file(&home()?).with_extension("json.lock");
+    pub fn update<T>(
+        store: &Store,
+        socket: &Path,
+        change: impl FnOnce(&mut Kept) -> T,
+    ) -> Option<(T, Kept)> {
+        let lock = store.file.as_ref()?.with_extension("json.lock");
         std::fs::create_dir_all(lock.parent()?).ok()?;
         // Held until the end of the step, and let go as the file closes.
         let lock = (std::fs::OpenOptions::new().create(true).truncate(false))
@@ -197,17 +242,24 @@ impl Kept {
             .open(lock)
             .ok()?;
         lock.lock().ok()?;
-        let mut kept = Kept::load(socket);
+        let mut kept = Kept::load(store, socket);
         let changed = change(&mut kept);
-        kept.save().ok()?;
+        kept.save(store).ok()?;
         Some((changed, kept))
     }
 
     /// Keep `lines` as the haiku `by` wrote for its claim since `since_ms`,
     /// at `now_ms`, if that claim is still the one kept: whether it was.
     /// A newer claim that took over while it was written keeps its own.
-    pub fn publish(socket: &Path, by: &str, since_ms: i64, lines: &[String], now_ms: i64) -> bool {
-        Kept::update(socket, |kept| {
+    pub fn publish(
+        store: &Store,
+        socket: &Path,
+        by: &str,
+        since_ms: i64,
+        lines: &[String],
+        now_ms: i64,
+    ) -> bool {
+        Kept::update(store, socket, |kept| {
             let current = kept.by == by && kept.since_ms == since_ms;
             if current {
                 kept.lines = lines.to_vec();
@@ -218,11 +270,10 @@ impl Kept {
         .is_some_and(|(current, _)| current)
     }
 
-    fn save(&self) -> std::io::Result<()> {
-        let home = home().ok_or(std::io::ErrorKind::NotFound)?;
-        let file = file(&home);
+    fn save(&self, store: &Store) -> std::io::Result<()> {
+        let file = store.file.as_ref().ok_or(std::io::ErrorKind::NotFound)?;
         // Each daemon's apart, by its socket; the others' as they are.
-        let mut all = all();
+        let mut all = store.all();
         all.insert(
             self.socket.clone(),
             json!({"day": self.day, "written": self.written, "by": self.by,
@@ -235,7 +286,7 @@ impl Kept {
         // Whole or not at all, should a sky stop halfway.
         let part = file.with_extension(format!("json.{}", std::process::id()));
         std::fs::write(&part, kept.to_string())?;
-        std::fs::rename(&part, &file)
+        std::fs::rename(&part, file)
     }
 
     /// Whether a haiku may be written now, at `now_ms`, by `by`, holder
@@ -260,39 +311,10 @@ impl Kept {
     }
 }
 
-/// Every daemon's haiku, by socket, as the file keeps them.
-fn all() -> serde_json::Map<String, Value> {
-    home()
-        .and_then(|home| std::fs::read(file(&home)).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|all| match all {
-            Value::Object(all) => Some(all),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
 /// The local day of `ms`, as the count is kept by.
 fn day(ms: i64) -> String {
     let local = crate::trigger::local(ms.div_euclid(1000));
     format!("{}-{:02}-{:02}", local.year, local.month, local.day)
-}
-
-fn file(home: &Path) -> PathBuf {
-    home.join(".agent/sonny/haiku.json")
-}
-
-#[cfg(not(test))]
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-/// Tests keep their haiku apart from the person's, and from each other's.
-#[cfg(test)]
-fn home() -> Option<PathBuf> {
-    let thread = format!("{:?}", std::thread::current().id());
-    let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
-    Some(std::env::temp_dir().join(format!("sonny-haiku-{}-{thread}", std::process::id())))
 }
 
 /// The haiku a copy of `bot` writes, or `None` when it writes none worth
@@ -431,25 +453,29 @@ mod tests {
 
     #[test]
     fn a_claim_is_read_counted_and_written_as_one_step() {
+        let store = Store::new();
         let rule = Rule { daily: 1, ..rule() };
         let socket = Path::new("/tmp/agent-claim.sock");
         let ms = 1_793_400_000_000;
-        let (first, kept) = Kept::update(socket, |kept| kept.claim(&rule, "a", ms, ms)).unwrap();
+        let (first, kept) =
+            Kept::update(&store, socket, |kept| kept.claim(&rule, "a", ms, ms)).unwrap();
         assert!(first);
         assert_eq!(kept.written, 1);
         // Another sky, after: the file already counts the first.
-        let (second, _) =
-            Kept::update(socket, |kept| kept.claim(&rule, "b", ms + 1, ms + 1)).unwrap();
+        let (second, _) = Kept::update(&store, socket, |kept| {
+            kept.claim(&rule, "b", ms + 1, ms + 1)
+        })
+        .unwrap();
         assert!(!second);
-        assert_eq!(Kept::load(socket).by, "a");
+        assert_eq!(Kept::load(&store, socket).by, "a");
         // A haiku is kept only for the claim it was written for.
         let lines = vec!["x".to_owned(), "y".into(), "z".into()];
-        assert!(!Kept::publish(socket, "a", ms - 1, &lines, ms + 2));
-        assert!(Kept::load(socket).lines.is_empty());
-        assert!(Kept::publish(socket, "a", ms, &lines, ms + 3));
-        let kept = Kept::load(socket);
+        assert!(!Kept::publish(&store, socket, "a", ms - 1, &lines, ms + 2));
+        assert!(Kept::load(&store, socket).lines.is_empty());
+        assert!(Kept::publish(&store, socket, "a", ms, &lines, ms + 3));
+        let kept = Kept::load(&store, socket);
         assert_eq!((kept.lines, kept.at_ms), (lines, ms + 3));
-        let _ = std::fs::remove_dir_all(home().unwrap());
+        let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
     }
 
     #[test]
@@ -472,6 +498,7 @@ mod tests {
 
     #[test]
     fn a_haiku_is_written_once_a_hold_and_within_the_day_s_cap() {
+        let store = Store::new();
         let rule = Rule { daily: 2, ..rule() };
         let mut kept = Kept {
             socket: "s".into(),
@@ -489,15 +516,19 @@ mod tests {
         // Kept for every sky of the same daemon, and only its.
         kept.lines = vec!["a".into(), "b".into(), "c".into()];
         kept.socket = "/tmp/agent.sock".into();
-        kept.save().unwrap();
-        assert_eq!(Kept::load(Path::new("/tmp/agent.sock")), kept);
-        assert!(Kept::load(Path::new("/tmp/other.sock")).lines.is_empty());
+        kept.save(&store).unwrap();
+        assert_eq!(Kept::load(&store, Path::new("/tmp/agent.sock")), kept);
+        assert!(
+            Kept::load(&store, Path::new("/tmp/other.sock"))
+                .lines
+                .is_empty()
+        );
         // Another daemon's claim leaves this one's as it was.
-        Kept::update(Path::new("/tmp/other.sock"), |other| {
+        Kept::update(&store, Path::new("/tmp/other.sock"), |other| {
             other.claim(&rule, "x", ms, ms)
         });
-        assert_eq!(Kept::load(Path::new("/tmp/agent.sock")), kept);
-        assert_eq!(Kept::load(Path::new("/tmp/other.sock")).by, "x");
-        let _ = std::fs::remove_dir_all(home().unwrap());
+        assert_eq!(Kept::load(&store, Path::new("/tmp/agent.sock")), kept);
+        assert_eq!(Kept::load(&store, Path::new("/tmp/other.sock")).by, "x");
+        let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
     }
 }
