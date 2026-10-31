@@ -2485,6 +2485,9 @@ async fn detach(
     // What the sandbox holds in place stays held while the command runs.
     let sandboxed = sandbox.is_some();
     let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+    // The bot's socket listens while anything the command left in its
+    // group runs, not only while the command itself does.
+    let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
     let mut child = process.spawn()?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     // It outlives turns and the daemon, but not the pull cord: a pull ends
@@ -2521,6 +2524,7 @@ async fn detach(
                 () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
+        drop(listening);
     });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
