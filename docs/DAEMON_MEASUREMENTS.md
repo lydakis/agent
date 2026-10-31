@@ -6126,3 +6126,33 @@ none is cut: the screen shows the path every call takes, and a cut call
 adds a file write and two syncs on a blocking thread, not the runtime's.
 The later head that syncs each file and removes pruned files after the
 group commits changes only cut calls and retention.
+
+## Event times and follow from a time (#498)
+
+Each event row now carries the time it was written, `written_ms`, taken in
+the insert as the larger of the clock and the newest row's time, so times
+never go back. That adds one indexed lookup of the newest row to every
+event insert. `follow` from a time binary-searches the event ids for the
+first written at or after it, reading the id bounds once; a follow from a
+cursor is unchanged. The Perf workflow's matched screen, base main cd2813f
+against the PR head da8d44f, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.115 | 29.891 | -0.7% |
+| admission | burst submit p99, ms | 4.205 | 4.242 | +0.9% |
+| completion | release to terminal p99, ms | 9.658 | 9.313 | -3.6% |
+| footprint | idle RSS, MiB | 19.578 | 19.295 | -1.4% |
+| footprint | per idle bot, KiB | 1.468 | 1.49 | +1.5% |
+| footprint | RSS after a turn each, MiB | 29.33 | 29.592 | +0.9% |
+| footprint | CPU per turn, ms | 0.895 | 0.893 | -0.2% |
+| lifecycle | CPU, s | 0.915 | 0.875 | -4.4% |
+| lifecycle | p95 turn, ms | 700.653 | 594.664 | -15.1% |
+| lifecycle | peak RSS, MiB | 25.857 | 25.615 | -0.9% |
+
+Nothing passed the gate's 15% in the direction that costs. The lifecycle
+p95 turn fell by 15%, the direction that saves, and nothing in the change
+would make turns faster: it is the runner's noise (#485's screen measured
+the same p95 at 578 ms on unchanged turn code). Every event insert reads
+the newest row through the primary key, an index seek on a page the
+insert just touched, so the per-turn CPU did not move.
