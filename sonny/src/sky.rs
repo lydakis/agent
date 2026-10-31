@@ -127,6 +127,12 @@ const REPLAY_BACK: i64 = 3_600_000;
 const SKY_COLS: usize = 60;
 /// How often a sky reads the haiku rule from the config again.
 const RULE_READ: Duration = Duration::from_secs(10);
+/// How often a sky reads its daemon's triggers again: soon enough that
+/// one made from a shell shows within moments.
+const SCHEDULE_READ: Duration = Duration::from_secs(2);
+/// How long a schedule a `triggers` call made keeps a read of the
+/// triggers from telling of it again.
+const TOLD: Duration = Duration::from_secs(60);
 const SKY_ROWS: usize = 24;
 /// How much longer one way than the other the sky may be.
 const STRETCH: f32 = 2.0;
@@ -193,6 +199,8 @@ enum Feed {
     Tape(Value),
     /// Who told whom before a replay's tape starts.
     Prior(Prior),
+    /// The daemon's store, whose triggers the sky shows.
+    Store(String),
     /// Caught up: from here on, what happens.
     Ready,
     Down(String),
@@ -205,6 +213,8 @@ enum End {
     Agent(usize),
     /// The rim, at this agent's angle: a lookout, an automation.
     Rim(usize),
+    /// Just outside this agent's star, where its schedule's tick is.
+    Tick(usize),
 }
 
 /// What a tool call does, which its twinkle's shape tells: a shell's
@@ -455,6 +465,20 @@ pub struct View {
     runtime: tokio::runtime::Handle,
     /// The andon cord, while it hangs or its start rings out.
     cord: Option<Cord>,
+    /// The daemon's store, whose triggers are this sky's.
+    store_id: Option<String>,
+    /// Its triggers as last read, soonest first, and which had been read
+    /// by then (none before the first read): one new since is a schedule
+    /// made.
+    schedules: Vec<crate::trigger::Upcoming>,
+    seen: Option<HashSet<(String, String)>>,
+    /// When the triggers were last read, and a read under way.
+    booked: Option<Instant>,
+    booking: bool,
+    /// Schedules `triggers` calls are making, by call; and those made, by
+    /// name, so a read of the triggers tells of them no second time.
+    bookings: HashMap<String, Booking>,
+    told: HashMap<String, Instant>,
 }
 
 /// What the haiku's file work sends back, none of it on the thread that
@@ -467,6 +491,17 @@ enum Heard {
     Read(haiku::Kept, Option<haiku::Rule>),
     /// The day's haikus, for a replay to show each when it was up.
     Poems(Vec<haiku::Poem>),
+    /// The daemon's triggers as read, soonest first.
+    Schedules(Vec<crate::trigger::Upcoming>),
+}
+
+/// A schedule a `triggers` call is making: for whom, how it was asked
+/// for (`every 30m`, `file`), and its name.
+#[derive(Debug, Clone, PartialEq)]
+struct Booking {
+    bot: String,
+    when: String,
+    name: String,
 }
 
 /// A haiku on the sky: who wrote it, its lines, when it starts to show,
@@ -793,6 +828,13 @@ impl View {
             ruled: Some(now),
             runtime: tokio::runtime::Handle::current(),
             cord: None,
+            store_id: None,
+            schedules: Vec::new(),
+            seen: None,
+            booked: None,
+            booking: false,
+            bookings: HashMap::new(),
+            told: HashMap::new(),
         }
     }
 
@@ -839,6 +881,7 @@ impl View {
 
     /// Let go of every agent and what they did, to draw them again.
     fn forget(&mut self) {
+        self.bookings.clear();
         self.agents.clear();
         self.index.clear();
         self.said.clear();
@@ -926,6 +969,7 @@ impl View {
                         replay.keep(event);
                     }
                 }
+                Feed::Store(store) => self.store_id = Some(store),
                 Feed::Prior(prior) => {
                     if let Some(replay) = &mut self.replay {
                         replay.prior = prior;
@@ -1005,6 +1049,10 @@ impl View {
                     self.shown = (by.clone(), at);
                     self.recite(by, lines, at, now);
                 }
+                Heard::Schedules(found) => {
+                    self.booking = false;
+                    self.timetable(found, now);
+                }
                 Heard::Poems(poems) => {
                     self.reading = false;
                     if let Some(replay) = &mut self.replay {
@@ -1065,6 +1113,25 @@ impl View {
             self.runtime.spawn_blocking(move || {
                 let rule = rule.then(haiku::Rule::load);
                 let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
+            });
+        }
+        // The triggers read again: each tick's next time, and a schedule
+        // made outside a `triggers` call, as from a shell. A replay draws
+        // no ticks: they are now's.
+        if self.replay.is_none()
+            && !self.booking
+            && let Some(store) = self.store_id.clone()
+            && self
+                .booked
+                .is_none_or(|at| now.duration_since(at) >= SCHEDULE_READ)
+        {
+            (self.booking, self.booked) = (true, Some(now));
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let found = crate::trigger::Places::home()
+                    .map(|places| crate::trigger::upcoming(&places, &store, wall_ms() / 1000))
+                    .unwrap_or_default();
+                let _ = send.send(Heard::Schedules(found));
             });
         }
         if self.replay.is_some() || self.title.rule.daily == 0 {
@@ -1135,6 +1202,57 @@ impl View {
         }
         self.shown = (kept.by.clone(), kept.at_ms);
         self.recite(kept.by, kept.lines, kept.at_ms, now);
+    }
+
+    /// The triggers as read: a new one no `triggers` call told of is told
+    /// now, for whom and how often, though not who made it.
+    fn timetable(&mut self, found: Vec<crate::trigger::Upcoming>, now: Instant) {
+        let ids: HashSet<(String, String)> = (found.iter())
+            .map(|u| (u.name.clone(), u.generation.clone()))
+            .collect();
+        self.told.retain(|_, at| now.duration_since(*at) < TOLD);
+        if let Some(seen) = &self.seen {
+            let new: Vec<(String, String)> = (found.iter())
+                .filter(|u| !seen.contains(&(u.name.clone(), u.generation.clone())))
+                .filter(|u| !self.told.contains_key(&u.name))
+                .map(|u| (u.bot.clone(), u.when.clone()))
+                .collect();
+            for (bot, when) in new {
+                let at = self.agent(&bot);
+                let whom = at.map_or(bot, |at| self.short(at));
+                let said = format!("{whom} {}, new", said_when(&when));
+                self.say(now, said, None, &Vec::from_iter(at));
+            }
+        }
+        (self.seen, self.schedules) = (Some(ids), found);
+    }
+
+    /// A `triggers` call made a schedule: a spark from who made it to its
+    /// agent's tick, and a line in the log.
+    fn booked(&mut self, by: usize, booking: Booking, now: Instant) {
+        self.told.insert(booking.name, now);
+        let to = self.agent(&booking.bot);
+        let whom = to.map_or_else(|| short(&booking.bot), |to| self.short(to));
+        let maker = match to == Some(by) {
+            true => "itself".to_owned(),
+            false => self.short(by),
+        };
+        // What the schedule is first, as the log is narrow.
+        let said = format!("{whom} {}, by {maker}", said_when(&booking.when));
+        let about: Vec<usize> = std::iter::once(by).chain(to).collect();
+        self.say(now, said, None, &about);
+        if let Some(to) = to {
+            // A spark of its own: no message, so no count of them.
+            let agent = &mut self.agents[by];
+            (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
+            agent.heat = agent.warmth(now) + 1.0;
+            self.sparks.push(Spark {
+                from: End::Agent(by),
+                to: End::Tick(to),
+                born: now,
+                color: None,
+            });
+        }
     }
 
     /// In a replay, the haiku up at its time, as it was then: written
@@ -1382,6 +1500,7 @@ impl View {
             End::Person => Some(End::Person),
             End::Agent(at) => moved[at].map(End::Agent),
             End::Rim(at) => moved[at].map(End::Rim),
+            End::Tick(at) => moved[at].map(End::Tick),
         };
         self.agents.retain(|agent| !agent.gone);
         for agent in &mut self.agents {
@@ -1688,7 +1807,7 @@ impl View {
                     let by = match from {
                         End::Person => "you".to_owned(),
                         End::Agent(by) => self.short(by),
-                        End::Rim(_) => match data["person"].as_str() {
+                        End::Rim(_) | End::Tick(_) => match data["person"].as_str() {
                             Some(person) => person.to_owned(),
                             None => {
                                 crate::transcript::from_outside(data["origin"].as_str()).to_owned()
@@ -1723,6 +1842,14 @@ impl View {
                 if self.replay.is_none() {
                     let by = self.agents[at].name.clone();
                     self.title.note(now, &by);
+                }
+                // A schedule asked for is told once the call is done.
+                if tool == crate::served::TRIGGERS
+                    && own
+                    && let Some(call) = data["call_id"].as_str()
+                    && let Some(booking) = booking(&data["arguments"], name)
+                {
+                    self.bookings.insert(call.to_owned(), booking);
                 }
                 if tool == crate::asks::TOOL && own {
                     if self.agents[at].state() != Some(State::NeedsYou) {
@@ -1779,6 +1906,12 @@ impl View {
             "tool_completed" if live => {
                 if let Some(id) = data["call_id"].as_str() {
                     self.agents[at].held.remove(id);
+                    if let Some(booking) = self.bookings.remove(id)
+                        && data["failed"] != true
+                        && data["denied"] != true
+                    {
+                        self.booked(at, booking, now);
+                    }
                 }
                 if data["failed"] == true || data["denied"] == true {
                     let work = Work::of(data["name"].as_str().unwrap_or(""));
@@ -2627,6 +2760,25 @@ impl View {
             let (a, b) = (self.agents[by].at, self.agents[to].at);
             sky.curve(a, bend(a, b), b, ink, gap);
         }
+        // Each schedule a tick just outside its agent's star, out from the
+        // middle, as on a clock's face: muted, and plain in the last tenth
+        // of its wait. Now's, so not in a replay.
+        if self.replay.is_none() {
+            let wall = wall_ms() / 1000;
+            for upcoming in self.schedules.iter().filter(|u| keeps_time(u)) {
+                let Some(at) = self.agent(&upcoming.bot).filter(|&at| shown[at]) else {
+                    continue;
+                };
+                let near = upcoming.next.is_some_and(|next| {
+                    let wait = upcoming.then.map_or(600, |then| then - next).max(60);
+                    next - wall <= wait / 10
+                });
+                let ink = if near { Ink::Plain } else { Ink::Muted };
+                for past in [0.05, 0.07, 0.09] {
+                    sky.dot(self.tick(at, past), ink);
+                }
+            }
+        }
         // Ripples and flashes, then sparks, then the stars over them.
         for (_, agent) in (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at]) {
             if let Some((at, reach)) = agent.ripple {
@@ -3037,6 +3189,10 @@ impl View {
                 Span::raw("⡇").fg(NEEDS),
                 vec![says("   the cord, down to who pulled it")],
             ),
+            row(
+                Span::styled("⠒", Ink::Muted.style()),
+                vec![says("   a schedule, lit as it nears")],
+            ),
             Line::default(),
             Line::from(says("now")),
             Line::default(),
@@ -3077,6 +3233,24 @@ impl View {
         if let Some(busiest) = busiest {
             stat("busiest pair", busiest);
         }
+        // The next schedules to fire, soonest first, then those that
+        // watch a file or a repository.
+        let wall = wall_ms() / 1000;
+        let next: Vec<String> = (self.schedules.iter().filter(|u| keeps_time(u)).take(3))
+            .map(|upcoming| {
+                let who = self
+                    .agent(&upcoming.bot)
+                    .map_or(short(&upcoming.bot), |at| self.short(at));
+                match upcoming.next {
+                    Some(next) => format!("{who} {}", until(next - wall)),
+                    // A watch: a file's or a repository's change.
+                    None => format!("{who} on change"),
+                }
+            })
+            .collect();
+        for (n, next) in next.into_iter().enumerate() {
+            stat(if n == 0 { "next up" } else { "" }, next);
+        }
         lines.truncate(rows);
         lines
     }
@@ -3109,7 +3283,20 @@ impl View {
                 let angle = self.agents[at].angle;
                 (1.05 * angle.cos(), 1.05 * angle.sin())
             }
+            End::Tick(at) => self.tick(at, 0.07),
         }
+    }
+
+    /// A point on the line out from the middle through an agent, this far
+    /// past its star: where its schedule's tick is drawn.
+    fn tick(&self, at: usize, past: f32) -> (f32, f32) {
+        let (x, y) = self.agents[at].at;
+        let r = x.hypot(y);
+        if r < 1e-3 {
+            let angle = self.agents[at].angle;
+            return (past * angle.cos(), past * angle.sin());
+        }
+        (x + past * x / r, y + past * y / r)
     }
 
     /// The agents as a list where the sky has no room: the tree's order,
@@ -4258,6 +4445,12 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
             return;
         }
     };
+    // Whose triggers are the sky's: its daemon's store's.
+    if let Some(store) = client.store()
+        && send.send(Feed::Store(store.to_owned())).is_err()
+    {
+        return;
+    }
     // A cord already pulled when the sky opens hangs, without its drop;
     // `paused` and `resumed` notices tell of what comes after.
     if !client.paused().is_null()
@@ -4391,9 +4584,90 @@ fn slim(mut event: Value) -> Value {
         && event["data"]["name"] != "commons"
         && let Some(data) = event["data"].as_object_mut()
     {
-        data.remove("arguments");
+        // A schedule's call keeps what the sky tells of it: for whom, how
+        // often, its name; not its message.
+        let kept = (data.get("name") == Some(&json!(crate::served::TRIGGERS)))
+            .then(|| data.get("arguments").and_then(Value::as_str))
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|call| {
+                let add = call.get("add")?.as_object()?;
+                let keys = ["name", "bot", "every", "in", "at", "cron", "file", "commit"];
+                let mut kept: serde_json::Map<String, Value> = (add.iter())
+                    .filter(|(key, _)| keys.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                if let Some(start) = add.get("start").and_then(|start| start.get("name")) {
+                    kept.insert("start".into(), json!({"name": start}));
+                }
+                Some(json!({"add": kept}).to_string())
+            });
+        match kept {
+            Some(kept) => data.insert("arguments".into(), json!(kept)),
+            None => data.remove("arguments"),
+        };
     }
     event
+}
+
+/// The schedule a `triggers` call by `by` asks for, from its arguments, a
+/// JSON preview: for whom (`by` when no other), how it was asked for, as
+/// a trigger's `when` says it, and its name. None for any other call, or
+/// one cut too short to read.
+fn booking(arguments: &Value, by: &str) -> Option<Booking> {
+    let call = serde_json::from_str::<Value>(arguments.as_str()?).ok()?;
+    let add = call.get("add")?.as_object()?;
+    let text = |key: &str| add.get(key).and_then(Value::as_str);
+    let bot = (text("bot"))
+        .or_else(|| add.get("start")?.get("name")?.as_str())
+        .unwrap_or(by)
+        .to_owned();
+    let when = match ["every", "in", "at", "cron"]
+        .iter()
+        .find_map(|k| Some((k, text(k)?)))
+    {
+        Some((kind, value)) => format!("{kind} {value}"),
+        None if text("file").is_some() => "file".into(),
+        None if text("commit").is_some() => "commit".into(),
+        None => "fire".into(),
+    };
+    Some(Booking {
+        name: text("name").unwrap_or(&bot).to_owned(),
+        bot,
+        when,
+    })
+}
+
+/// How a schedule fires, as the chat log tells it: `every 30m`, `in 2h`,
+/// `on a file change`; never the path or the command.
+fn said_when(when: &str) -> String {
+    let (kind, value) = when.split_once(' ').unwrap_or((when, ""));
+    match kind {
+        "every" | "in" | "at" => format!("{kind} {value}"),
+        "cron" => "on a cron".into(),
+        "file" => "on a file change".into(),
+        "commit" => "on each commit".into(),
+        _ => "to run by hand".into(),
+    }
+}
+
+/// Whether a schedule has a time to come or a watch kept: not a one-off
+/// whose time went, nor one only run by hand.
+fn keeps_time(upcoming: &crate::trigger::Upcoming) -> bool {
+    upcoming.next.is_some()
+        || ["file ", "commit "]
+            .iter()
+            .any(|kind| upcoming.when.starts_with(kind))
+}
+
+/// How long until `secs` from now, as the legend's next up says it.
+fn until(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => "now".into(),
+        s if s < 90 * 60 => format!("in {}m", s.div_euclid(60).max(1)),
+        s if s < 36 * 3600 => format!("in {}h", (s + 1800).div_euclid(3600)),
+        s => format!("in {}d", (s + 43_200).div_euclid(86_400)),
+    }
 }
 
 /// A pair of agents as `pairs` keys it: either way round, one key.
@@ -5171,6 +5445,134 @@ mod tests {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
         assert_eq!(replay.prior.told.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_made_sparks_to_its_tick_and_the_legend_says_what_is_next() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        view.heard.0.send(Heard::Schedules(Vec::new())).unwrap();
+        let live = |kind: &str, data: Value| {
+            Feed::Live(json!({"event": kind, "bot": "shop.lead", "turn": 1, "data": data}))
+        };
+        let add = |call: &str, add: Value| {
+            let arguments = json!({"add": add}).to_string();
+            live(
+                "tool_started",
+                json!({"name": "triggers", "call_id": call, "arguments": arguments}),
+            )
+        };
+        send.send(add(
+            "c1",
+            json!({"bot": "shop.login", "every": "30m", "name": "login-ci", "message": "check CI"}),
+        ))
+        .unwrap();
+        // One the tool refuses is told of not at all.
+        send.send(add("c2", json!({"in": "5m", "message": "x"})))
+            .unwrap();
+        view.drain();
+        assert!(view.ticker.is_empty());
+        send.send(live(
+            "tool_completed",
+            json!({"call_id": "c2", "failed": true}),
+        ))
+        .unwrap();
+        send.send(live("tool_completed", json!({"call_id": "c1"})))
+            .unwrap();
+        view.drain();
+        let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(logged, ["login every 30m, by shop lead"]);
+        let (lead, login) = (view.index["shop.lead"], view.index["shop.login"]);
+        let spark = view.sparks.last().unwrap();
+        assert_eq!((spark.from, spark.to), (End::Agent(lead), End::Tick(login)));
+        // A spark of its own, not a message.
+        assert!(view.recent.is_empty());
+        // Read from the triggers: the one the call made is not told again;
+        // ones made from a shell are, for whom and how, not who made them.
+        let wall = wall_ms() / 1000;
+        let upcoming =
+            |name: &str, bot: &str, when: &str, next: Option<i64>| crate::trigger::Upcoming {
+                name: name.into(),
+                generation: "g1".into(),
+                bot: bot.into(),
+                when: when.into(),
+                next,
+                then: next.map(|next| next + 1800),
+            };
+        let found = vec![
+            upcoming("login-ci", "shop.login", "every 30m", Some(wall + 750)),
+            upcoming(
+                "nightly",
+                "shop.lead",
+                "cron 0 3 * * *",
+                Some(wall + 30_000),
+            ),
+            upcoming("docs", "shop.login", "file /home/a/docs", None),
+            upcoming("gone", "shop.lead", "in 2h", None),
+        ];
+        view.heard.0.send(Heard::Schedules(found)).unwrap();
+        view.drain();
+        let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(
+            logged,
+            [
+                "login every 30m, by shop lead",
+                "shop lead on a cron, new",
+                "login on a file change, new",
+                "shop lead in 2h, new",
+            ]
+        );
+        // What comes next, soonest first; a one-off whose time went, not.
+        let key = text(&view.key(Instant::now(), 60));
+        assert!(key.contains("a schedule, lit as it nears"), "{key}");
+        assert!(key.contains("next up       login in 12m"), "{key}");
+        assert!(key.contains("shop lead in 8h"), "{key}");
+        assert!(key.contains("login on change"), "{key}");
+        assert!(!key.contains("in 2h"), "{key}");
+    }
+
+    #[test]
+    fn a_schedule_s_call_keeps_whom_and_how_often_on_the_tape_not_its_message() {
+        let arguments = json!({"add": {"bot": "b", "every": "1h", "message": "secret",
+            "if": "test -f x", "start": {"name": "n", "model": "m"}}})
+        .to_string();
+        let call = json!({"event": "tool_started", "bot": "a", "written_ms": 1,
+            "data": {"name": "triggers", "arguments": arguments}});
+        let kept = slim(call)["data"]["arguments"].as_str().unwrap().to_owned();
+        let kept: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(
+            kept,
+            json!({"add": {"bot": "b", "every": "1h", "start": {"name": "n"}}})
+        );
+        let booked = booking(&json!(kept.to_string()), "a").unwrap();
+        assert_eq!(
+            (
+                booked.bot.as_str(),
+                booked.when.as_str(),
+                booked.name.as_str()
+            ),
+            ("b", "every 1h", "b")
+        );
+        // For itself when it names no other; cut short, nothing.
+        let own = booking(&json!(r#"{"add":{"file":"/x","message":"m"}}"#), "a").unwrap();
+        assert_eq!((own.bot.as_str(), own.when.as_str()), ("a", "file"));
+        assert!(booking(&json!(r#"{"add":{"every":"1h","mess"#), "a").is_none());
+        assert_eq!(said_when("commit /repo"), "on each commit");
+        assert_eq!(
+            (until(30), until(750), until(30_000), until(200_000)),
+            (
+                "now".into(),
+                "in 12m".into(),
+                "in 8h".into(),
+                "in 2d".into()
+            )
+        );
     }
 
     #[test]
@@ -6051,7 +6453,8 @@ mod tests {
                 | Feed::Down(_)
                 | Feed::Model(..)
                 | Feed::Tape(_)
-                | Feed::Prior(_) => {
+                | Feed::Prior(_)
+                | Feed::Store(_) => {
                     continue;
                 }
             });

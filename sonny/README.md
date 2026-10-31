@@ -738,6 +738,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   a replay shows the one that was up at its time.
   `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
   `sky_haiku_margin` and `sky_haiku_hold`.
+  An agent with a schedule (a trigger that wakes it) carries a short tick
+  just outside its star, out from the middle, plain once its next run is
+  near (a tenth of the gap between runs, at least a minute). When an
+  agent makes a schedule a spark flies from it to that tick and the chat
+  log says what it is and who set it (`login every 30m, by shop lead`);
+  one made elsewhere is logged as new, and `?` lists what is next up.
   `sonny sky` draws the same sky on its own, in the whole terminal,
   to keep in another one beside the work, with your theme's grays and
   `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
@@ -751,6 +757,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky filling a wide terminal](../docs/sonny/sky-wide.png)
 
   ![/sky with the busiest agent's haiku](../docs/sonny/sky-haiku.gif)
+
+  ![/sky with an agent scheduling another, its tick on the rim and what is next up](../docs/sonny/sky-schedules.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
