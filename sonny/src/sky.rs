@@ -110,12 +110,15 @@ const REPLAY_BACK: i64 = 3_600_000;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
 const SKY_ROWS: usize = 24;
+/// How much longer one way than the other the sky may be.
+const STRETCH: f32 = 2.0;
 
 /// An agent as its making tells of it, as the listing would.
 fn made(name: &str, data: &Value) -> Value {
     json!({"name": name, "bot_id": data["bot_id"],
         "created_by": data["created_by"], "created_by_id": data["created_by_id"],
-        "running_turn": data["running_turn"], "model": data["model"]})
+        "running_turn": data["running_turn"], "model": data["model"],
+        "expire_ms": data["expire_ms"]})
 }
 
 /// The most events a replay keeps to step back through.
@@ -389,6 +392,10 @@ pub struct View {
     down: Option<String>,
     /// Playing the past back instead of watching live.
     replay: Option<Replay>,
+    /// Throwaway copies, by name, and the agent each copies (its name,
+    /// and its id when known): what one
+    /// does is drawn on its agent, as the approver's judgments light it.
+    copies: HashMap<String, (String, Option<i64>)>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -548,6 +555,7 @@ impl View {
             listing: false,
             down: None,
             replay: None,
+            copies: HashMap::new(),
         }
     }
 
@@ -888,6 +896,17 @@ impl View {
 
     fn seat(&mut self, bot: &Value) -> Option<usize> {
         let name = bot["name"].as_str()?;
+        // A copy the daemon throws away once idle is no star of its own:
+        // what one an agent made does is drawn on that agent, as the
+        // approver's judgments are; Sonny's own, a guess at the next
+        // message or a haiku, made by no agent, are not drawn at all.
+        if !bot["expire_ms"].is_null() {
+            if let Some(by) = bot["created_by"].as_str().filter(|by| !by.is_empty()) {
+                let id = bot["created_by_id"].as_i64();
+                self.copies.insert(name.to_owned(), (by.to_owned(), id));
+            }
+            return None;
+        }
         // A removed agent's name, or one now someone else's: let the old
         // one go with what pointed at it, and seat this one afresh.
         if let Some(&at) = self.index.get(name) {
@@ -942,6 +961,32 @@ impl View {
             .filter(|&at| !self.agents[at].gone)
     }
 
+    /// The agent a throwaway copy is drawn on: the one that made it, or
+    /// that one's, should it be a copy too; by name, and by id when both
+    /// are known, as a name used again is a stranger.
+    fn copied(&self, name: &str) -> Option<usize> {
+        let maker = |name: &str| {
+            let (by, id) = self.copies.get(name)?;
+            Some((by.as_str(), *id))
+        };
+        let same = |at: usize, id: Option<i64>| match (id, self.agents[at].id) {
+            (Some(made_by), Some(id)) => made_by == id,
+            _ => true,
+        };
+        let (by, id) = maker(name)?;
+        match self.agent(by) {
+            Some(at) => same(at, id).then_some(at),
+            None => {
+                let (by, id) = maker(by)?;
+                self.agent(by).filter(|&at| same(at, id))
+            }
+        }
+    }
+
+    fn agent_or_copied(&self, name: &str) -> Option<usize> {
+        self.agent(name).or_else(|| self.copied(name))
+    }
+
     /// One of the daemon's events: `{cursor, bot, turn, event, data}`,
     /// what is particular to its kind in `data`.
     fn event(&mut self, event: &Value, now: Instant, live: bool) {
@@ -957,6 +1002,7 @@ impl View {
                 return;
             }
             "deleted" => {
+                self.copies.remove(name);
                 if let Some(at) = self.agent(name) {
                     self.agents[at].gone = true;
                     self.laid = false;
@@ -965,9 +1011,18 @@ impl View {
             }
             _ => {}
         }
-        let Some(at) = self.agent(name) else {
+        let Some(at) = self.agent_or_copied(name) else {
             return;
         };
+        // A copy lends its agent what it is told and the tools it calls,
+        // not its turns' states: its agent works, waits or fails on its
+        // own.
+        let kind = event["event"].as_str().unwrap_or("");
+        let lent = matches!(kind, "queued" | "accepted" | "steered" | "tool_started");
+        let own = self.agent(name).is_some();
+        if !own && !lent {
+            return;
+        }
         let turn = event["turn"].as_i64().unwrap_or(-1);
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
@@ -978,7 +1033,8 @@ impl View {
                 let from = self.sender(data, at);
                 // Past turns say who talked to whom; whether an agent works
                 // now is the listing's, and live events' after it.
-                if kind == "accepted" && live {
+                // A copy's turn is its own: its agent's state stays its.
+                if kind == "accepted" && live && own {
                     let agent = &mut self.agents[at];
                     agent.running = Some(turn);
                     agent.sender = Some(from);
@@ -986,8 +1042,9 @@ impl View {
                     agent.failed = false;
                 }
                 // What it asked is answered by the one it asked: the person,
-                // or the agent that made it.
-                if kind != "queued" && live {
+                // or the agent that made it. A copy's prompt answers none of
+                // its agent's questions.
+                if kind != "queued" && live && own {
                     let maker = self.agents[at]
                         .made_by
                         .as_deref()
@@ -1064,15 +1121,18 @@ impl View {
             }
             "tool_started" if live => {
                 let tool = data["name"].as_str().unwrap_or("");
-                // A call approved starts.
-                if let Some(call) = data["call_id"].as_str() {
+                // A call approved starts; a copy's calls are lent as a
+                // twinkle, its asks and approvals staying its own.
+                if let Some(call) = data["call_id"].as_str()
+                    && own
+                {
                     self.agents[at].held.remove(call);
                 }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
                 if let Some(then) = self.then(now) {
                     self.calls.push_back(then);
                 }
-                if tool == crate::asks::TOOL {
+                if tool == crate::asks::TOOL && own {
                     if self.agents[at].state() != Some(State::NeedsYou) {
                         let said = format!("? {} asks you", self.short(at));
                         self.say(now, said, Some(NEEDS), &[at]);
@@ -1174,6 +1234,9 @@ impl View {
         if let Some(by) = data["from"]["bot"].as_str() {
             // A name used again is someone else: from outside, then.
             let id = data["from"]["bot_id"].as_i64();
+            if let Some(by) = self.copied(by) {
+                return End::Agent(by);
+            }
             return (self.agent(by))
                 .filter(|&by| {
                     id.is_none() || self.agents[by].id.is_none_or(|known| Some(known) == id)
@@ -1825,9 +1888,15 @@ impl View {
             };
             sky.star(agent.at, ink, big);
         }
-        // Names: leads always, others while working or lit, nearest the
-        // middle first, never over each other. In zen, only what needs the
-        // person or failed.
+        // Names: every star's that has room, leads and what works or was
+        // just lit before the quiet, nearest the middle first, never over
+        // each other, so no line runs to a star no one can name. In zen,
+        // only what needs the person or failed.
+        let active = |agent: &Agent| {
+            agent.root
+                || agent.state().is_some()
+                || (agent.lit).is_some_and(|lit| now.duration_since(lit) < Duration::from_secs(4))
+        };
         let mut named: Vec<usize> = (0..self.agents.len())
             .filter(|&at| {
                 let agent = &self.agents[at];
@@ -1837,11 +1906,7 @@ impl View {
                 if self.zen {
                     return matches!(agent.state(), Some(State::NeedsYou | State::Failed));
                 }
-                agent.root
-                    || agent.state().is_some()
-                    || agent
-                        .lit
-                        .is_some_and(|lit| now.duration_since(lit) < Duration::from_secs(4))
+                true
             })
             .collect();
         for at in picked.into_iter().chain(centre) {
@@ -1861,25 +1926,17 @@ impl View {
                 Some(at) != picked,
                 Some(at) != centre,
                 agent.state() != Some(State::NeedsYou),
+                !active(agent),
                 !agent.root,
                 std::cmp::Reverse(agent.root.then(|| sizes.get(&agent.arm).copied())),
                 (agent.at.0.hypot(agent.at.1) * 100.0) as i32,
             )
         });
-        // As many names as a third of the rows, the next in line taking
-        // the place of one with no room: what needs the person beyond
-        // them is counted on its arm instead.
-        let labels = (sky_rows / 3).max(4);
+        // Every star named that has room, in this order, a row clear of
+        // the next name: what needs the person and finds none is counted
+        // on its arm instead.
         let mut unnamed: BTreeMap<usize, usize> = BTreeMap::new();
-        let mut placed = 0;
         for at in named {
-            let agent = &self.agents[at];
-            if placed == labels {
-                if agent.state() == Some(State::NeedsYou) {
-                    *unnamed.entry(agent.arm).or_default() += 1;
-                }
-                continue;
-            }
             let agent = &self.agents[at];
             // The mark says what the colour does: `? ` for an agent that
             // needs you, `✗ ` for one that failed. Bold while it works.
@@ -1896,7 +1953,11 @@ impl View {
                 (_, true) => Style::default().bold(),
                 _ => name_style(agent.state(), agent.glow(now)),
             };
-            placed += usize::from(sky.label(agent.at, mark, &short(&agent.name), style));
+            if !sky.label(agent.at, mark, &short(&agent.name), style)
+                && agent.state() == Some(State::NeedsYou)
+            {
+                *unnamed.entry(agent.arm).or_default() += 1;
+            }
         }
         for (arm, n) in unnamed {
             let mark = Some(("?", Style::default().fg(NEEDS).bold()));
@@ -1907,11 +1968,11 @@ impl View {
                 Style::default().bold(),
             );
         }
-        // The biggest clouds are counted, as many as half the names.
+        // The biggest clouds are counted, as many as a sixth of the rows.
         if !self.zen {
             let mut clouds: Vec<_> = folded.into_iter().collect();
             clouds.sort_by_key(|&(arm, (n, _))| (std::cmp::Reverse(n), arm));
-            for (_, (n, (x, y))) in clouds.into_iter().take(labels / 2) {
+            for (_, (n, (x, y))) in clouds.into_iter().take((sky_rows / 6).max(2)) {
                 let middle = (x / n as f32, y / n as f32);
                 sky.label(middle, None, &format!("+{n}"), Ink::Muted.style());
             }
@@ -2017,7 +2078,13 @@ impl View {
             } else {
                 "Catching up with who is here…"
             };
-            lines.push(Line::from(cut(quiet, cols)).dim());
+            // A narrow column wraps the words, as a hint read whole; dim on
+            // the words, as the column keeps a span's style, not a line's.
+            lines.extend(
+                wrapped(quiet, cols)
+                    .into_iter()
+                    .map(|line| Line::from(Span::from(line).dim())),
+            );
         }
         if tall {
             let blank = room.saturating_sub(lines.len());
@@ -2490,6 +2557,21 @@ fn ago(now: Instant, at: Instant) -> String {
     }
 }
 
+/// Words wrapped to lines of `room` columns, a word too long for one cut.
+fn wrapped(text: &str, room: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.width() + 1 + word.width() <= room => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(cut(word, room)),
+        }
+    }
+    lines
+}
+
 /// Words cut to `room` columns, an ellipsis saying so.
 fn cut(text: &str, room: usize) -> String {
     if text.width() <= room {
@@ -2517,14 +2599,26 @@ fn radial(
 ) -> (Vec<Option<((f32, f32), f32)>>, Vec<(usize, usize)>) {
     let mut places = vec![None; nodes];
     let mut order = Vec::new();
-    let deep = !children.iter().all(Vec::is_empty);
+    // How many generations below the leads the deepest line goes.
+    fn height(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
+        match depth > children.len() {
+            true => depth,
+            false => (children[at].iter())
+                .map(|&kid| height(kid, children, depth + 1))
+                .fold(depth, usize::max),
+        }
+    }
+    let deepest = (roots.iter())
+        .map(|&root| height(root, children, 0))
+        .max()
+        .unwrap_or(0);
     #[allow(clippy::too_many_arguments)]
     fn place(
         at: usize,
         from: f32,
         span: f32,
         depth: usize,
-        deep: bool,
+        deepest: usize,
         children: &[Vec<usize>],
         places: &mut Vec<Option<((f32, f32), f32)>>,
         order: &mut Vec<(usize, usize)>,
@@ -2532,10 +2626,15 @@ fn radial(
         if places[at].is_some() {
             return;
         }
-        let radius = match (deep, depth) {
-            (false, _) => 0.62,
-            (true, 0) => 0.4,
-            (true, depth) => (0.66 + 0.14 * (depth - 1) as f32).min(0.95),
+        // Leads on the inner ring and every agent that made none on the
+        // outer, as a cluster dendrogram puts its leaves (d3.cluster), so
+        // the stars fill the disc rather than huddle where the deepest
+        // line leaves them; the agents between by their generation.
+        let radius = match (deepest, depth) {
+            (0, _) => 0.62,
+            (_, 0) => 0.45,
+            _ if children[at].is_empty() => 1.0,
+            (deepest, depth) => 0.45 + 0.55 * depth as f32 / deepest as f32,
         };
         let angle = from + span / 2.0;
         places[at] = Some(((radius * angle.cos(), radius * angle.sin()), angle));
@@ -2549,7 +2648,16 @@ fn radial(
         let mut start = from;
         for (kid, w) in kids.iter().zip(weights) {
             let part = span * w / total;
-            place(*kid, start, part, depth + 1, deep, children, places, order);
+            place(
+                *kid,
+                start,
+                part,
+                depth + 1,
+                deepest,
+                children,
+                places,
+                order,
+            );
             start += part;
         }
     }
@@ -2562,7 +2670,16 @@ fn radial(
     let mut from = -PI / 2.0;
     for (&root, weight) in roots.iter().zip(weights) {
         let span = TAU * weight / total;
-        place(root, from, span, 0, deep, children, &mut places, &mut order);
+        place(
+            root,
+            from,
+            span,
+            0,
+            deepest,
+            children,
+            &mut places,
+            &mut order,
+        );
         from += span;
     }
     let far = (places.iter().flatten())
@@ -2769,13 +2886,14 @@ impl Sky {
         (w / 2.0 + x * across, h / 2.0 + y * down)
     }
 
-    /// How many dots the unit disc's radius takes across and down: a
-    /// circle, as in 0.7.0, two dots in from the canvas's nearer edges, so
-    /// curves bend evenly and a centred sky's rings are rings.
+    /// How many dots the unit disc's radius takes across and down, two
+    /// dots in from the canvas's edges: round, as in 0.7.0, stretched
+    /// toward the pane's longer side by at most a quarter, so a wide pane
+    /// uses its width and the sky still reads as round.
     fn scale(&self) -> (f32, f32) {
         let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
-        let radius = (w.min(h) / 2.0 - 2.0).max(1.0);
-        (radius, radius)
+        let (across, down) = ((w / 2.0 - 2.0).max(1.0), (h / 2.0 - 2.0).max(1.0));
+        (across.min(down * STRETCH), down.min(across * STRETCH))
     }
 
     fn plot(&mut self, x: f32, y: f32, ink: Ink) {
@@ -2966,8 +3084,11 @@ impl Sky {
             return false;
         }
         let cells = row * self.cols + start..row * self.cols + start + count;
-        let span = start.saturating_sub(1)..(start + count + 1).min(self.cols);
+        // A row clear above and below, and two cells beside on its own row,
+        // so neighbouring names never read as one.
         let crowded = (row.saturating_sub(1)..(row + 2).min(self.rows)).any(|near| {
+            let gap = if near == row { 2 } else { 1 };
+            let span = start.saturating_sub(gap)..(start + count + gap).min(self.cols);
             self.text[near * self.cols + span.start..near * self.cols + span.end]
                 .iter()
                 .any(Option::is_some)
@@ -4102,6 +4223,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_throwaway_copy_lends_its_agent_what_it_is_told_and_no_star_of_its_own() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "approver.auto", "bot_id": 1}),
+            json!({"name": "shop.lead", "bot_id": 2}),
+            json!({"name": "shop.lead.suggest-1", "bot_id": 3, "expire_ms": 60_000}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "forked", "bot": "approver.auto.1.9.0",
+            "data": {"bot_id": 4, "created_by": "approver.auto", "expire_ms": 120_000}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.agent("approver.auto.1.9.0").is_none());
+        assert!(view.agent("shop.lead.suggest-1").is_none());
+        let auto = view.index["approver.auto"];
+        // A judgment: from the judge, at the edge, onto the approver.
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "approver.auto.1.9.0",
+            "turn": 1, "data": {"origin": "judge"}}),
+        ))
+        .unwrap();
+        // Its turn's end is the copy's, not the approver's.
+        send.send(Feed::Live(
+            json!({"event": "turn_finished", "bot": "approver.auto.1.9.0",
+            "turn": 1, "data": {"status": "failed", "error": "x"}}),
+        ))
+        .unwrap();
+        // Sonny's own guess, made by no agent, is not drawn at all.
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.lead.suggest-1",
+            "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert_eq!(view.sparks.len(), 1);
+        assert!(matches!(view.sparks[0].from, End::Rim(_)));
+        assert!(matches!(view.sparks[0].to, End::Agent(at) if at == auto));
+        assert_eq!(view.agents[auto].state(), None);
+        assert!(text(&view.ticked(Instant::now(), 40, 12, true)).contains("a judge → auto"));
+        send.send(Feed::Live(
+            json!({"event": "deleted", "bot": "approver.auto.1.9.0"}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.copies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_copy_leaves_its_agents_asks_alone_and_no_stranger_takes_its_work() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead", "bot_id": 2})]))
+            .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "forked", "bot": "shop.lead.side",
+            "data": {"bot_id": 3, "created_by": "shop.lead", "created_by_id": 2, "expire_ms": 60_000}}),
+        ))
+        .unwrap();
+        // The lead asks; its copy is told something and asks too.
+        send.send(Feed::Live(
+            json!({"event": "tool_started", "bot": "shop.lead",
+            "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c1"}}),
+        ))
+        .unwrap();
+        view.drain();
+        let lead = view.index["shop.lead"];
+        assert!(view.agents[lead].asking);
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.lead.side",
+            "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.agents[lead].asking, "a copy's prompt answers nothing");
+        view.agents[lead].asking = false;
+        send.send(Feed::Live(
+            json!({"event": "tool_started", "bot": "shop.lead.side",
+            "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c2"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(!view.agents[lead].asking, "a copy's ask is its own");
+        assert!(view.agents[lead].twinkle.is_some());
+        // The lead is removed and its name taken by someone else.
+        send.send(Feed::Live(json!({"event": "deleted", "bot": "shop.lead"})))
+            .unwrap();
+        send.send(Feed::Live(json!({"event": "created", "bot": "shop.lead",
+            "data": {"bot_id": 9}})))
+            .unwrap();
+        view.drain();
+        assert!(view.copied("shop.lead.side").is_none());
+    }
+
+    #[tokio::test]
     async fn a_commons_post_ripples_and_an_origin_comes_from_the_rim() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
@@ -4695,6 +4913,13 @@ mod tests {
         assert_eq!(short("shop.lead.billing"), "shop lead billing");
         assert_eq!(short("shop.fix-login"), "fix-login");
         assert_eq!(short("solo"), "solo");
+    }
+
+    #[test]
+    fn a_hint_wraps_in_a_narrow_column() {
+        let lines = wrapped("Quiet. Messages light up here as they go.", 20);
+        assert_eq!(lines, ["Quiet. Messages", "light up here as", "they go."]);
+        assert_eq!(wrapped("Catching", 5), ["Catc…"]);
     }
 
     #[test]
