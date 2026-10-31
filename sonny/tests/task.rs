@@ -778,7 +778,18 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
     assert_eq!(after("--workspace"), folder.to_string_lossy());
     // Told the rules of the lead's folder, not of its empty one.
     assert!(ran.join("\n").contains("Build with the workspace tool."));
-    assert!(!ran.iter().any(|arg| arg == "--writable"), "{ran:?}");
+    // It writes no folder but its own, and Sonny's zen folder every
+    // sandboxed row writes.
+    let writable: Vec<&String> = (ran.iter().zip(ran.iter().skip(1)))
+        .filter(|(flag, _)| *flag == "--writable")
+        .map(|(_, folder)| folder)
+        .collect();
+    assert!(
+        writable
+            .iter()
+            .all(|folder| folder.ends_with(".agent/sonny/zen")),
+        "{ran:?}"
+    );
     // The lead's folder is as it was.
     assert!(!ws.join(".git").exists());
     // Another folder's task of this name does not take it over.
