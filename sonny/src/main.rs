@@ -2269,6 +2269,8 @@ struct Fleet {
     named: HashMap<String, String>,
     /// What to ring for, taken by the app after each event.
     alerts: Vec<(sound::Alert, String)>,
+    /// The lead is in zen: only its own questions ring.
+    zen: bool,
     /// Tasks whose last turn completed, and that turn: its window closes
     /// once a wait has taken the result.
     ended: HashMap<String, i64>,
@@ -2428,6 +2430,7 @@ impl Fleet {
             doing: HashMap::new(),
             named: HashMap::new(),
             alerts: Vec::new(),
+            zen: false,
             ended: HashMap::new(),
             waits: Default::default(),
             returned: Vec::new(),
@@ -2626,6 +2629,8 @@ impl Fleet {
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
+                // In zen the lead breaks through with a question alone.
+                _ if self.zen && !(bot == self.lead && doing == "needs you") => None,
                 // The lead's view rings for its own ends: only it knows
                 // whether a turn the lookout started said anything.
                 "done" if bot == self.lead => None,
@@ -3088,7 +3093,11 @@ impl App {
                         self.retry.get_or_insert_with(Instant::now);
                         continue;
                     };
-                    let said = self.fleet.as_mut().and_then(|fleet| fleet.event(&event));
+                    let zen = self.zen.is_some();
+                    let said = self.fleet.as_mut().and_then(|fleet| {
+                        fleet.zen = zen;
+                        fleet.event(&event)
+                    });
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -5363,11 +5372,16 @@ impl App {
                     json!({"bot": self.bot, "turn": turn, "bytes": 4096}),
                 )
                 .await
-            && let Some(prompt) = read["prompts"].get(0)
+            && let Some(prompts) = read["prompts"].as_array()
         {
-            let from =
-                transcript::sender(prompt["from"]["bot"].as_str(), prompt["origin"].as_str());
-            aside = transcript::relays(prompt["text"].as_str().unwrap_or(""), from.as_deref());
+            let relays = |prompt: &Value| {
+                let from =
+                    transcript::sender(prompt["from"]["bot"].as_str(), prompt["origin"].as_str());
+                transcript::relays(prompt["text"].as_str().unwrap_or(""), from.as_deref())
+            };
+            // Started elsewhere, unless the person steered it: their words
+            // make it theirs, wherever the page starts.
+            aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
             began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
@@ -6042,14 +6056,16 @@ impl App {
                 {
                     return;
                 }
+                // Unseen in zen, so never what a reaction, /copy or
+                // /reply takes.
+                if self.zen_hides() {
+                    return;
+                }
                 if let Some(item) = &item {
                     self.last_reply = text(item);
                     if let Some(node) = data["node"].as_i64() {
                         self.saw_reply(node, &text(item));
                     }
-                }
-                if self.zen_hides() {
-                    return;
                 }
                 // Words written when the next item began are this message.
                 if let (Some(item), Some(node)) = (&item, data["node"].as_i64())
