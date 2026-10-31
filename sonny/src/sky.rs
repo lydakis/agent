@@ -18,7 +18,7 @@
 //! for the senders of past turns alone (who talked to whom, small events),
 //! then once live asks again for what animates the sky. Its connection is
 //! its own and closes with the view.
-use crate::project;
+use crate::{haiku, project};
 use agent_client::Client;
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
@@ -125,9 +125,16 @@ const REPLAY_STEP: f64 = 10_000.0;
 const REPLAY_BACK: i64 = 3_600_000;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
+/// How often a sky reads the haiku rule from the config again.
+const RULE_READ: Duration = Duration::from_secs(10);
 const SKY_ROWS: usize = 24;
 /// How much longer one way than the other the sky may be.
 const STRETCH: f32 = 2.0;
+/// A haiku streams in a word each half second, two words a second, with
+/// a breath between lines, and the one before fades out first.
+const WORD: f32 = 0.5;
+const LINE_BREATH: f32 = 1.1;
+const FADE: Duration = Duration::from_secs(2);
 
 /// An agent as its making tells of it, as the listing would.
 fn made(name: &str, data: &Value) -> Value {
@@ -417,8 +424,53 @@ pub struct View {
     /// and its id when known): what one
     /// does is drawn on its agent, as the approver's judgments light it.
     copies: HashMap<String, (String, Option<i64>)>,
+    /// Who is busiest, by the rule, and the haiku each holder writes.
+    title: haiku::Title,
+    /// The haiku shown last, by its writer and when it was written: one
+    /// in the file that is not it is new here.
+    shown: (String, i64),
+    verse: Option<Verse>,
+    /// The haiku before, fading out, since when.
+    fading: Option<(Verse, Instant)>,
+    /// What the haiku's file work, off this thread, sends back: haikus
+    /// written, and the file and rule as read.
+    heard: (mpsc::UnboundedSender<Heard>, mpsc::UnboundedReceiver<Heard>),
+    /// A read of the file under way, not yet heard back.
+    reading: bool,
+    /// Where the haikus are kept.
+    store: haiku::Store,
+    /// The holder the kept haiku names, given the title once it is here.
+    heir: Option<(String, Instant)>,
+    /// When the title was last weighed: once a second is enough.
+    weighed: Option<Instant>,
+    /// When the haiku rule was last read from the config.
+    ruled: Option<Instant>,
+    /// Where the copies that write haikus run.
+    runtime: tokio::runtime::Handle,
     /// The andon cord, while it hangs or its start rings out.
     cord: Option<Cord>,
+}
+
+/// What the haiku's file work sends back, none of it on the thread that
+/// draws: the file waits on other skies' locks, and on the disk.
+enum Heard {
+    /// A haiku its copy wrote, kept for every sky: who wrote it, when it
+    /// was kept, in Unix ms, and its lines.
+    Poem(String, i64, Vec<String>),
+    /// The file as read, and the rule when it was read again too.
+    Read(haiku::Kept, Option<haiku::Rule>),
+}
+
+/// A haiku on the sky: who wrote it, its lines, when it starts to show,
+/// when it was written, and since when its writer held the title, until
+/// it passed.
+struct Verse {
+    by: String,
+    lines: Vec<String>,
+    from: Instant,
+    written: Instant,
+    since: Instant,
+    until: Option<Instant>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -612,6 +664,24 @@ impl View {
         feed: mpsc::UnboundedReceiver<Feed>,
         task: tokio::task::JoinHandle<()>,
     ) -> Self {
+        let now = Instant::now();
+        // The haiku every sky of this daemon shows, while it is fresh.
+        let store = haiku::Store::new();
+        let kept = haiku::Kept::load(&store, &socket);
+        let ago = |ms: i64| {
+            let ms = (wall_ms() - ms).max(0) as u64;
+            now.checked_sub(Duration::from_millis(ms)).unwrap_or(now)
+        };
+        let fresh = kept.lines.len() == 3 && wall_ms() - kept.at_ms < HOUR.as_millis() as i64;
+        let verse = fresh.then(|| Verse {
+            by: kept.by.clone(),
+            lines: kept.lines.clone(),
+            from: ago(kept.at_ms),
+            written: ago(kept.at_ms),
+            since: ago(kept.since_ms),
+            until: None,
+        });
+        let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
         Self {
             socket,
             feed,
@@ -644,6 +714,17 @@ impl View {
             down: None,
             replay: None,
             copies: HashMap::new(),
+            title: haiku::Title::new(haiku::Rule::load(), now),
+            shown: (kept.by.clone(), kept.at_ms),
+            verse,
+            fading: None,
+            heard: mpsc::unbounded_channel(),
+            reading: false,
+            store,
+            heir,
+            weighed: None,
+            ruled: Some(now),
+            runtime: tokio::runtime::Handle::current(),
             cord: None,
         }
     }
@@ -831,6 +912,212 @@ impl View {
         self.sweep();
         self.sweep_cord(now);
         self.land(now);
+        self.reign(now);
+    }
+
+    /// Take the haikus written and let an hour-old one go; then, live,
+    /// pass the busiest title by its rule, and have a new holder write.
+    fn reign(&mut self, now: Instant) {
+        while let Ok(heard) = self.heard.1.try_recv() {
+            match heard {
+                Heard::Poem(by, at, lines) => {
+                    self.shown = (by.clone(), at);
+                    self.recite(by, lines, at, now);
+                }
+                Heard::Read(kept, rule) => {
+                    self.reading = false;
+                    if let Some(rule) = rule {
+                        self.title.rule = rule;
+                    }
+                    self.heed(kept, now);
+                }
+            }
+        }
+        if (self.verse.as_ref())
+            .is_some_and(|verse| now.saturating_duration_since(verse.written) > HOUR)
+        {
+            self.fading = self.verse.take().map(|verse| (verse, now));
+        }
+        if (self.fading.as_ref()).is_some_and(|(_, at)| now.duration_since(*at) > FADE) {
+            self.fading = None;
+        }
+        if !self.live || self.replay.is_some() {
+            return;
+        }
+        if self
+            .weighed
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.weighed = Some(now);
+        // The file read again, for what other skies wrote, and the rule as
+        // /config says now and then: haikus turned on or off, or the cap
+        // moved, since the sky opened.
+        if !self.reading {
+            self.reading = true;
+            let rule = self
+                .ruled
+                .is_none_or(|at| now.duration_since(at) >= RULE_READ);
+            if rule {
+                self.ruled = Some(now);
+            }
+            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let send = self.heard.0.clone();
+            self.runtime.spawn_blocking(move || {
+                let rule = rule.then(haiku::Rule::load);
+                let _ = send.send(Heard::Read(haiku::Kept::load(&store, &socket), rule));
+            });
+        }
+        if self.title.rule.daily == 0 {
+            return;
+        }
+        if let Some((name, since)) = self.heir.take()
+            && self.agent(&name).is_some()
+        {
+            self.title.holder = Some((name, since));
+        }
+        let (index, agents) = (&self.index, &self.agents);
+        let gone = |name: &str| index.get(name).is_none_or(|&at| agents[at].gone);
+        let Some(name) = self.title.crown(now, gone) else {
+            return;
+        };
+        if let Some(verse) = &mut self.verse
+            && verse.by != name
+        {
+            verse.until.get_or_insert(now);
+        }
+        let since = wall_ms();
+        let (store, socket) = (self.store.clone(), self.socket.clone());
+        let send = self.heard.0.clone();
+        // Counted in the file before it is spent, by the rule as /config
+        // says then, or not written at all; kept for every sky as it comes,
+        // this one closed or not, and only for its claim, should a newer
+        // one have taken over meanwhile.
+        self.runtime.spawn(async move {
+            let (claim, claim_socket, claim_name) = (store.clone(), socket.clone(), name.clone());
+            let claimed = tokio::task::spawn_blocking(move || {
+                let rule = haiku::Rule::load();
+                haiku::Kept::update(&claim, &claim_socket, |kept| {
+                    kept.claim(&rule, &claim_name, since, since)
+                })
+                .is_some_and(|(claimed, _)| claimed)
+            });
+            if !matches!(claimed.await, Ok(true)) {
+                return;
+            }
+            let Some(lines) = haiku::write(socket.clone(), name.clone()).await else {
+                return;
+            };
+            let kept = tokio::task::spawn_blocking(move || {
+                let at = wall_ms();
+                haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
+                    .then_some(Heard::Poem(name, at, lines))
+            });
+            if let Ok(Some(poem)) = kept.await {
+                let _ = send.send(poem);
+            }
+        });
+    }
+
+    /// The file as read: a haiku another sky wrote shows here too, and its
+    /// writer holds the title here as there.
+    fn heed(&mut self, kept: haiku::Kept, now: Instant) {
+        let new = (kept.by != self.shown.0 || kept.at_ms != self.shown.1)
+            && kept.lines.len() == 3
+            && self.live
+            && self.replay.is_none();
+        if !new {
+            return;
+        }
+        if self.agent(&kept.by).is_some() {
+            let held = (wall_ms() - kept.since_ms).max(0) as u64;
+            let since = now.checked_sub(Duration::from_millis(held)).unwrap_or(now);
+            self.title.holder = Some((kept.by.clone(), since));
+        }
+        self.shown = (kept.by.clone(), kept.at_ms);
+        self.recite(kept.by, kept.lines, kept.at_ms, now);
+    }
+
+    /// Show `lines` by `by`, written at `at_ms`, once the haiku before has
+    /// faded: an hour from when it was written, however late it came.
+    fn recite(&mut self, by: String, lines: Vec<String>, at_ms: i64, now: Instant) {
+        let age = Duration::from_millis((wall_ms() - at_ms).max(0) as u64);
+        if age > HOUR {
+            return;
+        }
+        let written = now.checked_sub(age).unwrap_or(now);
+        let since = (self.title.holder.as_ref())
+            .filter(|(name, _)| *name == by)
+            .map_or(now, |(_, since)| *since);
+        let from = match self.verse.take() {
+            Some(old) => {
+                self.fading = Some((old, now));
+                now + FADE
+            }
+            None => now,
+        };
+        self.verse = Some(Verse {
+            by,
+            lines,
+            from,
+            written,
+            since,
+            until: None,
+        });
+    }
+
+    /// The haiku's rows: its three lines streaming in a word at a time,
+    /// muted, each word up from faint, then its writer signed in faint;
+    /// the one before all faint as it fades. None in a replay.
+    fn haiku(&self, now: Instant) -> Vec<Line<'static>> {
+        if self.replay.is_some() {
+            return Vec::new();
+        }
+        let showing = self.verse.as_ref().filter(|verse| now >= verse.from);
+        let (verse, faded) = match (showing, &self.fading) {
+            (Some(verse), _) => (verse, false),
+            (None, Some((old, _))) => (old, true),
+            (None, None) => return Vec::new(),
+        };
+        let t = now.saturating_duration_since(verse.from).as_secs_f32();
+        let mut lines = Vec::new();
+        let mut word = 0;
+        let mut last = 0.0;
+        for (row, line) in verse.lines.iter().enumerate() {
+            let mut spans = Vec::new();
+            for text in line.split_whitespace() {
+                let shows = word as f32 * WORD + row as f32 * LINE_BREATH;
+                (word, last) = (word + 1, shows);
+                if !faded && t < shows {
+                    continue;
+                }
+                let ink = match faded || t < shows + WORD {
+                    true => Ink::Faint,
+                    false => Ink::Muted,
+                };
+                if !spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(text.to_owned(), ink.style()));
+            }
+            lines.push(Line::from(spans));
+        }
+        if faded || t >= last + LINE_BREATH {
+            let name = self
+                .agent(&verse.by)
+                .map_or(verse.by.clone(), |at| self.short(at));
+            let held = verse
+                .until
+                .unwrap_or(now)
+                .saturating_duration_since(verse.since);
+            let minutes = (held.as_secs() / 60).max(1);
+            let signed = format!("— {name}, busiest for {minutes}m");
+            lines.push(Line::default());
+            let signed = Span::styled(cut(&signed, haiku::WIDTH), Ink::Faint.style());
+            lines.push(Line::from(signed));
+        }
+        lines
     }
 
     /// Move a replay on by the time since the last frame, at its speed,
@@ -1244,6 +1531,15 @@ impl View {
                         self.hear(then, by, at);
                     }
                     self.send(from, End::Agent(at), now);
+                    if self.replay.is_none() {
+                        if let End::Agent(by) = from {
+                            let by = self.agents[by].name.clone();
+                            self.title.note(now, &by);
+                        }
+                        // A copy's word counts for its agent.
+                        let to = self.agents[at].name.clone();
+                        self.title.note(now, &to);
+                    }
                     let by = match from {
                         End::Person => "you".to_owned(),
                         End::Agent(by) => self.short(by),
@@ -1278,6 +1574,10 @@ impl View {
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
                 if let Some(then) = self.then(now) {
                     self.calls.push_back(then);
+                }
+                if self.replay.is_none() {
+                    let by = self.agents[at].name.clone();
+                    self.title.note(now, &by);
                 }
                 if tool == crate::asks::TOOL && own {
                     if self.agents[at].state() != Some(State::NeedsYou) {
@@ -2394,11 +2694,28 @@ impl View {
                 sky.label(middle, None, &format!("+{n}"), Ink::Muted.style());
             }
         }
+        // Zen keeps the haiku at the sky's top right, as does a sky over
+        // its log, whose log has no blank to spare.
+        if self.zen || !beside {
+            for (row, line) in self.haiku(now).iter().enumerate() {
+                let start = sky_cols.saturating_sub(haiku::WIDTH + 1);
+                sky.inscribe(row, start, line);
+            }
+        }
         let drawn = sky.lines();
         if beside {
             let column = match self.legend {
                 true => self.key(now, rows),
-                false => self.ticked(now, LOG_COLS, rows, true),
+                false => {
+                    // The haiku at the top, in the blank the log leaves.
+                    let mut column = self.ticked(now, LOG_COLS, rows, true);
+                    for (row, line) in self.haiku(now).into_iter().enumerate() {
+                        if column.get(row).is_some_and(|blank| blank.spans.is_empty()) {
+                            column[row] = line;
+                        }
+                    }
+                    column
+                }
             };
             for (row, mut line) in drawn.into_iter().enumerate() {
                 line.spans.push(Span::raw(" ".repeat(GAP)));
@@ -3565,6 +3882,30 @@ impl Sky {
     /// Words put at a place in a row, a blank cell kept either side and
     /// a blank row above and below, so names never run together or
     /// stack into a column; false when they don't fit there.
+    /// `line` from `start` on `row`, whatever is near: what the person
+    /// reads over the sky, clear of the dots under it and either side.
+    fn inscribe(&mut self, row: usize, start: usize, line: &Line) {
+        if row >= self.rows {
+            return;
+        }
+        let mut col = start;
+        for span in &line.spans {
+            let style = line.style.patch(span.style);
+            for ch in span.content.chars() {
+                if col >= self.cols {
+                    return;
+                }
+                self.text[row * self.cols + col] = (ch != ' ').then_some((ch, style));
+                self.dots[row * self.cols + col] = 0;
+                col += 1;
+            }
+        }
+        let sides = [start.checked_sub(1), Some(col).filter(|&c| c < self.cols)];
+        for col in sides.into_iter().flatten() {
+            self.dots[row * self.cols + col] = 0;
+        }
+    }
+
     fn put(&mut self, row: usize, start: usize, words: &str, style: Style) -> bool {
         let count = words.chars().count();
         if start + count > self.cols {
@@ -5026,6 +5367,124 @@ mod tests {
         .unwrap();
         view.drain();
         assert!(view.copies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_busiest_agent_s_haiku_streams_in_atop_the_log_and_copies_stay_off_the_sky() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.lead.suggest-1", "expire_ms": 60_000}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "forked", "bot": "shop.lead.haiku-1",
+            "data": {"bot_id": 7, "source": "shop.lead", "expire_ms": 120_000}}),
+        ))
+        .unwrap();
+        view.drain();
+        // Throwaway copies are no members of the sky.
+        assert!(view.agent("shop.lead.suggest-1").is_none());
+        assert!(view.agent("shop.lead.haiku-1").is_none());
+        let lines = [
+            "tests fail then pass",
+            "the pull request waits for me",
+            "morning merges in",
+        ];
+        let poem = (
+            "shop.lead".to_owned(),
+            wall_ms(),
+            lines.map(str::to_owned).to_vec(),
+        );
+        view.heard
+            .0
+            .send(Heard::Poem(poem.0, poem.1, poem.2))
+            .unwrap();
+        view.drain();
+        // Just in: its first word, faint, and nothing signed yet.
+        let shown = text(&view.card(150, 40));
+        assert!(
+            shown.contains("tests") && !shown.contains("fail"),
+            "{shown}"
+        );
+        assert!(!shown.contains("busiest"));
+        // A few seconds on, all of it, signed.
+        view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
+        let card = view.card(150, 40);
+        let shown = text(&card);
+        for line in lines {
+            assert!(shown.contains(line), "{shown}");
+        }
+        assert!(shown.contains("— shop lead, busiest for 1m"), "{shown}");
+        // A sky stacked over its log keeps it at its top right, as zen.
+        let stacked = text(&view.card(80, 40));
+        assert!(stacked.contains("morning merges in"), "{stacked}");
+        // The next fades the last out first.
+        let poem = (
+            "shop.lead".to_owned(),
+            wall_ms() + 1,
+            vec!["a".into(), "b".into(), "c".into()],
+        );
+        view.heard
+            .0
+            .send(Heard::Poem(poem.0, poem.1, poem.2))
+            .unwrap();
+        view.drain();
+        assert!(text(&view.card(150, 40)).contains("morning merges in"));
+        assert!(view.fading.is_some());
+        // Zen keeps it, over the sky.
+        view.verse.as_mut().unwrap().from -= Duration::from_secs(10);
+        view.zen = true;
+        assert!(text(&view.card(150, 40)).contains("— shop lead"));
+    }
+
+    #[tokio::test]
+    async fn a_haiku_another_sky_wrote_shows_here_and_its_writer_holds_the_title() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
+            .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        assert!(view.verse.is_none());
+        let lines = [
+            "frost on the window",
+            "a build turns green at dawn",
+            "nobody saw it",
+        ];
+        haiku::Kept::update(&view.store, &view.socket, |kept| {
+            (kept.by, kept.lines) = ("shop.lead".into(), lines.map(str::to_owned).to_vec());
+            kept.at_ms = wall_ms();
+            kept.since_ms = wall_ms() - 60_000;
+        });
+        // Read off the drawing thread, and heard back.
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        let verse = view.verse.as_ref().expect("the other sky's haiku");
+        assert_eq!(verse.lines, lines);
+        assert_eq!(view.title.holder.as_ref().unwrap().0, "shop.lead");
+        // Read once: weighing again shows it no second time.
+        view.weighed = None;
+        view.drain();
+        while view.reading {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            view.drain();
+        }
+        assert!(view.fading.is_none());
+        // One written over an hour ago, however late it comes, shows not.
+        let old = wall_ms() - 2 * HOUR.as_millis() as i64;
+        let late = Heard::Poem(
+            "shop.lead".into(),
+            old,
+            vec!["x".into(), "y".into(), "z".into()],
+        );
+        view.heard.0.send(late).unwrap();
+        view.drain();
+        assert_eq!(view.verse.as_ref().unwrap().lines, lines);
     }
 
     #[tokio::test]

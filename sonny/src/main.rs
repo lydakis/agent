@@ -29,6 +29,7 @@ mod embed;
 mod exec;
 mod footer;
 mod fuzzy;
+mod haiku;
 mod herdr;
 mod highlight;
 mod hint;
