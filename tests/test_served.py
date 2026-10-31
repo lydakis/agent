@@ -319,7 +319,7 @@ class ServedToolTests(ModelFixture):
 
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
     def test_an_agent_s_browser_shows_it_the_page_and_refuses_what_reaches_the_host(self):
-        self.browser(settings={'sandbox': 'workspace-write'}, approve=['browser'], approver='manual')
+        self.browser(settings={'sandbox': 'workspace-write', 'network': True}, approve=['browser'], approver='manual')
         # A config in the agent's folder names no program the host runs.
         (self.path / 'agent-browser.json').write_text(json.dumps({'executablePath': '/nonexistent/chrome'}))
         self.model.requests = queue.Queue()
@@ -375,6 +375,22 @@ class ServedToolTests(ModelFixture):
                                 request=asked[0]['request'], decision=decision, by='test')
             self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
             self.assertIn(said, self.output('calc.lead', turn))
+
+    @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
+    def test_an_agent_kept_off_the_network_asks_before_its_browser_reaches_it(self):
+        self.browser(settings={'sandbox': 'read-only'}, approve=['browser'], approver='manual')
+        self.script.append(('browser', {'commands': ['open https://example.com']}))
+        self.model.call_script = self.script
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='offline', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        self.assertEqual(asked[0]['arguments'], {'commands': ['open https://example.com'], 'network': False})
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                            request=asked[0]['request'], decision='deny', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertIn('browser was not approved', self.output('calc.lead', turn))
 
     def test_an_agent_saves_memory_through_the_host(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',

@@ -219,6 +219,9 @@ pub struct Reach {
     roots: Option<Vec<PathBuf>>,
     /// Whether it may write there, as its sandbox may: not when read only.
     writes: bool,
+    /// Whether its sandbox reaches the network, as the daemon's does: a
+    /// workspace-write one with `network` on, or none at all.
+    network: bool,
 }
 
 impl Reach {
@@ -245,6 +248,7 @@ impl Reach {
             cwd,
             roots,
             writes: sandbox != Some("read-only"),
+            network: !confined || sandbox == Some("workspace-write") && settings["network"] == true,
         }
     }
 
@@ -1008,6 +1012,20 @@ pub async fn answer(
         let _ = run(&session, &["close".into()], &confirm).await;
         *policy = Some(confirm.clone());
     }
+    // The browser reaches the network wherever the agent's commands may
+    // not, so for an agent kept off it the whole call is the person's to
+    // allow first, as a command of its that would reach it is.
+    let allowed = match reach.network {
+        true => None,
+        false => match steps
+            .ask(NAME, NAME, json!({"commands": lines, "network": false}))
+            .await
+        {
+            Ok(step) => step,
+            Err(why) => return Ok(Value::String(why)),
+        },
+    };
+    let mut failed = false;
     let mut parts: Vec<Value> = Vec::new();
     let mut text = String::new();
     let mut shown = 0;
@@ -1088,12 +1106,16 @@ pub async fn answer(
             shown += 1;
         }
         if !ok {
+            failed = true;
             let left = lines.len() - n - 1;
             if left > 0 {
                 text.push_str(&format!("(stopped: {left} more not run)\n"));
             }
             break;
         }
+    }
+    if let Some(step) = allowed {
+        steps.ran(step, failed).await;
     }
     let text = text.trim_end().to_owned();
     if parts.is_empty() {
