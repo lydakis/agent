@@ -943,6 +943,64 @@ impl ReadSource {
     }
 }
 
+/// Files in a bot's outputs folder that hold an outcome's cut streams
+/// whole: each stream's name and the file's path. Until the store records
+/// them they are the outcome's own and go with it, as a temporary file goes
+/// unless it is kept: an outcome dropped before its record, by a stopped
+/// turn or a write that failed, removes them, wherever it waited. Copies
+/// share them; the last one dropped unrecorded removes them. None, the
+/// usual case, allocates nothing.
+#[derive(Debug, Default, Clone)]
+pub struct Files(Option<std::sync::Arc<Owned>>);
+#[derive(Debug)]
+struct Owned {
+    files: Vec<(&'static str, String)>,
+    recorded: std::sync::atomic::AtomicBool,
+}
+impl Files {
+    pub fn new(files: Vec<(&'static str, String)>) -> Self {
+        Self((!files.is_empty()).then(|| {
+            std::sync::Arc::new(Owned {
+                files,
+                recorded: Default::default(),
+            })
+        }))
+    }
+    /// The store's record names them now: they last as it does.
+    pub fn recorded(&self) {
+        if let Some(owned) = &self.0 {
+            owned
+                .recorded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+impl std::ops::Deref for Files {
+    type Target = [(&'static str, String)];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().map_or(&[], |owned| &owned.files)
+    }
+}
+impl Drop for Owned {
+    // Dropped wherever its outcome goes, the runtime thread too, so the
+    // removal runs on a blocking worker when there is one.
+    fn drop(&mut self) {
+        if *self.recorded.get_mut() {
+            return;
+        }
+        let files: Vec<String> = self.files.drain(..).map(|(_, file)| file).collect();
+        let remove = move || {
+            for file in &files {
+                let _ = std::fs::remove_file(file);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
+    }
+}
+
 /// Model-facing result text plus any full outputs that were truncated.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -950,7 +1008,7 @@ pub struct Outcome {
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
     /// Retained streams written whole to a file in the bot's outputs
     /// folder, in place of a copy in the store: each one's path.
-    pub files: Vec<(&'static str, String)>,
+    pub files: Files,
     /// What follows the output, in order: an image file read's picture, or
     /// the pictures, and the words between them, a client answered with.
     pub parts: Vec<crate::codec::Part>,
@@ -983,7 +1041,7 @@ impl Outcome {
         Self {
             output,
             artifacts: Vec::new(),
-            files: Vec::new(),
+            files: Files::default(),
             parts: Vec::new(),
             note: None,
             failed: false,
@@ -1735,7 +1793,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            files: Vec::new(),
+            files: Files::default(),
             parts: Vec::new(),
             note: None,
             failed: !success,
@@ -1785,7 +1843,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            files: Vec::new(),
+            files: Files::default(),
             parts: Vec::new(),
             note: None,
             failed: !success,

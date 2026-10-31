@@ -6187,3 +6187,37 @@ GitHub runner (2026-10-31):
 Store jobs per turn did not change (about 7.5 on both), the head's 32
 finishes in each completion burst ran 3 ms in all, and nothing passed the
 gate's 15% in the direction that costs.
+
+## Cut output files owned until recorded (#505)
+
+`Outcome.files` became `Files`, an `Option<Arc>` that removes its files
+when dropped unless the store recorded them; `tool_finish` and
+`process_finish` mark it after their savepoint commits. A result with no
+cut stream carries `None`: no allocation, and recording it reads one
+`Option`. The Perf workflow's matched screen, base main cd2813f against the
+PR head bb27dcb, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.349 | 29.628 | -2.4% |
+| admission | burst submit p99, ms | 4.115 | 3.994 | -2.9% |
+| completion | release to terminal p99, ms | 9.514 | 9.137 | -4.0% |
+| footprint | idle RSS, MiB | 19.336 | 19.453 | +0.6% |
+| footprint | per idle bot, KiB | 1.494 | 1.45 | -2.9% |
+| footprint | RSS after a turn each, MiB | 28.477 | 29.678 | +4.2% |
+| footprint | CPU per turn, ms | 0.861 | 0.868 | +0.9% |
+| lifecycle | CPU, s | 0.875 | 0.815 | -6.9% |
+| lifecycle | p95 turn, ms | 734.262 | 849.132 | +15.6% |
+| lifecycle | peak RSS, MiB | 26.045 | 26.258 | +0.8% |
+
+Store jobs per turn held at 7.48. The lifecycle p95 warning is the
+runner's: that bench cuts no output, so its path differs by one `Option`
+check per result, and its base alone read 734 ms against 579 ms in the
+#485 screen. Run again alternately, three rounds each, on a 4-core Linux
+container, base cd2813f against the same head:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| lifecycle | CPU, s | 1.19 | 1.16 | -2.5% |
+| lifecycle | p95 turn, ms | 588.705 | 582.925 | -1.0% |
+| lifecycle | peak RSS, MiB | 25.805 | 25.695 | -0.4% |
