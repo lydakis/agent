@@ -1646,6 +1646,23 @@ class RuntimeTests(ModelFixture):
         self.assertIn('finished', json.dumps(output))
         self.assertEqual(marker.read_text(), 'x\n')
 
+    def test_a_drain_sends_no_retry_of_a_failed_model_call(self):
+        # The model call failed and waits 0.7 s for its retry when the drain
+        # begins: no retry is sent, and the turn parks for the next start.
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='r', prompt='busy:1')['result']['turn']
+        client.receive(lambda e: e.get('event') == 'retry' and e.get('turn') == turn)
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
+        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        self.assertEqual(sum(1 for e in client.saved if e.get('event') == 'turn_finished'), 0)
+        restarted = self.client()
+        self.addCleanup(lambda: restarted.close(kill=True))
+        self.assertEqual(restarted.finished(turn)['data']['status'], 'completed')
+
     def test_a_drain_starts_no_more_of_a_wide_batch_and_keeps_what_ran(self):
         # Five commands run together, four at a time: the fifth would start
         # as the first finishes, but the drain began, so it does not run.
