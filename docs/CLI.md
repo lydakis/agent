@@ -59,6 +59,8 @@ succeeds as a duplicate and leaves a later bot of the same name alone. An
 identity that name never held is `bot_not_found`.
 `follow --bot NAME` replays and follows the selected current turn to its end;
 an idle bot returns after replay. `follow --all` stays connected for future work.
+`follow --since 1h` replays from the first event written an hour ago or later
+instead of from a cursor; it conflicts with `--after`.
 `inspect --bot NAME` prints one bot's whole record: the fields of its `ls`
 row plus its instructions, settings and compaction. It changes nothing, so it
 is safe to repeat; with `--bot-id N`, a bot that no longer holds that

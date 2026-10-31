@@ -27,8 +27,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "follow",
         about: "Stream a bot's events, or every bot's with --all",
-        usage: "follow (--bot NAME | --all) [--after CURSOR]",
-        flags: "--bot --all --after --pretty",
+        usage: "follow (--bot NAME | --all) [--after CURSOR | --since DURATION]",
+        flags: "--bot --all --after --since --pretty",
         settings: "",
         startup: false,
     },
@@ -473,7 +473,7 @@ fn print_flags(flags: &str) {
             "--limit" => ("N", "List at most N"),
             "--since" => (
                 "DURATION",
-                "Only turns started this long ago or since; default: all",
+                "From this long ago: for usage, only turns started since (default: all); for follow, events written since",
             ),
             "--bucket" => (
                 "DURATION",
@@ -717,6 +717,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let has = |f: &str| flags.iter().any(|seen| seen == f);
     for (a, b) in [
         ("--all", "--bot"),
+        ("--after", "--since"),
         ("--fork", "--new"),
         ("--fork", "--turn"),
         ("--fork", "--bot-id"),

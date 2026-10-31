@@ -1075,7 +1075,11 @@ is `invalid_json` with a null `id`; JSON of the wrong shape is
 `invalid_request`, answered with its `id` when that parses, and its detail
 names the unknown or ill-typed field.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
-`data`, in exactly the shape `events` replays them. Durable events reach
+`data`, in exactly the shape `events` replays them, and `written_ms`, the Unix
+ms the event joined the store, set by the insert that writes it and never
+earlier than the event before it (should the clock go back, events keep the
+last time until it catches up, as a log's time index does); events from
+before schema 69 have none. Durable events reach
 followers in commit order: the storage worker itself hands each group's
 committed events, and the outcomes of turns its jobs ended, to one publisher
 before taking the next group. Tasks never publish durable events, so a
@@ -1108,6 +1112,7 @@ own path from the turn. Example requests:
 {"id":29,"op":"compact","bot":"Bob","bot_id":1}
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
+{"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":19,"op":"provider_models"}
@@ -1360,6 +1365,13 @@ symlinks, and unrelated files are never removed on startup; a refused stale
 socket can be recovered. Normal shutdown removes only the socket inode the
 service created. Do not replace ownership-lock files while a service runs.
 
+`follow` takes the cursor as `after`, or as `since_ms` (a Unix ms; giving
+both is `invalid_event_page`): it then starts from the first event written at
+or after that time, so a client can replay the last hour without knowing its
+cursors. Cursors and times rise together, so the daemon finds that cursor by
+halving the cursor range, a few point reads however many events are kept;
+events with no time count as older. It is the `usage` op's word for a start
+time, and `agent follow --since 1h` sends it.
 `follow` replays durable events after the cursor as notifications, emits
 `follow_live` with the cursor reached, and then delivers live events. The
 switch happens inside a storage job, so no committed event falls between the
@@ -1451,7 +1463,7 @@ person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
 in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
 does not exist, a steer's reply, or a turn that ended without a reply
-(or whose events were pruned before schema 69) is `quote_not_found`; a
+(or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
 quoted prompts bring counted (marked `nested` in the record, which a retry
 leaves out), or words and quotes past 256 KiB together, each quote's line
@@ -2163,7 +2175,7 @@ deleted once idle:
   is replay and artifact retrieval. A finished turn's row names the message
   with text it ended on, set in the write that finishes it, so a quote of its
   reply and the `reply` a `prompts` read of the next turn carries are
-  unaffected too, and read it by key rather than searching events. Schema 69
+  unaffected too, and read it by key rather than searching events. Schema 70
   adds it, found for finished turns from the events retention had left. New `wait` calls for an expired
   turn outcome return the turn's view with `error: turn_result_pruned`; they
   never report an empty success.
