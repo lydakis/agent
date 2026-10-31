@@ -1126,7 +1126,7 @@ the next forward page, or null. This lets clients retain only range endpoints.
 Turn IDs are inherited from each node's nearest turn-start ancestor.
 Each node, here and in `history_items`, carries `written_ms`, when it joined
 the history (a queued prompt when its turn started, a steer when its turn
-absorbed it), set by the insert that writes it; nodes from before schema 66
+absorbed it), set by the insert that writes it; nodes from before schema 67
 have none.
 `workspaces` lists each folder the page's turns ran in once, as
 `{"folder", "turns"}`, so a client resolves a path a message names where it was
