@@ -1623,6 +1623,21 @@ struct Running {
     note: bool,
 }
 
+/// The lists of a setting's values `/approvals` and `/fast` open over
+/// the composer.
+#[derive(Clone, Copy, PartialEq)]
+enum Choice {
+    Approvals,
+    Speed,
+}
+
+/// The speeds `/fast` lists, each where the provider serves it.
+const SPEEDS: [(&str, &str); 3] = [
+    ("standard", "the model's own speed and price"),
+    ("fast", "faster, at a higher price per token"),
+    ("ultrafast", "fastest, at a higher price still"),
+];
+
 /// The tier faster than standard a bot's record says it is served at.
 fn speed(record: &Value) -> Option<String> {
     (record["settings"]["speed"].as_str())
@@ -1663,7 +1678,7 @@ const COMMANDS: [(&str, &str); 26] = [
     ("/model", "Pick the model and effort"),
     (
         "/fast",
-        "Serve this agent faster at a higher price; again for standard",
+        "Choose how fast this agent is served, and at what price",
     ),
     (
         "/compact",
@@ -2058,8 +2073,8 @@ struct App {
     declared: Value,
     /// Its approval mode, when it is one of Sonny's.
     mode: Option<&'static str>,
-    /// `/approvals`, open over the composer: the mode picked.
-    choosing: Option<usize>,
+    /// `/approvals` or `/fast`, open over the composer: the row picked.
+    choosing: Option<(Choice, usize)>,
     /// Calls the approver serving `auto` is reviewing in this turn.
     reviewing: std::collections::HashSet<String>,
     /// Calls it denied while Sonny watched, newest last: what `/retry`
@@ -3371,6 +3386,31 @@ impl App {
         if !busy && self.gating.is_none() {
             self.spread = None;
         }
+    }
+
+    /// The rows `/fast` lists: standard, and each tier faster than it
+    /// the bot's provider serves.
+    fn speed_rows(&self) -> Vec<(&'static str, &'static str)> {
+        let serves = self.speeds();
+        (SPEEDS.into_iter())
+            .filter(|(speed, _)| *speed == "standard" || serves.iter().any(|s| s == speed))
+            .collect()
+    }
+
+    /// Serves the bot at `speed` from now, or from when no turn runs.
+    async fn pace_at(&mut self, speed: &'static str) {
+        let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
+        if speed == now {
+            return;
+        }
+        self.pace = Some(speed);
+        self.notice = Some(match (self.configure().await, self.pace.is_some()) {
+            (true, _) if speed == "standard" => "standard speed from the next call".into(),
+            (true, _) => format!("{speed} from the next call, at a higher price per token"),
+            (false, true) => "applies when idle".into(),
+            // Refused: the notice already says why.
+            (false, false) => return,
+        });
     }
 
     /// The tiers faster than standard the bot's provider serves.
@@ -8047,34 +8087,48 @@ impl App {
             }
             return;
         }
-        if let Some(pick) = &mut self.choosing {
+        if let Some((choice, mut pick)) = self.choosing {
             if let Event::Key(key) = event
                 && key.kind != KeyEventKind::Release
             {
-                let count = approvals::MODES.len();
+                let count = match choice {
+                    Choice::Approvals => approvals::MODES.len(),
+                    Choice::Speed => self.speed_rows().len(),
+                };
                 match key.code {
-                    KeyCode::Up => *pick = (*pick + count - 1) % count,
-                    KeyCode::Down => *pick = (*pick + 1) % count,
+                    KeyCode::Up => pick = (pick + count - 1) % count,
+                    KeyCode::Down => pick = (pick + 1) % count,
                     KeyCode::Enter => {
-                        let mode = approvals::MODES[*pick].0;
                         self.choosing = None;
-                        // The agents the lead made take it too, even when
-                        // the lead has it already.
-                        self.spread = Some((mode, Instant::now()));
-                        if self.mode != Some(mode) {
-                            self.gating = Some(mode);
-                            self.configure().await;
-                            if self.gating.is_some() {
-                                self.notice = Some("applies when idle".into());
+                        match choice {
+                            Choice::Approvals => {
+                                let mode = approvals::MODES[pick].0;
+                                // The agents the lead made take it too, even
+                                // when the lead has it already.
+                                self.spread = Some((mode, Instant::now()));
+                                if self.mode != Some(mode) {
+                                    self.gating = Some(mode);
+                                    self.configure().await;
+                                    if self.gating.is_some() {
+                                        self.notice = Some("applies when idle".into());
+                                    }
+                                }
                             }
+                            Choice::Speed => self.pace_at(self.speed_rows()[pick].0).await,
                         }
+                        return;
                     }
-                    KeyCode::Esc => self.choosing = None,
+                    KeyCode::Esc => {
+                        self.choosing = None;
+                        return;
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.choosing = None
+                        self.choosing = None;
+                        return;
                     }
                     _ => {}
                 }
+                self.choosing = Some((choice, pick));
             }
             return;
         }
@@ -8407,45 +8461,20 @@ impl App {
             }
             return;
         }
-        if prompt == "/fast" || prompt.starts_with("/fast ") {
+        if prompt == "/fast" {
             self.input.clear();
-            let asked = prompt["/fast".len()..].trim();
-            let serves = self.speeds();
-            // A pick still waiting for the turn to end is what it toggles.
-            let current = match self.pace {
-                Some(pace) => pace != "standard",
-                None => self.speed.is_some(),
-            };
-            let speed = match asked {
-                "" if current => "standard",
-                "" => "fast",
-                "ultra" | "ultrafast" => "ultrafast",
-                "off" | "standard" => "standard",
-                _ => {
-                    self.notice = Some("/fast, /fast ultra or /fast off".into());
-                    return;
-                }
-            };
-            if speed != "standard" && !serves.iter().any(|s| s == speed) {
+            let rows = self.speed_rows();
+            if rows.len() < 2 {
                 let provider = self.model.split_once('/').map_or("", |(p, _)| p);
-                self.notice = Some(match serves.as_slice() {
-                    [] => format!("{provider} serves its models at standard speed only"),
-                    [one] if one == "ultrafast" => {
-                        format!("{provider} serves ultrafast alone; /fast ultra picks it")
-                    }
-                    [one] => format!("{provider} serves {one} alone; /fast picks it"),
-                    _ => format!("{provider} serves {}", serves.join(" and ")),
-                });
+                self.notice = Some(format!(
+                    "{provider} serves its models at standard speed only"
+                ));
                 return;
             }
-            self.pace = Some(speed);
-            self.notice = Some(match (self.configure().await, self.pace.is_some()) {
-                (true, _) if speed == "standard" => "standard speed".into(),
-                (true, _) => format!("{speed}, at a higher price per token"),
-                (false, true) => "applies when idle".into(),
-                // Refused: the notice already says why.
-                (false, false) => return,
-            });
+            // On the pick still waiting for the turn to end, if there is one.
+            let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
+            let at = rows.iter().position(|(speed, _)| *speed == now);
+            self.choosing = Some((Choice::Speed, at.unwrap_or(0)));
             return;
         }
         if prompt == "/model" {
@@ -8542,12 +8571,13 @@ impl App {
         if prompt == "/approvals" {
             self.input.clear();
             let current = self.gating.or(self.mode);
-            self.choosing = Some(
+            self.choosing = Some((
+                Choice::Approvals,
                 approvals::MODES
                     .iter()
                     .position(|(mode, _)| Some(*mode) == current)
                     .unwrap_or(0),
-            );
+            ));
             return;
         }
         if prompt == "/copy" {
@@ -9651,7 +9681,26 @@ impl App {
                 frame.render_widget(Paragraph::new(keys), footer);
                 return;
             }
-            if let Some(pick) = self.choosing {
+            if let Some((Choice::Speed, pick)) = self.choosing {
+                let now = self.speed.as_deref().unwrap_or("standard");
+                let items: Vec<list::Item> = (self.speed_rows().into_iter())
+                    .map(|(speed, about)| list::Item::new(speed, about).current(speed == now))
+                    .collect();
+                over(
+                    frame,
+                    list::lines(&items, pick, width, composer.y as usize),
+                    composer,
+                );
+                let line = Line::from(vec![
+                    Span::raw("› ").bold(),
+                    Span::raw("speed for this agent").dim(),
+                ]);
+                frame.render_widget(Paragraph::new(line), composer);
+                let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
+                frame.render_widget(Paragraph::new(keys), footer);
+                return;
+            }
+            if let Some((_, pick)) = self.choosing {
                 let items: Vec<list::Item> = (approvals::MODES.iter())
                     .map(|(mode, about)| {
                         list::Item::new(*mode, *about).current(Some(*mode) == self.mode)
@@ -12630,7 +12679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_toggles_the_speed_its_provider_serves_and_names_what_it_does_not() {
+    async fn fast_lists_the_speeds_its_provider_serves_and_picks_one() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let providers = json!({"anthropic": {"speeds": ["fast"]}, "bedrock": {"speeds": []},
@@ -12641,12 +12690,25 @@ mod tests {
         })
         .await;
         let mut app = app(client);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         app.model = "anthropic/claude-opus-5-5".into();
         app.input.set("/fast");
         app.submit().await;
+        // Standard and the one tier Anthropic serves, standard in effect.
+        assert!(app.choosing == Some((Choice::Speed, 0)));
+        assert_eq!(
+            app.speed_rows(),
+            [
+                ("standard", "the model's own speed and price"),
+                ("fast", "faster, at a higher price per token")
+            ]
+        );
+        app.key(key(KeyCode::Down)).await;
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.choosing.is_none());
         assert_eq!(
             app.notice.as_deref(),
-            Some("fast, at a higher price per token")
+            Some("fast from the next call, at a higher price per token")
         );
         assert_eq!(app.speed.as_deref(), Some("fast"));
         assert!(
@@ -12655,33 +12717,41 @@ mod tests {
                 .iter()
                 .any(|s| s.content.contains("claude-opus-5-5 fast"))
         );
-        // Again, it goes back to standard.
+        // It opens again on what is in effect.
         app.input.set("/fast");
         app.submit().await;
-        assert_eq!(app.notice.as_deref(), Some("standard speed"));
+        assert!(app.choosing == Some((Choice::Speed, 1)));
+        // Enter on it changes nothing; Esc closes the list.
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        app.input.set("/fast");
+        app.submit().await;
+        app.key(key(KeyCode::Up)).await;
+        app.key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("standard speed from the next call")
+        );
         assert_eq!(app.speed, None);
         let speeds: Vec<_> = (asked.lock().unwrap().iter())
             .map(|sent| sent["speed"].clone())
             .collect();
         assert_eq!(speeds, [json!("fast"), json!("standard")]);
-        // A tier the provider does not serve is not asked for.
-        app.input.set("/fast ultra");
-        app.submit().await;
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("anthropic serves fast alone; /fast picks it")
-        );
+        // Nothing to pick where the provider serves standard alone.
         app.model = "bedrock/anthropic.claude-opus-5-5".into();
         app.input.set("/fast");
         app.submit().await;
+        assert!(app.choosing.is_none());
         assert_eq!(
             app.notice.as_deref(),
             Some("bedrock serves its models at standard speed only")
         );
-        assert_eq!(asked.lock().unwrap().len(), 2);
         app.model = "openai/gpt-6.1-sol".into();
-        app.input.set("/fast ultra");
+        app.input.set("/fast");
         app.submit().await;
+        assert_eq!(app.speed_rows().len(), 3);
+        app.key(key(KeyCode::Up)).await;
+        app.key(key(KeyCode::Enter)).await;
         assert_eq!(app.speed.as_deref(), Some("ultrafast"));
     }
 

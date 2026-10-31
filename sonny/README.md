@@ -463,6 +463,14 @@ one of its tasks, with its name (`👀 calc.lead`) under the agent's own.
   `.agents/project.toml` when the folder has one. A pick made while a turn
   runs shows in the footer and applies when the lead is idle; one that
   another client overtakes is dropped.
+- `/fast` picks how fast the lead's calls are served, from a list of
+  standard and each faster tier its provider serves: `fast` (Claude's
+  fast mode, OpenAI's priority tier) and `ultrafast`, each at a higher
+  price per token. The footer names the speed after the effort; a pick
+  made while a turn runs applies when the lead is idle. A provider that
+  serves standard alone, as Bedrock does for Claude, says so instead.
+
+  ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
 - `/compact` summarizes the lead's conversation before its next model
   call: at the running turn's next step, or before an idle lead's next
   reply. The daemon also compacts on its own once a call's input reaches
