@@ -305,7 +305,10 @@ class ServedToolTests(ModelFixture):
         """A lead with the browser tool, and the tool host, with
         agent-browser on its PATH."""
         tool = {**declared('browser'), 'steps': True}
-        made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+        # Its folder holds no home: agent-browser's own settings are there.
+        self.work = self.path / 'work'
+        self.work.mkdir()
+        made = self.daemon.request('create', bot='calc.lead', workspace=str(self.work), model='openai/synthetic-model',
                                    instructions='Lead.', declare=[tool], **create)
         self.assertIn('result', made)
         program = shutil.which('agent-browser')
@@ -321,7 +324,7 @@ class ServedToolTests(ModelFixture):
     def test_an_agent_s_browser_shows_it_the_page_and_refuses_what_reaches_the_host(self):
         self.browser(settings={'sandbox': 'workspace-write', 'network': True}, approve=['browser'], approver='manual')
         # A config in the agent's folder names no program the host runs.
-        (self.path / 'agent-browser.json').write_text(json.dumps({'executablePath': '/nonexistent/chrome'}))
+        (self.work / 'agent-browser.json').write_text(json.dumps({'executablePath': '/nonexistent/chrome'}))
         self.model.requests = queue.Queue()
         page = 'data:text/html,<title>Calc</title><h1>Sums</h1><button>Add</button>'
         # The first command starts Chrome, which can take a while.
@@ -351,9 +354,11 @@ class ServedToolTests(ModelFixture):
                                        {'commands': ['open about:blank --executable-path /bin/sh']}))
         self.assertEqual(refused['error'], 'browser_refused')
         self.assertIn('--executable-path', refused['detail'])
-        # Its folder as the daemon names it, and no file past it.
+        # Its folder as the daemon names it, and no file page.
         outside = json.loads(self.call('calc.lead', 'browser', {'commands': ['open file:///etc/hostname']}))
         self.assertEqual(outside['error'], 'browser_refused')
+        self.assertIn('file pages are not opened', outside['detail'])
+        outside = json.loads(self.call('calc.lead', 'browser', {'commands': ['pdf ../page.pdf']}))
         self.assertIn('outside your folder', outside['detail'])
 
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')

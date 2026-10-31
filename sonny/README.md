@@ -880,10 +880,13 @@ their sandbox: it runs the skill's commands in each agent's own browser
 session, its answers read from agent-browser's JSON, and a screenshot
 comes back as a picture, up to 20 a call. It refuses what would
 reach past the browser: flags that launch another program or load an
-extension, plugins, the clipboard, and files outside the agent's folder.
+extension, plugins, the clipboard, the browser's DevTools address, and
+files outside the agent's folder; a sandboxed agent's browser opens no
+`file://` page, as Playwright's MCP server keeps them closed by default.
 The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and
-`state` by default) wait for the agent's approvals, like any call that
-leaves its sandbox.
+`state` by default), signing in from agent-browser's vault, and every
+call of an agent kept off the network wait for the agent's approvals,
+like any call that leaves its sandbox.
 [docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one

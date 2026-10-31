@@ -338,6 +338,15 @@ impl Reach {
         if scheme != "file" {
             return Ok(url.to_owned());
         }
+        // A file page may open any other file, and a page is read whole, so
+        // a confined agent's browser opens none, as Playwright's MCP server
+        // keeps file:// closed by default: its files it reads itself.
+        if self.roots.is_some() {
+            return Err(format!(
+                "{url}: file pages are not opened for a sandboxed agent; read the file \
+                 itself, or serve its folder on localhost"
+            ));
+        }
         if parsed.host_str().is_some_and(|host| host != "localhost") {
             return Err(format!("{url} is a file on another machine"));
         }
@@ -382,6 +391,9 @@ struct Checked {
     /// Whether it is put to the agent's gate before it runs, whatever
     /// agent-browser would confirm.
     ask: bool,
+    /// What `find` does to what it finds, which agent-browser confirms
+    /// by `find`'s own action only.
+    subaction: Option<String>,
 }
 
 /// Each session's lock, held through a call, with the confirmations its
@@ -391,6 +403,19 @@ static SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<
 
 /// A session's lock, with the confirmations its browser started with.
 type Held = Arc<tokio::sync::Mutex<Option<String>>>;
+
+/// The folder the tool host keeps its pictures in until it reads them:
+/// Sonny's own, which only the person's programs write, never the shared
+/// temporary folder, where an agent could put a link in a picture's place.
+fn pictures() -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::var_os("HOME").ok_or("`screenshot` without a path needs HOME")?;
+    let dir = PathBuf::from(home).join(".agent/sonny/browser");
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)))
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir)
+}
 
 /// Pictures the tool host named, so two at once differ.
 static PICTURES: AtomicU64 = AtomicU64::new(0);
@@ -523,6 +548,14 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
         |args: &[String], flags: &[&str]| rest.iter().any(|&at| flags.contains(&args[at].as_str()));
     let mut picture = None;
     let mut ask = false;
+    let mut subaction = None;
+    // A link clicked into a new tab opens whatever it points at, unchecked.
+    if reach.roots.is_some()
+        && has(&args, &["--new-tab"])
+        && !matches!(command.as_str(), "open" | "goto" | "navigate" | "tab")
+    {
+        return refused("--new-tab is not taken here: click it, or open its address");
+    }
     match command.as_str() {
         "open" | "goto" | "navigate" | "pushstate" | "read" | "vitals" | "a11y" | "tab" => {}
         "screenshot" => {
@@ -551,7 +584,14 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                     let jpeg = args
                         .windows(2)
                         .any(|w| w[0] == "--screenshot-format" && w[1] == "jpeg");
-                    let file = std::env::temp_dir().join(format!(
+                    let dir = pictures()?;
+                    if reach.holds(&dir) {
+                        return refused(&format!(
+                            "without a path is kept in {}, where you write; give it a path in your folder",
+                            dir.display()
+                        ));
+                    }
+                    let file = dir.join(format!(
                         "sonny-browser-{}-{}.{}",
                         std::process::id(),
                         PICTURES.fetch_add(1, Ordering::Relaxed),
@@ -634,6 +674,10 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             Some("login" | "list" | "show") => ask = true,
             _ => return refused("is login, list or show here: the vault is the person's"),
         },
+        "find" => {
+            let at = if word!(0) == Some("nth") { 3 } else { 2 };
+            subaction = Some(word!(at).unwrap_or("click").to_owned());
+        }
         // The browser's DevTools address would let the agent drive it
         // around every check here.
         "get" if word!(0) == Some("cdp-url") => {
@@ -662,7 +706,12 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             );
         }
     }
-    Ok(Checked { args, picture, ask })
+    Ok(Checked {
+        args,
+        picture,
+        ask,
+        subaction,
+    })
 }
 
 /// What a session of the agent `bot` is called: agent-browser's session
@@ -764,13 +813,22 @@ impl Ran {
     /// `stdout`, agent-browser's JSON answer, with `stderr` after it;
     /// printed words alone when it gave none.
     fn of(stdout: &str, stderr: &str, success: bool) -> Ran {
+        Ran::read(stdout, stderr, success, false)
+    }
+
+    /// The answer to `confirm`: the confirmed action's own answer is
+    /// inside it, under `data.result`, without the markers the outer one
+    /// names. Elsewhere `data.result` is what a page's script returned.
+    fn confirmed(stdout: &str, stderr: &str, success: bool) -> Ran {
+        Ran::read(stdout, stderr, success, true)
+    }
+
+    fn read(stdout: &str, stderr: &str, success: bool, confirmed: bool) -> Ran {
         let answer = (stdout.lines().rev())
             .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
             .filter(Value::is_object);
-        // A confirmed action's own answer is inside the confirmation's,
-        // under `data.result`, without the markers the outer one names.
         let answer = answer.map(|answer| match &answer["data"]["result"] {
-            result @ Value::Object(inner) if inner.contains_key("success") => {
+            result @ Value::Object(inner) if confirmed && inner.contains_key("success") => {
                 let mut result = result.clone();
                 if result["_boundary"].is_null() {
                     result["_boundary"] = answer["_boundary"].clone();
@@ -940,11 +998,16 @@ async fn run(session: &str, args: &[String], confirm: &str) -> Ran {
         false => command.env("AGENT_BROWSER_CONFIRM_ACTIONS", confirm),
     };
     match command.output().await {
-        Ok(out) => Ran::of(
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-            out.status.success(),
-        ),
+        Ok(out) => {
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            match args.first().map(String::as_str) {
+                Some("confirm") => Ran::confirmed(&stdout, &stderr, out.status.success()),
+                _ => Ran::of(&stdout, &stderr, out.status.success()),
+            }
+        }
         Err(e) => Ran {
             said: format!("{PROGRAM} could not start: {e}"),
             ok: false,
@@ -979,6 +1042,22 @@ pub async fn answer(
         .await
         .map_err(|e| ("caller_unknown", e.to_string()))?;
     let reach = Reach::of(&record);
+    // What agent-browser reads its settings from, which can name the
+    // program it starts, is the person's to write, not the agent's.
+    let settings = std::env::var_os("AGENT_BROWSER_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent-browser"))
+        });
+    if let Some(settings) = settings.filter(|settings| reach.holds(settings)) {
+        return Err((
+            "browser_refused",
+            format!(
+                "{} holds agent-browser's settings and is in a folder you write, so the browser is not run for you",
+                settings.display()
+            ),
+        ));
+    }
     if reach.holds(program()) {
         return Err((
             "browser_refused",
@@ -1033,7 +1112,10 @@ pub async fn answer(
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
         }
-        let mut ran = match command.ask {
+        let asks = command.ask
+            || (command.subaction.as_deref())
+                .is_some_and(|action| confirm.split(',').any(|confirmed| confirmed == action));
+        let mut ran = match asks {
             true => match steps.ask(NAME, NAME, json!({"command": line})).await {
                 Ok(step) => {
                     let ran = run(&session, &command.args, &confirm).await;
@@ -1243,7 +1325,10 @@ mod tests {
         assert!(args(&up, &real).is_err(), "{up} ran");
         assert!(args("fill @e2 \"你好\"", &real).is_ok());
         assert!(args("fill @e2 \"-你好\"", &real).is_err());
-        assert!(args(&format!("open file://{}/index.html", real.display()), &real).is_ok());
+        // A file page could open any other, so a confined agent opens none.
+        assert!(args(&format!("open file://{}/index.html", real.display()), &real).is_err());
+        assert!(args("click a --new-tab", &real).is_err());
+        assert!(args("tab new https://example.com", &real).is_ok());
         // A link in the folder that points out of it leads out of it.
         std::os::unix::fs::symlink("/etc", real.join("out")).unwrap();
         assert!(args("upload @e1 out/passwd", &real).is_err());
@@ -1251,6 +1336,7 @@ mod tests {
         let free =
             Reach::of(&json!({"workspace": real, "settings": {"sandbox": "danger-full-access"}}));
         assert!(checked("pdf /tmp/page.pdf", &free).is_ok());
+        assert!(checked("open file:///tmp/page.html", &free).is_ok());
         // A read-only agent's browser reads its folder and writes nothing.
         let reader = Reach::of(&json!({"workspace": real, "settings": {"sandbox": "read-only"}}));
         for line in [
@@ -1336,13 +1422,21 @@ mod tests {
         // The person's sign-ins are used only when they allow it.
         assert!(checked("auth login site", &reach(&real)).unwrap().ask);
         assert!(!checked("get text body", &reach(&real)).unwrap().ask);
+        // What `find` does, agent-browser confirms only as `find`.
+        let found = |line: &str| checked(line, &reach(&real)).unwrap().subaction;
+        assert_eq!(found("find role button").as_deref(), Some("click"));
+        assert_eq!(
+            found("find label Email fill a@b.c").as_deref(),
+            Some("fill")
+        );
+        assert_eq!(found("find nth 2 .item hover").as_deref(), Some("hover"));
     }
 
     #[test]
     fn a_confirmed_action_answers_with_its_own_result() {
         let failed = r#"{"success":true,"data":{"result":{"success":false,"data":null,"error":"boom"}},"error":null}"#;
         assert_eq!(
-            Ran::of(failed, "", true),
+            Ran::confirmed(failed, "", true),
             Ran {
                 said: "boom".into(),
                 ok: false,
@@ -1350,8 +1444,13 @@ mod tests {
             }
         );
         let done = r#"{"success":true,"_boundary":{"nonce":"n","origin":"unknown"},"data":{"result":{"success":true,"data":{"result":"Calc"}}}}"#;
-        let ran = Ran::of(done, "", true);
+        let ran = Ran::confirmed(done, "", true);
         assert!(ran.ok && ran.said.contains("Calc"), "{ran:?}");
+        // What a page's script returned is only that, though it reads alike.
+        let returned =
+            r#"{"success":true,"data":{"origin":"x","result":{"success":false,"error":"app"}}}"#;
+        let ran = Ran::of(returned, "", true);
+        assert!(ran.ok && ran.said.contains("app"), "{ran:?}");
     }
 
     #[test]
