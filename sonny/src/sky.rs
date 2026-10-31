@@ -479,6 +479,9 @@ struct Verse {
     written: Instant,
     since: Instant,
     until: Option<Instant>,
+    /// In a replay, when it was written, in Unix ms: it streams in on the
+    /// replay's clock, at its speed, and holds still while it is paused.
+    story: Option<i64>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -743,6 +746,7 @@ impl View {
             written: ago(kept.at_ms),
             since: ago(kept.since_ms),
             until: None,
+            story: None,
         });
         let heir = fresh.then(|| (kept.by.clone(), ago(kept.since_ms)));
         Self {
@@ -1155,22 +1159,19 @@ impl View {
             self.fading = old.map(|old| (old, now));
             return;
         };
-        let from = match old {
-            Some(old) => {
-                self.fading = Some((old, now));
-                now + FADE
-            }
-            None => now,
-        };
+        // Its time is the replay's: it takes over from the one before at
+        // once, hours apart as they were written.
+        self.fading = old.map(|old| (old, now));
         // Signed for as long as its writer had held the title then.
         let held = Duration::from_millis((up.at_ms - up.since_ms).max(0) as u64);
         self.verse = Some(Verse {
             by: up.by,
             lines: up.lines,
-            from,
+            from: now,
             written: now,
             since: now.checked_sub(held).unwrap_or(now),
             until: Some(now),
+            story: Some(up.at_ms),
         });
     }
 
@@ -1199,6 +1200,7 @@ impl View {
             written,
             since,
             until: None,
+            story: None,
         });
     }
 
@@ -1212,7 +1214,10 @@ impl View {
             (None, Some((old, _))) => (old, true),
             (None, None) => return Vec::new(),
         };
-        let t = now.saturating_duration_since(verse.from).as_secs_f32();
+        let t = match (verse.story, &self.replay) {
+            (Some(at), Some(replay)) => ((replay.at - at as f64) / 1000.0).max(0.0) as f32,
+            _ => now.saturating_duration_since(verse.from).as_secs_f32(),
+        };
         let mut lines = Vec::new();
         let mut word = 0;
         let mut last = 0.0;
@@ -5107,7 +5112,6 @@ mod tests {
             (verse.by.as_str(), &verse.lines),
             ("shop.lead", &lines("dawn"))
         );
-        verse.from -= Duration::from_secs(10);
         let shown = text(&view.haiku(Instant::now()));
         assert!(shown.contains("busiest for 5m"), "{shown}");
         view.seek(from as f64 + 5_500_000.0, Instant::now());
@@ -5117,6 +5121,23 @@ mod tests {
         view.seek(from as f64 + 1_900_000.0, Instant::now());
         view.drain();
         assert_eq!(view.verse.as_ref().unwrap().lines, lines("dawn"));
+        // It streams in on the replay's clock: just begun as the replay
+        // reaches it, held still while paused, signed seconds of the
+        // replay's time on, however fast it plays.
+        view.seek(from as f64 + 1_800_001.0, Instant::now());
+        view.drain();
+        let begun = text(&view.haiku(Instant::now()));
+        assert!(
+            begun.contains("dawn") && !begun.contains("busiest"),
+            "{begun}"
+        );
+        view.replay.as_mut().unwrap().playing = false;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        view.drain();
+        assert_eq!(text(&view.haiku(Instant::now())), begun);
+        view.seek(from as f64 + 1_815_000.0, Instant::now());
+        view.drain();
+        assert!(text(&view.haiku(Instant::now())).contains("busiest for 5m"));
         // One another sky writes while the replay plays is read as it goes,
         // and shows when the replay reaches it.
         haiku::Kept::update(&view.store, &view.socket, |kept| {
