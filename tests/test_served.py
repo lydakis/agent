@@ -305,8 +305,9 @@ class ServedToolTests(ModelFixture):
         """A lead with the browser tool, and the tool host, with
         agent-browser on its PATH."""
         tool = {**declared('browser'), 'steps': True}
-        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[tool], **create)
+        made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                                   instructions='Lead.', declare=[tool], **create)
+        self.assertIn('result', made)
         program = shutil.which('agent-browser')
         # Its sockets beside its session's name, under the 104 bytes a
         # socket's path may have.
@@ -318,7 +319,7 @@ class ServedToolTests(ModelFixture):
 
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
     def test_an_agent_s_browser_shows_it_the_page_and_refuses_what_reaches_the_host(self):
-        self.browser()
+        self.browser(settings={'sandbox': 'workspace-write'}, approve=['browser'], approver='manual')
         self.model.requests = queue.Queue()
         page = 'data:text/html,<title>Calc</title><h1>Sums</h1><button>Add</button>'
         # The first command starts Chrome, which can take a while.
@@ -348,6 +349,10 @@ class ServedToolTests(ModelFixture):
                                        {'commands': ['open about:blank --executable-path /bin/sh']}))
         self.assertEqual(refused['error'], 'browser_refused')
         self.assertIn('--executable-path', refused['detail'])
+        # Its folder as the daemon names it, and no file past it.
+        outside = json.loads(self.call('calc.lead', 'browser', {'commands': ['open file:///etc/hostname']}))
+        self.assertEqual(outside['error'], 'browser_refused')
+        self.assertIn('outside your folder', outside['detail'])
 
     @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
     def test_an_action_agent_browser_confirms_waits_for_the_agent_s_gate(self):

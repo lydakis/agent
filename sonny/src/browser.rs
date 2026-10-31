@@ -165,9 +165,11 @@ pub struct Reach {
 }
 
 impl Reach {
-    /// The reach of the bot `record` describes, as `inspect` gives it.
+    /// The reach of the bot `record` describes, as `inspect` gives it: a
+    /// confined one with no workspace reaches no file.
     pub fn of(record: &Value) -> Reach {
-        let cwd = PathBuf::from(record["cwd"].as_str().unwrap_or("/"));
+        let workspace = record["workspace"].as_str().map(PathBuf::from);
+        let cwd = workspace.clone().unwrap_or_else(std::env::temp_dir);
         let settings = &record["settings"];
         let confined = matches!(
             settings["sandbox"].as_str(),
@@ -182,7 +184,7 @@ impl Reach {
                     _ => PathBuf::from(path),
                 }
             });
-            std::iter::once(cwd.clone()).chain(writable).collect()
+            workspace.into_iter().chain(writable).collect()
         });
         Reach { cwd, roots }
     }
@@ -211,14 +213,15 @@ impl Reach {
             return Ok(normal.to_string_lossy().into_owned());
         };
         // Through its real folder, so a link inside the folder that points
-        // out of it is out of it.
+        // out of it is out of it, and the browser is handed that real path,
+        // so a link changed after the check is not followed.
         let real = real(&normal);
         let inside = roots.iter().any(|root| {
             let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
             real.starts_with(&root)
         });
         match inside {
-            true => Ok(normal.to_string_lossy().into_owned()),
+            true => Ok(real.to_string_lossy().into_owned()),
             false => Err(format!("{path} is outside your folder")),
         }
     }
@@ -884,7 +887,9 @@ mod tests {
     }
 
     fn reach(dir: &Path) -> Reach {
-        Reach::of(&json!({"cwd": dir, "settings": {"sandbox": "workspace-write", "writable": []}}))
+        Reach::of(
+            &json!({"workspace": dir, "settings": {"sandbox": "workspace-write", "writable": []}}),
+        )
     }
 
     fn args(line: &str, dir: &Path) -> Result<Vec<String>, String> {
@@ -986,8 +991,18 @@ mod tests {
         std::os::unix::fs::symlink("/etc", real.join("out")).unwrap();
         assert!(args("upload @e1 out/passwd", &real).is_err());
         // An unconfined agent's files are anywhere.
-        let free = Reach::of(&json!({"cwd": real, "settings": {"sandbox": "danger-full-access"}}));
+        let free =
+            Reach::of(&json!({"workspace": real, "settings": {"sandbox": "danger-full-access"}}));
         assert!(checked("pdf /tmp/page.pdf", &free).is_ok());
+        // A confined agent with no folder named reaches no file.
+        let lost = Reach::of(&json!({"settings": {"sandbox": "workspace-write"}}));
+        assert!(checked("pdf page.pdf", &lost).is_err());
+        assert!(checked("open file:///etc/passwd", &lost).is_err());
+        // The browser is handed the real path, not the link.
+        std::os::unix::fs::symlink(real.join("shots"), real.join("in")).unwrap();
+        std::fs::create_dir_all(real.join("shots")).unwrap();
+        let shot = args("screenshot in/page.png", &real).unwrap();
+        assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
     }
 
     #[test]
