@@ -343,6 +343,10 @@ pub struct View {
     ticker: VecDeque<Note>,
     /// When the event a replay plays now was written.
     written: Option<i64>,
+    /// While a replay plays an event: now, and how long before the
+    /// replay's now it was written, not sped up, which the hour's counts
+    /// and weights go by while sparks and bursts play faster.
+    history: Option<(Instant, Duration)>,
     /// When messages were sent: an hour of it.
     recent: VecDeque<Instant>,
     /// When the view opened: breaths count from it, and the hour's counts
@@ -468,6 +472,7 @@ impl View {
             sent: HashSet::new(),
             ticker: VecDeque::new(),
             written: None,
+            history: None,
             recent: VecDeque::new(),
             opened: Instant::now(),
             laid: false,
@@ -655,11 +660,13 @@ impl View {
             let stamp = now
                 .checked_sub(Duration::from_secs_f64(ago))
                 .unwrap_or(self.opened.min(now));
+            let age = Duration::from_secs_f64((replay.at - written).max(0.0) / 1000.0);
             let event = event.clone();
             replay.played += 1;
             self.written = Some(written as i64);
+            self.history = Some((now, age));
             self.event(&event, stamp, true);
-            self.written = None;
+            (self.written, self.history) = (None, None);
         }
     }
 
@@ -939,8 +946,9 @@ impl View {
                 if live {
                     if let End::Agent(by) = from
                         && by != at
+                        && let Some(then) = self.then(now)
                     {
-                        self.hear(now, by, at);
+                        self.hear(then, by, at);
                     }
                     self.send(from, End::Agent(at), now);
                     let by = match from {
@@ -972,7 +980,9 @@ impl View {
                     self.agents[at].held.remove(call);
                 }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
-                self.calls.push_back(now);
+                if let Some(then) = self.then(now) {
+                    self.calls.push_back(then);
+                }
                 if tool == crate::asks::TOOL {
                     if self.agents[at].state() != Some(State::NeedsYou) {
                         let said = format!("? {} asks you", self.short(at));
@@ -1113,7 +1123,19 @@ impl View {
             born: now,
             color,
         });
-        self.recent.push_back(now);
+        if let Some(then) = self.then(now) {
+            self.recent.push_back(then);
+        }
+    }
+
+    /// When what happens at `now` happened, for the hour's counts: `now`
+    /// live; in a replay, as long before now as it was before the
+    /// replay's now, or nothing once more than the hour back.
+    fn then(&self, now: Instant) -> Option<Instant> {
+        match self.history {
+            None => Some(now),
+            Some((real, age)) => (age <= HOUR).then(|| real.checked_sub(age)).flatten(),
+        }
     }
 
     /// Told once when an agent comes to wait on the person's approval.
@@ -1446,7 +1468,7 @@ impl View {
                     replay.speed = (replay.speed * 2.0).min(REPLAY_FASTEST);
                     return true;
                 }
-                KeyCode::Left | KeyCode::Right if !self.listing => {
+                KeyCode::Left | KeyCode::Right => {
                     let step = REPLAY_STEP * f64::from(replay.speed);
                     let at = match code {
                         KeyCode::Left => replay.at - step,
@@ -2339,14 +2361,25 @@ pub fn replay_from(when: &str, now: i64) -> Option<i64> {
             return None;
         }
         let today = crate::trigger::local(now.div_euclid(1000));
-        let at = crate::trigger::Local {
-            hour,
-            minute,
-            ..today
+        let on = |day: crate::trigger::Local| {
+            crate::trigger::epoch_of(crate::trigger::Local {
+                hour,
+                minute,
+                ..day
+            })
         };
-        let at = crate::trigger::epoch_of(at)? * 1000;
-        // Later today is yesterday's.
-        return Some(if at > now { at - 86_400_000 } else { at });
+        let at = on(today)? * 1000;
+        if at <= now {
+            return Some(at);
+        }
+        // Later today is yesterday's, by the calendar: a day back from
+        // noon is yesterday whatever the clocks did overnight.
+        let noon = crate::trigger::epoch_of(crate::trigger::Local {
+            hour: 12,
+            minute: 0,
+            ..today
+        })?;
+        return Some(on(crate::trigger::local(noon - 86_400))? * 1000);
     }
     let unit = when.find(|c: char| !c.is_ascii_digit())?;
     let scale = match &when[unit..] {
@@ -3117,15 +3150,8 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         // A configured agent is read again: the event says only what
         // changed, and `m` colours by its model.
         if event["event"] == "configured" {
-            let model = event["changed"]
-                .as_array()
-                .is_some_and(|changed| changed.iter().any(|c| c == "model"));
-            if let (true, Some(name)) = (model, event["bot"].as_str())
-                && let Ok(bot) = client.request("inspect", json!({"bot": name})).await
-                && let Some(model) = bot["model"].as_str()
-                && send
-                    .send(Feed::Model(name.to_owned(), model.to_owned()))
-                    .is_err()
+            if let Some(model) = configured(&client, &event).await
+                && send.send(model).is_err()
             {
                 return;
             }
@@ -3140,6 +3166,33 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
         }
     }
     let _ = send.send(Feed::Down("the daemon closed the connection".into()));
+}
+
+/// A configured agent's model, read again when it changed: the event says
+/// only what changed, and `m` colours by its model.
+async fn configured(client: &Client, event: &Value) -> Option<Feed> {
+    let changed = event["changed"].as_array()?;
+    if !changed.iter().any(|c| c == "model") {
+        return None;
+    }
+    let name = event["bot"].as_str()?;
+    let bot = client.request("inspect", json!({"bot": name})).await.ok()?;
+    Some(Feed::Model(
+        name.to_owned(),
+        bot["model"].as_str()?.to_owned(),
+    ))
+}
+
+/// An event as a replay's tape keeps it: a tool's arguments only for a
+/// commons post, which is all the sky reads of them.
+fn slim(mut event: Value) -> Value {
+    if event["event"] == "tool_started"
+        && event["data"]["name"] != "commons"
+        && let Some(data) = event["data"].as_object_mut()
+    {
+        data.remove("arguments");
+    }
+    event
 }
 
 /// A replay's connection: every agent here now, then every event written
@@ -3168,12 +3221,19 @@ async fn tape(socket: PathBuf, from: i64, send: mpsc::UnboundedSender<Feed>) {
     while let Some(event) = events.recv().await {
         let sent = match event["event"].as_str() {
             Some("follow_live") => send.send(Feed::Ready),
-            Some("pruned" | "configured") => continue,
+            Some("pruned") => continue,
+            // As live: a new model is read again, for `m`.
+            Some("configured") => match configured(&client, &event).await {
+                Some(model) => send.send(model),
+                None => continue,
+            },
             Some("lagged" | "follow_lagged") => {
                 let _ = send.send(Feed::Down("fell behind the daemon".into()));
                 return;
             }
-            _ => send.send(Feed::Tape(event)),
+            // What the sky reads of a tool's arguments is a commons post;
+            // the rest stays with the daemon, not in the tape.
+            _ => send.send(Feed::Tape(slim(event))),
         };
         if sent.is_err() {
             return;
@@ -3517,10 +3577,17 @@ mod tests {
             logged,
             [("shop lead → login".to_owned(), Some(from + 1_000))]
         );
+        // The hour's weights go by when it was said, not sped up: eleven
+        // seconds before the replay's now, not a second and a half.
+        let ago = view.said[0].0.elapsed().as_secs_f32();
+        assert!((10.0..12.5).contains(&ago), "{ago}");
         assert!(view.agent("shop.cart").is_none());
-        // A step on: a minute and twenty seconds at 8×, the cart made and
-        // messaged, its time in the log.
+        // A step on, in the list a small pane shows too: a minute and
+        // twenty seconds at 8×, the cart made and messaged, its time in
+        // the log.
+        view.listing = true;
         assert!(view.press(KeyCode::Right));
+        view.listing = false;
         assert!(view.agent("shop.cart").is_some());
         assert_eq!(view.ticker.len(), 2);
         let log = text(&view.ticked(Instant::now(), 40, 12, true));
@@ -3546,6 +3613,14 @@ mod tests {
         // Esc watches live again.
         assert!(view.press(KeyCode::Esc));
         assert!(!view.replaying());
+    }
+
+    #[test]
+    fn a_replay_s_tape_keeps_tool_arguments_only_for_a_commons_post() {
+        let call = |name: &str| json!({"event": "tool_started", "bot": "a", "data": {"name": name, "arguments": "{}"}});
+        assert!(slim(call("shell"))["data"]["arguments"].is_null());
+        assert_eq!(slim(call("commons"))["data"]["arguments"], "{}");
+        assert_eq!(slim(call("shell"))["data"]["name"], "shell");
     }
 
     #[test]
