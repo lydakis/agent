@@ -392,9 +392,10 @@ pub struct View {
     down: Option<String>,
     /// Playing the past back instead of watching live.
     replay: Option<Replay>,
-    /// Throwaway copies, by name, and the agent each copies: what one
+    /// Throwaway copies, by name, and the agent each copies (its name,
+    /// and its id when known): what one
     /// does is drawn on its agent, as the approver's judgments light it.
-    copies: HashMap<String, String>,
+    copies: HashMap<String, (String, Option<i64>)>,
 }
 
 /// A replay: the daemon's events from a time on, played as they happened,
@@ -901,7 +902,8 @@ impl View {
         // message or a haiku, made by no agent, are not drawn at all.
         if !bot["expire_ms"].is_null() {
             if let Some(by) = bot["created_by"].as_str().filter(|by| !by.is_empty()) {
-                self.copies.insert(name.to_owned(), by.to_owned());
+                let id = bot["created_by_id"].as_i64();
+                self.copies.insert(name.to_owned(), (by.to_owned(), id));
             }
             return None;
         }
@@ -960,10 +962,25 @@ impl View {
     }
 
     /// The agent a throwaway copy is drawn on: the one that made it, or
-    /// that one's, should it be a copy too.
+    /// that one's, should it be a copy too; by name, and by id when both
+    /// are known, as a name used again is a stranger.
     fn copied(&self, name: &str) -> Option<usize> {
-        let by = self.copies.get(name)?;
-        self.agent(by).or_else(|| self.agent(self.copies.get(by)?))
+        let maker = |name: &str| {
+            let (by, id) = self.copies.get(name)?;
+            Some((by.as_str(), *id))
+        };
+        let same = |at: usize, id: Option<i64>| match (id, self.agents[at].id) {
+            (Some(made_by), Some(id)) => made_by == id,
+            _ => true,
+        };
+        let (by, id) = maker(name)?;
+        match self.agent(by) {
+            Some(at) => same(at, id).then_some(at),
+            None => {
+                let (by, id) = maker(by)?;
+                self.agent(by).filter(|&at| same(at, id))
+            }
+        }
     }
 
     fn agent_or_copied(&self, name: &str) -> Option<usize> {
@@ -1002,7 +1019,8 @@ impl View {
         // own.
         let kind = event["event"].as_str().unwrap_or("");
         let lent = matches!(kind, "queued" | "accepted" | "steered" | "tool_started");
-        if self.agent(name).is_none() && !lent {
+        let own = self.agent(name).is_some();
+        if !own && !lent {
             return;
         }
         let turn = event["turn"].as_i64().unwrap_or(-1);
@@ -1016,7 +1034,7 @@ impl View {
                 // Past turns say who talked to whom; whether an agent works
                 // now is the listing's, and live events' after it.
                 // A copy's turn is its own: its agent's state stays its.
-                if kind == "accepted" && live && self.agent(name).is_some() {
+                if kind == "accepted" && live && own {
                     let agent = &mut self.agents[at];
                     agent.running = Some(turn);
                     agent.sender = Some(from);
@@ -1024,8 +1042,9 @@ impl View {
                     agent.failed = false;
                 }
                 // What it asked is answered by the one it asked: the person,
-                // or the agent that made it.
-                if kind != "queued" && live {
+                // or the agent that made it. A copy's prompt answers none of
+                // its agent's questions.
+                if kind != "queued" && live && own {
                     let maker = self.agents[at]
                         .made_by
                         .as_deref()
@@ -1102,15 +1121,18 @@ impl View {
             }
             "tool_started" if live => {
                 let tool = data["name"].as_str().unwrap_or("");
-                // A call approved starts.
-                if let Some(call) = data["call_id"].as_str() {
+                // A call approved starts; a copy's calls are lent as a
+                // twinkle, its asks and approvals staying its own.
+                if let Some(call) = data["call_id"].as_str()
+                    && own
+                {
                     self.agents[at].held.remove(call);
                 }
                 self.agents[at].twinkle = Some((now, TOOL, Work::of(tool)));
                 if let Some(then) = self.then(now) {
                     self.calls.push_back(then);
                 }
-                if tool == crate::asks::TOOL {
+                if tool == crate::asks::TOOL && own {
                     if self.agents[at].state() != Some(State::NeedsYou) {
                         let said = format!("? {} asks you", self.short(at));
                         self.say(now, said, Some(NEEDS), &[at]);
@@ -4249,6 +4271,52 @@ mod tests {
         .unwrap();
         view.drain();
         assert!(view.copies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_copy_leaves_its_agents_asks_alone_and_no_stranger_takes_its_work() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "shop.lead", "bot_id": 2})]))
+            .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "forked", "bot": "shop.lead.side",
+            "data": {"bot_id": 3, "created_by": "shop.lead", "created_by_id": 2, "expire_ms": 60_000}}),
+        ))
+        .unwrap();
+        // The lead asks; its copy is told something and asks too.
+        send.send(Feed::Live(
+            json!({"event": "tool_started", "bot": "shop.lead",
+            "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c1"}}),
+        ))
+        .unwrap();
+        view.drain();
+        let lead = view.index["shop.lead"];
+        assert!(view.agents[lead].asking);
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": "shop.lead.side",
+            "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(view.agents[lead].asking, "a copy's prompt answers nothing");
+        view.agents[lead].asking = false;
+        send.send(Feed::Live(
+            json!({"event": "tool_started", "bot": "shop.lead.side",
+            "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c2"}}),
+        ))
+        .unwrap();
+        view.drain();
+        assert!(!view.agents[lead].asking, "a copy's ask is its own");
+        assert!(view.agents[lead].twinkle.is_some());
+        // The lead is removed and its name taken by someone else.
+        send.send(Feed::Live(json!({"event": "deleted", "bot": "shop.lead"})))
+            .unwrap();
+        send.send(Feed::Live(json!({"event": "created", "bot": "shop.lead",
+            "data": {"bot_id": 9}})))
+            .unwrap();
+        view.drain();
+        assert!(view.copied("shop.lead.side").is_none());
     }
 
     #[tokio::test]
