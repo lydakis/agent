@@ -134,7 +134,7 @@ class Conn:
         self.sock = socket.socket(socket.AF_UNIX)
         self.sock.connect(str(path))
         self.reader = self.sock.makefile('r')
-        self.replies, self.events = {}, 0
+        self.replies, self.events, self.live = {}, 0, 0
         self.cond = threading.Condition()
         self.next_id = 0
         self.ready = threading.Event()
@@ -152,7 +152,11 @@ class Conn:
                         self.replies[message['id']] = message
                         self.cond.notify_all()
                 else:
-                    self.events += 1
+                    with self.cond:
+                        self.events += 1
+                        if message.get('event') == 'follow_live':
+                            self.live += 1
+                            self.cond.notify_all()
         except (OSError, ValueError):
             pass
 
