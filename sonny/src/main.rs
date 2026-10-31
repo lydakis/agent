@@ -1780,7 +1780,7 @@ const COMMANDS: [(&str, &str); 28] = [
     ),
     (
         "/zen",
-        "Talk with the agent about one thing, the rest held back; again to leave",
+        "Talk with the agent about one thing, the rest held back; /zen again ends it",
     ),
     (
         "/margin",
@@ -9562,7 +9562,7 @@ impl App {
         }
         let changed = self.zen.is_some() != focus.is_some();
         self.notice = Some(match &focus {
-            Some(_) => "zen: only your turns and its questions show · /zen to leave".into(),
+            Some(_) => "zen: only your turns and the agent's questions show; /zen ends it".into(),
             None => "zen is off: the agent tells what it held".into(),
         });
         self.zen = focus;
