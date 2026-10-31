@@ -8095,6 +8095,9 @@ impl App {
                     Choice::Approvals => approvals::MODES.len(),
                     Choice::Speed => self.speed_rows().len(),
                 };
+                // Another client may have moved the bot to a provider
+                // that serves fewer tiers since the list opened.
+                pick = pick.min(count - 1);
                 match key.code {
                     KeyCode::Up => pick = (pick + count - 1) % count,
                     KeyCode::Down => pick = (pick + 1) % count,
@@ -9686,6 +9689,7 @@ impl App {
                 let items: Vec<list::Item> = (self.speed_rows().into_iter())
                     .map(|(speed, about)| list::Item::new(speed, about).current(speed == now))
                     .collect();
+                let pick = pick.min(items.len() - 1);
                 over(
                     frame,
                     list::lines(&items, pick, width, composer.y as usize),
@@ -12753,6 +12757,15 @@ mod tests {
         app.key(key(KeyCode::Up)).await;
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(app.speed.as_deref(), Some("ultrafast"));
+        // Moved meanwhile to a provider serving fewer tiers, the list
+        // takes its last row rather than one that is gone.
+        app.input.set("/fast");
+        app.submit().await;
+        assert!(app.choosing == Some((Choice::Speed, 2)));
+        app.model = "anthropic/claude-opus-5-5".into();
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.choosing.is_none());
+        assert_eq!(app.speed.as_deref(), Some("fast"));
     }
 
     #[tokio::test]
