@@ -939,10 +939,14 @@ impl Service {
                     self.telling.remove(&key);
                 }
                 Some(settled) = settled.recv() => {
-                    self.goals.settled(&settled, &client, &checked);
+                    let checking = self.goals.settled(&settled, &client, &checked);
                     let goals::Settled { bot, turn, outcome, .. } = settled;
+                    let now = Instant::now();
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
+                        if let Some(later) = checking {
+                            lookout.updates.goal_checking(&bot, later, now);
+                        }
                     }
                 }
                 // What sources say is news once the stream is live; until

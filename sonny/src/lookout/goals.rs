@@ -384,6 +384,9 @@ struct Check {
     turn: i64,
     /// The goal checked: one set since is checked afresh.
     set_ms: u64,
+    /// The idle count from before this turn and any that wait for it
+    /// counted, which a replay counts again.
+    idle: Option<(u64, i64, u32)>,
 }
 
 /// A turn that completed while its goal's check ran.
@@ -392,6 +395,7 @@ struct Later {
     at: Option<i64>,
     goal: Goal,
     idle: u32,
+    before: Option<(u64, i64, u32)>,
 }
 
 impl Goals {
@@ -413,41 +417,54 @@ impl Goals {
     /// completed meanwhile is checked now, unless the agent works again
     /// after it, whose turn is checked when it ends: after a restart the
     /// turn the check went on in may be one that already ended, which no
-    /// one would check again. Else it is plain news.
+    /// one would check again. Else it is plain news. Returns the turn whose
+    /// check starts now.
     pub fn settled(
         &mut self,
         settled: &Settled,
         client: &std::sync::Arc<Client>,
         done: &tokio::sync::mpsc::UnboundedSender<Settled>,
-    ) {
+    ) -> Option<i64> {
         if !(self.checking.get(&settled.bot)).is_some_and(|check| check.turn == settled.turn) {
-            return;
+            return None;
         }
         self.checking.remove(&settled.bot);
-        let Some(later) = self.later.remove(&settled.bot) else {
-            return;
-        };
+        let later = self.later.remove(&settled.bot)?;
         let goes_on = settled.outcome.is_none()
             && settled.continued.is_none_or(|turn| turn <= later.turn)
             && read(&self.store, &settled.bot).is_some_and(|now| now.set_ms == later.goal.set_ms);
-        match goes_on {
-            true => self.check(later.goal, later.turn, later.idle, later.at, client, done),
-            false => {
-                let _ = done.send(Settled {
-                    bot: settled.bot.clone(),
-                    turn: later.turn,
-                    outcome: Some(String::new()),
-                    continued: None,
-                });
-            }
+        if goes_on {
+            let turn = later.turn;
+            self.check(
+                later.goal,
+                turn,
+                later.idle,
+                later.at,
+                later.before,
+                client,
+                done,
+            );
+            return Some(turn);
         }
+        let _ = done.send(Settled {
+            bot: settled.bot.clone(),
+            turn: later.turn,
+            outcome: Some(String::new()),
+            continued: None,
+        });
+        None
     }
 
     /// Checks under way answer a connection since dropped, never the next:
-    /// they stop, and the replay runs them again.
+    /// they stop, and the replay runs them again, counting idle turns again
+    /// from where they stood before the first of them.
     pub fn reconnected(&mut self) {
-        for (_, check) in self.checking.drain() {
+        for (bot, check) in self.checking.drain() {
             check.pursuit.abort();
+            match check.idle {
+                Some(idle) => self.idle.insert(bot, idle),
+                None => self.idle.remove(&bot),
+            };
         }
         self.later.clear();
     }
@@ -582,7 +599,7 @@ impl Goals {
                     },
                     false => 0,
                 };
-                self.idle.insert(bot.to_owned(), (goal.set_ms, turn, idle));
+                let before = self.idle.insert(bot.to_owned(), (goal.set_ms, turn, idle));
                 let at = event["cursor"].as_i64();
                 // One under way: this turn waits for it, and one that
                 // waited before it is plain news.
@@ -592,6 +609,7 @@ impl Goals {
                         at,
                         goal,
                         idle,
+                        before,
                     };
                     if let Some(older) = self.later.insert(bot.to_owned(), later) {
                         let _ = done.send(Settled {
@@ -603,20 +621,23 @@ impl Goals {
                     }
                     return Some((bot.to_owned(), turn));
                 }
-                self.check(goal, turn, idle, at, client, done);
+                self.check(goal, turn, idle, at, before, client, done);
                 Some((bot.to_owned(), turn))
             }
             _ => None,
         }
     }
 
-    /// Run `goal`'s check for `turn`, whose end is at `at`.
+    /// Run `goal`'s check for `turn`, whose end is at `at`. `before` is
+    /// the idle count from before `turn` counted.
+    #[allow(clippy::too_many_arguments)]
     fn check(
         &mut self,
         goal: Goal,
         turn: i64,
         idle: u32,
         at: Option<i64>,
+        before: Option<(u64, i64, u32)>,
         client: &std::sync::Arc<Client>,
         done: &tokio::sync::mpsc::UnboundedSender<Settled>,
     ) {
@@ -644,6 +665,7 @@ impl Goals {
             at,
             turn,
             set_ms,
+            idle: before,
         };
         self.checking.insert(bot, check);
     }
@@ -951,6 +973,64 @@ mod tests {
         ended(&store, &set, 6, GAVE_UP, false);
         assert_eq!(standing(&store, "p.fix", Some(6)), None);
         assert_eq!(ending(&store, "p.fix", 6).unwrap()["outcome"], GAVE_UP);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replay_after_a_drop_counts_idle_turns_from_before_the_check_it_runs_again() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = scratch("replay");
+        let store = dir.join("state.sqlite");
+        let mut set = goal(&store, "p.fix");
+        set.check = "sleep 30".into();
+        write(&store, &set).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = dir.join("agent.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                write.write_all(format!("{ready}\n").as_bytes()).await.unwrap();
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let asked: Value = serde_json::from_str(&line).unwrap();
+                    let answer = json!({"id": asked["id"], "result": {}});
+                    write.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                }
+            });
+            let client = Client::connect(&socket).await.unwrap().0;
+            let (done, _settled) = tokio::sync::mpsc::unbounded_channel();
+            let mut goals = Goals::new(&store, &socket);
+            let turn = |goals: &mut Goals, turn: i64, tool: bool| {
+                let ev = |event: &str, data: Value| {
+                    json!({"bot": "p.fix", "turn": turn, "event": event, "data": data, "cursor": turn})
+                };
+                let asked = json!({"request_id": format!("{REQUEST}p.fix-{turn}")});
+                goals.event(&ev("accepted", asked), None, true, &client, &done);
+                if tool {
+                    goals.event(&ev("tool_started", json!({})), None, true, &client, &done);
+                }
+                let finished = ev("turn_finished", json!({"status": "completed"}));
+                goals.event(&finished, None, true, &client, &done)
+            };
+            // Goal turns with no call, a call, and no call, while the first
+            // one's check runs.
+            assert_eq!(turn(&mut goals, 1, false), Some(("p.fix".into(), 1)));
+            turn(&mut goals, 2, true);
+            turn(&mut goals, 3, false);
+            assert_eq!(goals.idle["p.fix"], (1, 3, 1));
+            // The connection drops, and the replay starts from turn 1: it
+            // is one idle turn, not one more after turn 3.
+            goals.reconnected();
+            turn(&mut goals, 1, false);
+            assert_eq!(goals.idle["p.fix"], (1, 1, 1));
+            goals.reconnected();
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
