@@ -24,11 +24,25 @@ LINE = r'\[trigger {} · \d{{4}}-\d\d-\d\d \d\d:\d\d · {}\]\n'
 LABEL = 'me.lydakis.agent.trigger.'
 
 
+def home_tag(home):
+    """HOME's tag in its triggers' labels, as Sonny computes it: FNV-1a 64 of the path, folded to 32 bits."""
+    data = str(home).encode().rstrip(b'/') or b'/'
+    value = 0xcbf29ce484222325
+    for byte in data:
+        value = ((value ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+    return f'{(value ^ (value >> 32)) & 0xffffffff:08x}'
+
+
+def label_of(home, name):
+    """A trigger's launchd label, or its systemd units' name: each HOME has its own."""
+    return f'{LABEL}{home_tag(home)}.{name}'
+
+
 def job(home, name):
     """Where a trigger's definition is under `home`: its plist on a Mac, its systemd service elsewhere."""
     if sys.platform == 'darwin':
-        return home / 'Library/LaunchAgents' / f'{LABEL}{name}.plist'
-    return home / '.config/systemd/user' / f'{LABEL}{name}.service'
+        return home / 'Library/LaunchAgents' / f'{label_of(home, name)}.plist'
+    return home / '.config/systemd/user' / f'{label_of(home, name)}.service'
 
 
 def definition(args):
@@ -564,7 +578,7 @@ class TriggerFireTests(ModelFixture):
     def test_real_launchd_fires_and_removes(self):
         # The plists live under this test's HOME, so nothing loads at the next login.
         name = f'ztest-{os.getpid()}'
-        label = f'me.lydakis.agent.trigger.{name}'
+        label = label_of(self.home, name)
         target = f'gui/{os.getuid()}/{label}'
         plist = self.home / f'Library/LaunchAgents/{label}.plist'
         self.addCleanup(lambda: subprocess.run(['/bin/launchctl', 'bootout', target], capture_output=True))
@@ -629,7 +643,7 @@ class TriggerFireTests(ModelFixture):
         data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
         runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
         name = f'ztest-{os.getpid()}'
-        label = f'{LABEL}{name}'
+        label = label_of(self.home, name)
         units = real / 'systemd/user'
         service = units / f'{label}.service'
         # The user manager gives no provider keys: a daemon a fire starts gets them from the login shell's profile.
@@ -712,6 +726,49 @@ class TriggerFireTests(ModelFixture):
         self.assertFalse((data / f'systemd/timers/stamp-{label}.timer').exists())
         # Nothing left: not loaded reads as that.
         self.assertEqual(json.loads(trigger('rm', name, ok=False).stderr)['error'], 'trigger_not_found')
+
+    @unittest.skipUnless(sys.platform.startswith('linux') and os.environ.get('AGENT_TEST_SYSTEMD') == '1',
+                         'real systemd: Linux with a user manager and AGENT_TEST_SYSTEMD=1')
+    def test_real_systemd_job_whose_home_is_gone_unloads_itself(self):
+        # One user manager for every HOME (#453): a test's HOME deleted with its trigger still loaded.
+        real = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+        data = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
+        runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+        gone = self.path / 'gone-home'
+        gone.mkdir()
+        name = f'ztest-gone-{os.getpid()}'
+        label = label_of(gone, name)
+        self.assertNotEqual(label, label_of(self.home, name))
+        units = real / 'systemd/user'
+        env = {**clean_env(), 'HOME': str(gone), 'AGENT_STORE': str(self.store),
+               'XDG_CONFIG_HOME': str(real), 'XDG_DATA_HOME': str(data), 'XDG_RUNTIME_DIR': runtime}
+
+        def systemctl(*args):
+            return subprocess.run(['systemctl', '--user', *args], env=env, capture_output=True, text=True)
+
+        def left():
+            return [*units.glob(f'{label}.*'), *units.glob(f'*.wants/{label}.*')]
+
+        def cleanup():
+            systemctl('stop', f'{label}.timer', f'{label}.path', f'{label}.service')
+            for path in left():
+                path.unlink()
+            systemctl('daemon-reload')
+        self.addCleanup(cleanup)
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        added = subprocess.run([str(SONNY), 'trigger', 'add', '--bot', 'p.task', '--name', name, '--every', '30m',
+                                '--', 'nobody home'], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(systemctl('is-active', f'{label}.timer').stdout.strip(), 'active')
+        turns = len(self.turns('p.task'))
+        shutil.rmtree(gone)
+        systemctl('start', f'{label}.service')
+        deadline = time.monotonic() + 30
+        while left() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        self.assertEqual(left(), [])
+        self.assertNotEqual(systemctl('is-active', f'{label}.timer').stdout.strip(), 'active')
+        self.assertEqual(len(self.turns('p.task')), turns)
 
 
 if __name__ == '__main__':

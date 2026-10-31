@@ -176,7 +176,7 @@ trigger ends, saying why (`asks_stuck`). A trigger that goes sets its asks aside
 job, and puts them back when it will not. Nothing else starts a fire:
 launchd is the only thing that runs one.
 
-Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.NAME.plist`,
+Each is one LaunchAgent, `~/Library/LaunchAgents/me.lydakis.agent.trigger.TAG.NAME.plist`,
 and that file is its definition: its program arguments carry the agent and
 its id (or the agent to start, its model and effort, and who added it), the
 store and the socket of the shell it was made from (an agent's shell has
@@ -262,10 +262,24 @@ loads it again, on a thread of its own so its screen does not wait (a Sonny
 in Homebrew's Cellar goes by its `opt` path, which an upgrade keeps); one launchd refuses keeps its old path and is tried again at the
 next start.
 
+launchd keeps one domain per user (`gui/UID`), and systemd one user manager,
+whatever HOME is, so a test's or an eval's HOME would add its jobs beside
+the user's own. A trigger's label therefore carries `TAG`, eight hex digits
+of a hash of its HOME's path (64-bit FNV-1a, folded to 32 bits, a trailing
+`/` left out): each HOME has labels of its own, and its `add`, `rm` and
+`ls` never reach another's. Sonny's start moves a trigger made from its
+HOME before labels had the tag to its tagged label, once (another HOME's,
+in a systemd unit folder they share, waits for that HOME's Sonny): launchd lets go of the old
+label and loads the job under the new one, from its definition moved to
+the new file; one that will not load goes back as it was, for the next
+start. A fire whose HOME is gone (a test's HOME deleted with its job still
+loaded) unloads its own job, by the label launchd (`XPC_SERVICE_NAME`) or
+systemd (its cgroup) runs it under, and sends nothing.
+
 ### On Linux
 
 systemd's user manager keeps triggers, through `systemctl --user`. Each is
-one service, `~/.config/systemd/user/me.lydakis.agent.trigger.NAME.service`
+one service, `~/.config/systemd/user/me.lydakis.agent.trigger.TAG.NAME.service`
 (under `XDG_CONFIG_HOME` when set, where the manager reads units), and that
 file is its definition as the plist is on a Mac: its `ExecStart=` is the
 fire's arguments, quoted as systemd reads them back, and two sections
