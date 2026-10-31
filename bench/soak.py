@@ -71,14 +71,17 @@ class Soak:
         self.turn_counter = {}
         self.next_at = {}
         self.followers, self.slow = {}, []
+        self.last_event = None
         self.forks = []
 
     # ---- daemon ----
     def daemon(self):
         extra = ('--socket', str(self.socket), '--max-active', '256')
         # A socket daemon answers on the socket; the stdio handle only owns the process.
-        self.client = Client(self.binary, self.store, self.url, 'shell,read,write,edit,wait,history',
-                             extra=extra)
+        # What the daemon writes to stderr is kept, for a run it ends early.
+        with open(self.out / 'daemon.stderr', 'a') as stderr:
+            self.client = Client(self.binary, self.store, self.url, 'shell,read,write,edit,wait,history',
+                                 extra=extra, stderr=stderr)
         self.process = psutil.Process(self.client.process.pid)
         self.control = Connection(self.socket, retain_durable=False)
         self.connections.append(self.control)
@@ -104,7 +107,8 @@ class Soak:
     # ---- events ----
     def absorb(self, message):
         if message is None:
-            raise RuntimeError('daemon exited')
+            raise RuntimeError(self.why_closed())
+        self.last_event = message
         event = message.get('event')
         if event == 'turn_finished':
             self.finished[message['turn']] = message
@@ -112,6 +116,22 @@ class Soak:
             self.counts['compactions'] += 1
         elif event == 'retry':
             self.counts['retries'] += 1
+
+    def why_closed(self):
+        """Why the events connection closed: the daemon exited, with its
+        code and the end of its stderr, or it let the connection go, with
+        the last event it sent (a `follow_lagged` says why)."""
+        code = self.client.process.poll()
+        if code is None:
+            try:
+                code = self.client.process.wait(timeout=2)
+            except Exception:
+                return f'the daemon closed the events connection; last event: {self.last_event}'
+        try:
+            tail = (self.out / 'daemon.stderr').read_text(errors='replace')[-4000:]
+        except OSError:
+            tail = ''
+        return f'daemon exited with {code}; last event: {self.last_event}; stderr ends:\n{tail}'
 
     def pump(self, timeout=.02):
         for message in self.events.saved:

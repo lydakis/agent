@@ -93,7 +93,13 @@ in the folder `add` ran in, with that folder's composed policy, the
 default tools and Sonny's own a task has: the memory tool, and `exec` while
 an MCP server is on, so an agent no one opens reaches the person's servers
 as one they open does; one a trigger made before it had them takes them at
-its next fire, gated as its mode gates the rest), made by the agent that added the trigger when one did, so
+its next fire, gated as its mode gates the rest), gated by the approver
+and sandboxed to its folder as `sonny --new` makes one (`auto`), with the
+person's fallback for its model: one way to make an agent, so an agent no
+one opens never runs with more reach than one they do. A call the approver
+doubts waits in `/approvals`, as any agent's does. One a trigger made
+before then, with no sandbox and no gate, is confined so at its next
+fire; one the person put in `full` stays there. It is made by the agent that added the trigger when one did, so
 it shows under that agent, and gives it the fire's message. Its id is kept with the trigger's
 state when the fire settles, and later fires message it. A name an agent already has is refused at
 `add` (`bot_exists`), and an agent of that name made before the first fire
@@ -343,8 +349,17 @@ or with `goal`.
 The roster and `/status` keep "it stopped" apart from "it did what was
 asked": a task whose turn completed while it has a goal reads `checking`,
 and the turn whose check passed reads `checked`, not `done`, until the
-task's next turn. That turn is noted in `STORE.lookout/goals/met/BOT.json`
-when the goal ends, and the note goes with the agent.
+task's next turn. How a goal ended, and by which turn, is noted in
+`STORE.lookout/goals/ended/BOT.json` before the goal itself goes, and the
+note goes with the agent. A lookout that restarts before the lead heard
+that turn reads how it ended from the note, so the lead still hears that
+it gave up or ran out of budget, not only that a turn completed.
+
+A turn that completes while the goal's check of an earlier one runs waits
+for that check, as a work queue keeps an item added again while it is
+processed: when the agent goes on in a newer turn, that turn is checked
+when it ends and the one that waited is plain news; else, as after a
+restart that replays two finished turns, the one that waited is checked.
 
 ## Memory
 
