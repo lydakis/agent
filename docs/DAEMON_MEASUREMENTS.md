@@ -6290,8 +6290,9 @@ Observation reads (`history_nodes`, `history_items`, `history_search`,
 `turns`, `bots`, `events`, `usage`, `prompts`) now run in a lane beside the
 service loop, on a pool of reader connections (`--max-readers`, one per
 logical CPU), taking all but one of them. A session waits for its read
-before its next request is taken, reads at most 8 requests ahead, and
-reads no further than its next while it waits.
+before its next request is taken and reads at most 8 requests ahead; while
+it waits it reads nothing more, and what it read ahead stops counting
+against the shared input queue.
 
 `bench/fair_queuing.py` gained floods of whole histories and searches
 across every bot, several flooding sessions at once (`--flooders`), deep

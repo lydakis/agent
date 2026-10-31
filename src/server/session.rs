@@ -72,6 +72,9 @@ struct Queues {
     turns: VecDeque<u64>,
     /// Sessions whose messages wait for one already taken to be answered.
     parked: HashSet<u64>,
+    /// How many of a session's oldest queued messages the room no longer
+    /// counts: those it read ahead before it was parked.
+    uncharged: HashMap<u64, usize>,
     senders: usize,
 }
 
@@ -82,9 +85,10 @@ pub struct Gone;
 pub struct Sender(Arc<Shared>);
 impl Sender {
     /// Queue `message` once there is room. A session with its share queued
-    /// waits for one to be taken, and a parked one with any queued waits to
-    /// be unparked, so sessions waiting on their own answers never fill the
-    /// room the others need.
+    /// waits for one to be taken, and a parked one reads nothing more until
+    /// it is unparked. What a session read ahead before it was parked stops
+    /// counting against the room, so sessions waiting on their own answers
+    /// never hold the room the others need: each holds at most its share.
     pub async fn send(&self, message: Inbound) -> std::result::Result<(), Gone> {
         let session = message.session();
         loop {
@@ -94,8 +98,7 @@ impl Sender {
             {
                 let queues = self.0.lock();
                 let queued = queues.sessions.get(&session).map_or(0, VecDeque::len);
-                let held =
-                    queued >= self.0.share || (queued > 0 && queues.parked.contains(&session));
+                let held = queued >= self.0.share || queues.parked.contains(&session);
                 if !held || self.0.room.is_closed() {
                     break;
                 }
@@ -159,8 +162,20 @@ impl Receiver {
                     } else {
                         queues.turns.push_back(session);
                     }
+                    let charged = match queues.uncharged.get_mut(&session) {
+                        Some(left) => {
+                            *left -= 1;
+                            if *left == 0 {
+                                queues.uncharged.remove(&session);
+                            }
+                            false
+                        }
+                        None => true,
+                    };
                     drop(guard);
-                    self.0.room.add_permits(1);
+                    if charged {
+                        self.0.room.add_permits(1);
+                    }
                     self.0.taken.notify_waiters();
                     return Some(message);
                 }
@@ -176,11 +191,24 @@ impl Receiver {
     /// Take no more of `session`'s messages until `unpark`: its next ones
     /// wait for the one it sent last to be answered, so a session's own
     /// requests keep their order while the loop serves other sessions.
+    /// What it read ahead is given back to the room, as it no longer waits
+    /// on the loop: at most its share, kept until it is taken.
     pub fn park(&self, session: u64) {
-        let mut queues = self.0.lock();
-        if queues.parked.insert(session) {
-            queues.turns.retain(|turn| *turn != session);
+        let mut guard = self.0.lock();
+        let queues = &mut *guard;
+        if !queues.parked.insert(session) {
+            return;
         }
+        queues.turns.retain(|turn| *turn != session);
+        let queued = queues.sessions.get(&session).map_or(0, VecDeque::len);
+        let uncharged = queues.uncharged.entry(session).or_default();
+        let freed = queued - *uncharged;
+        *uncharged = queued;
+        if queued == 0 {
+            queues.uncharged.remove(&session);
+        }
+        drop(guard);
+        self.0.room.add_permits(freed);
     }
     /// Take `session`'s messages again, in its turn.
     pub fn unpark(&self, session: u64) {
@@ -420,10 +448,8 @@ mod tests {
         );
         inbound.unpark(1);
         assert_eq!(inbound.recv().await.unwrap().session(), 1);
-        // Parked with one queued, a session's reader waits to read on, so
-        // its messages hold no more of the room.
+        // Parked, a session's reader waits to read on.
         inbound.park(1);
-        sender.send(Inbound::Closed(1)).await.unwrap();
         let reader = sender.clone();
         let held = tokio::spawn(async move { reader.send(Inbound::Closed(1)).await.is_ok() });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -431,12 +457,67 @@ mod tests {
         inbound.unpark(1);
         assert!(held.await.unwrap());
         assert_eq!(inbound.recv().await.unwrap().session(), 1);
-        assert_eq!(inbound.recv().await.unwrap().session(), 1);
         // Parked with nothing queued, then unparked: nothing to take.
         inbound.park(3);
         inbound.unpark(3);
         sender.send(Inbound::Closed(3)).await.unwrap();
         assert_eq!(inbound.recv().await.unwrap().session(), 3);
+    }
+
+    #[tokio::test]
+    async fn parked_sessions_give_the_room_back_to_the_others() {
+        // Room for 16, each session 2 ahead: eight sessions fill it, then
+        // each is parked behind its first message.
+        let (sender, mut inbound) = channel(16);
+        for session in 1..=8 {
+            for _ in 0..2 {
+                sender.send(Inbound::Closed(session)).await.unwrap();
+            }
+        }
+        for _ in 1..=8 {
+            let session = inbound.recv().await.unwrap().session();
+            inbound.park(session);
+        }
+        // What they read ahead waits for them without holding the room: a
+        // new session reads and is served at once, and the room counts
+        // only what it charged.
+        let room = |sender: &Sender| sender.0.room.available_permits();
+        assert_eq!(room(&sender), 16);
+        let quick = std::time::Duration::from_millis(100);
+        for _ in 0..2 {
+            tokio::time::timeout(quick, sender.send(Inbound::Closed(9)))
+                .await
+                .expect("a new session waited behind parked ones")
+                .unwrap();
+        }
+        assert_eq!(inbound.recv().await.unwrap().session(), 9);
+        assert_eq!(inbound.recv().await.unwrap().session(), 9);
+        // Unparked, they are served what they read ahead, and the room is
+        // whole again.
+        for session in 1..=8 {
+            inbound.unpark(session);
+        }
+        sender.send(Inbound::Closed(1)).await.unwrap();
+        for _ in 0..9 {
+            inbound.recv().await.unwrap();
+        }
+        assert_eq!(room(&sender), 16);
+        // Parked again while one it read ahead is still uncharged: only
+        // the charged ones go back.
+        sender.send(Inbound::Closed(10)).await.unwrap();
+        sender.send(Inbound::Closed(10)).await.unwrap();
+        inbound.recv().await.unwrap();
+        inbound.park(10);
+        assert_eq!(room(&sender), 16);
+        inbound.unpark(10);
+        sender.send(Inbound::Closed(10)).await.unwrap();
+        assert_eq!(room(&sender), 15);
+        inbound.recv().await.unwrap();
+        inbound.park(10);
+        assert_eq!(room(&sender), 16);
+        inbound.unpark(10);
+        inbound.recv().await.unwrap();
+        assert_eq!(room(&sender), 16);
     }
 
     #[tokio::test]
