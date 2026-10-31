@@ -92,8 +92,10 @@ pub struct Block {
     pub window: String,
 }
 
-/// The sides a split may be on.
-pub const SIDES: [&str; 4] = ["right", "left", "above", "below"];
+/// Where a block may go beside another: on a side, or floating over its
+/// window, for a moment.
+pub const SPLITS: [&str; 5] = ["right", "left", "above", "below", FLOAT];
+pub const FLOAT: &str = "float";
 
 /// Where `show_agent` puts a task.
 pub enum Placement {
@@ -147,6 +149,18 @@ pub trait Backend: Send {
         command: &[String],
         keep: bool,
     ) -> Result<String, String>;
+    /// A new block floating over `anchor`'s window, as `split` makes one.
+    /// A multiplexer that cannot float one splits it on the right.
+    fn float(
+        &self,
+        anchor: &str,
+        label: &str,
+        cwd: &Path,
+        command: &[String],
+        keep: bool,
+    ) -> Result<String, String> {
+        self.split(anchor, "right", false, label, cwd, command, keep)
+    }
     /// The block Sonny itself runs in, when in this home.
     fn own_block(&self) -> Option<String>;
     fn places(&self) -> Result<Places, String>;
@@ -515,7 +529,10 @@ impl Layout {
                     .find(|b| &b.label == beside && b.label != bot)
                     .map(|b| b.id.clone())
                     .ok_or(format!("no block labelled {beside} in {}", self.home()))?;
-                (self.backend).split(&anchor, side, false, bot, cwd, command, false)?
+                match side.as_str() {
+                    FLOAT => (self.backend).float(&anchor, bot, cwd, command, false)?,
+                    side => (self.backend).split(&anchor, side, false, bot, cwd, command, false)?,
+                }
             }
         };
         self.forget();
@@ -614,6 +631,7 @@ impl Layout {
         }
         let anchor = listed.iter().find(|b| b.label == owner);
         let block = match anchor.zip(side) {
+            Some((anchor, FLOAT)) => (self.backend).float(&anchor.id, &label, cwd, command, true),
             Some((anchor, side)) => {
                 (self.backend).split(&anchor.id, side, true, &label, cwd, command, true)
             }

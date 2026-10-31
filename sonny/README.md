@@ -306,9 +306,10 @@ server; `--no-layout` turns the layout off. Sonny writes the skill for the
 multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
 `herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
 the person can watch it, and read it back: the `run_in_pane` tool
-(`name`, `command`, `split` right, left, above or below) opens a block
+(`name`, `command`, `split` right, left, above, below or float) opens a block
 labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
-own block) and gives its ID. The `show_agent` tool (`agent`, `split`,
+own block; `float`, in Rex, over the agent's window, for something
+looked at once and closed) and gives its ID. The `show_agent` tool (`agent`, `split`,
 `beside`) moves a task's window. Tabs are the default; the skills tell agents to split only
 to show the person something now, such as a server's or a tool's output, or
 an agent to watch beside them. Sessions are for leads, tabs and splits for
