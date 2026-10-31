@@ -418,7 +418,7 @@ impl Goals {
         &mut self,
         settled: &Settled,
         client: &std::sync::Arc<Client>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
     ) {
         if !(self.checking.get(&settled.bot)).is_some_and(|check| check.turn == settled.turn) {
             return;
@@ -433,7 +433,7 @@ impl Goals {
         match goes_on {
             true => self.check(later.goal, later.turn, later.idle, later.at, client, done),
             false => {
-                let _ = done.try_send(Settled {
+                let _ = done.send(Settled {
                     bot: settled.bot.clone(),
                     turn: later.turn,
                     outcome: Some(String::new()),
@@ -478,7 +478,7 @@ impl Goals {
         bot_id: Option<i64>,
         live: bool,
         client: &std::sync::Arc<Client>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
     ) -> Option<(String, i64)> {
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
@@ -553,14 +553,14 @@ impl Goals {
                 {
                     let check = self.checking.remove(bot)?;
                     check.pursuit.abort();
-                    let _ = done.try_send(Settled {
+                    let _ = done.send(Settled {
                         bot: bot.to_owned(),
                         turn: check.turn,
                         outcome: Some(String::new()),
                         continued: None,
                     });
                     if let Some(later) = self.later.remove(bot) {
-                        let _ = done.try_send(Settled {
+                        let _ = done.send(Settled {
                             bot: bot.to_owned(),
                             turn: later.turn,
                             outcome: Some(String::new()),
@@ -594,7 +594,7 @@ impl Goals {
                         idle,
                     };
                     if let Some(older) = self.later.insert(bot.to_owned(), later) {
-                        let _ = done.try_send(Settled {
+                        let _ = done.send(Settled {
                             bot: bot.to_owned(),
                             turn: older.turn,
                             outcome: Some(String::new()),
@@ -618,7 +618,7 @@ impl Goals {
         idle: u32,
         at: Option<i64>,
         client: &std::sync::Arc<Client>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
     ) {
         let (client, done, store, socket) = (
             client.clone(),
@@ -637,7 +637,7 @@ impl Goals {
                 outcome,
                 continued,
             };
-            let _ = done.send(settled).await;
+            let _ = done.send(settled);
         });
         let check = Check {
             pursuit: pursuit.abort_handle(),
@@ -656,14 +656,14 @@ impl Goals {
         bot: &str,
         turn: i64,
         bot_id: Option<i64>,
-        done: &tokio::sync::mpsc::Sender<Settled>,
+        done: &tokio::sync::mpsc::UnboundedSender<Settled>,
     ) -> Option<(String, i64)> {
         let noted = ending(&self.store, bot, turn)?;
         if bot_id.is_some_and(|id| noted["bot_id"].as_i64() != Some(id)) {
             return None;
         }
         let outcome = noted["outcome"].as_str()?.to_owned();
-        let _ = done.try_send(Settled {
+        let _ = done.send(Settled {
             bot: bot.to_owned(),
             turn,
             outcome: Some(outcome),
@@ -747,10 +747,12 @@ async fn pursue(
     // The turn it goes on in: after a restart, the one this turn's own
     // request ID made before, which may have ended already. One made
     // before from other output than the check printed now is that turn
-    // too, though the daemon does not say which.
+    // too, which the daemon names.
     match client.request("submit", asked).await {
         Ok(made) => (None, made["turn"].as_i64()),
-        Err(error) if error.code == "idempotency_conflict" => (None, None),
+        Err(error) if error.code == "idempotency_conflict" => {
+            (None, error.facts.as_ref().and_then(|f| f["turn"].as_i64()))
+        }
         Err(error) => (
             Some(format!(
                 ", and could not go on with its goal: {}",
