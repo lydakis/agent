@@ -13,7 +13,7 @@ import unittest
 
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import SENT, ModelFixture
 from tests.test_served import declared
 
 
@@ -208,7 +208,9 @@ class AcpTests(ModelFixture):
         # reached: Sonny took the person's out of them.
         [turn] = self.daemon.request('turns', bot='calc.lead')['result']['turns']
         prompts = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
-        self.assertEqual(prompts[0]['text'], 'script')
+        # Stamped with when it was sent, as every message Sonny passes on.
+        self.assertRegex(prompts[0]['text'], SENT)
+        self.assertEqual(SENT.sub('', prompts[0]['text']), 'script')
 
         # The task opens as the lead thread's child, with its brief as the
         # first message, through this thread's own tools.

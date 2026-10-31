@@ -46,30 +46,80 @@ type Opened = std::sync::Arc<std::sync::Mutex<Option<std::collections::HashMap<i
 struct Share {
     bot: i64,
     generation: u64,
-    opened: Opened,
-    runtime: tokio::runtime::Handle,
-    grace: Duration,
+    expiries: std::sync::Arc<Expiries>,
 }
 
 impl Drop for Share {
     fn drop(&mut self) {
-        let (bot, generation, opened, grace) =
-            (self.bot, self.generation, self.opened.clone(), self.grace);
-        self.runtime.spawn(async move {
-            tokio::time::sleep(grace).await;
-            let mut opened = opened.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(map) = opened.as_mut() else {
-                return;
-            };
-            if map
-                .get(&bot)
-                .is_some_and(|open| open.generation == generation && open.share.strong_count() == 0)
-                && let Some(open) = map.remove(&bot)
-            {
-                open.accepting.abort();
-                let _ = std::fs::remove_file(open.path);
+        self.expiries.push(self.bot, self.generation);
+    }
+}
+
+/// When each bot's socket may close: one queue for every bot, in the order
+/// the grace started, which is the order it ends since every grace is the
+/// same. One task sleeps until the first, so a fleet's socket graces take
+/// no task or timer each.
+struct Expiries {
+    due: std::sync::Mutex<std::collections::VecDeque<(tokio::time::Instant, i64, u64)>>,
+    pushed: tokio::sync::Notify,
+    grace: Duration,
+}
+
+impl Expiries {
+    fn push(&self, bot: i64, generation: u64) {
+        let deadline = tokio::time::Instant::now() + self.grace;
+        let mut due = self.due.lock().unwrap_or_else(|e| e.into_inner());
+        due.push_back((deadline, bot, generation));
+        if due.len() == 1 {
+            self.pushed.notify_one();
+        }
+    }
+
+    /// Close each socket whose grace has ended with no share taken since.
+    /// The check and the unlink run off the runtime thread, under the lock
+    /// an open takes, so a socket opened again in the meantime is not the
+    /// one removed.
+    async fn run(self: std::sync::Arc<Self>, opened: Opened) {
+        loop {
+            let first = self
+                .due
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .front()
+                .map(|(deadline, ..)| *deadline);
+            match first {
+                None => self.pushed.notified().await,
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
             }
-        });
+            let now = tokio::time::Instant::now();
+            let ended: Vec<(i64, u64)> = {
+                let mut due = self.due.lock().unwrap_or_else(|e| e.into_inner());
+                let ready = due.partition_point(|(deadline, ..)| *deadline <= now);
+                due.drain(..ready)
+                    .map(|(_, bot, generation)| (bot, generation))
+                    .collect()
+            };
+            if ended.is_empty() {
+                continue;
+            }
+            let opened = opened.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut opened = opened.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(map) = opened.as_mut() else {
+                    return;
+                };
+                for (bot, generation) in ended {
+                    if map.get(&bot).is_some_and(|open| {
+                        open.generation == generation && open.share.strong_count() == 0
+                    }) && let Some(open) = map.remove(&bot)
+                    {
+                        open.accepting.abort();
+                        let _ = std::fs::remove_file(open.path);
+                    }
+                }
+            })
+            .await;
+        }
     }
 }
 
@@ -89,6 +139,12 @@ fn capabilities_with(
     // The folder is made ready by the first bot to need it, once the
     // daemon owns its socket.
     let opened: Opened = std::sync::Arc::default();
+    let expiries = std::sync::Arc::new(Expiries {
+        due: Default::default(),
+        pushed: tokio::sync::Notify::new(),
+        grace,
+    });
+    runtime.spawn(expiries.clone().run(opened.clone()));
     let generations = std::sync::atomic::AtomicU64::new(0);
     let (place, own) = (folder.clone(), socket.to_owned());
     let closing = opened.clone();
@@ -111,9 +167,7 @@ fn capabilities_with(
                 std::sync::Arc::new(Share {
                     bot,
                     generation,
-                    opened: opened.clone(),
-                    runtime: runtime.clone(),
-                    grace,
+                    expiries: expiries.clone(),
                 })
             };
             let generation = generations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

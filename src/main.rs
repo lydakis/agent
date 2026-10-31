@@ -84,7 +84,10 @@ fn run() -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") if args.len() == 1 => {
-            println!("agent-runtime {}", env!("CARGO_PKG_VERSION"));
+            match option_env!("AGENT_COMMIT") {
+                Some(commit) => println!("agent-runtime {} ({commit})", env!("CARGO_PKG_VERSION")),
+                None => println!("agent-runtime {}", env!("CARGO_PKG_VERSION")),
+            }
             return Ok(0);
         }
         Some("--help" | "-h") if args.len() == 1 => {

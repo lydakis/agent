@@ -6466,6 +6466,39 @@ opening covers only a field's name and separator, so the cost of a read
 stays with the redaction it already did. The session sweep runs once per
 terminal or detached command, at its end, off the runtime thread.
 
+## A bot's socket listens while it is used (#563)
+
+A sandboxed bot's own socket now listens only while a share in it is
+held: by its turn's policy, or by a running command's sandbox hold. It
+closes 30 s after the last share goes. All the bots' graces wait in one
+daemon-wide queue, which one task sleeps on, and they are checked and
+unlinked off the runtime thread. A bot that never runs a sandboxed
+command pays nothing; one that does pays one refcount per command and
+one queue entry per last drop. The Perf workflow's matched screen, base
+main ee94271 against the PR head 27a842c, on the GitHub runner
+(2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.104 | 35.656 | -1.2% |
+| admission | burst submit p99, ms | 4.065 | 4.03 | -0.8% |
+| completion | release to terminal p99, ms | 12.768 | 12.083 | -5.4% |
+| footprint | idle RSS, MiB | 20.18 | 19.771 | -2.0% |
+| footprint | per idle bot, KiB | 1.596 | 1.482 | -7.1% |
+| footprint | RSS after a turn each, MiB | 28.031 | 28.76 | +2.6% |
+| footprint | CPU per turn, ms | 1.209 | 1.179 | -2.5% |
+| lifecycle | CPU, s | 1.08 | 1.075 | -0.5% |
+| lifecycle | p95 turn, ms | 724.404 | 600.866 | -17.1% |
+| lifecycle | peak RSS, MiB | 27.516 | 27.018 | -1.8% |
+
+Store jobs per turn held at about 7.5. These benches run unsandboxed, so
+their path differs only by an `Option` that stays `None`. The lifecycle
+p95 drop is the runner's: the base read 724 ms here against 583 ms on
+the #562 screen. What the change is for is descriptors: before it, every
+bot that had ever run a sandboxed command kept a listening socket and an
+accept task until the bot was deleted. Now only bots in use, or within
+30 s of their last use, keep one.
+
 ## Request bytes read on credit
 
 `bench/ingress_credits.py`: 400 clients connect to one socket daemon and each
