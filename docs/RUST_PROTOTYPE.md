@@ -2332,9 +2332,10 @@ gives a sandboxed command no way to it.
 Creating a sandboxed bot checks that sandboxes run here and refuses with
 `sandbox_unavailable` otherwise: on Linux, a system bubblewrap
 (`/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` or
-`/run/current-system/sw/bin/bwrap`, never one found on `PATH`, which could
-lie in a folder a bot may write) must make the user, pid and network
-namespaces; on
+`/run/current-system/sw/bin/bwrap`, or the one a package build fixed with
+`AGENT_BWRAP`, as the Homebrew formula does for its own; never one found on
+`PATH`, which could lie in a folder a bot may write) must make the user, pid
+and network namespaces; on
 macOS, `/usr/bin/sandbox-exec` must exist. A sandboxed bot never runs
 unconfined for want of one. A `writable` folder that doesn't exist is
 `path_not_found`.

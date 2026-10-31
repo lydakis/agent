@@ -733,11 +733,17 @@ mod linux {
         "/run/current-system/sw/bin/bwrap",
     ];
 
+    /// The bubblewrap a package build depends on, fixed when the daemon is
+    /// built (`AGENT_BWRAP`), as Flatpak's `--with-system-bubblewrap`:
+    /// Homebrew on Linux installs it under its own prefix.
+    const BUILT_WITH: Option<&str> = option_env!("AGENT_BWRAP");
+
+    fn places() -> impl Iterator<Item = &'static str> {
+        BUILT_WITH.into_iter().chain(BWRAP)
+    }
+
     fn bwrap() -> Option<PathBuf> {
-        BWRAP
-            .iter()
-            .map(PathBuf::from)
-            .find(|found| found.is_file())
+        places().map(PathBuf::from).find(|found| found.is_file())
     }
 
     /// The bubblewrap that sandboxes run in, checked once: a daemon
@@ -758,7 +764,7 @@ mod linux {
             return Err(format!(
                 "bubblewrap (bwrap) is not in {}; install it, for example with \
                      `apt install bubblewrap` or `dnf install bubblewrap`",
-                BWRAP.join(", ")
+                places().collect::<Vec<_>>().join(", ")
             ));
         };
         let output = std::process::Command::new(&bwrap)

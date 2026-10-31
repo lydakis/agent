@@ -34,6 +34,17 @@ class FormulaTest(unittest.TestCase):
         self.assertIn('shell_output("#{bin}/agent --version")', formula)
         self.assertNotIn("lydakis/agent/agent", formula)
 
+    def test_agent_on_linux_builds_in_its_bubblewrap(self):
+        formula = self.render("agent")
+        # The daemon never looks bwrap up on PATH, so the build fixes where
+        # Homebrew's is; macOS sandboxes with Seatbelt and needs neither.
+        self.assertIn('  on_linux do\n    depends_on "bubblewrap"\n  end\n', formula)
+        self.assertIn(
+            '    ENV["AGENT_BWRAP"] = (Formula["bubblewrap"].opt_bin/"bwrap").to_s if OS.linux?\n'
+            '    system "cargo", "install", *std_cargo_args\n',
+            formula,
+        )
+
     def test_sonny_pulls_in_agent(self):
         formula = self.render("sonny")
         self.assertIn('  depends_on "lydakis/agent/agent"\n  depends_on "ripgrep"\n', formula)
