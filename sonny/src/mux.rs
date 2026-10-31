@@ -779,8 +779,8 @@ pub fn here(socket: &Path, project: &str, host: Option<&str>) -> Option<Layout> 
 /// in: where the lead's Sonny last laid the project out, in that
 /// multiplexer; without one, in Herdr or cmux when the project's lead is in
 /// a Herdr pane or a cmux tab, else in the multiplexer project `like`'s
-/// home is in, else in Rex (or Herdr, or cmux, without Rex), made when
-/// needed.
+/// home is in, made when needed. With none of these, the lead is in no
+/// multiplexer, and neither is anything it would see.
 pub fn for_agent(socket: &Path, project: &str, like: Option<&str>) -> Result<Layout, String> {
     let herdr = crate::herdr::find();
     let cmux = crate::cmux::find();
@@ -788,43 +788,46 @@ pub fn for_agent(socket: &Path, project: &str, like: Option<&str>) -> Result<Lay
     let recall = |project| Place::file(socket, project).and_then(|file| Place::recall(&file));
     let kept = recall(project);
     let like = like.and_then(recall);
-    let backend: Box<dyn Backend> =
-        match (kept, herdr, cmux, rex) {
-            (Some(Place::Herdr { workspace }), Some(herdr), _, _) => Box::new(
-                crate::herdr::Herdr::open(herdr, project, None, Some(&workspace))?,
-            ),
-            (Some(Place::Cmux { workspace }), _, Some(cmux), _) => Box::new(
-                crate::cmux::Cmux::open(cmux, project, None, Some(&workspace))?,
-            ),
-            (Some(Place::Rex { session, host }), _, _, Some(rex)) => Box::new(
-                crate::rex::Rex::open(rex, host.as_deref(), project, false, Some(&session))?,
-            ),
-            (_, Some(herdr), _, _)
-                if crate::herdr::has_lead(&herdr, project)
-                    || matches!(like, Some(Place::Herdr { .. })) =>
-            {
-                Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
-            }
-            (_, _, Some(cmux), _)
-                if crate::cmux::has_lead(&cmux, project)
-                    || matches!(like, Some(Place::Cmux { .. })) =>
-            {
-                Box::new(crate::cmux::Cmux::open(cmux, project, None, None)?)
-            }
-            (_, _, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
-                crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
-            ),
-            (_, _, _, Some(rex)) => {
-                Box::new(crate::rex::Rex::open(rex, None, project, false, None)?)
-            }
-            (_, Some(herdr), _, None) => {
-                Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
-            }
-            (_, None, Some(cmux), None) => {
-                Box::new(crate::cmux::Cmux::open(cmux, project, None, None)?)
-            }
-            (_, None, None, None) => return Err("none of rex, herdr or cmux was found".into()),
-        };
+    let backend: Box<dyn Backend> = match (kept, herdr, cmux, rex) {
+        (Some(Place::Herdr { workspace }), Some(herdr), _, _) => Box::new(
+            crate::herdr::Herdr::open(herdr, project, None, Some(&workspace))?,
+        ),
+        (Some(Place::Cmux { workspace }), _, Some(cmux), _) => Box::new(crate::cmux::Cmux::open(
+            cmux,
+            project,
+            None,
+            Some(&workspace),
+        )?),
+        (Some(Place::Rex { session, host }), _, _, Some(rex)) => Box::new(crate::rex::Rex::open(
+            rex,
+            host.as_deref(),
+            project,
+            false,
+            Some(&session),
+        )?),
+        (_, Some(herdr), _, _)
+            if crate::herdr::has_lead(&herdr, project)
+                || matches!(like, Some(Place::Herdr { .. })) =>
+        {
+            Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
+        }
+        (_, _, Some(cmux), _)
+            if crate::cmux::has_lead(&cmux, project)
+                || matches!(like, Some(Place::Cmux { .. })) =>
+        {
+            Box::new(crate::cmux::Cmux::open(cmux, project, None, None)?)
+        }
+        (_, _, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
+            crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
+        ),
+        // A home no one watches would hide what it runs: the person
+        // reads this project's work in its lead's Sonny instead.
+        _ => {
+            return Err(format!(
+                "{project}'s lead is not in Rex, Herdr or cmux, so nothing opened there would be seen"
+            ));
+        }
+    };
     Ok(Layout::new(backend))
 }
 
@@ -851,13 +854,13 @@ pub fn install_skill(host: Option<&str>) {
             skill("cmux-tabs", text, "CMUX_BIN", bin)
         }
         Some(Kind::Rex(bin)) => rex(bin),
-        // Out of sight, Rex is the default.
-        None => match crate::rex::find() {
-            Some(bin) => rex(bin),
-            None => return,
-        },
+        // Out of every multiplexer, agents get none: nothing they opened
+        // in one would be seen.
+        None => ("", String::new()),
     };
-    crate::skills::install(name, &text);
+    if !name.is_empty() {
+        crate::skills::install(name, &text);
+    }
     for other in ["rex-windows", "herdr-panes", "cmux-tabs"] {
         if other != name {
             crate::skills::remove(other);
