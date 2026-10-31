@@ -1610,6 +1610,9 @@ struct Relayed {
     from: Option<String>,
     /// Whether `from` names a person, whom no agents' colour marks.
     person: bool,
+    /// Whether it rode along on a call rather than coming as a message:
+    /// drawn as an attachment of what the call carried.
+    attached: bool,
     /// The whole message while it is open, read again from the history
     /// when it opens, so a long conversation keeps none of them.
     text: Option<String>,
@@ -1621,6 +1624,13 @@ struct Relayed {
 struct Cluster {
     messages: Vec<Clustered>,
     open: bool,
+}
+
+impl Cluster {
+    /// Whether it gathers words attached to calls, which no message joins.
+    fn attached(&self) -> bool {
+        (self.messages.first()).is_some_and(|message| message.kind == transcript::ATTACHED)
+    }
 }
 
 /// A message in a [`Cluster`]: its node, what it is, and the calls the
@@ -4775,21 +4785,29 @@ impl App {
     /// The person's message at `node` landed: drawn as it reads, what
     /// they ran as it was when it ran, its last row tagged, and the
     /// message the bot now answers. Drawn `older` than the rest, what
-    /// they ran is no part of what this window ran.
+    /// they ran is no part of what this window ran. Words someone else
+    /// `attached` to a call are no message the bot answers: they hang
+    /// under what that call carried.
     fn land(
         &mut self,
         node: i64,
         (said, quotes): (&str, &str),
-        from: Option<&str>,
-        person: bool,
+        (from, person, attached): (Option<&str>, bool, bool),
         older: bool,
     ) {
+        let attached = attached && transcript::relays(said, from);
+        if attached {
+            if self.zen.is_none() {
+                self.land_relayed(node, said, from, (person, true));
+            }
+            return;
+        }
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
         // Words between agents are one quiet row a click opens; none in zen.
         if transcript::relays(said, from) {
             if self.zen.is_none() {
-                self.land_relayed(node, said, from, person);
+                self.land_relayed(node, said, from, (person, false));
             }
         } else {
             let prose = self.prose();
@@ -4814,24 +4832,36 @@ impl App {
     }
 
     /// The message between agents at `node`: one quiet row a click opens,
-    /// gathered with those right before it into one that lists them.
-    fn land_relayed(&mut self, node: i64, said: &str, from: Option<&str>, person: bool) {
+    /// gathered with those right before it into one that lists them; one
+    /// `attached` to a call only with others attached.
+    fn land_relayed(
+        &mut self,
+        node: i64,
+        said: &str,
+        from: Option<&str>,
+        (person, attached): (bool, bool),
+    ) {
         let relayed = Relayed {
             head: transcript::relayed_head(said, from),
             from: from.map(str::to_owned),
             person,
+            attached,
             text: None,
         };
         self.relayed.insert(node, relayed);
         let message = Clustered {
             node,
-            kind: transcript::relayed_kind(said, from),
+            kind: match attached {
+                true => transcript::ATTACHED,
+                false => transcript::relayed_kind(said, from),
+            },
             names: transcript::relayed_names(said, from),
             calls: Vec::new(),
         };
         if let Some((at, drawn)) = self.clustering
             && drawn == self.rows_drawn
             && let Some(cluster) = self.clusters.get_mut(&at)
+            && cluster.attached() == attached
         {
             cluster.messages.push(message);
             if self.draw_cluster(at) {
@@ -4859,15 +4889,23 @@ impl App {
             }
         }
         let at = self.group();
-        self.clusters.insert(
-            at,
-            Cluster {
-                messages: vec![message],
-                open: false,
-            },
-        );
+        let cluster = Cluster {
+            messages: vec![message],
+            open: false,
+        };
+        // Words attached to a call hang right under what it carried, as
+        // part of it: no row apart, as a reaction goes under its reply.
+        let attached = cluster.attached();
+        self.clusters.insert(at, cluster);
         let (lines, marks) = self.cluster_lines(at);
-        let from = self.commit_quiet(lines);
+        let from = match attached {
+            true => {
+                let count = lines.len();
+                self.commit_after(lines, false);
+                self.pending.len() - count
+            }
+            false => self.commit_quiet(lines),
+        };
         let tag = screen::Mark::Tag(screen::Tag::Group(at as u64));
         self.marks
             .extend((from..self.pending.len()).map(|line| (line, tag.clone())));
@@ -4902,7 +4940,12 @@ impl App {
         let Some(relayed) = self.relayed.get(&node) else {
             return Vec::new();
         };
-        match &relayed.text {
+        // Attached, under what the call carried, with the clip for an arrow.
+        let width = match relayed.attached {
+            true => width.saturating_sub(transcript::ATTACHED_INDENT + 1),
+            false => width,
+        };
+        let lines = match &relayed.text {
             Some(text) => {
                 let mut lines = transcript::relayed(text, relayed.from.as_deref(), true, width);
                 let calls = calls.iter().flatten().cloned().collect();
@@ -4914,6 +4957,10 @@ impl App {
                 let agent = relayed.from.as_deref().filter(|_| !relayed.person);
                 transcript::relayed_shut(&relayed.head, agent, width)
             }
+        };
+        match relayed.attached {
+            true => transcript::attached(lines),
+            false => lines,
         }
     }
 
@@ -4933,7 +4980,15 @@ impl App {
         let names: Vec<String> = (cluster.messages.iter())
             .flat_map(|m| m.names.iter().cloned())
             .collect();
-        let mut lines = vec![transcript::gathered(&kinds, &names, cluster.open, width)];
+        let mut lines = match cluster.attached() {
+            true => transcript::attached(vec![transcript::gathered(
+                &kinds,
+                &names,
+                cluster.open,
+                width.saturating_sub(transcript::ATTACHED_INDENT + 1),
+            )]),
+            false => vec![transcript::gathered(&kinds, &names, cluster.open, width)],
+        };
         let mut marks = vec![(
             0,
             screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON)),
@@ -5397,6 +5452,10 @@ impl App {
                             item["person"] = json!(true);
                         }
                     }
+                    // It rode along on a call rather than coming as a message.
+                    if entry["attached"] == true && item["role"] == "user" {
+                        item["attached"] = json!(true);
+                    }
                     // Where its quoted words are among its parts, and who
                     // wrote them.
                     if let Some(quotes) = quotes.as_ref().filter(|_| item["role"] == "user") {
@@ -5671,8 +5730,11 @@ impl App {
                         self.land(
                             node,
                             (&text(&item), &quotes_of(&item)),
-                            item["from"].as_str(),
-                            item["person"] == true,
+                            (
+                                item["from"].as_str(),
+                                item["person"] == true,
+                                item["attached"] == true,
+                            ),
                             older,
                         );
                     }
@@ -6192,8 +6254,11 @@ impl App {
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
-                        item["from"].as_str(),
-                        item["person"] == true,
+                        (
+                            item["from"].as_str(),
+                            item["person"] == true,
+                            item["attached"] == true,
+                        ),
                         false,
                     );
                     self.answered(&text(item), item["from"].as_str());
@@ -6219,8 +6284,11 @@ impl App {
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
-                        item["from"].as_str(),
-                        item["person"] == true,
+                        (
+                            item["from"].as_str(),
+                            item["person"] == true,
+                            item["attached"] == true,
+                        ),
                         false,
                     );
                     self.answered(&text(item), item["from"].as_str());
@@ -13904,7 +13972,7 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let quotes = "\n\ncalc.fix replied:\n> Fixed **it**.\n> 1\n> 2\n> 3\n> 4\n> 5\n> 6\n> 7";
-        app.land(6, ("ship that", quotes), None, false, false);
+        app.land(6, ("ship that", quotes), (None, false, false), false);
         let rows = drawn(&mut app);
         let rows: Vec<&str> = rows.iter().map(|row| row.trim_end()).collect();
         assert_eq!(
@@ -13935,7 +14003,7 @@ mod tests {
             transcript::reply("Merged it.", 80, std::path::Path::new("/")),
         );
         app.saw_reply(4, "Merged it.");
-        app.land(6, ("and tag it", ""), None, false, false);
+        app.land(6, ("and tag it", ""), (None, false, false), false);
         app.commit_said(
             8,
             transcript::reply("Tagged 0.4.0.", 80, std::path::Path::new("/")),
@@ -14077,7 +14145,7 @@ mod tests {
         };
         // Attached mid-turn: the history drew the message and what the bot
         // reacted with so far, and the turn's start comes again after it.
-        app.land(5, ("ship it", ""), None, false, false);
+        app.land(5, ("ship it", ""), (None, false, false), false);
         app.daemon(react("c1", "👀")).await;
         app.daemon(turn_event("tool_completed", 4, json!({"call_id": "c1"})))
             .await;
@@ -14103,7 +14171,7 @@ mod tests {
     async fn the_leads_reaction_goes_under_the_persons_message_wherever_it_is() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
-        app.land(5, ("ship it", ""), None, false, false);
+        app.land(5, ("ship it", ""), (None, false, false), false);
         app.commit(vec![Line::from("• Shipped.")]);
         app.picked.set(5, "calc.lead", "👀", false);
         app.place_picked(5);
@@ -14129,7 +14197,7 @@ mod tests {
         );
         // Reacted to before it landed: under it once it does.
         app.picked.set(7, "calc.lead", "👀", false);
-        app.land(7, ("and the notes", ""), None, false, false);
+        app.land(7, ("and the notes", ""), (None, false, false), false);
         assert_eq!(drawn(&mut app).last().unwrap(), "   👀 calc.lead ");
     }
 
@@ -14556,8 +14624,7 @@ mod tests {
         app.land(
             4,
             ("The build is green.\nI pushed the fix to calc.add.", ""),
-            Some("calc.add"),
-            false,
+            (Some("calc.add"), false, false),
             false,
         );
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
@@ -14574,6 +14641,7 @@ mod tests {
                 head: "From ana".into(),
                 from: Some("ana".into()),
                 person: true,
+                attached: false,
                 text: None,
             },
         );
@@ -14603,7 +14671,7 @@ mod tests {
         // with what the agent did about them while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
-        app.land(5, (updates, ""), None, false, false);
+        app.land(5, (updates, ""), (None, false, false), false);
         let steer =
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
         app.commit_call(
@@ -14639,7 +14707,7 @@ mod tests {
         );
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
-        app.land(6, (updates, ""), None, false, false);
+        app.land(6, (updates, ""), (None, false, false), false);
         assert_eq!(
             drawn(&mut app)[2..],
             [
@@ -14649,12 +14717,12 @@ mod tests {
             ]
         );
         // The person's own words are drawn as ever.
-        app.land(7, ("thanks", ""), None, false, false);
+        app.land(7, ("thanks", ""), (None, false, false), false);
         assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
         // A message a page drawn again put in a newer cluster opens there,
         // not in the cluster its rows were let go from.
         app.next_group = 9;
-        app.land(8, (updates, ""), None, false, false);
+        app.land(8, (updates, ""), (None, false, false), false);
         let stale = Cluster {
             messages: vec![Clustered {
                 node: 8,
@@ -14679,6 +14747,67 @@ mod tests {
         // The message landing, which a new cluster is about to hold, stays.
         app.forget(first, 4);
         assert!(app.relayed.contains_key(&4) && !app.relayed.contains_key(&5));
+    }
+
+    #[tokio::test]
+    async fn words_attached_to_a_call_hang_under_what_it_carried() {
+        let note = "[mira replied in the commons thread t42, where you posted.]";
+        let client = daemon_answering(move |asked| {
+            let node = asked["nodes"][0].as_i64().unwrap_or(0);
+            match asked["op"].as_str() {
+                Some("history_items") => json!({"items": [{"node": node, "item":
+                    {"type": "message", "role": "user", "content": note}}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.land(3, ("What changed?", ""), (None, false, false), false);
+        let mine = drawn(&mut app).len();
+        // Read with the person's message: right under it, a clip for an
+        // arrow, and no message the bot answers.
+        app.land(4, (note, ""), (Some("the commons"), false, true), false);
+        let rows = drawn(&mut app);
+        assert_eq!(rows[mine..], ["  📎 From the commons ▸"], "{rows:?}");
+        assert_eq!(app.answering.as_ref().map(|(_, _, node)| *node), Some(3));
+        // Another joins it; a message between agents does not.
+        app.land(5, (note, ""), (Some("calc.add"), false, true), false);
+        assert_eq!(
+            drawn(&mut app)[mine..],
+            ["  📎 2 attached notes · the commons, calc.add ▸"]
+        );
+        app.land(
+            6,
+            ("Check div too.", ""),
+            (Some("calc.add"), false, false),
+            false,
+        );
+        assert_eq!(
+            drawn(&mut app)[mine..],
+            [
+                "  📎 2 attached notes · the commons, calc.add ▸",
+                "",
+                "↳ From calc.add ▸"
+            ]
+        );
+        // Opened, each under it the same way, its words under it.
+        let at = *app.clusters.keys().next().unwrap();
+        app.press(&format!("fold/{at}")).await;
+        app.press("said/4").await;
+        let open = drawn(&mut app);
+        assert_eq!(
+            open[mine..mine + 4],
+            [
+                "  📎 2 attached notes · the commons, calc.add ▾",
+                "    📎 From the commons ▾",
+                "      [mira replied in the commons thread t42, where you posted.]",
+                "    📎 From calc.add ▸",
+            ]
+        );
+        // The person's own words attached are theirs, as ever.
+        app.land(7, ("thanks", ""), (None, false, true), false);
+        assert_eq!(drawn(&mut app).iter().rev().nth(1).unwrap(), "› thanks");
     }
 
     #[tokio::test]

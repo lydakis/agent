@@ -2879,6 +2879,67 @@ fn schema_69_finds_each_finished_turns_reply() {
 }
 
 #[test]
+fn schema_70_finds_each_attached_message_from_its_event() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema70-attached-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let nodes: Vec<i64> = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for (request, origin) in [("n1", Some("commons")), ("n2", None)] {
+            let attach = TurnOptions {
+                delivery: Delivery::Attach,
+                origin: origin.map(Into::into),
+                ..TurnOptions::default()
+            };
+            db.begin("Bob", request, "fyi", true, &attach, allow_provider)
+                .unwrap();
+        }
+        let turn = db
+            .begin(
+                "Bob",
+                "r1",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let absorbed = db
+            .absorb(
+                turn,
+                None,
+                8 << 20,
+                4096,
+                ContextUsage::default(),
+                false,
+                true,
+            )
+            .unwrap();
+        (absorbed.entries.iter())
+            .filter(|e| e["event"] == "steered")
+            .map(|e| e["data"]["node"].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(nodes.len(), 2);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE senders DROP COLUMN attached; PRAGMA user_version=70;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let read = db.history_items("Bob", &nodes).unwrap();
+    for item in read["items"].as_array().unwrap() {
+        assert_eq!(item["attached"], true, "{item}");
+    }
+    assert_eq!(read["items"][0]["origin"], "commons");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn events_keep_when_they_were_written_and_a_time_finds_its_cursor() {
     let path = std::env::temp_dir().join(format!("agent-written-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -5041,6 +5102,90 @@ fn an_attached_message_needs_no_workspace_and_joins_the_turn_that_names_one() {
         .unwrap();
     assert_eq!(absorbed.outcomes[0].0, note.turn);
     assert_eq!(db.context(turn).unwrap().workspace, "/synthetic/today");
+}
+
+#[test]
+fn an_attached_message_says_it_rode_along_where_a_steer_does_not() {
+    let mut db = db();
+    db.create("Nomad", Some("/synthetic/today"), binding())
+        .unwrap();
+    let by = |delivery, origin: Option<&str>| TurnOptions {
+        delivery,
+        origin: origin.map(Into::into),
+        ..TurnOptions::default()
+    };
+    // Attached while idle: one from a client, one the person sent.
+    db.begin(
+        "Nomad",
+        "n1",
+        "a reply in the commons",
+        true,
+        &by(Delivery::Attach, Some("commons")),
+        allow_provider,
+    )
+    .unwrap();
+    db.begin(
+        "Nomad",
+        "n2",
+        "👍",
+        true,
+        &by(Delivery::Attach, None),
+        allow_provider,
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Nomad",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.begin(
+        "Nomad",
+        "s1",
+        "task update",
+        true,
+        &by(Delivery::Steer, Some("tasks")),
+        allow_provider,
+    )
+    .unwrap();
+    let absorbed = db
+        .absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+    let steered: Vec<(Value, Value)> = (absorbed.entries.iter())
+        .filter(|e| e["event"] == "steered")
+        .map(|e| (e["data"]["origin"].clone(), e["data"]["attached"].clone()))
+        .collect();
+    assert_eq!(
+        steered,
+        [
+            (json!("commons"), json!(true)),
+            (Value::Null, json!(true)),
+            (json!("tasks"), Value::Null),
+        ]
+    );
+    // History says the same, with each message's node.
+    let nodes: Vec<i64> = (absorbed.entries.iter())
+        .filter(|e| e["event"] == "steered")
+        .map(|e| e["data"]["node"].as_i64().unwrap())
+        .collect();
+    let read = db.history_items("Nomad", &nodes).unwrap();
+    let attached: Vec<&Value> = (read["items"].as_array().unwrap().iter())
+        .map(|item| &item["attached"])
+        .collect();
+    assert_eq!(attached, [&json!(true), &json!(true), &Value::Null]);
 }
 
 #[test]
