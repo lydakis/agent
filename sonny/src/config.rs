@@ -49,7 +49,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 21] = [
+pub const SETTINGS: [Setting; 22] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -133,6 +133,12 @@ pub const SETTINGS: [Setting; 21] = [
         about: "when a note the agent puts up or changes opens the margin: always, unless you closed it with Esc, or never",
         values: &["always", "unless-closed", "never"],
         default: "always",
+    },
+    Setting {
+        key: "sonny.agent_opens",
+        about: "where a click on an agent's name takes you: its tab in Rex, Herdr or cmux, or a look beside the conversation; a right click, the other",
+        values: &["tab", "beside"],
+        default: "tab",
     },
     Setting {
         key: "sonny.suggest",
