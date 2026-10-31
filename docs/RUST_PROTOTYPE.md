@@ -2375,20 +2375,28 @@ block them by default, a sandboxed bot's commands reach only the Unix
 sockets its `unix_sockets` names. Not even those in its own folders: a hard
 link there to any socket, which needs no right to the socket, would reach
 it, and a named folder the bot may write lets one in the same way. On macOS
-Seatbelt holds them to those paths, network on or off. Linux does not
-hold them yet: bubblewrap's read-only root still lets a command connect to
-any socket it can see.
+Seatbelt holds them to those paths, network on or off. On Linux, where a
+read-only mount doesn't stop `connect`, a seccomp filter bubblewrap loads
+refuses every Unix socket a command would make, as Codex's Linux sandbox
+does; a filter can't see the path, so a bot whose `unix_sockets` names any
+reaches them all, as Claude Code's `allowAllUnixSockets` does. Socket pairs
+stay allowed. The filter also refuses `io_uring`, whose calls it can't see,
+and ends a command that makes system calls of another architecture.
 
 A sandboxed bot's commands reach the daemon through the bot's own socket,
 never the daemon's: so `agent` and the clients built on it work in its shell,
 as that bot and only as far as a sandboxed bot may go. The daemon opens the
 socket, `SOCKET.d/BOT_ID` beside its own, the first time one of the bot's
-commands runs, and closes it when the bot is deleted. On Linux it is bound over the
-daemon's socket in the sandbox, and the folder of the bots' sockets is
-hidden; on macOS Seatbelt denies the daemon's socket and that folder and
-allows the bot's own, network on or off. Either way the command's
-`AGENT_SOCKET` names it, and no command reaches another bot's. A request on
-it:
+commands runs, and closes it when the bot is deleted. On macOS Seatbelt
+denies the daemon's socket and that folder and allows the bot's own,
+network on or off. On Linux, where the command makes no Unix socket, the
+daemon hands it connections, as a broker does: `AGENT_SOCKET_FD` names a
+descriptor the command inherits, and each byte written to it is answered
+with a connection to the bot's own socket, passed over it, or none when
+that socket is gone. The bot's socket is also bound over the daemon's in
+the sandbox, and the folder of the bots' sockets is hidden. Either way the
+command's `AGENT_SOCKET` names it, the clients connect as it says, and no
+command reaches another bot's. A request on it:
 
 | Request | On a bot's own socket |
 |---|---|

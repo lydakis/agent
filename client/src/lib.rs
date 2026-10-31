@@ -267,15 +267,28 @@ impl Client {
     /// daemon does to a lagging follower: it drops the session and tells the
     /// UI `follow_lagged`, and the UI attaches again from its cursor.
     pub async fn connect(socket: &Path) -> Result<(Arc<Self>, Events)> {
-        let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
+        let unavailable = |error: std::io::Error| {
+            Error::with(
+                "daemon_unavailable",
+                &format!("{}: {error}", socket.display()),
+            )
+        };
+        let path = socket.to_owned();
+        // In a Linux sandbox, the connection the daemon hands this command.
+        let handed = tokio::task::spawn_blocking(move || socket::handed(&path))
             .await
-            .map_err(|_| Error::new("daemon_connect_timeout"))?
-            .map_err(|error| {
-                Error::with(
-                    "daemon_unavailable",
-                    &format!("{}: {error}", socket.display()),
-                )
-            })?;
+            .map_err(|_| Error::new("daemon_unavailable"))?
+            .map_err(unavailable)?;
+        let stream = match handed {
+            Some(stream) => {
+                stream.set_nonblocking(true).map_err(unavailable)?;
+                UnixStream::from_std(stream).map_err(unavailable)?
+            }
+            None => tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
+                .await
+                .map_err(|_| Error::new("daemon_connect_timeout"))?
+                .map_err(unavailable)?,
+        };
         let (read, write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
         let ready = match tokio::time::timeout(Duration::from_secs(5), lines.next_line())
