@@ -693,18 +693,28 @@ way `/react` does, and each note in the margin has its own `↩`.
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
   chat log only its own; the stars glide to their places. Esc lets go of
-  the pick, then the centre. With thousands of agents the sky folds: a star
-  for every agent that needs you, failed, works or was just lit, and for the
-  leads, as many as the pane has room for; the rest are a faint dot each,
-  so a cloud's density says how big it is, and the biggest clouds carry
-  their count. Names keep a row apart, the leads of the biggest projects
-  first, a cell of clear sky either side. Under 60 columns or 24 rows the
-  sky becomes a list, a firefly per agent and the last it said or was told.
-  `sonny sky` draws the same sky on its own, in the whole terminal, to keep
-  in another one beside the work, with your theme's grays and `NO_COLOR`
-  honoured, and `sonny sky --center NAME` starts on an agent (its name,
-  label or project); `q` leaves it, and a daemon that goes is followed
-  again once it is back.
+  the pick, then the centre. With thousands of agents the sky folds: a
+  star for every agent that needs you, failed, works or was just lit, and
+  for the leads, as many as the pane has room for; the rest are a faint
+  dot each, so a cloud's density says how big it is, and the biggest
+  clouds carry their count. Names keep a row apart, the leads of the
+  biggest projects first, a cell of clear sky either side. Under 60
+  columns or 24 rows the sky becomes a list, a firefly per agent and the
+  last it said or was told. `r` replays the last hour: the sky starts from
+  who was here then, all idle, and what they said and did plays over it,
+  eight times as fast, the chat log saying when each line happened. Space
+  pauses, the left and right arrows step back and on, `[` and `]` halve
+  and double the speed (up to 512 times), and Esc goes back to live; the
+  footer is the replay's line, with a bar from where it started to now. It
+  reads as far back as the daemon keeps events, from when they carry their
+  time, and keeps the last 100,000 to step back through. `sonny sky`
+  draws the same sky on its own, in the whole terminal,
+  to keep in another one beside the work, with your theme's grays and
+  `NO_COLOR` honoured, and `sonny sky --center NAME` starts on an agent
+  (its name, label or project) and `sonny sky --replay [WHEN]` plays the
+  past back from WHEN (`2h`, `30m` or `1d` ago, or a time such as `02:10`;
+  an hour ago when not said); `q` leaves it, and a daemon that goes is
+  followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
 
@@ -715,6 +725,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/sky with each agent in its model's colour](../docs/sonny/sky-models.png)
 
   ![/sky folded at 10,000 agents](../docs/sonny/sky-10000.png)
+
+  ![/sky replaying two hours at 64 times](../docs/sonny/sky-replay.gif)
 
   ![/sky centred on the shop lead](../docs/sonny/sky-centre.png)
 

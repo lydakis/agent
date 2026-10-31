@@ -244,7 +244,8 @@ fn usage() -> String {
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
-     on its own in the whole terminal; --center NAME puts an agent in the middle.\n\
+     on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
+     --replay [WHEN] plays the past back from WHEN: 2h, 30m or 1d ago, or 02:10 (an hour ago).\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -863,22 +864,33 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `sonny sky [--center NAME] [--store PATH] [--socket PATH]`: `/sky` on
-/// its own, the whole terminal, until q; centred on an agent, by its name,
-/// its label or its project, when asked.
+/// `sonny sky [--center NAME] [--replay [WHEN]] [--store PATH] [--socket
+/// PATH]`: `/sky` on its own, the whole terminal, until q; centred on an
+/// agent, by its name, its label or its project, when asked; playing the
+/// past back from WHEN, an hour ago when not said.
 fn sky_cli(args: &[String]) -> Result<(), String> {
-    let (mut store, mut socket, mut centre) = (None, None, None);
-    let mut args = args.iter();
+    const USAGE: &str =
+        "usage: sonny sky [--center NAME] [--replay [WHEN]] [--store PATH] [--socket PATH]";
+    let (mut store, mut socket, mut centre, mut replay) = (None, None, None, None);
+    let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--store" => store = args.next().map(PathBuf::from),
             "--socket" => socket = args.next().map(PathBuf::from),
             "--center" | "--centre" => centre = args.next().cloned(),
-            _ => {
-                return Err(
-                    "usage: sonny sky [--center NAME] [--store PATH] [--socket PATH]".into(),
-                );
+            "--replay" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let when = args.next_if(|next| !next.starts_with("--"));
+                replay = Some(match when {
+                    Some(when) => sky::replay_from(when, now).ok_or_else(|| {
+                        format!("--replay needs a time such as 2h, 30m, 1d or 02:10, not {when}")
+                    })?,
+                    None => now - 3_600_000,
+                });
             }
+            _ => return Err(USAGE.into()),
         }
     }
     let (_, socket) = daemon_paths(store, socket)?;
@@ -887,7 +899,7 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    sky::watch(&runtime, socket, centre)
+    sky::watch(&runtime, socket, centre, replay)
 }
 
 async fn run() -> Result<(), String> {
@@ -10124,7 +10136,12 @@ impl App {
                         Line::from(spans).style(line.style)
                     })
                     .collect();
-                pane.set_card(lines, SKY_KEYS);
+                let keys = if view.replaying() {
+                    SKY_REPLAY_KEYS
+                } else {
+                    SKY_KEYS
+                };
+                pane.set_card(lines, keys);
                 pane.foot = (!view.zen).then(|| view.footer(width));
             } else if let Some(view) = &watch.background {
                 // Its card, with what was done or the keys the pick takes
@@ -10970,7 +10987,8 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "↑↓←→ pick · m models · z zen · ? legend · esc close";
+const SKY_KEYS: &str = "↑↓←→ pick · m models · r replay · z zen · ? legend · esc close";
+const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
