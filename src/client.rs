@@ -105,6 +105,8 @@ struct Options {
     turn_budget_tokens: Option<u64>,
     /// `run --image`: pictures sent with the prompt, by path.
     images: Vec<String>,
+    /// `run --quote`: turns whose words the prompt quotes.
+    quotes: Vec<Value>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
     /// `follow --all`: every bot on one connection.
@@ -180,6 +182,7 @@ fn parse(args: &[String]) -> Result<Options> {
         budget_tokens: None,
         turn_budget_tokens: None,
         images: Vec::new(),
+        quotes: Vec::new(),
         turn: None,
         keep_turns: None,
         all: false,
@@ -438,6 +441,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         })?)
                     }
                     "--image" => options.images.push(value),
+                    "--quote" => options.quotes.push(quote(&value)?),
                     "--turn-budget-tokens" => {
                         options.turn_budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--turn-budget-tokens needs an integer")
@@ -1005,6 +1009,28 @@ fn created_by() -> Result<(Option<String>, Option<i64>)> {
     }
 }
 
+/// A `--quote`: `BOT/TURN`, as a handle names it with or without `turn:`,
+/// and `:reply` for the reply that turn ended with.
+fn quote(value: &str) -> Result<Value> {
+    let handle = value.strip_prefix("turn:").unwrap_or(value);
+    let (handle, reply) = match handle.strip_suffix(":reply") {
+        Some(handle) => (handle, true),
+        None => (handle, false),
+    };
+    let parsed = handle.rsplit_once('/').and_then(|(bot, turn)| {
+        let turn = turn.parse::<i64>().ok().filter(|turn| *turn > 0)?;
+        (!bot.is_empty()).then_some((bot, turn))
+    });
+    let Some((bot, turn)) = parsed else {
+        return fail_with("usage", "--quote needs BOT/TURN or BOT/TURN:reply");
+    };
+    let mut quote = json!({"bot":bot,"turn":turn});
+    if reply {
+        quote["reply"] = json!(true);
+    }
+    Ok(quote)
+}
+
 /// Inside a bot's shell tool the daemon also names the turn; a prompt a
 /// client submits from there is that turn's model's words, not a person's.
 fn author() -> Result<Value> {
@@ -1502,6 +1528,7 @@ fn run(options: &Options) -> Result<i32> {
                 "model":if created { Value::Null } else { json!(options.model) },
                 "effort":if created { Value::Null } else { json!(options.effort) },
                 "delivery":options.delivery.as_deref().unwrap_or("reject"),"expected_turn":options.turn,"from":from,
+                "quotes":(!options.quotes.is_empty()).then_some(&options.quotes),
                 "budget_tokens":options.turn_budget_tokens}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;

@@ -6061,3 +6061,37 @@ the gate's 15% in the direction that costs. The later head that counts the
 kept pictures toward a request's picture bound adds one indexed read to
 picture elision only, which runs when a request carries too many pictures,
 never in these benches.
+
+## A person's words and quoted turns (#477)
+
+A submit can now name the person who wrote it (`person`) and quote other
+turns (`quotes`), and each history item records when it was written
+(`nodes.written_ms`). A turn without quotes pays one empty check at begin;
+a quoted turn copies at most 64 prompts or replies, bounded at 256 KiB, in
+the same store job that starts it. Every node insert writes one more
+integer. The Perf workflow's matched screen, base main dac04eb against the
+PR head f4955a5, on the GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.915 | 30.551 | -1.2% |
+| admission | burst submit p99, ms | 4.322 | 4.11 | -4.9% |
+| completion | release to terminal p99, ms | 9.368 | 9.46 | +1.0% |
+| footprint | idle RSS, MiB | 19.252 | 19.135 | -0.6% |
+| footprint | per idle bot, KiB | 1.368 | 1.608 | +17.5% |
+| footprint | RSS after a turn each, MiB | 29.414 | 29.174 | -0.8% |
+| footprint | CPU per turn, ms | 0.89 | 0.899 | +1.1% |
+| lifecycle | CPU, s | 0.835 | 0.905 | +8.4% |
+| lifecycle | p95 turn, ms | 673.778 | 827.412 | +22.8% |
+| lifecycle | peak RSS, MiB | 25.828 | 25.709 | -0.5% |
+
+Store jobs per turn did not change (about 7.5 on both). Two timings warned,
+and both came from too few runs on a busy runner: the lifecycle bench runs
+once per round, and its base p95 here (674 ms) was itself far off the 580 ms
+earlier screens measured. Run again alternately on a 4-core Linux box, four
+rounds each, lifecycle p95 turn was 578 to 584 ms on the base and 581 to
+589 ms on the head, CPU 0.93 to 1.00 s against 0.94 to 1.03 s. Per idle bot
+over six runs each was 1.28 to 1.44 KiB on the base and 1.42 to 1.75 KiB on
+the head, a median gap of about 60 bytes, inside the spread earlier screens
+moved by (#467 measured 1.64 and 1.35 for one daemon). Idle bots write no
+nodes and carry no new state, so nothing in this change adds to them.

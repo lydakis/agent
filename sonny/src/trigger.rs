@@ -3192,7 +3192,7 @@ async fn adopt(client: &Client, name: &str, id: i64) {
         let _ = client.request("configure", Value::Object(fields)).await;
     }
     if unconfined(&record)
-        && let Some(fields) = crate::approvals::regate(&record, crate::approvals::MODES[0].0)
+        && let Some(fields) = crate::approvals::regate(&record, crate::approvals::default())
     {
         let mut asked = Value::Object(fields);
         asked["bot"] = json!(name);

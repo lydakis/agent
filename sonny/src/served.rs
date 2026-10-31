@@ -784,12 +784,14 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                             let answer = match call["name"] == EXEC {
                                 // In the host, where the servers stay up.
                                 true => script(&hub, &client, &call).await,
-                                false => answer(&client, &call, &me, &store, &socket).await,
+                                false => answer(&client, &call, &me, &store, &socket)
+                                    .await
+                                    .map(Value::String),
                             };
                             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                                 "call_id": call["call_id"]});
                             match answer {
-                                Ok(output) => asked["output"] = json!(cut(output)),
+                                Ok(output) => asked["output"] = cut_parts(output),
                                 Err((code, detail)) => {
                                     asked["error"] = json!({"code": code, "detail": cut(detail)})
                                 }
@@ -851,11 +853,45 @@ fn cut(mut text: String) -> String {
     text
 }
 
+/// An answer of text alone or of parts, its text held to `OUTPUT_BYTES`
+/// together, as `cut` holds text alone; its pictures the script bounded.
+fn cut_parts(output: Value) -> Value {
+    let Value::Array(parts) = output else {
+        return json!(cut(output.as_str().unwrap_or_default().to_owned()));
+    };
+    let mut left = OUTPUT_BYTES;
+    let parts = parts.into_iter().filter_map(|mut part| {
+        let Some(text) = part["text"].as_str() else {
+            return Some(part);
+        };
+        if left == 0 {
+            return None;
+        }
+        let mut end = text.len().min(left);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        left -= end;
+        let kept = match end < text.len() {
+            true => format!("{}\n[cut]", &text[..end]),
+            false => text.to_owned(),
+        };
+        part["text"] = json!(kept);
+        Some(part)
+    });
+    Value::Array(parts.collect())
+}
+
 /// An `exec` call answered here, with its script's time bounded by the
-/// call's.
-async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> Answer {
+/// call's: its text, and the pictures it showed.
+async fn script(
+    hub: &crate::mcp::Hub,
+    client: &Arc<Client>,
+    call: &Value,
+) -> Result<Value, (&'static str, String)> {
     let input = call["arguments"]["input"].as_str().unwrap_or_default();
     let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, EXEC).await?;
     let steps = crate::exec::Steps::new(
         client.clone(),
         bot.clone(),
@@ -865,6 +901,34 @@ async fn script(hub: &crate::mcp::Hub, client: &Arc<Client>, call: &Value) -> An
     crate::exec::answer(hub, &bot, input, left(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
+}
+
+/// Refuses `tool`, one Sonny gates, to `bot` when it acts outside a
+/// sandbox no one reviews calls from. The sandbox is read from `inspect`,
+/// which a `bots` listing leaves out; `bot_id`, when given, pins the bot.
+async fn unreviewed(
+    client: &Client,
+    bot: &str,
+    bot_id: &Value,
+    tool: &str,
+) -> Result<(), (&'static str, String)> {
+    if !GATED.contains(&tool) {
+        return Ok(());
+    }
+    let inspected = client
+        .request("inspect", json!({"bot": bot, "bot_id": bot_id}))
+        .await
+        .map_err(|e| ("caller_unknown", e.to_string()))?;
+    match crate::approvals::may_run(&inspected, tool) {
+        true => Ok(()),
+        false => Err((
+            "escalation_refused",
+            format!(
+                "{tool} acts outside your sandbox, and no one reviews calls for you; \
+                 do without it"
+            ),
+        )),
+    }
 }
 
 /// The time a call has left before the daemon gives up on it.
@@ -951,6 +1015,9 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         }
         None => record.clone(),
     };
+    let name = call["name"].as_str().unwrap_or_default();
+    // That bot, by its id, not one given its name since.
+    unreviewed(client, bot, &record["bot_id"], name).await?;
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -1132,6 +1199,31 @@ fn code(said: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_confined_agent_no_one_reviews_is_refused_a_pane() {
+        // The listing leaves the sandbox out; the bot's own record says it.
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc", "bot_id": 7, "gates": []}]}),
+            Some("inspect") if asked["bot_id"] == 7 || asked["bot_id"].is_null() => {
+                json!({"name": "calc",
+                "bot_id": 7, "gates": [], "settings": {"sandbox": "read-only"}})
+            }
+            _ => json!({"error": {"code": "unexpected"}}),
+        })
+        .await;
+        let call = json!({"bot": "calc", "turn": 1, "name": RUN,
+            "arguments": {"command": "touch /tmp/x"}});
+        let none = Path::new("/nowhere");
+        let refused = answer(&client, &call, none, none, none).await;
+        assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
+        // A script calls MCP servers, which run as the person too.
+        let script_call = json!({"bot": "calc", "turn": 1, "call_id": "c1", "name": EXEC,
+            "arguments": {"input": "1"}});
+        let hub = crate::mcp::Hub::new(None);
+        let refused = script(&hub, &client, &script_call).await;
+        assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
+    }
+
     #[test]
     fn outside_content_is_a_search_a_fetched_page_or_an_mcp_server() {
         let read = [
@@ -1227,6 +1319,17 @@ mod tests {
         let long = "é".repeat(OUTPUT_BYTES);
         assert!(cut(long).len() <= OUTPUT_BYTES + 6);
         assert_eq!(cut("short".into()), "short");
+        let picture = json!({"type": "image", "media_type": "image/png", "data": "AA=="});
+        let parts = cut_parts(
+            json!([{"type": "text", "text": "x".repeat(OUTPUT_BYTES - 2)},
+            picture, {"type": "text", "text": "abcd"}, picture, {"type": "text", "text": "gone"}]),
+        );
+        assert_eq!(parts[0]["text"].as_str().unwrap().len(), OUTPUT_BYTES - 2);
+        assert_eq!(
+            (&parts[1], &parts[2]["text"], &parts[3]),
+            (&picture, &json!("ab\n[cut]"), &picture)
+        );
+        assert_eq!(parts.as_array().unwrap().len(), 4);
         assert_eq!(code("task_not_started"), "task_not_started");
         assert_eq!(code("tasks_exist"), "tasks_exist");
         assert_eq!(code("Anything Else"), "tool_failed");
