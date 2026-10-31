@@ -6750,6 +6750,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_replay_keeps_its_seat_until_its_read_is_done() {
+        let dir = scratch("replay-seat");
+        let (store, _publications) = Store::open_with(&dir.join("state.sqlite"), 1)
+            .await
+            .unwrap();
+        let seats = Arc::new(tokio::sync::Semaphore::new(1));
+        let hub = Hub::default().with_page_seats(seats.clone());
+        // The one reader is busy, so the replay's page waits in its queue.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let busy = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .read("busy", move |_| {
+                        let _ = gate.recv();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        let sub = hub.subscribe(hub::ALL, 1, Output::writer(tokio::io::sink()), 0, None);
+        let paging = tokio::spawn(replay(store.clone(), hub.clone(), hub::ALL.to_owned(), sub));
+        while seats.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        paging.abort();
+        let _ = paging.await;
+        // The read it queued still runs on the reader: its seat is still held.
+        assert_eq!(seats.available_permits(), 0);
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seats.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read's end frees its seat");
+    }
+
+    #[tokio::test]
     async fn a_replay_racing_new_events_delivers_each_once_in_order() {
         use tokio::io::AsyncBufReadExt;
         let dir = scratch("replay-race");

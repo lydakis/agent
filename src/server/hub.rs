@@ -691,18 +691,20 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             (s.session, s.output.clone(), s.last_cursor, s.kinds.clone())
         };
         let page_bot = bot.clone();
-        let mut page = {
-            let _seat = hub
-                .pages
-                .acquire()
-                .await
-                .expect("page seats are never closed");
-            reader
-                .read("events_after", move |db| {
-                    event_page(db, &page_bot, after, 256)
-                })
-                .await?
-        };
+        // The seat goes with the read itself: a replay cancelled while its
+        // page waits or runs on a reader keeps it until the read is done.
+        let seat = hub
+            .pages
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("page seats are never closed");
+        let mut page = reader
+            .read("events_after", move |db| {
+                let _seat = seat;
+                event_page(db, &page_bot, after, 256)
+            })
+            .await?;
         let Value::Array(events) = page["events"].take() else {
             return fail("invalid_event_page");
         };
