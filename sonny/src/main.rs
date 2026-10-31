@@ -5872,11 +5872,7 @@ impl App {
         // Zen set in another window of this agent: its message starts or
         // joins a turn, so a turn is when to look.
         if matches!(kind, "accepted" | "steered") {
-            let focus = zen::focus(&self.bot);
-            if focus.is_some() != self.zen.is_some() {
-                self.repaint = true;
-            }
-            self.zen = focus;
+            self.zen_taken_up();
         }
         let data = &event["data"];
         let turn = event["turn"].as_i64();
@@ -6403,6 +6399,9 @@ impl App {
                 self.draw_bot_reactions();
                 self.approvals.clear();
                 self.notice = None;
+                // Zen the agent set, or put in its own words, as the person
+                // asked: the turn's end is when to look.
+                self.zen_taken_up();
                 if status == "completed" && !quiet && turn.is_some() && turn == self.yours {
                     self.suggest();
                 }
@@ -9550,6 +9549,17 @@ impl App {
         }
     }
 
+    /// This agent's zen as its file now says, set elsewhere: drawn again
+    /// in the other view when it starts or ends, and told.
+    fn zen_taken_up(&mut self) {
+        let focus = zen::focus(&self.bot);
+        if focus.is_some() != self.zen.is_some() {
+            self.notice = Some(zen_notice(focus.is_some()));
+            self.repaint = true;
+        }
+        self.zen = focus;
+    }
+
     /// `/zen FOCUS` or `/zen off`: sent to the agent as typed, whose zen
     /// skill takes it from there, then kept for this agent and drawn.
     async fn zen_command(&mut self, command: zen::Command, queue: bool) {
@@ -9566,10 +9576,7 @@ impl App {
             self.notice = Some(error);
         }
         let changed = self.zen.is_some() != focus.is_some();
-        self.notice = Some(match &focus {
-            Some(_) => "zen: only your turns and the agent's questions show; /zen ends it".into(),
-            None => "zen is off: the agent tells what it held".into(),
-        });
+        self.notice = Some(zen_notice(focus.is_some()));
         self.zen = focus;
         self.pane_keys = false;
         // Drawn again in the other view; a new focus redraws nothing.
@@ -10906,6 +10913,14 @@ fn responses(item: &Value) -> Vec<Value> {
     items
 }
 
+/// What the window says when zen starts or ends, however it was asked.
+fn zen_notice(on: bool) -> String {
+    match on {
+        true => "zen: only your turns and the agent's questions show; /zen ends it".into(),
+        false => "zen is off: the agent tells what it held".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12065,6 +12080,37 @@ mod tests {
             .await;
         assert_eq!(app.zen, None);
         assert!(app.repaint);
+    }
+
+    #[tokio::test]
+    async fn zen_the_agent_set_when_asked_in_words_is_taken_up_as_its_turn_ends() {
+        let mut app = app(zen_daemon().await);
+        app.daemon(turn_event("accepted", 4, json!({"node": 11})))
+            .await;
+        assert_eq!(app.zen, None);
+        // The person asked in words; the agent wrote the focus itself.
+        zen::set("b", Some("the rounding")).unwrap();
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(app.zen.as_deref(), Some("the rounding"));
+        assert!(app.repaint);
+        assert_eq!(app.notice.as_deref(), Some(zen_notice(true).as_str()));
+        // The agent puts the person's scribble in its own words, as with
+        // a goal; the footer takes them at the turn's end, nothing redrawn.
+        app.repaint = false;
+        zen::set("b", Some("rounding in total()")).unwrap();
+        app.daemon(turn_event(
+            "turn_finished",
+            4,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        assert_eq!(app.zen.as_deref(), Some("rounding in total()"));
+        assert!(!app.repaint);
     }
 
     #[tokio::test]

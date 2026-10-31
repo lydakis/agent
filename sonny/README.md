@@ -67,7 +67,9 @@ clears its own; see [Goals](../docs/SONNY.md#goals)). `/zen FOCUS` asks the agen
 that one thing and hold everything else back, and shows only your turns and
 its questions, in the middle of the window, under a footer of the focus and
 what needs you; it interrupts only with a question, and `/zen` again ends it
-and has the agent say what it held.
+and has the agent say what it held. Like a goal, the focus is the agent's to
+read: a few hurried words are enough, and the footer shows the focus in its
+words. Asking in words ("let's go into zen on the receipts") works too.
 
 ![Zen: only the person's turns and the agent's question, centred](../docs/sonny/zen.png)
 

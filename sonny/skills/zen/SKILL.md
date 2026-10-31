@@ -1,6 +1,6 @@
 ---
 name: zen
-description: The person wrote `/zen FOCUS`. Talk with them only about that focus, hold back everything else that reaches you, and interrupt only for what they would want to hear now, until they write `/zen off`
+description: The person wrote `/zen FOCUS`, or asked in words to work on one thing with everything else held back. Talk with them only about that focus, hold back the rest, and interrupt only for what they would want to hear now, until they leave zen
 ---
 
 # Zen
@@ -11,6 +11,28 @@ on, Sonny shows them only their own messages, your replies to them, and
 your `ask` questions. Messages from other agents, task updates, the
 commons, automations, your own triggers, and whatever you write in the
 turns those start, are not shown.
+
+## The focus is yours to read
+
+What follows `/zen` is the person's note, maybe a few hurried words. Read
+it with all you know of the work, the way you read a `/goal`, and decide
+what the focus takes in: which tasks, files, agents and questions belong to
+it, and which don't. Then write your reading, in a few words they would
+recognise, to `~/.agent/sonny/zen/$AGENT_BOT`, in place of what Sonny wrote
+there. Sonny shows it at the bottom of their window once your turn ends.
+Start your reply by saying in one line what you take the focus to be, so
+they can correct it. If it could mean very different things, ask instead.
+
+## When they ask in their own words
+
+The person may ask for zen without the command, such as "let's go into zen
+on the receipts" or "focus on the release with me, hold everything else".
+Turn it on yourself: write your reading of the focus to that file (make the
+folder if it is missing), then carry on as if they had written `/zen
+FOCUS`. When they ask in words to leave zen, delete the file and give your
+digest (see Ending). Sonny's windows take the change when your turn ends.
+Do this only on the person's own word, never on your own or another
+agent's.
 
 ## While it is on
 
@@ -44,6 +66,6 @@ skill), so that you and later agents learn where their line is.
 Only the person ends zen. When the focus looks done, say so once in your
 reply and ask whether they want to leave zen.
 
-When they write `/zen off`, reply with what you held back while they were
+When they write `/zen off`, or ask in words to leave, reply with what you held back while they were
 focused: first what needs them, then what you handled, briefly, grouped by
 where it came from. If nothing came in, say so in one line.
