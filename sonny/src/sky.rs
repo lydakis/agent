@@ -51,6 +51,10 @@ const LIVE: &[&str] = &[
 ];
 /// How long a spark takes to cross.
 const FLIGHT: Duration = Duration::from_millis(1100);
+/// More leaves than this under one agent spread into a cloud.
+const CROWD: usize = 12;
+/// The most sparks drawn at once.
+const SPARKS: usize = 12;
 /// How long stars take to glide to new places, when the lens or the centre
 /// changes.
 const GLIDE: Duration = Duration::from_millis(330);
@@ -260,6 +264,8 @@ struct Agent {
     goal: Option<(f32, f32)>,
     angle: f32,
     root: bool,
+    /// The root whose arm it is on, in the tree.
+    arm: usize,
 }
 
 impl Agent {
@@ -896,7 +902,25 @@ impl View {
         self.laid = true;
         let count = self.agents.len();
         let (roots, children) = self.tree();
-        let (tree, order) = radial(&roots, &children, count);
+        let (mut tree, order) = radial(&roots, &children, count);
+        // A crowd of leaves under one agent spreads inward, each by its
+        // own name, so it reads as a cloud whose density says its size
+        // rather than a hard ring; the spread is the same every time.
+        for kids in children.iter().filter(|kids| kids.len() > CROWD) {
+            for &kid in kids.iter().filter(|&&kid| children[kid].is_empty()) {
+                if let Some(((x, y), _)) = &mut tree[kid] {
+                    let pull = 1.0 - 0.32 * hashed(&self.agents[kid].name);
+                    (*x, *y) = (*x * pull, *y * pull);
+                }
+            }
+        }
+        let mut arm = 0;
+        for &(at, depth) in &order {
+            if depth == 0 {
+                arm = at;
+            }
+            self.agents[at].arm = arm;
+        }
         self.order = order;
         for agent in &mut self.agents {
             agent.root = false;
@@ -1112,6 +1136,44 @@ impl View {
             .or_else(|| self.agent(&lead))
     }
 
+    /// Which agents draw as stars: all when they fit in `room`, else the
+    /// most interesting first. Interest is what a glance can act on, then
+    /// what happens, then place: needs you 1000, failed 500, working 40,
+    /// 30 for a glow just lit, 60 for a lead. What needs the person or
+    /// failed, and `always`, draw whatever the room.
+    fn shown(&self, now: Instant, room: usize, always: &[Option<usize>]) -> Vec<bool> {
+        let count = self.agents.len();
+        let live = self.agents.iter().filter(|a| !a.gone).count();
+        if live <= room {
+            return vec![true; count];
+        }
+        let interest = |at: usize| {
+            let agent = &self.agents[at];
+            let state = match agent.state() {
+                Some(State::NeedsYou) => 1000.0,
+                Some(State::Failed) => 500.0,
+                Some(State::Working) => 40.0,
+                None => 0.0,
+            };
+            state
+                + 30.0 * agent.glow(now).max(agent.warmth(now).min(1.0))
+                + if agent.root { 60.0 } else { 0.0 }
+        };
+        let mut ranked: Vec<(f32, usize)> = (0..count)
+            .filter(|&at| !self.agents[at].gone)
+            .map(|at| (interest(at), at))
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut shown = vec![false; count];
+        for (n, (score, at)) in ranked.into_iter().enumerate() {
+            shown[at] = n < room || score >= 500.0;
+        }
+        for at in always.iter().flatten() {
+            shown[*at] = true;
+        }
+        shown
+    }
+
     /// Put the agent asked for in the middle, or the person again.
     pub fn centre_on(&mut self, name: Option<String>) {
         if self.centre != name {
@@ -1237,6 +1299,13 @@ impl View {
         };
         let mut sky = Sky::new(sky_cols, sky_rows);
         let centre = self.centred();
+        let picked = self.pick.as_deref().and_then(|name| self.agent(name));
+        // At scale, the sky draws its most interesting agents as stars,
+        // as many as the pane has room for, and folds the rest into a
+        // faint cloud on their arm (Furnas' degree of interest). What
+        // needs the person or failed always draws.
+        let room = (sky_cols * sky_rows / 24).max(8);
+        let shown = self.shown(now, room, &[picked, centre]);
         // The person: the place and the word say who. In the middle, or
         // on a ring when an agent is centred.
         sky.text_at(self.person.at, "you", Style::default().bold());
@@ -1248,6 +1317,7 @@ impl View {
             for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
                 if let Some(by) = self.maker(at)
                     && !agent.root
+                    && shown[at]
                 {
                     sky.line(self.agents[by].at, agent.at, Ink::Faint, 3);
                 }
@@ -1295,7 +1365,7 @@ impl View {
             sky.curve(a, bend(a, b), b, ink, gap);
         }
         // Ripples and flashes, then sparks, then the stars over them.
-        for agent in self.agents.iter().filter(|a| !a.gone) {
+        for (_, agent) in (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at]) {
             if let Some((at, reach)) = agent.ripple {
                 let t = now.duration_since(at).as_secs_f32() / RIPPLE.as_secs_f32();
                 if t < 1.0 {
@@ -1320,7 +1390,8 @@ impl View {
                 sky.circle(agent.at, dots, ink);
             }
         }
-        for spark in &self.sparks {
+        // The newest dozen in flight: more is a blur, not news.
+        for spark in self.sparks.iter().rev().take(SPARKS) {
             let t = (now.duration_since(spark.born).as_secs_f32() / FLIGHT.as_secs_f32()).min(1.0);
             let (a, b) = (self.end(spark.from), self.end(spark.to));
             let control = match (spark.from, spark.to) {
@@ -1341,7 +1412,19 @@ impl View {
             }
         }
         let shade = Shade::now();
-        for agent in self.agents.iter().filter(|a| !a.gone) {
+        // The folded: a faint dot each, so a cloud's density says its size,
+        // and a count on each arm.
+        let mut folded: HashMap<usize, (usize, (f32, f32))> = HashMap::new();
+        for (at, agent) in self.agents.iter().enumerate() {
+            if agent.gone || shown[at] {
+                continue;
+            }
+            sky.dot(agent.at, Ink::Faint);
+            let cloud = folded.entry(agent.arm).or_insert((0, (0.0, 0.0)));
+            cloud.0 += 1;
+            cloud.1 = (cloud.1.0 + agent.at.0, cloud.1.1 + agent.at.1);
+        }
+        for (_, agent) in (self.agents.iter().enumerate()).filter(|(at, a)| !a.gone && shown[*at]) {
             if let Some((at, color, work)) = agent.twinkle
                 && now.duration_since(at) < TWINKLE
             {
@@ -1363,7 +1446,7 @@ impl View {
         let mut named: Vec<usize> = (0..self.agents.len())
             .filter(|&at| {
                 let agent = &self.agents[at];
-                if agent.gone {
+                if agent.gone || !shown[at] {
                     return false;
                 }
                 if self.zen {
@@ -1376,14 +1459,17 @@ impl View {
                         .is_some_and(|lit| now.duration_since(lit) < Duration::from_secs(4))
             })
             .collect();
-        let picked = self.pick.as_deref().and_then(|name| self.agent(name));
         for at in picked.into_iter().chain(centre) {
             if !named.contains(&at) {
                 named.push(at);
             }
         }
         // The pick, the centre, then what needs the person, so none is
-        // ever crowded out.
+        // ever crowded out; leads of the biggest projects before the rest.
+        let mut sizes: HashMap<usize, usize> = HashMap::new();
+        for agent in self.agents.iter().filter(|agent| !agent.gone) {
+            *sizes.entry(agent.arm).or_default() += 1;
+        }
         named.sort_by_key(|&at| {
             let agent = &self.agents[at];
             (
@@ -1391,10 +1477,24 @@ impl View {
                 Some(at) != centre,
                 agent.state() != Some(State::NeedsYou),
                 !agent.root,
+                std::cmp::Reverse(agent.root.then(|| sizes.get(&agent.arm).copied())),
                 (agent.at.0.hypot(agent.at.1) * 100.0) as i32,
             )
         });
+        // As many names as a third of the rows, the next in line taking
+        // the place of one with no room: what needs the person beyond
+        // them is counted on its arm instead.
+        let labels = (sky_rows / 3).max(4);
+        let mut unnamed: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut placed = 0;
         for at in named {
+            let agent = &self.agents[at];
+            if placed == labels {
+                if agent.state() == Some(State::NeedsYou) {
+                    *unnamed.entry(agent.arm).or_default() += 1;
+                }
+                continue;
+            }
             let agent = &self.agents[at];
             // The mark says what the colour does: `? ` for an agent that
             // needs you, `✗ ` for one that failed. Bold while it works.
@@ -1411,11 +1511,29 @@ impl View {
                 (_, true) => Style::default().bold(),
                 _ => name_style(agent.state(), agent.glow(now)),
             };
-            sky.label(agent.at, mark, &short(&agent.name), style);
+            placed += usize::from(sky.label(agent.at, mark, &short(&agent.name), style));
         }
         if self.lens == Lens::Models && centre.is_none() && !self.zen {
             for (model, at) in &self.groups {
                 sky.label(*at, None, model, Ink::Muted.style());
+            }
+        }
+        for (arm, n) in unnamed {
+            let mark = Some(("?", Style::default().fg(NEEDS).bold()));
+            sky.label(
+                self.agents[arm].at,
+                mark,
+                &n.to_string(),
+                Style::default().bold(),
+            );
+        }
+        // The biggest clouds are counted, as many as half the names.
+        if !self.zen {
+            let mut clouds: Vec<_> = folded.into_iter().collect();
+            clouds.sort_by_key(|&(arm, (n, _))| (std::cmp::Reverse(n), arm));
+            for (_, (n, (x, y))) in clouds.into_iter().take(labels / 2) {
+                let middle = (x / n as f32, y / n as f32);
+                sky.label(middle, None, &format!("+{n}"), Ink::Muted.style());
             }
         }
         let drawn = sky.lines();
@@ -1918,6 +2036,14 @@ fn radial(
     (places, order)
 }
 
+/// A name's own number in 0..1, the same every time.
+fn hashed(name: &str) -> f32 {
+    let hash = (name.bytes()).fold(2166136261u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(16777619)
+    });
+    (hash % 10_000) as f32 / 10_000.0
+}
+
 fn weight(at: usize, children: &[Vec<usize>]) -> usize {
     fn go(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
         if depth > children.len() {
@@ -2212,8 +2338,15 @@ impl Sky {
     }
 
     /// Words beside a point, a mark before them, right of it where they
-    /// fit, else left; never over or against other words.
-    fn label(&mut self, at: (f32, f32), mark: Option<(&str, Style)>, words: &str, style: Style) {
+    /// fit, else left; never over or against other words. False when
+    /// there is no room for them.
+    fn label(
+        &mut self,
+        at: (f32, f32),
+        mark: Option<(&str, Style)>,
+        words: &str,
+        style: Style,
+    ) -> bool {
         let (_, y) = self.spot(at);
         let row = (y / 4.0) as usize;
         let marked = match mark {
@@ -2223,7 +2356,7 @@ impl Sky {
         let words = marked.as_str();
         let width = words.width();
         if row >= self.rows || width + 2 > self.cols {
-            return;
+            return false;
         }
         // A blank cell between the words and their star, whichever cells
         // the star covers.
@@ -2234,29 +2367,43 @@ impl Sky {
             true => [right, left],
             false => [left, right],
         };
-        let Some(start) = sides.into_iter().flatten().find(|&start| {
-            self.clear_of_stars(row, start, width, &own) && self.put(row, start, words, style)
+        // Beside the star on its own row, else centred over it, else under
+        // it, as a map places a name where the dots leave room.
+        let centred = (own.start() + 1).saturating_sub(width / 2);
+        let spots = (sides
+            .into_iter()
+            .flatten()
+            .map(|start| (row, start, Some(own.clone()))))
+        .chain((row > 0).then(|| (row - 1, centred, None)))
+        .chain((row + 1 < self.rows).then(|| (row + 1, centred, None)));
+        let Some((row, start)) = spots.into_iter().find_map(|(row, start, own)| {
+            (start + width <= self.cols
+                && self.clear_of_stars(row, start, width, own.as_ref())
+                && self.put(row, start, words, style))
+            .then_some((row, start))
         }) else {
-            return;
+            return false;
         };
         if let Some((mark, mark_style)) = mark {
             for (cell, ch) in (row * self.cols + start..).zip(mark.chars()) {
                 self.text[cell] = Some((ch, mark_style));
             }
         }
+        true
     }
 
     /// No other agent's star in the cells words would take or the blank
-    /// either side of them.
+    /// either side of them; `own`, the cells of the star they name.
     fn clear_of_stars(
         &self,
         row: usize,
         start: usize,
         width: usize,
-        own: &std::ops::RangeInclusive<usize>,
+        own: Option<&std::ops::RangeInclusive<usize>>,
     ) -> bool {
-        (start.saturating_sub(1)..(start + width + 1).min(self.cols))
-            .all(|col| own.contains(&col) || !self.stars[row * self.cols + col])
+        (start.saturating_sub(1)..(start + width + 1).min(self.cols)).all(|col| {
+            own.is_some_and(|own| own.contains(&col)) || !self.stars[row * self.cols + col]
+        })
     }
 
     /// Words centred on a point.
@@ -2267,14 +2414,22 @@ impl Sky {
         self.put(row, start, words, style);
     }
 
-    /// Words put at a place in a row, a blank cell kept either side so
-    /// two names never run together; false when they don't fit there.
+    /// Words put at a place in a row, a blank cell kept either side and
+    /// a blank row above and below, so names never run together or
+    /// stack into a column; false when they don't fit there.
     fn put(&mut self, row: usize, start: usize, words: &str, style: Style) -> bool {
         let count = words.chars().count();
+        if start + count > self.cols {
+            return false;
+        }
         let cells = row * self.cols + start..row * self.cols + start + count;
-        let around = row * self.cols + start.saturating_sub(1)
-            ..row * self.cols + (start + count + 1).min(self.cols);
-        if start + count > self.cols || self.text[around].iter().any(Option::is_some) {
+        let span = start.saturating_sub(1)..(start + count + 1).min(self.cols);
+        let crowded = (row.saturating_sub(1)..(row + 2).min(self.rows)).any(|near| {
+            self.text[near * self.cols + span.start..near * self.cols + span.end]
+                .iter()
+                .any(Option::is_some)
+        });
+        if crowded {
             return false;
         }
         for (cell, ch) in cells.zip(words.chars()) {
@@ -2854,6 +3009,76 @@ mod tests {
         assert_eq!(view.pick.as_ref(), Some(&first));
         let listed = text(&view.card(40, 12));
         assert!(listed.contains(&short(&first)), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn a_crowd_folds_to_clouds_and_keeps_who_needs_you() {
+        let (mut view, send) = view();
+        let mut bots = vec![json!({"name": "shop.lead"}), json!({"name": "notes.lead"})];
+        for n in 0..2000 {
+            let lead = if n % 4 == 0 {
+                "notes.lead"
+            } else {
+                "shop.lead"
+            };
+            bots.push(
+                json!({"name": format!("{}.t{n}", &lead[..lead.len() - 5]), "created_by": lead}),
+            );
+        }
+        send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Live(
+            json!({"cursor": 1, "event": "tool_started", "bot": "shop.t7",
+            "turn": 1, "data": {"name": "ask"}}),
+        ))
+        .unwrap();
+        view.drain();
+        let (cols, rows) = (150 - LOG_COLS - GAP, 46);
+        let sky = text(&view.card(150, 46));
+        // Who needs the person is always a star and named; the leads too.
+        let room = (cols * (rows - 3) / 24).max(8);
+        let shown = view.shown(Instant::now(), room, &[]);
+        assert!(shown[view.index["shop.t7"]]);
+        assert!(shown.iter().filter(|&&shown| shown).count() <= room + 3);
+        assert!(sky.contains("? t7"), "{sky}");
+        assert!(
+            sky.contains("shop lead") && sky.contains("notes lead"),
+            "{sky}"
+        );
+        // The rest are counted as clouds, the biggest first, never more
+        // counts than half the names.
+        let counts = sky
+            .split_whitespace()
+            .filter(|word| word.starts_with('+'))
+            .count();
+        assert!((1..=rows / 3 / 2).contains(&counts), "{sky}");
+        // No two names on rows next to each other overlap.
+        let lines: Vec<&str> = sky.lines().collect();
+        for pair in lines.windows(2) {
+            let words = |line: &str| -> Vec<(usize, usize)> {
+                let line: Vec<char> = line.chars().take(cols).collect();
+                let mut spans = Vec::new();
+                let mut at = 0;
+                while at < line.len() {
+                    if line[at].is_alphanumeric() {
+                        let start = at;
+                        while at < line.len()
+                            && line[at] != ' '
+                            && !('\u{2800}'..='\u{28ff}').contains(&line[at])
+                        {
+                            at += 1;
+                        }
+                        spans.push((start, at));
+                    }
+                    at += 1;
+                }
+                spans
+            };
+            for (a, b) in words(pair[0]) {
+                for (c, d) in words(pair[1]) {
+                    assert!(b <= c || d <= a, "names stacked:\n{}\n{}", pair[0], pair[1]);
+                }
+            }
+        }
     }
 
     #[tokio::test]
