@@ -80,6 +80,26 @@ def deepen(bench, turns, size):
             time.sleep(.2)
 
 
+def replaying(path, count, timeout=600):
+    """Open `count` sessions that each follow every bot from the first
+    event, and wait until each has caught up: whole-store replays. Returns
+    the events they received."""
+    conns = [Conn(path) for _ in range(count)]
+    for conn in conns:
+        reply = conn.request('follow', bot='*', after=0)
+        assert 'result' in reply, reply
+    deadline = time.monotonic() + timeout
+    for conn in conns:
+        with conn.cond:
+            while not conn.live:
+                if not conn.cond.wait(deadline - time.monotonic()):
+                    raise TimeoutError('a replay never caught up')
+    received = sum(conn.events for conn in conns)
+    for conn in conns:
+        conn.sock.close()
+    return received
+
+
 def floods(bench, count, flooder=0):
     """Each flood's requests for one flooding connection; `flooder` keeps
     the bots one creates and deletes its own."""
@@ -99,6 +119,8 @@ def floods(bench, count, flooder=0):
             ('create', {'bot': f'flood{flooder}-{i}', 'workspace': str(bench.out),
                         'model': 'openai/synthetic-model', 'instructions': 'x', 'tools': []}),
             ('delete', {'bot': f'flood{flooder}-{i}'}))],
+        # Sessions each replaying every bot's events from the first.
+        'follow': [None] * max(1, count // 500),
     }
 
 
@@ -148,7 +170,12 @@ def main():
             replies = [None] * len(flooders)
 
             def flood(index):
-                replies[index] = flooders[index].many(plans[index][kind], timeout=600)
+                if kind == 'follow':
+                    replies[index] = []
+                    events[index] = replaying(bench.socket, len(plans[index][kind]))
+                else:
+                    replies[index] = flooders[index].many(plans[index][kind], timeout=600)
+            events = [0] * len(flooders)
             threads = [threading.Thread(target=flood, args=(i,)) for i in range(len(flooders))]
             started = time.monotonic()
             for thread in threads:
@@ -161,6 +188,8 @@ def main():
             results[kind] = {'requests': sent, 'flood_s': round(elapsed, 2),
                              'per_s': round(sent / elapsed), 'errors': len(bad),
                              'probe': probe.done()}
+            if kind == 'follow':
+                results[kind]['events'] = sum(events)
             print(kind, json.dumps(results[kind]), flush=True)
         print(json.dumps(results, indent=1))
         Path(args.out, 'results.json').write_text(json.dumps(results, indent=1))

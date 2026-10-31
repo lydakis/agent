@@ -47,11 +47,14 @@ in [`Service::dispatch`](../src/server/mod.rs); storage execution is in
 | --- | --- |
 | `bots`, `turns`, `inspect`, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
 | `history_nodes`, `history_items` | Reader shared with model-context construction |
-| `follow` | Bot inspection and replay on the worker; live delivery through the hub |
+| `follow` | Bot inspection on the worker; replay pages on the reader pool; the switch to live on the worker; live delivery through the hub |
 | `wait` | Handle registration and settlement against durable outcomes |
 
-[`Hub::replay`](../src/server/hub.rs) performs its final replay-to-live
-transition on the worker to avoid missing a commit between those modes.
+[`Hub::replay`](../src/server/hub.rs) reads its pages on the reader pool,
+at most all but one reader at a time across every replay, and holds no
+subscription lock while it reads. Only the final replay-to-live transition
+runs on the worker, as one job that reads at most one event, so no commit
+falls between those modes.
 `Hub::fan_out` visits subscriptions and clones events into their output
 queues. Slow socket followers close on a failed `try_send`; the stdio owner
 is backpressured and is not the observer transport.
@@ -112,9 +115,10 @@ The implementation must satisfy the whole path from admission to delivery:
    subscriptions. Byte sharing does not remove per-subscriber CPU work.
    Close overloaded followers promptly; they reconnect from their last
    received durable cursor.
-5. **Preserve replay ordering.** Replay pages use the observer reader.
-   The final transition remains ordered with commits, but handoffs are
-   admitted in bounded batches with at most one batch queued on the
+5. **Preserve replay ordering.** Replay pages use the reader pool (done,
+   #391 follow-up). The final transition remains ordered with commits;
+   each is one single-event job today, and still to do is admitting
+   handoffs in bounded batches with at most one batch queued on the
    worker. Validate each follower against its requested stream, including
    a quiet bot whose last event is older than the fleet's last cursor.
    The hub keys subscriptions and replay by name today. Capture the bot
