@@ -3347,8 +3347,9 @@ impl App {
                 mode,
                 &approvals::gateable(&self.tools, declared),
             ));
-            // A lead's sandbox goes with its mode.
-            if self.project.is_some() {
+            // An agent's sandbox goes with its row, a lead's or a task's;
+            // a side chat keeps its agent's.
+            if !SIDE.load(std::sync::atomic::Ordering::Relaxed) {
                 let workspace = std::path::Path::new(&self.workspace);
                 fields.extend(approvals::sandbox(mode, workspace));
             }

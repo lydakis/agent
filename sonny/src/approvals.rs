@@ -530,6 +530,21 @@ pub fn sandboxed_as(record: &Value, fields: &Map<String, Value>) -> bool {
             == fields["network"].as_bool().unwrap_or(false)
 }
 
+/// Whether the bot `record` describes may run Sonny's tool `tool`: any
+/// tool not in `served::GATED`, and one of those, which act outside the
+/// agent's sandbox, only once a gate has judged it or for an agent with
+/// no sandbox. A confined row no one reviews refuses them, as the daemon
+/// refuses its other ways out of the sandbox.
+pub fn may_run(record: &Value, tool: &str) -> bool {
+    let confined = matches!(
+        record["settings"]["sandbox"].as_str(),
+        Some("workspace-write" | "read-only")
+    );
+    let judged = (record["gates"].as_array().into_iter().flatten())
+        .any(|gate| (gate["tools"].as_array().into_iter().flatten()).any(|gated| gated == tool));
+    !crate::served::GATED.contains(&tool) || judged || !confined
+}
+
 /// What a bot's gate may hold back: its own `tools`, and of the tools its
 /// client declared, those Sonny gates (`served::GATED`).
 pub fn gateable(tools: &[String], declared: &Value) -> Vec<String> {
@@ -864,6 +879,25 @@ mod tests {
         assert_eq!(mode_in(&night, &modes[..4]), None);
         assert_eq!(mode_in(&strict, &modes[..4]), Some("auto"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_confined_agent_no_one_reviews_has_no_way_out_through_sonny() {
+        let run = crate::served::RUN;
+        let bot = |sandbox: Value, gates: Value| json!({"settings": {"sandbox": sandbox}, "gates": gates});
+        // Read only, no reviewer: a pane runs outside the sandbox, so no.
+        assert!(!may_run(&bot(json!("read-only"), json!([])), run));
+        assert!(!may_run(&bot(json!("workspace-write"), json!([])), run));
+        // A tool that stays inside still runs.
+        assert!(may_run(
+            &bot(json!("read-only"), json!([])),
+            crate::served::MEMORY
+        ));
+        // Judged by a gate, or with no sandbox at all, it runs.
+        let gated = json!([{"tag": "manual", "tools": [run]}]);
+        assert!(may_run(&bot(json!("read-only"), gated), run));
+        assert!(may_run(&bot(json!("danger-full-access"), json!([])), run));
+        assert!(may_run(&bot(Value::Null, json!([])), run));
     }
 
     #[test]

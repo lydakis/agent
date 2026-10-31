@@ -982,6 +982,16 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         }
         None => record.clone(),
     };
+    let name = call["name"].as_str().unwrap_or_default();
+    if !crate::approvals::may_run(record, name) {
+        return Err((
+            "escalation_refused",
+            format!(
+                "{name} acts outside your sandbox, and no one reviews calls for you; \
+                 do without it"
+            ),
+        ));
+    }
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
