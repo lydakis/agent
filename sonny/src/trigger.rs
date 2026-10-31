@@ -3184,7 +3184,7 @@ async fn start(client: &Client, trigger: &Trigger) -> Result<i64, String> {
 }
 
 /// Give the agent a `--start` trigger made before its agents had Sonny's
-/// tools those tools, as [`start`] gives them now; the lookout keeps them
+/// tools those tools, as [`start`] gives them now; the tool host keeps them
 /// up to date from then on. One that has any declared tools is left as it
 /// is, and a failure leaves it to the next fire.
 async fn adopt(client: &Client, name: &str, id: i64) {

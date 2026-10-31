@@ -8,8 +8,9 @@
 //! as the person's words to it would; everything else waits until it
 //! rests. One lookout watches a daemon, for every subscriber on it, started
 //! by the first Sonny to open; the daemon is unchanged: this follows every
-//! bot and submits to the subscribers like any client. It also answers its
-//! agents' calls of the tools Sonny answers (`served`).
+//! bot and submits to the subscribers like any client. The tools Sonny
+//! answers are another companion's (`tool_host`), which signals it to read
+//! the subscription files a call wrote (`reread_now`).
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod goals;
@@ -313,7 +314,7 @@ pub struct Settings {
 pub fn main(settings: Settings) -> Result<(), String> {
     let held = match lock(&settings.store)? {
         Some(held) => Some(held),
-        None => replace(&settings.store)?,
+        None => replace(&settings.store, "lookout")?,
     };
     let Some(_held) = held else {
         println!("{}", json!({"event": "already_watching"}));
@@ -329,10 +330,34 @@ pub fn main(settings: Settings) -> Result<(), String> {
 }
 
 /// `store`'s path with `suffix` after it, for the files beside it.
-fn beside(store: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn beside(store: &Path, suffix: &str) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+/// Set when the tool host signals that a call wrote files the lookout
+/// reads.
+static REREAD_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn reread_now() -> bool {
+    REREAD_NOW.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tell `store`'s lookout to read the subscription and goal files now: the
+/// process its lock names, if one holds it.
+pub(crate) fn tell_reread(store: &Path) {
+    let lock = beside(store, ".lookout.lock");
+    let pid: Option<i32> = (std::fs::read_to_string(&lock).ok())
+        .and_then(|pid| pid.trim().parse().ok())
+        .filter(|pid| *pid > 0);
+    if let Some(pid) = pid
+        && held(&lock)
+    {
+        // SAFETY: a signal to the process the held lock names, which reads
+        // its files again on it.
+        unsafe { libc::kill(pid, libc::SIGUSR1) };
+    }
 }
 
 /// This Sonny, told apart from another build of it: its version and when
@@ -347,18 +372,20 @@ pub(crate) fn identity() -> String {
     format!("{} {written}", env!("CARGO_PKG_VERSION"))
 }
 
-/// The lock, taken from a lookout another Sonny started, as one an upgrade
-/// left running, so the tools this Sonny gives its agents are answered:
-/// that lookout is stopped, and the lock awaited for a few seconds. `None`
-/// when the lookout holding it is this Sonny's own.
-fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
-    let theirs = std::fs::read_to_string(beside(store, ".lookout.sonny")).unwrap_or_default();
+/// The lock of the companion `name` (`STORE.NAME.lock`), taken from one
+/// another Sonny started, as one an upgrade left running, so this Sonny's
+/// own does the work: that one is stopped, and the lock awaited for a few
+/// seconds. `None` when the one holding it is this Sonny's own.
+pub(crate) fn replace(store: &Path, name: &str) -> Result<Option<std::fs::File>, String> {
+    let lock = beside(store, &format!(".{name}.lock"));
+    let theirs =
+        std::fs::read_to_string(beside(store, &format!(".{name}.sonny"))).unwrap_or_default();
     // The daemon's own companion takes the place of one a window started
     // before Sonny kept it as one, of this build too.
     if theirs == identity() && std::env::var_os("AGENT_COMPANION").is_none() {
         return Ok(None);
     }
-    let pid: Option<i32> = std::fs::read_to_string(beside(store, ".lookout.lock"))
+    let pid: Option<i32> = std::fs::read_to_string(&lock)
         .ok()
         .and_then(|pid| pid.trim().parse().ok());
     let Some(pid) = pid.filter(|pid| *pid > 0 && *pid != std::process::id() as i32) else {
@@ -369,7 +396,7 @@ fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
-        if let Some(held) = lock(store)? {
+        if let Some(held) = hold(&lock)? {
             return Ok(Some(held));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -380,15 +407,19 @@ fn replace(store: &Path) -> Result<Option<std::fs::File>, String> {
 /// The store's lookout lock, held while this process lives: `None` when
 /// another lookout holds it.
 fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
+    hold(&beside(store, ".lookout.lock"))
+}
+
+/// The lock file at `path`, held while this process lives, with its pid
+/// written in: `None` when another process holds it.
+pub(crate) fn hold(path: &Path) -> Result<Option<std::fs::File>, String> {
     use std::os::fd::AsRawFd;
-    let mut path = store.as_os_str().to_owned();
-    path.push(".lookout.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
-        .map_err(|e| format!("{}: {e}", std::path::Path::new(&path).display()))?;
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     // SAFETY: flock on a descriptor `file` owns and keeps open; the lock is
     // released when the process exits. Tried twice, since `running` holds
     // it for an instant.
@@ -407,10 +438,7 @@ fn lock(store: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() == Some(libc::EWOULDBLOCK) {
         true => Ok(None),
-        false => Err(format!(
-            "{}: {error}",
-            std::path::Path::new(&path).display()
-        )),
+        false => Err(format!("{}: {error}", path.display())),
     }
 }
 
@@ -446,14 +474,23 @@ async fn serve(settings: Settings) -> Result<(), String> {
         "{}",
         json!({"event": "watching", "pid": std::process::id()})
     );
-    let served = crate::served::Server::start(service.store.clone(), service.socket.clone());
+    // Told by the tool host that a call wrote subscription or goal files:
+    // read them at once rather than at the next reread.
+    if let Ok(mut told) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+    {
+        tokio::spawn(async move {
+            while told.recv().await.is_some() {
+                REREAD_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
     // Asked to give way, as by another build's lookout: what it still
-    // serves stops first, since that one serves it again.
+    // runs stops first, since that one runs it again.
     if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
         tokio::spawn(async move {
             term.recv().await;
-            crate::served::stop();
             sources::stop();
             goals::stop();
             std::process::exit(0);
@@ -464,9 +501,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
     loop {
         if let Ok((client, events)) = Client::connect(&service.socket).await {
             gone = None;
-            service
-                .watch(client, events, &served, &mut from_sources)
-                .await;
+            service.watch(client, events, &mut from_sources).await;
         }
         // A daemon restarting is back within moments; one shut down is not,
         // and the client that starts the next daemon starts its lookout.
@@ -677,7 +712,6 @@ impl Service {
         &mut self,
         client: Arc<Client>,
         mut events: agent_client::Events,
-        served: &crate::served::Server,
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Event>,
     ) {
         let bots = all_bots(&client).await;
@@ -699,11 +733,6 @@ impl Service {
         self.subscribers = subs::all(&self.store).into_iter().collect();
         for bot in &bots {
             self.seat(&client, bot).await;
-        }
-        // Once a lookout: a connection dropped and made again changes no
-        // bot's tools.
-        if self.started {
-            tokio::spawn(refresh_tools(client.clone(), bots.clone()));
         }
         self.resubscribe(true);
         let listed: HashSet<String> = (bots.iter())
@@ -804,12 +833,11 @@ impl Service {
                         self.configured(&client, &event).await;
                         continue;
                     }
-                    served.event(&event);
                     streaming |= event["event"] == "follow_live";
                     self.snapshot(&event, streaming);
-                    // A `subscriptions` call this lookout answered counts
+                    // A `subscriptions` call the tool host answered counts
                     // from the next event on, not from the next tick.
-                    if served.subscribed() {
+                    if reread_now() {
                         reread = Some(Instant::now());
                         self.reread(&client).await;
                     }
@@ -971,8 +999,8 @@ impl Service {
                     let now = Instant::now();
                     self.save_cursor();
                     // What `subscriptions` calls wrote since: at once for
-                    // one this lookout answered, else now and then.
-                    if served.subscribed() || reread.is_none_or(|at| now >= at + REREAD) {
+                    // one the tool host said it answered, else now and then.
+                    if reread_now() || reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         self.goals.reread();
                         self.runner.reload();
@@ -1467,8 +1495,13 @@ const STATUS_BYTES: u64 = 1 << 20;
 /// have it. The lock is tried shared and let go at once; a lookout
 /// starting meanwhile tries again (`lock`).
 pub fn running(store: &std::path::Path) -> bool {
+    held(&beside(store, ".lookout.lock"))
+}
+
+/// Whether a process holds the lock file at `path`.
+pub(crate) fn held(path: &Path) -> bool {
     use std::os::fd::AsRawFd;
-    let Ok(file) = std::fs::File::open(beside(store, ".lookout.lock")) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
     // SAFETY: flock on a descriptor `file` owns; closing it lets go.
@@ -1527,51 +1560,8 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
     subs::ensure(store, lead, subs::Sub::lead(lead, project))
 }
 
-/// Bring every agent Sonny declared on up to this build's tools, as
-/// opening its window would, so one no one opens after an upgrade, such
-/// as a task out of sight, gets a tool added since. A busy one is tried
-/// again each minute, for an hour.
-async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
-    let mut left = bots;
-    for _ in 0..60 {
-        let mut busy = Vec::new();
-        for bot in left {
-            let Ok(mut record) = client
-                .request(
-                    "inspect",
-                    json!({"bot": bot["name"], "bot_id": bot["bot_id"]}),
-                )
-                .await
-            else {
-                continue;
-            };
-            record["name"] = bot["name"].clone();
-            record["bot_id"] = bot["bot_id"].clone();
-            let Some(fields) = crate::declared::refresh(&record) else {
-                continue;
-            };
-            match client.request("configure", Value::Object(fields)).await {
-                Ok(_) => println!(
-                    "{}",
-                    json!({"event": "tools_refreshed", "bot": bot["name"]})
-                ),
-                Err(error) if error.code == "bot_busy" => busy.push(bot),
-                Err(error) => println!(
-                    "{}",
-                    json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": error.code})
-                ),
-            }
-        }
-        if busy.is_empty() {
-            return;
-        }
-        left = busy;
-        tokio::time::sleep(Duration::from_secs(60)).await;
-    }
-}
-
 /// Every bot the daemon lists, page by page.
-async fn all_bots(client: &Client) -> Vec<Value> {
+pub(crate) async fn all_bots(client: &Client) -> Vec<Value> {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {

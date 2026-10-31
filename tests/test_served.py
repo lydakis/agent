@@ -1,5 +1,5 @@
 """The tools Sonny answers, end to end: an agent's call waits in the daemon,
-the lookout runs it in the agent's folder, and its result or error is the
+the tool host runs it in the agent's folder, and its result or error is the
 call's output."""
 import json
 import os
@@ -34,16 +34,24 @@ class ServedToolTests(ModelFixture):
         self.addCleanup(self.daemon.close)
         self.script = []
 
-    def lookout(self, **extra):
+    def companion(self, command, started, **extra):
         env = {**clean_env(), 'HOME': str(self.path), 'AGENT_BIN': str(self.binary),
                'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.com',
                'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.com', **extra}
-        service = subprocess.Popen([str(self.sonny), 'lookout', '--store', str(self.store),
+        service = subprocess.Popen([str(self.sonny), command, '--store', str(self.store),
                                     '--socket', str(self.daemon.socket_path)],
                                    env=env, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (service.kill(), service.wait(timeout=5), service.stdout.close()))
-        self.assertEqual(json.loads(service.stdout.readline())['event'], 'watching')
+        self.assertEqual(json.loads(service.stdout.readline())['event'], started)
         return service
+
+    def host(self, **extra):
+        """The tool host, which answers the calls."""
+        return self.companion('tool-host', 'serving', **extra)
+
+    def lookout(self, **extra):
+        """The lookout, which tells leads and checks goals."""
+        return self.companion('lookout', 'watching', **extra)
 
     def call(self, bot, name, arguments, **submit):
         """`bot` calls `name` once; the call's output. The script runs on
@@ -79,7 +87,7 @@ class ServedToolTests(ModelFixture):
                             instructions='Lead.', declare=[declared('start_task', inherit=False),
                                                            declared('show_agent')],
                             approve=['show_agent'], approver='auto')
-        self.lookout()
+        self.host()
         output = self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': f'Fix {repo}/calc.py.'})
         self.assertTrue(output.startswith('Started calc.fix: '), output)
         worktree = self.path / '.agent/worktrees/calc.fix'
@@ -130,7 +138,7 @@ class ServedToolTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[dict(declared('start_task', inherit=False),
                                                                 expire_ms=120_000)])
-        self.lookout()
+        self.host()
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['turn']
         pid = self.path / 'setup.pid'
@@ -150,11 +158,11 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'setup.done').exists())
         self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
-    def test_a_lookout_that_gives_way_mid_setup_stops_it_and_the_next_serves_the_call(self):
+    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_serves_the_call(self):
         repo = self.path / 'calc'
         (repo / '.agents').mkdir(parents=True)
         setup = repo / '.agents/setup'
-        # The first setup is slow; the one the next lookout runs is not.
+        # The first setup is slow; the one the next host runs is not.
         pids = self.path / 'setup.pids'
         setup.write_text(f'#!/bin/sh\nfirst=$(test -e {pids} || echo 1)\necho $$ >> {pids}\n'
                          f'test -n "$first" && sleep 30\nexit 0\n')
@@ -165,7 +173,7 @@ class ServedToolTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[dict(declared('start_task', inherit=False),
                                                                 expire_ms=120_000)])
-        old = self.lookout()
+        old = self.host()
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['turn']
         deadline = time.monotonic() + 30
@@ -173,8 +181,8 @@ class ServedToolTests(ModelFixture):
             self.assertLess(time.monotonic(), deadline, 'the setup never ran')
             time.sleep(.05)
         first = int(pids.read_text().split()[0])
-        (self.path / 'state.sqlite.lookout.sonny').write_text('0.0.1 1')
-        self.lookout()
+        (self.path / 'state.sqlite.tool-host.sonny').write_text('0.0.1 1')
+        self.host()
         old.wait(timeout=10)
         deadline = time.monotonic() + 10
         stat = Path(f'/proc/{first}/stat')
@@ -197,7 +205,7 @@ class ServedToolTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('start_task', inherit=False)],
                             approve=['start_task'], approver='manual')
-        self.lookout()
+        self.host()
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='deny', prompt='script')['result']['turn']
         deadline = time.monotonic() + 10
@@ -214,13 +222,13 @@ class ServedToolTests(ModelFixture):
     def test_a_call_that_fails_is_answered_with_its_error(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('show_agent')])
-        self.lookout()
+        self.host()
         # No Rex or Herdr here to show it in.
         failed = json.loads(self.call('calc.lead', 'show_agent', {'agent': 'calc.fix', 'split': 'sideways'}))
         self.assertEqual(failed['error'], 'not_shown')
         self.assertIn('not a side', failed['detail'])
 
-    def test_a_call_made_before_the_lookout_started_is_answered_once_it_does(self):
+    def test_a_call_made_before_the_host_started_is_answered_once_it_does(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('subscriptions', inherit=False)])
         self.model.call_script = [('subscriptions', {})]
@@ -229,11 +237,11 @@ class ServedToolTests(ModelFixture):
         while not self.daemon.request('tool_calls', tag='sonny')['result']['calls']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.05)
-        self.lookout()
+        self.host()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': []})
 
-    def test_an_agent_s_script_calls_an_mcp_server_the_lookout_keeps_up(self):
+    def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')
         (self.path / '.agent').mkdir(exist_ok=True)
         (self.path / '.agent/config.toml').write_text(
@@ -246,7 +254,7 @@ class ServedToolTests(ModelFixture):
         self.assertIn('## test', script['description'])
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[script])
-        self.lookout()
+        self.host()
         said = self.call('calc.lead', 'exec', 'const r = await tools.mcp__test__echo({text: "hi"});\ntext(r.content[0].text);')
         self.assertTrue(said.startswith('Script completed\n'), said)
         self.assertTrue(said.endswith('MCP calls: test 1\nOutput:\nhi'), said)
@@ -258,10 +266,10 @@ class ServedToolTests(ModelFixture):
         self.assertEqual(refused['error'], 'exec_refused')
         self.assertIn('`wait`', refused['detail'])
 
-    def test_an_agent_saves_memory_through_the_lookout(self):
+    def test_an_agent_saves_memory_through_the_host(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('memory')])
-        self.lookout()
+        self.host()
         fact = {'name': 'prefers-short', 'type': 'feedback', 'description': 'Short replies.',
                 'source': 'the person, 2026-10-28', 'text': '-'}
         saved = json.loads(self.call('calc.lead', 'memory', {'save': fact, 'user': True}))
@@ -278,7 +286,7 @@ class ServedToolTests(ModelFixture):
         for bot in ('calc.a', 'shop.b'):
             self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
                                 instructions='Agent.', declare=[declared('commons')])
-        self.lookout()
+        self.host()
         scripts = {}
 
         def turn(bot, arguments):
@@ -311,7 +319,7 @@ class ServedToolTests(ModelFixture):
         for bot, prompt in [('shop.b', 'the WAL checkpoint stalls'), ('mail.c', 'hello')]:
             turn = self.daemon.request('submit', bot=bot, request_id=bot, prompt=prompt)['result']['turn']
             self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.lookout()
+        self.host()
         post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
         started = json.loads(self.call('calc.a', 'commons', {'post': post}))
         self.assertEqual(started['invited'], 'shop.b', started)
@@ -357,7 +365,7 @@ class ServedToolTests(ModelFixture):
             (memory / name / 'MEMORY.md').write_text(f'# Memory of {name}\n')
         self.daemon.request('create', bot='ws.lead', workspace=str(ws), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('new_project')])
-        self.lookout()
+        self.host()
         made = json.loads(self.call('ws.lead', 'new_project', {'folder': str(ws / 'api')}))
         self.assertEqual((made['coordinator'], made['created']), ('api.lead', True), made)
         # Its own project's memory, though the folder above is a project
@@ -383,7 +391,8 @@ class ServedToolTests(ModelFixture):
 
     def goal_watch(self):
         """calc.fix, calc.lead's task with the goal tool, watched by its
-        lead, which hears its turns; the lookout serving them."""
+        lead, which hears its turns; the host serving them, and the lookout
+        checking the goal: the lookout's process."""
         lead = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),
                                    model='openai/synthetic-model', instructions='Lead.',
                                    declare=[declared('goal')])['result']
@@ -394,6 +403,7 @@ class ServedToolTests(ModelFixture):
         folder.mkdir(exist_ok=True)
         watch = {'name': 'tasks', 'tasks_of': [], 'bots': ['calc.fix'], 'on': ['said', 'ended'], 'updates': True}
         (folder / 'calc.lead.json').write_text(json.dumps({'subscriptions': [watch]}))
+        self.host()
         return self.lookout()
 
     def lines_of(self, path, at_least, timeout=30):
@@ -490,6 +500,7 @@ class ServedToolTests(ModelFixture):
     def test_a_goal_no_one_watches_is_checked_again_after_a_restart(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('goal')])
+        self.host()
         old = self.lookout()
         runs = self.path / 'runs'
         self.call('calc.lead', 'goal', {'set': {'done_when': 'it ran again', 'check': f'echo . >> {runs}; sleep 30'}})
@@ -513,7 +524,7 @@ class ServedToolTests(ModelFixture):
         # A runtime folder no user manager serves.
         runtime = self.path / 'runtime'
         runtime.mkdir()
-        self.lookout(XDG_RUNTIME_DIR=str(runtime))
+        self.host(XDG_RUNTIME_DIR=str(runtime))
         refused = json.loads(self.call('calc.lead', 'triggers', {'add': {'every': '30m', 'message': 'Check.'}}))
         self.assertEqual(refused['error'], 'trigger_refused')
         self.assertIn('triggers_unsupported', refused['detail'])
@@ -526,6 +537,23 @@ class ServedToolTests(ModelFixture):
         old.wait(timeout=10)
         self.assertIsNone(new.poll())
         self.assertNotEqual((self.path / 'state.sqlite.lookout.sonny').read_text(), '0.0.1 1')
+
+    def test_one_tool_host_a_store_and_the_next_starts_where_it_stopped(self):
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('memory')])
+        old = self.host()
+        second = subprocess.run([str(self.sonny), 'tool-host', '--store', str(self.store),
+                                 '--socket', str(self.daemon.socket_path)],
+                                env={**clean_env(), 'HOME': str(self.path)}, capture_output=True, text=True,
+                                timeout=10)
+        self.assertEqual((second.returncode, json.loads(second.stdout)['event']), (0, 'already_serving'))
+        self.call('calc.lead', 'memory', {'user': True})
+        saved = self.lines_of(self.path / 'state.sqlite.tool-host.cursor', 1)
+        self.assertGreater(int(saved[0]), 0)
+        old.kill()
+        old.wait(timeout=10)
+        self.host()
+        self.assertTrue(json.loads(self.call('calc.lead', 'memory', {'user': True})))
 
 
 if __name__ == '__main__':

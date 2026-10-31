@@ -5,16 +5,16 @@
 //! answer, parking the turn after a moment, and gives up on it, typed
 //! `tool_unserved`, once its time runs out.
 //!
-//! The lookout answers them, one per daemon, outliving Sonny's windows:
-//! each call that starts, or waits from before the lookout did, is run as
-//! `sonny tool NAME` in the calling agent's folder, with the environment
-//! its shell would have, so a slow setup script or a failure touches only
-//! that call. What it prints is the call's result.
+//! The tool host answers them (`tool_host`), one per daemon, outliving
+//! Sonny's windows: each call that starts, or waits from before the host
+//! did, is run as `sonny tool NAME` in the calling agent's folder, with the
+//! environment its shell would have, so a slow setup script or a failure
+//! touches only that call. What it prints is the call's result. `exec`
+//! runs in the host itself, where the MCP servers stay up.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -469,13 +469,13 @@ fn run() -> Value {
 /// An answer: the call's result, or an error as the daemon carries it.
 type Answer = Result<String, (&'static str, String)>;
 
-/// `sonny tool NAME`, as the lookout runs it for one call: the arguments
+/// `sonny tool NAME`, as the tool host runs it for one call: the arguments
 /// on stdin, in the calling agent's folder and with its shell's variables.
 /// Prints the answer as one JSON line, `{"output": ...}` or
 /// `{"error": {"code", "detail"}}`.
 pub fn answer_here(args: &[String]) -> Result<(), String> {
     let [name] = args else {
-        return Err("sonny tool NAME runs one of Sonny's tools for the lookout".into());
+        return Err("sonny tool NAME runs one of Sonny's tools for the tool host".into());
     };
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).map_err(|e| e.to_string())?;
@@ -640,7 +640,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
-            // The model its turn runs, as the lookout set it for the call.
+            // The model its turn runs, as the host set it for the call.
             let model = std::env::var("AGENT_MODEL").ok();
             let mut said =
                 crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
@@ -714,11 +714,10 @@ fn project_of(bot: &str) -> String {
     }
 }
 
-/// The lookout's server for Sonny's tools: told of each event the lookout
+/// The tool host's server for Sonny's tools: told of each event the host
 /// follows, it answers the calls that wait for Sonny.
 pub struct Server {
     nudge: Arc<Notify>,
-    subscribed: Arc<AtomicBool>,
     serving: Serving,
 }
 
@@ -726,29 +725,12 @@ impl Server {
     /// Serve the daemon of `store` on `socket`, from a connection of its
     /// own.
     pub fn start(store: PathBuf, socket: PathBuf) -> Server {
-        let (nudge, subscribed, serving) =
-            (Arc::new(Notify::new()), Arc::default(), Serving::default());
-        tokio::spawn(serve(
-            store,
-            socket,
-            nudge.clone(),
-            Arc::clone(&subscribed),
-            Arc::clone(&serving),
-        ));
-        Server {
-            nudge,
-            subscribed,
-            serving,
-        }
+        let (nudge, serving) = (Arc::new(Notify::new()), Serving::default());
+        tokio::spawn(serve(store, socket, nudge.clone(), Arc::clone(&serving)));
+        Server { nudge, serving }
     }
 
-    /// Whether a `subscriptions` call changed a file since last asked, so
-    /// the lookout reads them now rather than at its next reread.
-    pub fn subscribed(&self) -> bool {
-        self.subscribed.swap(false, Ordering::Relaxed)
-    }
-
-    /// An event the lookout read: a call of Sonny's that started, or a
+    /// An event the host read: a call of Sonny's that started, or a
     /// stream live again, which may follow calls started while it was not.
     /// A turn that ended, as one the person interrupted, stops what its
     /// calls still run, so a slow setup starts no task after all.
@@ -773,13 +755,7 @@ impl Server {
 /// The calls being answered, by their turn and ID.
 type Serving = Arc<Mutex<HashMap<(i64, String), tokio::task::AbortHandle>>>;
 
-async fn serve(
-    store: PathBuf,
-    socket: PathBuf,
-    nudge: Arc<Notify>,
-    subscribed: Arc<AtomicBool>,
-    serving: Serving,
-) {
+async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Serving) {
     let Ok(me) = std::env::current_exe() else {
         return;
     };
@@ -795,19 +771,18 @@ async fn serve(
                     let key = (call["turn"].as_i64().unwrap_or(0), str_of(&call["call_id"]));
                     let mut jobs = serving.lock().unwrap();
                     if !jobs.contains_key(&key) {
-                        let (client, me, store, socket, serving, subscribed, hub) = (
+                        let (client, me, store, socket, serving, hub) = (
                             client.clone(),
                             me.clone(),
                             store.clone(),
                             socket.clone(),
                             serving.clone(),
-                            subscribed.clone(),
                             hub.clone(),
                         );
                         let held = key.clone();
                         let job = tokio::spawn(async move {
                             let answer = match call["name"] == EXEC {
-                                // In the lookout, where the servers stay up.
+                                // In the host, where the servers stay up.
                                 true => script(&hub, &client, &call).await,
                                 false => answer(&client, &call, &me, &store, &socket).await,
                             };
@@ -817,7 +792,7 @@ async fn serve(
                                 Ok(output) => {
                                     // Files the lookout reads, read now.
                                     if call["name"] == SUBSCRIPTIONS || call["name"] == GOAL {
-                                        subscribed.store(true, Ordering::Relaxed);
+                                        crate::lookout::tell_reread(&store);
                                     }
                                     asked["output"] = json!(cut(output))
                                 }
@@ -1124,7 +1099,7 @@ fn kill(group: u32) {
     unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
 }
 
-/// Stop every call still being answered, as a lookout that gives way to
+/// Stop every call still being answered, as a tool host that gives way to
 /// another build's does: that one answers them again, and two of a call
 /// would run at once, as two setups in one task's folder.
 pub fn stop() {

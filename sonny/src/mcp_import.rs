@@ -189,7 +189,7 @@ fn codex(name: &str, server: &toml::Value) -> Option<Raw> {
             }
             "env_vars" => {
                 // Passed through from Codex's environment: Sonny's servers
-                // inherit the lookout's, which ~/.agent/env sets.
+                // inherit the tool host's, which ~/.agent/env sets.
                 for var in value
                     .as_array()
                     .into_iter()
