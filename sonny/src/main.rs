@@ -6971,19 +6971,29 @@ impl App {
             return Latest::default();
         };
         // Newest first, as the nodes were asked for.
-        let items: Vec<Value> = read["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|entry| entry["item"].clone())
-            .collect();
+        let entries = read["items"].as_array().cloned().unwrap_or_default();
+        let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
         let pr = items
             .iter()
             .find(|item| item["role"] == "assistant")
             .and_then(|item| status::pull_request(&text(item)));
-        let flat: Vec<Value> = items
+        // Who sent each prompt, as `items_of` keeps it: another agent's
+        // message sets no question aside.
+        let flat: Vec<Value> = entries
             .iter()
-            .flat_map(|item| responses(item).into_iter().rev())
+            .flat_map(|entry| {
+                let from =
+                    transcript::sender(entry["from"]["bot"].as_str(), entry["origin"].as_str());
+                responses(&entry["item"])
+                    .into_iter()
+                    .rev()
+                    .map(move |mut item| {
+                        if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
+                            item["from"] = json!(from);
+                        }
+                        item
+                    })
+            })
             .collect();
         Latest {
             ask: asks::open(&flat),
@@ -9084,15 +9094,26 @@ impl App {
     /// `ask` answered from here: closed now, its answer kept until it
     /// lands so landing closes no other asked the same.
     fn close_ask(&mut self, ask: &asks::Ask) {
+        let held = self.focused();
         self.asks.retain(|open| open.id != ask.id);
         self.aside.retain(|open| open.id != ask.id);
         self.sent_answers.push(ask.question.clone());
-        self.settle_asks();
+        self.settle_asks(held);
     }
 
-    /// The focus on a question still open, the oldest once the one it
-    /// was on is gone from the end; none open, typing writes again.
-    fn settle_asks(&mut self) {
+    /// The id of the question in focus, for the focus to stay on it
+    /// while others before it close.
+    fn focused(&self) -> Option<String> {
+        self.asks.get(self.focus).map(|ask| ask.id.clone())
+    }
+
+    /// The focus on the question it was on, `held`, wherever that is
+    /// now; that one gone, on the one after it, or the oldest once it
+    /// was the last; none open, typing writes again.
+    fn settle_asks(&mut self, held: Option<String>) {
+        if let Some(at) = held.and_then(|id| self.asks.iter().position(|ask| ask.id == id)) {
+            self.focus = at;
+        }
         if self.focus >= self.asks.len() {
             self.focus = 0;
         }
@@ -9112,12 +9133,13 @@ impl App {
             self.sent_answers.remove(at);
             return;
         }
+        let held = self.focused();
         if asks::moves_on(message, from) {
             self.aside.append(&mut self.asks);
         } else if !asks::close(&mut self.asks, message) {
             asks::close(&mut self.aside, message);
         }
-        self.settle_asks();
+        self.settle_asks(held);
     }
 
     /// The composer's focus on the next open question, or the one
@@ -11777,6 +11799,43 @@ mod tests {
         app.answered("Done: tests pass", Some("tally.halves"));
         app.answered(&reactions::message("👍", None), None);
         assert_eq!(app.asks.len(), 1);
+        // One before the question in focus closing, from another window
+        // or its card, keeps the focus on the question being answered.
+        app.asks = vec![
+            ask("c5", "Tag it?"),
+            ask("c6", "Bump?"),
+            ask("c7", "Notes?"),
+        ];
+        app.focus = 1;
+        app.answered("You asked: Tag it?\n\nKeep it", None);
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
+        app.press("answer/0/c7").await;
+        assert_eq!(app.asking().map(|a| a.id.as_str()), Some("c6"));
+    }
+
+    #[tokio::test]
+    async fn another_agents_message_leaves_the_latest_question_open() {
+        // Newest first, as `history_nodes` gives them.
+        let entries = json!([
+            {"node": 3, "from": {"bot": "tally.halves"}, "item": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": "Done: tests pass"}]}},
+            {"node": 2, "item": {"type": "function_call_output", "call_id": "a1",
+                "output": "Asked."}},
+            {"node": 1, "item": {"type": "function_call", "name": "ask", "call_id": "a1",
+                "arguments": "{\"question\":\"Tag 0.4.1?\"}"}},
+        ]);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => {
+                json!({"nodes": [{"node": 3}, {"node": 2}, {"node": 1}], "next_from": null})
+            }
+            _ => json!({"items": entries.clone()}),
+        })
+        .await;
+        let app = app(client);
+        assert_eq!(
+            app.latest("halves").await.ask.as_deref(),
+            Some("Tag 0.4.1?")
+        );
     }
 
     #[tokio::test]
