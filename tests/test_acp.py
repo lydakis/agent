@@ -225,7 +225,11 @@ class AcpTests(ModelFixture):
         self.assertEqual(answered['result']['stopReason'], 'end_turn')
         self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
         kept = self.path / '.agent/sonny/t3/sessions' / child_session
-        self.assertEqual(kept.read_text(), 'calc.fix')
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        # The thread is the task by its identity and store, not its name alone.
+        pinned = json.loads(kept.read_text())
+        self.assertEqual((pinned['bot'], pinned['bot_id']), ('calc.fix', fix['bot_id']))
+        self.assertRegex(pinned['store'], '^[0-9a-f]{16}$')
         self.assertEqual([b['name'] for b in self.daemon.request('bots')['result']['bots']],
                          ['calc.fix', 'calc.lead'])
         # T3 Code tells the lead's thread its child ended; the lead hears of
