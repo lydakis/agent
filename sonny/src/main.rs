@@ -7287,8 +7287,11 @@ impl App {
         let flat: Vec<Value> = entries
             .iter()
             .flat_map(|entry| {
-                let from =
-                    transcript::sender(entry["from"]["bot"].as_str(), entry["origin"].as_str());
+                let from = transcript::sender(
+                    entry["from"]["bot"].as_str(),
+                    entry["origin"].as_str(),
+                    entry["person"].as_str(),
+                );
                 responses(&entry["item"])
                     .into_iter()
                     .rev()
