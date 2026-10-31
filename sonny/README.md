@@ -739,8 +739,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   `[sonny]` sets `sky_haikus` (0 for none), `sky_haiku_window`,
   `sky_haiku_margin` and `sky_haiku_hold`.
   An agent with a schedule (a trigger that wakes it) carries a short tick
-  just outside its star, out from the middle, plain once its next run is
-  near (a tenth of the gap between runs, at least a minute). When an
+  just outside its star, out from the middle (inward at the pane's edge),
+  plain once its next run is near (a tenth of the gap between runs, at
+  least a minute). When an
   agent makes a schedule a spark flies from it to that tick and the chat
   log says what it is and who set it (`login every 30m, by shop lead`);
   one made elsewhere is logged as new, and `?` lists what is next up.

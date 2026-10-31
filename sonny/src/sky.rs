@@ -2779,7 +2779,7 @@ impl View {
                 });
                 let ink = if near { Ink::Plain } else { Ink::Muted };
                 for past in [0.05, 0.07, 0.09] {
-                    sky.dot(self.tick(at, past), ink);
+                    sky.dot(self.tick_on(&sky, at, past), ink);
                 }
             }
         }
@@ -2813,7 +2813,11 @@ impl View {
         // The newest dozen in flight: more is a blur, not news.
         for spark in self.sparks.iter().rev().take(SPARKS) {
             let t = (now.duration_since(spark.born).as_secs_f32() / FLIGHT.as_secs_f32()).min(1.0);
-            let (a, b) = (self.end(spark.from), self.end(spark.to));
+            let end = |end: End| match end {
+                End::Tick(at) => self.tick_on(&sky, at, 0.07),
+                end => self.end(end),
+            };
+            let (a, b) = (end(spark.from), end(spark.to));
             let control = match (spark.from, spark.to) {
                 (End::Agent(_), End::Agent(_)) => bend(a, b),
                 _ => ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0),
@@ -3327,6 +3331,15 @@ impl View {
                 (1.05 * angle.cos(), 1.05 * angle.sin())
             }
             End::Tick(at) => self.tick(at, 0.07),
+        }
+    }
+
+    /// Where an agent's tick is on this canvas: outward, or, where the
+    /// canvas's edge would cut it off, the same way inward.
+    fn tick_on(&self, sky: &Sky, at: usize, past: f32) -> (f32, f32) {
+        match sky.holds(self.tick(at, 0.09)) {
+            true => self.tick(at, past),
+            false => self.tick(at, -past),
         }
     }
 
@@ -4062,6 +4075,13 @@ impl Sky {
         if self.inks[cell].is_none_or(|was| ink.rank() >= was.rank()) {
             self.inks[cell] = Some(ink);
         }
+    }
+
+    /// Whether a point falls on the canvas.
+    fn holds(&self, at: (f32, f32)) -> bool {
+        let (x, y) = self.spot(at);
+        let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
+        (0.0..w).contains(&x) && (0.0..h).contains(&y)
     }
 
     fn dot(&mut self, at: (f32, f32), ink: Ink) {
@@ -5605,6 +5625,29 @@ mod tests {
             "{under}"
         );
         assert!(view.legend_under(100).len() <= LEGEND);
+    }
+
+    #[tokio::test]
+    async fn a_tick_the_canvas_edge_would_cut_points_inward() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+        ]))
+        .unwrap();
+        view.drain();
+        let sky = Sky::new(80, 24);
+        let login = view.index["shop.login"];
+        // At the bottom of the rim: outward is off the canvas.
+        view.agents[login].at = (0.0, 1.0);
+        for past in [0.05, 0.07, 0.09] {
+            let (x, y) = view.tick_on(&sky, login, past);
+            assert!(sky.holds((x, y)), "{past}");
+            assert!(x.abs() < 1e-3 && y < 1.0, "{y}");
+        }
+        // Well inside: outward, as on a clock's face.
+        view.agents[login].at = (0.3, 0.0);
+        assert!(view.tick_on(&sky, login, 0.05).0 > 0.3);
     }
 
     #[test]
