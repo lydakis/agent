@@ -222,7 +222,12 @@ struct Agent {
     /// When it was last lit.
     lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
-    ripple: Option<Instant>,
+    /// A commons post's ripple: when, and how far it spreads.
+    ripple: Option<(Instant, f32)>,
+    /// How much it has been messaged lately: each message that lands adds
+    /// one, and it halves as a glow does.
+    heat: f32,
+    heated: Option<Instant>,
     /// It asked the person something, not yet answered.
     asking: bool,
     /// Its calls that wait for the person's approval.
@@ -264,6 +269,13 @@ impl Agent {
         } else {
             None
         }
+    }
+
+    /// Its heat now.
+    fn warmth(&self, now: Instant) -> f32 {
+        self.heated.map_or(0.0, |at| {
+            self.heat * 0.5f32.powf(now.duration_since(at).as_secs_f32() / HALF_LIFE)
+        })
     }
 
     /// How lit it is, 1 just lit to 0.
@@ -506,7 +518,10 @@ impl View {
         });
         for to in landed {
             if let End::Agent(at) = to {
-                self.agents[at].lit = Some(now);
+                let agent = &mut self.agents[at];
+                agent.lit = Some(now);
+                agent.heat = agent.warmth(now) + 1.0;
+                agent.heated = Some(now);
             }
         }
         let old = |at: &Instant| now.duration_since(*at) > HOUR;
@@ -693,7 +708,19 @@ impl View {
                     self.agents[at].asking = true;
                 }
                 if tool == "commons" && posted(&data["arguments"]) {
-                    self.agents[at].ripple = Some(now);
+                    // As far as the post reaches: who has read the thread
+                    // or posted in it. A post to an empty board stays small.
+                    let audience = (thread(&data["arguments"]))
+                        .zip(std::env::var_os("HOME"))
+                        .map_or(0, |(thread, home)| {
+                            crate::commons::audience(
+                                std::path::Path::new(&home),
+                                &thread,
+                                &self.agents[at].name,
+                            )
+                        });
+                    let reach = (0.08 + 0.04 * (1.0 + audience as f32).ln()).min(0.22);
+                    self.agents[at].ripple = Some((now, reach));
                     self.agents[at].last = Some((now, "posted to the commons".into()));
                     let said = format!("{} posted to the commons", self.short(at));
                     self.say(now, said, None, &[at]);
@@ -1218,15 +1245,27 @@ impl View {
             let (a, b) = (self.agents[a].at, self.agents[b].at);
             sky.curve(a, bend(a, b), b, ink, gap);
         }
-        // Ripples, then sparks, then the stars over them.
+        // Ripples and flashes, then sparks, then the stars over them.
         for agent in self.agents.iter().filter(|a| !a.gone) {
-            if let Some(at) = agent.ripple {
+            if let Some((at, reach)) = agent.ripple {
                 let t = now.duration_since(at).as_secs_f32() / RIPPLE.as_secs_f32();
                 if t < 1.0 {
                     // A commons post is the quietest event: nobody need act.
                     let ink = if t < 0.5 { Ink::Muted } else { Ink::Faint };
-                    sky.ring(agent.at, 0.03 + 0.05 * t, ink);
+                    sky.ring(agent.at, 0.03 + (reach - 0.03) * t, ink);
                 }
+            }
+            // A message landing flashes round its star and shrinks as it
+            // fades: the more it is messaged, the bigger, bounded.
+            let warmth = agent.warmth(now);
+            if warmth > 0.25 {
+                let ink = if warmth >= 1.0 {
+                    Ink::Muted
+                } else {
+                    Ink::Faint
+                };
+                let radius = (0.015 + 0.03 * (1.0 + warmth).ln()).min(0.08);
+                sky.ring(agent.at, radius, ink);
             }
         }
         for spark in &self.sparks {
@@ -1443,6 +1482,10 @@ impl View {
             ),
             row(Span::raw("⠶").bold(), vec![says("   a message on its way")]),
             row(
+                Span::styled("○", Ink::Muted.style()),
+                vec![says("   it lands: the busier, the bigger")],
+            ),
+            row(
                 Span::raw("⠤⠤").fg(TOOL),
                 vec![
                     says("  shell  "),
@@ -1462,7 +1505,7 @@ impl View {
             ),
             row(
                 Span::styled("◯", Ink::Muted.style()),
-                vec![says("   a commons post")],
+                vec![says("   a commons post, by its reach")],
             ),
             row(
                 Span::styled("⠁⠈", Ink::Faint.style()),
@@ -1839,6 +1882,23 @@ fn posted(arguments: &Value) -> bool {
     }
 }
 
+/// The thread a `commons` call posts to or replies in, from its
+/// arguments, a JSON preview that may be cut short.
+fn thread(arguments: &Value) -> Option<String> {
+    let text = arguments.as_str().unwrap_or("");
+    if let Ok(call) = serde_json::from_str::<Value>(text) {
+        let name = call["reply"]["thread"]
+            .as_str()
+            .or(call["post"]["name"].as_str());
+        return name.map(str::to_owned);
+    }
+    let key = ["\"thread\":\"", "\"name\":\""]
+        .iter()
+        .find_map(|key| text.find(key).map(|at| at + key.len()))?;
+    let rest = &text[key..];
+    rest.find('"').map(|end| rest[..end].to_owned())
+}
+
 /// An agent's label: `shop lead`, `shop lead billing`, or the name after
 /// its project's prefix.
 pub fn short(name: &str) -> String {
@@ -2089,8 +2149,8 @@ impl Sky {
     /// Words beside a point, a mark before them, right of it where they
     /// fit, else left; never over or against other words.
     fn label(&mut self, at: (f32, f32), mark: Option<(&str, Style)>, words: &str, style: Style) {
-        let (x, y) = self.spot(at);
-        let (col, row) = ((x / 2.0) as usize, (y / 4.0) as usize);
+        let (_, y) = self.spot(at);
+        let row = (y / 4.0) as usize;
         let marked = match mark {
             Some((mark, _)) => format!("{mark} {words}"),
             None => words.to_owned(),
@@ -2100,13 +2160,15 @@ impl Sky {
         if row >= self.rows || width + 2 > self.cols {
             return;
         }
-        let right = (col + 2 + width <= self.cols).then_some(col + 2);
-        let left = col.checked_sub(width + 1);
+        // A blank cell between the words and their star, whichever cells
+        // the star covers.
+        let (_, own) = self.covers(at);
+        let right = (own.end() + 2 + width <= self.cols).then_some(own.end() + 2);
+        let left = own.start().checked_sub(width + 1);
         let sides = match at.0 >= 0.0 {
             true => [right, left],
             false => [left, right],
         };
-        let (_, own) = self.covers(at);
         let Some(start) = sides.into_iter().flatten().find(|&start| {
             self.clear_of_stars(row, start, width, &own) && self.put(row, start, words, style)
         }) else {
@@ -2551,6 +2613,49 @@ mod tests {
         assert!(view.agents[view.index["shop.lead"]].root);
         assert!(view.agents[view.index["lone"]].root);
         assert!(!view.agents[view.index["shop.cart"]].root);
+    }
+
+    #[test]
+    fn a_commons_call_names_its_thread_even_cut_short() {
+        let thread = |text: &str| super::thread(&json!(text));
+        assert_eq!(
+            thread(r#"{"reply":{"thread":"t1","text":"x"}}"#).as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            thread(r#"{"post":{"name":"n1","title":"x"}}"#).as_deref(),
+            Some("n1")
+        );
+        assert_eq!(
+            thread(r#"{"reply":{"thread":"t2","text":"a long te"#).as_deref(),
+            Some("t2")
+        );
+        assert_eq!(thread(r#"{"read":"x"}"#), None);
+    }
+
+    #[tokio::test]
+    async fn messages_landing_heat_an_agent_and_it_cools() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
+        view.drain();
+        let now = Instant::now();
+        let land = |view: &mut View, at: Instant| {
+            view.sparks.push(Spark {
+                from: End::Person,
+                to: End::Agent(0),
+                born: at - FLIGHT,
+            });
+            view.land(at);
+        };
+        land(&mut view, now);
+        let one = view.agents[0].warmth(now);
+        land(&mut view, now);
+        land(&mut view, now);
+        // Three at once: hotter than one, so the flash is bigger.
+        assert!((one - 1.0).abs() < 0.01);
+        assert!(view.agents[0].warmth(now) > 2.9);
+        let later = now + Duration::from_secs_f32(HALF_LIFE);
+        assert!((view.agents[0].warmth(later) - 1.5).abs() < 0.05);
     }
 
     #[tokio::test]
@@ -3286,5 +3391,56 @@ mod tests {
         let lines = sky.lines();
         assert_eq!(text(&lines), "⠁⢀");
         assert_eq!(lines[0].spans[1].style.fg, Some(NEEDS));
+    }
+}
+
+#[cfg(test)]
+mod scale {
+    use super::*;
+
+    /// Frame times at scale: `cargo test -p sonny --release scale -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn frame_times_at_scale() {
+        for count in [30usize, 300, 3_000, 10_000] {
+            let (send, feed) = mpsc::unbounded_channel();
+            let mut view = View::with(PathBuf::new(), feed, tokio::spawn(async {}));
+            let projects = (count / 30).max(1);
+            let mut bots = Vec::new();
+            for p in 0..projects {
+                bots.push(json!({"name": format!("p{p}.lead"), "bot_id": p * 1000 + 1}));
+            }
+            for n in 0..count - projects {
+                let p = n % projects;
+                bots.push(
+                    json!({"name": format!("p{p}.a{n}"), "created_by": format!("p{p}.lead"),
+                    "bot_id": p * 1000 + 2 + n, "running_turn": (n % 4 == 0).then_some(1)}),
+                );
+            }
+            send.send(Feed::Roll(bots)).unwrap();
+            send.send(Feed::Ready).unwrap();
+            for n in 0..200 {
+                let (p, q) = (n % projects, (n * 7) % (count - projects));
+                let event = json!({"cursor": n + 1, "event": "accepted", "bot": format!("p{}.a{q}", q % projects),
+                    "turn": 2, "data": {"from": {"bot": format!("p{p}.lead")}}});
+                send.send(Feed::Live(event)).unwrap();
+            }
+            view.drain();
+            let start = Instant::now();
+            view.card(200, 56);
+            let first = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..20 {
+                view.drain();
+                view.card(200, 56);
+            }
+            let frame = start.elapsed() / 20;
+            let start = Instant::now();
+            view.card(50, 20);
+            let list = start.elapsed();
+            eprintln!(
+                "{count:>6} agents: first frame {first:?}, then {frame:?} a frame; list {list:?}"
+            );
+        }
     }
 }

@@ -607,7 +607,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   order they started, each arm as wide as the square root of its size.
   It is a calm window to keep open and watch: the lines that join who made
   whom are faint, a pair that talked in the last minute shows a faint trail
-  that fades, a message flies as a spark, a commons post ripples out, a
+  that fades, a message flies as a spark and flashes where it lands (the
+  more an agent is messaged, the bigger, within bounds), a commons post
+  ripples out as far as its thread reaches (everyone who read it or
+  posted in it; a post to an empty board stays small), a
   tool call twinkles in cyan in a shape for its kind (a shell's streak
   across, a file's up and down, the web's corners, any other tool's star).
   A working agent breathes, slowly, between the text's colour and a brighter
