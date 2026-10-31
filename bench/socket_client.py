@@ -120,8 +120,8 @@ class SocketClient:
             self.turns[response['result']['turn']] = params['bot']
         return response
 
-    def finished(self, turn):
-        return self.followers[self.turns[turn]].finished(turn)
+    def finished(self, turn, timeout=5):
+        return self.followers[self.turns[turn]].finished(turn, timeout)
 
     def verify_followers(self, pages):
         for bot, page in pages.items():

@@ -561,6 +561,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   network = false
   git = "read-only"       # "write" lets commits run without asking
   writable = ["~/.cargo"] # folders it writes besides its own, whole paths
+  unix_sockets = ["~/.colima/default/docker.sock"]  # the only sockets it reaches
   reviewer = "model"      # model, you, or none: refused, and told to do without
   ```
 
@@ -579,6 +580,13 @@ way `/react` does, and each note in the margin has its own `↩`.
   `cargo test`) adds its first words to the list, and the lead and its
   agents take it at once. The list holds for every folder, so a program
   named from the folder it runs in (`./build.sh`) is never offered.
+
+  A program listening on a Unix socket runs what it is asked outside the
+  sandbox, as Docker's does, so a sandboxed agent reaches none, even one
+  it made in its own folder, where a hard link could name any other. A
+  row's `unix_sockets` names those it may reach, each a socket or a folder
+  of them, as Claude Code's `allowUnixSockets` does. On Linux the sandbox
+  can't tell sockets apart, so a row that names any reaches them all.
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 
@@ -878,7 +886,19 @@ a skill of the same name it has no note of writing (yours, or one an
 earlier Sonny wrote) is left alone too. Remove its folder to get Sonny's.
 With agent-browser installed, Sonny also writes its `agent-browser` skill
 the same way, as `agent-browser skills get agent-browser` prints it for
-the version installed, and removes it when agent-browser is gone.
+the version installed, and removes it when agent-browser is gone. Agents
+drive it through the `browser` tool, which the tool host answers outside
+their sandbox: it runs the skill's commands in each agent's own browser
+session, its answers read from agent-browser's JSON, and a screenshot
+comes back as a picture, up to 20 a call. It refuses what would
+reach past the browser: flags that launch another program or load an
+extension, plugins, the clipboard, the browser's DevTools address, and
+files outside the agent's folder; a sandboxed agent's browser opens no
+`file://` page, as Playwright's MCP server keeps them closed by default.
+The actions in `sonny.browser_confirm` (`eval`, `download`, `upload` and
+`state` by default), signing in from agent-browser's vault, and every
+call of an agent kept off the network wait for the agent's approvals,
+like any call that leaves its sandbox.
 [docs/SONNY.md](../docs/SONNY.md) has the details of triggers, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
