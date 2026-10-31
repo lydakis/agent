@@ -72,6 +72,7 @@ mod skills;
 mod sky;
 mod snapshot;
 mod sound;
+mod stamp;
 mod started;
 mod status;
 mod suggest;
@@ -843,7 +844,14 @@ fn main() -> std::process::ExitCode {
         {
             match &rest[1..] {
                 [] => home::Places::home().and_then(|places| home::set_up(&places, None)),
-                [url] => home::Places::home().and_then(|places| home::set_up(&places, Some(url))),
+                [help] if help == "-h" || help == "--help" => {
+                    println!("usage: {}", home::USAGE);
+                    Ok(())
+                }
+                // A flag is never a repository's URL.
+                [url] if !url.starts_with('-') => {
+                    home::Places::home().and_then(|places| home::set_up(&places, Some(url)))
+                }
                 _ => Err(format!("usage: {}", home::USAGE)),
             }
         }
@@ -919,7 +927,10 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
 
 async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("sonny {}", env!("CARGO_PKG_VERSION"));
+        match option_env!("SONNY_COMMIT") {
+            Some(commit) => println!("sonny {} ({commit})", env!("CARGO_PKG_VERSION")),
+            None => println!("sonny {}", env!("CARGO_PKG_VERSION")),
+        }
         return Ok(());
     }
     let options = parse()?;
@@ -9577,11 +9588,17 @@ impl App {
         // A steer never moves a bot, so a moved lead comes back with the
         // next message that starts a turn.
         let workspace = (!steer).then(|| self.move_to.clone()).flatten();
+        // The person's words carry when they were sent; a record of what
+        // Sonny did for them is read as it is.
+        let sent = match origin {
+            None => stamp::now(&prompt),
+            Some(_) => prompt.clone(),
+        };
         let reply = self
             .client
             .request(
                 "submit",
-                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": prompt,
+                json!({"bot": self.bot, "request_id": unique("tui"), "prompt": sent,
                     "delivery": delivery, "model": model, "workspace": workspace,
                     "effort": effort, "origin": origin, "images": attach::submitted(pictures)}),
             )
@@ -11477,11 +11494,13 @@ fn quiet_message(text: &str) -> bool {
 }
 
 /// A message item's text: a prompt's own words, without the line the
-/// daemon adds after them naming who sent it.
+/// daemon adds after them naming who sent it or the time Sonny stamped on
+/// them.
 fn text(item: &Value) -> String {
     match (&item["role"], &item["content"]) {
         (role, Value::Array(parts)) if role == "user" => (parts.iter())
             .find_map(|part| part["text"].as_str())
+            .map(stamp::unstamped)
             .unwrap_or_default()
             .to_owned(),
         (_, content) => joined(content),
@@ -11623,6 +11642,20 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_is_drawn_without_the_time_it_was_sent() {
+        let sent = stamp::stamped("ship it", 1_793_473_920);
+        let item = json!({"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": sent},
+            {"type": "input_text", "text": "[Sent by lookout.tasks.]"}]});
+        assert_eq!(text(&item), "ship it");
+    }
+
+    /// The words a submit carried, without the time Sonny stamped on them.
+    fn words_sent(asked: &Value) -> &str {
+        stamp::unstamped(asked["prompt"].as_str().unwrap_or_default())
+    }
 
     #[test]
     fn over_ssh_with_nothing_to_open_on_a_link_is_copied() {
@@ -12638,7 +12671,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock()
                     .unwrap()
-                    .push(asked["prompt"].as_str().unwrap().to_owned());
+                    .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
             }
             json!({"turn": 2})
         })
@@ -13126,7 +13159,7 @@ mod tests {
         assert!(app.repaint);
         let prompts: Vec<String> = (asked.lock().unwrap().iter())
             .filter(|op| op["op"] == "submit")
-            .map(|op| op["prompt"].as_str().unwrap_or("").to_owned())
+            .map(|op| stamp::unstamped(op["prompt"].as_str().unwrap_or("")).to_owned())
             .collect();
         assert_eq!(prompts, ["/zen the receipts' currency", "/zen off"]);
     }
@@ -13489,7 +13522,7 @@ mod tests {
         // The next message goes alone.
         app.input.set("thanks");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[2]["prompt"], "thanks");
+        assert_eq!(words_sent(&sent.lock().unwrap()[2]), "thanks");
     }
 
     #[tokio::test]
@@ -13549,7 +13582,7 @@ mod tests {
             (&sent[2]["delivery"], &sent[3]["delivery"]),
             (&json!("reject"), &json!("steer"))
         );
-        assert_eq!(sent[4]["prompt"], "and now?");
+        assert_eq!(words_sent(&sent[4]), "and now?");
         assert_eq!(sent[4]["origin"], Value::Null);
         assert_eq!(sent[4]["delivery"], "steer");
         // A turn it starts moves a moved lead, as any message's does.
@@ -14201,7 +14234,7 @@ mod tests {
         // Words with an emoji are a message, sent as one.
         app.input.set("👍 ship it");
         app.submit().await;
-        assert_eq!(sent.lock().unwrap()[3]["prompt"], "👍 ship it");
+        assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
         assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
     }
 
@@ -14594,7 +14627,7 @@ mod tests {
         // lead, and it is the person's.
         let queued = sent.lock().unwrap()[0].clone();
         assert_eq!(queued["delivery"], "queue");
-        assert_eq!(queued["prompt"], "after this");
+        assert_eq!(words_sent(&queued), "after this");
         assert_eq!(queued["workspace"], "/moved");
         assert!(app.move_to.is_none());
         assert_eq!(app.yours, Some(2));
@@ -15499,7 +15532,7 @@ mod tests {
         let seen = sent.clone();
         let client = daemon_answering(move |asked| {
             if asked["op"] == "submit" {
-                seen.lock().unwrap().push(asked["prompt"].clone());
+                seen.lock().unwrap().push(json!(words_sent(asked)));
             }
             json!({"turn": 9})
         })
