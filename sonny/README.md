@@ -670,8 +670,14 @@ way `/react` does, and each note in the margin has its own `↩`.
   ![/commons in the pane](../docs/sonny/commons.png)
 - `/sky` draws every agent the daemon keeps, in the pane: leads on the inner
   ring, the agents each one made fanned out behind it, you in the middle,
-  on a circle, as 0.7.0 drew it. Projects keep their places in the order
-  they started, each arm as wide as the square root of its size. It is a
+  on a circle as 0.7.0 drew it, stretched to fill a wide pane (up to twice
+  as wide as high). Projects keep their places in the order they started,
+  each arm as wide as the square root of its size, and the agents that made
+  none sit on the outer edge, as a tree's leaves do, so the sky fills to
+  its rim. Throwaway copies, such as the approver's judges or a
+  suggestion's writer, get no star: what they are told and do lights the
+  agent that made them, and a judge's question comes in from the edge, not
+  from you. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
   turns and live, denser and brighter the more the pair talked this hour. A
@@ -699,8 +705,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   star for every agent that needs you, failed, works or was just lit, and
   for the leads, as many as the pane has room for; the rest are a faint
   dot each, so a cloud's density says how big it is, and the biggest
-  clouds carry their count. Names keep a row apart, the leads of the
-  biggest projects first, a cell of clear sky either side. Under 60
+  clouds carry their count. Every star is named where there is room, the
+  working and the lit first, then the leads of the biggest projects; names
+  keep a row apart and two cells from a neighbour on their row, a cell of
+  clear sky either side. Under 60
   columns or 24 rows the sky becomes a list, a firefly per agent and the
   last it said or was told. `r` replays the last hour: the sky starts from
   who was here then, all idle, and what they said and did plays over it,
@@ -719,6 +727,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   followed again once it is back.
 
   ![/sky in the pane](../docs/sonny/sky.gif)
+
+  ![/sky filling a wide terminal](../docs/sonny/sky-wide.png)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
