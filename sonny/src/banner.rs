@@ -27,7 +27,7 @@ pub fn welcome(folder: &str, model: &str, width: usize) -> (Vec<Line<'static>>, 
         Line::from("it plans, starts tasks in their own copies,".dim()),
         Line::from("and tells you when they need you.".dim()),
         Line::default(),
-        Line::from(format!("{folder} · {model}").dim()),
+        Line::from(format!("{folder} · {}", crate::models::named(model)).dim()),
         Line::default(),
         hints(accent),
     ];
