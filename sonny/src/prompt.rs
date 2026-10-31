@@ -508,14 +508,43 @@ fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
 }
 
-/// A link at the start of `rest`, as `transcript::inline` takes one: its
-/// label's length and where the link ends.
-fn link(rest: &str) -> Option<(usize, usize)> {
-    let close = rest.strip_prefix('[')?.find("](")? + 1;
-    let end = rest[close + 2..].find(')')? + close + 3;
-    let (label, url) = (&rest[1..close], &rest[close + 2..end - 1]);
-    (!label.is_empty() && !label.contains('[') && !url.is_empty() && !url.contains(' '))
-        .then_some((label.len(), end))
+/// A link starting at `at` in `line`, as `transcript::inline` takes one:
+/// its label's length and the link's.
+fn link(line: &str, at: usize, next: &mut Next) -> Option<(usize, usize)> {
+    if !line[at..].starts_with('[') {
+        return None;
+    }
+    let close = next.find(line, "](", at + 1)?;
+    let end = next.find(line, ")", close + 2)? + 1;
+    // No `[` in the label, no space in the URL, neither empty.
+    let bracket = next.find(line, "[", at + 1).unwrap_or(usize::MAX);
+    let space = next.find(line, " ", close + 2).unwrap_or(usize::MAX);
+    (close > at + 1 && end > close + 3 && bracket > close && space >= end)
+        .then_some((close - at - 1, end - at))
+}
+
+/// Where each mark is next found on a line, from where a search starts:
+/// searches from later and later on one line read it once, not once per
+/// mark that opens on it.
+#[derive(Default)]
+struct Next(Vec<(&'static str, Option<usize>)>);
+
+impl Next {
+    fn find(&mut self, line: &str, needle: &'static str, from: usize) -> Option<usize> {
+        let known = self.0.iter_mut().find(|(n, _)| *n == needle);
+        match known.as_deref() {
+            // Not on the rest of the line: nor on any later part of it.
+            Some((_, None)) => return None,
+            Some((_, Some(found))) if *found >= from => return Some(*found),
+            _ => {}
+        }
+        let found = (line.get(from..)?.find(needle)).map(|i| from + i);
+        match known {
+            Some(entry) => entry.1 = found,
+            None => self.0.push((needle, found)),
+        }
+        found
+    }
 }
 
 /// The inline marks of `line` from `from`, at `offset` in the text, over
@@ -537,6 +566,7 @@ fn inline(
     ];
     let mut at = from;
     let mut plain = from;
+    let mut next = Next::default();
     while at < line.len() {
         let rest = &line[at..];
         let found = pairs.iter().find_map(|(mark, style, nested)| {
@@ -549,12 +579,12 @@ fn inline(
             {
                 return None;
             }
-            let end = after.find(mark)?;
+            let end = next.find(line, mark, at + mark.len())? - (at + mark.len());
             (end > 0).then_some((mark.len(), end, *style, *nested))
         });
         // A link, `[label](url)`: its label underlined, the rest dim.
         if found.is_none()
-            && let Some((label, end)) = link(rest)
+            && let Some((label, end)) = link(line, at, &mut next)
         {
             if plain < at && base != Style::new() {
                 marked.push((offset + plain..offset + at, base));
@@ -716,7 +746,14 @@ mod tests {
                 ("](https://x.io)", false, true),
             ]
         );
-        assert!(styled("a [b] (c) and [](x) and [d](e f)").is_empty());
+        assert!(styled("a [b] (c) and [](x) and [d](e f) and [g]()").is_empty());
+        assert_eq!(styled("[a [b](c) d")[1].0, "b");
+        // A long line of marks that never close is read once, not once per
+        // mark: a paste of them stays quick to draw.
+        let long = format!("`*{}", "[x] (y) ".repeat(40_000));
+        let started = std::time::Instant::now();
+        assert!(marks(&long).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
