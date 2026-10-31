@@ -178,7 +178,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "pause",
-        about: "Stop every agent until resume, across restarts: running turns end, queued work waits",
+        about: "Stop every agent until resume, across restarts: running turns park, queued work waits",
         usage: "pause --reason TEXT",
         flags: "--reason --pretty",
         settings: "",
@@ -186,7 +186,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "resume",
-        about: "Lift a pause; what waited starts",
+        about: "Lift a pause; parked turns continue, what waited starts",
         usage: "resume",
         flags: "--pretty",
         settings: "",

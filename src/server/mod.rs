@@ -585,15 +585,16 @@ enum Command {
         grace_ms: u64,
     },
     /// Stop every agent until `resume`, across restarts: each running turn
-    /// ends with `daemon_paused`, no turn starts, and queued work waits.
+    /// parks at once, its unanswered calls answered `daemon_paused`, and
+    /// continues on `resume`; no turn starts, and queued work waits.
     /// `by` names who pulled it; a bot's own socket is that bot. While a
     /// pause holds, another changes nothing.
     Pause {
         reason: String,
         by: Option<String>,
     },
-    /// Lift the pause; what waited starts as capacity allows. `by` names
-    /// who let the line go on, as a pause's does.
+    /// Lift the pause; what waited, and the turns it parked, start as
+    /// capacity allows. `by` names who let the line go on, as a pause's does.
     Resume {
         #[serde(default)]
         by: Option<String>,
@@ -1246,10 +1247,11 @@ impl Active {
     }
     /// Cancel the turn with `code` unless a cause is already set: the first
     /// cause wins, so shutdown never relabels a client's pending interrupt.
+    /// A pause only parks the turn, so an interrupt after it still ends it.
     /// False when the task has already dropped its receiver.
     fn cancel(&self, code: &'static str) -> bool {
         self.cancel.send_if_modified(|cause| {
-            cause.is_none() && {
+            (cause.is_none() || (*cause == Some(turn::PAUSED) && code == turn::INTERRUPTED)) && {
                 *cause = Some(code);
                 true
             }
@@ -2788,7 +2790,14 @@ impl Service {
             // Keep the cancellation receiver alive through completion so an
             // interrupt cannot mistake this task for an unreaped parked turn.
             let mut cancelled = cancelled;
-            let exit = task.execute(cancelled.clone()).await;
+            let mut exit = task.execute(cancelled.clone()).await;
+            // An interrupt that came as the turn parked, after it last
+            // looked, still ends it: its requester was told it would.
+            if !matches!(exit, turn::Exit::Finished(_))
+                && *cancelled.borrow() == Some(turn::INTERRUPTED)
+            {
+                exit = turn::Exit::Finished(Some(Error::new(turn::INTERRUPTED)));
+            }
             let result = match &exit {
                 turn::Exit::Finished(error) => {
                     ending.store(true, std::sync::atomic::Ordering::Release);
@@ -3389,6 +3398,10 @@ impl Service {
                 if reason.is_empty() || reason.len() > 4096 {
                     return fail_with("usage", "a pause's reason is 1 to 4096 bytes");
                 }
+                // Told to every session, so bounded as a verdict's `by` is.
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
+                }
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
@@ -3398,11 +3411,11 @@ impl Service {
                     })
                     .await?;
                 self.paused = Some(pause.clone());
-                // The line stops: every running turn ends now. Parked and
-                // queued turns hold no slot and wait.
-                let mut interrupted = 0;
+                // The line stops: every running turn parks now, to continue
+                // on `resume`. Parked and queued turns hold no slot and wait.
+                let mut parked = 0;
                 if new {
-                    interrupted = (self.active.values())
+                    parked = (self.active.values())
                         .filter(|active| active.cancel(turn::PAUSED))
                         .count();
                     // And what they started that runs on without them.
@@ -3410,9 +3423,12 @@ impl Service {
                     self.notices
                         .push(json!({"event": "paused", "pause": pause, "durable": false}));
                 }
-                Ok(json!({"pause": pause, "changed": new, "interrupted": interrupted}))
+                Ok(json!({"pause": pause, "changed": new, "parked": parked}))
             }
             Command::Resume { by } => {
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail_with("invalid_by", "by must be 1 to 128 bytes");
+                }
                 let lifted = store.op("remove_pause", |db| db.remove_pause()).await?;
                 self.paused = None;
                 let changed = lifted.is_some();
@@ -5006,6 +5022,32 @@ mod tests {
             "bot_not_found"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn an_interrupt_supersedes_a_pause_and_nothing_relabels_an_interrupt() {
+        let active = |cancel| Active {
+            turn: 1,
+            task: 1,
+            cancel,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            ending: Arc::default(),
+        };
+        // A pause only parks the turn: an interrupt after it ends it.
+        let (cancel, cause) = watch::channel(None);
+        let pulled = active(cancel);
+        assert!(pulled.cancel(turn::PAUSED));
+        assert!(pulled.cancel(turn::INTERRUPTED));
+        assert_eq!(*cause.borrow(), Some(turn::INTERRUPTED));
+        // Nothing relabels an interrupt, and shutdown leaves a pause's park.
+        assert!(pulled.cancel(turn::PAUSED));
+        assert_eq!(*cause.borrow(), Some(turn::INTERRUPTED));
+        let (cancel, cause) = watch::channel(None);
+        let parked = active(cancel);
+        parked.cancel(turn::PAUSED);
+        parked.cancel(turn::SHUTDOWN);
+        assert_eq!(*cause.borrow(), Some(turn::PAUSED));
     }
     #[tokio::test]
     async fn interrupt_reconciles_a_parked_task_before_it_is_reaped() {
