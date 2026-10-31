@@ -40,7 +40,7 @@
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
-//! tool_processes = 8            # processes Sonny runs for agents at once (tool calls, goal checks) in each of its companions; 0, the default, twice the CPUs
+//! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
@@ -211,9 +211,9 @@ pub struct Sonny {
     /// thermostat's margin and hold, so it does not flicker.
     pub sky_haiku_margin: u64,
     pub sky_haiku_hold: u64,
-    /// The processes each of Sonny's companions runs for agents at once:
-    /// tool calls the tool host answers, goal checks. 0 for twice the
-    /// CPUs.
+    /// The processes Sonny runs for agents at once in all: three quarters
+    /// for tool calls the tool host answers, a quarter for goal checks,
+    /// each at least one. 0 for four times the CPUs.
     pub tool_processes: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,

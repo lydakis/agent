@@ -1,11 +1,15 @@
-//! The processes a Sonny companion runs for agents at once: the tool host's
-//! tool calls in `sonny tool` processes, or the lookout's goal checks. One
-//! budget for all of a companion's, as a systemd slice bounds a group of
-//! units, so a turn that parks cheaply in the daemon cannot leave unbounded
-//! work running here. Each companion is its own process with its own
-//! budget, so both together run at most twice it. Callers wait their turn in order (Tokio's semaphore is fair), and
-//! no agent holds more than half of it, so one agent's burst leaves room
-//! for the rest.
+//! The processes Sonny runs for agents at once: the tool host's tool calls
+//! in `sonny tool` processes, and the lookout's goal checks. One total, as a
+//! systemd slice bounds a group of units, so a turn that parks cheaply in
+//! the daemon cannot leave unbounded work running here. It is split by a
+//! fixed formula, as Kubernetes API Priority and Fairness gives each
+//! priority level its share of one server's seats: the tool host, whose
+//! calls hold live turns, takes three quarters, and the lookout, whose
+//! checks run after turns end, a quarter, each at least one. So a burst of
+//! slow checks never holds up a tool call, and the two companions, separate
+//! processes, share nothing to keep the total. Callers wait their turn in
+//! order (Tokio's semaphore is fair), and no agent holds more than half of
+//! a companion's share, so one agent's burst leaves room for the rest.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -84,17 +88,40 @@ impl Budget {
     }
 }
 
-/// The companion's budget, sized by `tool_processes` in the config, or
-/// twice the CPUs.
-pub fn processes() -> &'static Budget {
-    static BUDGET: OnceLock<Budget> = OnceLock::new();
-    BUDGET.get_or_init(|| {
+/// Which of Sonny's companions a budget is for.
+#[derive(Clone, Copy)]
+pub enum Companion {
+    ToolHost,
+    Lookout,
+}
+
+/// `companion`'s share of `total`: the lookout a quarter, the tool host the
+/// rest, each at least one.
+fn share(total: usize, companion: Companion) -> usize {
+    let lookout = (total / 4).max(1);
+    match companion {
+        Companion::Lookout => lookout,
+        Companion::ToolHost => total.saturating_sub(lookout).max(1),
+    }
+}
+
+/// This companion's budget: its share of `tool_processes` in the config,
+/// or of four times the CPUs.
+pub fn processes(companion: Companion) -> &'static Budget {
+    static TOOL_HOST: OnceLock<Budget> = OnceLock::new();
+    static LOOKOUT: OnceLock<Budget> = OnceLock::new();
+    let budget = match companion {
+        Companion::ToolHost => &TOOL_HOST,
+        Companion::Lookout => &LOOKOUT,
+    };
+    budget.get_or_init(|| {
         let set = agent_client::config::load().map_or(0, |config| config.sonny.tool_processes);
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        Budget::new(match set {
-            0 => 2 * cpus,
+        let total = match set {
+            0 => 4 * cpus,
             set => usize::try_from(set).unwrap_or(usize::MAX),
-        })
+        };
+        Budget::new(share(total, companion))
     })
 }
 
@@ -105,6 +132,22 @@ mod tests {
 
     fn leaked(size: usize) -> &'static Budget {
         Box::leak(Box::new(Budget::new(size)))
+    }
+
+    #[test]
+    fn the_tool_host_takes_three_quarters_and_the_lookout_a_quarter() {
+        let split = |total| {
+            (
+                share(total, Companion::ToolHost),
+                share(total, Companion::Lookout),
+            )
+        };
+        assert_eq!(split(48), (36, 12));
+        assert_eq!(split(10), (8, 2));
+        assert_eq!(split(4), (3, 1));
+        // Each gets at least one, even past a total too small for both.
+        assert_eq!(split(2), (1, 1));
+        assert_eq!(split(1), (1, 1));
     }
 
     #[tokio::test]
