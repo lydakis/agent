@@ -125,6 +125,8 @@ const REPLAY_STEP: f64 = 10_000.0;
 const REPLAY_BACK: i64 = 3_600_000;
 /// The least room the sky is drawn in; with less, a list.
 const SKY_COLS: usize = 60;
+/// How often a sky reads the haiku rule from the config again.
+const RULE_READ: Duration = Duration::from_secs(10);
 const SKY_ROWS: usize = 24;
 /// How much longer one way than the other the sky may be.
 const STRETCH: f32 = 2.0;
@@ -431,6 +433,8 @@ pub struct View {
     heir: Option<(String, Instant)>,
     /// When the title was last weighed: once a second is enough.
     weighed: Option<Instant>,
+    /// When the haiku rule was last read from the config.
+    ruled: Option<Instant>,
     /// Where the copies that write haikus run.
     runtime: tokio::runtime::Handle,
     /// The andon cord, while it hangs or its start rings out.
@@ -676,6 +680,7 @@ impl View {
             poems: mpsc::unbounded_channel(),
             heir,
             weighed: None,
+            ruled: Some(now),
             runtime: tokio::runtime::Handle::current(),
             cord: None,
         }
@@ -844,7 +849,7 @@ impl View {
         if (self.fading.as_ref()).is_some_and(|(_, at)| now.duration_since(*at) > FADE) {
             self.fading = None;
         }
-        if !self.live || self.replay.is_some() || self.title.rule.daily == 0 {
+        if !self.live || self.replay.is_some() {
             return;
         }
         if self
@@ -854,6 +859,18 @@ impl View {
             return;
         }
         self.weighed = Some(now);
+        // The rule as /config says, read again now and then: haikus turned
+        // on or off, or the cap moved, since the sky opened.
+        if self
+            .ruled
+            .is_none_or(|at| now.duration_since(at) >= RULE_READ)
+        {
+            self.title.rule = haiku::Rule::load();
+            self.ruled = Some(now);
+        }
+        if self.title.rule.daily == 0 {
+            return;
+        }
         if let Some((name, since)) = self.heir.take()
             && self.agent(&name).is_some()
         {
@@ -884,9 +901,10 @@ impl View {
         {
             verse.until.get_or_insert(now);
         }
-        // The rule as /config says now: one turned off or lowered since
-        // the sky opened spends no more.
+        // The rule as /config says now, before spending: one turned off or
+        // lowered since it was last read spends no more.
         self.title.rule = haiku::Rule::load();
+        self.ruled = Some(now);
         let since = wall_ms();
         let rule = self.title.rule;
         // Counted in the file before it is spent, or not written at all.
