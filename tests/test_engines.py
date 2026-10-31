@@ -164,6 +164,7 @@ sys.exit(7)
     def test_matrix_rss_guard_is_shared_by_every_selected_engine(self):
         self.assertEqual(rss_guard(['pi', 'codex', 'rust']), 512)
         self.assertEqual(rss_guard(['rust', 'opencode']), 2048)
+        self.assertEqual(rss_guard(['rust', 'fx']), 2048)
 
     def run_fake_claude(self, mode):
         root = Path(__file__).resolve().parent.parent
