@@ -163,10 +163,7 @@ impl Kept {
     /// What the file says for `socket`, or nothing kept.
     pub fn load(socket: &Path) -> Kept {
         let socket = socket.display().to_string();
-        let kept = home()
-            .and_then(|home| std::fs::read(file(&home)).ok())
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .filter(|kept| kept["socket"] == socket.as_str());
+        let kept = all().remove(&socket).filter(Value::is_object);
         let Some(kept) = kept else {
             return Kept {
                 socket,
@@ -213,8 +210,14 @@ impl Kept {
             return;
         };
         let file = file(&home);
-        let kept = json!({"socket": self.socket, "day": self.day, "written": self.written,
-            "by": self.by, "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms});
+        // Each daemon's apart, by its socket; the others' as they are.
+        let mut all = all();
+        all.insert(
+            self.socket.clone(),
+            json!({"day": self.day, "written": self.written, "by": self.by,
+                "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms}),
+        );
+        let kept = Value::Object(all);
         if let Some(dir) = file.parent()
             && std::fs::create_dir_all(dir).is_ok()
         {
@@ -246,6 +249,18 @@ impl Kept {
         self.at_ms = now_ms;
         true
     }
+}
+
+/// Every daemon's haiku, by socket, as the file keeps them.
+fn all() -> serde_json::Map<String, Value> {
+    home()
+        .and_then(|home| std::fs::read(file(&home)).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|all| match all {
+            Value::Object(all) => Some(all),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// The local day of `ms`, as the count is kept by.
@@ -460,6 +475,12 @@ mod tests {
         kept.save();
         assert_eq!(Kept::load(Path::new("/tmp/agent.sock")), kept);
         assert!(Kept::load(Path::new("/tmp/other.sock")).lines.is_empty());
+        // Another daemon's claim leaves this one's as it was.
+        Kept::update(Path::new("/tmp/other.sock"), |other| {
+            other.claim(&rule, "x", ms, ms)
+        });
+        assert_eq!(Kept::load(Path::new("/tmp/agent.sock")), kept);
+        assert_eq!(Kept::load(Path::new("/tmp/other.sock")).by, "x");
         let _ = std::fs::remove_dir_all(home().unwrap());
     }
 }
