@@ -1684,6 +1684,9 @@ struct Lookout {
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
+    /// A note under way when the lookout last stopped, sent again as it
+    /// was, under its request, so the daemon takes it at most once.
+    resend: Vec<sources::Heard>,
     /// A note on its way: what it tells, its key and how it goes, until
     /// the daemon answers.
     sending: Option<(updates::Told, Vec<String>, &'static str)>,
@@ -1734,6 +1737,7 @@ impl Lookout {
             heard_since: None,
             told_sources: HashMap::new(),
             held: None,
+            resend: Vec::new(),
             sending: None,
             sourcing: None,
             asking: None,
@@ -2330,7 +2334,13 @@ impl Lookout {
             !heard.subs.is_empty()
         });
         self.heard = heard;
-        if self.heard.is_empty() {
+        let mut resend = std::mem::take(&mut self.resend);
+        resend.retain_mut(|heard| {
+            heard.subs = self.hearing(&heard.event);
+            !heard.subs.is_empty()
+        });
+        self.resend = resend;
+        if self.heard.is_empty() && self.resend.is_empty() {
             self.heard_since = None;
         }
         self.keep();
@@ -2342,11 +2352,13 @@ impl Lookout {
         let Some(path) = &self.held else {
             return;
         };
-        let sending = self.sourcing.iter().flat_map(|(sent, ..)| sent);
-        let events: Vec<Value> = (sending.chain(&self.heard))
-            .map(|heard| heard.event.to_json())
-            .collect();
-        if events.is_empty() && self.told_sources.is_empty() {
+        let json = |heard: &sources::Heard| heard.event.to_json();
+        let sending: Vec<Value> = match &self.sourcing {
+            Some((sent, ..)) => sent.iter().map(json).collect(),
+            None => self.resend.iter().map(json).collect(),
+        };
+        let events: Vec<Value> = self.heard.iter().map(json).collect();
+        if events.is_empty() && sending.is_empty() && self.told_sources.is_empty() {
             let _ = std::fs::remove_file(path);
             return;
         }
@@ -2357,7 +2369,8 @@ impl Lookout {
                 (source.clone(), json!(epoch.saturating_sub(ago) as u64))
             })
             .collect();
-        let body = json!({"bot_id": self.updates.lead_id(), "events": events, "told": told});
+        let body = json!({"bot_id": self.updates.lead_id(), "sending": sending, "events": events,
+            "told": told});
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -2392,14 +2405,18 @@ impl Lookout {
                 self.told_sources.insert(source.clone(), at);
             }
         }
-        let events = kept["events"].as_array().into_iter().flatten();
-        self.heard = (events.filter_map(sources::Event::from_json))
-            .map(|event| sources::Heard {
-                event,
-                subs: Vec::new(),
-            })
-            .collect();
-        self.heard_since = (!self.heard.is_empty()).then_some(now);
+        let heard = |key: &str| -> Vec<sources::Heard> {
+            (kept[key].as_array().into_iter().flatten())
+                .filter_map(sources::Event::from_json)
+                .map(|event| sources::Heard {
+                    event,
+                    subs: Vec::new(),
+                })
+                .collect()
+        };
+        self.heard = heard("events");
+        self.resend = heard("sending");
+        self.heard_since = (!self.heard.is_empty() || !self.resend.is_empty()).then_some(now);
         self.rehear();
     }
 
@@ -2435,7 +2452,7 @@ impl Lookout {
         let Some(since) = self.heard_since else {
             return;
         };
-        if !self.heard.iter().any(|heard| self.ready(heard, now)) {
+        if self.resend.is_empty() && !self.heard.iter().any(|heard| self.ready(heard, now)) {
             return;
         }
         // A missed event would hold the note until the subscriber's next
@@ -2446,9 +2463,20 @@ impl Lookout {
         if self.sourcing.is_some() {
             return;
         }
-        let steer = self.heard.iter().any(|heard| heard.event.urgent);
+        let waiting = if self.resend.is_empty() {
+            &self.heard
+        } else {
+            &self.resend
+        };
+        let steer = waiting.iter().any(|heard| heard.event.urgent);
         if self.refused(now) || !(steer || (now >= since + SETTLE && self.updates.idle())) {
             return;
+        }
+        // The note under way when the lookout stopped goes first, as it was.
+        let sent = std::mem::take(&mut self.resend);
+        if !sent.is_empty() {
+            let prompt = sources::note(&sent, self.heard.len());
+            return self.source(client, woken, sent, prompt, steer);
         }
         // A bounded note sends what is urgent first, and always at least
         // one; what a digest still holds waits after the rest.
@@ -2468,6 +2496,18 @@ impl Lookout {
         ready.extend(held);
         self.heard = ready;
         let prompt = sources::note(&sent, self.heard.len());
+        self.source(client, woken, sent, prompt, steer);
+    }
+
+    /// Sends `sent` as one note, its request named by the events it tells.
+    fn source(
+        &mut self,
+        client: &Arc<Client>,
+        woken: &Woken,
+        sent: Vec<sources::Heard>,
+        prompt: String,
+        steer: bool,
+    ) {
         let key: Vec<String> = (sent.iter())
             .map(|heard| {
                 let event = &heard.event;
@@ -3774,6 +3814,22 @@ mod tests {
         assert!(again.heard_since.is_some());
         let ago = again.told_sources["slack"].elapsed().as_secs();
         assert!((59..=61).contains(&ago), "{ago}");
+        // A note under way when it stopped goes again first, as it was,
+        // under the same request.
+        let mut sending = made();
+        sending.heard_from(&slack("two", false));
+        let asked = sources::note(&sending.heard, 0);
+        let sent = std::mem::take(&mut sending.heard);
+        sending.sourcing = Some((sent, vec!["k".into()], "queue"));
+        sending.heard_from(&slack("three", false));
+        sending.held = Some(path.clone());
+        sending.keep();
+        let mut back = made();
+        back.restore(path.clone());
+        assert_eq!(back.resend.len(), 1);
+        assert_eq!(back.resend[0].event.text, "two");
+        assert_eq!(back.heard.len(), 1);
+        assert_eq!(sources::note(&back.resend, 0), asked);
         // Another bot of the name hears none of it.
         let mut other = Lookout::new("calc.lead");
         other.subs.push(hears("chat"));
