@@ -365,7 +365,7 @@ removed `artifact_pruned` (see Retention).
 stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
 those paths as `files` beside `artifacts`, so any command or tool reads them.
 The store keeps one row per stream naming the file and none of its bytes
-(schema 66), and `artifact` and `read artifact=` read the file. Each file is
+(schema 67), and `artifact` and `read artifact=` read the file. Each file is
 made new (0600, never through a link) and synced with its folder before the
 store records it, off the runtime thread, and only while
 the bot's sandbox cannot write the folder, checked after the folder is made: a
@@ -2350,9 +2350,10 @@ gives a sandboxed command no way to it.
 Creating a sandboxed bot checks that sandboxes run here and refuses with
 `sandbox_unavailable` otherwise: on Linux, a system bubblewrap
 (`/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` or
-`/run/current-system/sw/bin/bwrap`, never one found on `PATH`, which could
-lie in a folder a bot may write) must make the user, pid and network
-namespaces; on
+`/run/current-system/sw/bin/bwrap`, or the one a package build fixed with
+`AGENT_BWRAP`, as the Homebrew formula does for its own; never one found on
+`PATH`, which could lie in a folder a bot may write) must make the user, pid
+and network namespaces; on
 macOS, `/usr/bin/sandbox-exec` must exist. A sandboxed bot never runs
 unconfined for want of one. A `writable` folder that doesn't exist is
 `path_not_found`.
@@ -2452,7 +2453,14 @@ reads, or with `"error":{"code","detail"?}` in place of `output`, a refusal
 the model reads as `{"error":CODE,"detail":DETAIL}` (a code is 1 to 64
 lowercase letters, digits or `_`; output and detail each up to 64 KiB,
 redacted as command output is; anything else is `invalid_tool_result` or
-`tool_output_limit`). The first answer counts: another is
+`tool_output_limit`). `output` may instead be a list of parts the model
+reads in that order, as providers' own tool results and MCP's take them:
+`{"type":"text","text"}` and `{"type":"image","media_type","data"}`. Its
+text is up to 64 KiB together, redacted the same way, and its pictures
+are a prompt's: up to 20 of PNG, JPEG, GIF or WebP, 5 MiB together once
+decoded, else `invalid_image` or `image_limit`. A picture counts at its
+token cost, and a result with pictures elides to its text as a read
+picture does. The client scales a picture; the daemon sends it as given. The first answer counts: another is
 `call_already_answered`, one for a call that ended or ran out of time is
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.

@@ -1544,8 +1544,8 @@ where
 }
 
 /// What a bot this thread comes back to needs running, as when its lead
-/// was set up: the lookout watching the lead's tasks and answering
-/// Sonny's tools, and a judge for an `auto` gate.
+/// was set up: the lookout watching the lead's tasks, the tool host
+/// answering Sonny's tools, and a judge for an `auto` gate.
 async fn services(
     agent: &Agent,
     client: &Client,
@@ -1559,7 +1559,7 @@ async fn services(
     if let Some(project) = project {
         lookout::subscribe_lead(&agent.options.store, bot, project)?;
     }
-    crate::start_lookout(client).await?;
+    crate::start_companions(client).await?;
     if approvals::mode(&record) == Some("auto") {
         let model = format!(
             "{}/{}",
@@ -1645,7 +1645,7 @@ async fn setup_lead(
         }
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
-    crate::start_lookout(client).await?;
+    crate::start_companions(client).await?;
     if gating.or(mode) == Some("auto") {
         let model = format!(
             "{}/{}",

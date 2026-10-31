@@ -46,13 +46,14 @@ impl Rex {
     fn call(&self, args: &[&str]) -> Result<Value, String> {
         // Every call names its session: the shell's own Rex variables may
         // name another (a daemon's), and rex would look a bare ID up there.
-        let out = Command::new(&self.bin)
-            .env_remove("REX_SESSION")
-            .env_remove("REX_BLOCK")
-            .args(&self.host)
-            .args(args)
-            .output()
-            .map_err(|e| format!("rex: {e}"))?;
+        let out = crate::mux::output(
+            Command::new(&self.bin)
+                .env_remove("REX_SESSION")
+                .env_remove("REX_BLOCK")
+                .args(&self.host)
+                .args(args),
+        )
+        .map_err(|e| format!("rex: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "rex {}: {}",

@@ -109,6 +109,16 @@ class LookoutTests(ModelFixture):
         self.assertEqual(json.loads(service.stdout.readline())['event'], 'watching')
         return service
 
+    def host(self):
+        """The tool host, which answers Sonny's tools and tells the lookout
+        when a call changed what it reads."""
+        service = subprocess.Popen([str(self.sonny), 'tool-host', '--store', str(self.path / 'state.sqlite'),
+                                    '--socket', str(self.daemon.socket_path)],
+                                   env={**clean_env(), 'HOME': str(self.path)}, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (service.kill(), service.wait(timeout=5), service.stdout.close()))
+        self.assertEqual(json.loads(service.stdout.readline())['event'], 'serving')
+        return service
+
     def note_for(self, bot, timeout=30, having='', starting='Task updates: '):
         prompt = self.prompt_for(bot, timeout, having, starting)
         return prompt and prompt['text']
@@ -229,13 +239,14 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(woke, 'news held for a busy lead was lost with the lookout')
 
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
-        # It subscribes with the tool Sonny gives it, which the lookout
+        # It subscribes with the tool Sonny gives it, which the tool host
         # answers, to its own file only.
         tool = {'name': 'subscriptions', 'description': 'Subscribe.', 'answered_by': 'sonny',
                 'parameters': {'type': 'object', 'properties': {'add': {'type': 'object'}}}}
         self.make('reviewer', declare=[tool])
         self.make('ops.deploy')
         self.start()
+        self.host()
         self.model.call_script = [('subscriptions', {'add': {'name': 'deploys', 'bots': ['ops.*']}})]
         turn = self.daemon.request('submit', bot='reviewer', request_id='s', prompt='script')['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')

@@ -75,6 +75,7 @@ mod task;
 mod term;
 #[cfg(test)]
 mod testing;
+mod tool_host;
 mod transcript;
 mod tree;
 mod trigger;
@@ -210,7 +211,7 @@ struct Options {
     new: bool,
     model: Option<String>,
     workspace: Option<String>,
-    /// Lay the project's tasks out in Rex or Herdr, whichever Sonny runs in.
+    /// Lay the project's tasks out in Rex, Herdr or cmux, whichever Sonny runs in.
     layout: bool,
     /// The Rex server the project's session lives on, when not this one.
     rex_host: Option<String>,
@@ -231,14 +232,14 @@ fn usage() -> String {
      \x20      [--agent NAME [--new [--workspace DIR]] | --lead NAME | --new-lead [NAME]]\n\
      With no --agent, the folder's lead you last wrote to, its first made with --model the\n\
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
-     tasks open beside it in Rex or Herdr, each in a git worktree of its own. Type /status\n\
+     tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
      for the project's agents, /lead for the folder's leads.\n\
      Agents start tasks, put windows and panes where the person looks, make projects\n\
-     and follow agents in the lookout with tools Sonny gives them, which the lookout answers.\n\
+     and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
      sonny memory ... and sonny trigger ... are what ~/.agent/memory and ~/.agent/trigger\n\
      run, which Sonny writes at each start.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
-     on its own in the whole terminal.\n\
+     on its own in the whole terminal; --center NAME puts an agent in the middle.\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -252,7 +253,7 @@ fn usage() -> String {
 /// asked. A task gets a window of its own unless told otherwise; `split`
 /// puts it beside the caller's block, or `beside` another bot's. Another
 /// project's lead gets its project's own home instead (a Rex session, a
-/// Herdr workspace), running that lead's Sonny, unless it is there already.
+/// Herdr or cmux workspace), running that lead's Sonny, unless it is there already.
 async fn show(
     caller: &str,
     bot: &str,
@@ -474,22 +475,18 @@ async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
     keep(client, APPROVER, &bin, args, json!({"AGENT_MODEL": model})).await
 }
 
-/// The lookout, `sonny lookout`, which tells leads what happens in their
-/// tasks and answers Sonny's tools: the daemon's companion, so it runs for
-/// as long as the daemon does, whether or not a window is open, and comes
-/// back with the next daemon. This Sonny's own build replaces another's:
-/// the build is part of what the daemon keeps, so a Sonny upgraded in
-/// place has the daemon start the new one.
-async fn start_lookout(client: &Client) -> Result<(), String> {
+/// Sonny's companions in the daemon, so they run for as long as it does,
+/// whether or not a window is open, and come back with the next daemon:
+/// the lookout, `sonny lookout`, which tells leads what happens in their
+/// tasks, and the tool host, `sonny tool-host`, which answers the tools
+/// Sonny gives its agents. This Sonny's own build replaces another's: the
+/// build is part of what the daemon keeps, so a Sonny upgraded in place
+/// has the daemon start the new ones.
+async fn start_companions(client: &Client) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    keep(
-        client,
-        LOOKOUT,
-        &me,
-        daemon_args("lookout"),
-        json!({"SONNY_BUILD": lookout::identity()}),
-    )
-    .await
+    let build = json!({"SONNY_BUILD": lookout::identity()});
+    keep(client, LOOKOUT, &me, daemon_args("lookout"), build.clone()).await?;
+    keep(client, TOOL_HOST, &me, daemon_args(tool_host::NAME), build).await
 }
 
 /// How long a word waits on the daemon to say whether it names an agent.
@@ -497,6 +494,7 @@ const NAME_LOOKUP: Duration = Duration::from_secs(2);
 
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
+const TOOL_HOST: &str = "sonny-tool-host";
 const APPROVER: &str = "approver-auto";
 
 /// A companion's arguments: its store and socket come from the daemon
@@ -779,7 +777,7 @@ fn main() -> std::process::ExitCode {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
-        // The lookout runs this for each call of a tool Sonny answers.
+        // The tool host runs this for each call of a tool Sonny answers.
         Some((tool, rest)) if tool == "tool" => served::answer_here(rest),
         // `~/.agent/memory` runs this, from agents' shells.
         Some((verb, rest)) if verb == "memory" => {
@@ -806,6 +804,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(trigger::fire_cli(rest) as u8);
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
+        Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
         Some((verb, rest)) if verb == "approver" => approver::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
@@ -857,16 +856,22 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `sonny sky [--store PATH] [--socket PATH]`: `/sky` on its own,
-/// the whole terminal, until q.
+/// `sonny sky [--center NAME] [--store PATH] [--socket PATH]`: `/sky` on
+/// its own, the whole terminal, until q; centred on an agent, by its name,
+/// its label or its project, when asked.
 fn sky_cli(args: &[String]) -> Result<(), String> {
-    let (mut store, mut socket) = (None, None);
+    let (mut store, mut socket, mut centre) = (None, None, None);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--store" => store = args.next().map(PathBuf::from),
             "--socket" => socket = args.next().map(PathBuf::from),
-            _ => return Err("usage: sonny sky [--store PATH] [--socket PATH]".into()),
+            "--center" | "--centre" => centre = args.next().cloned(),
+            _ => {
+                return Err(
+                    "usage: sonny sky [--center NAME] [--store PATH] [--socket PATH]".into(),
+                );
+            }
         }
     }
     let (_, socket) = daemon_paths(store, socket)?;
@@ -875,7 +880,7 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    sky::watch(&runtime, socket)
+    sky::watch(&runtime, socket, centre)
 }
 
 async fn run() -> Result<(), String> {
@@ -1002,8 +1007,8 @@ async fn run() -> Result<(), String> {
         app.model = model.clone();
         app.turn_model = Some(model.clone());
     }
-    // Tasks are laid out in Rex when the person is in it (or names the
-    // Rex server to use); elsewhere they run out of sight, in /status.
+    // Tasks are laid out in the multiplexer the person runs Sonny in (or
+    // the Rex server named); elsewhere they run out of sight, in /status.
     if let Some(project) = &project
         && options.layout
     {
@@ -1027,8 +1032,8 @@ async fn run() -> Result<(), String> {
     {
         app.notice = Some(format!("the lookout: {error}"));
     }
-    // It answers the tools Sonny gives every agent, a lead or not.
-    if let Err(error) = start_lookout(&app.client).await {
+    // They answer the tools Sonny gives every agent, a lead or not.
+    if let Err(error) = start_companions(&app.client).await {
         app.notice = Some(error);
     }
     // The lead told what its folder tells it today (skills and memory added
@@ -2261,7 +2266,7 @@ struct App {
     suggestion: Option<String>,
 }
 
-/// The lead's tasks, laid out in the project's Rex session: a window for
+/// The lead's tasks, laid out in the project's home in a multiplexer: a window for
 /// each task while it works, opened as its turn starts. It follows every
 /// bot on its own connection, so the lead's own view is not disturbed.
 struct Fleet {
@@ -2281,7 +2286,7 @@ struct Fleet {
     leads: std::collections::HashSet<String>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
-    /// Said once in the status row when Rex is set up.
+    /// Said once in the status row when tasks open where this pane is not.
     note: Option<String>,
     /// What each bot is doing, as its window says.
     doing: HashMap<String, &'static str>,
@@ -3896,7 +3901,7 @@ impl App {
                 .await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
-            if let Err(error) = start_lookout(&self.client).await {
+            if let Err(error) = start_companions(&self.client).await {
                 self.notice = Some(error);
             }
             if self.mode == Some("auto")
@@ -6657,10 +6662,11 @@ impl App {
 
     /// What the lookout does for this window's lead.
     fn lookout_line(&self) -> String {
-        match &self.project {
+        let lookout = match &self.project {
             Some(_) => lookout::status(&self.options.store, &self.bot),
             None => String::new(),
-        }
+        };
+        tool_host::with_status(lookout, &self.options.store)
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
@@ -7450,23 +7456,24 @@ impl App {
             if self.pane_keys {
                 match key.code {
                     // Back to the margin from what is over it; the margin closed.
-                    KeyCode::Esc => self.close_pane(true),
-                    // `/sky` shows what its marks mean, or the ticker again.
-                    KeyCode::Char('?')
-                        if pane.is_card()
-                            && let Some(view) =
-                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
+                    KeyCode::Esc
+                        if !(pane.is_card()
+                            && self
+                                .watch
+                                .as_mut()
+                                .and_then(|w| w.sky.as_mut())
+                                .is_some_and(|view| view.press(KeyCode::Esc))) =>
                     {
-                        view.legend = !view.legend
+                        self.close_pane(true)
                     }
-                    // `/sky` alone: no chat log, no counts, few names.
-                    KeyCode::Char('z')
-                        if pane.is_card()
-                            && let Some(view) =
-                                self.watch.as_mut().and_then(|w| w.sky.as_mut()) =>
-                    {
-                        view.zen = !view.zen
-                    }
+                    KeyCode::Esc => {}
+                    // `/sky`'s own keys: its legend, zen, the lenses on Tab,
+                    // a star picked and centred on; Esc lets go of the pick
+                    // and the centre before it closes the pane.
+                    _ if pane.is_card()
+                        && !switches(key)
+                        && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
+                        && view.press(key.code) => {}
                     // `/status` lists the resolved tasks, or only counts them.
                     KeyCode::Char('r')
                         if pane.is_card()
@@ -10468,7 +10475,7 @@ fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::la
 
 /// What the pane's title row says the keys do on `/status`.
 const STATUS_KEYS: &str = "esc close";
-const SKY_KEYS: &str = "z zen · ? legend · esc close";
+const SKY_KEYS: &str = "tab lens · ↑↓←→ pick · z zen · ? legend · esc close";
 
 /// What the title row says the keys do on `/status` itself.
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";

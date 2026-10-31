@@ -1,5 +1,5 @@
 //! `exec`, the one tool through which agents reach the MCP servers in
-//! `[sonny.mcp_servers]`: the model writes JavaScript, the lookout runs it
+//! `[sonny.mcp_servers]`: the model writes JavaScript, the tool host runs it
 //! in QuickJS with each server's tools as `tools.mcp__SERVER__TOOL`, and
 //! only what the script passes to `text()` or `image()` comes back. The
 //! contract is Codex's code mode, word for word where it fits, since the
@@ -36,7 +36,7 @@ const PRAGMA: &str = "// @exec:";
 /// expiry say less.
 const MEMORY: usize = 256 << 20;
 pub const TIMEOUT: Duration = Duration::from_secs(600);
-/// Scripts that run at once in the lookout; the rest wait their turn.
+/// Scripts that run at once in the tool host; the rest wait their turn.
 const SCRIPTS: usize = 4;
 static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SCRIPTS);
 /// Scripts alive at once, running or waiting for verdicts, so that their
@@ -616,7 +616,7 @@ async fn run(
     };
     let run = Run {
         hub: hub.clone(),
-        lookout: tokio::runtime::Handle::current(),
+        host: tokio::runtime::Handle::current(),
         nested: Arc::new(nested),
         failed: Arc::new(failed),
         listed: Value::Array(listed).to_string(),
@@ -904,8 +904,8 @@ enum Ended {
 /// One script's run: what it reaches and what it said.
 struct Run {
     hub: Hub,
-    /// The lookout's runtime, where the servers' connections live.
-    lookout: tokio::runtime::Handle,
+    /// The tool host's runtime, where the servers' connections live.
+    host: tokio::runtime::Handle,
     nested: Arc<BTreeMap<String, Nested>>,
     failed: Arc<Vec<String>>,
     listed: String,
@@ -1169,7 +1169,7 @@ impl Run {
         )?;
         let call = Caller {
             hub: self.hub.clone(),
-            lookout: self.lookout.clone(),
+            host: self.host.clone(),
             nested: Arc::clone(&self.nested),
             failed: Arc::clone(&self.failed),
             calls: Arc::clone(&self.calls),
@@ -1254,7 +1254,7 @@ fn said_of(result: Result<String, String>) -> String {
 #[derive(Clone)]
 struct Caller {
     hub: Hub,
-    lookout: tokio::runtime::Handle,
+    host: tokio::runtime::Handle,
     nested: Arc<BTreeMap<String, Nested>>,
     failed: Arc<Vec<String>>,
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
@@ -1284,7 +1284,7 @@ impl Caller {
         };
         let arguments: Value = serde_json::from_str(&arguments).map_err(|e| e.to_string())?;
         // Put to the agent's gate first, with the script's time stopped,
-        // on the lookout's runtime, where its connection lives.
+        // on the host's runtime, where its connection lives.
         let mut allowed = None;
         if let Some(steps) = self.steps.clone().filter(|_| nested.asks) {
             let asked = match &arguments {
@@ -1293,10 +1293,7 @@ impl Caller {
             };
             let stopped = self.clock.stop();
             let asking = Arc::clone(&steps);
-            let approval = Abort(
-                self.lookout
-                    .spawn(async move { asking.ask(&id, asked).await }),
-            );
+            let approval = Abort(self.host.spawn(async move { asking.ask(&id, asked).await }));
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
             // starting again once it has a place, as a new script's does.
@@ -1316,7 +1313,7 @@ impl Caller {
             .or_default() += 1;
         let hub = self.hub.clone();
         let call = Abort(
-            self.lookout
+            self.host
                 .spawn(async move { hub.call(&nested.server, &nested.tool, arguments).await }),
         );
         let result = call
@@ -1325,14 +1322,14 @@ impl Caller {
             .and_then(|called| called);
         if let Some((steps, step)) = allowed {
             let failed = !matches!(&result, Ok(called) if !called.is_error);
-            self.lookout
+            self.host
                 .spawn(async move { steps.ran(step, failed).await });
         }
         result
     }
 }
 
-/// A call on the lookout's runtime, stopped when the script no longer
+/// A call on the host's runtime, stopped when the script no longer
 /// waits for it.
 struct Abort<T>(tokio::task::JoinHandle<T>);
 

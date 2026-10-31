@@ -24,7 +24,7 @@ A lead hears of its tasks' turns from Sonny's task updates and lookout, not
 from triggers.
 
 Sonny's agents add and change triggers with the `triggers` tool, which
-Sonny's lookout answers outside the agent's sandbox, since a trigger is a
+Sonny's tool host answers outside the agent's sandbox, since a trigger is a
 job of the system's scheduler: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `fire` or `show` NAME, or nothing to list them.
@@ -386,7 +386,7 @@ one line per fact, and is held to 16 KiB so reading it at the start of
 every task stays cheap. The daemon knows nothing of memory.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
-lookout answers outside the agent's sandbox, so a sandboxed agent still
+tool host answers outside the agent's sandbox, so a sandboxed agent still
 saves to `~/.agents/memory`: `read` NAME, `save {name, type,
 description, source, text}`, `remove`, `index`, `check`, `changed` or `cleanup`, scoped by `user`
 or `project`, or nothing to show both indexes. It waits for no verdict.
@@ -680,6 +680,35 @@ A link the Agent app left there, into its bundle's
 own skill of the same name wins over any of them. Agents already running
 keep the index they were created with.
 
+## Tool host
+
+The tools Sonny gives its agents (`start_task`, `memory`, `goal`,
+`triggers`, `subscriptions`, the commons, `exec` and the rest whose
+`answered_by` is `sonny`) wait in the daemon until Sonny answers them
+([served.rs](../sonny/src/served.rs)). The tool host answers them:
+`sonny tool-host --store STORE --socket SOCKET`, the daemon's companion
+`sonny-tool-host` ([tool_host.rs](../sonny/src/tool_host.rs)), which Sonny
+and `sonny acp` add beside the lookout, so the calls are answered with
+every window closed, by the build that declared them. It is the lookout's
+sibling, not part of it, as Codex keeps its code-mode host apart from the
+session: a tool that runs long, crashes or holds memory, as an MCP server
+or a browser can, never holds up the news a lead hears, and either can be
+replaced without the other.
+
+Each call that starts, or waited from before the host did, runs as
+`sonny tool NAME` in the calling agent's folder, with the environment its
+shell would have; `exec` runs in the host itself, where the MCP servers
+stay up (next section). A turn that ends stops the calls it still has
+running. The host holds `STORE.tool-host.lock`, so a second one prints
+`{"event":"already_serving"}` and exits, unless another build started the
+running one, which it then stops and replaces (`STORE.tool-host.sonny`
+says which build runs). It follows the daemon's `tool_started` and
+`turn_finished` events from `STORE.tool-host.cursor`, the first time from
+the lookout's cursor rather than the whole log, and exits once the daemon
+has been gone 30 seconds. On starting, it brings every agent Sonny declared
+tools on up to this build's tools. `/status` says "tools not answered"
+when no tool host runs.
+
 ## MCP servers
 
 The person's MCP servers live in `~/.agent/config.toml`, under Codex's key
@@ -744,7 +773,7 @@ later scripts, `ALL_TOOLS` lists every tool, and `tools.tool_search` ranks
 them for a query. The description lists each server and declares its tools
 in TypeScript up to about 3,000 tokens; the rest are found from a script. A
 script runs in QuickJS with no files, network or timers, at most 256 MB and
-10 minutes, four at once in the lookout and sixteen alive (more wait
+10 minutes, four at once in the tool host and sixteen alive (more wait
 their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
 the whole to a file; saved outputs and images are kept a week. A first
@@ -758,13 +787,13 @@ result over 16 MB is refused, as rmcp refuses such a message. Two tools
 whose identifiers would be the same (`my-server` and `my_server`'s
 `search`) are neither on `tools`, the description saying why.
 
-The lookout runs the scripts and keeps the servers
+The tool host runs the scripts and keeps the servers
 ([mcp.rs](../sonny/src/mcp.rs)): one connection per server for every agent,
 started by the first call and stopped after ten idle minutes, with each
 server's tool list kept in `~/.agent/sonny/mcp`, readable by the person
 alone and keyed by a digest of its config rather than the config's
 secrets, so agents are told of its tools without starting it. A server's
-stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the lookout and
+stderr is kept by its last twenty lines, each cut at 1 KB, for when it fails. Servers run as the person, beside the tool host and
 outside every agent's sandbox, as Codex starts its own: a sandboxed task
 reaches them only through `exec`. A turn that ends, as one the person
 interrupts, stops its script and the calls it has in flight.
