@@ -689,7 +689,7 @@ impl Service {
         mut events: agent_client::Events,
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Event>,
     ) {
-        let bots = all_bots(&client).await;
+        let (bots, complete) = listed(&client).await;
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
@@ -706,8 +706,9 @@ impl Service {
             }
         }
         // Agents that posted in the commons before posting subscribed them
-        // are subscribed to its threads, once.
-        if crate::commons::on()
+        // are subscribed to its threads, once, from a whole listing.
+        if complete
+            && crate::commons::on()
             && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
         {
             let names = (bots.iter())
@@ -1603,6 +1604,12 @@ pub fn subscribe_lead(store: &Path, lead: &str, project: &str) -> Result<bool, S
 
 /// Every bot the daemon lists, page by page.
 pub(crate) async fn all_bots(client: &Client) -> Vec<Value> {
+    listed(client).await.0
+}
+
+/// Every bot the daemon lists, and whether every page came: a request
+/// that fails leaves the ones before it.
+async fn listed(client: &Client) -> (Vec<Value>, bool) {
     let mut bots = Vec::new();
     let mut after = Value::Null;
     loop {
@@ -1610,11 +1617,11 @@ pub(crate) async fn all_bots(client: &Client) -> Vec<Value> {
             .request("bots", json!({"limit": 256, "after": after}))
             .await
         else {
-            return bots;
+            return (bots, false);
         };
         bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
         match &page["next_after"] {
-            Value::Null => return bots,
+            Value::Null => return (bots, true),
             next => after = next.clone(),
         }
     }
@@ -2463,20 +2470,20 @@ impl Lookout {
         if self.sourcing.is_some() {
             return;
         }
-        let waiting = if self.resend.is_empty() {
-            &self.heard
-        } else {
-            &self.resend
-        };
-        let steer = waiting.iter().any(|heard| heard.event.urgent);
-        if self.refused(now) || !(steer || (now >= since + SETTLE && self.updates.idle())) {
+        if self.refused(now) {
             return;
         }
-        // The note under way when the lookout stopped goes first, as it was.
+        // The note under way when the lookout stopped goes again first, as
+        // it was, busy or not: the daemon took it already, or takes it now.
         let sent = std::mem::take(&mut self.resend);
         if !sent.is_empty() {
+            let steer = sent.iter().any(|heard| heard.event.urgent);
             let prompt = sources::note(&sent, self.heard.len());
             return self.source(client, woken, sent, prompt, steer);
+        }
+        let steer = self.heard.iter().any(|heard| heard.event.urgent);
+        if !(steer || (now >= since + SETTLE && self.updates.idle())) {
+            return;
         }
         // A bounded note sends what is urgent first, and always at least
         // one; what a digest still holds waits after the rest.
@@ -4036,6 +4043,41 @@ mod tests {
         while let Some((_, _, answer)) = woke.recv().await {
             lookout.answered(answer);
         }
+    }
+
+    #[tokio::test]
+    async fn a_note_under_way_at_a_stop_goes_again_as_it_was_busy_or_not() {
+        let (client, mut got) = submits().await;
+        let mut before = lookout();
+        before.updates.live = true;
+        before.subs.push(hears("chat"));
+        (before.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+        before.heard_from(&slack("first", false));
+        before.heard_since = Some(Instant::now() - SETTLE);
+        wake_sources(&mut before, &client).await;
+        let first = got.recv().await.unwrap();
+        // As if it stopped before the daemon's answer came: the same note,
+        // under the same request, while the subscriber is busy.
+        let event = slack("first", false);
+        let sent = vec![sources::Heard {
+            event,
+            subs: vec!["chat".into()],
+        }];
+        let mut again = lookout();
+        again.updates.live = true;
+        again.subs.push(hears("chat"));
+        busy(&mut again);
+        again.resend = sent;
+        again.heard_since = Some(Instant::now());
+        again.heard_from(&slack("down", true));
+        wake_sources(&mut again, &client).await;
+        let resent = got.recv().await.unwrap();
+        assert_eq!(resent["request_id"], first["request_id"]);
+        // The urgent one goes next, not after the turn.
+        wake_sources(&mut again, &client).await;
+        let urgent = got.recv().await.unwrap();
+        assert_eq!(urgent["delivery"], "steer");
+        assert!(urgent["prompt"].as_str().unwrap().contains("down"));
     }
 
     #[tokio::test]
