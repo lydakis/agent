@@ -289,8 +289,8 @@ approval gate as a call that leaves the sandbox would; `memory` and
   ripgrep.
 - The Homebrew formulas build from source on the person's machine. The
   Linux tarballs are static builds and are not code-signed.
-- The repository has secret scanning, Dependabot alerts and Dependabot
-  security updates on.
+- The repository has secret scanning with push protection, Dependabot
+  alerts and Dependabot security updates on.
 
 ## Known limits
 
