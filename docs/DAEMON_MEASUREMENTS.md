@@ -6221,3 +6221,65 @@ container, base cd2813f against the same head:
 | lifecycle | CPU, s | 1.19 | 1.16 | -2.5% |
 | lifecycle | p95 turn, ms | 588.705 | 582.925 | -1.0% |
 | lifecycle | peak RSS, MiB | 25.805 | 25.695 | -0.4% |
+
+## Words attached to a call say so (#535)
+
+`keep_sender`, the `INSERT … SELECT … RETURNING` that already runs as a
+turn's prompt is absorbed, now also copies whether the turn was delivered
+with `attach` into a new `senders.attached` column, and `history_items`
+reads that column with the rest of the sender row. No store job is added:
+the same statements run, one column wider. An attach from a client that
+names no sender (no bot, origin, person or quotes) now keeps a sender row
+where it kept none; steers and queued turns are unchanged. The Perf
+workflow's matched screen, base main 09fe6ee against the PR head 2209f50
+(the later head changes only Sonny's test and README examples), on the
+GitHub runner (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 40.309 | 39.361 | -2.4% |
+| admission | burst submit p99, ms | 6.253 | 6.197 | -0.9% |
+| completion | release to terminal p99, ms | 13.813 | 14.151 | +2.4% |
+| footprint | idle RSS, MiB | 19.088 | 19.211 | +0.6% |
+| footprint | per idle bot, KiB | 1.598 | 1.532 | -4.1% |
+| footprint | RSS after a turn each, MiB | 27.182 | 27.574 | +1.4% |
+| footprint | CPU per turn, ms | 1.277 | 1.269 | -0.6% |
+| lifecycle | CPU, s | 1.145 | 1.15 | +0.4% |
+| lifecycle | p95 turn, ms | 582.418 | 579.83 | -0.4% |
+| lifecycle | peak RSS, MiB | 25.004 | 25.391 | +1.5% |
+
+Store jobs per turn held at about 7.5, and nothing passed the gate's 15% in
+the direction that costs.
+
+## The socket, the store and their folder are their owner's alone
+
+`Owner::bind` binds the daemon's socket under a `177` umask and gives the
+mask back after, so the name is `0600` from its first instant: two system
+calls on the runtime thread, once, before any session is accepted or
+companion started. `Store::open` makes a missing folder `0700`, makes a
+new `state.sqlite` `0600` before SQLite first opens it (the `-wal` and
+`-shm` SQLite makes take the main file's mode) and tightens a store an
+earlier daemon left looser: one `open(O_CREAT|O_EXCL)` and, for a store
+that exists, three `stat` calls and at most three `chmod`, on the storage
+thread as the rest of `open` is. The companions' folder and logs, the
+daemon's log and the lookout's log are made owner-only the same way,
+once each. Nothing is added per bot or per turn, and no store job. The
+matched screen, base main 36c6f49 against the head of this change, run
+alternately, two rounds each, on an Apple M1 Max, macOS 27.2, external
+power, Python 3.12.9 and psutil 7.2.2 (2026-10-31):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| footprint | idle RSS, MiB | 13.117 | 13.055 | -0.5% |
+| footprint | per idle bot, KiB | 2.312 | 2.176 | -5.9% |
+| footprint | RSS after a turn each, MiB | 29.938 | 29.641 | -1.0% |
+| footprint | CPU per turn, ms | 0.754 | 0.623 | -17.4% |
+| lifecycle | CPU, s | 0.418 | 0.349 | -16.6% |
+| lifecycle | p95 turn, ms | 608.342 | 600.122 | -1.4% |
+| lifecycle | peak RSS, MiB | 24.289 | 23.734 | -2.3% |
+
+Store jobs per turn held at about 7.5 on both sides (7.488 to 7.499 base,
+7.455 to 7.498 head). The CPU drops are the laptop's: the base ran first
+in each round, and the change adds nothing to a turn's path; read them as
+no cost, not a gain. The Perf workflow screens the pull request with the
+admission and completion bursts as well.

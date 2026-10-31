@@ -109,6 +109,24 @@ fn prepare(folder: &Path, socket: &Path) -> Result<()> {
     }
 }
 
+/// The process umask set to `177` until dropped, which restores it: a
+/// socket is made `0777` less the mask, as a folder is, so `077` would
+/// leave it `0700`.
+struct Umask(libc::mode_t);
+impl Umask {
+    fn owner_only() -> Self {
+        // SAFETY: umask only replaces the calling process's mask and
+        // returns the old one.
+        Self(unsafe { libc::umask(0o177) })
+    }
+}
+impl Drop for Umask {
+    fn drop(&mut self) {
+        // SAFETY: as above, restoring what was taken.
+        unsafe { libc::umask(self.0) };
+    }
+}
+
 pub struct Owner {
     path: PathBuf,
     identity: (u64, u64),
@@ -129,6 +147,7 @@ impl Owner {
             .truncate(false)
             .read(true)
             .write(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(lock_path)?;
         lock.try_lock()
@@ -151,7 +170,18 @@ impl Owner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let listener = UnixListener::bind(&path).map_err(|_| Error::new("socket_bind_failed"))?;
+        // Owner-only from the moment the name exists. Whoever can connect
+        // has every bot, so the mode is set with the umask around the
+        // bind, not with a chmod after it: a chmod would leave an instant
+        // in which another user's connect lands in the backlog and is
+        // accepted later. The umask is the process's, but the daemon
+        // binds before it accepts a session or starts a companion, so no
+        // child is spawned in that instant, and a file another thread
+        // makes then is only tighter than it would be.
+        let listener = {
+            let _owner_only = Umask::owner_only();
+            UnixListener::bind(&path).map_err(|_| Error::new("socket_bind_failed"))?
+        };
         let metadata = std::fs::symlink_metadata(&path)?;
         Ok((
             Self {
@@ -178,8 +208,41 @@ impl Drop for Owner {
 mod tests {
     use super::*;
 
+    /// The umask is the process's: tests that bind take turns, so one
+    /// does not see another's mask.
+    static BINDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn the_socket_is_its_owner_s_alone_and_the_umask_is_given_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = BINDING.lock().await;
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+        };
+        let directory =
+            std::env::temp_dir().join(format!("agent-socket-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let before = directory.join("before");
+        File::create(&before).unwrap();
+        let path = directory.join("endpoint");
+        let (owner, listener) = Owner::bind(&path).await.unwrap();
+        assert_eq!(mode(&path) & 0o777, 0o600);
+        assert_eq!(mode(&directory.join("endpoint.owner-lock")) & 0o777, 0o600);
+        // What the process makes afterwards takes the umask it had.
+        let after = directory.join("after");
+        File::create(&after).unwrap();
+        assert_eq!(mode(&after), mode(&before));
+        drop((owner, listener));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn shutdown_does_not_unlink_a_replacement_socket() {
+        let _turn = BINDING.lock().await;
         let directory =
             std::env::temp_dir().join(format!("agent-socket-owner-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();

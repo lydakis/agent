@@ -268,10 +268,11 @@ fn subscriptions() -> Value {
             The person's own words cut into your running turn; the rest waits until your turn ends. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
-            \"From your sources\": every event, at once when the source marks it urgent. Add one, or remove \
-            one by name; with neither, or after either, the result lists them all, with the sources there \
-            are. Adding one again changes nothing; one by a name in use that differs is refused with the \
-            field, so remove it first.",
+            \"From your sources\": every event, at once when the source marks it urgent, or only those its \
+            filter matches. Add one, or remove one by name; with neither, or after either, the result lists \
+            them all, with the sources there are and the fields their events lately had, to filter on. \
+            Adding one again changes nothing; one by a name in use that differs is refused with the field, \
+            so remove it first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -285,7 +286,17 @@ fn subscriptions() -> Value {
                             "description": "Bots it watches by name, * matching any run of characters; \
                                 another lead, which has subscriptions of its own, counts only where named as it is."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Sources it hears, by name: every event each says."}
+                            "description": "Sources it hears, by name: every event each says, unless filtered."},
+                        "filter": {"type": "object",
+                            "description": "Only the sources' events this matches are heard: an event pattern as \
+                                AWS EventBridge writes one. Each field the event must have maps to a list of values, \
+                                any of which will do, or to a pattern for a field that is an object; every field \
+                                must match, and a field that is a list matches when any item does. A value is a \
+                                string, number, boolean or null, or {\"prefix\": S}, {\"suffix\": S}, \
+                                {\"wildcard\": S} (* any run of characters), {\"equals-ignore-case\": S}, \
+                                {\"anything-but\": V or [V, ...]}, {\"numeric\": [\">\", 0, \"<=\", 5]} or \
+                                {\"exists\": true or false}; \"$or\": [pattern, ...] takes any of several. \
+                                As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -1292,6 +1303,18 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
             }
         }
     }
+    // A place among the processes Sonny runs for agents, within the call's
+    // time: held until its process is done.
+    let owner = str_of(&caller["name"]);
+    let _place = tokio::time::timeout(left(call), crate::budget::processes().admit(&owner))
+        .await
+        .map_err(|_| {
+            (
+                "tool_unserved",
+                "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
+                    .to_owned(),
+            )
+        })?;
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;

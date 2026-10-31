@@ -38,6 +38,7 @@
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
+//! tool_processes = 8            # processes Sonny runs for agents at once (tool calls, goal checks) in each of its companions; 0, the default, twice the CPUs
 //! unsandboxed = ["mcpx"]        # commands run outside agents' sandboxes
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
@@ -199,6 +200,10 @@ pub struct Sonny {
     /// thermostat's margin and hold, so it does not flicker.
     pub sky_haiku_margin: u64,
     pub sky_haiku_hold: u64,
+    /// The processes each of Sonny's companions runs for agents at once:
+    /// tool calls the tool host answers, goal checks. 0 for twice the
+    /// CPUs.
+    pub tool_processes: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -232,6 +237,7 @@ impl Default for Sonny {
             sky_haiku_window: 10,
             sky_haiku_margin: 50,
             sky_haiku_hold: 10,
+            tool_processes: 0,
             chime: true,
             verbose: false,
             start_at_boot: false,
@@ -621,6 +627,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_window",
                 "sky_haiku_margin",
                 "sky_haiku_hold",
+                "tool_processes",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -689,6 +696,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
+                "tool_processes" => Some(&mut config.sonny.tool_processes),
                 _ => None,
             } {
                 *count = (value.as_integer())
@@ -1086,7 +1094,14 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
         |e: &dyn std::fmt::Display| format!("config_unwritable: {}: {e}", path.display());
     parse(text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| unwritable(&e))?;
+        use std::os::unix::fs::DirBuilderExt;
+        // `~/.agent` is its owner's alone when a client makes it, as when
+        // the daemon does; one that exists keeps its mode.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| unwritable(&e))?;
     }
     let staged = path.with_extension(format!("toml.{}", std::process::id()));
     std::fs::write(&staged, text)

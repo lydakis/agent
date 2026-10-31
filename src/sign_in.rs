@@ -459,7 +459,13 @@ fn host_id(path: &Path) -> Result<String> {
         &hex[20..]
     );
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        use std::os::unix::fs::DirBuilderExt;
+        // `~/.agent` is its owner's alone when the CLI makes it, as when
+        // the daemon does; one that exists keeps its mode.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     std::fs::write(path, format!("{id}\n"))?;
     Ok(id)

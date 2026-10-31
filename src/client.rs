@@ -873,16 +873,26 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
             "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
+    // The daemon's folder and log are its user's alone, as the daemon
+    // makes its own files; a folder that exists keeps its mode.
     if let Some(parent) = options.store.parent() {
-        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     let mut log = options.store.clone().into_os_string();
     log.push(".log");
     let log_path = log;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let log = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)?
+    };
     // Other starts of this store append to the same log; only what follows
     // this point, from our child, is ours to report.
     let start = log.metadata()?.len();

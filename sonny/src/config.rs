@@ -49,7 +49,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 25] = [
+pub const SETTINGS: [Setting; 26] = [
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -199,6 +199,12 @@ pub const SETTINGS: [Setting; 25] = [
         about: "the minutes the busiest keeps the title before another can take it",
         values: &[],
         default: "10",
+    },
+    Setting {
+        key: "sonny.tool_processes",
+        about: "processes each of Sonny's companions runs for agents at once (the tool host's tool calls, the lookout's goal checks), each agent at most half; 0 for twice the CPUs",
+        values: &[],
+        default: "0",
     },
 ];
 

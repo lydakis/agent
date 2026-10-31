@@ -1343,6 +1343,30 @@ pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'s
     vec![Line::from(spans).dim()]
 }
 
+/// What words attached to a call are, as the row that gathers several
+/// counts them: they rode along on a call, and no message came.
+pub const ATTACHED: &str = "attached note";
+
+/// How far words attached to a call sit in from what the call carried:
+/// under its words, past the `›` or `•` that leads them.
+pub const ATTACHED_INDENT: usize = 2;
+
+/// Rows of words between agents (a shut or open row, or one gathering
+/// several) as words attached to a call: the footer's clip `📎` for the
+/// arrow, a message's `↳`, since no message came, and moved in under what
+/// the call carried, so they read as part of it and not as words of
+/// their own. The clip is a column wider than the arrow.
+pub fn attached(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut lines = lines;
+    if let Some(span) = (lines.first_mut())
+        .and_then(|line| line.spans.iter_mut().find(|span| !span.content.is_empty()))
+        && let Some(rest) = span.content.strip_prefix("↳ ")
+    {
+        span.content = format!("📎 {rest}").into();
+    }
+    indented(lines, ATTACHED_INDENT)
+}
+
 /// What a message between agents is, as the row that gathers several
 /// counts them: `task update`, `message`.
 pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {

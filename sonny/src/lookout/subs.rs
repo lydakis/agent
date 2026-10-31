@@ -15,8 +15,11 @@ pub struct Sub {
     /// Bots it watches by name, `*` matching any run of characters.
     pub bots: Vec<String>,
     /// Sources it hears, by the names `[sonny.sources]` gives them: every
-    /// event one prints.
+    /// event one prints, or those its filter matches.
     pub sources: Vec<String>,
+    /// An event pattern on the fields of its sources' events, as
+    /// `pattern` reads it: only those it matches are heard.
+    pub filter: Option<Value>,
 }
 
 impl Sub {
@@ -34,7 +37,15 @@ impl Sub {
                 false => Vec::new(),
             },
             sources: Vec::new(),
+            filter: None,
         }
+    }
+
+    /// Whether it hears this event of a source.
+    pub fn hears(&self, event: &super::sources::Event) -> bool {
+        self.sources.contains(&event.source)
+            && (self.filter.as_ref())
+                .is_none_or(|filter| super::pattern::matches(filter, &event.fields))
     }
 
     pub fn to_json(&self) -> Value {
@@ -47,6 +58,9 @@ impl Sub {
         }
         if !self.sources.is_empty() {
             out["sources"] = json!(self.sources);
+        }
+        if let Some(filter) = &self.filter {
+            out["filter"] = filter.clone();
         }
         out
     }
@@ -67,6 +81,14 @@ impl Sub {
             tasks_of: strings("tasks_of"),
             bots: strings("bots"),
             sources: strings("sources"),
+            // A filter that does not check hears nothing rather than all.
+            filter: match value.get("filter") {
+                None | Some(Value::Null) => None,
+                Some(filter) => match super::pattern::check(filter) {
+                    Ok(()) => Some(filter.clone()),
+                    Err(_) => Some(Value::Bool(false)),
+                },
+            },
         })
     }
 
@@ -76,7 +98,11 @@ impl Sub {
             .chain(self.bots.iter().map(|g| format!("bots {g}")))
             .chain(self.sources.iter().map(|s| format!("source {s}")))
             .collect();
-        format!("{} · {}", self.name, watched.join(", "))
+        let filter = match &self.filter {
+            Some(filter) => format!(" where {filter}"),
+            None => String::new(),
+        };
+        format!("{} · {}{filter}", self.name, watched.join(", "))
     }
 
     /// The first field in which two subscriptions under one name differ.
@@ -85,6 +111,7 @@ impl Sub {
             ("tasks_of", self.tasks_of != other.tasks_of),
             ("bot", self.bots != other.bots),
             ("sources", self.sources != other.sources),
+            ("filter", self.filter != other.filter),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -278,6 +305,18 @@ pub fn change(
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
     }
+    if let Some(sub) = &add
+        && let Some(filter) = &sub.filter
+    {
+        let unseen = unseen(store, sub, filter);
+        if !unseen.is_empty() {
+            said["unseen"] = json!(format!(
+                "no recent event of {} had {}: the filter hears none until one does",
+                sub.sources.join(" or "),
+                unseen.join(", ")
+            ));
+        }
+    }
     if let Some(sub) = add {
         match subs.iter().find(|s| s.name == sub.name) {
             Some(had) => match had.differs(&sub) {
@@ -297,8 +336,25 @@ pub fn change(
         }
     }
     said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
-    said["sources"] = json!(sources);
+    said["sources"] = json!(super::sources::listed(store, sources));
     Ok(said)
+}
+
+/// The fields that keep a filter from hearing any event like those its
+/// sources lately printed, where the lookout has seen one.
+fn unseen(store: &Path, sub: &Sub, filter: &Value) -> Vec<String> {
+    let seen: Vec<Vec<String>> = (sub.sources.iter())
+        .filter_map(|source| super::sources::fields_seen(store, source))
+        .collect();
+    if seen.is_empty() {
+        return Vec::new();
+    }
+    let had = |field: &str| {
+        seen.iter().flatten().any(|had| {
+            had == field || (had.strip_prefix(field)).is_some_and(|r| r.starts_with('.'))
+        })
+    };
+    super::pattern::missing(filter, &had)
 }
 
 /// A subscription as a call gives it, held to what one may say.
@@ -315,14 +371,25 @@ fn parse(value: &Value) -> Result<Sub, String> {
             .filter_map(|s| s.as_str().map(str::to_owned))
             .collect()
     };
+    let filter = match value.get("filter") {
+        None | Some(Value::Null) => None,
+        Some(filter) => {
+            super::pattern::check(filter)?;
+            Some(filter.clone())
+        }
+    };
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
         bots: strings("bots"),
         sources: strings("sources"),
+        filter,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
         return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
+    }
+    if sub.filter.is_some() && sub.sources.is_empty() {
+        return Err("a filter narrows what sources say: name the sources it filters".into());
     }
     Ok(sub)
 }
@@ -358,6 +425,70 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_narrows_sources_and_warns_of_fields_no_event_had() {
+        let dir = std::env::temp_dir().join(format!("lookout-subs-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let sources = ["cr".to_owned()];
+        let add = |sub: Value| change(&store, "shop.lead", Some(&sub), None, &sources);
+        let filter = json!({"paths": [{"prefix": "src/billing/"}]});
+        let crs = json!({"name": "crs", "sources": ["cr"], "filter": filter});
+        // No event seen yet: nothing to warn of.
+        let added = add(crs.clone()).unwrap();
+        assert_eq!(added["subscriptions"][0]["filter"], filter);
+        assert!(added.get("unseen").is_none(), "{added}");
+        let sub = &read(&store, "shop.lead")[0];
+        assert_eq!(sub.filter.as_ref(), Some(&filter));
+        assert!(
+            sub.describe()
+                .ends_with(r#"source cr where {"paths":[{"prefix":"src/billing/"}]}"#)
+        );
+        // Another filter under the name is another subscription.
+        let other = json!({"name": "crs", "sources": ["cr"], "filter": {"paths": ["x"]}});
+        assert!(add(other).unwrap_err().contains("another filter"));
+        // A filter is for sources, and checked.
+        let bots = json!({"name": "b", "bots": ["a"], "filter": filter});
+        assert!(add(bots).unwrap_err().contains("name the sources"));
+        let bad = json!({"name": "b", "sources": ["cr"], "filter": {"paths": "src/"}});
+        assert!(add(bad).unwrap_err().contains("list of values"));
+        // Once the lookout has seen the source's shape, a field it never
+        // had is said.
+        let shapes = super::super::beside(&store, ".sources").join(".shapes");
+        std::fs::create_dir_all(&shapes).unwrap();
+        std::fs::write(
+            shapes.join("cr.json"),
+            json!({"events": 3, "fields": {
+                "text": {"kinds": ["string"], "example": "\"CR-1\""},
+                "paths": {"kinds": ["list of strings"], "example": "[\"src/a.rs\"]"},
+                "meta.team": {"kinds": ["string"], "example": "\"core\""}}})
+            .to_string(),
+        )
+        .unwrap();
+        let typo = json!({"name": "t", "sources": ["cr"],
+            "filter": {"path": ["x"], "meta": {"team": ["core"]}}});
+        let warned = add(typo).unwrap();
+        assert_eq!(
+            warned["unseen"],
+            "no recent event of cr had path: the filter hears none until one does"
+        );
+        let listed = &warned["sources"][0];
+        assert_eq!(listed["name"], "cr");
+        assert_eq!(
+            listed["fields"]["paths"],
+            "list of strings, as [\"src/a.rs\"]"
+        );
+        // A file edited by hand with a filter that does not check hears
+        // nothing rather than everything.
+        let bad =
+            Sub::from_json(&json!({"name": "x", "sources": ["cr"], "filter": {"a": 1}})).unwrap();
+        let event =
+            super::super::sources::Event::parse("cr", r#"{"text": "t", "a": 1}"#, 0).unwrap();
+        assert!(!bad.hears(&event));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn subscriptions_are_added_once_and_refused_when_they_differ() {
         let dir = std::env::temp_dir().join(format!("lookout-subs-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -382,7 +513,11 @@ mod tests {
         );
         let sources = ["mail".to_owned(), "slack".to_owned()];
         let heard = change(&store, "shop.lead", Some(&slack), None, &sources).unwrap();
-        assert_eq!(heard["sources"], json!(["mail", "slack"]));
+        let names: Vec<&Value> = (heard["sources"].as_array().unwrap().iter())
+            .map(|s| &s["name"])
+            .collect();
+        assert_eq!(names, ["mail", "slack"]);
+        assert_eq!(heard["sources"][0], json!({"name": "mail", "events": 0}));
         let typo = json!({"name": "s2", "sources": ["slakc"]});
         let refused = change(&store, "shop.lead", Some(&typo), None, &sources).unwrap_err();
         assert!(
