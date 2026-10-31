@@ -148,24 +148,31 @@ class TriggerFireTests(ModelFixture):
             self.assertEqual(item['origin'], 'trigger')
         finally:
             connection.close()
-        # A working bot is not interrupted or queued behind: that time is skipped.
+        # A working bot is not interrupted: the fire waits behind its work,
+        # as anacron runs a missed job once, and one fire of the trigger at
+        # a time waits there.
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
         self.addCleanup(self.model.release_headers.set)
         self.agent('run', '--store', str(self.store), '--bot', 'p.task', '--detach', 'gate')
         time.sleep(0.5)
-        skipped = self.fire('p.task', 'Check the PR again.')
+        late = self.fire('p.task', 'Check the PR again.', generation='7')
+        self.assertEqual((late['last']['outcome'], late['last'].get('late')), ('sent', True), late)
+        skipped = self.fire('p.task', 'Check the PR again.', generation='7')
         self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
         self.model.release_headers.set()
         busy = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'gate')
-        self.agent('wait', '--store', str(self.store), f'turn:p.task/{busy}')
-        # The skip starts no turn: the bot is told in its next model call.
-        told = self.turns('p.task')[-1]
-        self.assertGreater(told['turn'], busy)
+        self.agent('wait', '--store', str(self.store), f"turn:p.task/{late['last']['turn']}")
+        turns = self.turns('p.task')
+        waited = next(t for t in turns if t['turn'] == late['last']['turn'])
+        self.assertGreater(waited['turn'], busy)
+        self.assertEqual(waited['status'], 'completed')
+        # The second fire starts no turn: the bot is told in a model call.
+        told = turns[-1]
         self.assertIn(told['status'], ('attached', 'steered'))
         self.assertRegex(told['prompt_preview'],
                          r'^\[trigger p\.task · .* · every 30m not sent to p\.task: bot_busy')
-        self.assertEqual(len(self.turns('p.task')), 4)
+        self.assertEqual(len(turns), 5)
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
