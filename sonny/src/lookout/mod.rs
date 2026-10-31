@@ -14,6 +14,7 @@
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod goals;
+pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;
 mod updates;
@@ -2260,10 +2261,11 @@ impl Lookout {
     }
 
     /// The last note was refused lately: even a steer waits the gap after.
-    /// The subscriptions that hear a source now.
-    fn hearing(&self, source: &str) -> Vec<String> {
+    /// The subscriptions that hear a source's event now: those naming
+    /// the source whose filter, if any, matches it.
+    fn hearing(&self, event: &sources::Event) -> Vec<String> {
         (self.subs.iter())
-            .filter(|sub| sub.sources.iter().any(|name| name == source))
+            .filter(|sub| sub.hears(event))
             .map(|sub| sub.name.clone())
             .collect()
     }
@@ -2273,7 +2275,7 @@ impl Lookout {
     fn rehear(&mut self) {
         let mut heard = std::mem::take(&mut self.heard);
         heard.retain_mut(|heard| {
-            heard.subs = self.hearing(&heard.event.source);
+            heard.subs = self.hearing(&heard.event);
             !heard.subs.is_empty()
         });
         self.heard = heard;
@@ -2285,7 +2287,7 @@ impl Lookout {
     /// A source's event, held for the next note when a subscription
     /// hears that source.
     fn heard_from(&mut self, event: &sources::Event) {
-        let subs = self.hearing(&event.source);
+        let subs = self.hearing(event);
         if subs.is_empty() {
             return;
         }
@@ -2461,6 +2463,7 @@ mod tests {
             tasks_of: tasks_of.iter().map(|b| b.to_string()).collect(),
             bots: bots.iter().map(|b| b.to_string()).collect(),
             sources: Vec::new(),
+            filter: None,
         }
     }
 
@@ -3527,6 +3530,7 @@ mod tests {
             from: Some("ana".into()),
             url: None,
             urgent,
+            fields: std::sync::Arc::new(json!({"text": text})),
             at_ms: 1,
             seq: 0,
         }
@@ -3565,6 +3569,31 @@ mod tests {
         lookout.subs.clear();
         lookout.rehear();
         assert!(lookout.heard.is_empty() && lookout.heard_since.is_none());
+    }
+
+    #[test]
+    fn a_filtered_subscription_hears_only_the_events_it_matches() {
+        let mut lookout = lookout();
+        let mut billing = hears("billing");
+        billing.filter = Some(json!({"paths": [{"prefix": "src/billing/"}]}));
+        lookout.subs.push(billing);
+        lookout.subs.push(hears("all"));
+        let change = |paths: Value| {
+            let line = json!({"text": "CR-7", "id": paths.to_string(), "paths": paths});
+            sources::Event::parse("slack", &line.to_string(), 1).unwrap()
+        };
+        lookout.heard_from(&change(json!(["src/billing/tax.rs", "README.md"])));
+        lookout.heard_from(&change(json!(["src/search/index.rs"])));
+        let subs: Vec<_> = lookout.heard.iter().map(|h| h.subs.clone()).collect();
+        assert_eq!(subs, [vec!["billing", "all"], vec!["all"]]);
+        // Without the subscription that hears all, the other is dropped.
+        lookout.subs.retain(|sub| sub.name == "billing");
+        lookout.rehear();
+        assert_eq!(lookout.heard.len(), 1);
+        assert_eq!(lookout.heard[0].subs, ["billing"]);
+        // A filter matches nothing on a plain line that lacks its field.
+        lookout.heard_from(&slack("src/billing/ is down", false));
+        assert_eq!(lookout.heard.len(), 1);
     }
 
     /// A daemon that greets, answers each request with `{}` and sends each
